@@ -39,6 +39,4 @@ current (found) issues:
 
 4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
 
-5. (MAJOR) When removing channel from sub list & removing it's videos from DL blocklist, it often fails to do so, and videos will not redownload if channel is added back. (UPDATE) Actually looking like the current implementation of the large channel caching system is preventing ANY new channels from being added. this is a critical bug that will prevent basic usage of the program
-
-6. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though. It feels like manually clicking sync-subbed does them in the right order, but when auto-sync fires it does not. Not sure if that's the exact correlation though.
+5. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though. It feels like manually clicking sync-subbed does them in the right order, but when auto-sync fires it does not. Not sure if that's the exact correlation though.

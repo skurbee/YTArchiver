@@ -19,4 +19,4 @@ you can of course still manually download single videos
 
 
 I didn't write any of this code (except for manually changing the label on things or changing padding or whatever)
-All Claude-Code. Cost me about $150 in extra use credits, and about 30 real world hours testing and tweaking lol
+All Claude-Code.

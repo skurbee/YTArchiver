@@ -46,3 +46,5 @@ current (found) issues:
 7. if more than 1 channel is queued for initialization, they don't go sequentially. It starts doing both at the same time, alternating videos between them. This is not the intended behavior.
 
 8. hovering over the taskbar icon shows "idle" while a manual single channel initialization is running.
+
+9. clicking download after adding a single video URL on the main page should add that video to the job queue. right now it downloads at the same time as a channel sync, adding slight IP ban risk from having 2 downloads going simultaneously.

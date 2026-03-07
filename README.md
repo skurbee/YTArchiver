@@ -33,7 +33,7 @@ All Claude-Code.
 current (found) issues:
 1. Simple log mode does not notify the user that a channel was skipped due to daily limit
 
-2. last full sync timer sometimes resetting when single channel sync is preformed
+2. last full sync timer sometimes resetting when single channel sync is performed
 
 3. Channels that hit daily limit are not itemized in the log when running a full subbed channel sync, even in verbose log mode
 

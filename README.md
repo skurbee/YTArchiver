@@ -35,7 +35,7 @@ current (found) issues:
 
 2. last full sync timer sometimes resetting when single channel sync is performed
 
-3. Channels that hit daily limit are not itemized in the log when running a full subbed channel sync, even in verbose log mode
+3. Channels that hit daily limit are not itemized in the log when running a full subbed channel sync, even in verbose log mode. Right now if you have 50 channels subbed and 1 has hit it's daily limit, the "full sync" shows 49 channels. The limited channel should still be itemized, but shown as skipped due to limits in the log.
 
 4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
 

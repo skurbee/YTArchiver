@@ -40,3 +40,5 @@ current (found) issues:
 4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
 
 5. When removing channel from sub list & removing it's videos from DL blocklist, it often fails to do so, and videos will not redownload if channel is added back.
+
+6. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though.

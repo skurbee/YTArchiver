@@ -44,3 +44,5 @@ current (found) issues:
 6. When a video is filtered for being too long, the log occasionally shows filtered for being too short.
 
 7. if more than 1 channel is queued for initialization, they don't go sequentially. It starts doing both at the same time, alternating videos between them. This is not the intended behavior.
+
+8. hovering over the taskbar icon shows "idle" while a manual single channel initialization is running.

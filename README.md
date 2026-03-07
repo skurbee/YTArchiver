@@ -39,4 +39,4 @@ current (found) issues:
 
 4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
 
-5. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though. It feels like manually clicking sync-subbed does them in the right order, but when auto-sync fires it does not. Not sure if that's the exact correlation though.
+5. It's supposed to run the subbed channels alphabetically. Manually clicking the Sync-Subbed button does this, but an auto-sync firing syncs channels in the order that they were added.

@@ -41,4 +41,4 @@ current (found) issues:
 
 5. It's supposed to run the subbed channels alphabetically. Manually clicking the Sync-Subbed button does this, but an auto-sync firing syncs channels in the order that they were added.
 
-6. When a video is filtered for being too long, the log shows filtered for being too short.
+6. When a video is filtered for being too long, the log occasionally shows filtered for being too short.

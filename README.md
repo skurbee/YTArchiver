@@ -41,4 +41,4 @@ current (found) issues:
 
 5. When removing channel from sub list & removing it's videos from DL blocklist, it often fails to do so, and videos will not redownload if channel is added back.
 
-6. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though.
+6. It's supposed to run the subbed channels alphabetically, randomly does them out of order for some reason though. It feels like manually clicking sync-subbed does them in the right order, but when auto-sync fires it does not. Not sure if that's the exact correlation though.

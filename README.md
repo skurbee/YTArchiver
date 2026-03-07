@@ -20,3 +20,15 @@ you can of course still manually download single videos
 
 I didn't write any of this code (except for manually changing the label on things or changing padding or whatever)
 All Claude-Code.
+
+
+current (found) issues:
+1. Simple log mode does not notify the user that a channel was skipped due to daily limit
+
+2. last full sync timer sometimes resetting when single channel sync is preformed
+
+3. Channels that hit daily limit are not itemized in the log when running a full subbed channel sync, even in verbose log mode
+
+4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
+
+5. When removing channel from sub list & removing it's videos from DL blocklist, it often fails to do so, and videos will not redownload if channel is added back.

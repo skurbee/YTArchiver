@@ -40,3 +40,5 @@ current (found) issues:
 4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
 
 5. It's supposed to run the subbed channels alphabetically. Manually clicking the Sync-Subbed button does this, but an auto-sync firing syncs channels in the order that they were added.
+
+6. When a video is filtered for being too long, the log shows filtered for being too short.

@@ -32,6 +32,4 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. If a channel is added to the sub list while a sync is running, the pause/cancel buttons dissapear (sometimes)
-
-2. Badge showing # of downloaded videos on windows taskbar icon is super tiny and basically unreadable
+1. 

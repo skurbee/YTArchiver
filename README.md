@@ -30,5 +30,6 @@ All Claude-Code.
 
 
 
-current (found) issues:
+I will list current found issues here as I find them.
+
 1. 

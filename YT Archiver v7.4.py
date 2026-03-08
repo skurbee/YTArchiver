@@ -893,24 +893,20 @@ def _generate_spin_frames(base_img, num_frames=12):
 
 
 def _make_badge_icon(base_img, count):
-    """Composite a large red badge with a number onto the icon."""
+    """Composite a bright green notification dot onto the icon."""
     img = base_img.copy().convert("RGBA")
     sz = img.size[0]
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    # Large badge covering most of the bottom-right quadrant
-    badge_r = max(8, sz * 3 // 8)
+    badge_r = max(5, sz // 4)
     cx = sz - badge_r - 1
-    cy = sz - badge_r - 1
-    draw.ellipse([cx - badge_r, cy - badge_r, cx + badge_r, cy + badge_r], fill=(220, 40, 40, 240))
-    text = str(count) if count < 100 else "99+"
-    try:
-        font = ImageFont.truetype("arial.ttf", max(8, int(badge_r * 1.1)))
-    except Exception:
-        font = ImageFont.load_default()
-    tb = draw.textbbox((0, 0), text, font=font)
-    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-    draw.text((cx - tw // 2, cy - th // 2 - 1), text, fill=(255, 255, 255, 255), font=font)
+    cy = badge_r + 1
+    # White outline for contrast
+    draw.ellipse([cx - badge_r - 1, cy - badge_r - 1, cx + badge_r + 1, cy + badge_r + 1],
+                 fill=(255, 255, 255, 255))
+    # Bright green dot
+    draw.ellipse([cx - badge_r, cy - badge_r, cx + badge_r, cy + badge_r],
+                 fill=(50, 205, 50, 255))
     return Image.alpha_composite(img, overlay)
 
 
@@ -1319,7 +1315,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.3 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v7.4 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3003,6 +2999,13 @@ def remove_channel():
 
         threading.Thread(target=_purge_ids, daemon=True).start()
 
+    # Determine channel folder path before removing from config
+    with config_lock:
+        _folder_ovr = ch_to_remove.get("folder_override", "").strip()
+        _ch_folder_name = sanitize_folder(_folder_ovr or removed_name)
+        _base = config.get("output_dir", "").strip() or BASE_DIR
+    _ch_folder_path = os.path.join(_base, _ch_folder_name)
+
     with config_lock:
         config["channels"] = [c for c in config.get("channels", []) if c["name"] != removed_name]
         if chan_var.get() == removed_name:
@@ -3015,6 +3018,33 @@ def remove_channel():
     refresh_channel_dropdowns()
     save_config(config)
     remove_channel_btn.pack_forget()
+
+    # Offer to delete the channel's folder if it exists
+    if os.path.isdir(_ch_folder_path):
+        try:
+            _total_bytes = 0
+            for _dp, _dns, _fns in os.walk(_ch_folder_path):
+                for _fn in _fns:
+                    try:
+                        _total_bytes += os.path.getsize(os.path.join(_dp, _fn))
+                    except OSError:
+                        pass
+            _size_disp = _fmt_size(str(_total_bytes)) if _total_bytes else "empty"
+        except OSError:
+            _size_disp = "unknown size"
+
+        if messagebox.askyesno(
+            "Delete channel folder?",
+            f"Would you like to delete this channel's folder as well?\n\n"
+            f"{_ch_folder_path}\n"
+            f"({_size_disp})",
+            icon="warning"
+        ):
+            try:
+                shutil.rmtree(_ch_folder_path)
+                log(f"  ✓ Deleted folder: {_ch_folder_path}\n", "green")
+            except Exception as e:
+                log(f"ERROR: Could not delete folder: {e}\n", "red")
 
 
 split_row = ttk.Frame(add_outer, style="Raised.TFrame")
@@ -4950,6 +4980,11 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
 
                         # Log ✓ line with standardized column widths for Simple mode
                         _size_str = f"({_fmt_size(size_bytes)})" if size_bytes and size_bytes not in ("NA", "None", "none", "") else ""
+                        _date_str_raw = parts[3].strip() if len(parts) >= 4 else ""
+                        if len(_date_str_raw) == 8 and _date_str_raw.isdigit():
+                            _disp_date = f"{_date_str_raw[4:6]}.{_date_str_raw[6:]}.{_date_str_raw[2:4]}"
+                        else:
+                            _disp_date = ""
                         if is_simple_mode:
                             _title_max = 52
                             _chan_max = 18
@@ -4959,8 +4994,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                             else:
                                 _disp_title = _raw_title.ljust(_title_max)
                             _disp_chan = channel_name[:_chan_max].ljust(_chan_max)
+                            _date_col = f" {_disp_date}  " if _disp_date else "  "
                             _disp_size = _size_str.rjust(10) if _size_str else ""
-                            log(f"  ✓ {_disp_title}  {_disp_chan} {_disp_size}\n", "simpledownload")
+                            log(f"  ✓ {_disp_title}  {_disp_chan}{_date_col}{_disp_size}\n", "simpledownload")
                         else:
                             _size_str2 = f"  ({_fmt_size(size_bytes)})" if size_bytes and size_bytes not in ("NA", "None", "none", "") else ""
                             log(f"  ✓ {parts[1]}  —  {channel_name}{_size_str2}\n", "simpledownload")
@@ -6949,7 +6985,12 @@ tab_recent.rowconfigure(1, weight=1)
 def on_tab_changed(event):
     global new_download_count
     selected = notebook.select()
-    if selected == str(tab_recent):
+    if selected == str(tab_download):
+        # Re-show cancel/pause buttons if a sync or reorg is still active
+        # (they can lose pack state when switching tabs during long operations)
+        if _sync_running or _reorg_running:
+            _show_cancel_pause()
+    elif selected == str(tab_recent):
         if new_download_count > 0:
             new_download_count = 0
             notebook.tab(tab_recent, text="  Recent  ")

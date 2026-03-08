@@ -2,7 +2,7 @@
 Claude-Code + 30hrs of time + $150 in extra usage = 4kVideoDownloader+ replacement.
 
 
-What started out as a simple script to re-date video files and trim ones over/under a certain length has turned into a somewhat complex YT-DLP GUI with some features added on top. I now use it in replacement of 4kVideoDownloader+.
+What started out as a simple script has turned into a somewhat complex YT-DLP GUI with some features I wanted added on top. I now use it in replacement of 4kVideoDownloader+ to download/archive YT channels.
 
 Sub to a channel-
 
@@ -18,7 +18,7 @@ Prioritizes slow & steady to be extra safe from YT IP ban
 
 Uses Firefox for YT cookies (apparently getting them from chromium is harder?)
 
-When downloading a large channel for the first time, it hashes the video IDs to a cache. That way, if the download is cancelled or interupted, it doesn't have to re-scan the entire channel. On extremely large channels this can save 10+ minutes on resume.
+When downloading a large channel for the first time, it caches the video IDs. That way, if the download is cancelled or interupted, it doesn't have to re-scan the entire channel to find where it left off. On extremely large channels this can save 10+ minutes on resume.
 
 you can of course still manually download single videos
 
@@ -33,4 +33,4 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. 
+1. When the sync log appears, it is supposed to only have enough padding for the lines it has to show. At the moment it's opening with ~8 lines of space, and has to be manually dragged back down to a reasonable size.

@@ -18,12 +18,13 @@ Prioritizes slow & steady to be extra safe from YT IP ban
 
 Uses Firefox for YT cookies (apparently getting them from chromium is harder?)
 
-When downloading a large channel for the first time, it hashes the video IDs to a cache. It then only downloads a certain number of videos from that channel per day. It uses the cached video IDs to pick back up where it left off the next day, without having to re-scan the whole channel. 
-This is currently set to a very aggressive 1000 a day, but that's for my use case of downloading 144p stuff lol
+When downloading a large channel for the first time, it hashes the video IDs to a cache. That way, if the download is cancelled or interupted, it doesn't have to re-scan the entire channel. On extremely large channels this can save 10+ minutes on resume.
 
 you can of course still manually download single videos
 
+Auto-Sync with log to show history
 
+editable job-queue
 
 I didn't write any of this code (except for manually changing the label on things or changing padding or whatever)
 All Claude-Code.

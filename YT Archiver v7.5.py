@@ -1315,7 +1315,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.4 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v7.5 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5895,6 +5895,17 @@ def stop_downloads():
             else:
                 p.kill()
     log("\n⛔ Cancelling...\n", "red")
+
+    # Safety net: force-hide cancel/pause buttons after a delay in case
+    # the worker thread's finally block fails to clean up (e.g. exception,
+    # stuck on process I/O, etc.)
+    def _cancel_safety_net():
+        if cancel_btn.winfo_ismapped():
+            cancel_btn.pack_forget()
+        if pause_btn.winfo_ismapped():
+            pause_btn.pack_forget()
+        cancel_btn.config(text="⛔ Cancel")
+    root.after(3000, _cancel_safety_net)
 
 
 def _fmt_time():

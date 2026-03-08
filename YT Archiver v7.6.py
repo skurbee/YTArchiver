@@ -1315,7 +1315,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.5 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v7.6 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1864,20 +1864,20 @@ ttk.Label(mode_add_frame, text="Neither checked = subscribe only (new uploads)",
 
 _date_row = ttk.Frame(mode_add_frame, style="Raised.TFrame")
 ttk.Label(_date_row, text="Start date:", style="Dim.TLabel").pack(side="left", padx=(18, 6))
+ttk.Label(_date_row, text="Year", style="Dim.TLabel").pack(side="left", padx=(0, 3))
 _date_year_entry = _entry(_date_row, textvariable=date_year_var, width=6)
 _date_year_entry.pack(side="left")
 _placeholder(_date_year_entry, "YYYY")
-ttk.Label(_date_row, text="Year", style="Dim.TLabel").pack(side="left", padx=(3, 10))
+ttk.Label(_date_row, text="Month", style="Dim.TLabel").pack(side="left", padx=(10, 3))
 _date_month_entry = _entry(_date_row, textvariable=date_month_var, width=4)
 _date_month_entry.pack(side="left")
 _placeholder(_date_month_entry, "MM")
-ttk.Label(_date_row, text="Month", style="Dim.TLabel").pack(side="left", padx=(3, 10))
+ttk.Label(_date_row, text="Day", style="Dim.TLabel").pack(side="left", padx=(10, 3))
 _date_day_entry = _entry(_date_row, textvariable=date_day_var, width=4)
 _date_day_entry.pack(side="left")
 _placeholder(_date_day_entry, "DD")
-ttk.Label(_date_row, text="Day", style="Dim.TLabel").pack(side="left", padx=(3, 12))
 ttk.Label(_date_row, text="Month/Day optional (defaults to Jan 1)",
-          style="Dim.TLabel").pack(side="left")
+          style="Dim.TLabel").pack(side="left", padx=(12, 0))
 
 
 def _date_auto_advance(entry, next_entry, max_chars):

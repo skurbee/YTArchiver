@@ -31,22 +31,4 @@ All Claude-Code.
 
 
 current (found) issues:
-1. Simple log mode does not notify the user that a channel was skipped due to daily limit
-
-2. last full sync timer sometimes resetting when single channel sync is performed
-
-3. Channels that hit daily limit are not itemized in the log when running a full subbed channel sync, even in verbose log mode. Right now if you have 50 channels subbed and 1 has hit it's daily limit, the "full sync" shows 49 channels. The limited channel should still be itemized, but shown as skipped due to limits in the log.
-
-4. Does not check that channel /dir still exists in any way (in case user deletes outside of program/manually)
-
-5. It's supposed to run the subbed channels alphabetically. Manually clicking the Sync-Subbed button does this, but an auto-sync firing syncs channels in the order that they were added.
-
-6. When a video is filtered for being too long, the log occasionally shows filtered for being too short.
-
-7. if more than 1 channel is queued for initialization, they don't go sequentially. It starts doing both at the same time, alternating videos between them. This is not the intended behavior.
-
-8. hovering over the taskbar icon shows "idle" while a manual single channel initialization is running.
-
-9. clicking download after adding a single video URL on the main page should add that video to the job queue. right now it downloads at the same time as a channel sync, adding slight IP ban risk from having 2 downloads going simultaneously.
-
-10. Pause/Cancel buttons seem to like to disappear if a sync goes on for a long time
+1. 

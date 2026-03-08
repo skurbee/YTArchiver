@@ -893,18 +893,19 @@ def _generate_spin_frames(base_img, num_frames=12):
 
 
 def _make_badge_icon(base_img, count):
-    """Composite a red badge with a number onto the bottom-right of the icon."""
+    """Composite a large red badge with a number onto the icon."""
     img = base_img.copy().convert("RGBA")
     sz = img.size[0]
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    badge_r = max(6, sz // 4)
+    # Large badge covering most of the bottom-right quadrant
+    badge_r = max(8, sz * 3 // 8)
     cx = sz - badge_r - 1
     cy = sz - badge_r - 1
     draw.ellipse([cx - badge_r, cy - badge_r, cx + badge_r, cy + badge_r], fill=(220, 40, 40, 240))
     text = str(count) if count < 100 else "99+"
     try:
-        font = ImageFont.truetype("arial.ttf", max(7, badge_r))
+        font = ImageFont.truetype("arial.ttf", max(8, int(badge_r * 1.1)))
     except Exception:
         font = ImageFont.load_default()
     tb = draw.textbbox((0, 0), text, font=font)
@@ -1318,7 +1319,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.1 - 03.07.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v7.3 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2272,6 +2273,27 @@ def _chan_ctx_reapply_org():
 
 _chan_ctx_menu.add_command(label="Re-apply Organization", command=_chan_ctx_reapply_org)
 
+_chan_ctx_menu.add_separator()
+
+
+def _chan_ctx_remove():
+    ch = _ctx_channel["ch"]
+    if not ch:
+        return
+    if not messagebox.askyesno("Remove Channel",
+                               f"Are you sure you want to remove \"{ch['name']}\" from your subscription list?"):
+        return
+    # Select the channel in the tree so remove_channel() can find it
+    for item in settings_chan_tree.get_children():
+        if settings_chan_tree.item(item)['values'][6] == ch["url"]:
+            settings_chan_tree.selection_set(item)
+            on_chan_list_select(None)
+            break
+    remove_channel()
+
+
+_chan_ctx_menu.add_command(label="Remove this channel", command=_chan_ctx_remove)
+
 
 def _chan_ctx_show(event):
     row = settings_chan_tree.identify_row(event.y)
@@ -2293,7 +2315,8 @@ def _chan_ctx_show(event):
         sm = ch.get("split_months", False)
 
         # Menu indices: 0=Sync, 1=Edit, 2=Open folder, 3=Open URL, 4=separator,
-        #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply
+        #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
+        #               10=separator, 11=Remove
         # Dynamic label: show "Add to job queue" when a sync/reorg is running
         if _sync_running or _reorg_running:
             _chan_ctx_menu.entryconfig(0, label="Add to job queue")
@@ -2434,15 +2457,8 @@ def add_channel():
     refresh_channel_dropdowns()
     save_config(config)
 
-    # If a sync is queued/running and we just added a NEW channel, auto-add it to the sync queue
-    if not editing and (_sync_running or _reorg_running):
-        with _sync_queue_lock:
-            if _sync_queue and not any(q["url"] == url for q in _sync_queue):
-                new_ch_copy = copy.deepcopy(config["channels"][-1]) if config.get("channels") else None
-                if new_ch_copy:
-                    _sync_queue.append(new_ch_copy)
-                    log(f"  Added {name} to active sync queue.\n", "simpleline_green")
-                    _update_queue_btn()
+    # Don't auto-add newly subscribed channels to the sync queue —
+    # initialization should only happen on manual sync or full sync-subbed run.
 
     # Auto-reorganize existing downloads if split settings changed during edit
     if editing and (old_split_years != new_years or old_split_months != new_months):
@@ -2524,6 +2540,10 @@ def sync_single_channel():
                 can_proceed, cooldown_str = _check_batch_cooldown(ch)
                 if not can_proceed:
                     log(f"Skipping {ch['name']} — next batch after {cooldown_str}\n", "dim")
+                    if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                        _stop_simple_anim()
+                        _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
+                        log(f"[{1}/{1}] {_cn:<34} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
                     return
 
             if mode == "sub" and not is_init:
@@ -2762,11 +2782,11 @@ def sync_single_channel():
                                 cfg_ch["sync_complete"] = True
                                 cfg_ch["initialized"] = True
                             cfg_ch["last_sync"] = _ts
-                    config["last_sync"] = _ts
+                    # Don't update global "Last Full Sync" for single channel syncs —
+                    # that should only be set when a full sync-subbed run completes.
                 save_config(config)
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
-                    root.after(0, lambda ts=_ts: _update_last_sync_display(ts))
                 _dl = session_totals["dl"]
                 _plural = "s" if _dl != 1 else ""
                 _notif_msg = f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
@@ -2782,35 +2802,38 @@ def sync_single_channel():
                 log("=" * 45 + "\n", "summary")
                 log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
-            _sync_running = False
             elapsed_single = (datetime.now() - t_start_single).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_single,
                          kind="Manual", channel_name=ch.get("name", ""),
                          skipped=session_totals["dur"])
 
-            # Check for queued syncs or reorg jobs before fully finishing
+            # Check for queued syncs or reorg jobs before fully finishing.
+            # Keep _sync_running=True until we confirm nothing else is queued,
+            # to prevent a race where another sync starts in the gap.
             _queue_started = False
             if not cancel_event.is_set():
                 _queue_started = _process_sync_queue() or _process_reorg_queue()
 
-            if not _queue_started and root.winfo_exists():
-                def _on_single_sync_done():
-                    _validate_download_btn()
-                    sync_btn.config(state="normal")
-                    sync_single_btn.config(state="normal", text="▶ Sync this channel")
-                    _hide_cancel_pause()
-                    _tray_stop_spin()
-                    _dl = session_totals["dl"]
-                    if _dl > 0:
-                        _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
-                    else:
-                        _update_tray_tooltip("YT Archiver — Idle")
+            if not _queue_started:
+                _sync_running = False
+                if root.winfo_exists():
+                    def _on_single_sync_done():
+                        _validate_download_btn()
+                        sync_btn.config(state="normal")
+                        sync_single_btn.config(state="normal", text="▶ Sync this channel")
+                        _hide_cancel_pause()
+                        _tray_stop_spin()
+                        _dl = session_totals["dl"]
+                        if _dl > 0:
+                            _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
+                        else:
+                            _update_tray_tooltip("YT Archiver — Idle")
 
-                    _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
-                    if _iv:
-                        _schedule_autorun(_iv)
+                        _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
+                        if _iv:
+                            _schedule_autorun(_iv)
 
-                root.after(0, _on_single_sync_done)
+                    root.after(0, _on_single_sync_done)
 
             # Process any videos queued during the sync (only if no queued sync took over)
             if not cancel_event.is_set() and not _queue_started:
@@ -4186,8 +4209,8 @@ def internal_run_subscribe_before_date(url, date_str):
         cleanup_process(proc)
 
 
-BATCH_LIMIT = 1000
-BATCH_COOLDOWN_HOURS = 24
+BATCH_LIMIT = 100000
+BATCH_COOLDOWN_HOURS = 72
 
 
 def _check_batch_cooldown(ch):
@@ -5119,9 +5142,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                     elif _has_max and not _has_min:
                         _filter_reason = "Filtered: too long."
                     elif _has_min and _has_max:
-                        # Both filters exist — figure out which one actually failed
-                        # yt-dlp only shows the failing filter expression
-                        _filter_reason = "Filtered: too short." if "duration>?" in _fexpr else "Filtered: too long."
+                        # Both filters present — yt-dlp shows the full compound filter
+                        # so we can't reliably determine which bound was exceeded.
+                        _filter_reason = "Filtered: outside duration range."
 
                 if is_simple_mode:
                     _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
@@ -5417,6 +5440,12 @@ def start_sync_all():
                     can_proceed, cooldown_str = _check_batch_cooldown(ch)
                     if not can_proceed:
                         log(f"  Skipping — next batch after {cooldown_str}\n", "dim")
+                        # Show in simple mode summary so user sees the channel wasn't forgotten
+                        if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                            _stop_simple_anim()
+                            _pad = 34 + len(str(current_total)) - len(str(i))
+                            _cn = ch_name if len(ch_name) <= _pad else ch_name[:_pad - 3] + "..."
+                            log(f"[{i}/{current_total}] {_cn:<{_pad}} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
                         continue
 
                 if mode == "sub" and not is_initialized:
@@ -6486,7 +6515,7 @@ def _run_autorun():
         return
 
     with config_lock:
-        channels = list(config.get("channels", []))
+        channels = sorted(config.get("channels", []), key=lambda c: c.get("name", "").lower())
     if not channels:
         return
 
@@ -6575,6 +6604,12 @@ def _run_autorun():
                     can_proceed, cooldown_str = _check_batch_cooldown(ch)
                     if not can_proceed:
                         log(f"  Skipping — next batch after {cooldown_str}\n", "dim")
+                        if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                            _stop_simple_anim()
+                            _tot = len(channels)
+                            _pad = 34 + len(str(_tot)) - len(str(i))
+                            _cn = ch['name'] if len(ch['name']) <= _pad else ch['name'][:_pad - 3] + "..."
+                            log(f"[{i}/{_tot}] {_cn:<{_pad}} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
                         continue
 
                 if mode == "sub" and not is_init:
@@ -7758,6 +7793,85 @@ def check_dependencies():
 root.after(100, check_dependencies)
 
 
+def _check_channel_folders():
+    """Check that each subscribed channel's directory still exists on disk.
+    If a folder is missing, prompt the user to remove the channel or locate the folder."""
+    with config_lock:
+        base = config.get("output_dir", "").strip() or BASE_DIR
+        channels = list(config.get("channels", []))
+    if not channels:
+        return
+
+    missing = []
+    for ch in channels:
+        folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+        folder_path = os.path.join(base, folder_name)
+        if not os.path.isdir(folder_path):
+            # Only flag channels that have been initialized (new channels won't have folders yet)
+            if ch.get("initialized", False):
+                missing.append((ch["name"], ch["url"], folder_path))
+
+    if not missing:
+        return
+
+    import queue as _q
+    result_q = _q.Queue()
+
+    def _prompt_missing():
+        for ch_name, ch_url, expected_path in missing:
+            answer = messagebox.askyesnocancel(
+                "Missing Channel Folder",
+                f"Cannot locate folder for \"{ch_name}\".\n\n"
+                f"Expected: {expected_path}\n\n"
+                "• Yes — Remove from Sub list\n"
+                "• No — Browse for the folder\n"
+                "• Cancel — Ignore for now",
+                icon="warning"
+            )
+            if answer is True:
+                # Remove from sub list
+                with config_lock:
+                    config["channels"] = [c for c in config.get("channels", []) if c["url"] != ch_url]
+                save_config(config)
+                log(f"  Removed \"{ch_name}\" from sub list (folder missing).\n", "dim")
+            elif answer is False:
+                # Browse for folder
+                new_path = filedialog.askdirectory(
+                    title=f"Locate folder for \"{ch_name}\"",
+                    initialdir=base
+                )
+                if new_path and os.path.isdir(new_path):
+                    # Validate the folder is inside the parent output directory
+                    norm_new = os.path.normpath(new_path)
+                    norm_base = os.path.normpath(base)
+                    if os.path.dirname(norm_new) == norm_base:
+                        new_folder_name = os.path.basename(norm_new)
+                        with config_lock:
+                            for cfg_ch in config.get("channels", []):
+                                if cfg_ch["url"] == ch_url:
+                                    cfg_ch["folder_override"] = new_folder_name
+                                    break
+                        save_config(config)
+                        log(f"  Updated folder for \"{ch_name}\" → {new_folder_name}\n", "green")
+                    else:
+                        messagebox.showwarning(
+                            "Invalid Location",
+                            f"The selected folder must be inside your output directory:\n{base}"
+                        )
+            # else: Cancel — do nothing
+        result_q.put(True)
+        if root.winfo_exists():
+            root.after(0, refresh_channel_dropdowns)
+
+    if root.winfo_exists():
+        root.after(0, _prompt_missing)
+        # Wait for the dialogs to complete before continuing startup
+        try:
+            result_q.get(timeout=300)
+        except _q.Empty:
+            pass
+
+
 def run_startup_updates():
     def _download_yt_dlp_binary(target_path):
         """Download the latest yt-dlp binary from GitHub to target_path."""
@@ -7885,6 +7999,9 @@ def run_startup_updates():
             log(f"ffmpeg: {first_line}\n", "green")
         except FileNotFoundError:
             log("ffmpeg not found — skipping version check.\n", "red")
+
+        # Check that each subscribed channel's folder still exists
+        _check_channel_folders()
 
         log("--- Startup checks complete, ready to download ---\n", "simpleline_green")
 

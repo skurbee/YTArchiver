@@ -1358,7 +1358,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.6 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.7 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3886,7 +3886,7 @@ def _check_whisper_installed():
     try:
         result = subprocess.run(
             [_WHISPER_PYTHON, "-c", "import whisper, torch; print(torch.cuda.is_available())"],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30, startupinfo=startupinfo
         )
         return result.returncode == 0 and "True" in result.stdout
     except Exception:
@@ -3905,7 +3905,7 @@ def _install_whisper_blocking():
             [_WHISPER_PYTHON, "-m", "pip", "install",
              "torch", "torchvision", "torchaudio",
              "--index-url", "https://download.pytorch.org/whl/cu121"],
-            capture_output=True, text=True, timeout=900
+            capture_output=True, text=True, timeout=900, startupinfo=startupinfo
         )
         if torch_result.returncode == 0:
             log("  ✓ CUDA PyTorch installed.\n", "simpleline_green")
@@ -3917,7 +3917,7 @@ def _install_whisper_blocking():
         log("  Installing Whisper AI...\n", "simpleline")
         result = subprocess.run(
             [_WHISPER_PYTHON, "-m", "pip", "install", "openai-whisper"],
-            capture_output=True, text=True, timeout=600
+            capture_output=True, text=True, timeout=600, startupinfo=startupinfo
         )
         if result.returncode == 0:
             log("  ✓ Whisper AI installed successfully.\n", "simpleline_green")
@@ -3941,7 +3941,7 @@ def _start_whisper_process():
         _whisper_proc = subprocess.Popen(
             [_WHISPER_PYTHON, "-c", _WHISPER_SCRIPT],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1
+            text=True, bufsize=1, startupinfo=startupinfo
         )
         # Wait for "ready" message (model loading)
         ready_line = _whisper_proc.stdout.readline().strip()
@@ -4007,6 +4007,19 @@ def _load_punctuation_model():
     if _punct_pipe is not None:
         return True
     try:
+        # When packaged as exe, sys.stdout/stderr can be None — transformers
+        # and huggingface_hub check .isatty() on them for progress bars.
+        import sys as _sys, io as _io
+        if _sys.stdout is None:
+            _sys.stdout = _io.StringIO()
+        if _sys.stderr is None:
+            _sys.stderr = _io.StringIO()
+
+        # Suppress noisy transformers/HF warnings during model load
+        import os as _os
+        _os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
         from transformers import pipeline as tf_pipeline
         import torch as _torch
         log("  Loading punctuation model...\n", "simpleline")
@@ -4100,7 +4113,7 @@ def _fetch_auto_captions(video_id, temp_dir):
     ]
 
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
     except Exception as e:
         log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
         return None
@@ -4272,7 +4285,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     "--no-warnings",
                     ch_url
                 ]
-                enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=300)
+                enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=300, startupinfo=startupinfo)
                 for line in enum_proc.stdout.strip().split("\n"):
                     if "|||" in line:
                         vid_id, yt_title = line.strip().split("|||", 1)
@@ -4349,7 +4362,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 try:
                     probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
                                  "format=duration", "-of", "csv=p=0", fpath]
-                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
                     secs = float(probe_result.stdout.strip())
                     hrs, remainder = divmod(int(secs), 3600)
                     mins, sec = divmod(remainder, 60)
@@ -4388,7 +4401,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     try:
                         _cuda_check = subprocess.run(
                             [_WHISPER_PYTHON, "-c", "import torch; print(torch.cuda.is_available())"],
-                            capture_output=True, text=True, timeout=30
+                            capture_output=True, text=True, timeout=30, startupinfo=startupinfo
                         ) if os.path.exists(_WHISPER_PYTHON) else None
                         _has_cuda = _cuda_check is not None and "True" in _cuda_check.stdout
                     except Exception:
@@ -4454,7 +4467,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         try:
                             probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
                                          "format=duration", "-of", "csv=p=0", fpath]
-                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
                             secs = float(probe_result.stdout.strip())
                             hrs, remainder = divmod(int(secs), 3600)
                             mins, sec = divmod(remainder, 60)

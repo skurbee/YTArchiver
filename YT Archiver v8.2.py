@@ -11,6 +11,7 @@ import shutil
 import sys
 import ctypes
 import signal
+import collections
 from datetime import datetime
 import unicodedata
 import difflib
@@ -100,7 +101,7 @@ _tray_spin_job = None  # threading.Timer for spin animation
 _tray_spin_idx = 0
 _reorg_queue = []  # list of (channel_name, folder_path, target_years, target_months, ch_url, recheck_dates) tuples
 _reorg_queue_lock = threading.Lock()
-_current_job = {"label": None}  # currently processing job label for queue display
+_current_job = {"label": None, "url": None}  # currently processing job label + channel URL for queue display
 _last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts from last internal_run_cmd_blocking
 _queue_items_removed = False  # tracks if user removed items from sync queue during a manual sync
 
@@ -145,6 +146,51 @@ class _ToolTip:
         lbl.pack()
 
 
+# Thread-safe log queue: worker threads append callbacks here instead of
+# calling root.after() directly (which hits the Tcl interpreter lock and
+# can deadlock with the main thread's event processing on Windows).
+_ui_queue = collections.deque()
+
+# Thread-safe cache of log_mode_var.get() == "Simple".
+# Worker threads read this instead of calling log_mode_var.get(), which
+# would acquire the Tcl interpreter lock on every call (hundreds/sec
+# during downloads).  Updated on the main thread via trace callback.
+_is_simple_mode = False
+
+
+def _flush_ui_queue():
+    """Process pending UI callbacks on the main thread with a time budget."""
+    try:
+        deadline = time.monotonic() + 0.012  # 12ms budget per tick
+        while time.monotonic() < deadline:
+            try:
+                fn = _ui_queue.popleft()
+                fn()
+            except IndexError:
+                break
+    except Exception:
+        pass
+    try:
+        if root.winfo_exists():
+            root.after(50, _flush_ui_queue)
+    except Exception:
+        pass
+
+
+def _sync_mini_logs_timer():
+    """Sync mini logs on a slow timer instead of per-log-line."""
+    try:
+        if '_sync_mini_logs_from_main' in globals():
+            _sync_mini_logs_from_main()
+    except Exception:
+        pass
+    try:
+        if root.winfo_exists():
+            root.after(250, _sync_mini_logs_timer)
+    except Exception:
+        pass
+
+
 def log(text, tag=None):
     def _write():
         try:
@@ -172,7 +218,7 @@ def log(text, tag=None):
                     elif "SUMMARY:" in text or "TOTAL SESSION" in text:
                         use_tag = "summary"
 
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     if use_tag == "header" and "---" in text:
                         log_box.config(state="disabled")
                         return
@@ -197,7 +243,7 @@ def log(text, tag=None):
                     if dl_ranges:
                         log_box.delete(dl_ranges[0], dl_ranges[1])
 
-                if ('log_mode_var' in globals() and log_mode_var.get() == "Simple"
+                if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
@@ -207,7 +253,7 @@ def log(text, tag=None):
                 else:
                     log_box.insert(tk.END, text, use_tag)
 
-                if _autorun_active and ('log_mode_var' not in globals() or log_mode_var.get() != "Simple"):
+                if _autorun_active and (not _is_simple_mode):
                     try:
                         line_count = int(log_box.index("end-1c").split(".")[0])
                         if line_count > 20:
@@ -223,9 +269,6 @@ def log(text, tag=None):
                 if '_show_clear_log_if_needed' in globals():
                     _show_clear_log_if_needed()
 
-                # Mirror last few lines of main log to mini logs on Subs/Recent tabs
-                if '_sync_mini_logs_from_main' in globals():
-                    _sync_mini_logs_from_main()
             elif sys.stdout:
                 sys.stdout.write(text)
                 sys.stdout.flush()
@@ -234,7 +277,7 @@ def log(text, tag=None):
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
         elif sys.stdout:
             sys.stdout.write(text)
             sys.stdout.flush()
@@ -246,7 +289,7 @@ def log_progress_bar(current, total):
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     return
                 try:
                     at_bottom = log_box.yview()[1] >= 0.99
@@ -269,15 +312,12 @@ def log_progress_bar(current, total):
                 if at_bottom:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
-
-                if '_sync_mini_logs_from_main' in globals():
-                    _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -295,7 +335,7 @@ def log_dl_progress(msg):
                 ranges = log_box.tag_ranges("dlprogress")
                 if ranges:
                     log_box.delete(ranges[0], ranges[1])
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], msg, "dlprogress")
@@ -307,15 +347,12 @@ def log_dl_progress(msg):
                 if at_bottom:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
-
-                if '_sync_mini_logs_from_main' in globals():
-                    _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -330,15 +367,12 @@ def clear_transient_lines():
                     if ranges:
                         log_box.delete(ranges[0], ranges[1])
                 log_box.config(state="disabled")
-
-                if '_sync_mini_logs_from_main' in globals():
-                    _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -361,16 +395,12 @@ def log_simple_status(text):
                 if at_bottom:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
-
-            # Mirror last few lines of main log to mini logs
-            if '_sync_mini_logs_from_main' in globals():
-                _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -384,16 +414,12 @@ def clear_simple_status():
                 if ranges:
                     log_box.delete(ranges[0], ranges[1])
                 log_box.config(state="disabled")
-
-            # Mirror last few lines of main log to mini logs
-            if '_sync_mini_logs_from_main' in globals():
-                _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -408,15 +434,12 @@ def _clear_simpledownload_lines():
                 for i in range(len(ranges) - 1, -1, -2):
                     log_box.delete(ranges[i - 1], ranges[i])
                 log_box.config(state="disabled")
-
-                if '_sync_mini_logs_from_main' in globals():
-                    _sync_mini_logs_from_main()
         except Exception:
             pass
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -432,8 +455,7 @@ def _simple_anim_tick():
             return
 
         if pause_event.is_set():
-            _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
-            return
+            return  # just return; finally block handles rescheduling
         d = _DOTS[_simple_anim_state["dots"] % 3]
         _simple_anim_state["dots"] += 1
         i = _simple_anim_state["idx"]
@@ -615,6 +637,9 @@ if os.name == 'nt':
 
 
 def _suspend_proc(proc):
+    """Suspend a process at the OS level. Currently unused — pause relies on
+    pipe backpressure instead (worker stops reading stdout, pipe buffer fills,
+    yt-dlp naturally blocks on its next write). Kept for potential future use."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -626,11 +651,12 @@ def _suspend_proc(proc):
                 ctypes.windll.kernel32.CloseHandle(handle)
         else:
             os.kill(proc.pid, signal.SIGSTOP)
-    except Exception as e:
-        log(f"  Warning: could not suspend process {proc.pid}: {e}\n", "dim")
+    except Exception:
+        pass
 
 
 def _resume_proc(proc):
+    """Resume a previously suspended process. Currently unused — see _suspend_proc."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -640,12 +666,10 @@ def _resume_proc(proc):
             if handle:
                 ctypes.windll.ntdll.NtResumeProcess(handle)
                 ctypes.windll.kernel32.CloseHandle(handle)
-            else:
-                log(f"  Warning: could not open process {proc.pid} for resume\n", "dim")
         else:
             os.kill(proc.pid, signal.SIGCONT)
-    except Exception as e:
-        log(f"  Warning: could not resume process {proc.pid}: {e}\n", "dim")
+    except Exception:
+        pass
 
 
 def show_notification(title, message):
@@ -851,6 +875,11 @@ except Exception:
 
 root = tk.Tk()
 root.title("YT Archiver")
+
+# Start the UI queue flush timer — processes log callbacks from worker threads
+root.after(50, _flush_ui_queue)
+# Start the mini-log sync timer — mirrors main log to Subs/Recent tab mini-logs
+root.after(250, _sync_mini_logs_timer)
 
 # Set window/taskbar icon
 icon_path = os.path.join(RESOURCE_PATH, "icon.ico")
@@ -1322,7 +1351,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.7 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.2 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1667,6 +1696,7 @@ def _set_initial_sash():
 root.after(150, _set_initial_sash)
 
 log_mode_var = tk.StringVar(value=config.get("log_mode", "Simple"))
+_is_simple_mode = log_mode_var.get() == "Simple"
 
 tab_settings = ttk.Frame(notebook)
 notebook.add(tab_settings, text="  Subs  ")
@@ -2337,9 +2367,23 @@ def _chan_ctx_show(event):
         #               10=separator, 11=Remove
         # Dynamic label: show "Add to job queue" when a sync/reorg is running
         if _sync_running or _reorg_running:
-            _chan_ctx_menu.entryconfig(0, label="Add to job queue")
+            # Check if this channel is already queued or actively syncing
+            _ch_url = ch.get("url", "")
+            with _sync_queue_lock:
+                _already_queued = any(q["url"] == _ch_url for q in _sync_queue)
+            _already_syncing = _current_job.get("url") == _ch_url
+            if _already_queued or _already_syncing:
+                _chan_ctx_menu.entryconfig(0, label="Already in job queue",
+                                          state="normal", foreground=C_DIM,
+                                          command=lambda: None)
+            else:
+                _chan_ctx_menu.entryconfig(0, label="Add to job queue",
+                                          state="normal", foreground=C_TEXT,
+                                          command=_chan_ctx_sync_now)
         else:
-            _chan_ctx_menu.entryconfig(0, label="Sync now")
+            _chan_ctx_menu.entryconfig(0, label="Sync now",
+                                      state="normal", foreground=C_TEXT,
+                                      command=_chan_ctx_sync_now)
 
         # Dim the option matching the channel's current organization mode;
         # all others stay enabled (they will queue if a sync/reorg is running)
@@ -2513,6 +2557,7 @@ def sync_single_channel():
 
     _sync_running = True
     _current_job["label"] = f"Sync {ch['name']}"
+    _current_job["url"] = ch["url"]
     _tray_start_spin()
     _update_tray_tooltip(f"YT Archiver — Syncing {ch['name']}")
 
@@ -2558,7 +2603,7 @@ def sync_single_channel():
                 can_proceed, cooldown_str = _check_batch_cooldown(ch)
                 if not can_proceed:
                     log(f"Skipping {ch['name']} — next batch after {cooldown_str}\n", "dim")
-                    if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                    if _is_simple_mode:
                         _stop_simple_anim()
                         _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
                         log(f"[{1}/{1}] {_cn:<34} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
@@ -2612,7 +2657,7 @@ def sync_single_channel():
                 # Always update anim state so switching to Simple mid-sync shows correct channel
                 _simple_anim_state.update({"channel": ch['name'], "idx": 1, "total": 1,
                                            "dl_current": 0, "ch_total": 0})
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     _start_simple_anim(ch['name'], 1, 1)
 
                 # Skip prefetch for uninitialized full-mode channels — it always returns 0
@@ -2725,7 +2770,7 @@ def sync_single_channel():
 
             if not cancel_event.is_set() and not _all_cached_done:
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids)
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     _stop_simple_anim()
                     if not cancel_event.is_set():
                         _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
@@ -2857,7 +2902,8 @@ def sync_single_channel():
             if not cancel_event.is_set() and not _queue_started:
                 _process_video_dl_queue()
 
-    notebook.select(tab_download)
+    # Don't switch to Download tab — mini-logs on every tab show progress,
+    # and the user may want to stay on the Subs tab to queue more channels.
     t_start_single = datetime.now()
     threading.Thread(target=_single_worker, daemon=True).start()
 
@@ -3215,7 +3261,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
     log(f"  Found {total:,} video file(s) to process...\n", "dim")
 
     # Phase 2: Determine target path for each file and move if needed
-    is_simple = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
+    is_simple = _is_simple_mode
     _reorg_dots = [0]
     _reorg_anim_job = [None]
     _reorg_anim_active = [False]
@@ -3402,7 +3448,7 @@ def _fix_file_dates(channel_url, folder_path):
             if not _fetch_anim["active"] or not root.winfo_exists():
                 return
             try:
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple" and _fetch_anim["count"] > 0:
+                if _is_simple_mode and _fetch_anim["count"] > 0:
                     _fetch_anim["dot_i"] = (_fetch_anim["dot_i"] + 1) % 3
                     log_simple_status(f"  Fetched dates for {_fetch_anim['count']:,} videos so far{_dot_cycle[_fetch_anim['dot_i']]}\n")
                 _fetch_anim["job"] = root.after(500, _animate_fetch_dots)
@@ -3415,13 +3461,6 @@ def _fix_file_dates(channel_url, folder_path):
         for line in proc.stdout:
             if cancel_event.is_set():
                 break
-            if pause_event.is_set():
-                log(f"  ⏸ Paused at {_fmt_time()} — click Resume to continue.\n", "pauselog")
-                while pause_event.is_set() and not cancel_event.is_set():
-                    time.sleep(0.2)
-                if cancel_event.is_set():
-                    break
-                log(f"  ▶ Resumed at {_fmt_time()}\n", "pauselog")
             parts = line.strip().split("|||", 1)
             if len(parts) == 2:
                 upload_date = parts[0].strip()
@@ -3455,7 +3494,7 @@ def _fix_file_dates(channel_url, folder_path):
                         date_words.append((upload_date, _words, norm_ascii or norm))
                     count += 1
                     _fetch_anim["count"] = count
-                    is_simple = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
+                    is_simple = _is_simple_mode
                     if not is_simple:
                         # Verbose mode: log each video individually (use explicit "dim" tag
                         # to prevent auto-tag detection from coloring titles containing
@@ -3579,7 +3618,7 @@ def _fix_file_dates(channel_url, folder_path):
                     unmatched_files.append(fname)
 
         # Log unmatched files for debugging
-        if unmatched_files and not ('log_mode_var' in globals() and log_mode_var.get() == "Simple"):
+        if unmatched_files and not (_is_simple_mode):
             log(f"  Unmatched files ({len(unmatched_files)}):\n", "dim")
             for uf in unmatched_files[:20]:
                 log(f"    - {uf}\n", "dim")
@@ -4132,7 +4171,7 @@ def _log_scan_status(checked, matched, date_disp, title):
 
     try:
         if 'root' in globals() and root.winfo_exists():
-            root.after(0, _write)
+            _ui_queue.append(_write)
     except Exception:
         pass
 
@@ -4185,7 +4224,7 @@ def internal_run_subscribe_before_date(url, date_str):
 
                 try:
                     if 'root' in globals() and root.winfo_exists():
-                        root.after(0, _write)
+                        _ui_queue.append(_write)
                 except Exception:
                     pass
                 time.sleep(1)
@@ -4480,7 +4519,7 @@ def _enumerate_all_video_ids(url):
         if not proc:
             return []
 
-        is_simple = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
+        is_simple = _is_simple_mode
         _enum_count = 0
         _got_any_output = False
         _start_time = time.time()
@@ -4824,34 +4863,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
     _prog_last_ts = 0.0
     _prog_last_pct = -1.0
     _speed_samples = []
-    _last_output_time = [time.monotonic()]
-    _was_paused = [False]
-
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
 
-        # Watchdog: kill stuck yt-dlp process if no stdout for 30s after resume
-        def _stdout_watchdog():
-            while proc.poll() is None and not cancel_event.is_set():
-                time.sleep(5)
-                if _was_paused[0] and not pause_event.is_set():
-                    # We just resumed — check for stuck process
-                    elapsed = time.monotonic() - _last_output_time[0]
-                    if elapsed > 30:
-                        log("  ⚠ Process unresponsive after resume — restarting...\n", "dim")
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                        break
-
-        _wd_thread = threading.Thread(target=_stdout_watchdog, daemon=True)
-        _wd_thread.start()
-
         for line in proc.stdout:
-            _last_output_time[0] = time.monotonic()
-            is_simple_mode = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
+            is_simple_mode = _is_simple_mode
 
             # Strip Unicode replacement characters from yt-dlp output
             line = line.replace('\ufffd', '')
@@ -4859,16 +4876,17 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
             if cancel_event.is_set():
                 break
 
-            if pause_event.is_set():
-                _was_paused[0] = True
-                log(f"  ⏸ Paused at {_fmt_time()} — click Resume to continue.\n", "pauselog")
+            # Pause: stop reading stdout → OS pipe buffer fills → yt-dlp
+            # blocks on write → download freezes naturally.  The UI queue's
+            # time budget handles any burst of buffered lines on resume.
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
                 if not cancel_event.is_set():
-                    _last_output_time[0] = time.monotonic()
                     log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
-                else:
-                    break
+            if cancel_event.is_set():
+                break
 
             line_lower = line.lower()
             if "error:" in line_lower and "cookie" in line_lower and (
@@ -5179,8 +5197,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                                 if not _merge_anim["active"] or not root.winfo_exists():
                                     return
                                 if pause_event.is_set():
-                                    _merge_anim["job"] = root.after(500, _merge_anim_tick)
-                                    return
+                                    return  # just return; finally block handles rescheduling
                                 _merge_anim["dots"] = (_merge_anim["dots"] + 1) % 3
                                 d = _DOTS[_merge_anim["dots"]]
                                 elapsed = time.monotonic() - _merge_start_ts
@@ -5310,7 +5327,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
 
         if not cancel_event.is_set():
             clear_transient_lines()
-            _simple = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
+            _simple = _is_simple_mode
             if not _simple:
                 if dl_count == 0:
                     if err_count == 0:
@@ -5483,6 +5500,7 @@ def start_sync_all():
                 ch_name = ch["name"]
                 ch_dl_map[ch_name] = 0
                 _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Checking {ch_name} for new videos"
+                _current_job["url"] = ch.get("url")
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
                 _update_tray_tooltip(f"YT Archiver — [{i}/{current_total}] {ch_name}")
@@ -5519,7 +5537,7 @@ def start_sync_all():
                     if not can_proceed:
                         log(f"  Skipping — next batch after {cooldown_str}\n", "dim")
                         # Show in simple mode summary so user sees the channel wasn't forgotten
-                        if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                        if _is_simple_mode:
                             _stop_simple_anim()
                             _pad = 34 + len(str(current_total)) - len(str(i))
                             _cn = ch_name if len(ch_name) <= _pad else ch_name[:_pad - 3] + "..."
@@ -5587,7 +5605,7 @@ def start_sync_all():
                     # Always update anim state so switching to Simple mid-sync shows correct channel
                     _simple_anim_state.update({"channel": ch_name, "idx": i, "total": current_total,
                                                "dl_current": 0, "ch_total": 0})
-                    if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                    if _is_simple_mode:
                         _start_simple_anim(ch_name, i, current_total)
 
                     # Skip prefetch for uninitialized full-mode channels
@@ -5707,7 +5725,7 @@ def start_sync_all():
                     _stop_simple_anim()
                     break
 
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     _stop_simple_anim()
                     _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
                     _tag = "simpleline_green" if c_dl else "simpleline"
@@ -5818,6 +5836,7 @@ def start_sync_all():
         finally:
             _sync_running = False
             _current_job["label"] = None
+            _current_job["url"] = None
             _update_queue_btn()
             elapsed_manual = (datetime.now() - t_start_manual).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_manual, kind="Manual",
@@ -5911,6 +5930,7 @@ def stop_downloads():
     _sync_running = False
     _reorg_running = False
     _current_job["label"] = None
+    _current_job["url"] = None
     _tray_stop_spin()
     _update_tray_tooltip("YT Archiver — Idle")
 
@@ -5925,21 +5945,16 @@ def stop_downloads():
     sync_btn.config(state="normal", text="🔄 Sync Subbed")
     sync_single_btn.config(state="normal", text="▶ Sync this channel")
 
-    # Kill processes in background thread so UI never blocks on proc_lock
-    def _do_kill():
-        with proc_lock:
-            procs = list(active_processes)
-        for p in procs:
-            if p.poll() is None:
-                _resume_proc(p)  # Resume first in case process was suspended
-                if os.name == "nt":
-                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     startupinfo=startupinfo)
-                else:
-                    p.kill()
-
-    threading.Thread(target=_do_kill, daemon=True).start()
+    with proc_lock:
+        procs = list(active_processes)
+    for p in procs:
+        if p.poll() is None:
+            if os.name == "nt":
+                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 startupinfo=startupinfo)
+            else:
+                p.kill()
     log("\n⛔ Cancelling...\n", "red")
 
     # Safety net: force-hide cancel/pause buttons after a delay in case
@@ -5962,27 +5977,15 @@ def toggle_pause():
     if pause_event.is_set():
         pause_event.clear()
         pause_btn.config(text="⏸ Pause")
-
-        # Resume processes in a background thread so the UI never blocks
-        def _do_resume():
-            with proc_lock:
-                procs = list(active_processes)
-            for p in procs:
-                _resume_proc(p)
-
-        threading.Thread(target=_do_resume, daemon=True).start()
+        # No OS-level process resume needed — the worker thread will
+        # exit its pause loop and resume reading stdout, which unblocks
+        # yt-dlp automatically via pipe backpressure.
     else:
         pause_event.set()
         pause_btn.config(text="▶ Resume")
-
-        # Suspend processes in a background thread so the UI never blocks
-        def _do_suspend():
-            with proc_lock:
-                procs = list(active_processes)
-            for p in procs:
-                _suspend_proc(p)
-
-        threading.Thread(target=_do_suspend, daemon=True).start()
+        # No OS-level process suspend needed — the worker thread will
+        # stop reading stdout at the next pause check, the pipe buffer
+        # fills up, and yt-dlp naturally blocks on its next write.
 
 
 cancel_pause_frame = ttk.Frame(btn_frame)
@@ -6011,6 +6014,7 @@ def _hide_cancel_pause():
         pause_event.clear()
         cancel_btn.config(text="⛔ Cancel")  # Reset for next use
         _current_job["label"] = None
+        _current_job["url"] = None
 
 
 # --- Job Queue Button ---
@@ -6488,6 +6492,8 @@ ttk.Radiobutton(_log_mode_frame, text="Simple", variable=log_mode_var, value="Si
 
 
 def _save_log_mode(*_):
+    global _is_simple_mode
+    _is_simple_mode = log_mode_var.get() == "Simple"
     with config_lock:
         config["log_mode"] = log_mode_var.get()
     save_config(config)
@@ -6669,6 +6675,7 @@ def _run_autorun():
 
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
+                _current_job["url"] = ch.get("url")
 
                 log(f"\n--- [{i}/{len(channels)}] SYNCING: {ch_name} ---\n", "header")
                 _update_tray_tooltip(f"YT Archiver — [{i}/{len(channels)}] {ch_name}")
@@ -6704,7 +6711,7 @@ def _run_autorun():
                     can_proceed, cooldown_str = _check_batch_cooldown(ch)
                     if not can_proceed:
                         log(f"  Skipping — next batch after {cooldown_str}\n", "dim")
-                        if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                        if _is_simple_mode:
                             _stop_simple_anim()
                             _tot = len(channels)
                             _pad = 34 + len(str(_tot)) - len(str(i))
@@ -6751,7 +6758,7 @@ def _run_autorun():
                     # Always update anim state so switching to Simple mid-sync shows correct channel
                     _simple_anim_state.update({"channel": ch['name'], "idx": i, "total": len(channels),
                                                "dl_current": 0, "ch_total": 0})
-                    if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                    if _is_simple_mode:
                         _start_simple_anim(ch['name'], i, len(channels))
 
                     # Skip prefetch for uninitialized full-mode channels
@@ -6866,7 +6873,7 @@ def _run_autorun():
                     _stop_simple_anim()
                     break
 
-                if 'log_mode_var' in globals() and log_mode_var.get() == "Simple":
+                if _is_simple_mode:
                     _stop_simple_anim()
                     _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
                     _tag = "simpleline_green" if c_dl else "simpleline"
@@ -8206,27 +8213,20 @@ def on_closing():
         except Exception:
             pass
 
-    # Clear pause so suspended processes can be killed cleanly
+    # Clear pause so worker threads can exit cleanly
     pause_event.clear()
     cancel_event.set()
 
-    # Kill processes in a thread with timeout so we never hang on exit
-    def _shutdown_kill():
-        with proc_lock:
-            procs = list(active_processes)
-        for p in procs:
-            if p.poll() is None:
-                _resume_proc(p)  # Resume first — suspended processes can block taskkill
-                if os.name == 'nt':
-                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     startupinfo=startupinfo)
-                else:
-                    p.kill()
-
-    _kill_thread = threading.Thread(target=_shutdown_kill, daemon=True)
-    _kill_thread.start()
-    _kill_thread.join(timeout=3)  # Wait max 3 seconds, then proceed
+    with proc_lock:
+        procs = list(active_processes)
+    for p in procs:
+        if p.poll() is None:
+            if os.name == 'nt':
+                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 startupinfo=startupinfo)
+            else:
+                p.kill()
 
     # Give worker threads a moment to notice cancel_event and save state
     # (they're daemon threads — root.destroy() will kill them)

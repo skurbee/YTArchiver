@@ -33,6 +33,6 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. 
+1. pause/cancel buttons occasionally dissapearing.
 
-2.
+2. Sometimes when manually syncing a channel and auto-sync fires, it starts doing both at the same time. not the intended behavior

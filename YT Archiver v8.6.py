@@ -1358,7 +1358,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.5 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.6 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4365,7 +4365,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 date_fmt = _format_upload_date(upload_date)
                 dur_fmt = _format_duration(dur_str)
-                entry = f"===({fname}), {date_fmt}, {dur_fmt}===\n{text}\n\n\n"
+                src_tag = "(YT+PUNCTUATION)" if _punct_loaded else "(YT CAPTIONS)"
+                entry = f"===({fname}), {date_fmt}, {dur_fmt}, {src_tag}===\n{text}\n\n\n"
 
                 try:
                     with open(txt_path, "a", encoding="utf-8") as f:
@@ -4468,7 +4469,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         date_fmt = _format_upload_date(upload_date)
                         dur_fmt = _format_duration(dur_str)
-                        entry = f"===({fname}), {date_fmt}, {dur_fmt}===\n{text}\n\n\n"
+                        entry = f"===({fname}), {date_fmt}, {dur_fmt}, (WHISPER TRANSCRIBED)===\n{text}\n\n\n"
 
                         try:
                             with open(txt_path, "a", encoding="utf-8") as f:
@@ -7879,6 +7880,17 @@ tab_recent.rowconfigure(1, weight=1)
 def on_tab_changed(event):
     global new_download_count
     selected = notebook.select()
+
+    # When leaving the Recent tab, clear any selection so the user doesn't
+    # have to manually deselect before scrolling when they come back.
+    if selected != str(tab_recent):
+        try:
+            if recent_tree.selection():
+                recent_tree.selection_remove(*recent_tree.selection())
+                delete_files_btn.config(state="disabled")
+        except Exception:
+            pass
+
     if selected == str(tab_download):
         # Re-show cancel/pause buttons if a sync, reorg, or transcription is still active
         # (they can lose pack state when switching tabs during long operations)

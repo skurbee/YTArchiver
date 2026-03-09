@@ -6,15 +6,15 @@ What started out as a simple script has turned into a somewhat complex YT-DLP GU
 
 Sub to a channel-
 
-Choose res to download-
+Choose resolution to download that channel at-
 
 Limit shortest/longest video to cut out shorts/live-
 
 Chose starting date to download-(if you don't want the first few years of a channel for example)
 
-Can organize (and re-organize!) downloaded channels
+Can organize (and re-organize!) downloaded channels into Years/Months
 
-Prioritizes slow & steady to be extra safe from YT IP ban
+Prioritizes slow & steady to be safe from YT IP ban
 
 Uses Firefox for YT cookies (apparently getting them from chromium is harder?)
 

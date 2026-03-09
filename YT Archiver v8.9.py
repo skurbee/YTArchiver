@@ -1358,7 +1358,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.8 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.9 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3861,11 +3861,20 @@ _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
 _WHISPER_SCRIPT = r'''
-import sys, json, whisper, torch, io, re
+import sys, json, io, re
+
+# Save real stdout for our JSON protocol. Whisper's verbose=True uses print()
+# which goes to sys.stdout, so we must redirect it to a dummy to avoid mixing
+# Whisper's text output with our JSON messages on the pipe.
+_out = sys.stdout
+sys.stdout = io.StringIO()
+
+import whisper, torch
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=device)
-print(json.dumps({"status": "ready", "device": device}), flush=True)
+_out.write(json.dumps({"status": "ready", "device": device}) + "\n")
+_out.flush()
 
 for line in sys.stdin:
     line = line.strip()
@@ -3881,12 +3890,12 @@ for line in sys.stdin:
     if not path:
         continue
     try:
-        # Capture verbose output on stderr to extract progress from segment timestamps
-        old_stderr = sys.stderr
-
         class _ProgressCapture:
-            def __init__(self, dur):
+            """Replaces sys.stdout to intercept Whisper's verbose print() calls,
+            parse segment timestamps, and send progress % via the real pipe."""
+            def __init__(self, dur, out):
                 self.dur = dur
+                self.out = out
                 self.last_pct = -1
             def write(self, text):
                 if self.dur <= 0:
@@ -3897,22 +3906,30 @@ for line in sys.stdin:
                     pct = min(99, int(current / self.dur * 100))
                     if pct > self.last_pct:
                         self.last_pct = pct
-                        print(json.dumps({"status": "progress", "pct": pct}), flush=True)
+                        self.out.write(json.dumps({"status": "progress", "pct": pct}) + "\n")
+                        self.out.flush()
             def flush(self):
                 pass
             def isatty(self):
                 return False
 
-        sys.stderr = _ProgressCapture(duration)
+        # Whisper verbose=True uses print() → sys.stdout for segment text.
+        # Redirect stdout to our progress parser, stderr to a dummy.
+        old_stderr = sys.stderr
+        sys.stdout = _ProgressCapture(duration, _out)
+        sys.stderr = io.StringIO()  # swallow any tqdm/warnings on stderr
         result = model.transcribe(path, language="en", verbose=True)
         sys.stderr = old_stderr
+        sys.stdout = io.StringIO()  # reset to dummy
 
         segments = result.get("segments", [])
         text = " ".join(seg["text"].strip() for seg in segments if seg.get("text", "").strip())
-        print(json.dumps({"status": "ok", "text": text}), flush=True)
+        _out.write(json.dumps({"status": "ok", "text": text}) + "\n")
+        _out.flush()
     except Exception as e:
         sys.stderr = old_stderr if 'old_stderr' in dir() else sys.__stderr__
-        print(json.dumps({"status": "error", "text": str(e)}), flush=True)
+        _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
+        _out.flush()
 '''
 
 

@@ -1,6 +1,5 @@
 # YTArchiverTool
-Claude-Code + 30hrs of time + $150 in extra usage = 4kVideoDownloader+ replacement.
-
+A personal project to replace 4KVideoDownloader+, with some features that I needed, built entirely with Claude-Code.
 
 What started out as a simple script has turned into a somewhat complex YT-DLP GUI with some features I wanted added on top. I now use it in replacement of 4kVideoDownloader+ to download/archive YT channels.
 
@@ -25,6 +24,8 @@ you can of course still manually download single videos
 Auto-Sync with log to show history
 
 editable job-queue
+
+Transcribe channels and output it to .txt files. prob not useful to most people
 
 I didn't write any of this code (except for manually changing the label on things or changing padding or whatever)
 All Claude-Code.

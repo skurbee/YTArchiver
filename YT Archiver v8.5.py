@@ -104,6 +104,13 @@ _reorg_queue_lock = threading.Lock()
 _current_job = {"label": None, "url": None}  # currently processing job label + channel URL for queue display
 _last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts from last internal_run_cmd_blocking
 _queue_items_removed = False  # tracks if user removed items from sync queue during a manual sync
+_transcribe_running = False
+_transcribe_queue = []  # list of (ch_name, ch_url, folder, split_years, split_months, combined) tuples
+_transcribe_queue_lock = threading.Lock()
+_whisper_model = None  # unused legacy, kept for compat
+_whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
+_punct_pipe = None  # transformers NER pipeline for punctuation restoration
+_job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 
 
 class _ToolTip:
@@ -1351,7 +1358,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.2 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.5 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2173,7 +2180,7 @@ def _chan_ctx_sync_now():
     ch = _ctx_channel["ch"]
     if not ch:
         return
-    if _sync_running or _reorg_running:
+    if _sync_running or _reorg_running or _transcribe_running:
         # Queue the channel for sync after the current operation finishes
         with _sync_queue_lock:
             # Don't queue duplicates
@@ -2324,6 +2331,78 @@ _chan_ctx_menu.add_command(label="Re-apply Organization", command=_chan_ctx_reap
 _chan_ctx_menu.add_separator()
 
 
+def _chan_ctx_transcribe():
+    """Right-click → Transcribe channel. Shows dialog for org mode, then starts transcription."""
+    ch = _ctx_channel["ch"]
+    if not ch:
+        return
+    folder = _chan_ctx_get_folder()
+    if not folder:
+        return
+    ch_name = ch["name"]
+    ch_url = ch["url"]
+    sy = ch.get("split_years", False)
+    sm = ch.get("split_months", False)
+
+    if not sy:
+        # Unorganized — no dialog needed, just one big file
+        _start_transcription(ch_name, ch_url, folder, False, False, combined=True)
+        return
+
+    # Show dialog: Combined vs Follow organization
+    dlg = tk.Toplevel(root)
+    dlg.title("Transcribe Channel")
+    dlg.configure(bg=C_BG)
+    dlg.resizable(False, False)
+    dlg.transient(root)
+    dlg.grab_set()
+
+    # Center on parent
+    dlg.update_idletasks()
+    pw, ph = root.winfo_width(), root.winfo_height()
+    px, py = root.winfo_x(), root.winfo_y()
+    dw, dh = 380, 200
+    dlg.geometry(f"{dw}x{dh}+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+
+    tk.Label(dlg, text=f"Transcribe: {ch_name}", bg=C_BG, fg=C_TEXT,
+             font=("Segoe UI Semibold", 11)).pack(pady=(16, 4))
+    tk.Label(dlg, text="Where should transcript files be placed?", bg=C_BG, fg=C_DIM,
+             font=("Segoe UI", 9)).pack(pady=(0, 12))
+
+    choice_var = tk.StringVar(value="follow")
+    org_desc = "Year" if sy and not sm else "Year/Month"
+
+    rb_frame = tk.Frame(dlg, bg=C_BG)
+    rb_frame.pack(padx=20, anchor="w")
+    tk.Radiobutton(rb_frame, text=f"Follow organization ({org_desc} folders)",
+                   variable=choice_var, value="follow",
+                   bg=C_BG, fg=C_TEXT, selectcolor=C_RAISED, activebackground=C_BG,
+                   activeforeground=C_TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+    tk.Radiobutton(rb_frame, text="Combined (one file for entire channel)",
+                   variable=choice_var, value="combined",
+                   bg=C_BG, fg=C_TEXT, selectcolor=C_RAISED, activebackground=C_BG,
+                   activeforeground=C_TEXT, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+
+    btn_frame = tk.Frame(dlg, bg=C_BG)
+    btn_frame.pack(pady=(16, 0))
+
+    def _on_ok():
+        combined = choice_var.get() == "combined"
+        dlg.destroy()
+        _start_transcription(ch_name, ch_url, folder, sy, sm, combined)
+
+    ttk.Button(btn_frame, text="Start", command=_on_ok, style="Sync.TButton").pack(side="left", padx=4)
+    ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side="left", padx=4)
+
+    dlg.bind("<Return>", lambda e: _on_ok())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+
+_chan_ctx_menu.add_command(label="Transcribe channel", command=_chan_ctx_transcribe)
+
+_chan_ctx_menu.add_separator()
+
+
 def _chan_ctx_remove():
     ch = _ctx_channel["ch"]
     if not ch:
@@ -2364,9 +2443,9 @@ def _chan_ctx_show(event):
 
         # Menu indices: 0=Sync, 1=Edit, 2=Open folder, 3=Open URL, 4=separator,
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
-        #               10=separator, 11=Remove
-        # Dynamic label: show "Add to job queue" when a sync/reorg is running
-        if _sync_running or _reorg_running:
+        #               10=separator, 11=Transcribe, 12=separator, 13=Remove
+        # Dynamic label: show "Add to job queue" when a sync/reorg/transcribe is running
+        if _sync_running or _reorg_running or _transcribe_running:
             # Check if this channel is already queued or actively syncing
             _ch_url = ch.get("url", "")
             with _sync_queue_lock:
@@ -2393,6 +2472,16 @@ def _chan_ctx_show(event):
             else:
                 _chan_ctx_menu.entryconfig(idx, foreground=C_TEXT, state="normal")
         _chan_ctx_menu.entryconfig(9, foreground=C_TEXT, state="normal")
+
+        # Transcribe menu item (index 11)
+        if _transcribe_running:
+            _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
+        else:
+            _chan_ctx_menu.entryconfig(11, label="Transcribe channel",
+                                      state="normal", foreground=C_TEXT,
+                                      command=_chan_ctx_transcribe)
 
         try:
             _chan_ctx_menu.tk_popup(event.x_root, event.y_root)
@@ -2554,6 +2643,10 @@ def sync_single_channel():
 
     sync_single_btn.config(state="disabled", text="⏳ Syncing...")
     _show_cancel_pause()
+
+    global _job_generation
+    _job_generation += 1
+    _my_gen = _job_generation
 
     _sync_running = True
     _current_job["label"] = f"Sync {ch['name']}"
@@ -2870,37 +2963,40 @@ def sync_single_channel():
                          kind="Manual", channel_name=ch.get("name", ""),
                          skipped=session_totals["dur"])
 
-            # Check for queued syncs or reorg jobs before fully finishing.
-            # Keep _sync_running=True until we confirm nothing else is queued,
-            # to prevent a race where another sync starts in the gap.
-            _queue_started = False
-            if not cancel_event.is_set():
-                _queue_started = _process_sync_queue() or _process_reorg_queue()
+            # If a newer job has taken over (user cancelled + started new sync),
+            # don't touch any shared state — the new job owns it now.
+            if _job_generation == _my_gen:
+                # Check for queued syncs, reorg, or transcription jobs before fully finishing.
+                # Keep _sync_running=True until we confirm nothing else is queued,
+                # to prevent a race where another sync starts in the gap.
+                _queue_started = False
+                if not cancel_event.is_set():
+                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
 
-            if not _queue_started:
-                _sync_running = False
-                if root.winfo_exists():
-                    def _on_single_sync_done():
-                        _validate_download_btn()
-                        sync_btn.config(state="normal")
-                        sync_single_btn.config(state="normal", text="▶ Sync this channel")
-                        _hide_cancel_pause()
-                        _tray_stop_spin()
-                        _dl = session_totals["dl"]
-                        if _dl > 0:
-                            _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
-                        else:
-                            _update_tray_tooltip("YT Archiver — Idle")
+                if not _queue_started:
+                    _sync_running = False
+                    if root.winfo_exists():
+                        def _on_single_sync_done():
+                            _validate_download_btn()
+                            sync_btn.config(state="normal")
+                            sync_single_btn.config(state="normal", text="▶ Sync this channel")
+                            _hide_cancel_pause()
+                            _tray_stop_spin()
+                            _dl = session_totals["dl"]
+                            if _dl > 0:
+                                _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
+                            else:
+                                _update_tray_tooltip("YT Archiver — Idle")
 
-                        _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
-                        if _iv:
-                            _schedule_autorun(_iv)
+                            _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
+                            if _iv:
+                                _schedule_autorun(_iv)
 
-                    root.after(0, _on_single_sync_done)
+                        root.after(0, _on_single_sync_done)
 
-            # Process any videos queued during the sync (only if no queued sync took over)
-            if not cancel_event.is_set() and not _queue_started:
-                _process_video_dl_queue()
+                # Process any videos queued during the sync (only if no queued sync took over)
+                if not cancel_event.is_set() and not _queue_started:
+                    _process_video_dl_queue()
 
     # Don't switch to Download tab — mini-logs on every tab show progress,
     # and the user may want to stay on the Subs tab to queue more channels.
@@ -3670,8 +3766,8 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
     """Trigger reorganization automatically after updating channel split settings."""
     global _reorg_running
 
-    # If a reorg or sync is already running, queue this request
-    if _reorg_running or _sync_running:
+    # If a reorg, sync, or transcription is already running, queue this request
+    if _reorg_running or _sync_running or _transcribe_running:
         with _reorg_queue_lock:
             if not any(q[0] == channel_name for q in _reorg_queue):
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
@@ -3711,10 +3807,707 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                     reorg_done_label.pack(side="left", padx=(4, 0))
                     _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
                 root.after(0, _reorg_done)
-            # Process any queued reorg or sync jobs
+            # Process any queued reorg, transcription, or sync jobs
             if not cancel_event.is_set():
                 if not _process_reorg_queue():
-                    _process_sync_queue()
+                    if not _process_transcribe_queue():
+                        _process_sync_queue()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# ─── Transcription Feature ──────────────────────────────────────────────────────
+
+def _parse_vtt_to_text(vtt_path):
+    """Parse a .vtt subtitle file into clean plain text."""
+    try:
+        with open(vtt_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception:
+        return ""
+
+    lines = raw.split("\n")
+    clean = []
+    prev = ""
+    for line in lines:
+        line = line.strip()
+        # Skip WEBVTT header, NOTE lines, blank lines
+        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") or line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        # Skip timestamp lines (00:00:01.234 --> 00:00:04.567)
+        if re.match(r'\d{2}:\d{2}', line) and '-->' in line:
+            continue
+        # Skip cue position markers
+        if re.match(r'^\d+$', line):  # numeric cue IDs
+            continue
+        if 'align:' in line or 'position:' in line:
+            continue
+        # Strip HTML tags
+        line = re.sub(r'<[^>]+>', '', line)
+        line = line.strip()
+        if not line:
+            continue
+        # Deduplicate consecutive identical lines (YouTube auto-subs repeat)
+        if line != prev:
+            clean.append(line)
+            prev = line
+
+    return " ".join(clean)
+
+
+# Path to Python 3.11 with CUDA PyTorch + Whisper installed
+_WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
+_whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
+
+# Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting file paths
+_WHISPER_SCRIPT = r'''
+import sys, json, whisper, torch
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = whisper.load_model("large-v3", device=device)
+print(json.dumps({"status": "ready", "device": device}), flush=True)
+for line in sys.stdin:
+    path = line.strip()
+    if not path:
+        continue
+    try:
+        result = model.transcribe(path, language="en")
+        segments = result.get("segments", [])
+        text = " ".join(seg["text"].strip() for seg in segments if seg.get("text", "").strip())
+        print(json.dumps({"status": "ok", "text": text}), flush=True)
+    except Exception as e:
+        print(json.dumps({"status": "error", "text": str(e)}), flush=True)
+'''
+
+
+def _check_whisper_installed():
+    """Check if openai-whisper + CUDA PyTorch is installed under Python 3.11."""
+    if not os.path.exists(_WHISPER_PYTHON):
+        return False
+    try:
+        result = subprocess.run(
+            [_WHISPER_PYTHON, "-c", "import whisper, torch; print(torch.cuda.is_available())"],
+            capture_output=True, text=True, timeout=30
+        )
+        return result.returncode == 0 and "True" in result.stdout
+    except Exception:
+        return False
+
+
+def _install_whisper_blocking():
+    """Install openai-whisper + CUDA PyTorch under Python 3.11. Returns True on success."""
+    if not os.path.exists(_WHISPER_PYTHON):
+        log(f"  ⚠ Python 3.11 not found at {_WHISPER_PYTHON}\n", "red")
+        return False
+    try:
+        # Step 1: Install CUDA PyTorch
+        log("  Installing CUDA PyTorch under Python 3.11...\n", "simpleline")
+        torch_result = subprocess.run(
+            [_WHISPER_PYTHON, "-m", "pip", "install",
+             "torch", "torchvision", "torchaudio",
+             "--index-url", "https://download.pytorch.org/whl/cu121"],
+            capture_output=True, text=True, timeout=900
+        )
+        if torch_result.returncode == 0:
+            log("  ✓ CUDA PyTorch installed.\n", "simpleline_green")
+        else:
+            log(f"  ⚠ CUDA PyTorch install failed: {torch_result.stderr[:300]}\n", "red")
+            return False
+
+        # Step 2: Install openai-whisper
+        log("  Installing Whisper AI...\n", "simpleline")
+        result = subprocess.run(
+            [_WHISPER_PYTHON, "-m", "pip", "install", "openai-whisper"],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0:
+            log("  ✓ Whisper AI installed successfully.\n", "simpleline_green")
+            return True
+        else:
+            log(f"  ⚠ Whisper install failed: {result.stderr[:500]}\n", "red")
+            return False
+    except Exception as e:
+        log(f"  ⚠ Whisper install error: {e}\n", "red")
+        return False
+
+
+def _start_whisper_process():
+    """Start the persistent Whisper subprocess under Python 3.11. Returns True if ready."""
+    global _whisper_proc
+    if _whisper_proc is not None and _whisper_proc.poll() is None:
+        return True  # Already running
+
+    try:
+        log("  Loading Whisper model (large-v3) on GPU... this takes ~10 sec\n", "simpleline")
+        _whisper_proc = subprocess.Popen(
+            [_WHISPER_PYTHON, "-c", _WHISPER_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1
+        )
+        # Wait for "ready" message (model loading)
+        ready_line = _whisper_proc.stdout.readline().strip()
+        if ready_line:
+            import json as _json
+            info = _json.loads(ready_line)
+            if info.get("status") == "ready":
+                log(f"  ✓ Whisper model loaded (large-v3, {info.get('device', '?').upper()}).\n", "simpleline_green")
+                return True
+        log("  ⚠ Whisper process did not start correctly.\n", "red")
+        return False
+    except Exception as e:
+        log(f"  ⚠ Failed to start Whisper process: {e}\n", "red")
+        return False
+
+
+def _stop_whisper_process():
+    """Stop the persistent Whisper subprocess."""
+    global _whisper_proc
+    if _whisper_proc is not None:
+        try:
+            _whisper_proc.stdin.close()
+            _whisper_proc.terminate()
+            _whisper_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _whisper_proc.kill()
+            except Exception:
+                pass
+        _whisper_proc = None
+
+
+def _whisper_transcribe(audio_path):
+    """Transcribe a file using the persistent Whisper subprocess. Returns text or None."""
+    global _whisper_proc
+    if _whisper_proc is None or _whisper_proc.poll() is not None:
+        if not _start_whisper_process():
+            return None
+    try:
+        import json as _json
+        log(f"    Whisper transcribing...\n", "simpleline")
+        _whisper_proc.stdin.write(audio_path + "\n")
+        _whisper_proc.stdin.flush()
+        response_line = _whisper_proc.stdout.readline().strip()
+        if response_line:
+            result = _json.loads(response_line)
+            if result.get("status") == "ok":
+                return result.get("text") or None
+            else:
+                log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
+                return None
+        return None
+    except Exception as e:
+        log(f"  ⚠ Whisper communication error: {e}\n", "red")
+        _stop_whisper_process()  # Kill broken process, will restart on next call
+        return None
+
+
+# ─── Punctuation restoration (for YouTube auto-captions) ─────────────────────
+def _load_punctuation_model():
+    """Load the punctuation restoration NER pipeline. Returns True if ready."""
+    global _punct_pipe
+    if _punct_pipe is not None:
+        return True
+    try:
+        from transformers import pipeline as tf_pipeline
+        import torch as _torch
+        log("  Loading punctuation model...\n", "simpleline")
+        if _torch.cuda.is_available():
+            _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
+                                      aggregation_strategy="none", device=0)
+        else:
+            _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
+                                      aggregation_strategy="none")
+        log("  ✓ Punctuation model loaded.\n", "simpleline_green")
+        return True
+    except ImportError:
+        log("  ⚠ Punctuation model not available (transformers not installed).\n", "red")
+        return False
+    except Exception as e:
+        log(f"  ⚠ Failed to load punctuation model: {e}\n", "red")
+        return False
+
+
+def _punctuate_text(text):
+    """Restore punctuation and capitalization to unpunctuated text.
+
+    Uses the oliverguhr/fullstop-punctuation-multilang-large model to add
+    periods, commas, question marks, etc. Returns original text if model
+    is unavailable.
+    """
+    if _punct_pipe is None:
+        return text
+    try:
+        # Preprocess: strip existing punctuation (except in numbers)
+        cleaned = re.sub(r"(?<!\d)[.,;:!?](?!\d)", "", text)
+        words = cleaned.split()
+        if not words:
+            return text
+
+        # Overlap chunking for long texts (model context ~230 tokens)
+        chunk_size = 230
+        overlap = 5 if len(words) > chunk_size else 0
+
+        def _chunk(lst, n, stride):
+            for i in range(0, len(lst), n - stride):
+                yield lst[i:i + n]
+
+        batches = list(_chunk(words, chunk_size, overlap))
+        if len(batches) > 1 and len(batches[-1]) <= overlap:
+            batches.pop()
+
+        tagged = []
+        for batch in batches:
+            ov = 0 if batch is batches[-1] else overlap
+            text_chunk = " ".join(batch)
+            result = _punct_pipe(text_chunk)
+            char_index = 0
+            result_index = 0
+            for word in batch[:len(batch) - ov]:
+                char_index += len(word) + 1
+                label = "0"
+                while result_index < len(result) and char_index > result[result_index]["end"]:
+                    label = result[result_index]["entity"]
+                    result_index += 1
+                tagged.append((word, label))
+
+        # Build output with punctuation
+        out = ""
+        for word, label in tagged:
+            out += word
+            if label == "0":
+                out += " "
+            elif label in ".,?-:":
+                out += label + " "
+        out = out.strip()
+
+        # Capitalize after sentence-ending punctuation and at start
+        out = re.sub(r"([.!?]\s+)(\w)", lambda m: m.group(1) + m.group(2).upper(), out)
+        if out:
+            out = out[0].upper() + out[1:]
+        return out
+    except Exception:
+        return text  # fallback to unpunctuated on any error
+
+
+def _fetch_auto_captions(video_id, temp_dir):
+    """Fetch YouTube captions (manual or auto-generated) for a video. Returns text or None."""
+    temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
+    cmd = [
+        "yt-dlp", "--skip-download",
+        "--write-sub", "--write-auto-sub", "--sub-lang", "en", "--sub-format", "vtt",
+        "-o", temp_base + ".%(ext)s",
+        "--no-playlist",
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
+        return None
+
+    # Find any VTT file created for this video
+    import glob
+    vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
+    if not vtt_files:
+        return None
+    vtt_path = vtt_files[0]
+
+    text = _parse_vtt_to_text(vtt_path)
+    try:
+        for vf in vtt_files:
+            os.remove(vf)
+    except Exception:
+        pass
+    return text if text else None
+
+
+def _format_upload_date(date_str):
+    """Convert YYYYMMDD to (MM.DD.YYYY) display format."""
+    if len(date_str) == 8 and date_str.isdigit():
+        return f"({date_str[4:6]}.{date_str[6:8]}.{date_str[:4]})"
+    return f"({date_str})" if date_str else "(Unknown date)"
+
+
+def _format_duration(dur_str):
+    """Ensure duration is wrapped in parens."""
+    if not dur_str:
+        return "(Unknown length)"
+    return f"({dur_str})"
+
+
+def _get_transcript_filename(ch_name, folder_path, split_years, split_months, combined,
+                              year=None, month=None):
+    """Build the transcript .txt file path based on organization settings.
+
+    Returns (file_path, subfolder_path) where subfolder_path is the target directory.
+    """
+    if combined or (not split_years):
+        # Single file in channel root
+        return os.path.join(folder_path, f"{ch_name} Transcript.txt"), folder_path
+
+    if split_years and split_months and year and month:
+        # Year/Month: e.g. "ChannelName January 24 Transcript.txt" in year/month folder
+        month_num = int(month) if isinstance(month, str) and month.isdigit() else month
+        month_name = MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown").split(" ", 1)[1]  # "January"
+        yr_short = str(year)[-2:]  # "24"
+        subfolder = os.path.join(folder_path, str(year), MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown"))
+        fname = f"{ch_name} {month_name} {yr_short} Transcript.txt"
+        return os.path.join(subfolder, fname), subfolder
+
+    if split_years and year:
+        # Year only: e.g. "ChannelName 2024 Transcript.txt" in year folder
+        subfolder = os.path.join(folder_path, str(year))
+        fname = f"{ch_name} {year} Transcript.txt"
+        return os.path.join(subfolder, fname), subfolder
+
+    # Fallback
+    return os.path.join(folder_path, f"{ch_name} Transcript.txt"), folder_path
+
+
+def _scan_existing_transcripts(folder_path, ch_name):
+    """Scan all transcript .txt files under folder_path. Return set of video titles already transcribed."""
+    existing = set()
+    pattern = re.compile(r'^===\((.+?)\),\s*\(')
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if f.startswith(ch_name) and f.endswith("Transcript.txt"):
+                try:
+                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                        for line in fh:
+                            m = pattern.match(line.strip())
+                            if m:
+                                existing.add(m.group(1))
+                except Exception:
+                    pass
+    return existing
+
+
+def _process_transcribe_queue():
+    """Process next queued transcription if any. Returns True if one was started."""
+    with _transcribe_queue_lock:
+        if not _transcribe_queue:
+            return False
+        args = _transcribe_queue.pop(0)
+        remaining = len(_transcribe_queue)
+
+    ch_name, ch_url, folder, sy, sm, combined = args
+    _current_job["label"] = f"Transcribe {ch_name}"
+    _update_queue_btn()
+    log(f"\n=== Processing queued transcription: {ch_name}", "header")
+    if remaining:
+        log(f" ({remaining} more in queue)", "header")
+    log(f" ===\n", "header")
+    _start_transcription(ch_name, ch_url, folder, sy, sm, combined)
+    return True
+
+
+def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined):
+    """Start transcribing a channel. Queues if something is already running."""
+    global _transcribe_running
+
+    if _sync_running or _reorg_running or _transcribe_running:
+        with _transcribe_queue_lock:
+            if not any(q[1] == ch_url for q in _transcribe_queue):
+                _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
+                log(f"\n=== Added {ch_name} transcription to job queue ===\n", "header")
+            else:
+                log(f"  ⚠ {ch_name} is already in the transcription queue.\n", "simpleline")
+        _update_queue_btn()
+        return
+
+    def _worker():
+        global _transcribe_running
+        _transcribe_running = True
+        _current_job["label"] = f"Transcribe {ch_name}"
+        _current_job["url"] = ch_url
+        _update_queue_btn()
+        _whisper_available = None  # None = not checked yet
+
+        try:
+            cancel_event.clear()
+            if root.winfo_exists():
+                root.after(0, _show_cancel_pause)
+
+            log(f"\n{'='*60}\n", "header")
+            log(f"  TRANSCRIBING: {ch_name}\n", "header")
+            log(f"{'='*60}\n\n", "header")
+
+            # ── Step 1: Scan local video files ──────────────────────────
+            log("  Scanning local video files...\n", "simpleline")
+            _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
+            local_files = {}  # filename_no_ext -> full_path
+            for dirpath, _, files in os.walk(folder):
+                for f in files:
+                    if f.lower().endswith(_VIDEO_EXTS):
+                        fname_no_ext = os.path.splitext(f)[0]
+                        local_files[fname_no_ext] = os.path.join(dirpath, f)
+
+            if not local_files:
+                log("  ⚠ No video files found in channel folder.\n", "red")
+                return
+
+            log(f"  Found {len(local_files)} video file(s) on disk.\n", "simpleline")
+
+            # ── Step 2: Scan existing transcripts to skip already-done ──
+            already_done = _scan_existing_transcripts(folder, ch_name)
+            files_to_process = {}
+            for fname, fpath in local_files.items():
+                if fname not in already_done:
+                    files_to_process[fname] = fpath
+
+            if already_done:
+                log(f"  {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
+
+            if not files_to_process:
+                log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                return
+
+            # ── Step 3: Fetch YT playlist for title→ID matching ─────────
+            log("  Fetching YouTube video list for caption matching...\n", "simpleline")
+            yt_title_to_id = {}  # yt_title -> video_id
+            try:
+                enum_cmd = [
+                    "yt-dlp", "--flat-playlist",
+                    "--print", "%(id)s|||%(title)s",
+                    "--no-warnings",
+                    ch_url
+                ]
+                enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=300)
+                for line in enum_proc.stdout.strip().split("\n"):
+                    if "|||" in line:
+                        vid_id, yt_title = line.strip().split("|||", 1)
+                        yt_title_to_id[yt_title.strip()] = vid_id.strip()
+                log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+            except Exception as e:
+                log(f"  ⚠ Could not fetch YouTube list: {e}. All files will use Whisper.\n", "red")
+
+            # ── Step 4: Split into matched (captions) vs unmatched (Whisper) ─
+            matched = []    # (filename, filepath, video_id)  — can try auto-captions
+            unmatched = []  # (filename, filepath)            — must use Whisper
+
+            for fname, fpath in files_to_process.items():
+                if fname in yt_title_to_id:
+                    matched.append((fname, fpath, yt_title_to_id[fname]))
+                else:
+                    unmatched.append((fname, fpath))
+
+            log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
+            if unmatched:
+                log(f"  {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
+            log("\n", "simpleline")
+
+            total = len(matched) + len(unmatched)
+            temp_dir = os.path.join(folder, "_transcribe_temp")
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Load punctuation model if we have any matched files (for YT captions)
+            _punct_loaded = False
+            if matched:
+                _punct_loaded = _load_punctuation_model()
+
+            done_count = 0
+            err_count = 0
+            idx = 0
+
+            # ── Phase A: Process matched files (auto-captions first) ────
+            for fname, fpath, vid_id in matched:
+                idx += 1
+
+                # Pause check
+                if pause_event.is_set() and not cancel_event.is_set():
+                    log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                    while pause_event.is_set() and not cancel_event.is_set():
+                        time.sleep(0.25)
+                    if not cancel_event.is_set():
+                        log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                if cancel_event.is_set():
+                    log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
+                    break
+
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "simpleline")
+
+                text = _fetch_auto_captions(vid_id, temp_dir)
+                source = "auto-captions"
+
+                if not text:
+                    # Auto-captions failed — Whisper this file instead
+                    log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "simpleline")
+                    unmatched.append((fname, fpath))
+                    idx -= 1   # give back the slot — this file will be counted in Phase B
+                    continue
+
+                # Restore punctuation to YouTube captions
+                if _punct_loaded:
+                    text = _punctuate_text(text)
+
+                # Get date/duration from local file mtime
+                mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                year_num, month_num = mtime.year, mtime.month
+                upload_date = mtime.strftime("%Y%m%d")
+
+                dur_str = ""
+                try:
+                    probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
+                                 "format=duration", "-of", "csv=p=0", fpath]
+                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                    secs = float(probe_result.stdout.strip())
+                    hrs, remainder = divmod(int(secs), 3600)
+                    mins, sec = divmod(remainder, 60)
+                    dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
+                except Exception:
+                    pass
+
+                # Write transcript entry
+                txt_path, subfolder = _get_transcript_filename(
+                    ch_name, folder, split_years, split_months, combined,
+                    year=year_num, month=month_num)
+                os.makedirs(subfolder, exist_ok=True)
+
+                date_fmt = _format_upload_date(upload_date)
+                dur_fmt = _format_duration(dur_str)
+                entry = f"===({fname}), {date_fmt}, {dur_fmt}===\n{text}\n\n\n"
+
+                try:
+                    with open(txt_path, "a", encoding="utf-8") as f:
+                        f.write(entry)
+                except Exception as e:
+                    log(f"  ⚠ Error writing transcript: {e}\n", "red")
+                    err_count += 1
+                    continue
+
+                done_count += 1
+                log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
+
+            # ── Phase B: Process unmatched files (Whisper) ──────────────
+            if unmatched and not cancel_event.is_set():
+                # Check if Whisper is available (only once)
+                if _whisper_available is None:
+                    # First check if CUDA GPU is even present on this system
+                    _has_cuda = False
+                    try:
+                        _cuda_check = subprocess.run(
+                            [_WHISPER_PYTHON, "-c", "import torch; print(torch.cuda.is_available())"],
+                            capture_output=True, text=True, timeout=30
+                        ) if os.path.exists(_WHISPER_PYTHON) else None
+                        _has_cuda = _cuda_check is not None and "True" in _cuda_check.stdout
+                    except Exception:
+                        pass
+
+                    if not _has_cuda:
+                        _whisper_available = False
+                        log(f"  ⚠ No CUDA GPU detected — Whisper unavailable.\n", "simpleline")
+                        log(f"  Skipping {len(unmatched)} video(s) without YouTube captions.\n", "simpleline")
+                    else:
+                        _whisper_available = _check_whisper_installed()
+                        if not _whisper_available:
+                            log("  Whisper AI is not installed (needed for files without captions).\n", "simpleline")
+                            _install_result = [None]
+
+                            def _ask_install():
+                                _install_result[0] = messagebox.askyesno(
+                                    "Install Whisper AI",
+                                    f"{len(unmatched)} video(s) need Whisper AI for transcription.\n\n"
+                                    "Whisper requires ~1.5 GB of downloads.\n\n"
+                                    "Install now? (These videos will be skipped if you decline)")
+                            if root.winfo_exists():
+                                root.after(0, _ask_install)
+                                while _install_result[0] is None and not cancel_event.is_set():
+                                    time.sleep(0.1)
+                                if _install_result[0]:
+                                    _whisper_available = _install_whisper_blocking()
+                                else:
+                                    _whisper_available = False
+                                    log(f"  Skipping {len(unmatched)} video(s) without captions.\n", "simpleline")
+
+                if _whisper_available:
+                    for fname, fpath in unmatched:
+                        idx += 1
+
+                        # Pause check
+                        if pause_event.is_set() and not cancel_event.is_set():
+                            log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                            while pause_event.is_set() and not cancel_event.is_set():
+                                time.sleep(0.25)
+                            if not cancel_event.is_set():
+                                log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                        if cancel_event.is_set():
+                            log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
+                            break
+
+                        log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "simpleline")
+                        text = _whisper_transcribe(fpath)
+                        source = "Whisper"
+
+                        if not text:
+                            log(f"  [{idx}/{total}] {fname} — Whisper returned empty. Skipping.\n", "simpleline")
+                            err_count += 1
+                            continue
+
+                        # Get date/duration from file mtime
+                        mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                        year_num, month_num = mtime.year, mtime.month
+                        upload_date = mtime.strftime("%Y%m%d")
+
+                        # Try to get duration from file
+                        dur_str = ""
+                        try:
+                            probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
+                                         "format=duration", "-of", "csv=p=0", fpath]
+                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                            secs = float(probe_result.stdout.strip())
+                            hrs, remainder = divmod(int(secs), 3600)
+                            mins, sec = divmod(remainder, 60)
+                            dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
+                        except Exception:
+                            pass
+
+                        txt_path, subfolder = _get_transcript_filename(
+                            ch_name, folder, split_years, split_months, combined,
+                            year=year_num, month=month_num)
+                        os.makedirs(subfolder, exist_ok=True)
+
+                        date_fmt = _format_upload_date(upload_date)
+                        dur_fmt = _format_duration(dur_str)
+                        entry = f"===({fname}), {date_fmt}, {dur_fmt}===\n{text}\n\n\n"
+
+                        try:
+                            with open(txt_path, "a", encoding="utf-8") as f:
+                                f.write(entry)
+                        except Exception as e:
+                            log(f"  ⚠ Error writing transcript: {e}\n", "red")
+                            err_count += 1
+                            continue
+
+                        done_count += 1
+                        log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
+                else:
+                    err_count += len(unmatched)
+
+            # Cleanup temp dir
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+            if not cancel_event.is_set():
+                log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
+                if err_count:
+                    log(f", {err_count} skipped", "simpleline_green")
+                log(".\n", "simpleline_green")
+
+        except Exception as e:
+            log(f"\n  ⚠ Transcription error: {e}\n", "red")
+        finally:
+            _transcribe_running = False
+            _stop_whisper_process()  # Free GPU memory
+            if root.winfo_exists():
+                root.after(0, _hide_cancel_pause)
+            # Process any queued jobs
+            if not cancel_event.is_set():
+                if not _process_transcribe_queue():
+                    if not _process_reorg_queue():
+                        _process_sync_queue()
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -5375,7 +6168,7 @@ def start_download():
     url_entry.event_generate("<FocusOut>")
     vid_custom_name_var.set("")
 
-    if _sync_running or _reorg_running:
+    if _sync_running or _reorg_running or _transcribe_running:
         # Queue the download for after the current operation finishes
         with _video_dl_queue_lock:
             _video_dl_queue.append((cmd, True))
@@ -5453,6 +6246,10 @@ def start_sync_all():
             pass
 
     _dot_state["job"] = root.after(500, _animate_dots)
+
+    global _job_generation
+    _job_generation += 1
+    _my_gen = _job_generation
 
     _sync_running = True
     _current_job["label"] = "Full Sub Sync"
@@ -5834,40 +6631,43 @@ def start_sync_all():
                     f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
                 )
         finally:
-            _sync_running = False
-            _current_job["label"] = None
-            _current_job["url"] = None
-            _update_queue_btn()
             elapsed_manual = (datetime.now() - t_start_manual).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_manual, kind="Manual",
                          skipped=session_totals["dur"])
 
-            # Check for queued syncs or reorg jobs before fully finishing
-            _queue_started = False
-            if not cancel_event.is_set():
-                _queue_started = _process_sync_queue() or _process_reorg_queue()
+            # If a newer job has taken over, don't touch shared state
+            if _job_generation == _my_gen:
+                _sync_running = False
+                _current_job["label"] = None
+                _current_job["url"] = None
+                _update_queue_btn()
 
-            if not _queue_started and root.winfo_exists():
-                def _on_manual_sync_done():
-                    _validate_download_btn()
-                    sync_btn.config(state="normal", text="🔄 Sync Subbed")
-                    _hide_cancel_pause()
-                    _tray_stop_spin()
-                    _dl = session_totals["dl"]
-                    if _dl > 0:
-                        _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
-                    else:
-                        _update_tray_tooltip("YT Archiver — Idle")
+                # Check for queued syncs, reorg, or transcription jobs before fully finishing
+                _queue_started = False
+                if not cancel_event.is_set():
+                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
 
-                    _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
-                    if _iv:
-                        _schedule_autorun(_iv)
+                if not _queue_started and root.winfo_exists():
+                    def _on_manual_sync_done():
+                        _validate_download_btn()
+                        sync_btn.config(state="normal", text="🔄 Sync Subbed")
+                        _hide_cancel_pause()
+                        _tray_stop_spin()
+                        _dl = session_totals["dl"]
+                        if _dl > 0:
+                            _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
+                        else:
+                            _update_tray_tooltip("YT Archiver — Idle")
 
-                root.after(0, _on_manual_sync_done)
+                        _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
+                        if _iv:
+                            _schedule_autorun(_iv)
 
-            # Process any videos queued during the sync (only if no queued sync took over)
-            if not cancel_event.is_set() and not _queue_started:
-                _process_video_dl_queue()
+                    root.after(0, _on_manual_sync_done)
+
+                # Process any videos queued during the sync (only if no queued sync took over)
+                if not cancel_event.is_set() and not _queue_started:
+                    _process_video_dl_queue()
 
     t_start_manual = datetime.now()
     threading.Thread(target=_sync_worker, daemon=True).start()
@@ -5915,20 +6715,24 @@ _ToolTip(clear_log_btn, "Clear the log output")
 
 
 def stop_downloads():
-    global _sync_running, _reorg_running
+    global _sync_running, _reorg_running, _transcribe_running
     pause_event.clear()
 
-    # Clear any queued syncs, video downloads, and reorg jobs
+    # Clear any queued syncs, video downloads, reorg, and transcription jobs
     with _sync_queue_lock:
         _sync_queue.clear()
     with _video_dl_queue_lock:
         _video_dl_queue.clear()
     with _reorg_queue_lock:
         _reorg_queue.clear()
+    with _transcribe_queue_lock:
+        _transcribe_queue.clear()
 
     # Reset flags immediately so context-menu actions work right after cancel
     _sync_running = False
     _reorg_running = False
+    _transcribe_running = False
+    _stop_whisper_process()  # Kill Whisper subprocess on cancel
     _current_job["label"] = None
     _current_job["url"] = None
     _tray_stop_spin()
@@ -5961,6 +6765,9 @@ def stop_downloads():
     # the worker thread's finally block fails to clean up (e.g. exception,
     # stuck on process I/O, etc.)
     def _cancel_safety_net():
+        # Only hide buttons if no new job has started since we cancelled
+        if _sync_running or _reorg_running or _transcribe_running:
+            return  # a new job took over — don't touch buttons
         if cancel_btn.winfo_ismapped():
             cancel_btn.pack_forget()
         if pause_btn.winfo_ismapped():
@@ -6008,7 +6815,7 @@ def _show_cancel_pause():
 
 
 def _hide_cancel_pause():
-    if not _sync_running and not _reorg_running:
+    if not _sync_running and not _reorg_running and not _transcribe_running:
         cancel_btn.pack_forget()
         pause_btn.pack_forget()
         pause_event.clear()
@@ -6053,6 +6860,9 @@ def _get_queue_items():
                 items.append((f"Re-Organize {ch_name}", "reorg", i))
             else:
                 items.append((f"Un-Organize {ch_name}", "reorg", i))
+    with _transcribe_queue_lock:
+        for i, args in enumerate(_transcribe_queue):
+            items.append((f"Transcribe {args[0]}", "transcribe", i))
     with _video_dl_queue_lock:
         n_vids = len(_video_dl_queue)
         if n_vids == 1:
@@ -6075,6 +6885,10 @@ def _remove_queue_item(source, idx):
         with _reorg_queue_lock:
             if 0 <= idx < len(_reorg_queue):
                 removed = _reorg_queue.pop(idx)[0]
+    elif source == "transcribe":
+        with _transcribe_queue_lock:
+            if 0 <= idx < len(_transcribe_queue):
+                removed = _transcribe_queue.pop(idx)[0]
     elif source == "video":
         with _video_dl_queue_lock:
             if _video_dl_queue:
@@ -6645,6 +7459,10 @@ def _run_autorun():
             _show_cancel_pause(),
         ))
 
+    global _job_generation
+    _job_generation += 1
+    _my_gen = _job_generation
+
     _sync_running = True
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Auto-syncing...")
@@ -6967,7 +7785,6 @@ def _run_autorun():
 
         finally:
             _autorun_active = False
-            _sync_running = False
             elapsed = (datetime.now() - t_start).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed, kind="Auto",
                          skipped=session_totals["dur"])
@@ -6976,15 +7793,21 @@ def _run_autorun():
                 config["last_sync"] = _ts
             save_config(config)
 
-            # Check for queued syncs or reorg jobs before fully finishing
-            _queue_started = False
-            if not cancel_event.is_set():
-                _queue_started = _process_sync_queue() or _process_reorg_queue()
-
+            # Always update display timestamps
             if root.winfo_exists():
                 root.after(0, refresh_channel_dropdowns)
                 root.after(0, lambda ts=_ts: _update_last_sync_display(ts))
-                if not _queue_started:
+
+            # If a newer job has taken over, don't touch shared state
+            if _job_generation == _my_gen:
+                _sync_running = False
+
+                # Check for queued syncs, reorg, or transcription jobs before fully finishing
+                _queue_started = False
+                if not cancel_event.is_set():
+                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
+
+                if root.winfo_exists() and not _queue_started:
                     _iv = interval_mins
                     _dl_count = session_totals["dl"]
                     def _on_auto_done(iv=_iv, dl=_dl_count):
@@ -6999,9 +7822,9 @@ def _run_autorun():
                             _update_tray_tooltip("YT Archiver — Idle")
                     root.after(0, _on_auto_done)
 
-            # Process any videos queued during the sync (only if no queued sync took over)
-            if not cancel_event.is_set() and not _queue_started:
-                _process_video_dl_queue()
+                # Process any videos queued during the sync (only if no queued sync took over)
+                if not cancel_event.is_set() and not _queue_started:
+                    _process_video_dl_queue()
 
     threading.Thread(target=_auto_worker, daemon=True).start()
 
@@ -7057,9 +7880,9 @@ def on_tab_changed(event):
     global new_download_count
     selected = notebook.select()
     if selected == str(tab_download):
-        # Re-show cancel/pause buttons if a sync or reorg is still active
+        # Re-show cancel/pause buttons if a sync, reorg, or transcription is still active
         # (they can lose pack state when switching tabs during long operations)
-        if _sync_running or _reorg_running:
+        if _sync_running or _reorg_running or _transcribe_running:
             _show_cancel_pause()
     elif selected == str(tab_recent):
         if new_download_count > 0:
@@ -8132,13 +8955,16 @@ root.after(200, run_startup_updates)
 
 def _save_queue_state():
     """Save current queue state to disk for restoration on next launch."""
-    queue_data = {"sync": [], "reorg": [], "video": []}
+    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": []}
     with _sync_queue_lock:
         for ch in _sync_queue:
             queue_data["sync"].append(copy.deepcopy(ch))
     with _reorg_queue_lock:
         for args in _reorg_queue:
             queue_data["reorg"].append(list(args))
+    with _transcribe_queue_lock:
+        for args in _transcribe_queue:
+            queue_data["transcribe"].append(list(args))
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
@@ -8172,6 +8998,12 @@ def _load_queue_state():
                 for args in reorg_items:
                     _reorg_queue.append(tuple(args))
                     restored += 1
+        transcribe_items = queue_data.get("transcribe", [])
+        if transcribe_items:
+            with _transcribe_queue_lock:
+                for args in transcribe_items:
+                    _transcribe_queue.append(tuple(args))
+                    restored += 1
         if restored:
             log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
             _update_queue_btn()
@@ -8190,6 +9022,10 @@ def on_closing():
     if not has_queue:
         with _reorg_queue_lock:
             if _reorg_queue:
+                has_queue = True
+    if not has_queue:
+        with _transcribe_queue_lock:
+            if _transcribe_queue:
                 has_queue = True
 
     if has_queue:
@@ -8212,6 +9048,9 @@ def on_closing():
             _tray_icon.stop()
         except Exception:
             pass
+
+    # Stop Whisper subprocess if running
+    _stop_whisper_process()
 
     # Clear pause so worker threads can exit cleanly
     pause_event.clear()

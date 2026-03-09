@@ -33,6 +33,7 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. 
+1. Because there's a mini-log on every page, tabbing the user back over to the Download tab when they manually sync a channel from the sub list feels incorrect.
+especially since there's a queue system in place, and the user very well may just be going right back to the sub tab anyway. Needs changed
 
 2. 

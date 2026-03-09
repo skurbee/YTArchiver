@@ -626,8 +626,8 @@ def _suspend_proc(proc):
                 ctypes.windll.kernel32.CloseHandle(handle)
         else:
             os.kill(proc.pid, signal.SIGSTOP)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"  Warning: could not suspend process {proc.pid}: {e}\n", "dim")
 
 
 def _resume_proc(proc):
@@ -640,10 +640,12 @@ def _resume_proc(proc):
             if handle:
                 ctypes.windll.ntdll.NtResumeProcess(handle)
                 ctypes.windll.kernel32.CloseHandle(handle)
+            else:
+                log(f"  Warning: could not open process {proc.pid} for resume\n", "dim")
         else:
             os.kill(proc.pid, signal.SIGCONT)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"  Warning: could not resume process {proc.pid}: {e}\n", "dim")
 
 
 def show_notification(title, message):
@@ -1123,7 +1125,7 @@ if os.name == "nt":
         pass
 
 
-def _entry(parent, **kw):
+def _entry(parent, maxlen=500, **kw):
     kw.setdefault("bg", C_INPUT)
     kw.setdefault("fg", C_TEXT)
     kw.setdefault("insertbackground", C_TEXT)
@@ -1133,7 +1135,12 @@ def _entry(parent, **kw):
     kw.setdefault("highlightbackground", C_BORDER_LT)
     kw.setdefault("highlightcolor", C_ACCENT)
     kw.setdefault("font", ("Segoe UI", 9))
-    return tk.Entry(parent, **kw)
+    e = tk.Entry(parent, **kw)
+    # Only add maxlen validation if caller didn't provide their own validator
+    if maxlen and maxlen > 0 and 'validate' not in kw and 'validatecommand' not in kw:
+        _vcmd = (e.register(lambda new_val, _ml=maxlen: len(new_val) <= _ml), '%P')
+        e.config(validate="key", validatecommand=_vcmd)
+    return e
 
 
 def _placeholder(entry, text):
@@ -1315,7 +1322,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v7.6 - 03.08.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v7.7 - 03.08.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1611,9 +1618,9 @@ def _auto_scrollbar(scrollbar, first, last):
         scrollbar.grid()
     scrollbar.set(first, last)
 
-# Main log frame added SECOND (bottom)
+# Main log frame added SECOND (bottom) — weight=1 keeps it compact initially
 log_frame = ttk.Frame(log_paned)
-log_paned.add(log_frame, weight=3)
+log_paned.add(log_frame, weight=1)
 log_frame.columnconfigure(0, weight=1)
 log_frame.rowconfigure(0, weight=1)
 
@@ -1643,6 +1650,21 @@ log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
+
+
+# Set initial sash position so the log panel starts with ~3 lines of space
+def _set_initial_sash():
+    try:
+        # Place sash so the autorun history area gets minimal space
+        # and the log area starts with roughly 3 lines (~50px)
+        h = log_paned.winfo_height()
+        if h > 100:
+            log_paned.sashpos(0, max(0, h - 55))
+    except Exception:
+        pass
+
+
+root.after(150, _set_initial_sash)
 
 log_mode_var = tk.StringVar(value=config.get("log_mode", "Simple"))
 
@@ -3357,7 +3379,7 @@ def _fix_file_dates(channel_url, folder_path):
         proc = spawn_yt_dlp([
             "yt-dlp", "--skip-download", "--no-warnings", "--ignore-errors",
             "--ignore-no-formats-error",
-            "--sleep-requests", "1.5",
+            "--sleep-requests", "1.0",
             "--print", "%(upload_date)s|||%(title)s",
             "--cookies-from-browser", "firefox",
             channel_url
@@ -4030,7 +4052,7 @@ def build_channel_cmd(url, out_dir, min_dur, resolution, folder_override="", bre
         "yt-dlp", "--newline", "--no-quiet", "--mtime", "--ignore-errors",
         "--trim-filenames", "200", "--format", fmt, "--merge-output-format", "mp4",
         "--ppa", "Merger:-c copy",
-        "--sleep-requests", "0.5",
+        "--sleep-requests", "0.25",
         "--match-filter", _dur_filter,
         "--output", out_template,
         "--download-archive", ARCHIVE_FILE,
@@ -4802,12 +4824,33 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
     _prog_last_ts = 0.0
     _prog_last_pct = -1.0
     _speed_samples = []
+    _last_output_time = [time.monotonic()]
+    _was_paused = [False]
 
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
 
+        # Watchdog: kill stuck yt-dlp process if no stdout for 30s after resume
+        def _stdout_watchdog():
+            while proc.poll() is None and not cancel_event.is_set():
+                time.sleep(5)
+                if _was_paused[0] and not pause_event.is_set():
+                    # We just resumed — check for stuck process
+                    elapsed = time.monotonic() - _last_output_time[0]
+                    if elapsed > 30:
+                        log("  ⚠ Process unresponsive after resume — restarting...\n", "dim")
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        break
+
+        _wd_thread = threading.Thread(target=_stdout_watchdog, daemon=True)
+        _wd_thread.start()
+
         for line in proc.stdout:
+            _last_output_time[0] = time.monotonic()
             is_simple_mode = 'log_mode_var' in globals() and log_mode_var.get() == "Simple"
 
             # Strip Unicode replacement characters from yt-dlp output
@@ -4817,10 +4860,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                 break
 
             if pause_event.is_set():
+                _was_paused[0] = True
                 log(f"  ⏸ Paused at {_fmt_time()} — click Resume to continue.\n", "pauselog")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
                 if not cancel_event.is_set():
+                    _last_output_time[0] = time.monotonic()
                     log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
                 else:
                     break
@@ -5166,21 +5211,18 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                 dur_count += 1
                 session_totals["dur"] += 1
 
-                # Determine filter reason from the expression in parentheses
-                _filter_reason = "Does not pass filter."
-                _fm = re.search(r'filter\s*\(([^)]+)\)', line)
-                if _fm:
-                    _fexpr = _fm.group(1)
-                    _has_min = "duration>?" in _fexpr or "duration >" in _fexpr
-                    _has_max = "duration<?" in _fexpr or "duration <" in _fexpr
-                    if _has_min and not _has_max:
-                        _filter_reason = "Filtered: too short."
-                    elif _has_max and not _has_min:
-                        _filter_reason = "Filtered: too long."
-                    elif _has_min and _has_max:
-                        # Both filters present — yt-dlp shows the full compound filter
-                        # so we can't reliably determine which bound was exceeded.
-                        _filter_reason = "Filtered: outside duration range."
+                # Determine filter reason by checking the whole yt-dlp line
+                # (works regardless of whether yt-dlp wraps the expression in parens)
+                _has_min = "duration>?" in line or "duration >" in line
+                _has_max = "duration<?" in line or "duration <" in line
+                if _has_min and not _has_max:
+                    _filter_reason = "Filtered: too short."
+                elif _has_max and not _has_min:
+                    _filter_reason = "Filtered: too long."
+                elif _has_min and _has_max:
+                    _filter_reason = "Filtered: outside duration range."
+                else:
+                    _filter_reason = "Filtered: outside duration range."
 
                 if is_simple_mode:
                     _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
@@ -5883,17 +5925,21 @@ def stop_downloads():
     sync_btn.config(state="normal", text="🔄 Sync Subbed")
     sync_single_btn.config(state="normal", text="▶ Sync this channel")
 
-    with proc_lock:
-        procs = list(active_processes)
-    for p in procs:
-        if p.poll() is None:
-            _resume_proc(p)  # Resume first in case process was suspended
-            if os.name == "nt":
-                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=startupinfo)
-            else:
-                p.kill()
+    # Kill processes in background thread so UI never blocks on proc_lock
+    def _do_kill():
+        with proc_lock:
+            procs = list(active_processes)
+        for p in procs:
+            if p.poll() is None:
+                _resume_proc(p)  # Resume first in case process was suspended
+                if os.name == "nt":
+                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     startupinfo=startupinfo)
+                else:
+                    p.kill()
+
+    threading.Thread(target=_do_kill, daemon=True).start()
     log("\n⛔ Cancelling...\n", "red")
 
     # Safety net: force-hide cancel/pause buttons after a delay in case
@@ -5916,20 +5962,27 @@ def toggle_pause():
     if pause_event.is_set():
         pause_event.clear()
         pause_btn.config(text="⏸ Pause")
-        # Resume all active processes immediately
-        with proc_lock:
-            procs = list(active_processes)
-        for p in procs:
-            _resume_proc(p)
+
+        # Resume processes in a background thread so the UI never blocks
+        def _do_resume():
+            with proc_lock:
+                procs = list(active_processes)
+            for p in procs:
+                _resume_proc(p)
+
+        threading.Thread(target=_do_resume, daemon=True).start()
     else:
         pause_event.set()
         pause_btn.config(text="▶ Resume")
-        # Suspend all active processes immediately so pause works
-        # even when the worker thread is blocked on stdout (e.g. during merge)
-        with proc_lock:
-            procs = list(active_processes)
-        for p in procs:
-            _suspend_proc(p)
+
+        # Suspend processes in a background thread so the UI never blocks
+        def _do_suspend():
+            with proc_lock:
+                procs = list(active_processes)
+            for p in procs:
+                _suspend_proc(p)
+
+        threading.Thread(target=_do_suspend, daemon=True).start()
 
 
 cancel_pause_frame = ttk.Frame(btn_frame)
@@ -6479,7 +6532,7 @@ def _refresh_autorun_history():
         autorun_clear_btn.grid(row=0, column=3, sticky="w", padx=(0, 16))
         # Bring the frame back if it's not currently shown
         if str(autorun_history_frame) not in current_panes:
-            log_paned.insert(0, autorun_history_frame, weight=1)
+            log_paned.insert(0, autorun_history_frame, weight=0)
     else:
         autorun_clear_btn.grid_remove()
         # Hide the frame if it's currently visible
@@ -8157,18 +8210,23 @@ def on_closing():
     pause_event.clear()
     cancel_event.set()
 
-    with proc_lock:
-        procs = list(active_processes)
-    for p in procs:
-        if p.poll() is None:
-            _resume_proc(p)  # Resume first — suspended processes can block taskkill
-            if os.name == 'nt':
-                # Non-blocking Popen so the main thread doesn't freeze
-                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=startupinfo)
-            else:
-                p.kill()
+    # Kill processes in a thread with timeout so we never hang on exit
+    def _shutdown_kill():
+        with proc_lock:
+            procs = list(active_processes)
+        for p in procs:
+            if p.poll() is None:
+                _resume_proc(p)  # Resume first — suspended processes can block taskkill
+                if os.name == 'nt':
+                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     startupinfo=startupinfo)
+                else:
+                    p.kill()
+
+    _kill_thread = threading.Thread(target=_shutdown_kill, daemon=True)
+    _kill_thread.start()
+    _kill_thread.join(timeout=3)  # Wait max 3 seconds, then proceed
 
     # Give worker threads a moment to notice cancel_event and save state
     # (they're daemon threads — root.destroy() will kill them)

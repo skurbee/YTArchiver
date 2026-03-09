@@ -33,6 +33,6 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. When the sync log appears, it is supposed to only have enough padding for the lines it has to show. At the moment it's opening with ~8 lines of space, and has to be manually dragged back down to a reasonable size.
+1. 
 
-2. There should be a text length limit in any text boxes that the user can interact with. Right now if the user pastes something huge in there, it kinda freaks out and crashes.
+2. 

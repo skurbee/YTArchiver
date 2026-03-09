@@ -1358,7 +1358,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.7 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v8.8 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3859,22 +3859,59 @@ def _parse_vtt_to_text(vtt_path):
 _WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
 
-# Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting file paths
+# Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
 _WHISPER_SCRIPT = r'''
-import sys, json, whisper, torch
+import sys, json, whisper, torch, io, re
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = whisper.load_model("large-v3", device=device)
 print(json.dumps({"status": "ready", "device": device}), flush=True)
+
 for line in sys.stdin:
-    path = line.strip()
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        path = req.get("path", "")
+        duration = req.get("duration", 0)
+    except json.JSONDecodeError:
+        path = line
+        duration = 0
     if not path:
         continue
     try:
-        result = model.transcribe(path, language="en")
+        # Capture verbose output on stderr to extract progress from segment timestamps
+        old_stderr = sys.stderr
+
+        class _ProgressCapture:
+            def __init__(self, dur):
+                self.dur = dur
+                self.last_pct = -1
+            def write(self, text):
+                if self.dur <= 0:
+                    return
+                m = re.search(r'-->\s*(\d+):(\d+\.\d+)\]', text)
+                if m:
+                    current = int(m.group(1)) * 60 + float(m.group(2))
+                    pct = min(99, int(current / self.dur * 100))
+                    if pct > self.last_pct:
+                        self.last_pct = pct
+                        print(json.dumps({"status": "progress", "pct": pct}), flush=True)
+            def flush(self):
+                pass
+            def isatty(self):
+                return False
+
+        sys.stderr = _ProgressCapture(duration)
+        result = model.transcribe(path, language="en", verbose=True)
+        sys.stderr = old_stderr
+
         segments = result.get("segments", [])
         text = " ".join(seg["text"].strip() for seg in segments if seg.get("text", "").strip())
         print(json.dumps({"status": "ok", "text": text}), flush=True)
     except Exception as e:
+        sys.stderr = old_stderr if 'old_stderr' in dir() else sys.__stderr__
         print(json.dumps({"status": "error", "text": str(e)}), flush=True)
 '''
 
@@ -3974,26 +4011,41 @@ def _stop_whisper_process():
         _whisper_proc = None
 
 
-def _whisper_transcribe(audio_path):
-    """Transcribe a file using the persistent Whisper subprocess. Returns text or None."""
+def _whisper_transcribe(audio_path, duration=0):
+    """Transcribe a file using the persistent Whisper subprocess. Returns text or None.
+
+    If duration (seconds) is provided, progress percentage is logged in real time.
+    """
     global _whisper_proc
     if _whisper_proc is None or _whisper_proc.poll() is not None:
         if not _start_whisper_process():
             return None
     try:
         import json as _json
-        log(f"    Whisper transcribing...\n", "simpleline")
-        _whisper_proc.stdin.write(audio_path + "\n")
+        log(f"    Whisper transcribing, 0%...\n", "simpleline")
+        request = _json.dumps({"path": audio_path, "duration": duration})
+        _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
-        response_line = _whisper_proc.stdout.readline().strip()
-        if response_line:
+
+        # Read responses — may be progress updates before the final result
+        while True:
+            response_line = _whisper_proc.stdout.readline().strip()
+            if not response_line:
+                return None
             result = _json.loads(response_line)
-            if result.get("status") == "ok":
+            if result.get("status") == "progress":
+                pct = result.get("pct", 0)
+                if pause_event.is_set() and not cancel_event.is_set():
+                    log(f"    Whisper transcribing, {pct}% — will pause after this file...\n", "simpleline")
+                else:
+                    log(f"    Whisper transcribing, {pct}%...\n", "simpleline")
+                continue
+            elif result.get("status") == "ok":
+                log(f"    Whisper transcribing, 100%...\n", "simpleline")
                 return result.get("text") or None
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
                 return None
-        return None
     except Exception as e:
         log(f"  ⚠ Whisper communication error: {e}\n", "red")
         _stop_whisper_process()  # Kill broken process, will restart on next call
@@ -4351,6 +4403,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
+                    log(f"    Adding punctuation...\n", "simpleline")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -4448,8 +4501,26 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                             break
 
+                        # Get duration BEFORE whisper (needed for progress %)
+                        _dur_secs = 0
+                        dur_str = ""
+                        try:
+                            probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
+                                         "format=duration", "-of", "csv=p=0", fpath]
+                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
+                            _dur_secs = float(probe_result.stdout.strip())
+                            hrs, remainder = divmod(int(_dur_secs), 3600)
+                            mins, sec = divmod(remainder, 60)
+                            dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
+                        except Exception:
+                            pass
+
                         log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "simpleline")
-                        text = _whisper_transcribe(fpath)
+                        # Check if pause was requested — Whisper can't be interrupted mid-file,
+                        # so inform the user it will pause after the current file finishes.
+                        if pause_event.is_set() and not cancel_event.is_set():
+                            log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
+                        text = _whisper_transcribe(fpath, duration=_dur_secs)
                         source = "Whisper"
 
                         if not text:
@@ -4457,23 +4528,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             err_count += 1
                             continue
 
-                        # Get date/duration from file mtime
+                        # Get date from file mtime
                         mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
                         year_num, month_num = mtime.year, mtime.month
                         upload_date = mtime.strftime("%Y%m%d")
-
-                        # Try to get duration from file
-                        dur_str = ""
-                        try:
-                            probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
-                                         "format=duration", "-of", "csv=p=0", fpath]
-                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
-                            secs = float(probe_result.stdout.strip())
-                            hrs, remainder = divmod(int(secs), 3600)
-                            mins, sec = divmod(remainder, 60)
-                            dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
-                        except Exception:
-                            pass
 
                         txt_path, subfolder = _get_transcript_filename(
                             ch_name, folder, split_years, split_months, combined,

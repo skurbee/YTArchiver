@@ -110,7 +110,7 @@ _transcribe_queue = []  # list of (ch_name, ch_url, folder, split_years, split_m
 _transcribe_queue_lock = threading.Lock()
 _whisper_model = None  # unused legacy, kept for compat
 _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
-_punct_pipe = None  # transformers NER pipeline for punctuation restoration
+_punct_proc = None  # persistent punctuation subprocess (model stays loaded on GPU)
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 
 # Unified queue ordering — tracks insertion order across all queue types.
@@ -1515,7 +1515,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.8 - 03.10.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.9 - 03.10.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3141,11 +3141,17 @@ def sync_single_channel():
                     _notif_msg += " (batch — more remaining)"
                 show_notification("YT Archiver — Sync complete", _notif_msg)
 
+                _skipped_list = _last_run_counts.get("skipped_titles", [])
+                _skip_n = len(_skipped_list)
                 log("\n" + "=" * 45 + "\n", "summary")
-                log(f"TOTAL SESSION SUMMARY:\n", "summary")
-                log(f"Downloaded: {session_totals['dl']}\n", "summary")
+                log(f"CHANNEL SUMMARY:\n", "summary")
+                log(f"Downloaded: {session_totals['dl']}, Skipped: {_skip_n}\n", "summary")
                 if session_totals['err'] > 0:
                     log(f"Errors: {session_totals['err']}\n", "summary")
+                if _skipped_list:
+                    log(f"Skipped videos:\n", "summary")
+                    for _i, (_title, _reason) in enumerate(_skipped_list, 1):
+                        log(f"  {_i}. {_title}  — {_reason}\n", "filterskip")
                 log("=" * 45 + "\n", "summary")
                 log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
@@ -4169,6 +4175,191 @@ for line in sys.stdin:
 '''
 
 
+# Punctuation helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
+_PUNCT_SCRIPT = r'''
+import sys, json, io, re, os, logging
+
+_out = sys.stdout
+sys.stdout = io.StringIO()
+sys.stderr = io.StringIO()
+
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+for _name in ("transformers", "huggingface_hub", "safetensors", "transformers.modeling_utils"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+
+try:
+    from transformers import pipeline as tf_pipeline
+    import torch
+
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
+                       aggregation_strategy="none",
+                       device=0 if device_str == "cuda" else -1)
+
+    _out.write(json.dumps({"status": "ready", "device": device_str}) + "\n")
+    _out.flush()
+except Exception as e:
+    _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
+    _out.flush()
+    sys.exit(1)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        text = req.get("text", "")
+    except json.JSONDecodeError:
+        continue
+    if not text:
+        _out.write(json.dumps({"status": "ok", "text": ""}) + "\n")
+        _out.flush()
+        continue
+
+    try:
+        cleaned = re.sub(r"(?<!\d)[.,;:!?](?!\d)", "", text)
+        words = cleaned.split()
+        if not words:
+            _out.write(json.dumps({"status": "ok", "text": text}) + "\n")
+            _out.flush()
+            continue
+
+        chunk_size = 230
+        overlap = 5 if len(words) > chunk_size else 0
+
+        def _chunk(lst, n, stride):
+            for i in range(0, len(lst), n - stride):
+                yield lst[i:i + n]
+
+        batches = list(_chunk(words, chunk_size, overlap))
+        if len(batches) > 1 and len(batches[-1]) <= overlap:
+            batches.pop()
+
+        tagged = []
+        for batch in batches:
+            ov = 0 if batch is batches[-1] else overlap
+            text_chunk = " ".join(batch)
+            result = pipe(text_chunk)
+            char_index = 0
+            result_index = 0
+            for word in batch[:len(batch) - ov]:
+                char_index += len(word) + 1
+                label = "0"
+                while result_index < len(result) and char_index > result[result_index]["end"]:
+                    label = result[result_index]["entity"]
+                    result_index += 1
+                tagged.append((word, label))
+
+        out = ""
+        for word, label in tagged:
+            out += word
+            if label == "0":
+                out += " "
+            elif label in ".,?-:":
+                out += label + " "
+        out = out.strip()
+
+        out = re.sub(r"([.!?]\s+)(\w)", lambda m: m.group(1) + m.group(2).upper(), out)
+        if out:
+            out = out[0].upper() + out[1:]
+
+        _out.write(json.dumps({"status": "ok", "text": out}) + "\n")
+        _out.flush()
+    except Exception as e:
+        _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
+        _out.flush()
+'''
+
+
+def _check_punct_installed():
+    """Check if transformers is installed under Python 3.11."""
+    if not os.path.exists(_WHISPER_PYTHON):
+        return False
+    try:
+        result = subprocess.run(
+            [_WHISPER_PYTHON, "-c", "from transformers import pipeline; print('ok')"],
+            capture_output=True, text=True, timeout=30, startupinfo=startupinfo
+        )
+        return result.returncode == 0 and "ok" in result.stdout
+    except Exception:
+        return False
+
+
+def _install_punct_blocking():
+    """Install transformers under Python 3.11. Returns True on success."""
+    if not os.path.exists(_WHISPER_PYTHON):
+        log(f"  ⚠ Python 3.11 not found at {_WHISPER_PYTHON}\n", "red")
+        return False
+    try:
+        log("  Installing transformers library for punctuation...\n", "simpleline")
+        result = subprocess.run(
+            [_WHISPER_PYTHON, "-m", "pip", "install", "transformers"],
+            capture_output=True, text=True, timeout=600, startupinfo=startupinfo
+        )
+        if result.returncode == 0:
+            log("  ✓ Punctuation library installed.\n", "simpleline_green")
+            return True
+        else:
+            log(f"  ⚠ Punctuation library install failed: {result.stderr[:300]}\n", "red")
+            return False
+    except Exception as e:
+        log(f"  ⚠ Punctuation library install error: {e}\n", "red")
+        return False
+
+
+def _start_punct_process():
+    """Start the persistent punctuation subprocess under Python 3.11. Returns True if ready."""
+    global _punct_proc
+    if _punct_proc is not None and _punct_proc.poll() is None:
+        return True  # Already running
+
+    try:
+        log("  Loading punctuation model...\n", "simpleline")
+        _punct_proc = subprocess.Popen(
+            [_WHISPER_PYTHON, "-c", _PUNCT_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, startupinfo=startupinfo
+        )
+        ready_line = _punct_proc.stdout.readline().strip()
+        if ready_line:
+            info = json.loads(ready_line)
+            if info.get("status") == "ready":
+                log(f"  ✓ Punctuation model loaded ({info.get('device', '?').upper()}).\n", "simpleline_green")
+                return True
+            elif info.get("status") == "error":
+                log(f"  ⚠ Punctuation model failed: {info.get('text', 'unknown')}\n", "red")
+                _stop_punct_process()
+                return False
+        log("  ⚠ Punctuation process did not start correctly.\n", "red")
+        _stop_punct_process()
+        return False
+    except Exception as e:
+        log(f"  ⚠ Failed to start punctuation process: {e}\n", "red")
+        _stop_punct_process()
+        return False
+
+
+def _stop_punct_process():
+    """Stop the persistent punctuation subprocess."""
+    global _punct_proc
+    if _punct_proc is not None:
+        try:
+            _punct_proc.stdin.close()
+            _punct_proc.terminate()
+            _punct_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _punct_proc.kill()
+            except Exception:
+                pass
+        _punct_proc = None
+
+
 def _check_whisper_installed():
     """Check if openai-whisper + CUDA PyTorch is installed under Python 3.11."""
     if not os.path.exists(_WHISPER_PYTHON):
@@ -4316,127 +4507,48 @@ def _whisper_transcribe(audio_path, duration=0, title=""):
 
 # ─── Punctuation restoration (for YouTube auto-captions) ─────────────────────
 def _load_punctuation_model():
-    """Load the punctuation restoration NER pipeline. Returns True if ready."""
-    global _punct_pipe
-    if _punct_pipe is not None:
+    """Start the punctuation restoration subprocess on GPU. Returns True if ready."""
+    global _punct_proc
+    if _punct_proc is not None and _punct_proc.poll() is None:
         return True
-    try:
-        import sys as _sys, io as _io, os as _os, logging as _logging
 
-        # Suppress ALL console output during model load (prevents CMD window
-        # flashing when packaged as exe, and noisy warnings when run as .py)
-        _saved_stdout = _sys.stdout
-        _saved_stderr = _sys.stderr
-        _sys.stdout = _io.StringIO()
-        _sys.stderr = _io.StringIO()
-
-        # Suppress noisy transformers/HF warnings
-        _os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-        _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-        _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-        # Set logging levels to suppress transformers/HF/safetensors warnings
-        for _logger_name in ("transformers", "huggingface_hub", "safetensors",
-                              "transformers.modeling_utils"):
-            _logging.getLogger(_logger_name).setLevel(_logging.ERROR)
-
-        try:
-            from transformers import pipeline as tf_pipeline
-            import torch as _torch
-        finally:
-            # Restore stdout/stderr after imports
-            _sys.stdout = _saved_stdout if _saved_stdout is not None else _io.StringIO()
-            _sys.stderr = _saved_stderr if _saved_stderr is not None else _io.StringIO()
-
-        log("  Loading punctuation model...\n", "simpleline")
-
-        # Redirect again during model download/load (tqdm, safetensors report)
-        _saved_stdout2 = _sys.stdout
-        _saved_stderr2 = _sys.stderr
-        _sys.stdout = _io.StringIO()
-        _sys.stderr = _io.StringIO()
-        try:
-            if _torch.cuda.is_available():
-                _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
-                                          aggregation_strategy="none", device=0)
-            else:
-                _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
-                                          aggregation_strategy="none")
-        finally:
-            _sys.stdout = _saved_stdout2 if _saved_stdout2 is not None else _io.StringIO()
-            _sys.stderr = _saved_stderr2 if _saved_stderr2 is not None else _io.StringIO()
-
-        log("  ✓ Punctuation model loaded.\n", "simpleline_green")
-        return True
-    except ImportError:
-        log("  ⚠ Punctuation model not available (transformers not installed).\n", "red")
+    if not os.path.exists(_WHISPER_PYTHON):
+        log("  ⚠ Punctuation model unavailable (Python 3.11 not found).\n", "red")
         return False
-    except Exception as e:
-        log(f"  ⚠ Failed to load punctuation model: {e}\n", "red")
-        return False
+
+    # Check / install transformers in the CUDA Python environment
+    if not _check_punct_installed():
+        if not _install_punct_blocking():
+            return False
+
+    return _start_punct_process()
 
 
 def _punctuate_text(text):
-    """Restore punctuation and capitalization to unpunctuated text.
+    """Restore punctuation and capitalization via the GPU subprocess.
 
-    Uses the oliverguhr/fullstop-punctuation-multilang-large model to add
-    periods, commas, question marks, etc. Returns original text if model
-    is unavailable.
+    Returns original text if subprocess is unavailable or errors.
     """
-    if _punct_pipe is None:
+    global _punct_proc
+    if _punct_proc is None or _punct_proc.poll() is not None:
         return text
     try:
-        # Preprocess: strip existing punctuation (except in numbers)
-        cleaned = re.sub(r"(?<!\d)[.,;:!?](?!\d)", "", text)
-        words = cleaned.split()
-        if not words:
+        request = json.dumps({"text": text})
+        _punct_proc.stdin.write(request + "\n")
+        _punct_proc.stdin.flush()
+
+        response_line = _punct_proc.stdout.readline().strip()
+        if not response_line:
             return text
-
-        # Overlap chunking for long texts (model context ~230 tokens)
-        chunk_size = 230
-        overlap = 5 if len(words) > chunk_size else 0
-
-        def _chunk(lst, n, stride):
-            for i in range(0, len(lst), n - stride):
-                yield lst[i:i + n]
-
-        batches = list(_chunk(words, chunk_size, overlap))
-        if len(batches) > 1 and len(batches[-1]) <= overlap:
-            batches.pop()
-
-        tagged = []
-        for batch in batches:
-            ov = 0 if batch is batches[-1] else overlap
-            text_chunk = " ".join(batch)
-            result = _punct_pipe(text_chunk)
-            char_index = 0
-            result_index = 0
-            for word in batch[:len(batch) - ov]:
-                char_index += len(word) + 1
-                label = "0"
-                while result_index < len(result) and char_index > result[result_index]["end"]:
-                    label = result[result_index]["entity"]
-                    result_index += 1
-                tagged.append((word, label))
-
-        # Build output with punctuation
-        out = ""
-        for word, label in tagged:
-            out += word
-            if label == "0":
-                out += " "
-            elif label in ".,?-:":
-                out += label + " "
-        out = out.strip()
-
-        # Capitalize after sentence-ending punctuation and at start
-        out = re.sub(r"([.!?]\s+)(\w)", lambda m: m.group(1) + m.group(2).upper(), out)
-        if out:
-            out = out[0].upper() + out[1:]
-        return out
+        result = json.loads(response_line)
+        if result.get("status") == "ok":
+            return result.get("text", text)
+        else:
+            log(f"    ⚠ Punctuation error: {result.get('text', 'unknown')}\n", "red")
+            return text
     except Exception:
-        return text  # fallback to unpunctuated on any error
+        _stop_punct_process()  # Kill broken process
+        return text
 
 
 def _fetch_auto_captions(video_id, temp_dir):
@@ -5133,6 +5245,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         finally:
             _transcribe_running = False
             _stop_whisper_process()  # Free GPU memory
+            _stop_punct_process()   # Free GPU memory
             _tray_stop_spin()
             _update_tray_tooltip("YT Archiver — Idle")
             if root.winfo_exists():
@@ -6285,6 +6398,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
     skip_count = 0
     err_count = 0
     dur_count = 0
+    _skipped_dur_titles = []  # titles of videos skipped by duration/filter
     current_vid_id = None
     current_merge_dest = ""
     current_dl_size_bytes = ""
@@ -6670,12 +6784,13 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                 else:
                     _filter_reason = "Filtered: outside duration range."
 
+                # Extract title for summary enumeration (both modes)
+                _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
+                _skip_title_raw = _m_title.group(1).strip() if _m_title else "Unknown"
+                _skipped_dur_titles.append((_skip_title_raw, _filter_reason))
+
                 if is_simple_mode:
-                    _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
-                    if _m_title:
-                        _skip_title = _m_title.group(1).strip()
-                    else:
-                        _skip_title = "Unknown"
+                    _skip_title = _skip_title_raw
                     _skip_tmax = 49
                     if len(_skip_title) > _skip_tmax:
                         _skip_title = _skip_title[:_skip_tmax - 3] + "..."
@@ -6699,6 +6814,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                     session_totals["dur"] += 1
                     _vid = current_vid_id or "video"
                     _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
+                    _skipped_dur_titles.append((_skip_title, "Members-only content."))
                     if is_simple_mode:
                         _skip_tmax = 49
                         if len(_skip_title) > _skip_tmax:
@@ -6772,7 +6888,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
     finally:
         cleanup_process(proc)
 
-    _last_run_counts.update({"dl": dl_count, "skip": skip_count, "dur": dur_count, "err": err_count})
+    _last_run_counts.update({"dl": dl_count, "skip": skip_count, "dur": dur_count, "err": err_count,
+                             "skipped_titles": list(_skipped_dur_titles)})
     return dl_count
 
 
@@ -7387,6 +7504,7 @@ def stop_downloads():
     _reorg_running = False
     _transcribe_running = False
     _stop_whisper_process()  # Kill Whisper subprocess on cancel
+    _stop_punct_process()   # Kill punctuation subprocess on cancel
     _current_job["label"] = None
     _current_job["url"] = None
     _tray_stop_spin()
@@ -9799,8 +9917,9 @@ def on_closing():
         except Exception:
             pass
 
-    # Stop Whisper subprocess if running
+    # Stop Whisper/punctuation subprocesses if running
     _stop_whisper_process()
+    _stop_punct_process()
 
     # Clear pause so worker threads can exit cleanly
     pause_event.clear()

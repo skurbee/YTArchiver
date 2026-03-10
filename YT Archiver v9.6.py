@@ -233,11 +233,27 @@ def log(text, tag=None):
                         use_tag = "summary"
 
                 # Whisper progress: always replace in-place (both simple + verbose)
+                # Split percentage out and render it green
                 if use_tag == "whisper_progress":
                     ranges = log_box.tag_ranges("whisper_progress")
                     if ranges:
                         log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(tk.END, text, "whisper_progress")
+                    # Also remove the green pct portion
+                    pct_ranges = log_box.tag_ranges("whisper_pct")
+                    if pct_ranges:
+                        log_box.delete(pct_ranges[0], pct_ranges[1])
+                    # Split text to colorize the percentage green
+                    import re as _re_wp
+                    _wp_match = _re_wp.search(r'(\d+%)', text)
+                    if _wp_match:
+                        _before = text[:_wp_match.start()]
+                        _pct_str = _wp_match.group(1)
+                        _after = text[_wp_match.end():]
+                        log_box.insert(tk.END, _before, "whisper_progress")
+                        log_box.insert(tk.END, _pct_str, "whisper_pct")
+                        log_box.insert(tk.END, _after, "whisper_progress")
+                    else:
+                        log_box.insert(tk.END, text, "whisper_progress")
                     if at_bottom:
                         log_box.see(tk.END)
                     log_box.config(state="disabled")
@@ -272,6 +288,9 @@ def log(text, tag=None):
                 wp_ranges = log_box.tag_ranges("whisper_progress")
                 if wp_ranges:
                     log_box.delete(wp_ranges[0], wp_ranges[1])
+                wpp_ranges = log_box.tag_ranges("whisper_pct")
+                if wpp_ranges:
+                    log_box.delete(wpp_ranges[0], wpp_ranges[1])
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary")):
@@ -1388,7 +1407,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.4 - 03.10.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.6 - 03.10.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1717,6 +1736,7 @@ log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consola
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -3915,6 +3935,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
 
 def _parse_vtt_to_text(vtt_path):
     """Parse a .vtt subtitle file into clean plain text."""
+    import html as _html_mod
     try:
         with open(vtt_path, "r", encoding="utf-8") as f:
             raw = f.read()
@@ -3939,7 +3960,10 @@ def _parse_vtt_to_text(vtt_path):
             continue
         # Strip HTML tags
         line = re.sub(r'<[^>]+>', '', line)
-        line = line.strip()
+        # Decode HTML entities (&nbsp; &amp; &lt; etc.) to plain text
+        line = _html_mod.unescape(line)
+        # Normalize whitespace (non-breaking spaces, multiple spaces, etc.)
+        line = re.sub(r'\s+', ' ', line).strip()
         if not line:
             continue
         # Deduplicate consecutive identical lines (YouTube auto-subs repeat)
@@ -3953,6 +3977,7 @@ def _parse_vtt_to_text(vtt_path):
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
 _WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
+_whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
 _WHISPER_SCRIPT = r'''
@@ -3967,7 +3992,9 @@ sys.stdout = io.StringIO()
 import whisper, torch
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model = whisper.load_model("large-v3", device=device)
+import os as _os
+_model_name = _os.environ.get("WHISPER_MODEL", "large-v3")
+model = whisper.load_model(_model_name, device=device)
 _out.write(json.dumps({"status": "ready", "device": device}) + "\n")
 _out.flush()
 
@@ -4086,11 +4113,14 @@ def _start_whisper_process():
         return True  # Already running
 
     try:
-        log("  Loading Whisper model (large-v3) on GPU... this takes ~10 sec\n", "simpleline")
+        _model = _whisper_model_choice
+        log(f"  Loading Whisper model ({_model}) on GPU... this takes ~10 sec\n", "simpleline")
+        _env = os.environ.copy()
+        _env["WHISPER_MODEL"] = _model
         _whisper_proc = subprocess.Popen(
             [_WHISPER_PYTHON, "-c", _WHISPER_SCRIPT],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, startupinfo=startupinfo
+            text=True, bufsize=1, startupinfo=startupinfo, env=_env
         )
         # Wait for "ready" message (model loading)
         ready_line = _whisper_proc.stdout.readline().strip()
@@ -4098,7 +4128,7 @@ def _start_whisper_process():
             import json as _json
             info = _json.loads(ready_line)
             if info.get("status") == "ready":
-                log(f"  ✓ Whisper model loaded (large-v3, {info.get('device', '?').upper()}).\n", "simpleline_green")
+                log(f"  ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
                 return True
         log("  ⚠ Whisper process did not start correctly.\n", "red")
         return False
@@ -4135,7 +4165,7 @@ def _whisper_transcribe(audio_path, duration=0, title=""):
             return None
     try:
         import json as _json
-        _title_part = f" ({title})" if title else ""
+        _title_part = f' "{title}"' if title else ""
         log(f"    Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
@@ -4475,7 +4505,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         return
 
     def _worker():
-        global _transcribe_running
+        global _transcribe_running, _whisper_model_choice
         _transcribe_running = True
         _current_job["label"] = f"Transcribe {ch_name}"
         _current_job["url"] = ch_url
@@ -4590,6 +4620,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             err_count = 0
             idx = 0
             _modified_txt_files = set()  # track which .txt files we wrote to, for post-sort
+            _transcription_log = []  # [(fname, source, elapsed_secs, error_str_or_None)]
+            _t_total_start = time.time()
 
             # ── Phase A: Process matched files (auto-captions first) ────
             for fname, fpath, vid_id in matched:
@@ -4607,6 +4639,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     break
 
                 log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "simpleline")
+                _t_vid_start = time.time()
 
                 text = _fetch_auto_captions(vid_id, temp_dir)
                 source = "auto-captions"
@@ -4657,9 +4690,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _modified_txt_files.add(txt_path)
                 except Exception as e:
                     log(f"  ⚠ Error writing transcript: {e}\n", "red")
+                    _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
                     err_count += 1
                     continue
 
+                _vid_elapsed = time.time() - _t_vid_start
+                _transcription_log.append((fname, source, _vid_elapsed, None))
                 done_count += 1
                 log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
 
@@ -4667,8 +4703,90 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if unmatched and not cancel_event.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
                 unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+
+                # ── Model selection dialog ──
+                log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
+                _model_result = [None]
+
+                def _ask_model():
+                    _dlg = tk.Toplevel(root)
+                    _dlg.title("Whisper Model Selection")
+                    _dlg.configure(bg=C_BG)
+                    _dlg.resizable(False, False)
+                    _dlg.transient(root)
+                    _dlg.grab_set()
+
+                    # Center on root window
+                    _dlg.update_idletasks()
+                    _rx = root.winfo_rootx() + root.winfo_width() // 2
+                    _ry = root.winfo_rooty() + root.winfo_height() // 2
+                    _dlg.geometry(f"+{_rx - 160}+{_ry - 120}")
+
+                    tk.Label(_dlg, text="Which model to use for Whisper?",
+                             bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                             pady=10, padx=20).pack(fill="x")
+                    tk.Label(_dlg, text=f"{len(unmatched)} video(s) without YouTube captions",
+                             bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+                             padx=20).pack(fill="x")
+
+                    _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
+                    _btn_frame.pack(fill="x", padx=20)
+
+                    _models = [
+                        ("tiny",     "Fastest  (~30-50× realtime)",  "tiny"),
+                        ("small",    "Fast  (~15-20× realtime)",     "small"),
+                        ("medium",   "Balanced  (~7-10× realtime)",  "medium"),
+                        ("large-v3", "Best quality  (~3-5× realtime)", "large-v3"),
+                    ]
+
+                    def _pick(m, dlg=_dlg):
+                        _model_result[0] = m
+                        dlg.destroy()
+
+                    for label, desc, model_id in _models:
+                        _row = tk.Frame(_btn_frame, bg=C_BG)
+                        _row.pack(fill="x", pady=2)
+                        _b = tk.Button(_row, text=label, width=10,
+                                       bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                                       activeforeground=C_TEXT, relief="flat", bd=0,
+                                       font=("Segoe UI", 9, "bold"), cursor="hand2",
+                                       command=lambda m=model_id: _pick(m))
+                        _b.pack(side="left", padx=(0, 8))
+                        tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                                 font=("Segoe UI", 9)).pack(side="left")
+                        if model_id == "large-v3":
+                            tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
+                                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+                    # Skip button
+                    tk.Frame(_dlg, bg=C_BG, height=5).pack()
+                    tk.Button(_dlg, text="Skip Whisper (use only YT captions)",
+                              bg="#3a3a3a", fg=C_DIM, activebackground="#555555",
+                              activeforeground=C_TEXT, relief="flat", bd=0,
+                              font=("Segoe UI", 8), cursor="hand2",
+                              command=lambda: _pick("skip")).pack(pady=(0, 12))
+
+                    _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("large-v3"))
+
+                if root.winfo_exists():
+                    root.after(0, _ask_model)
+                    while _model_result[0] is None and not cancel_event.is_set():
+                        time.sleep(0.1)
+
+                if cancel_event.is_set():
+                    log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                    # fall through — _whisper_available stays None, nothing will run
+                elif _model_result[0] == "skip":
+                    log(f"  Skipping {len(unmatched)} video(s) without YouTube captions.\n", "simpleline")
+                    _whisper_available = False
+                else:
+                    _whisper_model_choice = _model_result[0]
+                    # If model changed, stop old process so it relaunches with new model
+                    _stop_whisper_process()
+                    log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
+
                 # Check if Whisper is available (only once)
-                if _whisper_available is None:
+                if not cancel_event.is_set() and _model_result[0] != "skip" and _whisper_available is None:
                     # First check if CUDA GPU is even present on this system
                     _has_cuda = False
                     try:
@@ -4736,6 +4854,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             pass
 
                         log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "simpleline")
+                        _t_vid_start = time.time()
                         # Check if pause was requested — Whisper can't be interrupted mid-file,
                         # so inform the user it will pause after the current file finishes.
                         if pause_event.is_set() and not cancel_event.is_set():
@@ -4745,6 +4864,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         if not text:
                             log(f"  [{idx}/{total}] {fname} — Whisper returned empty. Skipping.\n", "simpleline")
+                            _transcription_log.append((fname, source, time.time() - _t_vid_start, "empty result"))
                             err_count += 1
                             continue
 
@@ -4760,7 +4880,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         date_fmt = _format_upload_date(upload_date)
                         dur_fmt = _format_duration(dur_str)
-                        entry = f"===({fname}), {date_fmt}, {dur_fmt}, (WHISPER TRANSCRIBED)===\n{text}\n\n\n"
+                        _w_model_tag = f"WHISPER {_whisper_model_choice.upper()}"
+                        entry = f"===({fname}), {date_fmt}, {dur_fmt}, ({_w_model_tag})===\n{text}\n\n\n"
 
                         try:
                             with open(txt_path, "a", encoding="utf-8") as f:
@@ -4768,9 +4889,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _modified_txt_files.add(txt_path)
                         except Exception as e:
                             log(f"  ⚠ Error writing transcript: {e}\n", "red")
+                            _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
                             err_count += 1
                             continue
 
+                        _vid_elapsed = time.time() - _t_vid_start
+                        _transcription_log.append((fname, source, _vid_elapsed, None))
                         done_count += 1
                         log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
                 else:
@@ -4792,6 +4916,32 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if err_count:
                     log(f", {err_count} skipped", "simpleline_green")
                 log(".\n", "simpleline_green")
+
+            # ── Transcription Summary ──
+            if _transcription_log:
+                _t_total_elapsed = time.time() - _t_total_start
+                _t_hrs, _t_rem = divmod(int(_t_total_elapsed), 3600)
+                _t_mins, _t_secs = divmod(_t_rem, 60)
+                if _t_hrs:
+                    _total_str = f"{_t_hrs}h {_t_mins}m {_t_secs}s"
+                elif _t_mins:
+                    _total_str = f"{_t_mins}m {_t_secs}s"
+                else:
+                    _total_str = f"{_t_secs}s"
+
+                log("\n" + "=" * 50 + "\n", "summary")
+                log(f"TRANSCRIPTION SUMMARY: {ch_name}\n", "summary")
+                log(f"Total time: {_total_str}\n", "summary")
+                log(f"Completed: {done_count}  |  Errors: {err_count}\n", "summary")
+                log("-" * 50 + "\n", "summary")
+                for _tl_name, _tl_source, _tl_secs, _tl_err in _transcription_log:
+                    _tl_m, _tl_s = divmod(int(_tl_secs), 60)
+                    _tl_time = f"{_tl_m}m {_tl_s:02d}s" if _tl_m else f"{_tl_s}s"
+                    if _tl_err:
+                        log(f"  ✗ {_tl_name}  [{_tl_source}]  {_tl_time}  ERROR: {_tl_err}\n", "red")
+                    else:
+                        log(f"  ✓ {_tl_name}  [{_tl_source}]  {_tl_time}\n", "dim")
+                log("=" * 50 + "\n", "summary")
 
         except Exception as e:
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
@@ -4911,7 +5061,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("whisper_progress", {"foreground": C_TEXT})]:
+                             ("whisper_progress", {"foreground": C_TEXT}),
+                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -7165,8 +7316,10 @@ def _get_queue_items():
         for i, ch in enumerate(_sync_queue):
             name = ch.get("name", "?")
             mode = ch.get("mode", "full")
-            if mode == "full":
-                lbl = f"Sync {name}" if ch.get("initialized", False) else f"Initialize {name}"
+            if not ch.get("initialized", False):
+                lbl = f"Initialize {name}"
+            elif mode == "full":
+                lbl = f"Sync {name}"
             else:
                 lbl = f"Check {name} for new videos"
             sync_map[ch["url"]] = (lbl, "sync", i)
@@ -8444,13 +8597,15 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("whisper_progress", {"foreground": C_TEXT})]:
+                             ("whisper_progress", {"foreground": C_TEXT}),
+                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpledownload", "simplestatus", "dlprogress", "scanline",
-                 "pauselog", "livestream", "filterskip", "dim", "whisper_progress")
+                 "pauselog", "livestream", "filterskip", "dim", "whisper_progress",
+                 "whisper_pct")
 
 
 def _sync_mini_logs_from_main():

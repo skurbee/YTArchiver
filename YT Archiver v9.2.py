@@ -1374,7 +1374,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.1 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.2 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4354,8 +4354,8 @@ def _sort_transcript_entries(txt_paths):
                     sort_key = "00000000"  # unknown date → put first
                 dated_entries.append((sort_key, entry))
 
-            # Sort chronologically
-            dated_entries.sort(key=lambda x: x[0])
+            # Sort newest first (reverse chronological)
+            dated_entries.sort(key=lambda x: x[0], reverse=True)
 
             # Rewrite file
             sorted_content = ""
@@ -4491,9 +4491,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 else:
                     unmatched.append((fname, fpath))
 
-            # Sort by file modification time so transcripts are chronological
-            matched.sort(key=lambda x: os.path.getmtime(x[1]))
-            unmatched.sort(key=lambda x: os.path.getmtime(x[1]))
+            # Sort by file modification time, newest first
+            matched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+            unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
 
             log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
@@ -4592,8 +4592,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not cancel_event.is_set():
-                # Re-sort unmatched by mtime (Phase A may have added failed items)
-                unmatched.sort(key=lambda x: os.path.getmtime(x[1]))
+                # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
+                unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
                 # Check if Whisper is available (only once)
                 if _whisper_available is None:
                     # First check if CUDA GPU is even present on this system

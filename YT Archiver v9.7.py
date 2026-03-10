@@ -171,6 +171,9 @@ _ui_queue = collections.deque()
 # during downloads).  Updated on the main thread via trace callback.
 _is_simple_mode = False
 
+# Whisper progress dot animation state
+_whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
+
 
 def _flush_ui_queue():
     """Process pending UI callbacks on the main thread with a time budget."""
@@ -233,25 +236,41 @@ def log(text, tag=None):
                         use_tag = "summary"
 
                 # Whisper progress: always replace in-place (both simple + verbose)
-                # Split percentage out and render it green
+                # Split percentage out and render it green, with animated trailing dots
                 if use_tag == "whisper_progress":
-                    ranges = log_box.tag_ranges("whisper_progress")
-                    if ranges:
-                        log_box.delete(ranges[0], ranges[1])
-                    # Also remove the green pct portion
-                    pct_ranges = log_box.tag_ranges("whisper_pct")
-                    if pct_ranges:
-                        log_box.delete(pct_ranges[0], pct_ranges[1])
+                    # Delete ALL whisper_progress/pct/dots ranges
+                    for _wp_tag in ("whisper_dots", "whisper_pct", "whisper_progress"):
+                        while True:
+                            _wr = log_box.tag_ranges(_wp_tag)
+                            if not _wr:
+                                break
+                            log_box.delete(_wr[0], _wr[1])
                     # Split text to colorize the percentage green
                     import re as _re_wp
                     _wp_match = _re_wp.search(r'(\d+%)', text)
                     if _wp_match:
                         _before = text[:_wp_match.start()]
                         _pct_str = _wp_match.group(1)
-                        _after = text[_wp_match.end():]
+                        # Strip trailing dots/newline — we animate those separately
+                        _after_raw = text[_wp_match.end():]
+                        _suffix = _after_raw.rstrip(".\n ").rstrip()
                         log_box.insert(tk.END, _before, "whisper_progress")
                         log_box.insert(tk.END, _pct_str, "whisper_pct")
-                        log_box.insert(tk.END, _after, "whisper_progress")
+                        if _suffix:
+                            log_box.insert(tk.END, _suffix, "whisper_progress")
+                        # Animated dots
+                        _dot_chars = [".", "..", "..."]
+                        _whisper_dots["base_before"] = _before
+                        _whisper_dots["pct_str"] = _pct_str
+                        _whisper_dots["suffix"] = _suffix
+                        _d = _dot_chars[_whisper_dots["idx"] % 3]
+                        log_box.insert(tk.END, _d + "\n", "whisper_dots")
+                        # Start dot animation timer if not already running
+                        if not _whisper_dots["active"]:
+                            _whisper_dots["active"] = True
+                            _whisper_dots["idx"] = 0
+                            if 'root' in globals() and root.winfo_exists():
+                                _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
                     else:
                         log_box.insert(tk.END, text, "whisper_progress")
                     if at_bottom:
@@ -265,17 +284,27 @@ def log(text, tag=None):
                         return
 
                     if use_tag not in ("red", "simpleline", "simpleline_green", "summary", "header",
-                                       "simpledownload", "pauselog", "livestream", "filterskip"):
+                                       "simpledownload", "pauselog", "livestream", "filterskip",
+                                       "transcribe_using"):
                         if "SUMMARY:" not in text and "TOTAL SESSION" not in text and "===" not in text:
                             log_box.config(state="disabled")
                             return
 
-                    if use_tag in ("simpleline", "simpleline_green"):
+                    if use_tag in ("simpleline", "simpleline_green", "transcribe_using"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             log_box.delete(ranges[0], ranges[1])
 
-                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "red", "summary"):
+                    # Purge "using/fetching" lines when a done line arrives
+                    if use_tag == "simpleline_green":
+                        for _tu_tag in ("transcribe_using",):
+                            while True:
+                                _tu_r = log_box.tag_ranges(_tu_tag)
+                                if not _tu_r:
+                                    break
+                                log_box.delete(_tu_r[0], _tu_r[1])
+
+                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "red", "summary", "transcribe_using"):
                         dl_ranges = log_box.tag_ranges("dlprogress")
                         if dl_ranges:
                             log_box.delete(dl_ranges[0], dl_ranges[1])
@@ -285,12 +314,13 @@ def log(text, tag=None):
                         log_box.delete(dl_ranges[0], dl_ranges[1])
 
                 # Clear whisper progress line when any other content is logged
-                wp_ranges = log_box.tag_ranges("whisper_progress")
-                if wp_ranges:
-                    log_box.delete(wp_ranges[0], wp_ranges[1])
-                wpp_ranges = log_box.tag_ranges("whisper_pct")
-                if wpp_ranges:
-                    log_box.delete(wpp_ranges[0], wpp_ranges[1])
+                _stop_whisper_dot_anim()
+                for _wp_tag in ("whisper_dots", "whisper_pct", "whisper_progress"):
+                    while True:
+                        _wr = log_box.tag_ranges(_wp_tag)
+                        if not _wr:
+                            break
+                        log_box.delete(_wr[0], _wr[1])
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary")):
@@ -332,6 +362,41 @@ def log(text, tag=None):
             sys.stdout.flush()
     except Exception:
         pass
+
+
+def _whisper_dot_tick():
+    """Animate the trailing dots on the Whisper progress line."""
+    if not _whisper_dots["active"]:
+        return
+    _whisper_dots["idx"] = (_whisper_dots["idx"] + 1) % 3
+    _dot_chars = [".", "..", "..."]
+    try:
+        if 'log_box' in globals() and log_box.winfo_exists():
+            log_box.config(state="normal")
+            # Only replace the dots portion
+            _dr = log_box.tag_ranges("whisper_dots")
+            if _dr:
+                log_box.delete(_dr[0], _dr[1])
+                log_box.insert(_dr[0], _dot_chars[_whisper_dots["idx"]] + "\n", "whisper_dots")
+            log_box.config(state="disabled")
+    except Exception:
+        pass
+    if _whisper_dots["active"] and 'root' in globals():
+        try:
+            _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
+        except Exception:
+            pass
+
+
+def _stop_whisper_dot_anim():
+    """Stop the whisper dot animation."""
+    _whisper_dots["active"] = False
+    if _whisper_dots["job"]:
+        try:
+            root.after_cancel(_whisper_dots["job"])
+        except Exception:
+            pass
+        _whisper_dots["job"] = None
 
 
 def log_progress_bar(current, total):
@@ -726,15 +791,30 @@ def show_notification(title, message):
         try:
             safe_title = title.replace("'", "''")
             safe_message = message.replace("'", "''")
+            # Windows Runtime toast shows "YT Archiver" as app name;
+            # fallback to NotifyIcon if WinRT types unavailable
             ps = (
+                "try{"
+                "[void][Windows.UI.Notifications.ToastNotificationManager,"
+                "Windows.UI.Notifications,ContentType=WindowsRuntime];"
+                "[void][Windows.Data.Xml.Dom.XmlDocument,"
+                "Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime];"
+                "$t=[Windows.UI.Notifications.ToastNotificationManager]::"
+                "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+                "$n=$t.GetElementsByTagName('text');"
+                f"[void]$n.Item(0).AppendChild($t.CreateTextNode('{safe_title}'));"
+                f"[void]$n.Item(1).AppendChild($t.CreateTextNode('{safe_message}'));"
+                "$toast=[Windows.UI.Notifications.ToastNotification]::new($t);"
+                "[Windows.UI.Notifications.ToastNotificationManager]::"
+                "CreateToastNotifier('YT Archiver').Show($toast)"
+                "}catch{"
                 "Add-Type -AssemblyName System.Windows.Forms;"
-                "$n = New-Object System.Windows.Forms.NotifyIcon;"
-                "$n.Icon = [System.Drawing.SystemIcons]::Information;"
-                "$n.Visible = $true;"
-                f"$n.ShowBalloonTip(6000, '{safe_title}', '{safe_message}', "
+                "$i=New-Object System.Windows.Forms.NotifyIcon;"
+                "$i.Icon=[System.Drawing.SystemIcons]::Information;"
+                "$i.Visible=$true;"
+                f"$i.ShowBalloonTip(6000,'{safe_title}','{safe_message}',"
                 "[System.Windows.Forms.ToolTipIcon]::None);"
-                "Start-Sleep -Seconds 7;"
-                "$n.Dispose()"
+                "Start-Sleep -Seconds 7;$i.Dispose()}"
             )
             subprocess.Popen(
                 ['powershell', '-WindowStyle', 'Hidden', '-Command', ps],
@@ -972,6 +1052,29 @@ def _generate_spin_frames(base_img, num_frames=12, color=(100, 180, 255, 220)):
     return frames
 
 
+def _generate_flash_frames(base_img, num_frames=8):
+    """Pre-generate pulsing red flash frames for transcription — highly visible.
+    Alternates between a bright red-tinted icon and the normal icon with a
+    large red dot, creating an unmistakable flashing effect.
+    """
+    frames = []
+    sz = base_img.size[0]
+    for i in range(num_frames):
+        # Sine wave for smooth pulse: 0.0 → 1.0 → 0.0
+        import math
+        t = (math.sin(i / num_frames * 2 * math.pi - math.pi / 2) + 1) / 2  # 0..1
+        alpha = int(60 + t * 180)  # range 60..240
+        frame = base_img.copy().convert("RGBA")
+        overlay = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        # Large red circle covering most of the icon
+        pad = max(2, sz // 6)
+        draw.ellipse([pad, pad, sz - pad, sz - pad], fill=(220, 40, 40, alpha))
+        frame = Image.alpha_composite(frame, overlay)
+        frames.append(frame)
+    return frames
+
+
 def _make_badge_icon(base_img, count):
     """Composite a bright green notification dot onto the icon."""
     img = base_img.copy().convert("RGBA")
@@ -1003,7 +1106,9 @@ def _tray_spin_tick():
         _tray_icon.icon = _frames[_tray_spin_idx]
     except Exception:
         pass
-    _tray_spin_job = threading.Timer(0.18, _tray_spin_tick)
+    # Red flash pulses slower (0.12s × 8 frames = ~1s cycle), blue spins faster
+    _interval = 0.12 if _tray_spin_use_red else 0.18
+    _tray_spin_job = threading.Timer(_interval, _tray_spin_tick)
     _tray_spin_job.daemon = True
     _tray_spin_job.start()
 
@@ -1133,7 +1238,7 @@ def _setup_tray_icon():
 
         # Pre-generate spin frames (blue for sync, red for transcription)
         _tray_spin_frames = _generate_spin_frames(_tray_base_img)
-        _tray_spin_frames_red = _generate_spin_frames(_tray_base_img, color=(220, 60, 60, 240))
+        _tray_spin_frames_red = _generate_flash_frames(_tray_base_img)
 
         _tray_icon = pystray.Icon(
             "YT Archiver",
@@ -1407,7 +1512,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.6 - 03.10.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.7 - 03.10.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1733,10 +1838,12 @@ log_box.tag_configure("dlprogress", foreground=C_TEXT)
 log_box.tag_configure("simplestatus", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
 log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
+log_box.tag_configure("transcribe_using", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
+log_box.tag_configure("whisper_dots", foreground=C_TEXT, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -3110,11 +3217,15 @@ def _process_sync_queue():
 
     # Find and select the channel in the tree, then sync it
     def _start_queued():
+        global _sync_running
         for item in settings_chan_tree.get_children():
             if settings_chan_tree.item(item)['values'][6] == next_ch["url"]:
                 settings_chan_tree.selection_set(item)
                 on_chan_list_select(None)
                 break
+        # Must clear _sync_running before calling sync_single_channel(),
+        # otherwise it sees True and re-queues instead of starting.
+        _sync_running = False
         sync_single_channel()
 
     if root.winfo_exists():
@@ -4638,7 +4749,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "simpleline")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text = _fetch_auto_captions(vid_id, temp_dir)
@@ -4646,14 +4757,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 if not text:
                     # Auto-captions failed — Whisper this file instead
-                    log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "simpleline")
+                    log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "transcribe_using")
                     unmatched.append((fname, fpath))
                     idx -= 1   # give back the slot — this file will be counted in Phase B
                     continue
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n", "simpleline")
+                    log(f"    Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -4697,7 +4808,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _vid_elapsed = time.time() - _t_vid_start
                 _transcription_log.append((fname, source, _vid_elapsed, None))
                 done_count += 1
-                log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
+                _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
+                _ve_str = f"(took {_ve_m}min {_ve_s:02d}sec)" if _ve_m else f"(took {_ve_s}sec)"
+                log(f"  [{idx}/{total}] {fname} — done ({source}) {_ve_str}\n", "simpleline_green")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not cancel_event.is_set():
@@ -4720,7 +4833,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _dlg.update_idletasks()
                     _rx = root.winfo_rootx() + root.winfo_width() // 2
                     _ry = root.winfo_rooty() + root.winfo_height() // 2
-                    _dlg.geometry(f"+{_rx - 160}+{_ry - 120}")
+                    _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
 
                     tk.Label(_dlg, text="Which model to use for Whisper?",
                              bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
@@ -4739,9 +4852,39 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         ("large-v3", "Best quality  (~3-5× realtime)", "large-v3"),
                     ]
 
+                    _DEFAULT_MODEL = "medium"
+                    _countdown = {"secs": 60, "job": None}
+
                     def _pick(m, dlg=_dlg):
+                        if _countdown["job"]:
+                            try:
+                                _dlg.after_cancel(_countdown["job"])
+                            except Exception:
+                                pass
                         _model_result[0] = m
-                        dlg.destroy()
+                        try:
+                            dlg.destroy()
+                        except Exception:
+                            pass
+
+                    # Countdown label
+                    _timer_lbl = tk.Label(_dlg, text=f"Auto-selecting {_DEFAULT_MODEL} in 60s...",
+                                          bg=C_BG, fg=C_DIM, font=("Segoe UI", 8),
+                                          padx=20)
+                    _timer_lbl.pack(fill="x", pady=(0, 4))
+
+                    def _tick():
+                        _countdown["secs"] -= 1
+                        if _countdown["secs"] <= 0:
+                            _pick(_DEFAULT_MODEL)
+                            return
+                        try:
+                            _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+                            _countdown["job"] = _dlg.after(1000, _tick)
+                        except Exception:
+                            pass
+
+                    _countdown["job"] = _dlg.after(1000, _tick)
 
                     for label, desc, model_id in _models:
                         _row = tk.Frame(_btn_frame, bg=C_BG)
@@ -4754,7 +4897,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _b.pack(side="left", padx=(0, 8))
                         tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
                                  font=("Segoe UI", 9)).pack(side="left")
-                        if model_id == "large-v3":
+                        if model_id == _DEFAULT_MODEL:
                             tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
                                      font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
 
@@ -4766,7 +4909,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                               font=("Segoe UI", 8), cursor="hand2",
                               command=lambda: _pick("skip")).pack(pady=(0, 12))
 
-                    _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick("large-v3"))
+                    _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
                 if root.winfo_exists():
                     root.after(0, _ask_model)
@@ -4853,7 +4996,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         except Exception:
                             pass
 
-                        log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "simpleline")
+                        log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "transcribe_using")
                         _t_vid_start = time.time()
                         # Check if pause was requested — Whisper can't be interrupted mid-file,
                         # so inform the user it will pause after the current file finishes.
@@ -4896,7 +5039,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))
                         done_count += 1
-                        log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
+                        _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
+                        _ve_str = f"(took {_ve_m}min {_ve_s:02d}sec)" if _ve_m else f"(took {_ve_s}sec)"
+                        log(f"  [{idx}/{total}] {fname} — done ({source}) {_ve_str}\n", "simpleline_green")
                 else:
                     err_count += len(unmatched)
 
@@ -4942,6 +5087,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     else:
                         log(f"  ✓ {_tl_name}  [{_tl_source}]  {_tl_time}\n", "dim")
                 log("=" * 50 + "\n", "summary")
+
+            # Record in autorun history
+            if done_count > 0 or err_count > 0:
+                _t_rec_elapsed = time.time() - _t_total_start
+                _record_transcription(done_count, err_count, _t_rec_elapsed,
+                                      channel_name=ch_name, skipped=0)
 
         except Exception as e:
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
@@ -5062,7 +5213,9 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
                              ("whisper_progress", {"foreground": C_TEXT}),
-                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")})]:
+                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("whisper_dots", {"foreground": C_TEXT}),
+                             ("transcribe_using", {"foreground": C_TEXT})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -7901,6 +8054,32 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
 _record_autorun = _record_sync
 
 
+def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", skipped=0):
+    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
+        "%I:%M%p").lower().lstrip("0")
+    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    mins = int(elapsed_secs // 60)
+    secs = int(elapsed_secs % 60)
+    if mins >= 60:
+        hrs = mins // 60
+        rem_mins = mins % 60
+        dur = f"took {hrs}h {rem_mins:02d}m"
+    elif mins:
+        dur = f"took {mins}m {secs:02d}s"
+    else:
+        dur = f"took {secs}s"
+    ch_part = f"  {channel_name}  —" if channel_name else " "
+    line = f"[Transcr.] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    with config_lock:
+        hist = config.setdefault("autorun_history", [])
+        hist.insert(0, line)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            config["autorun_history"] = hist[:AUTORUN_HISTORY_MAX]
+    save_config(config)
+    if root.winfo_exists():
+        root.after(0, _refresh_autorun_history)
+
+
 def _tick_countdown():
     try:
         if not root.winfo_exists():
@@ -8598,14 +8777,16 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
                              ("whisper_progress", {"foreground": C_TEXT}),
-                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")})]:
+                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("whisper_dots", {"foreground": C_TEXT}),
+                             ("transcribe_using", {"foreground": C_TEXT})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpledownload", "simplestatus", "dlprogress", "scanline",
                  "pauselog", "livestream", "filterskip", "dim", "whisper_progress",
-                 "whisper_pct")
+                 "whisper_pct", "whisper_dots", "transcribe_using")
 
 
 def _sync_mini_logs_from_main():

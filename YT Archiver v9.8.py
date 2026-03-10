@@ -174,6 +174,9 @@ _is_simple_mode = False
 # Whisper progress dot animation state
 _whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
 
+# Whisper transcription progress counter (for simple mode prefix)
+_whisper_counter = {"idx": 0, "total": 0}
+
 
 def _flush_ui_queue():
     """Process pending UI callbacks on the main thread with a time budget."""
@@ -1512,7 +1515,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.7 - 03.10.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.8 - 03.10.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4277,7 +4280,9 @@ def _whisper_transcribe(audio_path, duration=0, title=""):
     try:
         import json as _json
         _title_part = f' "{title}"' if title else ""
-        log(f"    Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
+        # In simple mode, prefix with [idx/total] instead of spaces
+        _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+        log(f"{_wp}Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
@@ -4291,14 +4296,14 @@ def _whisper_transcribe(audio_path, duration=0, title=""):
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
                 if cancel_event.is_set():
-                    log(f"    Whisper transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
+                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
                 elif pause_event.is_set():
-                    log(f"    Whisper transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
+                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
                 else:
-                    log(f"    Whisper transcribing{_title_part}, {pct}%...\n", "whisper_progress")
+                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}%...\n", "whisper_progress")
                 continue
             elif result.get("status") == "ok":
-                log(f"    Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
+                log(f"{_wp}Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
                 return result.get("text") or None
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
@@ -4699,11 +4704,31 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             matched = []    # (filename, filepath, video_id)  — can try auto-captions
             unmatched = []  # (filename, filepath)            — must use Whisper
 
+            def _normalize_for_match(title):
+                """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
+                import unicodedata
+                s = unicodedata.normalize('NFKC', title)
+                s = re.sub(r'[\\/:*?"<>|]', '', s)
+                s = re.sub(r'\s+', ' ', s).strip()
+                return s.lower()
+
+            # Build normalized lookup: normalized_yt_title → video_id
+            _yt_normalized = {}
+            for yt_title, vid_id in yt_title_to_id.items():
+                _norm = _normalize_for_match(yt_title)
+                if _norm not in _yt_normalized:  # first match wins (avoid rare collisions)
+                    _yt_normalized[_norm] = vid_id
+
             for fname, fpath in files_to_process.items():
+                # Try exact match first, then normalized match
                 if fname in yt_title_to_id:
                     matched.append((fname, fpath, yt_title_to_id[fname]))
                 else:
-                    unmatched.append((fname, fpath))
+                    _norm_fname = _normalize_for_match(fname)
+                    if _norm_fname in _yt_normalized:
+                        matched.append((fname, fpath, _yt_normalized[_norm_fname]))
+                    else:
+                        unmatched.append((fname, fpath))
 
             # Sort by file modification time, newest first
             matched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
@@ -4820,6 +4845,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # ── Model selection dialog ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
                 _model_result = [None]
+                _model_timed_out = [False]
 
                 def _ask_model():
                     _dlg = tk.Toplevel(root)
@@ -4876,6 +4902,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     def _tick():
                         _countdown["secs"] -= 1
                         if _countdown["secs"] <= 0:
+                            _model_timed_out[0] = True
                             _pick(_DEFAULT_MODEL)
                             return
                         try:
@@ -4926,7 +4953,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _whisper_model_choice = _model_result[0]
                     # If model changed, stop old process so it relaunches with new model
                     _stop_whisper_process()
-                    log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
+                    if _model_timed_out[0]:
+                        log(f"  No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
+                    else:
+                        log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
                 # Check if Whisper is available (only once)
                 if not cancel_event.is_set() and _model_result[0] != "skip" and _whisper_available is None:
@@ -4996,8 +5026,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         except Exception:
                             pass
 
-                        log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "transcribe_using")
+                        if not _is_simple_mode:
+                            log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "transcribe_using")
                         _t_vid_start = time.time()
+                        # Set counter for simple mode progress prefix
+                        _whisper_counter["idx"] = idx
+                        _whisper_counter["total"] = total
                         # Check if pause was requested — Whisper can't be interrupted mid-file,
                         # so inform the user it will pause after the current file finishes.
                         if pause_event.is_set() and not cancel_event.is_set():

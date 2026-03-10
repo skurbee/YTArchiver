@@ -3109,16 +3109,19 @@ def _process_next_queued():
     for source, key in order_copy:
         if source == "sync":
             with _sync_queue_lock:
-                if _sync_queue:
-                    return _process_sync_queue()
+                has_items = bool(_sync_queue)
+            if has_items:
+                return _process_sync_queue()
         elif source == "reorg":
             with _reorg_queue_lock:
-                if _reorg_queue:
-                    return _process_reorg_queue()
+                has_items = bool(_reorg_queue)
+            if has_items:
+                return _process_reorg_queue()
         elif source == "transcribe":
             with _transcribe_queue_lock:
-                if _transcribe_queue:
-                    return _process_transcribe_queue()
+                has_items = bool(_transcribe_queue)
+            if has_items:
+                return _process_transcribe_queue()
     # Fallback: try each queue in case _queue_order is out of sync
     return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
 

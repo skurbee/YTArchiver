@@ -95,7 +95,8 @@ _video_dl_queue_lock = threading.Lock()
 _reorg_running = False
 _tray_icon = None  # pystray.Icon instance
 _tray_base_img = None  # PIL Image of the base icon
-_tray_spin_frames = []  # pre-generated spinning animation frames
+_tray_spin_frames = []  # pre-generated spinning animation frames (blue/default)
+_tray_spin_frames_red = []  # pre-generated spinning animation frames (red/transcription)
 _tray_spin_active = False
 _tray_spin_job = None  # threading.Timer for spin animation
 _tray_spin_idx = 0
@@ -928,7 +929,7 @@ elif os.path.exists(icon_path):
     root.iconbitmap(default=icon_path)
 
 # ─── System tray icon ────────────────────────────────────────────────
-def _generate_spin_frames(base_img, num_frames=12):
+def _generate_spin_frames(base_img, num_frames=12, color=(100, 180, 255, 220)):
     """Pre-generate spinning arc overlay frames composited onto the base icon."""
     frames = []
     sz = base_img.size[0]
@@ -940,7 +941,7 @@ def _generate_spin_frames(base_img, num_frames=12):
         # Draw a partial arc (120 degrees) as the spinner
         pad = max(2, sz // 8)
         bbox = [pad, pad, sz - pad, sz - pad]
-        draw.arc(bbox, angle_start, angle_start + 120, fill=(100, 180, 255, 220), width=max(2, sz // 12))
+        draw.arc(bbox, angle_start, angle_start + 120, fill=color, width=max(2, sz // 12))
         frame = Image.alpha_composite(frame.convert("RGBA"), overlay)
         frames.append(frame)
     return frames
@@ -964,14 +965,17 @@ def _make_badge_icon(base_img, count):
     return Image.alpha_composite(img, overlay)
 
 
+_tray_spin_use_red = False  # which frame set is active
+
 def _tray_spin_tick():
     """Advance the spinning animation by one frame."""
     global _tray_spin_idx, _tray_spin_job
-    if not _tray_spin_active or _tray_icon is None or not _tray_spin_frames:
+    _frames = _tray_spin_frames_red if _tray_spin_use_red else _tray_spin_frames
+    if not _tray_spin_active or _tray_icon is None or not _frames:
         return
-    _tray_spin_idx = (_tray_spin_idx + 1) % len(_tray_spin_frames)
+    _tray_spin_idx = (_tray_spin_idx + 1) % len(_frames)
     try:
-        _tray_icon.icon = _tray_spin_frames[_tray_spin_idx]
+        _tray_icon.icon = _frames[_tray_spin_idx]
     except Exception:
         pass
     _tray_spin_job = threading.Timer(0.18, _tray_spin_tick)
@@ -979,11 +983,14 @@ def _tray_spin_tick():
     _tray_spin_job.start()
 
 
-def _tray_start_spin():
-    """Start the spinning animation on the tray icon."""
-    global _tray_spin_active, _tray_spin_idx
+def _tray_start_spin(red=False):
+    """Start the spinning animation on the tray icon.
+    red=True uses a bold red spinner (for transcription / heavy GPU work).
+    """
+    global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red
     if not HAS_TRAY or _tray_icon is None:
         return
+    _tray_spin_use_red = red
     _tray_spin_active = True
     _tray_spin_idx = 0
     _tray_spin_tick()
@@ -1083,7 +1090,7 @@ def _build_tray_menu():
 
 def _setup_tray_icon():
     """Initialize and start the system tray icon."""
-    global _tray_icon, _tray_base_img, _tray_spin_frames
+    global _tray_icon, _tray_base_img, _tray_spin_frames, _tray_spin_frames_red
     if not HAS_TRAY:
         return
     try:
@@ -1099,8 +1106,9 @@ def _setup_tray_icon():
             d = ImageDraw.Draw(_tray_base_img)
             d.rounded_rectangle([8, 8, 56, 56], radius=8, fill=(100, 180, 255, 255))
 
-        # Pre-generate spin frames
+        # Pre-generate spin frames (blue for sync, red for transcription)
         _tray_spin_frames = _generate_spin_frames(_tray_base_img)
+        _tray_spin_frames_red = _generate_spin_frames(_tray_base_img, color=(220, 60, 60, 240))
 
         _tray_icon = pystray.Icon(
             "YT Archiver",
@@ -1374,7 +1382,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.2 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.3 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2665,6 +2673,17 @@ def sync_single_channel():
                 ch = copy.deepcopy(c)
                 break
         if not ch: return
+
+    # If something is already running, queue instead of starting immediately
+    if _sync_running or _reorg_running or _transcribe_running:
+        with _sync_queue_lock:
+            if not any(q["url"] == ch["url"] for q in _sync_queue):
+                _sync_queue.append(copy.deepcopy(ch))
+                log(f"\n=== Added {ch['name']} to sync queue ===\n", "header")
+            else:
+                log(f"  ⚠ {ch['name']} is already in the sync queue.\n", "simpleline")
+        _update_queue_btn()
+        return
 
     for key in session_totals:
         session_totals[key] = 0
@@ -4409,6 +4428,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _current_job["label"] = f"Transcribe {ch_name}"
         _current_job["url"] = ch_url
         _update_queue_btn()
+        _tray_start_spin(red=True)
+        _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
         _whisper_available = None  # None = not checked yet
 
         try:
@@ -4725,6 +4746,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         finally:
             _transcribe_running = False
             _stop_whisper_process()  # Free GPU memory
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
             if root.winfo_exists():
                 root.after(0, _hide_cancel_pause)
             # Process any queued jobs
@@ -6429,8 +6452,8 @@ def start_sync_all():
         _update_queue_btn()
         return
 
-    # If a reorg is running, queue the sync for later
-    if _reorg_running:
+    # If a reorg or transcription is running, queue the sync for later
+    if _reorg_running or _transcribe_running:
         with _sync_queue_lock:
             # Check if a full sync is already queued
             already_queued = len([q for q in _sync_queue if q["url"] in [c["url"] for c in channels]]) >= len(channels)
@@ -6440,7 +6463,8 @@ def start_sync_all():
             for ch in channels:
                 if not any(q["url"] == ch["url"] for q in _sync_queue):
                     _sync_queue.append(copy.deepcopy(ch))
-        log(f"\n=== Sync added to job queue (reorganize in progress) ===\n", "header")
+        _what = "transcription" if _transcribe_running else "reorganize"
+        log(f"\n=== Sync added to job queue ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
         _update_queue_btn()
         return

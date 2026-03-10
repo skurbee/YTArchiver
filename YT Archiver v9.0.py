@@ -225,6 +225,17 @@ def log(text, tag=None):
                     elif "SUMMARY:" in text or "TOTAL SESSION" in text:
                         use_tag = "summary"
 
+                # Whisper progress: always replace in-place (both simple + verbose)
+                if use_tag == "whisper_progress":
+                    ranges = log_box.tag_ranges("whisper_progress")
+                    if ranges:
+                        log_box.delete(ranges[0], ranges[1])
+                    log_box.insert(tk.END, text, "whisper_progress")
+                    if at_bottom:
+                        log_box.see(tk.END)
+                    log_box.config(state="disabled")
+                    return
+
                 if _is_simple_mode:
                     if use_tag == "header" and "---" in text:
                         log_box.config(state="disabled")
@@ -249,6 +260,11 @@ def log(text, tag=None):
                     dl_ranges = log_box.tag_ranges("dlprogress")
                     if dl_ranges:
                         log_box.delete(dl_ranges[0], dl_ranges[1])
+
+                # Clear whisper progress line when any other content is logged
+                wp_ranges = log_box.tag_ranges("whisper_progress")
+                if wp_ranges:
+                    log_box.delete(wp_ranges[0], wp_ranges[1])
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary")):
@@ -1358,7 +1374,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v8.9 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.0 - 03.09.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1686,6 +1702,7 @@ log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
+log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -2474,10 +2491,24 @@ def _chan_ctx_show(event):
         _chan_ctx_menu.entryconfig(9, foreground=C_TEXT, state="normal")
 
         # Transcribe menu item (index 11)
-        if _transcribe_running:
-            _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
-                                      state="normal", foreground=C_DIM,
-                                      command=lambda: None)
+        if _transcribe_running or _sync_running or _reorg_running:
+            _ch_url_t = ch.get("url", "")
+            # Check if this channel is already being transcribed or queued
+            _is_active_transcribe = _current_job.get("url") == _ch_url_t and "Transcribe" in (_current_job.get("label") or "")
+            with _transcribe_queue_lock:
+                _already_queued_t = any(q[1] == _ch_url_t for q in _transcribe_queue)
+            if _is_active_transcribe:
+                _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
+                                          state="normal", foreground=C_DIM,
+                                          command=lambda: None)
+            elif _already_queued_t:
+                _chan_ctx_menu.entryconfig(11, label="Already in job queue",
+                                          state="normal", foreground=C_DIM,
+                                          command=lambda: None)
+            else:
+                _chan_ctx_menu.entryconfig(11, label="Add to job queue",
+                                          state="normal", foreground=C_TEXT,
+                                          command=_chan_ctx_transcribe)
         else:
             _chan_ctx_menu.entryconfig(11, label="Transcribe channel",
                                       state="normal", foreground=C_TEXT,
@@ -4028,10 +4059,11 @@ def _stop_whisper_process():
         _whisper_proc = None
 
 
-def _whisper_transcribe(audio_path, duration=0):
+def _whisper_transcribe(audio_path, duration=0, title=""):
     """Transcribe a file using the persistent Whisper subprocess. Returns text or None.
 
     If duration (seconds) is provided, progress percentage is logged in real time.
+    title is shown in the progress line so the user knows which video is being processed.
     """
     global _whisper_proc
     if _whisper_proc is None or _whisper_proc.poll() is not None:
@@ -4039,7 +4071,8 @@ def _whisper_transcribe(audio_path, duration=0):
             return None
     try:
         import json as _json
-        log(f"    Whisper transcribing, 0%...\n", "simpleline")
+        _title_part = f" ({title})" if title else ""
+        log(f"    Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
@@ -4052,13 +4085,15 @@ def _whisper_transcribe(audio_path, duration=0):
             result = _json.loads(response_line)
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
-                if pause_event.is_set() and not cancel_event.is_set():
-                    log(f"    Whisper transcribing, {pct}% — will pause after this file...\n", "simpleline")
+                if cancel_event.is_set():
+                    log(f"    Whisper transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
+                elif pause_event.is_set():
+                    log(f"    Whisper transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
                 else:
-                    log(f"    Whisper transcribing, {pct}%...\n", "simpleline")
+                    log(f"    Whisper transcribing{_title_part}, {pct}%...\n", "whisper_progress")
                 continue
             elif result.get("status") == "ok":
-                log(f"    Whisper transcribing, 100%...\n", "simpleline")
+                log(f"    Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
                 return result.get("text") or None
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
@@ -4076,28 +4111,52 @@ def _load_punctuation_model():
     if _punct_pipe is not None:
         return True
     try:
-        # When packaged as exe, sys.stdout/stderr can be None — transformers
-        # and huggingface_hub check .isatty() on them for progress bars.
-        import sys as _sys, io as _io
-        if _sys.stdout is None:
-            _sys.stdout = _io.StringIO()
-        if _sys.stderr is None:
-            _sys.stderr = _io.StringIO()
+        import sys as _sys, io as _io, os as _os, logging as _logging
 
-        # Suppress noisy transformers/HF warnings during model load
-        import os as _os
+        # Suppress ALL console output during model load (prevents CMD window
+        # flashing when packaged as exe, and noisy warnings when run as .py)
+        _saved_stdout = _sys.stdout
+        _saved_stderr = _sys.stderr
+        _sys.stdout = _io.StringIO()
+        _sys.stderr = _io.StringIO()
+
+        # Suppress noisy transformers/HF warnings
         _os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         _os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+        _os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-        from transformers import pipeline as tf_pipeline
-        import torch as _torch
+        # Set logging levels to suppress transformers/HF/safetensors warnings
+        for _logger_name in ("transformers", "huggingface_hub", "safetensors",
+                              "transformers.modeling_utils"):
+            _logging.getLogger(_logger_name).setLevel(_logging.ERROR)
+
+        try:
+            from transformers import pipeline as tf_pipeline
+            import torch as _torch
+        finally:
+            # Restore stdout/stderr after imports
+            _sys.stdout = _saved_stdout if _saved_stdout is not None else _io.StringIO()
+            _sys.stderr = _saved_stderr if _saved_stderr is not None else _io.StringIO()
+
         log("  Loading punctuation model...\n", "simpleline")
-        if _torch.cuda.is_available():
-            _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
-                                      aggregation_strategy="none", device=0)
-        else:
-            _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
-                                      aggregation_strategy="none")
+
+        # Redirect again during model download/load (tqdm, safetensors report)
+        _saved_stdout2 = _sys.stdout
+        _saved_stderr2 = _sys.stderr
+        _sys.stdout = _io.StringIO()
+        _sys.stderr = _io.StringIO()
+        try:
+            if _torch.cuda.is_available():
+                _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
+                                          aggregation_strategy="none", device=0)
+            else:
+                _punct_pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",
+                                          aggregation_strategy="none")
+        finally:
+            _sys.stdout = _saved_stdout2 if _saved_stdout2 is not None else _io.StringIO()
+            _sys.stderr = _saved_stderr2 if _saved_stderr2 is not None else _io.StringIO()
+
         log("  ✓ Punctuation model loaded.\n", "simpleline_green")
         return True
     except ImportError:
@@ -4264,6 +4323,53 @@ def _scan_existing_transcripts(folder_path, ch_name):
     return existing
 
 
+def _sort_transcript_entries(txt_paths):
+    """Sort transcript entries in each .txt file chronologically by date.
+
+    Entry format: ===({title}), ({MM.DD.YYYY}), ({duration}), ({source})===
+    Entries are separated by triple-newline.
+    """
+    _entry_re = re.compile(r'^===\((.+?)\),\s*\((\d{2})\.(\d{2})\.(\d{4})\)')
+    for txt_path in txt_paths:
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.strip():
+                continue
+
+            # Split into entries (each starts with ===)
+            raw_entries = re.split(r'(?=^===\()', content, flags=re.MULTILINE)
+            raw_entries = [e for e in raw_entries if e.strip()]
+            if len(raw_entries) <= 1:
+                continue  # nothing to sort
+
+            # Parse date from each entry for sorting
+            dated_entries = []
+            for entry in raw_entries:
+                m = _entry_re.match(entry.strip())
+                if m:
+                    mm, dd, yyyy = m.group(2), m.group(3), m.group(4)
+                    sort_key = f"{yyyy}{mm}{dd}"
+                else:
+                    sort_key = "00000000"  # unknown date → put first
+                dated_entries.append((sort_key, entry))
+
+            # Sort chronologically
+            dated_entries.sort(key=lambda x: x[0])
+
+            # Rewrite file
+            sorted_content = ""
+            for _, entry in dated_entries:
+                # Ensure each entry ends with exactly triple-newline
+                entry = entry.rstrip("\n") + "\n\n\n"
+                sorted_content += entry
+
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(sorted_content)
+        except Exception:
+            pass  # don't break transcription over a sort error
+
+
 def _process_transcribe_queue():
     """Process next queued transcription if any. Returns True if one was started."""
     with _transcribe_queue_lock:
@@ -4330,6 +4436,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             log(f"  Found {len(local_files)} video file(s) on disk.\n", "simpleline")
 
+            if cancel_event.is_set():
+                log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                return
+
             # ── Step 2: Scan existing transcripts to skip already-done ──
             already_done = _scan_existing_transcripts(folder, ch_name)
             files_to_process = {}
@@ -4342,6 +4452,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             if not files_to_process:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                return
+
+            if cancel_event.is_set():
+                log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
@@ -4363,6 +4477,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             except Exception as e:
                 log(f"  ⚠ Could not fetch YouTube list: {e}. All files will use Whisper.\n", "red")
 
+            if cancel_event.is_set():
+                log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                return
+
             # ── Step 4: Split into matched (captions) vs unmatched (Whisper) ─
             matched = []    # (filename, filepath, video_id)  — can try auto-captions
             unmatched = []  # (filename, filepath)            — must use Whisper
@@ -4372,6 +4490,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     matched.append((fname, fpath, yt_title_to_id[fname]))
                 else:
                     unmatched.append((fname, fpath))
+
+            # Sort by file modification time so transcripts are chronological
+            matched.sort(key=lambda x: os.path.getmtime(x[1]))
+            unmatched.sort(key=lambda x: os.path.getmtime(x[1]))
 
             log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
@@ -4387,9 +4509,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if matched:
                 _punct_loaded = _load_punctuation_model()
 
+            if cancel_event.is_set():
+                log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                return
+
             done_count = 0
             err_count = 0
             idx = 0
+            _modified_txt_files = set()  # track which .txt files we wrote to, for post-sort
 
             # ── Phase A: Process matched files (auto-captions first) ────
             for fname, fpath, vid_id in matched:
@@ -4454,6 +4581,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 try:
                     with open(txt_path, "a", encoding="utf-8") as f:
                         f.write(entry)
+                    _modified_txt_files.add(txt_path)
                 except Exception as e:
                     log(f"  ⚠ Error writing transcript: {e}\n", "red")
                     err_count += 1
@@ -4464,6 +4592,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not cancel_event.is_set():
+                # Re-sort unmatched by mtime (Phase A may have added failed items)
+                unmatched.sort(key=lambda x: os.path.getmtime(x[1]))
                 # Check if Whisper is available (only once)
                 if _whisper_available is None:
                     # First check if CUDA GPU is even present on this system
@@ -4537,7 +4667,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # so inform the user it will pause after the current file finishes.
                         if pause_event.is_set() and not cancel_event.is_set():
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
-                        text = _whisper_transcribe(fpath, duration=_dur_secs)
+                        text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname)
                         source = "Whisper"
 
                         if not text:
@@ -4562,6 +4692,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         try:
                             with open(txt_path, "a", encoding="utf-8") as f:
                                 f.write(entry)
+                            _modified_txt_files.add(txt_path)
                         except Exception as e:
                             log(f"  ⚠ Error writing transcript: {e}\n", "red")
                             err_count += 1
@@ -4571,6 +4702,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         log(f"  [{idx}/{total}] {fname} — done ({source})\n", "simpleline_green")
                 else:
                     err_count += len(unmatched)
+
+            # ── Post-process: sort entries chronologically in each .txt file ──
+            if _modified_txt_files and done_count > 0:
+                _sort_transcript_entries(_modified_txt_files)
 
             # Cleanup temp dir
             try:
@@ -4702,7 +4837,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                             ("filterskip", {"foreground": C_LOG_SUM})]:
+                             ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("whisper_progress", {"foreground": C_TEXT})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -6911,6 +7047,7 @@ def _hide_cancel_pause():
         cancel_btn.config(text="⛔ Cancel")  # Reset for next use
         _current_job["label"] = None
         _current_job["url"] = None
+        _update_queue_btn()  # Hide queue button when no jobs remain
 
 
 # --- Job Queue Button ---
@@ -8173,13 +8310,14 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                             ("filterskip", {"foreground": C_LOG_SUM})]:
+                             ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("whisper_progress", {"foreground": C_TEXT})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpledownload", "simplestatus", "dlprogress", "scanline",
-                 "pauselog", "livestream", "filterskip", "dim")
+                 "pauselog", "livestream", "filterskip", "dim", "whisper_progress")
 
 
 def _sync_mini_logs_from_main():

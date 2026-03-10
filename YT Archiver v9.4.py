@@ -113,6 +113,12 @@ _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
 _punct_pipe = None  # transformers NER pipeline for punctuation restoration
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 
+# Unified queue ordering — tracks insertion order across all queue types.
+# Each entry is ("sync"|"reorg"|"transcribe"|"video", url_or_key).
+# _get_queue_items() and _process_next_queued() use this for display and execution order.
+_queue_order = []
+_queue_order_lock = threading.Lock()
+
 
 class _ToolTip:
     """Simple tooltip that appears on hover after a short delay."""
@@ -1382,7 +1388,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.3 - 03.09.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v9.4 - 03.10.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2211,6 +2217,8 @@ def _chan_ctx_sync_now():
             # Don't queue duplicates
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
+                with _queue_order_lock:
+                    _queue_order.append(("sync", ch["url"]))
                 log(f"\n=== Added {ch['name']} to sync queue ===\n", "header")
             else:
                 log(f"  ⚠ {ch['name']} is already in the sync queue.\n", "simpleline")
@@ -2679,6 +2687,8 @@ def sync_single_channel():
         with _sync_queue_lock:
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
+                with _queue_order_lock:
+                    _queue_order.append(("sync", ch["url"]))
                 log(f"\n=== Added {ch['name']} to sync queue ===\n", "header")
             else:
                 log(f"  ⚠ {ch['name']} is already in the sync queue.\n", "simpleline")
@@ -2713,6 +2723,7 @@ def sync_single_channel():
                 return
 
             log(f"\n--- [1/1] SYNCING: {ch['name']} ---\n", "header")
+            log(f"  Checking channel...\n", "dim")
 
             deferred_streams = []
             live_ids = []
@@ -3021,7 +3032,7 @@ def sync_single_channel():
                 # to prevent a race where another sync starts in the gap.
                 _queue_started = False
                 if not cancel_event.is_set():
-                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
+                    _queue_started = _process_next_queued()
 
                 if not _queue_started:
                     _sync_running = False
@@ -3061,6 +3072,11 @@ def _process_sync_queue():
             return False
         next_ch = _sync_queue.pop(0)
         remaining = len(_sync_queue)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("sync", next_ch["url"]))
+        except ValueError:
+            pass
 
     if next_ch.get("initialized", False):
         _current_job["label"] = f"Check {next_ch['name']} for new videos"
@@ -3084,6 +3100,27 @@ def _process_sync_queue():
     if root.winfo_exists():
         root.after(100, _start_queued)
     return True
+
+
+def _process_next_queued():
+    """Process the next queued item in insertion order. Returns True if something was started."""
+    with _queue_order_lock:
+        order_copy = list(_queue_order)
+    for source, key in order_copy:
+        if source == "sync":
+            with _sync_queue_lock:
+                if _sync_queue:
+                    return _process_sync_queue()
+        elif source == "reorg":
+            with _reorg_queue_lock:
+                if _reorg_queue:
+                    return _process_reorg_queue()
+        elif source == "transcribe":
+            with _transcribe_queue_lock:
+                if _transcribe_queue:
+                    return _process_transcribe_queue()
+    # Fallback: try each queue in case _queue_order is out of sync
+    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
 
 
 def _process_video_dl_queue():
@@ -3796,6 +3833,11 @@ def _process_reorg_queue():
         remaining = len(_reorg_queue)
 
     ch_name, folder, t_years, t_months, ch_url, recheck = args
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("reorg", ch_url or ch_name))
+        except ValueError:
+            pass
     if recheck:
         _current_job["label"] = f"Re-date & Organize {ch_name}"
     elif t_years:
@@ -3821,6 +3863,8 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
         with _reorg_queue_lock:
             if not any(q[0] == channel_name for q in _reorg_queue):
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
+                with _queue_order_lock:
+                    _queue_order.append(("reorg", ch_url or channel_name))
                 log(f"\n=== Added {channel_name} reorganize to job queue ===\n", "header")
             else:
                 log(f"  ⚠ {channel_name} is already in the reorganize queue.\n", "simpleline")
@@ -3857,11 +3901,9 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                     reorg_done_label.pack(side="left", padx=(4, 0))
                     _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
                 root.after(0, _reorg_done)
-            # Process any queued reorg, transcription, or sync jobs
+            # Process any queued jobs in insertion order
             if not cancel_event.is_set():
-                if not _process_reorg_queue():
-                    if not _process_transcribe_queue():
-                        _process_sync_queue()
+                _process_next_queued()
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -4398,6 +4440,11 @@ def _process_transcribe_queue():
         remaining = len(_transcribe_queue)
 
     ch_name, ch_url, folder, sy, sm, combined = args
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("transcribe", ch_url))
+        except ValueError:
+            pass
     _current_job["label"] = f"Transcribe {ch_name}"
     _update_queue_btn()
     log(f"\n=== Processing queued transcription: {ch_name}", "header")
@@ -4416,6 +4463,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         with _transcribe_queue_lock:
             if not any(q[1] == ch_url for q in _transcribe_queue):
                 _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
+                with _queue_order_lock:
+                    _queue_order.append(("transcribe", ch_url))
                 log(f"\n=== Added {ch_name} transcription to job queue ===\n", "header")
             else:
                 log(f"  ⚠ {ch_name} is already in the transcription queue.\n", "simpleline")
@@ -4750,11 +4799,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _update_tray_tooltip("YT Archiver — Idle")
             if root.winfo_exists():
                 root.after(0, _hide_cancel_pause)
-            # Process any queued jobs
+            # Process any queued jobs in insertion order
             if not cancel_event.is_set():
-                if not _process_transcribe_queue():
-                    if not _process_reorg_queue():
-                        _process_sync_queue()
+                _process_next_queued()
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -6420,6 +6467,9 @@ def start_download():
         # Queue the download for after the current operation finishes
         with _video_dl_queue_lock:
             _video_dl_queue.append((cmd, True))
+        with _queue_order_lock:
+            if not any(t == "video" for t, _ in _queue_order):
+                _queue_order.append(("video", "batch"))
         log(f"Video added to download queue.\n", "simpleline_green")
         _update_queue_btn()
         return
@@ -6447,6 +6497,8 @@ def start_sync_all():
             for ch in channels:
                 if not any(q["url"] == ch["url"] for q in _sync_queue):
                     _sync_queue.append(copy.deepcopy(ch))
+                    with _queue_order_lock:
+                        _queue_order.append(("sync", ch["url"]))
                     added += 1
         log(f"\n=== {added} channel{'s' if added != 1 else ''} added to sync queue ===\n", "header")
         _update_queue_btn()
@@ -6463,6 +6515,8 @@ def start_sync_all():
             for ch in channels:
                 if not any(q["url"] == ch["url"] for q in _sync_queue):
                     _sync_queue.append(copy.deepcopy(ch))
+                    with _queue_order_lock:
+                        _queue_order.append(("sync", ch["url"]))
         _what = "transcription" if _transcribe_running else "reorganize"
         log(f"\n=== Sync added to job queue ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
@@ -6522,6 +6576,8 @@ def start_sync_all():
                 for ch in channels:
                     if not any(q["url"] == ch["url"] for q in _sync_queue):
                         _sync_queue.append(copy.deepcopy(ch))
+                        with _queue_order_lock:
+                            _queue_order.append(("sync", ch["url"]))
             _update_queue_btn()
 
             processed = 0
@@ -6531,6 +6587,11 @@ def start_sync_all():
                         break
                     ch = _sync_queue.pop(0)
                     current_total = processed + 1 + len(_sync_queue)
+                with _queue_order_lock:
+                    try:
+                        _queue_order.remove(("sync", ch["url"]))
+                    except ValueError:
+                        pass
                 _update_queue_btn()
                 processed += 1
                 i = processed
@@ -6549,6 +6610,7 @@ def start_sync_all():
                 _current_job["url"] = ch.get("url")
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
+                log(f"  Checking channel...\n", "dim")
                 _update_tray_tooltip(f"YT Archiver — [{i}/{current_total}] {ch_name}")
 
                 max_dur_ch = ch.get("max_duration", 0)
@@ -6891,10 +6953,10 @@ def start_sync_all():
                 _current_job["url"] = None
                 _update_queue_btn()
 
-                # Check for queued syncs, reorg, or transcription jobs before fully finishing
+                # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
                 if not cancel_event.is_set():
-                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
+                    _queue_started = _process_next_queued()
 
                 if not _queue_started and root.winfo_exists():
                     def _on_manual_sync_done():
@@ -6976,6 +7038,8 @@ def stop_downloads():
         _reorg_queue.clear()
     with _transcribe_queue_lock:
         _transcribe_queue.clear()
+    with _queue_order_lock:
+        _queue_order.clear()
 
     # Reset flags immediately so context-menu actions work right after cancel
     _sync_running = False
@@ -7085,40 +7149,75 @@ def _get_queue_items():
     """Return a list of (label, queue_source, index) for all queued items.
     queue_source is 'sync', 'reorg', 'video', or 'current' — used for removal.
     index is the position within that specific queue.
+    Items are returned in _queue_order (insertion order), not grouped by type.
     """
     items = []
     # Show currently processing item first
     if _current_job["label"]:
         items.append((f"▶ {_current_job['label']}", "current", -1))
+
+    # Build lookup maps from type-specific queues, keyed by URL
+    sync_map = {}
     with _sync_queue_lock:
         for i, ch in enumerate(_sync_queue):
             name = ch.get("name", "?")
             mode = ch.get("mode", "full")
             if mode == "full":
-                if ch.get("initialized", False):
-                    items.append((f"Sync {name}", "sync", i))
-                else:
-                    items.append((f"Initialize {name}", "sync", i))
+                lbl = f"Sync {name}" if ch.get("initialized", False) else f"Initialize {name}"
             else:
-                items.append((f"Check {name} for new videos", "sync", i))
+                lbl = f"Check {name} for new videos"
+            sync_map[ch["url"]] = (lbl, "sync", i)
+    reorg_map = {}
     with _reorg_queue_lock:
         for i, args in enumerate(_reorg_queue):
-            ch_name, _, t_years, t_months, _, recheck = args
+            ch_name, _, t_years, t_months, ch_url, recheck = args
+            key = ch_url or ch_name
             if recheck:
-                items.append((f"Re-date & Organize {ch_name}", "reorg", i))
+                lbl = f"Re-date & Organize {ch_name}"
             elif t_years:
-                items.append((f"Re-Organize {ch_name}", "reorg", i))
+                lbl = f"Re-Organize {ch_name}"
             else:
-                items.append((f"Un-Organize {ch_name}", "reorg", i))
+                lbl = f"Un-Organize {ch_name}"
+            reorg_map[key] = (lbl, "reorg", i)
+    transcribe_map = {}
     with _transcribe_queue_lock:
         for i, args in enumerate(_transcribe_queue):
-            items.append((f"Transcribe {args[0]}", "transcribe", i))
+            transcribe_map[args[1]] = (f"Transcribe {args[0]}", "transcribe", i)
+    video_item = None
     with _video_dl_queue_lock:
         n_vids = len(_video_dl_queue)
         if n_vids == 1:
-            items.append(("Download 1 video", "video", 0))
+            video_item = ("Download 1 video", "video", 0)
         elif n_vids > 1:
-            items.append((f"Download {n_vids} videos", "video", 0))
+            video_item = (f"Download {n_vids} videos", "video", 0)
+
+    # Emit items in _queue_order (insertion order)
+    seen = set()
+    with _queue_order_lock:
+        for source, key in _queue_order:
+            if (source, key) in seen:
+                continue
+            seen.add((source, key))
+            if source == "sync" and key in sync_map:
+                items.append(sync_map.pop(key))
+            elif source == "reorg" and key in reorg_map:
+                items.append(reorg_map.pop(key))
+            elif source == "transcribe" and key in transcribe_map:
+                items.append(transcribe_map.pop(key))
+            elif source == "video" and video_item:
+                items.append(video_item)
+                video_item = None
+
+    # Append any orphaned items (added without _queue_order tracking, e.g. legacy/startup)
+    for entry in sync_map.values():
+        items.append(entry)
+    for entry in reorg_map.values():
+        items.append(entry)
+    for entry in transcribe_map.values():
+        items.append(entry)
+    if video_item:
+        items.append(video_item)
+
     return items
 
 
@@ -7126,24 +7225,38 @@ def _remove_queue_item(source, idx):
     """Remove an item from a specific queue by source and index."""
     global _queue_items_removed
     removed = None
+    removed_key = None
     if source == "sync":
         with _sync_queue_lock:
             if 0 <= idx < len(_sync_queue):
-                removed = _sync_queue.pop(idx).get("name", "?")
+                popped = _sync_queue.pop(idx)
+                removed = popped.get("name", "?")
+                removed_key = popped.get("url")
                 _queue_items_removed = True
     elif source == "reorg":
         with _reorg_queue_lock:
             if 0 <= idx < len(_reorg_queue):
-                removed = _reorg_queue.pop(idx)[0]
+                popped = _reorg_queue.pop(idx)
+                removed = popped[0]
+                removed_key = popped[4] or popped[0]  # ch_url or ch_name
     elif source == "transcribe":
         with _transcribe_queue_lock:
             if 0 <= idx < len(_transcribe_queue):
-                removed = _transcribe_queue.pop(idx)[0]
+                popped = _transcribe_queue.pop(idx)
+                removed = popped[0]
+                removed_key = popped[1]  # ch_url
     elif source == "video":
         with _video_dl_queue_lock:
             if _video_dl_queue:
                 _video_dl_queue.clear()
                 removed = "queued videos"
+                removed_key = "batch"
+    if removed_key:
+        with _queue_order_lock:
+            try:
+                _queue_order.remove((source, removed_key))
+            except ValueError:
+                pass
     if removed:
         log(f"  Removed {removed} from queue.\n", "dim")
     _update_queue_btn()
@@ -7225,11 +7338,9 @@ def _show_queue_menu(event=None):
                     lbl.pack(side="left", fill="x", expand=True)
                     _widgets.append({"row": row, "lbl": lbl, "source": source, "idx": idx})
                 else:
-                    handle = None
-                    if source == "sync":
-                        handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
-                                          font=("Segoe UI", 10), cursor="fleur", pady=2)
-                        handle.pack(side="left")
+                    handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
+                                      font=("Segoe UI", 10), cursor="fleur", pady=2)
+                    handle.pack(side="left")
 
                     lbl = tk.Label(row, text=f" {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
                                    font=("Segoe UI", 9), anchor="w", padx=4, pady=2)
@@ -7260,103 +7371,98 @@ def _show_queue_menu(event=None):
                     for w in ([row, lbl] + ([handle] if handle else [])):
                         w.bind("<Button-3>", _remove)
 
-                    # Left-click to remove for non-sync items (legacy behavior)
-                    if source != "sync":
-                        def _click_remove(e, s=source, qi=idx, lb=label):
-                            popup.destroy()
-                            _confirm_remove(s, qi, lb)
-                        row.bind("<Button-1>", _click_remove)
-                        lbl.bind("<Button-1>", _click_remove)
+                    # Drag-to-reorder for all non-current items
+                    def _make_drag_bindings(r, l, h, s=source):
+                        def _find_my_widget_index():
+                            """Look up this row's position in _state['widgets']."""
+                            for wi_idx, wi in enumerate(_state["widgets"]):
+                                if wi["row"] is r:
+                                    return wi_idx
+                            return -1
 
-                    # Drag-to-reorder for sync items
-                    if source == "sync" and handle:
-                        def _make_drag_bindings(r, l, h):
-                            def _find_my_idx():
-                                """Look up current sync index dynamically."""
-                                for wi in _state["widgets"]:
-                                    if wi["row"] is r:
-                                        return wi["idx"]
-                                return -1
+                        def _on_press(e):
+                            _drag["active"] = True
+                            _drag["src_widget_idx"] = _find_my_widget_index()
+                            _drag["src_widget"] = r
+                            r.config(bg="#555555")
+                            l.config(bg="#555555")
+                            if h: h.config(bg="#555555")
 
-                            def _on_press(e):
-                                _drag["active"] = True
-                                _drag["src_sync_idx"] = _find_my_idx()
-                                _drag["src_widget"] = r
-                                r.config(bg="#555555")
-                                l.config(bg="#555555")
-                                h.config(bg="#555555")
-
-                            def _on_motion(e):
-                                if not _drag["active"]:
-                                    return
-                                y = e.y_root
-                                for wi in _state["widgets"]:
-                                    if wi["source"] != "sync" or wi["row"] == _drag["src_widget"]:
-                                        continue
-                                    try:
-                                        wy = wi["row"].winfo_rooty()
-                                        wh = wi["row"].winfo_height()
-                                        if wy <= y <= wy + wh:
-                                            wi["row"].config(bg="#3a5a3a")
-                                            wi["lbl"].config(bg="#3a5a3a")
-                                            if wi.get("handle"): wi["handle"].config(bg="#3a5a3a")
-                                        else:
-                                            wi["row"].config(bg="#2d2d2d")
-                                            wi["lbl"].config(bg="#2d2d2d")
-                                            if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                    except Exception:
-                                        pass
-
-                            def _on_release(e):
-                                if not _drag["active"]:
-                                    return
-                                _drag["active"] = False
-                                # Reset all backgrounds
-                                for wi in _state["widgets"]:
-                                    try:
+                        def _on_motion(e):
+                            if not _drag["active"]:
+                                return
+                            y = e.y_root
+                            for wi in _state["widgets"]:
+                                if wi["source"] == "current" or wi["row"] == _drag["src_widget"]:
+                                    continue
+                                try:
+                                    wy = wi["row"].winfo_rooty()
+                                    wh2 = wi["row"].winfo_height()
+                                    if wy <= y <= wy + wh2:
+                                        wi["row"].config(bg="#3a5a3a")
+                                        wi["lbl"].config(bg="#3a5a3a")
+                                        if wi.get("handle"): wi["handle"].config(bg="#3a5a3a")
+                                    else:
                                         wi["row"].config(bg="#2d2d2d")
                                         wi["lbl"].config(bg="#2d2d2d")
                                         if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                    except Exception:
-                                        pass
-                                # Find drop target
-                                y = e.y_root
-                                target_idx = None
-                                for wi in _state["widgets"]:
-                                    if wi["source"] != "sync":
-                                        continue
-                                    try:
-                                        wy = wi["row"].winfo_rooty()
-                                        wh = wi["row"].winfo_height()
-                                        if wy <= y <= wy + wh:
-                                            target_idx = wi["idx"]
-                                            break
-                                    except Exception:
-                                        pass
-                                if target_idx is not None and target_idx != _drag["src_sync_idx"]:
-                                    with _sync_queue_lock:
-                                        src = _drag["src_sync_idx"]
-                                        dst = target_idx
-                                        if 0 <= src < len(_sync_queue) and 0 <= dst < len(_sync_queue):
-                                            item = _sync_queue.pop(src)
-                                            _sync_queue.insert(dst, item)
-                                    # Update labels in-place instead of full rebuild
-                                    new_items = _get_queue_items()
-                                    _state["last_snapshot"] = [(lb, s, ix) for lb, s, ix in new_items]
-                                    for j, (new_label, new_source, new_idx) in enumerate(new_items):
-                                        if j < len(_state["widgets"]):
-                                            wi = _state["widgets"][j]
-                                            prefix = "  " if new_source == "current" else " "
-                                            wi["lbl"].config(text=f"{prefix}{j + 1}. {new_label}")
-                                            wi["source"] = new_source
-                                            wi["idx"] = new_idx
+                                except Exception:
+                                    pass
 
-                            for w in [h, l, r]:
-                                w.bind("<ButtonPress-1>", _on_press)
-                                w.bind("<B1-Motion>", _on_motion)
-                                w.bind("<ButtonRelease-1>", _on_release)
+                        def _on_release(e):
+                            if not _drag["active"]:
+                                return
+                            _drag["active"] = False
+                            # Reset all backgrounds
+                            for wi in _state["widgets"]:
+                                try:
+                                    wi["row"].config(bg="#2d2d2d")
+                                    wi["lbl"].config(bg="#2d2d2d")
+                                    if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
+                                except Exception:
+                                    pass
+                            # Find drop target (any non-current row)
+                            y = e.y_root
+                            target_widget_idx = None
+                            for wi_idx, wi in enumerate(_state["widgets"]):
+                                if wi["source"] == "current":
+                                    continue
+                                try:
+                                    wy = wi["row"].winfo_rooty()
+                                    wh2 = wi["row"].winfo_height()
+                                    if wy <= y <= wy + wh2:
+                                        target_widget_idx = wi_idx
+                                        break
+                                except Exception:
+                                    pass
+                            src_wi = _drag["src_widget_idx"]
+                            if target_widget_idx is not None and target_widget_idx != src_wi:
+                                # Reorder _queue_order based on widget positions
+                                # Widget list mirrors _queue_order but offset by 1 if "current" is at [0]
+                                has_current = (_state["widgets"][0]["source"] == "current") if _state["widgets"] else False
+                                src_qo = (src_wi - 1) if has_current else src_wi
+                                dst_qo = (target_widget_idx - 1) if has_current else target_widget_idx
+                                with _queue_order_lock:
+                                    if 0 <= src_qo < len(_queue_order) and 0 <= dst_qo < len(_queue_order):
+                                        moved = _queue_order.pop(src_qo)
+                                        _queue_order.insert(dst_qo, moved)
+                                # Update labels in-place
+                                new_items = _get_queue_items()
+                                _state["last_snapshot"] = [(lb, s2, ix) for lb, s2, ix in new_items]
+                                for j, (new_label, new_source, new_idx) in enumerate(new_items):
+                                    if j < len(_state["widgets"]):
+                                        wi = _state["widgets"][j]
+                                        prefix = "  " if new_source == "current" else " "
+                                        wi["lbl"].config(text=f"{prefix}{j + 1}. {new_label}")
+                                        wi["source"] = new_source
+                                        wi["idx"] = new_idx
 
-                        _make_drag_bindings(row, lbl, handle)
+                        for w in [h, l, r]:
+                            w.bind("<ButtonPress-1>", _on_press)
+                            w.bind("<B1-Motion>", _on_motion)
+                            w.bind("<ButtonRelease-1>", _on_release)
+
+                    _make_drag_bindings(row, lbl, handle)
 
             inner.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -7367,8 +7473,8 @@ def _show_queue_menu(event=None):
             canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
             # Footer hint
-            has_sync = any(s == "sync" for _, s, _ in items)
-            hint_text = "  Drag to reorder · Right-click to remove" if has_sync else "  Click to remove"
+            has_queued = any(s != "current" for _, s, _ in items)
+            hint_text = "  Drag to reorder · Right-click to remove" if has_queued else ""
             hint = tk.Label(wrapper, text=hint_text, bg="#2d2d2d", fg="#4a4f5a",
                             font=("Segoe UI", 8), anchor="w")
             hint.pack(fill="x", padx=4, pady=(2, 6))
@@ -8052,10 +8158,10 @@ def _run_autorun():
             if _job_generation == _my_gen:
                 _sync_running = False
 
-                # Check for queued syncs, reorg, or transcription jobs before fully finishing
+                # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
                 if not cancel_event.is_set():
-                    _queue_started = _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
+                    _queue_started = _process_next_queued()
 
                 if root.winfo_exists() and not _queue_started:
                     _iv = interval_mins
@@ -9217,7 +9323,7 @@ root.after(200, run_startup_updates)
 
 def _save_queue_state():
     """Save current queue state to disk for restoration on next launch."""
-    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": []}
+    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "order": []}
     with _sync_queue_lock:
         for ch in _sync_queue:
             queue_data["sync"].append(copy.deepcopy(ch))
@@ -9230,6 +9336,8 @@ def _save_queue_state():
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
+    with _queue_order_lock:
+        queue_data["order"] = list(_queue_order)
     try:
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
@@ -9266,6 +9374,13 @@ def _load_queue_state():
                 for args in transcribe_items:
                     _transcribe_queue.append(tuple(args))
                     restored += 1
+        # Restore unified queue ordering
+        saved_order = queue_data.get("order", [])
+        if saved_order:
+            with _queue_order_lock:
+                for entry in saved_order:
+                    if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                        _queue_order.append(tuple(entry))
         if restored:
             log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
             _update_queue_btn()

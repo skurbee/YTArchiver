@@ -34,6 +34,6 @@ All Claude-Code.
 
 I will list current found issues here as I find them.
 
-1. queueing different operations (transcriptions along with channel syncs) acts weird, and doesn't stay in the order the user queued them in.
+1. 
 
 2. 

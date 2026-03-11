@@ -6590,24 +6590,56 @@ def _process_mt_queue():
 
 def _start_manual_transcription():
     """Prompt user to select a local video file or folder, then add to GPU Tasks queue."""
-    _choice = [None]
-
-    def _ask():
-        _choice[0] = messagebox.askyesnocancel(
-            "Manual Transcription",
-            "Select a single file or an entire folder?\n\n"
-            "• Yes — Select a file\n"
-            "• No  — Select a folder (all videos → single transcript)",
-            icon="question"
-        )
+    _choice = [None]  # "file", "folder", or None (cancelled)
 
     if root.winfo_exists():
-        _ask()
+        _dlg = tk.Toplevel(root)
+        _dlg.title("Manual Transcription")
+        _dlg.configure(bg=C_BG)
+        _dlg.resizable(False, False)
+        _dlg.transient(root)
+        _dlg.grab_set()
+        _dlg.update_idletasks()
+        _rx = root.winfo_rootx() + root.winfo_width() // 2
+        _ry = root.winfo_rooty() + root.winfo_height() // 2
+        _dlg.geometry(f"+{_rx - 140}+{_ry - 60}")
+
+        tk.Label(_dlg, text="Select a single file or an entire folder?",
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                 pady=12, padx=20).pack(fill="x")
+
+        _btn_row = tk.Frame(_dlg, bg=C_BG)
+        _btn_row.pack(fill="x", padx=20, pady=(0, 14))
+
+        def _pick(val):
+            _choice[0] = val
+            try:
+                _dlg.destroy()
+            except Exception:
+                pass
+
+        for lbl, val in [("\U0001F4C4  File", "file"), ("\U0001F4C1  Folder", "folder")]:
+            b = tk.Button(_btn_row, text=lbl, bg=C_BTN, fg=C_TEXT,
+                          activebackground=C_BTN_HVR, activeforeground=C_TEXT,
+                          font=("Segoe UI", 10), relief="flat", bd=0,
+                          cursor="hand2", padx=16, pady=6,
+                          command=lambda v=val: _pick(v))
+            b.pack(side="left", expand=True, fill="x", padx=4)
+
+        _cancel_btn = tk.Button(_btn_row, text="Cancel", bg=C_BTN, fg=C_DIM,
+                                activebackground=C_BTN_HVR, activeforeground=C_TEXT,
+                                font=("Segoe UI", 9), relief="flat", bd=0,
+                                cursor="hand2", padx=10, pady=6,
+                                command=lambda: _pick(None))
+        _cancel_btn.pack(side="left", padx=(8, 4))
+
+        _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+        root.wait_window(_dlg)
 
     if _choice[0] is None:
         return  # cancelled
 
-    if _choice[0]:  # Yes = file
+    if _choice[0] == "file":
         file_path = filedialog.askopenfilename(
             title="Select video file to transcribe",
             filetypes=[
@@ -6626,7 +6658,7 @@ def _start_manual_transcription():
                 return
 
         _add_to_gpu_queue({"type": "mt", "file_path": file_path})
-    else:  # No = folder
+    else:  # folder
         folder_path = filedialog.askdirectory(title="Select folder to transcribe")
         if not folder_path:
             return

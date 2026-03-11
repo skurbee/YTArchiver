@@ -37,8 +37,11 @@ I will list found but unpatched issues here:
 
 1. the current method of comparing file title to video title for transcriptions is good for backlogs. however, a lot of channels change video titles in the first few days. So whats happening:
 Video gets downloaded, auto-transcribe gets added to GPU task list-
+
 in the time it takes the user to start the GPU task list, channel changes video title-
-so instead of using the basically free YT autosub + punctuation model, it's falling back to whisper which takes ~50x longer to process per video
+
+so instead of using the basically free YT autosub + punctuation model, it's falling back to whisper which takes ~50x longer to process per video.
+
 not a huge deal, but maybe we need to check for transcripts on a per video ID basis, and not Title
 
 2. 

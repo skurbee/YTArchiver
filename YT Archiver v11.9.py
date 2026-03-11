@@ -1582,7 +1582,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v11.8 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v11.9 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6602,11 +6602,7 @@ def _start_manual_transcription():
         )
 
     if root.winfo_exists():
-        root.after(0, _ask)
-        while _choice[0] is None:
-            time.sleep(0.05)
-            if not root.winfo_exists():
-                return
+        _ask()
 
     if _choice[0] is None:
         return  # cancelled

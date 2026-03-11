@@ -77,7 +77,7 @@ CHANNEL_DEFAULTS = {"resolution": "720", "mode": "full", "min_duration": 0, "max
                     "compress_enabled": False, "compress_level": "", "compress_output_res": ""}
 
 # Compression presets: level → MB per hour of video
-_COMPRESS_LEVELS = {"Low": 500, "High": 200, "Extreme": 100}
+_COMPRESS_LEVELS = {"Low": 1200, "High": 700, "Extreme": 300}
 
 RESOLUTION_OPTIONS = ["144", "240", "360", "480", "720", "1080", "1440", "2160", "best"]
 active_processes = []
@@ -123,6 +123,7 @@ _gpu_cancel = threading.Event()
 _gpu_pause = threading.Event()
 _gpu_popup = {"win": None}
 _gpu_current = {"label": None, "ch_url": None}  # currently processing GPU task
+_gpu_current_item = None  # full dict of the item currently being processed (for persistence)
 _whisper_model = None  # unused legacy, kept for compat
 _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
 _punct_proc = None  # persistent punctuation subprocess (model stays loaded on GPU)
@@ -556,6 +557,46 @@ def clear_simple_status():
         pass
 
 
+def _update_encode_progress(text):
+    """Update the in-place encoding progress line (replaces previous progress)."""
+    def _write():
+        try:
+            if 'log_box' in globals() and log_box.winfo_exists():
+                log_box.config(state="normal")
+                ranges = log_box.tag_ranges("encode_progress")
+                if ranges:
+                    log_box.delete(ranges[0], ranges[1])
+                log_box.insert(tk.END, text, "encode_progress")
+                log_box.see(tk.END)
+                log_box.config(state="disabled")
+        except Exception:
+            pass
+    try:
+        if 'root' in globals() and root.winfo_exists():
+            _ui_queue.append(_write)
+    except Exception:
+        pass
+
+
+def _clear_encode_progress():
+    """Clear the encoding progress line."""
+    def _write():
+        try:
+            if 'log_box' in globals() and log_box.winfo_exists():
+                log_box.config(state="normal")
+                ranges = log_box.tag_ranges("encode_progress")
+                if ranges:
+                    log_box.delete(ranges[0], ranges[1])
+                log_box.config(state="disabled")
+        except Exception:
+            pass
+    try:
+        if 'root' in globals() and root.winfo_exists():
+            _ui_queue.append(_write)
+    except Exception:
+        pass
+
+
 def _clear_simpledownload_lines():
     def _write():
         try:
@@ -603,7 +644,11 @@ def _simple_anim_tick():
             n = dynamic_total
             _simple_anim_state["total"] = n
 
-        if dl_cur > 0 and ch_tot > 0:
+        _bs = _simple_anim_state.get("batch_size", 0)
+        if dl_cur > 0 and _bs > 0:
+            _b_num = (dl_cur - 1) // _bs + 1
+            status = f"  Downloading {dl_cur} (Batch {_b_num}){d}"
+        elif dl_cur > 0 and ch_tot > 0:
             status = f"  Downloading {dl_cur} of {ch_tot}{d}"
         elif dl_cur > 0:
             status = f"  Downloading{d}"
@@ -635,7 +680,8 @@ def _start_simple_anim(channel, idx, total):
     _simple_anim_state.update({"active": True, "channel": channel,
                                "idx": idx, "total": total, "dots": 0,
                                "dl_current": 0, "ch_total": 0, "page_num": 0,
-                               "enum_page": 0, "enum_count": 0, "job": None})
+                               "enum_page": 0, "enum_count": 0, "batch_size": 0,
+                               "job": None})
     if root.winfo_exists():
         _simple_anim_state["job"] = root.after(0, _simple_anim_tick)
 
@@ -650,9 +696,10 @@ def _stop_simple_anim():
         _simple_anim_state["job"] = None
 
 
-def _update_simple_dl(dl_current, ch_total):
+def _update_simple_dl(dl_current, ch_total, batch_size=0):
     _simple_anim_state["dl_current"] = dl_current
     _simple_anim_state["ch_total"] = ch_total
+    _simple_anim_state["batch_size"] = batch_size
 
 
 def _cleanup_partial_files(directory):
@@ -1535,7 +1582,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v11.1 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v11.8 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1869,6 +1916,7 @@ log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("encode_progress", foreground=C_LOG_DIM, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -1933,7 +1981,7 @@ chan_scrollbar = ttk.Scrollbar(chan_list_frame, orient="vertical")
 chan_scrollbar.grid(row=0, column=1, sticky="ns")
 
 settings_chan_tree = ttk.Treeview(chan_list_frame, style="Recent.Treeview",
-                                  columns=("folder", "res", "min", "max", "from", "transcribed", "last_sync", "url"),
+                                  columns=("folder", "res", "min", "max", "from", "compress", "transcribed", "last_sync", "url"),
                                   show="headings", selectmode="browse",
                                   yscrollcommand=chan_scrollbar.set)
 settings_chan_tree.grid(row=0, column=0, sticky="nsew")
@@ -2016,6 +2064,7 @@ settings_chan_tree.heading("res", text="Res", anchor="w", command=lambda: _sort_
 settings_chan_tree.heading("min", text="Min", anchor="w", command=lambda: _sort_chan_tree("min", False))
 settings_chan_tree.heading("max", text="Max", anchor="w", command=lambda: _sort_chan_tree("max", False))
 settings_chan_tree.heading("from", text="Date Limit", anchor="w", command=lambda: _sort_chan_tree("from", False))
+settings_chan_tree.heading("compress", text="Compress", anchor="center")
 settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w")
 settings_chan_tree.heading("last_sync", text="Last Sync", anchor="w",
                            command=lambda: _sort_chan_tree("last_sync", False))
@@ -2026,6 +2075,7 @@ settings_chan_tree.column("res", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("min", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("from", stretch=False, width=85, anchor="w")
+settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
 settings_chan_tree.column("url", stretch=True, minwidth=100, anchor="w")
@@ -2195,17 +2245,21 @@ def refresh_channel_dropdowns():
             else:
                 from_str = "—"
 
-            # Transcribed status column
+            # Compress column — checkmark if any compression settings enabled
+            compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _COMPRESS_LEVELS else "—"
+
+            # Transcribed status column — only show Running/Queued for transcription tasks, not encode
             auto_t = c.get("auto_transcribe", False)
             ch_url_t = c.get("url", "")
             t_complete = c.get("transcription_complete", False)
-            # Check running/queued status
             _is_queued_t = False
             _is_running_t = False
             with _gpu_queue_lock:
-                _is_queued_t = any(q.get("ch_url") == ch_url_t for q in _gpu_queue)
+                _is_queued_t = any(q.get("ch_url") == ch_url_t and q["type"] in ("transcribe", "mt") for q in _gpu_queue)
             if _gpu_running and _gpu_current.get("ch_url") == ch_url_t:
-                _is_running_t = True
+                _cur_item = _gpu_current_item
+                if _cur_item and _cur_item.get("type") in ("transcribe", "mt"):
+                    _is_running_t = True
             if _is_running_t:
                 trans_str = "Running"
             elif _is_queued_t:
@@ -2218,7 +2272,7 @@ def refresh_channel_dropdowns():
                 trans_str = "—"
 
             tag = "odd" if i % 2 else "even"
-            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, from_str, trans_str, ls_str, c['url']),
+            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, from_str, compress_str, trans_str, ls_str, c['url']),
                                       tags=(tag,))
 
     if _chan_sort_state["col"]:
@@ -2314,7 +2368,7 @@ def on_channel_double_click(event):
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][8]
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -2412,7 +2466,7 @@ def _chan_ctx_sync_now():
         return
     # Match the channel in the treeview to visually select it before syncing
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][8] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2633,7 +2687,7 @@ def _chan_ctx_remove():
         return
     # Select the channel in the tree so remove_channel() can find it
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][8] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2648,7 +2702,7 @@ def _chan_ctx_show(event):
     if row:
         settings_chan_tree.selection_set(row)
         on_chan_list_select(None)
-        target_url = settings_chan_tree.item(row)['values'][7]
+        target_url = settings_chan_tree.item(row)['values'][8]
         with config_lock:
             for c in config.get("channels", []):
                 if c["url"] == target_url:
@@ -2883,11 +2937,13 @@ def add_channel():
                     _bl_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
                 if _bl_count > 0:
                     _bl_res = ch.get("resolution", "720")
+                    _bl_res_label = "Best" if _bl_res == "best" else f"{_bl_res}p"
+                    _bl_out_label = f" → {_new_c_res}p output" if _new_c_res else ""
                     _bl_ask = messagebox.askyesno(
                         "Apply to Existing Videos",
                         f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
-                        f"They will be re-downloaded at {_bl_res}p and compressed "
-                        f"({_new_c_level}).",
+                        f"Re-download at {_bl_res_label}{_bl_out_label}, "
+                        f"compress level: {_new_c_level}.",
                         parent=root
                     )
                     if _bl_ask:
@@ -2911,7 +2967,7 @@ def sync_single_channel():
     if not sel:
         return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][8]
 
     with config_lock:
         ch = None
@@ -3161,8 +3217,30 @@ def sync_single_channel():
                         else:
                             log(f"  Large channel detected ({ch_total:,} videos). Downloading batch of {BATCH_LIMIT:,}...\n", "green")
 
+            # Build incremental compress callback if compress is enabled
+            _sc_level = ch.get("compress_level", "")
+            _sc_batch_cb = None
+            if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+                _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                _sc_prompt_shown = [False]
+                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level):
+                    _b = count // 20
+                    _add_to_gpu_queue({
+                        "type": "encode", "ch_name": _ch["name"], "ch_url": _ch["url"],
+                        "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                        "output_res": _ch.get("compress_output_res", ""),
+                        "split_years": _ch.get("split_years", False),
+                        "split_months": _ch.get("split_months", False),
+                        "batch_num": _b,
+                    }, _quiet=True)
+                    if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
+                        _sc_prompt_shown[0] = True
+                        if _ask_start_gpu_tasks(count):
+                            root.after(0, _gpu_start)
+
             if not cancel_event.is_set() and not _all_cached_done:
-                c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids)
+                c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
+                                                 on_batch_ready=_sc_batch_cb)
                 if _is_simple_mode:
                     _stop_simple_anim()
                     if not cancel_event.is_set():
@@ -3258,7 +3336,8 @@ def sync_single_channel():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                    })
+                        "batch_num": (c_dl - 1) // 20 + 1,
+                    }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded,
                 # add it to the GPU Tasks so the user can process when ready
@@ -3366,7 +3445,7 @@ def _process_sync_queue():
     def _start_queued():
         global _sync_running
         for item in settings_chan_tree.get_children():
-            if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
+            if settings_chan_tree.item(item)['values'][8] == next_ch["url"]:
                 settings_chan_tree.selection_set(item)
                 on_chan_list_select(None)
                 break
@@ -3470,7 +3549,7 @@ def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][8]
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -3555,6 +3634,16 @@ def remove_channel():
     refresh_channel_dropdowns()
     save_config(config)
     remove_channel_btn.pack_forget()
+
+    # Remove any queued GPU tasks for this channel
+    with _gpu_queue_lock:
+        _before = len(_gpu_queue)
+        _gpu_queue[:] = [q for q in _gpu_queue if q.get("ch_url") != removed_url]
+        _removed_gpu = _before - len(_gpu_queue)
+    if _removed_gpu:
+        log(f"  Removed {_removed_gpu} GPU task(s) for \"{removed_name}\" from queue.\n", "dim")
+        _update_gpu_btn()
+        _save_queue_state()
 
     # Offer to delete the channel's folder if it exists
     if os.path.isdir(_ch_folder_path):
@@ -4712,7 +4801,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         # ── Step 3: Calculate target bitrate ──
         # Convert MB/hr to kbps: MB/hr * 1024 * 8 / 3600
         target_total_kbps = (bitrate_mbhr * 1024 * 8) / 3600
-        audio_kbps = 64  # fixed AAC audio bitrate
+        audio_kbps = 128  # fixed AAC audio bitrate
         video_kbps = max(int(target_total_kbps - audio_kbps), 50)  # minimum 50 kbps video
 
         log(f"  Video bitrate: {video_kbps} kbps, Audio: {audio_kbps} kbps\n", "simpleline")
@@ -4756,8 +4845,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             cmd += [
                 "-c:v", "av1_nvenc",
                 "-b:v", f"{video_kbps}k",
-                "-preset", "p4",
-                "-multipass", "1",
+                "-preset", "p6",
+                "-multipass", "2",
                 "-c:a", "aac", "-b:a", f"{audio_kbps}k",
                 "-movflags", "+faststart",
                 "-metadata", "comment=ytarchiver_compressed=1",
@@ -4770,10 +4859,13 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     startupinfo=startupinfo, encoding="utf-8", errors="replace"
                 )
                 _ffmpeg_proc = proc
+                _encode_t0 = time.time()
 
                 # Parse progress from stderr
                 _time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
                 last_pct = -1
+                _dot_idx = 0
+                _EDOTS = [".", "..", "..."]
                 for line in proc.stderr:
                     if _ce.is_set():
                         proc.terminate()
@@ -4788,14 +4880,26 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         h, mi, s, cs = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
                         elapsed = h * 3600 + mi * 60 + s + cs / 100
                         pct = min(int(elapsed / duration * 100), 100)
-                        if pct != last_pct and pct % 5 == 0:
+                        if pct != last_pct:
                             last_pct = pct
-                            clear_transient_lines()
-                            log(f"    Encoding: {pct}%\n", "transient")
+                            _dot_idx += 1
+                            _d = _EDOTS[_dot_idx % 3]
+                            if _pe.is_set():
+                                _update_encode_progress(f"    Encoding {pct}% — will pause after this video{_d}\n")
+                            else:
+                                _update_encode_progress(f"    Encoding {pct}%{_d}\n")
+                    elif duration <= 0:
+                        _dot_idx += 1
+                        _d = _EDOTS[_dot_idx % 3]
+                        if _pe.is_set():
+                            _update_encode_progress(f"    Encoding — will pause after this video{_d}\n")
+                        else:
+                            _update_encode_progress(f"    Encoding{_d}\n")
 
                 proc.wait()
                 _ffmpeg_proc = None
-                clear_transient_lines()
+                _clear_encode_progress()
+                _encode_elapsed = time.time() - _encode_t0
 
                 if _ce.is_set():
                     # Clean up temp file on cancel
@@ -4805,6 +4909,11 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     except Exception:
                         pass
                     break
+
+                # Format elapsed time
+                _em = int(_encode_elapsed) // 60
+                _es = int(_encode_elapsed) % 60
+                _elapsed_str = f"{_em}m{_es:02d}s" if _em > 0 else f"{_es}s"
 
                 if proc.returncode == 0 and os.path.exists(temp_path):
                     # Get sizes for logging
@@ -4818,7 +4927,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         done_count += 1
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
-                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller)\n", "simpleline_green")
+                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, took {_elapsed_str})\n", "simpleline_green")
                     except Exception as e:
                         err_count += 1
                         log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -4828,7 +4937,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                             pass
                 else:
                     err_count += 1
-                    log(f"    ⚠ ffmpeg failed (exit code {proc.returncode})\n", "red")
+                    log(f"    ⚠ ffmpeg failed (exit code {proc.returncode}, took {_elapsed_str})\n", "red")
                     try:
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
@@ -5046,7 +5155,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                 # Calculate target bitrate
                 target_total_kbps = (_bitrate * 1024 * 8) / 3600
-                audio_kbps = 64
+                audio_kbps = 128
                 video_kbps = max(int(target_total_kbps - audio_kbps), 50)
 
                 for idx, (vid_id, orig_path, orig_size) in enumerate(batch):
@@ -5113,7 +5222,9 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                     # Compress with ffmpeg
                     compressed_path = os.path.join(temp_dir, f"{vid_id}_compressed.mp4")
-                    log(f"    Compressing...\n", "simpleline")
+
+                    # Get duration for progress reporting
+                    _bl_duration = _ffprobe_duration(dl_path)
 
                     ffmpeg_cmd = ["ffmpeg", "-y", "-i", dl_path]
                     if _out_res:
@@ -5121,8 +5232,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     ffmpeg_cmd += [
                         "-c:v", "av1_nvenc",
                         "-b:v", f"{video_kbps}k",
-                        "-preset", "p4",
-                        "-multipass", "1",
+                        "-preset", "p6",
+                        "-multipass", "2",
                         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
                         "-movflags", "+faststart",
                         "-metadata", "comment=ytarchiver_compressed=1",
@@ -5135,7 +5246,12 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             startupinfo=startupinfo, encoding="utf-8", errors="replace"
                         )
                         _ffmpeg_proc = proc
+                        _bl_encode_t0 = time.time()
 
+                        _bl_time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+                        _bl_last_pct = -1
+                        _bl_dot_idx = 0
+                        _EDOTS = [".", "..", "..."]
                         for line in proc.stderr:
                             if _ce.is_set():
                                 proc.terminate()
@@ -5145,12 +5261,40 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                     proc.kill()
                                 break
 
+                            _bl_m = _bl_time_re.search(line)
+                            if _bl_m and _bl_duration > 0:
+                                _bl_h, _bl_mi, _bl_s, _bl_cs = int(_bl_m.group(1)), int(_bl_m.group(2)), int(_bl_m.group(3)), int(_bl_m.group(4))
+                                _bl_elapsed = _bl_h * 3600 + _bl_mi * 60 + _bl_s + _bl_cs / 100
+                                _bl_pct = min(int(_bl_elapsed / _bl_duration * 100), 100)
+                                if _bl_pct != _bl_last_pct:
+                                    _bl_last_pct = _bl_pct
+                                    _bl_dot_idx += 1
+                                    _d = _EDOTS[_bl_dot_idx % 3]
+                                    if _pe.is_set():
+                                        _update_encode_progress(f"    Encoding {_bl_pct}% — will pause after this video{_d}\n")
+                                    else:
+                                        _update_encode_progress(f"    Encoding {_bl_pct}%{_d}\n")
+                            elif _bl_duration <= 0:
+                                _bl_dot_idx += 1
+                                _d = _EDOTS[_bl_dot_idx % 3]
+                                if _pe.is_set():
+                                    _update_encode_progress(f"    Encoding — will pause after this video{_d}\n")
+                                else:
+                                    _update_encode_progress(f"    Encoding{_d}\n")
+
                         if not _ce.is_set():
                             proc.wait()
                         _ffmpeg_proc = None
+                        _clear_encode_progress()
+                        _bl_encode_elapsed = time.time() - _bl_encode_t0
 
                         if _ce.is_set():
                             break
+
+                        # Format elapsed time
+                        _bl_em = int(_bl_encode_elapsed) // 60
+                        _bl_es = int(_bl_encode_elapsed) % 60
+                        _bl_elapsed_str = f"{_bl_em}m{_bl_es:02d}s" if _bl_em > 0 else f"{_bl_es}s"
 
                         if proc.returncode == 0 and os.path.exists(compressed_path):
                             new_size = os.path.getsize(compressed_path)
@@ -5160,12 +5304,13 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 batch_new += new_size
                                 o_mb = orig_size / (1024 * 1024)
                                 n_mb = new_size / (1024 * 1024)
-                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB\n", "simpleline_green")
+                                _bl_ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
+                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, took {_bl_elapsed_str})\n", "simpleline_green")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
                                 batch_errors += 1
                         else:
-                            log(f"    ⚠ Encode failed.\n", "red")
+                            log(f"    ⚠ Encode failed (took {_bl_elapsed_str}).\n", "red")
                             batch_errors += 1
                     except FileNotFoundError:
                         log(f"    ⚠ ffmpeg not found.\n", "red")
@@ -5683,36 +5828,137 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
     return _model_result[0], _model_timed_out[0]
 
 
-def _add_to_gpu_queue(item):
-    """Add a task to the GPU Tasks queue and show the GPU button."""
+def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
+    """Show a timed dialog asking the user to start GPU Tasks. Returns True if user clicks Yes.
+    Auto-dismisses after timeout seconds (default 3 min), returning False.
+    Thread-safe: creates dialog on main thread, waits from worker thread.
+    """
+    _result = [None]  # None=pending, True=yes, False=no/timeout
+
+    def _show():
+        dlg = tk.Toplevel(root)
+        dlg.title("Start GPU Tasks?")
+        dlg.configure(bg=C_BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss(False))
+
+        tk.Label(dlg, text=f"Downloaded {count} videos so far.",
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold")).pack(padx=20, pady=(14, 4))
+        tk.Label(dlg, text="It is recommended to start GPU Tasks now\nto save storage space.",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(padx=20, pady=(0, 8))
+
+        _secs = [timeout]
+        _timer_lbl = tk.Label(dlg, text=f"Auto-dismissing in {_secs[0]}s...",
+                              bg=C_BG, fg=C_DIM, font=("Segoe UI", 8))
+        _timer_lbl.pack(padx=20, pady=(0, 4))
+        _timer_job = [None]
+
+        def _tick():
+            _secs[0] -= 1
+            if _secs[0] <= 0:
+                _dismiss(False)
+                return
+            try:
+                _timer_lbl.config(text=f"Auto-dismissing in {_secs[0]}s...")
+                _timer_job[0] = dlg.after(1000, _tick)
+            except Exception:
+                pass
+
+        def _dismiss(val):
+            _result[0] = val
+            if _timer_job[0]:
+                try:
+                    dlg.after_cancel(_timer_job[0])
+                except Exception:
+                    pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        btn_row = tk.Frame(dlg, bg=C_BG)
+        btn_row.pack(padx=20, pady=(4, 14))
+        tk.Button(btn_row, text="Start GPU Tasks", bg="#3a6a3a", fg="#cccccc",
+                  relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  command=lambda: _dismiss(True)).pack(side="left", padx=(0, 10))
+        tk.Button(btn_row, text="Not Now", bg=C_SURFACE, fg=C_DIM,
+                  relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                  command=lambda: _dismiss(False)).pack(side="left")
+
+        _timer_job[0] = dlg.after(1000, _tick)
+        dlg.update_idletasks()
+        dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
+
+    root.after(0, _show)
+    _ce = cancel_ev or cancel_event
+    while _result[0] is None and not _ce.is_set():
+        time.sleep(0.25)
+    return _result[0] is True
+
+
+def _add_to_gpu_queue(item, _quiet=False):
+    """Add a task to the GPU Tasks queue and show the GPU button.
+    _quiet: if True, suppress duplicate warning logs (used by incremental compress callback).
+    """
     with _gpu_queue_lock:
+        # Also check the currently-running item for dedup
+        _cur = _gpu_current_item
         # Duplicate check
         if item["type"] == "transcribe":
-            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "transcribe" for q in _gpu_queue):
-                log(f"  ⚠ {item['ch_name']} is already in the GPU Tasks queue.\n", "simpleline")
+            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "transcribe" for q in _gpu_queue) or \
+               (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "transcribe"):
+                if not _quiet:
+                    log(f"  ⚠ {item['ch_name']} is already in the GPU Tasks queue.\n", "simpleline")
                 return
             label = f"Transcribe {item['ch_name']}"
         elif item["type"] == "encode":
-            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "encode" for q in _gpu_queue):
-                log(f"  ⚠ {item['ch_name']} compression is already in the GPU Tasks queue.\n", "simpleline")
-                return
-            label = f"Compress {item['ch_name']}"
+            _bn = item.get("batch_num")
+            if _bn is not None:
+                # Batch-numbered: dedup by channel + batch number
+                if any(q.get("ch_url") == item["ch_url"] and q["type"] == "encode" and q.get("batch_num") == _bn for q in _gpu_queue) or \
+                   (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "encode" and _cur.get("batch_num") == _bn):
+                    if not _quiet:
+                        log(f"  ⚠ {item['ch_name']} Batch {_bn} compression is already in the GPU Tasks queue.\n", "simpleline")
+                    return
+                label = f"Compress {item['ch_name']}, Batch {_bn}"
+            else:
+                # Non-batch: dedup by channel URL (original behavior)
+                if any(q.get("ch_url") == item["ch_url"] and q["type"] == "encode" for q in _gpu_queue) or \
+                   (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "encode"):
+                    if not _quiet:
+                        log(f"  ⚠ {item['ch_name']} compression is already in the GPU Tasks queue.\n", "simpleline")
+                    return
+                label = f"Compress {item['ch_name']}"
         elif item["type"] == "backlog_encode":
-            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "backlog_encode" for q in _gpu_queue):
-                log(f"  ⚠ {item['ch_name']} backlog is already in the GPU Tasks queue.\n", "simpleline")
+            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "backlog_encode" for q in _gpu_queue) or \
+               (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "backlog_encode"):
+                if not _quiet:
+                    log(f"  ⚠ {item['ch_name']} backlog is already in the GPU Tasks queue.\n", "simpleline")
                 return
             label = f"Backlog {item['ch_name']}"
         elif item["type"] == "mt":
-            if any(q.get("file_path") == item.get("file_path") for q in _gpu_queue):
-                log(f"  File already in GPU Tasks queue.\n", "simpleline")
-                return
-            fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-            label = f"M.T. {fname}"
+            if item.get("folder_path"):
+                # Folder-based manual transcription
+                if any(q.get("folder_path") == item["folder_path"] and q["type"] == "mt" for q in _gpu_queue):
+                    if not _quiet:
+                        log(f"  Folder already in GPU Tasks queue.\n", "simpleline")
+                    return
+                label = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
+            else:
+                # Single-file manual transcription
+                if any(q.get("file_path") == item.get("file_path") for q in _gpu_queue):
+                    if not _quiet:
+                        log(f"  File already in GPU Tasks queue.\n", "simpleline")
+                    return
+                fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                label = f"M.T. {fname}"
         else:
             label = "GPU Task"
         _gpu_queue.append(item)
-    log(f"\n=== Added to GPU Tasks: {label} ===\n", "header")
+    log(f"=== Added to GPU Tasks: {label} ===\n", "header")
     _update_gpu_btn()
+    _save_queue_state()
 
 
 def _process_transcribe_queue():
@@ -6343,26 +6589,71 @@ def _process_mt_queue():
 
 
 def _start_manual_transcription():
-    """Prompt user to select a local video file, then add it to GPU Tasks queue."""
-    file_path = filedialog.askopenfilename(
-        title="Select video file to transcribe",
-        filetypes=[
-            ("Video files", "*.mp4 *.mkv *.webm *.avi *.mov *.flv *.wmv *.m4v"),
-            ("Audio files", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac"),
-            ("All files", "*.*"),
-        ]
-    )
-    if not file_path:
-        return
-    file_path = os.path.normpath(file_path)
+    """Prompt user to select a local video file or folder, then add to GPU Tasks queue."""
+    _choice = [None]
 
-    # Check if already in GPU queue
-    with _gpu_queue_lock:
-        if any(item.get("file_path") == file_path for item in _gpu_queue):
-            log(f"  File already in GPU Tasks queue.\n", "simpleline")
+    def _ask():
+        _choice[0] = messagebox.askyesnocancel(
+            "Manual Transcription",
+            "Select a single file or an entire folder?\n\n"
+            "• Yes — Select a file\n"
+            "• No  — Select a folder (all videos → single transcript)",
+            icon="question"
+        )
+
+    if root.winfo_exists():
+        root.after(0, _ask)
+        while _choice[0] is None:
+            time.sleep(0.05)
+            if not root.winfo_exists():
+                return
+
+    if _choice[0] is None:
+        return  # cancelled
+
+    if _choice[0]:  # Yes = file
+        file_path = filedialog.askopenfilename(
+            title="Select video file to transcribe",
+            filetypes=[
+                ("Video files", "*.mp4 *.mkv *.webm *.avi *.mov *.flv *.wmv *.m4v"),
+                ("Audio files", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not file_path:
+            return
+        file_path = os.path.normpath(file_path)
+
+        with _gpu_queue_lock:
+            if any(item.get("file_path") == file_path for item in _gpu_queue):
+                log(f"  File already in GPU Tasks queue.\n", "simpleline")
+                return
+
+        _add_to_gpu_queue({"type": "mt", "file_path": file_path})
+    else:  # No = folder
+        folder_path = filedialog.askdirectory(title="Select folder to transcribe")
+        if not folder_path:
+            return
+        folder_path = os.path.normpath(folder_path)
+
+        # Count video files
+        _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
+                     ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
+        vid_count = sum(1 for f in os.listdir(folder_path)
+                        if os.path.isfile(os.path.join(folder_path, f))
+                        and os.path.splitext(f)[1].lower() in _vid_exts)
+        if vid_count == 0:
+            log(f"  No video/audio files found in folder.\n", "red")
             return
 
-    _add_to_gpu_queue({"type": "mt", "file_path": file_path})
+        with _gpu_queue_lock:
+            if any(item.get("folder_path") == folder_path and item["type"] == "mt" for item in _gpu_queue):
+                log(f"  Folder already in GPU Tasks queue.\n", "simpleline")
+                return
+
+        folder_name = os.path.basename(folder_path)
+        _add_to_gpu_queue({"type": "mt", "folder_path": folder_path, "folder_name": folder_name,
+                           "vid_count": vid_count})
 
 
 def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
@@ -6529,6 +6820,203 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         threading.Thread(target=_worker, daemon=True).start()
 
 
+def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, pause_ev=None,
+                                      _sync_mode=False):
+    """Run manual transcription of all video/audio files in a folder.
+
+    All files are transcribed and written to a single (foldername) Transcript.txt
+    using the same entry format as channel transcription.
+    Always runs via GPU Tasks (_sync_mode=True from GPU worker).
+    """
+    global _transcribe_running, _whisper_model_choice
+
+    _VID_EXTS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
+                 ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
+
+    def _worker():
+        global _transcribe_running, _whisper_model_choice
+        _ce = cancel_ev or cancel_event
+        _pe = pause_ev or pause_event
+        _transcribe_running = True
+        _tray_start_spin(red=True)
+        _update_tray_tooltip(f"YT Archiver — Transcribing {folder_name}")
+
+        try:
+            _ce.clear()
+
+            log(f"\n{'='*60}\n", "header")
+            log(f"  MANUAL TRANSCRIPTION (FOLDER): {folder_name}\n", "header")
+            log(f"{'='*60}\n\n", "header")
+
+            if not os.path.isdir(folder_path):
+                log(f"  Folder not found: {folder_path}\n", "red")
+                return
+
+            # Gather video/audio files, sorted by name
+            files = sorted([f for f in os.listdir(folder_path)
+                            if os.path.isfile(os.path.join(folder_path, f))
+                            and os.path.splitext(f)[1].lower() in _VID_EXTS])
+
+            if not files:
+                log(f"  No video/audio files found in folder.\n", "red")
+                return
+
+            out_path = os.path.join(folder_path, f"{folder_name} Transcript.txt")
+            log(f"  Found {len(files)} files to transcribe\n", "simpleline")
+            log(f"  Output: {folder_name} Transcript.txt\n\n", "simpleline")
+
+            # Check CUDA availability
+            _has_cuda = False
+            try:
+                _cuda_check = subprocess.run(
+                    [_WHISPER_PYTHON, "-c", "import torch; print(torch.cuda.is_available())"],
+                    capture_output=True, text=True, timeout=30, startupinfo=startupinfo
+                ) if os.path.exists(_WHISPER_PYTHON) else None
+                _has_cuda = _cuda_check is not None and "True" in _cuda_check.stdout
+            except Exception:
+                pass
+
+            if not _has_cuda:
+                log(f"  ⚠ No CUDA GPU detected — Whisper unavailable.\n", "red")
+                return
+
+            # Check Whisper installation
+            if not _check_whisper_installed():
+                log("  Whisper AI is not installed.\n", "red")
+                _install_result = [None]
+
+                def _ask_install():
+                    _install_result[0] = messagebox.askyesno(
+                        "Install Whisper AI",
+                        "Whisper AI is required for transcription.\n\n"
+                        "This requires ~1.5 GB of downloads.\n\n"
+                        "Install now?")
+
+                if root.winfo_exists():
+                    root.after(0, _ask_install)
+                    while _install_result[0] is None and not _ce.is_set():
+                        time.sleep(0.1)
+                    if not _install_result[0]:
+                        log(f"  Transcription cancelled — Whisper not installed.\n", "red")
+                        return
+                    if not _install_whisper_blocking():
+                        log(f"  Failed to install Whisper.\n", "red")
+                        return
+
+            _stop_whisper_process()
+            log(f"  Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
+
+            _t_start = time.time()
+            _whisper_counter["idx"] = 0
+            _whisper_counter["total"] = len(files)
+            _transcribed = 0
+            _skipped = 0
+
+            for i, filename in enumerate(files):
+                if _ce.is_set():
+                    log(f"\n  Cancelled.\n", "red")
+                    return
+
+                # Handle pause
+                while _pe.is_set() and not _ce.is_set():
+                    time.sleep(0.5)
+                if _ce.is_set():
+                    log(f"\n  Cancelled.\n", "red")
+                    return
+
+                fpath = os.path.join(folder_path, filename)
+                fname = os.path.splitext(filename)[0]
+                _whisper_counter["idx"] = i + 1
+
+                log(f"  [{i+1}/{len(files)}] {fname}\n", "simpleline")
+
+                # Get duration
+                dur_str = ""
+                _dur_secs = 0
+                try:
+                    probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
+                                 "format=duration", "-of", "csv=p=0", fpath]
+                    probe_result = subprocess.run(probe_cmd, capture_output=True,
+                                                  text=True, timeout=30, startupinfo=startupinfo)
+                    _dur_secs = float(probe_result.stdout.strip())
+                    hrs, remainder = divmod(int(_dur_secs), 3600)
+                    mins, sec = divmod(remainder, 60)
+                    dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
+                except Exception:
+                    pass
+
+                # Get date from file mtime
+                try:
+                    mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                    upload_date = mtime.strftime("%Y%m%d")
+                except Exception:
+                    upload_date = ""
+
+                # Transcribe
+                text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname,
+                                           cancel_ev=_ce, pause_ev=_pe)
+
+                if _ce.is_set():
+                    log(f"\n  Cancelled.\n", "red")
+                    return
+
+                if not text:
+                    log(f"    ⚠ Whisper returned empty result, skipping.\n", "red")
+                    _skipped += 1
+                    continue
+
+                # Build entry in channel transcription format
+                date_fmt = _format_upload_date(upload_date)
+                dur_fmt = _format_duration(dur_str)
+                _w_model_tag = f"WHISPER {_whisper_model_choice.upper()}"
+                entry = f"===({fname}), {date_fmt}, {dur_fmt}, ({_w_model_tag})===\n{text}\n\n\n"
+
+                try:
+                    with open(out_path, "a", encoding="utf-8") as f:
+                        f.write(entry)
+                    _transcribed += 1
+                except Exception as e:
+                    log(f"    ⚠ Error writing transcript: {e}\n", "red")
+                    _skipped += 1
+
+            # Sort the transcript file by date (newest first)
+            if _transcribed > 0 and os.path.isfile(out_path):
+                try:
+                    _sort_transcript_entries(out_path)
+                except Exception:
+                    pass
+
+            elapsed = time.time() - _t_start
+            _m, _s = divmod(int(elapsed), 60)
+            _h, _m = divmod(_m, 60)
+            if _h:
+                _time_str = f"{_h}hr {_m:02d}min {_s:02d}sec"
+            elif _m:
+                _time_str = f"{_m}min {_s:02d}sec"
+            else:
+                _time_str = f"{_s}sec"
+
+            log(f"\n  Folder transcription complete: {_transcribed} transcribed", "simpleline_green")
+            if _skipped:
+                log(f", {_skipped} skipped", "simpleline_green")
+            log(f" ({_time_str})\n", "simpleline_green")
+            log(f"  Saved: {folder_name} Transcript.txt\n", "simpleline_green")
+
+        except Exception as e:
+            log(f"\n  Manual folder transcription error: {e}\n", "red")
+        finally:
+            _transcribe_running = False
+            if not _sync_mode:
+                _stop_whisper_process()
+                _tray_stop_spin()
+                _update_tray_tooltip("YT Archiver — Idle")
+
+    if _sync_mode:
+        _worker()
+    else:
+        threading.Thread(target=_worker, daemon=True).start()
+
+
 def _toggle_split_months(*_):
     if new_split_years_var.get():
         split_months_cb.pack(side="left", padx=(0, 4))
@@ -6556,7 +7044,7 @@ _compress_level_label = tk.Label(compress_row, text="Level:", bg=C_SURFACE, fg=C
                                   font=("Segoe UI", 9))
 _compress_level_combo = _combo(compress_row, textvariable=new_compress_level_var,
                                 values=["Low", "High", "Extreme"], state="readonly", width=8)
-_ToolTip(_compress_level_combo, "Low = ~500 MB/hr · High = ~200 MB/hr · Extreme = ~100 MB/hr")
+_ToolTip(_compress_level_combo, "Low = ~1200 MB/hr · High = ~700 MB/hr · Extreme = ~300 MB/hr\nAV1 NVENC, preset p6, two-pass, 128k AAC audio")
 
 _COMPRESS_RES_OPTIONS = ["Original", "144p", "240p", "360p", "480p", "720p", "1080p"]
 _compress_output_label = tk.Label(compress_row, text="Output:", bg=C_SURFACE, fg=C_DIM,
@@ -7711,7 +8199,7 @@ def _parse_ytdlp_size(s):
     return str(int(val * mult.get(unit, 1)))
 
 
-def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
+def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_ready=None):
     if live_ids is None:
         live_ids = []
     proc = None
@@ -7732,18 +8220,29 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
 
-        for line in proc.stdout:
-            is_simple_mode = _is_simple_mode
+        # Threaded stdout reader — prevents blocking when yt-dlp hangs,
+        # so pause/cancel checks still run every 2 seconds.
+        import queue as _queue_mod
+        _line_q = _queue_mod.Queue()
 
-            # Strip Unicode replacement characters from yt-dlp output
-            line = line.replace('\ufffd', '')
+        def _stdout_reader():
+            try:
+                for _rl in proc.stdout:
+                    _line_q.put(_rl)
+                    # When paused, stop reading to create back-pressure on yt-dlp
+                    while pause_event.is_set() and not cancel_event.is_set():
+                        time.sleep(0.5)
+            except Exception:
+                pass
+            _line_q.put(None)  # sentinel: EOF
 
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+
+        while True:
             if cancel_event.is_set():
                 break
 
-            # Pause: stop reading stdout → OS pipe buffer fills → yt-dlp
-            # blocks on write → download freezes naturally.  The UI queue's
-            # time budget handles any burst of buffered lines on resume.
+            # Pause check runs even when yt-dlp produces no output
             if pause_event.is_set() and not cancel_event.is_set():
                 log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
                 while pause_event.is_set() and not cancel_event.is_set():
@@ -7752,6 +8251,18 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                     log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
             if cancel_event.is_set():
                 break
+
+            try:
+                line = _line_q.get(timeout=2.0)
+            except _queue_mod.Empty:
+                continue  # no output — loop back to check pause/cancel
+            if line is None:
+                break  # EOF — yt-dlp exited
+
+            is_simple_mode = _is_simple_mode
+
+            # Strip Unicode replacement characters from yt-dlp output
+            line = line.replace('\ufffd', '')
 
             line_lower = line.lower()
             if "error:" in line_lower and "cookie" in line_lower and (
@@ -8177,8 +8688,15 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None):
                     dl_count += 1
                     session_totals["dl"] += 1
 
+                    # Trigger incremental compress callback every 20 downloads
+                    if on_batch_ready and dl_count > 0 and dl_count % 20 == 0:
+                        try:
+                            on_batch_ready(dl_count)
+                        except Exception:
+                            pass
+
                     if is_simple_mode:
-                        _update_simple_dl(dl_count, 0)
+                        _update_simple_dl(dl_count, 0, batch_size=20 if on_batch_ready else 0)
 
             if not is_simple_mode:
                 log(line)
@@ -8601,9 +9119,31 @@ def start_sync_all():
                             else:
                                 log(f"  Large channel detected ({ch_total:,} videos). Downloading batch of {BATCH_LIMIT:,}...\n", "green")
 
+                # Build incremental compress callback if compress is enabled
+                _sc_level = ch.get("compress_level", "")
+                _sc_batch_cb = None
+                if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+                    _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _sc_prompt_shown = [False]
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level):
+                        _b = count // 20
+                        _add_to_gpu_queue({
+                            "type": "encode", "ch_name": _cn, "ch_url": _u,
+                            "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                            "output_res": _ch.get("compress_output_res", ""),
+                            "split_years": _ch.get("split_years", False),
+                            "split_months": _ch.get("split_months", False),
+                            "batch_num": _b,
+                        }, _quiet=True)
+                        if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
+                            _sc_prompt_shown[0] = True
+                            if _ask_start_gpu_tasks(count):
+                                root.after(0, _gpu_start)
+
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
-                                                     live_ids=live_ids)
+                                                     live_ids=live_ids,
+                                                     on_batch_ready=_sc_batch_cb)
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl
 
@@ -8678,7 +9218,8 @@ def start_sync_all():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                    })
+                        "batch_num": (c_dl - 1) // 20 + 1,
+                    }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
                 if c_dl > 0 and ch.get("auto_transcribe", False):
@@ -9492,65 +10033,14 @@ def _update_gpu_badge():
 
 
 # --- Sync Tasks button blink animation (subtle) ---
-_sync_blink = {"active": False, "on": False, "job": None}
+_sync_blink = {"active": False}
+_gpu_blink = {"active": False}
+_blink_clock = {"on": False, "job": None}  # unified blink clock for both buttons
 
 # Dedicated style for Sync Tasks button — same as Emoji.TButton but we toggle its background
 style.configure("SyncQ.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
                 font=("Segoe UI Emoji", 11))
 style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-
-
-def _sync_blink_tick():
-    """Toggle the Sync Tasks button background between normal and muted blue."""
-    try:
-        if not _sync_blink["active"] or not root.winfo_exists():
-            style.configure("SyncQ.TButton", background=C_BTN)
-            style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-            _sync_blink["on"] = False
-            _sync_blink["job"] = None
-            return
-        _sync_blink["on"] = not _sync_blink["on"]
-        if _sync_blink["on"]:
-            style.configure("SyncQ.TButton", background="#3a5a3a")
-            style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
-        else:
-            style.configure("SyncQ.TButton", background=C_BTN)
-            style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-        _sync_blink["job"] = root.after(800, _sync_blink_tick)
-    except Exception:
-        _sync_blink["active"] = False
-        _sync_blink["job"] = None
-
-
-def _sync_blink_start():
-    """Start the Sync Tasks button blink animation."""
-    if _sync_blink["active"]:
-        return
-    _sync_blink["active"] = True
-    _sync_blink["on"] = False
-    if root.winfo_exists():
-        _sync_blink["job"] = root.after(0, _sync_blink_tick)
-
-
-def _sync_blink_stop():
-    """Stop the Sync Tasks button blink animation."""
-    _sync_blink["active"] = False
-    if _sync_blink["job"]:
-        try:
-            root.after_cancel(_sync_blink["job"])
-        except Exception:
-            pass
-        _sync_blink["job"] = None
-    _sync_blink["on"] = False
-    try:
-        style.configure("SyncQ.TButton", background=C_BTN)
-        style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-    except Exception:
-        pass
-
-
-# --- GPU button blink animation ---
-_gpu_blink = {"active": False, "on": False, "job": None}
 
 # Dedicated style for GPU button — same as Emoji.TButton but we toggle its background
 style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
@@ -9558,27 +10048,66 @@ style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 
 style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 
-def _gpu_blink_tick():
-    """Toggle the GPU button background between normal and red."""
+def _blink_tick():
+    """Unified blink clock — toggles both Sync and GPU buttons in phase."""
     try:
-        if not _gpu_blink["active"] or not root.winfo_exists() or not gpu_btn.winfo_ismapped():
-            # Reset to normal background when stopping
-            style.configure("Gpu.TButton", background=C_BTN)
-            style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-            _gpu_blink["on"] = False
-            _gpu_blink["job"] = None
+        if not root.winfo_exists():
+            _blink_clock["job"] = None
             return
-        _gpu_blink["on"] = not _gpu_blink["on"]
-        if _gpu_blink["on"]:
-            style.configure("Gpu.TButton", background="#6b1a1a")
-            style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+        _blink_clock["on"] = not _blink_clock["on"]
+        is_on = _blink_clock["on"]
+
+        # Sync Tasks button
+        if _sync_blink["active"]:
+            if is_on:
+                style.configure("SyncQ.TButton", background="#3a5a3a")
+                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+            else:
+                style.configure("SyncQ.TButton", background=C_BTN)
+                style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+
+        # GPU Tasks button
+        if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
+            if is_on:
+                style.configure("Gpu.TButton", background="#6b1a1a")
+                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+            else:
+                style.configure("Gpu.TButton", background=C_BTN)
+                style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+
+        # Keep ticking while at least one blink is active
+        if _sync_blink["active"] or _gpu_blink["active"]:
+            _blink_clock["job"] = root.after(700, _blink_tick)
         else:
-            style.configure("Gpu.TButton", background=C_BTN)
-            style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-        _gpu_blink["job"] = root.after(600, _gpu_blink_tick)
+            _blink_clock["on"] = False
+            _blink_clock["job"] = None
     except Exception:
-        _gpu_blink["active"] = False
-        _gpu_blink["job"] = None
+        _blink_clock["job"] = None
+
+
+def _ensure_blink_running():
+    """Start the unified blink clock if it's not already ticking."""
+    if _blink_clock["job"] is None and root.winfo_exists():
+        _blink_clock["on"] = False
+        _blink_clock["job"] = root.after(0, _blink_tick)
+
+
+def _sync_blink_start():
+    """Start the Sync Tasks button blink animation."""
+    if _sync_blink["active"]:
+        return
+    _sync_blink["active"] = True
+    _ensure_blink_running()
+
+
+def _sync_blink_stop():
+    """Stop the Sync Tasks button blink animation."""
+    _sync_blink["active"] = False
+    try:
+        style.configure("SyncQ.TButton", background=C_BTN)
+        style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+    except Exception:
+        pass
 
 
 def _gpu_blink_start():
@@ -9586,21 +10115,12 @@ def _gpu_blink_start():
     if _gpu_blink["active"]:
         return
     _gpu_blink["active"] = True
-    _gpu_blink["on"] = False
-    if root.winfo_exists():
-        _gpu_blink["job"] = root.after(0, _gpu_blink_tick)
+    _ensure_blink_running()
 
 
 def _gpu_blink_stop():
     """Stop the GPU button blink animation."""
     _gpu_blink["active"] = False
-    if _gpu_blink["job"]:
-        try:
-            root.after_cancel(_gpu_blink["job"])
-        except Exception:
-            pass
-        _gpu_blink["job"] = None
-    _gpu_blink["on"] = False
     try:
         style.configure("Gpu.TButton", background=C_BTN)
         style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
@@ -9636,12 +10156,17 @@ def _get_gpu_queue_items():
             if item["type"] == "transcribe":
                 items.append((f"Transcribe {item['ch_name']}", i))
             elif item["type"] == "encode":
-                items.append((f"Compress {item['ch_name']}", i))
+                _bn = item.get("batch_num")
+                _bl = f"Compress {item['ch_name']}, Batch {_bn}" if _bn is not None else f"Compress {item['ch_name']}"
+                items.append((_bl, i))
             elif item["type"] == "backlog_encode":
                 items.append((f"Backlog {item['ch_name']}", i))
             elif item["type"] == "mt":
-                fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-                items.append((f"M.T. {fname}", i))
+                if item.get("folder_path"):
+                    items.append((f"M.T. {item['folder_name']} ({item['vid_count']} files)", i))
+                else:
+                    fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                    items.append((f"M.T. {fname}", i))
     return items
 
 
@@ -9656,6 +10181,7 @@ def _remove_gpu_queue_item(idx):
                 label = os.path.splitext(os.path.basename(removed.get("file_path", "")))[0]
             log(f"  Removed {label} from GPU Tasks.\n", "dim")
     _update_gpu_btn()
+    _save_queue_state()
 
 
 def _show_gpu_menu(event=None):
@@ -9963,7 +10489,7 @@ def _gpu_start():
         _update_gpu_btn()
 
         def _gpu_worker():
-            global _gpu_running
+            global _gpu_running, _gpu_current_item
             try:
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
@@ -9981,9 +10507,12 @@ def _gpu_start():
                         if not _gpu_queue:
                             break
                         item = _gpu_queue.pop(0)
+                    _gpu_current_item = item
+                    _save_queue_state()
 
                     if item["type"] == "encode":
-                        _gpu_current["label"] = f"Compress {item['ch_name']}"
+                        _ebn = item.get("batch_num")
+                        _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
                         _compress_channel(
@@ -10008,15 +10537,25 @@ def _gpu_start():
                             _sync_mode=True
                         )
                     elif item["type"] == "mt":
-                        fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-                        _gpu_current["label"] = f"M.T. {fname}"
-                        _gpu_current["ch_url"] = None
-                        _update_gpu_btn()
-                        _run_manual_transcription(
-                            item["file_path"],
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            skip_model_dialog=True, _sync_mode=True
-                        )
+                        if item.get("folder_path"):
+                            _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
+                            _gpu_current["ch_url"] = None
+                            _update_gpu_btn()
+                            _run_manual_transcription_folder(
+                                item["folder_path"], item["folder_name"],
+                                cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                                _sync_mode=True
+                            )
+                        else:
+                            fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                            _gpu_current["label"] = f"M.T. {fname}"
+                            _gpu_current["ch_url"] = None
+                            _update_gpu_btn()
+                            _run_manual_transcription(
+                                item["file_path"],
+                                cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                                skip_model_dialog=True, _sync_mode=True
+                            )
                     elif item["type"] == "transcribe":
                         _gpu_current["label"] = f"Transcribe {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
@@ -10030,6 +10569,7 @@ def _gpu_start():
 
                     _gpu_current["label"] = None
                     _gpu_current["ch_url"] = None
+                    _gpu_current_item = None
                     _update_gpu_btn()
 
                 if not _gpu_cancel.is_set():
@@ -10040,12 +10580,14 @@ def _gpu_start():
                 _gpu_running = False
                 _gpu_current["label"] = None
                 _gpu_current["ch_url"] = None
+                _gpu_current_item = None
                 _stop_whisper_process()
                 _stop_punct_process()
                 _stop_ffmpeg_process()
                 _tray_stop_spin()
                 _update_tray_tooltip("YT Archiver — Idle")
                 _update_gpu_btn()
+                _save_queue_state()
                 if root.winfo_exists():
                     root.after(0, _sync_task_finished)
 
@@ -10155,7 +10697,7 @@ def _gpu_start():
     _update_gpu_btn()
 
     def _gpu_worker():
-        global _gpu_running
+        global _gpu_running, _gpu_current_item
         try:
             while True:
                 # Pause check
@@ -10175,17 +10717,29 @@ def _gpu_start():
                     if not _gpu_queue:
                         break
                     item = _gpu_queue.pop(0)
+                _gpu_current_item = item
+                _save_queue_state()
 
                 if item["type"] == "mt":
-                    fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-                    _gpu_current["label"] = f"M.T. {fname}"
-                    _gpu_current["ch_url"] = None
-                    _update_gpu_btn()
-                    _run_manual_transcription(
-                        item["file_path"],
-                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                        skip_model_dialog=True, _sync_mode=True
-                    )
+                    if item.get("folder_path"):
+                        _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
+                        _gpu_current["ch_url"] = None
+                        _update_gpu_btn()
+                        _run_manual_transcription_folder(
+                            item["folder_path"], item["folder_name"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            _sync_mode=True
+                        )
+                    else:
+                        fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                        _gpu_current["label"] = f"M.T. {fname}"
+                        _gpu_current["ch_url"] = None
+                        _update_gpu_btn()
+                        _run_manual_transcription(
+                            item["file_path"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            skip_model_dialog=True, _sync_mode=True
+                        )
                 elif item["type"] == "transcribe":
                     _gpu_current["label"] = f"Transcribe {item['ch_name']}"
                     _gpu_current["ch_url"] = item.get("ch_url")
@@ -10197,7 +10751,8 @@ def _gpu_start():
                         skip_model_dialog=True, _sync_mode=True
                     )
                 elif item["type"] == "encode":
-                    _gpu_current["label"] = f"Compress {item['ch_name']}"
+                    _ebn = item.get("batch_num")
+                    _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
                     _gpu_current["ch_url"] = item.get("ch_url")
                     _update_gpu_btn()
                     _compress_channel(
@@ -10224,6 +10779,7 @@ def _gpu_start():
 
                 _gpu_current["label"] = None
                 _gpu_current["ch_url"] = None
+                _gpu_current_item = None
                 _update_gpu_btn()
 
             if not _gpu_cancel.is_set():
@@ -10234,12 +10790,14 @@ def _gpu_start():
             _gpu_running = False
             _gpu_current["label"] = None
             _gpu_current["ch_url"] = None
+            _gpu_current_item = None
             _stop_whisper_process()
             _stop_punct_process()
             _stop_ffmpeg_process()
             _tray_stop_spin()
             _update_tray_tooltip("YT Archiver — Idle")
             _update_gpu_btn()
+            _save_queue_state()
             # Safety: ensure main cancel/pause buttons are hidden after GPU work
             if root.winfo_exists():
                 root.after(0, _sync_task_finished)
@@ -10758,9 +11316,31 @@ def _run_autorun():
                             else:
                                 log(f"  Large channel detected ({ch_total:,} videos). Downloading batch of {BATCH_LIMIT:,}...\n", "green")
 
+                # Build incremental compress callback if compress is enabled
+                _sc_level = ch.get("compress_level", "")
+                _sc_batch_cb = None
+                if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+                    _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _sc_prompt_shown = [False]
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level):
+                        _b = count // 20
+                        _add_to_gpu_queue({
+                            "type": "encode", "ch_name": _cn, "ch_url": _u,
+                            "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                            "output_res": _ch.get("compress_output_res", ""),
+                            "split_years": _ch.get("split_years", False),
+                            "split_months": _ch.get("split_months", False),
+                            "batch_num": _b,
+                        }, _quiet=True)
+                        if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
+                            _sc_prompt_shown[0] = True
+                            if _ask_start_gpu_tasks(count):
+                                root.after(0, _gpu_start)
+
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
-                                                     live_ids=live_ids)
+                                                     live_ids=live_ids,
+                                                     on_batch_ready=_sc_batch_cb)
 
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl
@@ -10837,7 +11417,8 @@ def _run_autorun():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                    })
+                        "batch_num": (c_dl - 1) // 20 + 1,
+                    }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
                 if c_dl > 0 and ch.get("auto_transcribe", False):
@@ -12100,6 +12681,7 @@ def _save_queue_state():
     with _gpu_queue_lock:
         for item in _gpu_queue:
             queue_data["gpu"].append(copy.deepcopy(item))
+    queue_data["gpu_paused"] = _gpu_pause.is_set()
     with _queue_order_lock:
         queue_data["order"] = list(_queue_order)
     try:
@@ -12139,11 +12721,16 @@ def _load_queue_state():
                     _transcribe_queue.append(tuple(args))
                     restored += 1
         gpu_items = queue_data.get("gpu", [])
+        gpu_restored = 0
         if gpu_items:
             with _gpu_queue_lock:
                 for item in gpu_items:
                     _gpu_queue.append(item)
                     restored += 1
+                    gpu_restored += 1
+        # Restore GPU pause state
+        if queue_data.get("gpu_paused", False) and gpu_restored > 0:
+            _gpu_pause.set()
         # Restore unified queue ordering
         saved_order = queue_data.get("order", [])
         if saved_order:
@@ -12153,6 +12740,9 @@ def _load_queue_state():
                         _queue_order.append(tuple(entry))
         if restored:
             log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
+            if gpu_restored:
+                _pause_str = " (paused)" if _gpu_pause.is_set() else ""
+                log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str} — click 💻 to start.\n", "simpleline_green")
             _update_queue_btn()
             _update_gpu_btn()
             return True
@@ -12179,6 +12769,13 @@ def on_closing():
         with _gpu_queue_lock:
             if _gpu_queue:
                 has_queue = True
+    if not has_queue and _gpu_running:
+        has_queue = True
+
+    # Re-queue the currently-processing GPU item so it persists through restart
+    if _gpu_current_item is not None:
+        with _gpu_queue_lock:
+            _gpu_queue.insert(0, _gpu_current_item)
 
     if has_queue:
         _save_queue_state()

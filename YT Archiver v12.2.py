@@ -1365,19 +1365,19 @@ C_LOG_SUM = "#f5a623"
 
 root.configure(bg=C_BG)
 
-if os.name == "nt":
+def _apply_dark_title_bar(win):
+    """Apply dark title bar to a Tk or Toplevel window on Windows."""
+    if os.name != "nt":
+        return
     try:
         from ctypes import windll, byref, c_int
-
-        HWND = windll.user32.GetParent(root.winfo_id())
-
-        dark = c_int(1)
-        windll.dwmapi.DwmSetWindowAttribute(HWND, 20, byref(dark), 4)
-
-        color = c_int(0x00120f0f)
-        windll.dwmapi.DwmSetWindowAttribute(HWND, 35, byref(color), 4)
+        hwnd = windll.user32.GetParent(win.winfo_id())
+        windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, byref(c_int(1)), 4)
+        windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, byref(c_int(0x00120f0f)), 4)
     except Exception:
         pass
+
+_apply_dark_title_bar(root)
 
 
 def _entry(parent, maxlen=500, **kw):
@@ -1582,7 +1582,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v11.9 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.2 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2312,6 +2312,7 @@ def _set_edit_mode(ch):
     new_compress_level_var.set(ch.get("compress_level", ""))
     _cr = ch.get("compress_output_res", "")
     new_compress_res_var.set(f"{_cr}p" if _cr else "Original")
+    new_compress_batch_var.set(str(ch.get("compress_batch_size", 20)))
     add_channel_btn.config(text="💾 Update channel", state="normal", style="Warn.TButton")
     add_outer.config(text="Edit channel")
     _set_add_details_visible(True)
@@ -2348,6 +2349,7 @@ def _clear_edit_mode():
     new_compress_var.set(False)
     new_compress_level_var.set("")
     new_compress_res_var.set("Original")
+    new_compress_batch_var.set("20")
     add_channel_btn.config(text="Add channel", style="TButton", state="disabled")
     add_outer.config(text="Add channel")
     _set_add_details_visible(False)
@@ -2630,6 +2632,8 @@ def _chan_ctx_transcribe():
     dlg.resizable(False, False)
     dlg.transient(root)
     dlg.grab_set()
+    dlg.update_idletasks()
+    _apply_dark_title_bar(dlg)
 
     # Center on parent
     dlg.update_idletasks()
@@ -2886,6 +2890,10 @@ def add_channel():
                     ch["compress_enabled"] = _new_compress
                     ch["compress_level"] = _new_c_level
                     ch["compress_output_res"] = _new_c_res
+                    try:
+                        ch["compress_batch_size"] = int(new_compress_batch_var.get())
+                    except (ValueError, TypeError):
+                        ch["compress_batch_size"] = 20
                     break
         else:
             if any(c["name"] == name for c in channels):
@@ -2903,6 +2911,7 @@ def add_channel():
                 "compress_enabled": new_compress_var.get(),
                 "compress_level": new_compress_level_var.get(),
                 "compress_output_res": (lambda v: v.replace("p", "") if v != "Original" else "")(new_compress_res_var.get()),
+                "compress_batch_size": int(new_compress_batch_var.get() or "20"),
             })
 
     _clear_edit_mode()
@@ -2957,7 +2966,7 @@ def add_channel():
                             "output_res": _new_c_res,
                             "split_years": new_years,
                             "split_months": new_months,
-                            "batch_size": 20,
+                            "batch_size": int(new_compress_batch_var.get() or "20"),
                         })
 
 
@@ -3220,18 +3229,19 @@ def sync_single_channel():
             # Build incremental compress callback if compress is enabled
             _sc_level = ch.get("compress_level", "")
             _sc_batch_cb = None
+            _sc_bsize = ch.get("compress_batch_size", 20)
             if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
                 _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                 _sc_prompt_shown = [False]
-                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level):
-                    _b = count // 20
+                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                    _b = count // _bs
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": _ch["name"], "ch_url": _ch["url"],
                         "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
                         "output_res": _ch.get("compress_output_res", ""),
                         "split_years": _ch.get("split_years", False),
                         "split_months": _ch.get("split_months", False),
-                        "batch_num": _b,
+                        "batch_num": _b, "batch_size": _bs,
                     }, _quiet=True)
                     if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                         _sc_prompt_shown[0] = True
@@ -3240,7 +3250,8 @@ def sync_single_channel():
 
             if not cancel_event.is_set() and not _all_cached_done:
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
-                                                 on_batch_ready=_sc_batch_cb)
+                                                 on_batch_ready=_sc_batch_cb,
+                                                 compress_batch_size=_sc_bsize)
                 if _is_simple_mode:
                     _stop_simple_anim()
                     if not cancel_event.is_set():
@@ -3336,7 +3347,8 @@ def sync_single_channel():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // 20 + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_size": _sc_bsize,
                     }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded,
@@ -5395,6 +5407,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             dlg.configure(bg=C_BG)
                             dlg.resizable(False, False)
                             dlg.grab_set()
+                            dlg.update_idletasks()
+                            _apply_dark_title_bar(dlg)
 
                             tk.Label(dlg, text="Adjust settings and try batch 1 again:",
                                      bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10)).pack(padx=16, pady=(12, 8))
@@ -5749,6 +5763,7 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
         _dlg.transient(root)
         _dlg.grab_set()
         _dlg.update_idletasks()
+        _apply_dark_title_bar(_dlg)
         _rx = root.winfo_rootx() + root.winfo_width() // 2
         _ry = root.winfo_rooty() + root.winfo_height() // 2
         _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
@@ -5841,6 +5856,8 @@ def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
         dlg.configure(bg=C_BG)
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.update_idletasks()
+        _apply_dark_title_bar(dlg)
         dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss(False))
 
         tk.Label(dlg, text=f"Downloaded {count} videos so far.",
@@ -6260,6 +6277,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _dlg.resizable(False, False)
                         _dlg.transient(root)
                         _dlg.grab_set()
+                        _dlg.update_idletasks()
+                        _apply_dark_title_bar(_dlg)
 
                         # Center on root window
                         _dlg.update_idletasks()
@@ -6600,6 +6619,7 @@ def _start_manual_transcription():
         _dlg.transient(root)
         _dlg.grab_set()
         _dlg.update_idletasks()
+        _apply_dark_title_bar(_dlg)
         _rx = root.winfo_rootx() + root.winfo_width() // 2
         _ry = root.winfo_rooty() + root.winfo_height() // 2
         _dlg.geometry(f"+{_rx - 140}+{_ry - 60}")
@@ -7063,6 +7083,7 @@ compress_row.grid(row=5, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(
 new_compress_var = tk.BooleanVar(value=False)
 new_compress_level_var = tk.StringVar(value="")
 new_compress_res_var = tk.StringVar(value="")
+new_compress_batch_var = tk.StringVar(value="20")
 
 compress_cb = ttk.Checkbutton(compress_row, text="Compress after download",
                                variable=new_compress_var)
@@ -7082,6 +7103,13 @@ _compress_res_combo = _combo(compress_row, textvariable=new_compress_res_var,
 new_compress_res_var.set("Original")
 _ToolTip(_compress_res_combo, "Output resolution (Original = keep source resolution)")
 
+_compress_batch_label = tk.Label(compress_row, text="Batch:", bg=C_SURFACE, fg=C_DIM,
+                                  font=("Segoe UI", 9))
+_compress_batch_combo = _combo(compress_row, textvariable=new_compress_batch_var,
+                                values=["1", "5", "10", "20", "50"], state="readonly", width=4)
+new_compress_batch_var.set("20")
+_ToolTip(_compress_batch_combo, "Compress every N downloads during bulk syncs.\nSmaller = more frequent GPU tasks, larger = fewer.")
+
 
 def _toggle_compress_entry(*_):
     if new_compress_var.get():
@@ -7089,13 +7117,18 @@ def _toggle_compress_entry(*_):
         _compress_level_combo.pack(side="left", padx=(0, 8))
         _compress_output_label.pack(side="left", padx=(0, 4))
         _compress_res_combo.pack(side="left", padx=(0, 8))
+        _compress_batch_label.pack(side="left", padx=(0, 4))
+        _compress_batch_combo.pack(side="left", padx=(0, 8))
     else:
         _compress_level_label.pack_forget()
         _compress_level_combo.pack_forget()
         _compress_output_label.pack_forget()
         _compress_res_combo.pack_forget()
+        _compress_batch_label.pack_forget()
+        _compress_batch_combo.pack_forget()
         new_compress_level_var.set("")
         new_compress_res_var.set("Original")
+        new_compress_batch_var.set("20")
 
 
 new_compress_var.trace_add("write", _toggle_compress_entry)
@@ -7326,7 +7359,8 @@ def _validate_add_btn():
                                 ch.get("split_months", False) == new_split_months_var.get() and \
                                 ch.get("compress_enabled", False) == new_compress_var.get() and \
                                 ch.get("compress_level", "") == new_compress_level_var.get() and \
-                                ch.get("compress_output_res", "") == _cur_c_res_val:
+                                ch.get("compress_output_res", "") == _cur_c_res_val and \
+                                ch.get("compress_batch_size", 20) == int(new_compress_batch_var.get() or "20"):
                             is_changed = False
                         break
 
@@ -7363,7 +7397,7 @@ def _trigger_validation(*_):
 url_var.trace_add("write", on_url_change)
 for var in (url_var, new_name_var, new_url_var, new_dur_var, new_maxdur_var, new_res_var, new_mode_var, date_year_var,
             date_month_var, date_day_var, new_split_years_var, new_split_months_var,
-            new_compress_var, new_compress_level_var, new_compress_res_var):
+            new_compress_var, new_compress_level_var, new_compress_res_var, new_compress_batch_var):
     var.trace_add("write", _trigger_validation)
 
 for entry_widget in (url_entry, new_name_entry, _new_url_entry, _date_year_entry, _date_month_entry, _date_day_entry):
@@ -8227,7 +8261,7 @@ def _parse_ytdlp_size(s):
     return str(int(val * mult.get(unit, 1)))
 
 
-def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_ready=None):
+def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_ready=None, compress_batch_size=20):
     if live_ids is None:
         live_ids = []
     proc = None
@@ -8716,15 +8750,15 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     dl_count += 1
                     session_totals["dl"] += 1
 
-                    # Trigger incremental compress callback every 20 downloads
-                    if on_batch_ready and dl_count > 0 and dl_count % 20 == 0:
+                    # Trigger incremental compress callback every N downloads
+                    if on_batch_ready and dl_count > 0 and dl_count % compress_batch_size == 0:
                         try:
                             on_batch_ready(dl_count)
                         except Exception:
                             pass
 
                     if is_simple_mode:
-                        _update_simple_dl(dl_count, 0, batch_size=20 if on_batch_ready else 0)
+                        _update_simple_dl(dl_count, 0, batch_size=compress_batch_size if on_batch_ready else 0)
 
             if not is_simple_mode:
                 log(line)
@@ -9150,18 +9184,19 @@ def start_sync_all():
                 # Build incremental compress callback if compress is enabled
                 _sc_level = ch.get("compress_level", "")
                 _sc_batch_cb = None
+                _sc_bsize = ch.get("compress_batch_size", 20)
                 if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level):
-                        _b = count // 20
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                        _b = count // _bs
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
                             "output_res": _ch.get("compress_output_res", ""),
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
-                            "batch_num": _b,
+                            "batch_num": _b, "batch_size": _bs,
                         }, _quiet=True)
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
@@ -9171,7 +9206,8 @@ def start_sync_all():
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,
-                                                     on_batch_ready=_sc_batch_cb)
+                                                     on_batch_ready=_sc_batch_cb,
+                                                     compress_batch_size=_sc_bsize)
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl
 
@@ -9246,7 +9282,8 @@ def start_sync_all():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // 20 + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_size": _sc_bsize,
                     }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
@@ -9665,34 +9702,12 @@ def _show_queue_menu(event=None):
         wrapper = tk.Frame(popup, bg="#2d2d2d")
         _widgets = []
 
-        # Header row: "  Sync Tasks (N)  [✕]"
+        # Header row: "  Sync Tasks (N)"
         hdr = tk.Frame(wrapper, bg="#2d2d2d")
         hdr.pack(fill="x", padx=4, pady=(6, 2))
         hdr_text = f"  Sync Tasks ({len(items)})" if items else "  Sync Tasks (empty)"
         tk.Label(hdr, text=hdr_text, bg="#2d2d2d", fg="#888888",
                  font=("Segoe UI", 9, "italic"), anchor="w").pack(side="left")
-
-        def _clear_sync_queue():
-            with _sync_queue_lock:
-                _sync_queue.clear()
-            with _video_dl_queue_lock:
-                _video_dl_queue.clear()
-            with _reorg_queue_lock:
-                _reorg_queue.clear()
-            with _transcribe_queue_lock:
-                _transcribe_queue.clear()
-            with _mt_queue_lock:
-                _mt_queue.clear()
-            with _queue_order_lock:
-                _queue_order.clear()
-            _update_queue_btn()
-
-        _clear_btn = tk.Button(hdr, text="✕", bg="#2d2d2d", fg="#888888",
-                  activebackground="#444444", activeforeground="#cccccc",
-                  relief="flat", bd=0, font=("Segoe UI", 9),
-                  cursor="hand2", command=_clear_sync_queue, padx=4)
-        _clear_btn.pack(side="right")
-        _ToolTip(_clear_btn, "Clear Sync Queue")
 
         if items:
             max_visible = 10
@@ -10633,6 +10648,7 @@ def _gpu_start():
     _dlg.transient(root)
     _dlg.grab_set()
     _dlg.update_idletasks()
+    _apply_dark_title_bar(_dlg)
     _rx = root.winfo_rootx() + root.winfo_width() // 2
     _ry = root.winfo_rooty() + root.winfo_height() // 2
     _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
@@ -11347,18 +11363,19 @@ def _run_autorun():
                 # Build incremental compress callback if compress is enabled
                 _sc_level = ch.get("compress_level", "")
                 _sc_batch_cb = None
+                _sc_bsize = ch.get("compress_batch_size", 20)
                 if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level):
-                        _b = count // 20
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                        _b = count // _bs
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
                             "output_res": _ch.get("compress_output_res", ""),
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
-                            "batch_num": _b,
+                            "batch_num": _b, "batch_size": _bs,
                         }, _quiet=True)
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
@@ -11368,7 +11385,8 @@ def _run_autorun():
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,
-                                                     on_batch_ready=_sc_batch_cb)
+                                                     on_batch_ready=_sc_batch_cb,
+                                                     compress_batch_size=_sc_bsize)
 
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl
@@ -11445,7 +11463,8 @@ def _run_autorun():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // 20 + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_size": _sc_bsize,
                     }, _quiet=True)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded

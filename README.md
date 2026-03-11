@@ -9,9 +9,11 @@ Choose resolution to download that channel at-
 
 Limit shortest/longest video to cut out shorts/live-
 
-Chose starting date to download-(if you don't want the first few years of a channel for example)
+Choose starting date to download-(if you don't want the first few years of a channel for example)
 
 Can organize (and re-organize!) downloaded channels into Years/Months
+
+can retroactively change file dates to YT upload dates- if you're switching over from 4kVD
 
 Prioritizes slow & steady to be safe from YT IP ban
 
@@ -25,14 +27,13 @@ Auto-Sync with log to show history
 
 editable job-queue
 
-Transcribe channels and output it to .txt files. prob not useful to most people
+Transcribe channels and output it to .txt files (following org structure that channel is in)
 
-I didn't write any of this code (except for manually changing the label on things or changing padding or whatever)
-All Claude-Code.
-
+this is maybe 2% me and 98% claude-code :)
 
 
-I will list current found issues here as I find them.
+
+I will list found but unpatched issues here:
 
 1. 
 

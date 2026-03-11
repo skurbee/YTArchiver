@@ -25,8 +25,12 @@ you can of course still manually download single videos
 
 Auto-Sync with log to show history
 
-editable job-queue
+editable sync-queue and GPU-queue
 
+HQ Compressor mode now fully functional.
+Instead of downloading @ low res from YT, you can download at high res then compress locally for higher quality to filesize ratio than youtube gives.
+Can retroactivly apply new settings to already downloaded videos. Processes them in batches of 20.
+Download 20 vids, compress 20 vids, replace those 20 in the channel folder. rinse and repeat until whole channel now reflects new settings
 Transcribe channels and output it to .txt files (following org structure that channel is in)
 
 this is maybe 2% me and 98% claude-code :)
@@ -35,11 +39,7 @@ this is maybe 2% me and 98% claude-code :)
 
 I will list found but unpatched issues here:
 
-1. the current method of comparing file title to video title for transcriptions is good for backlogs. however, a lot of channels change video titles in the first few days. So whats happening:
-   Video gets downloaded, auto-transcribe gets added to GPU task list-
-   in the time it takes the user to start the GPU task list, channel changes video title-
-   so instead of using the basically free YT autosub + punctuation model, it's falling back to whisper which takes ~50x longer to process    per video.
-   not a huge deal, but maybe we need to check for transcripts on a per video ID basis, and not Title
+1. 
 
 2. 
 

@@ -332,14 +332,17 @@ def log(text, tag=None):
                     if dl_ranges:
                         log_box.delete(dl_ranges[0], dl_ranges[1])
 
-                # Clear whisper progress line when any other content is logged
-                _stop_whisper_dot_anim()
-                for _wp_tag in ("whisper_dots", "whisper_pct", "whisper_progress"):
-                    while True:
-                        _wr = log_box.tag_ranges(_wp_tag)
-                        if not _wr:
-                            break
+                # Save whisper progress content before clearing (to re-insert after new content)
+                _saved_wp_parts = []  # list of (text, tag) to re-insert
+                for _wp_tag in ("whisper_progress", "whisper_pct", "whisper_dots"):
+                    _wr = log_box.tag_ranges(_wp_tag)
+                    while _wr:
+                        _saved_wp_parts.append((log_box.get(_wr[0], _wr[1]), _wp_tag))
                         log_box.delete(_wr[0], _wr[1])
+                        _wr = log_box.tag_ranges(_wp_tag)
+                _had_whisper = bool(_saved_wp_parts)
+                if _had_whisper:
+                    _stop_whisper_dot_anim()
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary")):
@@ -350,6 +353,17 @@ def log(text, tag=None):
                         log_box.insert(tk.END, text, use_tag)
                 else:
                     log_box.insert(tk.END, text, use_tag)
+
+                # Re-insert whisper progress at the bottom so it stays visible
+                if _had_whisper and _saved_wp_parts:
+                    for _wp_text, _wp_tag in _saved_wp_parts:
+                        log_box.insert(tk.END, _wp_text, _wp_tag)
+                    # Restart dot animation
+                    if not _whisper_dots["active"]:
+                        _whisper_dots["active"] = True
+                        _whisper_dots["idx"] = 0
+                        if 'root' in globals() and root.winfo_exists():
+                            _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
 
                 if _autorun_active and (not _is_simple_mode):
                     try:
@@ -1582,7 +1596,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.3 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.4 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3291,7 +3305,7 @@ def sync_single_channel():
             if cancel_event.is_set():
                 _stop_simple_anim()
                 clear_transient_lines()
-                log("\nSync cancelled by user.\n", "red")
+                log("\nSyncs cancelled by user.\n", "red")
                 _cleanup_partial_files(out_dir)
                 # Save batch resume if large channel and enough progress was made
                 if ch_total > 200 or batch_limited:
@@ -5538,7 +5552,10 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             return None
     try:
         import json as _json
-        _title_part = f' "{title}"' if title else ""
+        _title_disp = title
+        if _title_disp and len(_title_disp) > 40:
+            _title_disp = _title_disp[:37] + "..."
+        _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces
         _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
         log(f"{_wp}Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
@@ -6263,8 +6280,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 done_count += 1
                 _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                 _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
-                _src_part = f"{source},".ljust(15)  # "auto-captions," vs "Whisper,       "
-                log(f"  [{idx}/{total}] {fname} — done ({_src_part}{_ve_str})\n", "simpleline_green")
+                _src_part = f"{source},"
+                log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -6514,8 +6531,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         done_count += 1
                         _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                         _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
-                        _src_part = f"{source},".ljust(15)  # "auto-captions," vs "Whisper,       "
-                        log(f"  [{idx}/{total}] {fname} — done ({_src_part}{_ve_str})\n", "simpleline_green")
+                        _src_part = f"{source},"
+                        log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
                 else:
                     err_count += len(unmatched)
 
@@ -9531,7 +9548,7 @@ def stop_downloads():
                                  startupinfo=startupinfo)
             else:
                 p.kill()
-    log("\n⛔ Cancelling...\n", "red")
+    log("\n⛔ Cancelling Syncs...\n", "red")
 
 
 def _fmt_time():
@@ -9567,6 +9584,32 @@ queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="SyncQ.TButton")
 # Packed later after _last_sync_spacer is created
 
 
+def _active_label(label, with_dots=False):
+    """Convert task label to active/running form: 'Sync X' -> 'Syncing X', etc.
+    If with_dots=True, append animated dots based on current time."""
+    _verb_map = {
+        "Sync ": "Syncing ",
+        "Transcribe ": "Transcribing ",
+        "Initialize ": "Initializing ",
+        "Compress ": "Compressing ",
+        "Re-Organize ": "Re-Organizing ",
+        "Re-date & Organize ": "Re-dating & Organizing ",
+        "Un-Organize ": "Un-Organizing ",
+        "Download ": "Downloading ",
+        "Backlog ": "Processing Backlog ",
+        "M.T. ": "M.T. ",
+    }
+    result = label
+    for prefix, replacement in _verb_map.items():
+        if label.startswith(prefix):
+            result = replacement + label[len(prefix):]
+            break
+    if with_dots:
+        _dot_phase = int(time.time() * 2) % 3  # cycles every ~0.5s
+        result += "." * (_dot_phase + 1)
+    return result
+
+
 def _get_queue_items():
     """Return a list of (label, queue_source, index) for all queued items.
     queue_source is 'sync', 'reorg', 'video', or 'current' — used for removal.
@@ -9576,7 +9619,8 @@ def _get_queue_items():
     items = []
     # Show currently processing item first
     if _current_job["label"]:
-        items.append((f"▶ {_current_job['label']}", "current", -1))
+        _active_lbl = _active_label(_current_job["label"], with_dots=True) if (_sync_running or _reorg_running or _transcribe_running) else _current_job["label"]
+        items.append((f"▶ {_active_lbl}", "current", -1))
 
     # Build lookup maps from type-specific queues, keyed by URL
     sync_map = {}
@@ -10231,7 +10275,7 @@ def _get_gpu_queue_items():
     """Return list of (label, index) for display in the GPU Tasks popup."""
     items = []
     if _gpu_running and _gpu_current["label"]:
-        items.append((f"▶ {_gpu_current['label']}", -1))
+        items.append((f"▶ {_active_label(_gpu_current['label'], with_dots=True)}", -1))
     with _gpu_queue_lock:
         for i, item in enumerate(_gpu_queue):
             if item["type"] == "transcribe":
@@ -10398,40 +10442,45 @@ def _show_gpu_menu(event=None):
                     pass
             _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
 
-            # Footer buttons
-            btn_row = tk.Frame(wrapper, bg="#2d2d2d")
-            btn_row.pack(fill="x", padx=4, pady=(4, 6))
-
-            if not _gpu_running:
-                with _gpu_queue_lock:
-                    _has_items = bool(_gpu_queue)
-                if _has_items:
-                    tk.Button(btn_row, text="\u25B6 Start", bg="#3a6a3a", fg="#cccccc",
-                              activebackground="#4a8a4a", activeforeground="#cccccc",
-                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=_do_gpu_start).pack(side="left", padx=(4, 4))
-            else:
-                if _gpu_pause.is_set():
-                    tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
-                              activebackground="#4a8a4a", activeforeground="#cccccc",
-                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
-                else:
-                    tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
-                              activebackground="#3a5e84", activeforeground="#cccccc",
-                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
-                tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
-                          activebackground="#a52a2a", activeforeground="#ffffff",
-                          relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                          cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
-
             # Footer hint
             has_queued = any(idx != -1 for _, idx in items)
             hint_text = "  Right-click to remove" if has_queued else ""
             hint = tk.Label(wrapper, text=hint_text, bg="#2d2d2d", fg="#4a4f5a",
                             font=("Segoe UI", 8), anchor="w")
-            hint.pack(fill="x", padx=4, pady=(2, 6))
+            hint.pack(fill="x", padx=4, pady=(2, 2))
+
+            # Footer buttons — only shown when there's something to act on
+            _show_gpu_btns = False
+            if not _gpu_running:
+                with _gpu_queue_lock:
+                    _show_gpu_btns = bool(_gpu_queue)
+            else:
+                _show_gpu_btns = True
+
+            if _show_gpu_btns:
+                btn_row = tk.Frame(wrapper, bg="#2d2d2d")
+                btn_row.pack(fill="x", padx=4, pady=(4, 6))
+
+                if not _gpu_running:
+                    tk.Button(btn_row, text="\u25B6 Start", bg="#3a6a3a", fg="#cccccc",
+                              activebackground="#4a8a4a", activeforeground="#cccccc",
+                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                              cursor="hand2", command=_do_gpu_start).pack(side="left", padx=(4, 4))
+                else:
+                    if _gpu_pause.is_set():
+                        tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                                  activebackground="#4a8a4a", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                                  cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                    else:
+                        tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
+                                  activebackground="#3a5e84", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                                  cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                    tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
+                              activebackground="#a52a2a", activeforeground="#ffffff",
+                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                              cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
         else:
             empty = tk.Label(wrapper, text="  (empty)", bg="#2d2d2d", fg="#666666",
                              font=("Segoe UI", 9), anchor="w")
@@ -10581,7 +10630,7 @@ def _gpu_start():
                             log(f"  ▶ GPU Tasks resuming...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
-                        log(f"\n  ⛔ GPU Tasks cancelled.\n", "red")
+                        log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
                         break
 
                     with _gpu_queue_lock:
@@ -10791,7 +10840,7 @@ def _gpu_start():
                         log(f"  ▶ GPU Tasks resuming...\n", "pauselog")
 
                 if _gpu_cancel.is_set():
-                    log(f"\n  ⛔ GPU Tasks cancelled.\n", "red")
+                    log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
                     break
 
                 # Pop next item
@@ -10893,6 +10942,7 @@ def _gpu_cancel_handler():
     with _gpu_queue_lock:
         _gpu_queue.clear()
     _stop_whisper_process()
+    log("\n⛔ Cancelling GPU Tasks...\n", "red")
     _update_gpu_btn()
 
 

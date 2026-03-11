@@ -73,7 +73,8 @@ DEFAULT_CONFIG = {
 
 RECENT_MAX = 1000
 CHANNEL_DEFAULTS = {"resolution": "720", "mode": "full", "min_duration": 0, "max_duration": 0,
-                    "split_years": False, "split_months": False}
+                    "split_years": False, "split_months": False, "auto_transcribe": False,
+                    "compress_enabled": False, "compress_bitrate": 0}
 
 RESOLUTION_OPTIONS = ["144", "240", "360", "480", "720", "1080", "1440", "2160", "best"]
 active_processes = []
@@ -108,13 +109,24 @@ _queue_items_removed = False  # tracks if user removed items from sync queue dur
 _transcribe_running = False
 _transcribe_queue = []  # list of (ch_name, ch_url, folder, split_years, split_months, combined) tuples
 _transcribe_queue_lock = threading.Lock()
+_mt_queue = []  # list of file paths (str) for manual transcription
+_mt_queue_lock = threading.Lock()
+
+# GPU Task List queue — independent from the main job queue
+_gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
+_gpu_queue_lock = threading.Lock()
+_gpu_running = False
+_gpu_cancel = threading.Event()
+_gpu_pause = threading.Event()
+_gpu_popup = {"win": None}
+_gpu_current = {"label": None, "ch_url": None}  # currently processing GPU task
 _whisper_model = None  # unused legacy, kept for compat
 _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
 _punct_proc = None  # persistent punctuation subprocess (model stays loaded on GPU)
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 
 # Unified queue ordering — tracks insertion order across all queue types.
-# Each entry is ("sync"|"reorg"|"transcribe"|"video", url_or_key).
+# Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video", url_or_key).
 # _get_queue_items() and _process_next_queued() use this for display and execution order.
 _queue_order = []
 _queue_order_lock = threading.Lock()
@@ -1441,17 +1453,22 @@ style.configure("Accent.TButton", background=C_PRIMARY, foreground=C_TEXT, paddi
 style.map("Accent.TButton", background=[("active", C_PRIMARY_H), ("disabled", C_BORDER)],
           foreground=[("disabled", C_DIM)])
 style.configure("Sync.TButton", background=C_SYNC, foreground="#ffffff", padding=_bp, relief="flat",
-                font=("Segoe UI", 9, "bold"))
+                font=("Segoe UI Emoji", 9, "bold"))
 style.map("Sync.TButton", background=[("active", C_SYNC_H), ("disabled", C_BORDER)])
 style.configure("Cancel.TButton", background=C_CANCEL, foreground="#ffffff", padding=_bp, relief="flat",
-                font=("Segoe UI", 9))
+                font=("Segoe UI Emoji", 9))
 style.map("Cancel.TButton", background=[("active", "#7a2020"), ("disabled", C_BORDER)])
 style.configure("Pause.TButton", background="#2a4a6b", foreground="#ffffff", padding=_bp, relief="flat",
-                font=("Segoe UI", 9))
+                font=("Segoe UI Emoji", 9))
 style.map("Pause.TButton", background=[("active", "#3a5e84"), ("disabled", C_BORDER)])
 style.configure("Warn.TButton", background=C_WARN, foreground="#ffffff", padding=_bp, relief="flat",
                 font=("Segoe UI", 9))
 style.map("Warn.TButton", background=[("active", "#7a4412"), ("disabled", C_BORDER)])
+
+# Emoji-only icon buttons — use Segoe UI Emoji for better glyph rendering on Windows
+style.configure("Emoji.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
+                font=("Segoe UI Emoji", 11))
+style.map("Emoji.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 style.configure("TEntry",
                 fieldbackground=C_INPUT, foreground=C_TEXT, insertcolor=C_TEXT,
@@ -1515,7 +1532,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v9.9 - 03.10.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v10.6 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -1539,6 +1556,8 @@ _placeholder(url_entry, "https://www.youtube.com/watch?v=...")
 
 url_type_label = ttk.Label(url_input_frame, text="", style="Type.TLabel")
 url_type_label.grid(row=0, column=2, sticky="w", padx=(10, 0))
+
+# M.T. button removed — manual transcription is now accessed via the GPU Task List (💻) popup
 
 channel_panel = ttk.Frame(tab_download)
 channel_panel.columnconfigure(0, weight=1)
@@ -1911,7 +1930,7 @@ chan_scrollbar = ttk.Scrollbar(chan_list_frame, orient="vertical")
 chan_scrollbar.grid(row=0, column=1, sticky="ns")
 
 settings_chan_tree = ttk.Treeview(chan_list_frame, style="Recent.Treeview",
-                                  columns=("folder", "res", "min", "max", "from", "last_sync", "url"),
+                                  columns=("folder", "res", "min", "max", "from", "last_sync", "transcribed", "url"),
                                   show="headings", selectmode="browse",
                                   yscrollcommand=chan_scrollbar.set)
 settings_chan_tree.grid(row=0, column=0, sticky="nsew")
@@ -1924,6 +1943,7 @@ _CHAN_COL_LABELS = {
     "max": "Max",
     "from": "Date Limit",
     "last_sync": "Last Sync",
+    "transcribed": "Transcribed",
     "url": "URL"
 }
 _chan_sort_state = {"col": None, "reverse": False}
@@ -1995,6 +2015,7 @@ settings_chan_tree.heading("max", text="Max", anchor="w", command=lambda: _sort_
 settings_chan_tree.heading("from", text="Date Limit", anchor="w", command=lambda: _sort_chan_tree("from", False))
 settings_chan_tree.heading("last_sync", text="Last Sync", anchor="w",
                            command=lambda: _sort_chan_tree("last_sync", False))
+settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w")
 settings_chan_tree.heading("url", text="URL", anchor="w")
 
 settings_chan_tree.column("folder", stretch=False, width=170, anchor="w")
@@ -2003,6 +2024,7 @@ settings_chan_tree.column("min", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("from", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
+settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("url", stretch=True, minwidth=100, anchor="w")
 settings_chan_tree.tag_configure("odd", background="#0c0f14")
 settings_chan_tree.tag_configure("even", background=C_LOG_BG)
@@ -2170,8 +2192,30 @@ def refresh_channel_dropdowns():
             else:
                 from_str = "—"
 
+            # Transcribed status column
+            auto_t = c.get("auto_transcribe", False)
+            ch_url_t = c.get("url", "")
+            t_complete = c.get("transcription_complete", False)
+            # Check running/queued status
+            _is_queued_t = False
+            _is_running_t = False
+            with _gpu_queue_lock:
+                _is_queued_t = any(q.get("ch_url") == ch_url_t for q in _gpu_queue)
+            if _gpu_running and _gpu_current.get("ch_url") == ch_url_t:
+                _is_running_t = True
+            if _is_running_t:
+                trans_str = "Running"
+            elif _is_queued_t:
+                trans_str = "Queued"
+            elif t_complete:
+                trans_str = "✓ Done" if auto_t else "✓"
+            elif auto_t:
+                trans_str = "✓ Auto"
+            else:
+                trans_str = "—"
+
             tag = "odd" if i % 2 else "even"
-            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, from_str, ls_str, c['url']),
+            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, from_str, ls_str, trans_str, c['url']),
                                       tags=(tag,))
 
     if _chan_sort_state["col"]:
@@ -2206,6 +2250,10 @@ def _set_edit_mode(ch):
     _toggle_date_entry()
     new_split_years_var.set(ch.get("split_years", False))
     new_split_months_var.set(ch.get("split_months", False))
+    new_auto_transcribe_var.set(ch.get("auto_transcribe", False))
+    new_compress_var.set(ch.get("compress_enabled", False))
+    _br = ch.get("compress_bitrate", 0)
+    new_compress_bitrate_var.set(str(_br) if _br else "")
     add_channel_btn.config(text="💾 Update channel", state="normal", style="Warn.TButton")
     add_outer.config(text="Edit channel")
     _set_add_details_visible(True)
@@ -2238,6 +2286,9 @@ def _clear_edit_mode():
     _toggle_date_entry()
     new_split_years_var.set(False)
     new_split_months_var.set(False)
+    new_auto_transcribe_var.set(False)
+    new_compress_var.set(False)
+    new_compress_bitrate_var.set("")
     add_channel_btn.config(text="Add channel", style="TButton", state="disabled")
     add_outer.config(text="Add channel")
     _set_add_details_visible(False)
@@ -2258,7 +2309,7 @@ def on_channel_double_click(event):
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][6]
+    target_url = item['values'][7]
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -2341,7 +2392,7 @@ def _chan_ctx_sync_now():
     ch = _ctx_channel["ch"]
     if not ch:
         return
-    if _sync_running or _reorg_running or _transcribe_running:
+    if _sync_running or _reorg_running:
         # Queue the channel for sync after the current operation finishes
         with _sync_queue_lock:
             # Don't queue duplicates
@@ -2356,7 +2407,7 @@ def _chan_ctx_sync_now():
         return
     # Match the channel in the treeview to visually select it before syncing
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][6] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2509,7 +2560,8 @@ def _chan_ctx_transcribe():
 
     if not sy:
         # Unorganized — no dialog needed, just one big file
-        _start_transcription(ch_name, ch_url, folder, False, False, combined=True)
+        _add_to_gpu_queue({"type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+                           "folder": folder, "split_years": False, "split_months": False, "combined": True})
         return
 
     # Show dialog: Combined vs Follow organization
@@ -2552,7 +2604,8 @@ def _chan_ctx_transcribe():
     def _on_ok():
         combined = choice_var.get() == "combined"
         dlg.destroy()
-        _start_transcription(ch_name, ch_url, folder, sy, sm, combined)
+        _add_to_gpu_queue({"type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+                           "folder": folder, "split_years": sy, "split_months": sm, "combined": combined})
 
     ttk.Button(btn_frame, text="Start", command=_on_ok, style="Sync.TButton").pack(side="left", padx=4)
     ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side="left", padx=4)
@@ -2575,7 +2628,7 @@ def _chan_ctx_remove():
         return
     # Select the channel in the tree so remove_channel() can find it
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][6] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2590,7 +2643,7 @@ def _chan_ctx_show(event):
     if row:
         settings_chan_tree.selection_set(row)
         on_chan_list_select(None)
-        target_url = settings_chan_tree.item(row)['values'][6]
+        target_url = settings_chan_tree.item(row)['values'][7]
         with config_lock:
             for c in config.get("channels", []):
                 if c["url"] == target_url:
@@ -2607,8 +2660,8 @@ def _chan_ctx_show(event):
         # Menu indices: 0=Sync, 1=Edit, 2=Open folder, 3=Open URL, 4=separator,
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
         #               10=separator, 11=Transcribe, 12=separator, 13=Remove
-        # Dynamic label: show "Add to job queue" when a sync/reorg/transcribe is running
-        if _sync_running or _reorg_running or _transcribe_running:
+        # Dynamic label: show "Add to job queue" when a sync/reorg is running
+        if _sync_running or _reorg_running:
             # Check if this channel is already queued or actively syncing
             _ch_url = ch.get("url", "")
             with _sync_queue_lock:
@@ -2636,27 +2689,22 @@ def _chan_ctx_show(event):
                 _chan_ctx_menu.entryconfig(idx, foreground=C_TEXT, state="normal")
         _chan_ctx_menu.entryconfig(9, foreground=C_TEXT, state="normal")
 
-        # Transcribe menu item (index 11)
-        if _transcribe_running or _sync_running or _reorg_running:
-            _ch_url_t = ch.get("url", "")
-            # Check if this channel is already being transcribed or queued
-            _is_active_transcribe = _current_job.get("url") == _ch_url_t and "Transcribe" in (_current_job.get("label") or "")
-            with _transcribe_queue_lock:
-                _already_queued_t = any(q[1] == _ch_url_t for q in _transcribe_queue)
-            if _is_active_transcribe:
-                _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
-                                          state="normal", foreground=C_DIM,
-                                          command=lambda: None)
-            elif _already_queued_t:
-                _chan_ctx_menu.entryconfig(11, label="Already in job queue",
-                                          state="normal", foreground=C_DIM,
-                                          command=lambda: None)
-            else:
-                _chan_ctx_menu.entryconfig(11, label="Queue transcription",
-                                          state="normal", foreground=C_TEXT,
-                                          command=_chan_ctx_transcribe)
+        # Transcribe menu item (index 11) — now routes to GPU Task List
+        _ch_url_t = ch.get("url", "")
+        # Check if this channel is already being transcribed via GPU Task List
+        _is_active_gpu = _gpu_running and _gpu_current.get("label") and _ch_url_t and _ch_url_t in (_gpu_current.get("label") or "")
+        with _gpu_queue_lock:
+            _already_in_gpu = any(q.get("ch_url") == _ch_url_t for q in _gpu_queue)
+        if _is_active_gpu:
+            _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
+        elif _already_in_gpu:
+            _chan_ctx_menu.entryconfig(11, label="Already in GPU Task List",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
         else:
-            _chan_ctx_menu.entryconfig(11, label="Transcribe channel",
+            _chan_ctx_menu.entryconfig(11, label="Add to GPU Task List",
                                       state="normal", foreground=C_TEXT,
                                       command=_chan_ctx_transcribe)
 
@@ -2766,11 +2814,16 @@ def add_channel():
                     ch["date_after"] = date_after
                     ch["split_years"] = new_years
                     ch["split_months"] = new_months
+                    ch["auto_transcribe"] = new_auto_transcribe_var.get()
+                    ch["compress_enabled"] = new_compress_var.get()
+                    _br_str = new_compress_bitrate_var.get().strip()
+                    ch["compress_bitrate"] = int(_br_str) if _br_str.isdigit() else 0
                     break
         else:
             if any(c["name"] == name for c in channels):
                 log(f"ERROR: A channel named '{name}' already exists.\n", "red")
                 return
+            _br_str = new_compress_bitrate_var.get().strip()
             channels.append({
                 "name": name, "url": url, "resolution": new_res_var.get(),
                 "min_duration": dur_val,
@@ -2779,6 +2832,9 @@ def add_channel():
                 "folder_override": sanitize_folder(name),
                 "split_years": new_years,
                 "split_months": new_months,
+                "auto_transcribe": new_auto_transcribe_var.get(),
+                "compress_enabled": new_compress_var.get(),
+                "compress_bitrate": int(_br_str) if _br_str.isdigit() else 0,
             })
 
     _clear_edit_mode()
@@ -2802,7 +2858,7 @@ def sync_single_channel():
     if not sel:
         return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][6]
+    target_url = item['values'][7]
 
     with config_lock:
         ch = None
@@ -2813,7 +2869,7 @@ def sync_single_channel():
         if not ch: return
 
     # If something is already running, queue instead of starting immediately
-    if _sync_running or _reorg_running or _transcribe_running:
+    if _sync_running or _reorg_running:
         with _sync_queue_lock:
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
@@ -3134,6 +3190,33 @@ def sync_single_channel():
                 save_config(config)
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
+
+                # New videos downloaded — clear transcription_complete flag
+                if c_dl > 0:
+                    ch["transcription_complete"] = False
+
+                # Auto-compress: if channel has compress enabled and new videos were downloaded
+                if c_dl > 0 and ch.get("compress_enabled", False) and ch.get("compress_bitrate", 0) > 0:
+                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                    _add_to_gpu_queue({
+                        "type": "encode", "ch_name": ch["name"], "ch_url": url,
+                        "folder": _ac_folder, "bitrate_mbhr": ch["compress_bitrate"],
+                        "split_years": ch.get("split_years", False),
+                        "split_months": ch.get("split_months", False),
+                    })
+
+                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded,
+                # add it to the GPU Task List so the user can process when ready
+                if c_dl > 0 and ch.get("auto_transcribe", False):
+                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                    _at_sy = ch.get("split_years", False)
+                    _at_sm = ch.get("split_months", False)
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch["name"], "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
+
                 _dl = session_totals["dl"]
                 _plural = "s" if _dl != 1 else ""
                 _notif_msg = f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
@@ -3215,7 +3298,7 @@ def _process_sync_queue():
             pass
 
     if next_ch.get("initialized", False):
-        _current_job["label"] = f"Check {next_ch['name']} for new videos"
+        _current_job["label"] = f"Sync {next_ch['name']}"
     else:
         _current_job["label"] = f"Initialize {next_ch['name']}"
     _update_queue_btn()
@@ -3228,7 +3311,7 @@ def _process_sync_queue():
     def _start_queued():
         global _sync_running
         for item in settings_chan_tree.get_children():
-            if settings_chan_tree.item(item)['values'][6] == next_ch["url"]:
+            if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
                 settings_chan_tree.selection_set(item)
                 on_chan_list_select(None)
                 break
@@ -3262,8 +3345,13 @@ def _process_next_queued():
                 has_items = bool(_transcribe_queue)
             if has_items:
                 return _process_transcribe_queue()
+        elif source == "mt":
+            with _mt_queue_lock:
+                has_items = bool(_mt_queue)
+            if has_items:
+                return _process_mt_queue()
     # Fallback: try each queue in case _queue_order is out of sync
-    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue()
+    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue()
 
 
 def _process_video_dl_queue():
@@ -3327,7 +3415,7 @@ def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][6]
+    target_url = item['values'][7]
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -3446,6 +3534,7 @@ split_row.grid(row=4, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(2, 
 
 new_split_years_var = tk.BooleanVar(value=False)
 new_split_months_var = tk.BooleanVar(value=False)
+new_auto_transcribe_var = tk.BooleanVar(value=False)
 
 split_years_cb = ttk.Checkbutton(split_row, text="Split folder into years?",
                                   variable=new_split_years_var)
@@ -3454,6 +3543,10 @@ split_years_cb.pack(side="left", padx=(4, 16))
 split_months_cb = ttk.Checkbutton(split_row, text="Split years into months?",
                                    variable=new_split_months_var)
 # Initially hidden — only shown when "Split folder into years?" is checked
+
+auto_transcribe_cb = ttk.Checkbutton(split_row, text="Auto-transcribe new videos",
+                                      variable=new_auto_transcribe_var)
+auto_transcribe_cb.pack(side="right", padx=(16, 4))
 
 reorg_done_label = ttk.Label(split_row, text="Done!", style="Green.TLabel")
 _reorg_done_job = {"id": None}
@@ -4001,8 +4094,8 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
     """Trigger reorganization automatically after updating channel split settings."""
     global _reorg_running
 
-    # If a reorg, sync, or transcription is already running, queue this request
-    if _reorg_running or _sync_running or _transcribe_running:
+    # If a reorg or sync is already running, queue this request
+    if _reorg_running or _sync_running:
         with _reorg_queue_lock:
             if not any(q[0] == channel_name for q in _reorg_queue):
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
@@ -4098,6 +4191,7 @@ def _parse_vtt_to_text(vtt_path):
 _WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
 _whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
+_ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
 _WHISPER_SCRIPT = r'''
@@ -4458,12 +4552,273 @@ def _stop_whisper_process():
         _whisper_proc = None
 
 
-def _whisper_transcribe(audio_path, duration=0, title=""):
+def _stop_ffmpeg_process():
+    """Stop the ffmpeg encode subprocess if running."""
+    global _ffmpeg_proc
+    if _ffmpeg_proc is not None:
+        try:
+            _ffmpeg_proc.terminate()
+            _ffmpeg_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _ffmpeg_proc.kill()
+            except Exception:
+                pass
+        _ffmpeg_proc = None
+
+
+def _ffprobe_duration(file_path):
+    """Get video duration in seconds via ffprobe. Returns float or 0 on error."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0
+
+
+def _ffprobe_is_compressed(file_path):
+    """Check if a file has the ytarchiver_compressed metadata marker."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags=comment",
+             "-of", "csv=p=0", file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
+        )
+        return "ytarchiver_compressed=1" in result.stdout
+    except Exception:
+        return False
+
+
+def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_months,
+                      cancel_ev=None, pause_ev=None, _sync_mode=False):
+    """Compress all un-compressed video files in a channel folder using ffmpeg AV1 NVENC.
+
+    bitrate_mbhr: target file size in MB per hour of video.
+    cancel_ev/pause_ev: optional threading.Events.
+    _sync_mode: if True, run directly (blocking) instead of spawning a thread.
+    """
+    global _ffmpeg_proc
+
+    _VIDEO_EXTS_COMPRESS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
+
+    def _worker():
+        global _ffmpeg_proc
+        _ce = cancel_ev or cancel_event
+        _pe = pause_ev or pause_event
+
+        log(f"\n=== Compressing: {ch_name} ===\n", "header")
+        log(f"  Target: {bitrate_mbhr} MB/hr\n", "simpleline")
+
+        # ── Step 1: Scan for video files ──
+        local_files = {}
+        for dirpath, _, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(_VIDEO_EXTS_COMPRESS):
+                    # Skip temp files from previous interrupted runs
+                    if "_TEMP_COMPRESS" in f:
+                        continue
+                    fpath = os.path.join(dirpath, f)
+                    local_files[f] = fpath
+
+        if not local_files:
+            log("  No video files found to compress.\n", "simpleline")
+            return
+
+        log(f"  Found {len(local_files)} video file(s).\n", "simpleline")
+
+        # ── Step 2: Filter out already-compressed files ──
+        files_to_compress = {}
+        skipped = 0
+        for fname, fpath in local_files.items():
+            if _ce.is_set():
+                log(f"\n  ⛔ Compression cancelled.\n", "red")
+                return
+            if _ffprobe_is_compressed(fpath):
+                skipped += 1
+            else:
+                files_to_compress[fname] = fpath
+
+        if skipped:
+            log(f"  {skipped} file(s) already compressed — skipping.\n", "simpleline")
+        if not files_to_compress:
+            log(f"  ✓ All videos already compressed!\n", "simpleline_green")
+            return
+
+        log(f"  {len(files_to_compress)} file(s) to compress.\n", "simpleline")
+
+        # ── Step 3: Calculate target bitrate ──
+        # Convert MB/hr to kbps: MB/hr * 1024 * 8 / 3600
+        target_total_kbps = (bitrate_mbhr * 1024 * 8) / 3600
+        audio_kbps = 64  # fixed AAC audio bitrate
+        video_kbps = max(int(target_total_kbps - audio_kbps), 50)  # minimum 50 kbps video
+
+        log(f"  Video bitrate: {video_kbps} kbps, Audio: {audio_kbps} kbps\n", "simpleline")
+
+        # ── Step 4: Process each file ──
+        done_count = 0
+        err_count = 0
+        total = len(files_to_compress)
+        t_start = time.time()
+
+        for idx, (fname, fpath) in enumerate(files_to_compress.items(), 1):
+            # Pause check
+            if _pe.is_set() and not _ce.is_set():
+                log(f"\n  ⏸ Compression paused.\n", "pauselog")
+                while _pe.is_set() and not _ce.is_set():
+                    time.sleep(0.25)
+                if not _ce.is_set():
+                    log(f"  ▶ Compression resuming...\n", "pauselog")
+
+            if _ce.is_set():
+                log(f"\n  ⛔ Compression cancelled.\n", "red")
+                break
+
+            # Get duration for progress reporting
+            duration = _ffprobe_duration(fpath)
+            dur_str = f"{int(duration // 60)}m{int(duration % 60):02d}s" if duration else "?"
+
+            fname_short = fname if len(fname) <= 50 else fname[:47] + "..."
+            log(f"\n  [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline")
+
+            # Build temp output path
+            base, ext = os.path.splitext(fpath)
+            temp_path = base + "_TEMP_COMPRESS.mp4"
+
+            # Build ffmpeg command
+            cmd = [
+                "ffmpeg", "-y", "-i", fpath,
+                "-c:v", "av1_nvenc",
+                "-b:v", f"{video_kbps}k",
+                "-preset", "p4",
+                "-multipass", "1",
+                "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+                "-movflags", "+faststart",
+                "-metadata", "comment=ytarchiver_compressed=1",
+                temp_path
+            ]
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    startupinfo=startupinfo, encoding="utf-8", errors="replace"
+                )
+                _ffmpeg_proc = proc
+
+                # Parse progress from stderr
+                _time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+                last_pct = -1
+                for line in proc.stderr:
+                    if _ce.is_set():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                        break
+
+                    m = _time_re.search(line)
+                    if m and duration > 0:
+                        h, mi, s, cs = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                        elapsed = h * 3600 + mi * 60 + s + cs / 100
+                        pct = min(int(elapsed / duration * 100), 100)
+                        if pct != last_pct and pct % 5 == 0:
+                            last_pct = pct
+                            clear_transient_lines()
+                            log(f"    Encoding: {pct}%\n", "transient")
+
+                proc.wait()
+                _ffmpeg_proc = None
+                clear_transient_lines()
+
+                if _ce.is_set():
+                    # Clean up temp file on cancel
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except Exception:
+                        pass
+                    break
+
+                if proc.returncode == 0 and os.path.exists(temp_path):
+                    # Get sizes for logging
+                    orig_size = os.path.getsize(fpath)
+                    new_size = os.path.getsize(temp_path)
+                    ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
+
+                    # Atomic replace
+                    try:
+                        os.replace(temp_path, fpath)
+                        done_count += 1
+                        orig_mb = orig_size / (1024 * 1024)
+                        new_mb = new_size / (1024 * 1024)
+                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller)\n", "simpleline_green")
+                    except Exception as e:
+                        err_count += 1
+                        log(f"    ⚠ Replace failed: {e}\n", "red")
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                else:
+                    err_count += 1
+                    log(f"    ⚠ ffmpeg failed (exit code {proc.returncode})\n", "red")
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except Exception:
+                        pass
+
+            except FileNotFoundError:
+                err_count += 1
+                log(f"    ⚠ ffmpeg not found — cannot compress.\n", "red")
+                break
+            except Exception as e:
+                err_count += 1
+                _ffmpeg_proc = None
+                log(f"    ⚠ Compression error: {e}\n", "red")
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+
+        # ── Summary ──
+        elapsed = time.time() - t_start
+        if not _ce.is_set():
+            _e_hrs, _e_rem = divmod(int(elapsed), 3600)
+            _e_mins, _e_secs = divmod(_e_rem, 60)
+            if _e_hrs:
+                _t_str = f"{_e_hrs}h {_e_mins}m {_e_secs}s"
+            elif _e_mins:
+                _t_str = f"{_e_mins}m {_e_secs}s"
+            else:
+                _t_str = f"{_e_secs}s"
+            log(f"\n  ✓ Compression complete: {done_count} done", "simpleline_green")
+            if err_count:
+                log(f", {err_count} errors", "simpleline_green")
+            log(f" ({_t_str})\n", "simpleline_green")
+
+    if _sync_mode:
+        _worker()
+    else:
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None):
     """Transcribe a file using the persistent Whisper subprocess. Returns text or None.
 
     If duration (seconds) is provided, progress percentage is logged in real time.
     title is shown in the progress line so the user knows which video is being processed.
+    cancel_ev/pause_ev default to the global cancel_event/pause_event if not provided.
     """
+    _ce = cancel_ev or cancel_event
+    _pe = pause_ev or pause_event
     global _whisper_proc
     if _whisper_proc is None or _whisper_proc.poll() is not None:
         if not _start_whisper_process():
@@ -4486,9 +4841,9 @@ def _whisper_transcribe(audio_path, duration=0, title=""):
             result = _json.loads(response_line)
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
-                if cancel_event.is_set():
+                if _ce.is_set():
                     log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
-                elif pause_event.is_set():
+                elif _pe.is_set():
                     log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
                 else:
                     log(f"{_wp}Whisper transcribing{_title_part}, {pct}%...\n", "whisper_progress")
@@ -4692,6 +5047,129 @@ def _sort_transcript_entries(txt_paths):
             pass  # don't break transcription over a sort error
 
 
+def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
+                              subtitle_text="Manual file transcription"):
+    """Show model selection dialog for manual transcription.
+    Returns (model_string, timed_out) tuple, or (None, False) if cancelled.
+    Blocks the calling thread until the user picks.
+    """
+    _model_result = [None]
+    _model_timed_out = [False]
+
+    def _ask():
+        _dlg = tk.Toplevel(root)
+        _dlg.title("Whisper Model Selection")
+        _dlg.configure(bg=C_BG)
+        _dlg.resizable(False, False)
+        _dlg.transient(root)
+        _dlg.grab_set()
+        _dlg.update_idletasks()
+        _rx = root.winfo_rootx() + root.winfo_width() // 2
+        _ry = root.winfo_rooty() + root.winfo_height() // 2
+        _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
+
+        tk.Label(_dlg, text=prompt_text,
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                 pady=10, padx=20).pack(fill="x")
+        tk.Label(_dlg, text=subtitle_text,
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+                 padx=20).pack(fill="x")
+
+        _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
+        _btn_frame.pack(fill="x", padx=20)
+
+        _models = [
+            ("tiny",     "Fastest  (~30-50\u00d7 realtime)",  "tiny"),
+            ("small",    "Fast  (~15-20\u00d7 realtime)",     "small"),
+            ("medium",   "Balanced  (~7-10\u00d7 realtime)",  "medium"),
+            ("large-v3", "Best quality  (~3-5\u00d7 realtime)", "large-v3"),
+        ]
+        _DEFAULT_MODEL = "small"
+        _countdown = {"secs": 60, "job": None}
+
+        def _pick(m, dlg=_dlg):
+            if _countdown["job"]:
+                try:
+                    _dlg.after_cancel(_countdown["job"])
+                except Exception:
+                    pass
+            _model_result[0] = m
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        _timer_lbl = tk.Label(_dlg, text=f"Auto-selecting {_DEFAULT_MODEL} in 60s...",
+                              bg=C_BG, fg=C_DIM, font=("Segoe UI", 8),
+                              padx=20)
+        _timer_lbl.pack(fill="x", pady=(0, 4))
+
+        def _tick():
+            _countdown["secs"] -= 1
+            if _countdown["secs"] <= 0:
+                _model_timed_out[0] = True
+                _pick(_DEFAULT_MODEL)
+                return
+            try:
+                _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+                _countdown["job"] = _dlg.after(1000, _tick)
+            except Exception:
+                pass
+
+        _countdown["job"] = _dlg.after(1000, _tick)
+
+        for label, desc, model_id in _models:
+            _row = tk.Frame(_btn_frame, bg=C_BG)
+            _row.pack(fill="x", pady=2)
+            _b = tk.Button(_row, text=label, width=10,
+                           bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                           activeforeground=C_TEXT, relief="flat", bd=0,
+                           font=("Segoe UI", 9, "bold"), cursor="hand2",
+                           command=lambda m=model_id: _pick(m))
+            _b.pack(side="left", padx=(0, 8))
+            tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                     font=("Segoe UI", 9)).pack(side="left")
+            if model_id == _DEFAULT_MODEL:
+                tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
+                         font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+        _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
+
+    if root.winfo_exists():
+        root.after(0, _ask)
+        while _model_result[0] is None and not cancel_event.is_set():
+            time.sleep(0.1)
+
+    return _model_result[0], _model_timed_out[0]
+
+
+def _add_to_gpu_queue(item):
+    """Add a task to the GPU Task List queue and show the GPU button."""
+    with _gpu_queue_lock:
+        # Duplicate check
+        if item["type"] == "transcribe":
+            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "transcribe" for q in _gpu_queue):
+                log(f"  ⚠ {item['ch_name']} is already in the GPU Task List queue.\n", "simpleline")
+                return
+            label = f"Transcribe {item['ch_name']}"
+        elif item["type"] == "encode":
+            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "encode" for q in _gpu_queue):
+                log(f"  ⚠ {item['ch_name']} compression is already in the GPU Task List queue.\n", "simpleline")
+                return
+            label = f"Compress {item['ch_name']}"
+        elif item["type"] == "mt":
+            if any(q.get("file_path") == item.get("file_path") for q in _gpu_queue):
+                log(f"  File already in GPU Task List queue.\n", "simpleline")
+                return
+            fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+            label = f"M.T. {fname}"
+        else:
+            label = "GPU Task"
+        _gpu_queue.append(item)
+    log(f"\n=== Added to GPU Task List: {label} ===\n", "header")
+    _update_gpu_btn()
+
+
 def _process_transcribe_queue():
     """Process next queued transcription if any. Returns True if one was started."""
     with _transcribe_queue_lock:
@@ -4716,11 +5194,17 @@ def _process_transcribe_queue():
     return True
 
 
-def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined):
-    """Start transcribing a channel. Queues if something is already running."""
+def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined,
+                         cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False):
+    """Start transcribing a channel. Queues if something is already running.
+
+    cancel_ev/pause_ev: optional threading.Events (default to global cancel_event/pause_event).
+    skip_model_dialog: if True, skip model selection and use current _whisper_model_choice.
+    _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
+    """
     global _transcribe_running
 
-    if _sync_running or _reorg_running or _transcribe_running:
+    if not _sync_mode and (_sync_running or _reorg_running or _transcribe_running):
         with _transcribe_queue_lock:
             if not any(q[1] == ch_url for q in _transcribe_queue):
                 _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
@@ -4734,17 +5218,20 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
     def _worker():
         global _transcribe_running, _whisper_model_choice
+        _ce = cancel_ev or cancel_event
+        _pe = pause_ev or pause_event
         _transcribe_running = True
-        _current_job["label"] = f"Transcribe {ch_name}"
-        _current_job["url"] = ch_url
-        _update_queue_btn()
+        if not _sync_mode:
+            _current_job["label"] = f"Transcribe {ch_name}"
+            _current_job["url"] = ch_url
+            _update_queue_btn()
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
         _whisper_available = None  # None = not checked yet
 
         try:
-            cancel_event.clear()
-            if root.winfo_exists():
+            _ce.clear()
+            if not _sync_mode and root.winfo_exists():
                 root.after(0, _show_cancel_pause)
 
             log(f"\n{'='*60}\n", "header")
@@ -4767,7 +5254,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             log(f"  Found {len(local_files)} video file(s) on disk.\n", "simpleline")
 
-            if cancel_event.is_set():
+            if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
@@ -4783,9 +5270,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             if not files_to_process:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                # Mark channel as fully transcribed
+                with config_lock:
+                    for _cfg_ch in config.get("channels", []):
+                        if _cfg_ch.get("url") == ch_url:
+                            _cfg_ch["transcription_complete"] = True
+                            break
+                    save_config()
                 return
 
-            if cancel_event.is_set():
+            if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
@@ -4808,7 +5302,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             except Exception as e:
                 log(f"  ⚠ Could not fetch YouTube list: {e}. All files will use Whisper.\n", "red")
 
-            if cancel_event.is_set():
+            if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
@@ -4860,7 +5354,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if matched:
                 _punct_loaded = _load_punctuation_model()
 
-            if cancel_event.is_set():
+            if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
@@ -4876,13 +5370,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 idx += 1
 
                 # Pause check
-                if pause_event.is_set() and not cancel_event.is_set():
+                if _pe.is_set() and not _ce.is_set():
                     log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
-                    while pause_event.is_set() and not cancel_event.is_set():
+                    while _pe.is_set() and not _ce.is_set():
                         time.sleep(0.25)
-                    if not cancel_event.is_set():
+                    if not _ce.is_set():
                         log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
-                if cancel_event.is_set():
+                if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
@@ -4946,116 +5440,125 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _transcription_log.append((fname, source, _vid_elapsed, None))
                 done_count += 1
                 _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
-                _ve_str = f"(took {_ve_m}min {_ve_s:02d}sec)" if _ve_m else f"(took {_ve_s}sec)"
-                log(f"  [{idx}/{total}] {fname} — done ({source}) {_ve_str}\n", "simpleline_green")
+                _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
+                _src_part = f"{source},".ljust(15)  # "auto-captions," vs "Whisper,       "
+                log(f"  [{idx}/{total}] {fname} — done ({_src_part}{_ve_str})\n", "simpleline_green")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
-            if unmatched and not cancel_event.is_set():
+            if unmatched and not _ce.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
                 unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
 
-                # ── Model selection dialog ──
+                # ── Model selection ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
-                _model_result = [None]
-                _model_timed_out = [False]
 
-                def _ask_model():
-                    _dlg = tk.Toplevel(root)
-                    _dlg.title("Whisper Model Selection")
-                    _dlg.configure(bg=C_BG)
-                    _dlg.resizable(False, False)
-                    _dlg.transient(root)
-                    _dlg.grab_set()
+                if skip_model_dialog:
+                    # GPU Task List mode — model already chosen, skip dialog
+                    _stop_whisper_process()
+                    log(f"  Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+                    _model_result = [_whisper_model_choice]
+                    _model_timed_out = [False]
+                else:
+                    _model_result = [None]
+                    _model_timed_out = [False]
 
-                    # Center on root window
-                    _dlg.update_idletasks()
-                    _rx = root.winfo_rootx() + root.winfo_width() // 2
-                    _ry = root.winfo_rooty() + root.winfo_height() // 2
-                    _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
+                    def _ask_model():
+                        _dlg = tk.Toplevel(root)
+                        _dlg.title("Whisper Model Selection")
+                        _dlg.configure(bg=C_BG)
+                        _dlg.resizable(False, False)
+                        _dlg.transient(root)
+                        _dlg.grab_set()
 
-                    tk.Label(_dlg, text="Which model to use for Whisper?",
-                             bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
-                             pady=10, padx=20).pack(fill="x")
-                    tk.Label(_dlg, text=f"{len(unmatched)} video(s) without YouTube captions",
-                             bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
-                             padx=20).pack(fill="x")
+                        # Center on root window
+                        _dlg.update_idletasks()
+                        _rx = root.winfo_rootx() + root.winfo_width() // 2
+                        _ry = root.winfo_rooty() + root.winfo_height() // 2
+                        _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
 
-                    _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
-                    _btn_frame.pack(fill="x", padx=20)
+                        tk.Label(_dlg, text="Which model to use for Whisper?",
+                                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                                 pady=10, padx=20).pack(fill="x")
+                        tk.Label(_dlg, text=f"{len(unmatched)} video(s) without YouTube captions",
+                                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+                                 padx=20).pack(fill="x")
 
-                    _models = [
-                        ("tiny",     "Fastest  (~30-50× realtime)",  "tiny"),
-                        ("small",    "Fast  (~15-20× realtime)",     "small"),
-                        ("medium",   "Balanced  (~7-10× realtime)",  "medium"),
-                        ("large-v3", "Best quality  (~3-5× realtime)", "large-v3"),
-                    ]
+                        _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
+                        _btn_frame.pack(fill="x", padx=20)
 
-                    _DEFAULT_MODEL = "medium"
-                    _countdown = {"secs": 60, "job": None}
+                        _models = [
+                            ("tiny",     "Fastest  (~30-50× realtime)",  "tiny"),
+                            ("small",    "Fast  (~15-20× realtime)",     "small"),
+                            ("medium",   "Balanced  (~7-10× realtime)",  "medium"),
+                            ("large-v3", "Best quality  (~3-5× realtime)", "large-v3"),
+                        ]
 
-                    def _pick(m, dlg=_dlg):
-                        if _countdown["job"]:
+                        _DEFAULT_MODEL = "small"
+                        _countdown = {"secs": 60, "job": None}
+
+                        def _pick(m, dlg=_dlg):
+                            if _countdown["job"]:
+                                try:
+                                    _dlg.after_cancel(_countdown["job"])
+                                except Exception:
+                                    pass
+                            _model_result[0] = m
                             try:
-                                _dlg.after_cancel(_countdown["job"])
+                                dlg.destroy()
                             except Exception:
                                 pass
-                        _model_result[0] = m
-                        try:
-                            dlg.destroy()
-                        except Exception:
-                            pass
 
-                    # Countdown label
-                    _timer_lbl = tk.Label(_dlg, text=f"Auto-selecting {_DEFAULT_MODEL} in 60s...",
-                                          bg=C_BG, fg=C_DIM, font=("Segoe UI", 8),
-                                          padx=20)
-                    _timer_lbl.pack(fill="x", pady=(0, 4))
+                        # Countdown label
+                        _timer_lbl = tk.Label(_dlg, text=f"Auto-selecting {_DEFAULT_MODEL} in 60s...",
+                                              bg=C_BG, fg=C_DIM, font=("Segoe UI", 8),
+                                              padx=20)
+                        _timer_lbl.pack(fill="x", pady=(0, 4))
 
-                    def _tick():
-                        _countdown["secs"] -= 1
-                        if _countdown["secs"] <= 0:
-                            _model_timed_out[0] = True
-                            _pick(_DEFAULT_MODEL)
-                            return
-                        try:
-                            _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
-                            _countdown["job"] = _dlg.after(1000, _tick)
-                        except Exception:
-                            pass
+                        def _tick():
+                            _countdown["secs"] -= 1
+                            if _countdown["secs"] <= 0:
+                                _model_timed_out[0] = True
+                                _pick(_DEFAULT_MODEL)
+                                return
+                            try:
+                                _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+                                _countdown["job"] = _dlg.after(1000, _tick)
+                            except Exception:
+                                pass
 
-                    _countdown["job"] = _dlg.after(1000, _tick)
+                        _countdown["job"] = _dlg.after(1000, _tick)
 
-                    for label, desc, model_id in _models:
-                        _row = tk.Frame(_btn_frame, bg=C_BG)
-                        _row.pack(fill="x", pady=2)
-                        _b = tk.Button(_row, text=label, width=10,
-                                       bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
-                                       activeforeground=C_TEXT, relief="flat", bd=0,
-                                       font=("Segoe UI", 9, "bold"), cursor="hand2",
-                                       command=lambda m=model_id: _pick(m))
-                        _b.pack(side="left", padx=(0, 8))
-                        tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
-                                 font=("Segoe UI", 9)).pack(side="left")
-                        if model_id == _DEFAULT_MODEL:
-                            tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
-                                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+                        for label, desc, model_id in _models:
+                            _row = tk.Frame(_btn_frame, bg=C_BG)
+                            _row.pack(fill="x", pady=2)
+                            _b = tk.Button(_row, text=label, width=10,
+                                           bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                                           activeforeground=C_TEXT, relief="flat", bd=0,
+                                           font=("Segoe UI", 9, "bold"), cursor="hand2",
+                                           command=lambda m=model_id: _pick(m))
+                            _b.pack(side="left", padx=(0, 8))
+                            tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                                     font=("Segoe UI", 9)).pack(side="left")
+                            if model_id == _DEFAULT_MODEL:
+                                tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
+                                         font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
 
-                    # Skip button
-                    tk.Frame(_dlg, bg=C_BG, height=5).pack()
-                    tk.Button(_dlg, text="Skip Whisper (use only YT captions)",
-                              bg="#3a3a3a", fg=C_DIM, activebackground="#555555",
-                              activeforeground=C_TEXT, relief="flat", bd=0,
-                              font=("Segoe UI", 8), cursor="hand2",
-                              command=lambda: _pick("skip")).pack(pady=(0, 12))
+                        # Skip button
+                        tk.Frame(_dlg, bg=C_BG, height=5).pack()
+                        tk.Button(_dlg, text="Skip Whisper (use only YT captions)",
+                                  bg="#3a3a3a", fg=C_DIM, activebackground="#555555",
+                                  activeforeground=C_TEXT, relief="flat", bd=0,
+                                  font=("Segoe UI", 8), cursor="hand2",
+                                  command=lambda: _pick("skip")).pack(pady=(0, 12))
 
-                    _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
+                        _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
-                if root.winfo_exists():
-                    root.after(0, _ask_model)
-                    while _model_result[0] is None and not cancel_event.is_set():
-                        time.sleep(0.1)
+                    if root.winfo_exists():
+                        root.after(0, _ask_model)
+                        while _model_result[0] is None and not _ce.is_set():
+                            time.sleep(0.1)
 
-                if cancel_event.is_set():
+                if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled.\n", "red")
                     # fall through — _whisper_available stays None, nothing will run
                 elif _model_result[0] == "skip":
@@ -5071,7 +5574,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
                 # Check if Whisper is available (only once)
-                if not cancel_event.is_set() and _model_result[0] != "skip" and _whisper_available is None:
+                if not _ce.is_set() and _model_result[0] != "skip" and _whisper_available is None:
                     # First check if CUDA GPU is even present on this system
                     _has_cuda = False
                     try:
@@ -5101,7 +5604,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     "Install now? (These videos will be skipped if you decline)")
                             if root.winfo_exists():
                                 root.after(0, _ask_install)
-                                while _install_result[0] is None and not cancel_event.is_set():
+                                while _install_result[0] is None and not _ce.is_set():
                                     time.sleep(0.1)
                                 if _install_result[0]:
                                     _whisper_available = _install_whisper_blocking()
@@ -5114,13 +5617,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         idx += 1
 
                         # Pause check
-                        if pause_event.is_set() and not cancel_event.is_set():
+                        if _pe.is_set() and not _ce.is_set():
                             log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
-                            while pause_event.is_set() and not cancel_event.is_set():
+                            while _pe.is_set() and not _ce.is_set():
                                 time.sleep(0.25)
-                            if not cancel_event.is_set():
+                            if not _ce.is_set():
                                 log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
-                        if cancel_event.is_set():
+                        if _ce.is_set():
                             log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                             break
 
@@ -5146,9 +5649,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _whisper_counter["total"] = total
                         # Check if pause was requested — Whisper can't be interrupted mid-file,
                         # so inform the user it will pause after the current file finishes.
-                        if pause_event.is_set() and not cancel_event.is_set():
+                        if _pe.is_set() and not _ce.is_set():
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
-                        text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname)
+                        text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
                         source = "Whisper"
 
                         if not text:
@@ -5186,8 +5689,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _transcription_log.append((fname, source, _vid_elapsed, None))
                         done_count += 1
                         _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
-                        _ve_str = f"(took {_ve_m}min {_ve_s:02d}sec)" if _ve_m else f"(took {_ve_s}sec)"
-                        log(f"  [{idx}/{total}] {fname} — done ({source}) {_ve_str}\n", "simpleline_green")
+                        _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
+                        _src_part = f"{source},".ljust(15)  # "auto-captions," vs "Whisper,       "
+                        log(f"  [{idx}/{total}] {fname} — done ({_src_part}{_ve_str})\n", "simpleline_green")
                 else:
                     err_count += len(unmatched)
 
@@ -5202,11 +5706,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             except Exception:
                 pass
 
-            if not cancel_event.is_set():
+            if not _ce.is_set():
                 log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
                 if err_count:
                     log(f", {err_count} skipped", "simpleline_green")
                 log(".\n", "simpleline_green")
+                # Mark channel as fully transcribed (only if not cancelled)
+                if err_count == 0:
+                    with config_lock:
+                        for _cfg_ch in config.get("channels", []):
+                            if _cfg_ch.get("url") == ch_url:
+                                _cfg_ch["transcription_complete"] = True
+                                break
+                        save_config()
 
             # ── Transcription Summary ──
             if _transcription_log:
@@ -5244,17 +5756,232 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
-            _stop_whisper_process()  # Free GPU memory
-            _stop_punct_process()   # Free GPU memory
-            _tray_stop_spin()
-            _update_tray_tooltip("YT Archiver — Idle")
-            if root.winfo_exists():
+            if not _sync_mode:
+                _stop_whisper_process()  # Free GPU memory (skip in sync_mode — GPU worker manages this)
+                _stop_punct_process()   # Free GPU memory
+                _tray_stop_spin()
+                _update_tray_tooltip("YT Archiver — Idle")
+                _current_job["label"] = None
+                _current_job["url"] = None
+                _update_queue_btn()
+            if not _sync_mode and root.winfo_exists():
                 root.after(0, _hide_cancel_pause)
-            # Process any queued jobs in insertion order
-            if not cancel_event.is_set():
+            # Process any queued jobs in insertion order (only when not in sync_mode)
+            if not _sync_mode and not _ce.is_set():
                 _process_next_queued()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    if _sync_mode:
+        _worker()  # Run synchronously — caller is the GPU worker thread
+    else:
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+def _process_mt_queue():
+    """Process next queued manual transcription. Returns True if one was started."""
+    with _mt_queue_lock:
+        if not _mt_queue:
+            return False
+        file_path = _mt_queue.pop(0)
+        remaining = len(_mt_queue)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("mt", file_path))
+        except ValueError:
+            pass
+    fname = os.path.splitext(os.path.basename(file_path))[0]
+    log(f"\n=== Processing queued manual transcription: {fname}", "header")
+    if remaining:
+        log(f" ({remaining} more in queue)", "header")
+    log(f" ===\n", "header")
+    _run_manual_transcription(file_path)
+    return True
+
+
+def _start_manual_transcription():
+    """Prompt user to select a local video file, then add it to GPU Task List queue."""
+    file_path = filedialog.askopenfilename(
+        title="Select video file to transcribe",
+        filetypes=[
+            ("Video files", "*.mp4 *.mkv *.webm *.avi *.mov *.flv *.wmv *.m4v"),
+            ("Audio files", "*.wav *.mp3 *.m4a *.flac *.ogg *.aac"),
+            ("All files", "*.*"),
+        ]
+    )
+    if not file_path:
+        return
+    file_path = os.path.normpath(file_path)
+
+    # Check if already in GPU queue
+    with _gpu_queue_lock:
+        if any(item.get("file_path") == file_path for item in _gpu_queue):
+            log(f"  File already in GPU Task List queue.\n", "simpleline")
+            return
+
+    _add_to_gpu_queue({"type": "mt", "file_path": file_path})
+
+
+def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
+                              skip_model_dialog=False, _sync_mode=False):
+    """Run manual transcription of a single local file in a background thread.
+
+    cancel_ev/pause_ev: optional threading.Events (default to global cancel_event/pause_event).
+    skip_model_dialog: if True, skip model selection and use current _whisper_model_choice.
+    _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
+    """
+    global _transcribe_running, _whisper_model_choice
+
+    fname = os.path.splitext(os.path.basename(file_path))[0]
+
+    def _worker():
+        global _transcribe_running, _whisper_model_choice
+        _ce = cancel_ev or cancel_event
+        _pe = pause_ev or pause_event
+        _transcribe_running = True
+        if not _sync_mode:
+            _current_job["label"] = f"M.T. {fname}"
+            _current_job["url"] = None
+            _update_queue_btn()
+        _tray_start_spin(red=True)
+        _update_tray_tooltip(f"YT Archiver \u2014 Transcribing {fname}")
+
+        try:
+            _ce.clear()
+            if not _sync_mode and root.winfo_exists():
+                root.after(0, _show_cancel_pause)
+
+            log(f"\n{'='*60}\n", "header")
+            log(f"  MANUAL TRANSCRIPTION: {fname}\n", "header")
+            log(f"{'='*60}\n\n", "header")
+
+            if not os.path.isfile(file_path):
+                log(f"  File not found: {file_path}\n", "red")
+                return
+
+            out_dir = os.path.dirname(file_path)
+            out_path = os.path.join(out_dir, fname + ".txt")
+            if os.path.isfile(out_path):
+                log(f"  Transcript already exists: {os.path.basename(out_path)}\n", "simpleline")
+                log(f"  Overwriting...\n", "simpleline")
+
+            if skip_model_dialog:
+                # GPU Task List mode — model already chosen
+                _stop_whisper_process()
+                log(f"  Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+            else:
+                # Model selection dialog
+                model_choice, timed_out = _ask_whisper_model_dialog(
+                    prompt_text="Which Whisper model to use?",
+                    subtitle_text=f"Transcribing: {fname}"
+                )
+                if _ce.is_set() or model_choice is None:
+                    log(f"\n  Cancelled.\n", "red")
+                    return
+
+                _whisper_model_choice = model_choice
+                _stop_whisper_process()
+
+                if timed_out:
+                    log(f"  No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
+                else:
+                    log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
+
+            # Check CUDA availability
+            _has_cuda = False
+            try:
+                _cuda_check = subprocess.run(
+                    [_WHISPER_PYTHON, "-c", "import torch; print(torch.cuda.is_available())"],
+                    capture_output=True, text=True, timeout=30, startupinfo=startupinfo
+                ) if os.path.exists(_WHISPER_PYTHON) else None
+                _has_cuda = _cuda_check is not None and "True" in _cuda_check.stdout
+            except Exception:
+                pass
+
+            if not _has_cuda:
+                log(f"  \u26a0 No CUDA GPU detected \u2014 Whisper unavailable.\n", "red")
+                return
+
+            # Check Whisper installation
+            if not _check_whisper_installed():
+                log("  Whisper AI is not installed.\n", "red")
+                _install_result = [None]
+
+                def _ask_install():
+                    _install_result[0] = messagebox.askyesno(
+                        "Install Whisper AI",
+                        "Whisper AI is required for transcription.\n\n"
+                        "This requires ~1.5 GB of downloads.\n\n"
+                        "Install now?")
+
+                if root.winfo_exists():
+                    root.after(0, _ask_install)
+                    while _install_result[0] is None and not _ce.is_set():
+                        time.sleep(0.1)
+                    if not _install_result[0]:
+                        log(f"  Transcription cancelled \u2014 Whisper not installed.\n", "red")
+                        return
+                    if not _install_whisper_blocking():
+                        log(f"  Failed to install Whisper.\n", "red")
+                        return
+
+            # Get duration for progress reporting
+            _dur_secs = 0
+            try:
+                probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
+                             "format=duration", "-of", "csv=p=0", file_path]
+                probe_result = subprocess.run(probe_cmd, capture_output=True,
+                                              text=True, timeout=30, startupinfo=startupinfo)
+                _dur_secs = float(probe_result.stdout.strip())
+            except Exception:
+                pass
+
+            if _ce.is_set():
+                log(f"\n  Cancelled.\n", "red")
+                return
+
+            _whisper_counter["idx"] = 1
+            _whisper_counter["total"] = 1
+            _t_start = time.time()
+            log(f"  Transcribing with Whisper ({_whisper_model_choice})...\n", "simpleline")
+
+            text = _whisper_transcribe(file_path, duration=_dur_secs, title=fname,
+                                       cancel_ev=_ce, pause_ev=_pe)
+
+            if not text:
+                log(f"  Whisper returned empty result.\n", "red")
+                return
+
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except Exception as e:
+                log(f"  Error writing transcript: {e}\n", "red")
+                return
+
+            elapsed = time.time() - _t_start
+            _m, _s = divmod(int(elapsed), 60)
+            _time_str = f"{_m}min {_s:02d}sec" if _m else f"{_s}sec"
+            log(f"\n  Transcript saved: {os.path.basename(out_path)} ({_time_str})\n", "simpleline_green")
+
+        except Exception as e:
+            log(f"\n  Manual transcription error: {e}\n", "red")
+        finally:
+            _transcribe_running = False
+            if not _sync_mode:
+                _stop_whisper_process()
+                _tray_stop_spin()
+                _update_tray_tooltip("YT Archiver \u2014 Idle")
+                _current_job["label"] = None
+                _current_job["url"] = None
+                _update_queue_btn()
+            if not _sync_mode and root.winfo_exists():
+                root.after(0, _hide_cancel_pause)
+            if not _sync_mode and not _ce.is_set():
+                _process_next_queued()
+
+    if _sync_mode:
+        _worker()  # Run synchronously — caller is the GPU worker thread
+    else:
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 def _toggle_split_months(*_):
@@ -5268,8 +5995,41 @@ def _toggle_split_months(*_):
 new_split_years_var.trace_add("write", _toggle_split_months)
 
 
+# --- Compress row (Row 5) ---
+compress_row = ttk.Frame(add_outer, style="Raised.TFrame")
+compress_row.grid(row=5, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(2, 4))
+
+new_compress_var = tk.BooleanVar(value=False)
+new_compress_bitrate_var = tk.StringVar(value="")
+
+compress_cb = ttk.Checkbutton(compress_row, text="Compress after download",
+                               variable=new_compress_var)
+compress_cb.pack(side="left", padx=(4, 8))
+
+_compress_target_label = tk.Label(compress_row, text="Target:", bg=C_SURFACE, fg=C_DIM,
+                                   font=("Segoe UI", 9))
+_compress_bitrate_entry = _entry(compress_row, textvariable=new_compress_bitrate_var, width=6)
+_compress_mbhr_label = tk.Label(compress_row, text="MB/hr", bg=C_SURFACE, fg=C_DIM,
+                                 font=("Segoe UI", 9))
+_ToolTip(_compress_bitrate_entry, "Target file size in MB per hour of video (e.g. 50, 100, 200)")
+
+
+def _toggle_compress_entry(*_):
+    if new_compress_var.get():
+        _compress_target_label.pack(side="left", padx=(0, 4))
+        _compress_bitrate_entry.pack(side="left", padx=(0, 2))
+        _compress_mbhr_label.pack(side="left", padx=(0, 8))
+    else:
+        _compress_target_label.pack_forget()
+        _compress_bitrate_entry.pack_forget()
+        _compress_mbhr_label.pack_forget()
+        new_compress_bitrate_var.set("")
+
+
+new_compress_var.trace_add("write", _toggle_compress_entry)
+
 action_btn_frame = ttk.Frame(add_outer, style="Raised.TFrame")
-action_btn_frame.grid(row=5, column=0, columnspan=9, sticky="w", padx=8, pady=(4, 8))
+action_btn_frame.grid(row=6, column=0, columnspan=9, sticky="w", padx=8, pady=(4, 8))
 
 add_channel_btn = ttk.Button(action_btn_frame, text="Add channel", command=add_channel, state="disabled")
 add_channel_btn.pack(side="left", padx=(0, 8))
@@ -6921,7 +7681,7 @@ def start_download():
     url_entry.event_generate("<FocusOut>")
     vid_custom_name_var.set("")
 
-    if _sync_running or _reorg_running or _transcribe_running:
+    if _sync_running or _reorg_running:
         # Queue the download for after the current operation finishes
         with _video_dl_queue_lock:
             _video_dl_queue.append((cmd, True))
@@ -6962,8 +7722,8 @@ def start_sync_all():
         _update_queue_btn()
         return
 
-    # If a reorg or transcription is running, queue the sync for later
-    if _reorg_running or _transcribe_running:
+    # If a reorg is running, queue the sync for later
+    if _reorg_running:
         with _sync_queue_lock:
             # Check if a full sync is already queued
             already_queued = len([q for q in _sync_queue if q["url"] in [c["url"] for c in channels]]) >= len(channels)
@@ -7064,7 +7824,7 @@ def start_sync_all():
 
                 ch_name = ch["name"]
                 ch_dl_map[ch_name] = 0
-                _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Checking {ch_name} for new videos"
+                _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
@@ -7337,6 +8097,36 @@ def start_sync_all():
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
 
+                # New videos downloaded — clear transcription_complete flag
+                if c_dl > 0:
+                    ch["transcription_complete"] = False
+                    with config_lock:
+                        for _cfg_ch in config.get("channels", []):
+                            if _cfg_ch.get("url") == url:
+                                _cfg_ch["transcription_complete"] = False
+                                break
+
+                # Auto-compress: if channel has compress enabled and new videos were downloaded
+                if c_dl > 0 and ch.get("compress_enabled", False) and ch.get("compress_bitrate", 0) > 0:
+                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _add_to_gpu_queue({
+                        "type": "encode", "ch_name": ch_name, "ch_url": url,
+                        "folder": _ac_folder, "bitrate_mbhr": ch["compress_bitrate"],
+                        "split_years": ch.get("split_years", False),
+                        "split_months": ch.get("split_months", False),
+                    })
+
+                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
+                if c_dl > 0 and ch.get("auto_transcribe", False):
+                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _at_sy = ch.get("split_years", False)
+                    _at_sm = ch.get("split_months", False)
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch_name, "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
+
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
                 log(f"  ⚠  DOWNLOADING {len(deferred_streams)} DEFERRED LIVESTREAM(S)  ⚠\n", "livestream")
@@ -7488,6 +8278,7 @@ def stop_downloads():
     pause_event.clear()
 
     # Clear any queued syncs, video downloads, reorg, and transcription jobs
+    # (GPU Task List is independent — cancelled only via its own menu)
     with _sync_queue_lock:
         _sync_queue.clear()
     with _video_dl_queue_lock:
@@ -7496,6 +8287,8 @@ def stop_downloads():
         _reorg_queue.clear()
     with _transcribe_queue_lock:
         _transcribe_queue.clear()
+    with _mt_queue_lock:
+        _mt_queue.clear()
     with _queue_order_lock:
         _queue_order.clear()
 
@@ -7503,14 +8296,16 @@ def stop_downloads():
     _sync_running = False
     _reorg_running = False
     _transcribe_running = False
-    _stop_whisper_process()  # Kill Whisper subprocess on cancel
-    _stop_punct_process()   # Kill punctuation subprocess on cancel
+    if not _gpu_running:
+        _stop_whisper_process()  # Kill Whisper subprocess on cancel (only if GPU isn't using it)
+        _stop_punct_process()   # Kill punctuation subprocess on cancel
     _current_job["label"] = None
     _current_job["url"] = None
     _tray_stop_spin()
     _update_tray_tooltip("YT Archiver — Idle")
 
     _update_queue_btn()
+    _update_gpu_btn()
 
     cancel_event.set()
 
@@ -7538,7 +8333,7 @@ def stop_downloads():
     # stuck on process I/O, etc.)
     def _cancel_safety_net():
         # Only hide buttons if no new job has started since we cancelled
-        if _sync_running or _reorg_running or _transcribe_running:
+        if _sync_running or _reorg_running:
             return  # a new job took over — don't touch buttons
         if cancel_btn.winfo_ismapped():
             cancel_btn.pack_forget()
@@ -7587,7 +8382,7 @@ def _show_cancel_pause():
 
 
 def _hide_cancel_pause():
-    if not _sync_running and not _reorg_running and not _transcribe_running:
+    if not _sync_running and not _reorg_running:
         cancel_btn.pack_forget()
         pause_btn.pack_forget()
         pause_event.clear()
@@ -7600,7 +8395,7 @@ def _hide_cancel_pause():
 # --- Job Queue Button ---
 _queue_popup = {"win": None}  # Track the popup window
 
-queue_btn = ttk.Button(btn_frame, text="📋", width=3, padding=[2, 2])
+queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="Emoji.TButton")
 # Starts hidden — shown when any queue has items
 
 
@@ -7623,10 +8418,8 @@ def _get_queue_items():
             mode = ch.get("mode", "full")
             if not ch.get("initialized", False):
                 lbl = f"Initialize {name}"
-            elif mode == "full":
-                lbl = f"Sync {name}"
             else:
-                lbl = f"Check {name} for new videos"
+                lbl = f"Sync {name}"
             sync_map[ch["url"]] = (lbl, "sync", i)
     reorg_map = {}
     with _reorg_queue_lock:
@@ -7644,6 +8437,11 @@ def _get_queue_items():
     with _transcribe_queue_lock:
         for i, args in enumerate(_transcribe_queue):
             transcribe_map[args[1]] = (f"Transcribe {args[0]}", "transcribe", i)
+    mt_map = {}
+    with _mt_queue_lock:
+        for i, fpath in enumerate(_mt_queue):
+            mt_fname = os.path.splitext(os.path.basename(fpath))[0]
+            mt_map[fpath] = (f"M.T. {mt_fname}", "mt", i)
     video_item = None
     with _video_dl_queue_lock:
         n_vids = len(_video_dl_queue)
@@ -7665,6 +8463,8 @@ def _get_queue_items():
                 items.append(reorg_map.pop(key))
             elif source == "transcribe" and key in transcribe_map:
                 items.append(transcribe_map.pop(key))
+            elif source == "mt" and key in mt_map:
+                items.append(mt_map.pop(key))
             elif source == "video" and video_item:
                 items.append(video_item)
                 video_item = None
@@ -7675,6 +8475,8 @@ def _get_queue_items():
     for entry in reorg_map.values():
         items.append(entry)
     for entry in transcribe_map.values():
+        items.append(entry)
+    for entry in mt_map.values():
         items.append(entry)
     if video_item:
         items.append(video_item)
@@ -7706,6 +8508,12 @@ def _remove_queue_item(source, idx):
                 popped = _transcribe_queue.pop(idx)
                 removed = popped[0]
                 removed_key = popped[1]  # ch_url
+    elif source == "mt":
+        with _mt_queue_lock:
+            if 0 <= idx < len(_mt_queue):
+                popped = _mt_queue.pop(idx)
+                removed = os.path.splitext(os.path.basename(popped))[0]
+                removed_key = popped
     elif source == "video":
         with _video_dl_queue_lock:
             if _video_dl_queue:
@@ -7742,7 +8550,7 @@ def _show_queue_menu(event=None):
 
     # Shared state for drag-to-reorder and live refresh
     _drag = {"active": False, "src_sync_idx": -1, "src_widget": None}
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": []}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": [], "mw_bind_id": None}
 
     def _build_content():
         """Build or rebuild queue popup content. Skips if nothing changed."""
@@ -7752,11 +8560,13 @@ def _show_queue_menu(event=None):
             return  # No change
         _state["last_snapshot"] = snapshot
 
-        # Unbind global mousewheel before rebuilding
-        try:
-            popup.unbind_all("<MouseWheel>")
-        except Exception:
-            pass
+        # Unbind old mousewheel before rebuilding
+        if _state["mw_bind_id"]:
+            try:
+                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
+            except Exception:
+                pass
+            _state["mw_bind_id"] = None
 
         # Build new content into a fresh wrapper (double-buffer to avoid flash)
         wrapper = tk.Frame(popup, bg="#2d2d2d")
@@ -7928,10 +8738,13 @@ def _show_queue_menu(event=None):
             inner.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
 
-            # Mouse wheel scrolling
+            # Mouse wheel scrolling — popup-level binding to avoid global event interference
             def _on_mousewheel(e):
-                canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+                try:
+                    canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                except Exception:
+                    pass
+            _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
 
             # Footer hint
             has_queued = any(s != "current" for _, s, _ in items)
@@ -7958,12 +8771,19 @@ def _show_queue_menu(event=None):
     _build_content()
 
     # Position below the button
-    try:
-        x = queue_btn.winfo_rootx()
-        y = queue_btn.winfo_rooty() + queue_btn.winfo_height()
-        popup.geometry(f"+{x}+{y}")
-    except Exception:
-        pass
+    def _reposition_queue_popup(*_args):
+        try:
+            if popup.winfo_exists():
+                x = queue_btn.winfo_rootx()
+                y = queue_btn.winfo_rooty() + queue_btn.winfo_height()
+                popup.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    _reposition_queue_popup()
+
+    # Follow main window when it moves
+    _state["configure_bind_id"] = root.bind("<Configure>", _reposition_queue_popup, add="+")
 
     # --- Live refresh (updates queue while open) ---
     def _refresh():
@@ -7971,10 +8791,11 @@ def _show_queue_menu(event=None):
             if popup.winfo_exists() and not _drag["active"]:
                 _build_content()
             if popup.winfo_exists():
-                _state["refresh_job"] = popup.after(1000, _refresh)
+                _reposition_queue_popup()
+                _state["refresh_job"] = popup.after(300, _refresh)
         except Exception:
             pass
-    _state["refresh_job"] = popup.after(1000, _refresh)
+    _state["refresh_job"] = popup.after(300, _refresh)
 
     # --- Close popup: toggle via queue button, or press Escape ---
     popup.bind("<Escape>", lambda e: popup.destroy())
@@ -7987,6 +8808,32 @@ def _show_queue_menu(event=None):
             pass
     _state["esc_bind_id"] = root.bind("<Escape>", _esc_close, add="+")
 
+    # Close when clicking outside the popup
+    _state["popup_alive"] = True
+
+    def _on_click_outside_q(e):
+        try:
+            if not _state.get("popup_alive"):
+                return
+            if not popup.winfo_exists():
+                return
+            # Check if the click is on the queue_btn itself (toggle behavior)
+            try:
+                w = e.widget
+                if w == queue_btn:
+                    return  # Let the button's own command handle toggle
+            except Exception:
+                pass
+            # Check if click is inside the popup
+            px, py = popup.winfo_rootx(), popup.winfo_rooty()
+            pw, ph = popup.winfo_width(), popup.winfo_height()
+            if px <= e.x_root <= px + pw and py <= e.y_root <= py + ph:
+                return  # Click inside popup — ignore
+            popup.destroy()
+        except Exception:
+            pass
+    _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside_q, add="+")
+
     def _on_popup_destroy(e):
         if e.widget != popup:
             return
@@ -7996,12 +8843,25 @@ def _show_queue_menu(event=None):
         except Exception:
             pass
         try:
-            popup.unbind_all("<MouseWheel>")
+            if _state.get("mw_bind_id"):
+                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
         except Exception:
             pass
         try:
             if _state.get("esc_bind_id"):
                 root.unbind("<Escape>", _state["esc_bind_id"])
+        except Exception:
+            pass
+        try:
+            if _state.get("configure_bind_id"):
+                root.unbind("<Configure>", _state["configure_bind_id"])
+        except Exception:
+            pass
+        _state["popup_alive"] = False
+        try:
+            if _state.get("click_outside_id"):
+                root.unbind("<Button-1>", _state["click_outside_id"])
+                _state["click_outside_id"] = None
         except Exception:
             pass
         _queue_popup["win"] = None
@@ -8019,6 +8879,10 @@ def _update_queue_btn():
             items = _get_queue_items()
             if items and not queue_btn.winfo_ismapped():
                 queue_btn.pack(side="left", padx=(6, 0), before=_last_sync_spacer)
+                # Re-pack GPU button after queue button to maintain correct order
+                if gpu_btn.winfo_ismapped():
+                    gpu_btn.pack_forget()
+                    gpu_btn.pack(side="left", padx=(6, 0), after=queue_btn)
             elif not items:
                 if queue_btn.winfo_ismapped():
                     queue_btn.pack_forget()
@@ -8030,6 +8894,737 @@ def _update_queue_btn():
             pass
     if root.winfo_exists():
         root.after(0, _do)
+
+
+# --- GPU Task List Button ---
+gpu_btn = ttk.Button(btn_frame, text="💻", width=3, style="Gpu.TButton")
+# Starts hidden — shown when GPU queue has items or GPU is running
+
+# --- GPU badge (red circle with count) ---
+_gpu_badge = tk.Label(gpu_btn, text="", bg="#cc2222", fg="#ffffff",
+                      font=("Segoe UI", 7, "bold"), padx=2, pady=0,
+                      borderwidth=0, highlightthickness=0)
+_gpu_badge_count = {"n": -1}  # track last displayed count to avoid redundant updates
+
+
+def _update_gpu_badge():
+    """Update the red badge count on the GPU button."""
+    with _gpu_queue_lock:
+        n = len(_gpu_queue)
+    if _gpu_running and _gpu_current.get("label"):
+        n += 1
+    if n == _gpu_badge_count["n"]:
+        return  # no change
+    _gpu_badge_count["n"] = n
+    if n > 0:
+        _gpu_badge.config(text=str(n) if n <= 99 else "99+")
+        _gpu_badge.place(relx=1.0, rely=0.0, anchor="ne", x=-1, y=1)
+        _gpu_badge.lift()
+    else:
+        _gpu_badge.place_forget()
+
+
+# --- GPU button blink animation ---
+_gpu_blink = {"active": False, "on": False, "job": None}
+
+# Dedicated style for GPU button — same as Emoji.TButton but we toggle its background
+style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
+                font=("Segoe UI Emoji", 11))
+style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+
+
+def _gpu_blink_tick():
+    """Toggle the GPU button background between normal and red."""
+    try:
+        if not _gpu_blink["active"] or not root.winfo_exists() or not gpu_btn.winfo_ismapped():
+            # Reset to normal background when stopping
+            style.configure("Gpu.TButton", background=C_BTN)
+            style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+            _gpu_blink["on"] = False
+            _gpu_blink["job"] = None
+            return
+        _gpu_blink["on"] = not _gpu_blink["on"]
+        if _gpu_blink["on"]:
+            style.configure("Gpu.TButton", background="#6b1a1a")
+            style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+        else:
+            style.configure("Gpu.TButton", background=C_BTN)
+            style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+        _gpu_blink["job"] = root.after(600, _gpu_blink_tick)
+    except Exception:
+        _gpu_blink["active"] = False
+        _gpu_blink["job"] = None
+
+
+def _gpu_blink_start():
+    """Start the GPU button blink animation."""
+    if _gpu_blink["active"]:
+        return
+    _gpu_blink["active"] = True
+    _gpu_blink["on"] = False
+    if root.winfo_exists():
+        _gpu_blink["job"] = root.after(0, _gpu_blink_tick)
+
+
+def _gpu_blink_stop():
+    """Stop the GPU button blink animation."""
+    _gpu_blink["active"] = False
+    if _gpu_blink["job"]:
+        try:
+            root.after_cancel(_gpu_blink["job"])
+        except Exception:
+            pass
+        _gpu_blink["job"] = None
+    _gpu_blink["on"] = False
+    try:
+        style.configure("Gpu.TButton", background=C_BTN)
+        style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+    except Exception:
+        pass
+
+
+def _update_gpu_btn():
+    """Show/hide the GPU Task List button."""
+    def _do():
+        try:
+            with _gpu_queue_lock:
+                has_items = bool(_gpu_queue)
+            should_show = has_items or _gpu_running
+            if should_show and not gpu_btn.winfo_ismapped():
+                # Always pack GPU button after queue button (to its right)
+                if queue_btn.winfo_ismapped():
+                    gpu_btn.pack(side="left", padx=(6, 0), after=queue_btn)
+                else:
+                    gpu_btn.pack(side="left", padx=(6, 0), before=_last_sync_spacer)
+            elif not should_show:
+                if gpu_btn.winfo_ismapped():
+                    gpu_btn.pack_forget()
+                    _gpu_badge.place_forget()
+                    _gpu_badge_count["n"] = -1  # reset so badge re-draws on next show
+                if _gpu_popup["win"] and _gpu_popup["win"].winfo_exists():
+                    _gpu_popup["win"].destroy()
+                    _gpu_popup["win"] = None
+
+            # Update badge count
+            _update_gpu_badge()
+
+            # Manage blink animation based on GPU running state
+            if _gpu_running and not _gpu_blink["active"]:
+                _gpu_blink_start()
+            elif not _gpu_running and _gpu_blink["active"]:
+                _gpu_blink_stop()
+        except Exception:
+            pass
+    if root.winfo_exists():
+        root.after(0, _do)
+
+
+def _get_gpu_queue_items():
+    """Return list of (label, index) for display in the GPU Task List popup."""
+    items = []
+    if _gpu_running and _gpu_current["label"]:
+        items.append((f"▶ {_gpu_current['label']}", -1))
+    with _gpu_queue_lock:
+        for i, item in enumerate(_gpu_queue):
+            if item["type"] == "transcribe":
+                items.append((f"Transcribe {item['ch_name']}", i))
+            elif item["type"] == "encode":
+                items.append((f"Compress {item['ch_name']}", i))
+            elif item["type"] == "mt":
+                fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                items.append((f"M.T. {fname}", i))
+    return items
+
+
+def _remove_gpu_queue_item(idx):
+    """Remove an item from the GPU queue by index."""
+    with _gpu_queue_lock:
+        if 0 <= idx < len(_gpu_queue):
+            removed = _gpu_queue.pop(idx)
+            if removed["type"] == "transcribe":
+                label = removed["ch_name"]
+            else:
+                label = os.path.splitext(os.path.basename(removed.get("file_path", "")))[0]
+            log(f"  Removed {label} from GPU Task List.\n", "dim")
+    _update_gpu_btn()
+
+
+def _show_gpu_menu(event=None):
+    """Show the GPU Task List popup menu — styled to match the Job Queue popup."""
+    if _gpu_popup["win"] and _gpu_popup["win"].winfo_exists():
+        _gpu_popup["win"].destroy()
+        _gpu_popup["win"] = None
+        return
+
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
+    _gpu_popup["win"] = popup
+
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None}
+
+    def _mt_from_popup():
+        popup.destroy()
+        _gpu_popup["win"] = None
+        _start_manual_transcription()
+
+    def _confirm_gpu_remove(idx, label):
+        if messagebox.askyesno("Remove from GPU Task List",
+                               f"Remove '{label}' from the GPU Task List?",
+                               parent=popup):
+            _remove_gpu_queue_item(idx)
+
+    def _do_gpu_start():
+        """Start GPU processing — closes popup first, then shows model dialog."""
+        try:
+            if popup.winfo_exists():
+                popup.destroy()
+                _gpu_popup["win"] = None
+            _gpu_start()
+        except Exception:
+            pass
+
+    def _build_content():
+        """Build or rebuild GPU popup content. Skips if nothing changed."""
+        items = _get_gpu_queue_items()
+        btn_state = ("running_paused" if _gpu_pause.is_set() else "running") if _gpu_running else "idle"
+        snapshot = [(lbl, idx) for lbl, idx in items] + [("__btn__", btn_state)]
+        if _state["last_snapshot"] == snapshot:
+            return
+        _state["last_snapshot"] = snapshot
+
+        # Unbind old mousewheel before rebuilding
+        if _state["mw_bind_id"]:
+            try:
+                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
+            except Exception:
+                pass
+            _state["mw_bind_id"] = None
+
+        wrapper = tk.Frame(popup, bg="#2d2d2d")
+
+        # Header row: "  GPU Task List (N)  [📁]"
+        hdr = tk.Frame(wrapper, bg="#2d2d2d")
+        hdr.pack(fill="x", padx=4, pady=(6, 2))
+        with _gpu_queue_lock:
+            n = len(_gpu_queue)
+        count_n = n + (1 if _gpu_running and _gpu_current["label"] else 0)
+        hdr_text = f"  GPU Task List ({count_n})" if count_n else "  GPU Task List (empty)"
+        tk.Label(hdr, text=hdr_text, bg="#2d2d2d", fg="#888888",
+                 font=("Segoe UI", 9, "italic"), anchor="w").pack(side="left")
+        # Small folder icon button for Manual Transcription
+        _folder_btn = tk.Button(hdr, text="\U0001F4C1", bg="#2d2d2d", fg="#888888",
+                  activebackground="#444444", activeforeground="#cccccc",
+                  relief="flat", bd=0, font=("Segoe UI Emoji", 9),
+                  cursor="hand2", command=_mt_from_popup, padx=4)
+        _folder_btn.pack(side="right")
+        _ToolTip(_folder_btn, "Manual Transcription")
+
+        if items:
+            max_visible = 10
+            show_count = min(len(items), max_visible)
+            item_height = 26
+            list_height = show_count * item_height
+
+            canvas_frame = tk.Frame(wrapper, bg="#2d2d2d")
+            canvas_frame.pack(fill="both", expand=True, padx=2)
+
+            canvas = tk.Canvas(canvas_frame, bg="#2d2d2d", highlightthickness=0,
+                               height=list_height, width=310)
+
+            if len(items) > max_visible:
+                scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+                scrollbar.pack(side="right", fill="y")
+                canvas.configure(yscrollcommand=scrollbar.set)
+
+            canvas.pack(side="left", fill="both", expand=True)
+
+            inner = tk.Frame(canvas, bg="#2d2d2d")
+            canvas.create_window((0, 0), window=inner, anchor="nw")
+
+            for i, (label, idx) in enumerate(items):
+                row = tk.Frame(inner, bg="#2d2d2d")
+                row.pack(fill="x")
+
+                if idx == -1:
+                    # Currently processing — green, bold
+                    lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#6abf6a",
+                                   font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
+                    lbl.pack(side="left", fill="x", expand=True)
+                else:
+                    lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
+                                   font=("Segoe UI", 9), anchor="w", padx=4, pady=2)
+                    lbl.pack(side="left", fill="x", expand=True)
+
+                    # Hover highlight
+                    def _enter(e, r=row, l=lbl):
+                        r.config(bg="#444444"); l.config(bg="#444444")
+                    def _leave(e, r=row, l=lbl):
+                        r.config(bg="#2d2d2d"); l.config(bg="#2d2d2d")
+                    for w in (row, lbl):
+                        w.bind("<Enter>", _enter)
+                        w.bind("<Leave>", _leave)
+
+                    # Right-click to remove
+                    def _remove(e, qi=idx, lb=label):
+                        _confirm_gpu_remove(qi, lb)
+                    for w in (row, lbl):
+                        w.bind("<Button-3>", _remove)
+
+            inner.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+            # Use popup-level binding instead of bind_all to avoid global event interference
+            def _on_mousewheel(e):
+                try:
+                    canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                except Exception:
+                    pass
+            _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
+
+            # Footer buttons
+            btn_row = tk.Frame(wrapper, bg="#2d2d2d")
+            btn_row.pack(fill="x", padx=4, pady=(4, 6))
+
+            if not _gpu_running:
+                with _gpu_queue_lock:
+                    _has_items = bool(_gpu_queue)
+                if _has_items:
+                    tk.Button(btn_row, text="\u25B6 Start", bg="#3a6a3a", fg="#cccccc",
+                              activebackground="#4a8a4a", activeforeground="#cccccc",
+                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                              cursor="hand2", command=_do_gpu_start).pack(side="left", padx=(4, 4))
+            else:
+                if _gpu_pause.is_set():
+                    tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                              activebackground="#4a8a4a", activeforeground="#cccccc",
+                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                              cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                else:
+                    tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
+                              activebackground="#3a5e84", activeforeground="#cccccc",
+                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                              cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
+                          activebackground="#a52a2a", activeforeground="#ffffff",
+                          relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                          cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
+
+            # Footer hint
+            has_queued = any(idx != -1 for _, idx in items)
+            hint_text = "  Right-click to remove" if has_queued else ""
+            hint = tk.Label(wrapper, text=hint_text, bg="#2d2d2d", fg="#4a4f5a",
+                            font=("Segoe UI", 8), anchor="w")
+            hint.pack(fill="x", padx=4, pady=(2, 6))
+        else:
+            empty = tk.Label(wrapper, text="  (empty)", bg="#2d2d2d", fg="#666666",
+                             font=("Segoe UI", 9), anchor="w")
+            empty.pack(fill="x", padx=4, pady=(0, 6))
+
+        # Swap: pack new wrapper, then destroy old (double-buffer avoids flash)
+        wrapper.pack(fill="both", expand=True)
+        old_wrapper = _state["wrapper"]
+        if old_wrapper:
+            try:
+                old_wrapper.destroy()
+            except Exception:
+                pass
+        _state["wrapper"] = wrapper
+
+    _build_content()
+
+    # Position below the button
+    def _reposition_gpu_popup(*_args):
+        try:
+            if popup.winfo_exists():
+                x = gpu_btn.winfo_rootx()
+                y = gpu_btn.winfo_rooty() + gpu_btn.winfo_height()
+                popup.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+    _reposition_gpu_popup()
+
+    # Follow main window when it moves
+    _state["configure_bind_id"] = root.bind("<Configure>", _reposition_gpu_popup, add="+")
+
+    # --- Live refresh (double-buffered — no flicker) ---
+    def _refresh():
+        try:
+            if popup.winfo_exists():
+                _build_content()
+            if popup.winfo_exists():
+                _reposition_gpu_popup()
+                _state["refresh_job"] = popup.after(300, _refresh)
+        except Exception:
+            pass
+    _state["refresh_job"] = popup.after(1000, _refresh)
+
+    # Close on Escape
+    popup.bind("<Escape>", lambda e: popup.destroy())
+    _state["esc_bind_id"] = root.bind("<Escape>", lambda e: (popup.destroy() if popup.winfo_exists() else None), add="+")
+
+    # Close when clicking outside the popup
+    _state["popup_alive"] = True
+
+    def _on_click_outside(e):
+        try:
+            if not _state.get("popup_alive"):
+                return
+            if not popup.winfo_exists():
+                return
+            # Check if the click is on the gpu_btn itself (toggle behavior)
+            try:
+                w = e.widget
+                if w == gpu_btn:
+                    return  # Let the button's own command handle toggle
+            except Exception:
+                pass
+            # Check if click is inside the popup
+            px, py = popup.winfo_rootx(), popup.winfo_rooty()
+            pw, ph = popup.winfo_width(), popup.winfo_height()
+            if px <= e.x_root <= px + pw and py <= e.y_root <= py + ph:
+                return  # Click inside popup — ignore
+            popup.destroy()
+        except Exception:
+            pass
+    _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside, add="+")
+
+    def _on_popup_destroy(e):
+        if e.widget != popup:
+            return
+        try:
+            if _state["refresh_job"]:
+                popup.after_cancel(_state["refresh_job"])
+        except Exception:
+            pass
+        try:
+            if _state.get("mw_bind_id"):
+                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
+        except Exception:
+            pass
+        try:
+            if _state.get("esc_bind_id"):
+                root.unbind("<Escape>", _state["esc_bind_id"])
+        except Exception:
+            pass
+        try:
+            if _state.get("configure_bind_id"):
+                root.unbind("<Configure>", _state["configure_bind_id"])
+        except Exception:
+            pass
+        _state["popup_alive"] = False
+        try:
+            if _state.get("click_outside_id"):
+                root.unbind("<Button-1>", _state["click_outside_id"])
+                _state["click_outside_id"] = None
+        except Exception:
+            pass
+        _gpu_popup["win"] = None
+    popup.bind("<Destroy>", _on_popup_destroy)
+
+
+gpu_btn.config(command=_show_gpu_menu)
+_ToolTip(gpu_btn, "GPU Task List")
+
+
+def _gpu_start():
+    """Start processing the GPU Task List queue."""
+    global _gpu_running, _whisper_model_choice
+
+    with _gpu_queue_lock:
+        if not _gpu_queue:
+            return
+
+    # Close popup before model dialog (if still open)
+    if _gpu_popup["win"] and _gpu_popup["win"].winfo_exists():
+        _gpu_popup["win"].destroy()
+        _gpu_popup["win"] = None
+
+    # Only show Whisper model dialog if queue contains transcription tasks
+    _has_transcribe_tasks = False
+    with _gpu_queue_lock:
+        _has_transcribe_tasks = any(q["type"] in ("transcribe", "mt") for q in _gpu_queue)
+
+    if not _has_transcribe_tasks:
+        # No transcription tasks — skip model dialog and start immediately
+        _gpu_running = True
+        _gpu_cancel.clear()
+        _gpu_pause.clear()
+        _update_gpu_btn()
+
+        def _gpu_worker():
+            global _gpu_running
+            try:
+                while True:
+                    if _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                        log(f"  ⏸ GPU Task List paused.\n", "pauselog")
+                        while _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                            time.sleep(0.25)
+                        if not _gpu_cancel.is_set():
+                            log(f"  ▶ GPU Task List resuming...\n", "pauselog")
+
+                    if _gpu_cancel.is_set():
+                        log(f"\n  ⛔ GPU Task List cancelled.\n", "red")
+                        break
+
+                    with _gpu_queue_lock:
+                        if not _gpu_queue:
+                            break
+                        item = _gpu_queue.pop(0)
+
+                    if item["type"] == "encode":
+                        _gpu_current["label"] = f"Compress {item['ch_name']}"
+                        _gpu_current["ch_url"] = item.get("ch_url")
+                        _update_gpu_btn()
+                        _compress_channel(
+                            item["ch_name"], item["ch_url"], item["folder"],
+                            item["bitrate_mbhr"],
+                            item["split_years"], item["split_months"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            _sync_mode=True
+                        )
+                    elif item["type"] == "mt":
+                        fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                        _gpu_current["label"] = f"M.T. {fname}"
+                        _gpu_current["ch_url"] = None
+                        _update_gpu_btn()
+                        _run_manual_transcription(
+                            item["file_path"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            skip_model_dialog=True, _sync_mode=True
+                        )
+                    elif item["type"] == "transcribe":
+                        _gpu_current["label"] = f"Transcribe {item['ch_name']}"
+                        _gpu_current["ch_url"] = item.get("ch_url")
+                        _update_gpu_btn()
+                        _start_transcription(
+                            item["ch_name"], item["ch_url"], item["folder"],
+                            item["split_years"], item["split_months"], item["combined"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            skip_model_dialog=True, _sync_mode=True
+                        )
+
+                    _gpu_current["label"] = None
+                    _gpu_current["ch_url"] = None
+                    _update_gpu_btn()
+
+                if not _gpu_cancel.is_set():
+                    log(f"\n  ✓ All GPU Task List completed.\n", "simpleline_green")
+            except Exception as e:
+                log(f"\n  ⚠ GPU Task List error: {e}\n", "red")
+            finally:
+                _gpu_running = False
+                _gpu_current["label"] = None
+                _gpu_current["ch_url"] = None
+                _stop_whisper_process()
+                _stop_punct_process()
+                _stop_ffmpeg_process()
+                _tray_stop_spin()
+                _update_tray_tooltip("YT Archiver — Idle")
+                _update_gpu_btn()
+                if root.winfo_exists():
+                    root.after(0, _hide_cancel_pause)
+
+        threading.Thread(target=_gpu_worker, daemon=True).start()
+        return
+
+    # Show model dialog directly on the main thread (using wait_window to avoid deadlock)
+    _model_result = [None]
+    _model_timed_out = [False]
+
+    _dlg = tk.Toplevel(root)
+    _dlg.title("Whisper Model Selection")
+    _dlg.configure(bg=C_BG)
+    _dlg.resizable(False, False)
+    _dlg.transient(root)
+    _dlg.grab_set()
+    _dlg.update_idletasks()
+    _rx = root.winfo_rootx() + root.winfo_width() // 2
+    _ry = root.winfo_rooty() + root.winfo_height() // 2
+    _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
+
+    tk.Label(_dlg, text="Which Whisper model for GPU Task List?",
+             bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+             pady=10, padx=20).pack(fill="x")
+    tk.Label(_dlg, text="This model will be used for all queued tasks",
+             bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+             padx=20).pack(fill="x")
+
+    _btn_frame_dlg = tk.Frame(_dlg, bg=C_BG, pady=10)
+    _btn_frame_dlg.pack(fill="x", padx=20)
+
+    _models = [
+        ("tiny",     "Fastest  (~30-50\u00d7 realtime)",  "tiny"),
+        ("small",    "Fast  (~15-20\u00d7 realtime)",     "small"),
+        ("medium",   "Balanced  (~7-10\u00d7 realtime)",  "medium"),
+        ("large-v3", "Best quality  (~3-5\u00d7 realtime)", "large-v3"),
+    ]
+    _DEFAULT_MODEL = "small"
+    _countdown = {"secs": 60, "job": None}
+
+    def _pick(m):
+        if _countdown["job"]:
+            try:
+                _dlg.after_cancel(_countdown["job"])
+            except Exception:
+                pass
+        _model_result[0] = m
+        try:
+            _dlg.destroy()
+        except Exception:
+            pass
+
+    _timer_lbl = tk.Label(_dlg, text=f"Auto-selecting {_DEFAULT_MODEL} in 60s...",
+                          bg=C_BG, fg=C_DIM, font=("Segoe UI", 8),
+                          padx=20)
+    _timer_lbl.pack(fill="x", pady=(0, 4))
+
+    def _tick():
+        _countdown["secs"] -= 1
+        if _countdown["secs"] <= 0:
+            _model_timed_out[0] = True
+            _pick(_DEFAULT_MODEL)
+            return
+        try:
+            _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+            _countdown["job"] = _dlg.after(1000, _tick)
+        except Exception:
+            pass
+
+    _countdown["job"] = _dlg.after(1000, _tick)
+
+    for label, desc, model_id in _models:
+        _row = tk.Frame(_btn_frame_dlg, bg=C_BG)
+        _row.pack(fill="x", pady=2)
+        _b = tk.Button(_row, text=label, width=10,
+                       bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                       activeforeground=C_TEXT, relief="flat", bd=0,
+                       font=("Segoe UI", 9, "bold"), cursor="hand2",
+                       command=lambda m=model_id: _pick(m))
+        _b.pack(side="left", padx=(0, 8))
+        tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                 font=("Segoe UI", 9)).pack(side="left")
+        if model_id == _DEFAULT_MODEL:
+            tk.Label(_row, text="(default)", bg=C_BG, fg="#5a8a5a",
+                     font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+    _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
+
+    # Block until dialog closes (non-deadlocking — lets mainloop process events)
+    root.wait_window(_dlg)
+
+    model_choice = _model_result[0]
+    timed_out = _model_timed_out[0]
+    if model_choice is None:
+        return
+    _whisper_model_choice = model_choice
+    _stop_whisper_process()
+
+    if timed_out:
+        log(f"\n  GPU Task List: auto-selected {_whisper_model_choice} model\n", "simpleline")
+    else:
+        log(f"\n  GPU Task List: using {_whisper_model_choice} model\n", "simpleline")
+
+    _gpu_running = True
+    _gpu_cancel.clear()
+    _gpu_pause.clear()
+    _update_gpu_btn()
+
+    def _gpu_worker():
+        global _gpu_running
+        try:
+            while True:
+                # Pause check
+                if _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                    log(f"  ⏸ GPU Task List paused.\n", "pauselog")
+                    while _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                        time.sleep(0.25)
+                    if not _gpu_cancel.is_set():
+                        log(f"  ▶ GPU Task List resuming...\n", "pauselog")
+
+                if _gpu_cancel.is_set():
+                    log(f"\n  ⛔ GPU Task List cancelled.\n", "red")
+                    break
+
+                # Pop next item
+                with _gpu_queue_lock:
+                    if not _gpu_queue:
+                        break
+                    item = _gpu_queue.pop(0)
+
+                if item["type"] == "mt":
+                    fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                    _gpu_current["label"] = f"M.T. {fname}"
+                    _gpu_current["ch_url"] = None
+                    _update_gpu_btn()
+                    _run_manual_transcription(
+                        item["file_path"],
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        skip_model_dialog=True, _sync_mode=True
+                    )
+                elif item["type"] == "transcribe":
+                    _gpu_current["label"] = f"Transcribe {item['ch_name']}"
+                    _gpu_current["ch_url"] = item.get("ch_url")
+                    _update_gpu_btn()
+                    _start_transcription(
+                        item["ch_name"], item["ch_url"], item["folder"],
+                        item["split_years"], item["split_months"], item["combined"],
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        skip_model_dialog=True, _sync_mode=True
+                    )
+                elif item["type"] == "encode":
+                    _gpu_current["label"] = f"Compress {item['ch_name']}"
+                    _gpu_current["ch_url"] = item.get("ch_url")
+                    _update_gpu_btn()
+                    _compress_channel(
+                        item["ch_name"], item["ch_url"], item["folder"],
+                        item["bitrate_mbhr"],
+                        item["split_years"], item["split_months"],
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        _sync_mode=True
+                    )
+
+                _gpu_current["label"] = None
+                _gpu_current["ch_url"] = None
+                _update_gpu_btn()
+
+            if not _gpu_cancel.is_set():
+                log(f"\n  ✓ All GPU Task List completed.\n", "simpleline_green")
+        except Exception as e:
+            log(f"\n  ⚠ GPU Task List error: {e}\n", "red")
+        finally:
+            _gpu_running = False
+            _gpu_current["label"] = None
+            _gpu_current["ch_url"] = None
+            _stop_whisper_process()
+            _stop_punct_process()
+            _stop_ffmpeg_process()
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
+            _update_gpu_btn()
+            # Safety: ensure main cancel/pause buttons are hidden after GPU work
+            if root.winfo_exists():
+                root.after(0, _hide_cancel_pause)
+
+    threading.Thread(target=_gpu_worker, daemon=True).start()
+
+
+def _gpu_cancel_handler():
+    """Cancel all GPU Task List."""
+    _gpu_cancel.set()
+    with _gpu_queue_lock:
+        _gpu_queue.clear()
+    _stop_whisper_process()
+    _update_gpu_btn()
+
+
+def _gpu_pause_handler():
+    """Toggle pause on GPU Task List."""
+    if _gpu_pause.is_set():
+        _gpu_pause.clear()
+    else:
+        _gpu_pause.set()
 
 
 def _format_last_sync(ts_str):
@@ -8161,6 +9756,8 @@ def _refresh_autorun_history():
         autorun_history_listbox.insert(tk.END, f"  {entry}")
     for i in range(0, autorun_history_listbox.size(), 2):
         autorun_history_listbox.itemconfig(i, bg="#0c0f14")
+    # Scroll to bottom so newest entry is visible
+    autorun_history_listbox.see(tk.END)
 
     # Get the currently visible panes
     current_panes = [str(p) for p in log_paned.panes()]
@@ -8195,9 +9792,9 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
     line = f"[{kind}] {ts}, {date}  —{ch_part}  {dl} downloaded · {skipped} skipped · {err} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
-        hist.insert(0, line)
+        hist.append(line)
         if len(hist) > AUTORUN_HISTORY_MAX:
-            config["autorun_history"] = hist[:AUTORUN_HISTORY_MAX]
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
     if root.winfo_exists():
         root.after(0, _refresh_autorun_history)
@@ -8224,9 +9821,9 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
     line = f"[Transcr.] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
-        hist.insert(0, line)
+        hist.append(line)
         if len(hist) > AUTORUN_HISTORY_MAX:
-            config["autorun_history"] = hist[:AUTORUN_HISTORY_MAX]
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
     if root.winfo_exists():
         root.after(0, _refresh_autorun_history)
@@ -8581,6 +10178,37 @@ def _run_autorun():
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
 
+                # New videos downloaded — clear transcription_complete flag
+                if c_dl > 0:
+                    with config_lock:
+                        for _cfg_ch in config.get("channels", []):
+                            if _cfg_ch.get("url") == url:
+                                _cfg_ch["transcription_complete"] = False
+                                break
+
+                # Auto-compress: if channel has compress enabled and new videos were downloaded
+                if c_dl > 0 and ch.get("compress_enabled", False) and ch.get("compress_bitrate", 0) > 0:
+                    ch_name_ac = ch.get("name", "")
+                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_ac))
+                    _add_to_gpu_queue({
+                        "type": "encode", "ch_name": ch_name_ac, "ch_url": url,
+                        "folder": _ac_folder, "bitrate_mbhr": ch["compress_bitrate"],
+                        "split_years": ch.get("split_years", False),
+                        "split_months": ch.get("split_months", False),
+                    })
+
+                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
+                if c_dl > 0 and ch.get("auto_transcribe", False):
+                    ch_name_at = ch.get("name", "")
+                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_at))
+                    _at_sy = ch.get("split_years", False)
+                    _at_sm = ch.get("split_months", False)
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch_name_at, "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
+
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
                 log(f"  ⚠  DOWNLOADING {len(deferred_streams)} DEFERRED LIVESTREAM(S)  ⚠\n", "livestream")
@@ -8734,9 +10362,9 @@ def on_tab_changed(event):
             pass
 
     if selected == str(tab_download):
-        # Re-show cancel/pause buttons if a sync, reorg, or transcription is still active
+        # Re-show cancel/pause buttons if a sync or reorg is still active
         # (they can lose pack state when switching tabs during long operations)
-        if _sync_running or _reorg_running or _transcribe_running:
+        if _sync_running or _reorg_running:
             _show_cancel_pause()
     elif selected == str(tab_recent):
         if new_download_count > 0:
@@ -9814,7 +11442,7 @@ root.after(200, run_startup_updates)
 
 def _save_queue_state():
     """Save current queue state to disk for restoration on next launch."""
-    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "order": []}
+    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "order": [], "gpu": []}
     with _sync_queue_lock:
         for ch in _sync_queue:
             queue_data["sync"].append(copy.deepcopy(ch))
@@ -9827,6 +11455,9 @@ def _save_queue_state():
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
+    with _gpu_queue_lock:
+        for item in _gpu_queue:
+            queue_data["gpu"].append(copy.deepcopy(item))
     with _queue_order_lock:
         queue_data["order"] = list(_queue_order)
     try:
@@ -9865,6 +11496,12 @@ def _load_queue_state():
                 for args in transcribe_items:
                     _transcribe_queue.append(tuple(args))
                     restored += 1
+        gpu_items = queue_data.get("gpu", [])
+        if gpu_items:
+            with _gpu_queue_lock:
+                for item in gpu_items:
+                    _gpu_queue.append(item)
+                    restored += 1
         # Restore unified queue ordering
         saved_order = queue_data.get("order", [])
         if saved_order:
@@ -9875,6 +11512,7 @@ def _load_queue_state():
         if restored:
             log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
             _update_queue_btn()
+            _update_gpu_btn()
             return True
     except Exception:
         pass
@@ -9895,15 +11533,13 @@ def on_closing():
         with _transcribe_queue_lock:
             if _transcribe_queue:
                 has_queue = True
+    if not has_queue:
+        with _gpu_queue_lock:
+            if _gpu_queue:
+                has_queue = True
 
     if has_queue:
-        answer = messagebox.askyesnocancel(
-            "Queue in Progress",
-            "There are jobs in the queue.\n\nPreserve queue on next launch?")
-        if answer is None:  # Cancel — don't close
-            return
-        if answer:  # Yes — save queue
-            _save_queue_state()
+        _save_queue_state()
 
     # Stop the system tray icon
     global _tray_spin_active, _tray_spin_job
@@ -9917,9 +11553,10 @@ def on_closing():
         except Exception:
             pass
 
-    # Stop Whisper/punctuation subprocesses if running
+    # Stop Whisper/punctuation/ffmpeg subprocesses if running
     _stop_whisper_process()
     _stop_punct_process()
+    _stop_ffmpeg_process()
 
     # Clear pause so worker threads can exit cleanly
     pause_event.clear()

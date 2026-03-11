@@ -1582,7 +1582,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.2 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.3 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3252,6 +3252,20 @@ def sync_single_channel():
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
                                                  on_batch_ready=_sc_batch_cb,
                                                  compress_batch_size=_sc_bsize)
+
+                # Also check /streams tab for past livestreams
+                _streams_url = _get_streams_url(url)
+                if _streams_url and not cancel_event.is_set():
+                    _streams_cmd = build_channel_cmd(_streams_url, out_dir, min_dur, res, folder_ovr,
+                                                     break_on_existing=is_init and sync_complete,
+                                                     max_dur=ch.get("max_duration", 0),
+                                                     split_years=ch.get("split_years", False),
+                                                     split_months=ch.get("split_months", False))
+                    _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
+                                                      compress_batch_size=_sc_bsize)
+                    if _s_dl:
+                        c_dl = (c_dl or 0) + _s_dl
+
                 if _is_simple_mode:
                     _stop_simple_anim()
                     if not cancel_event.is_set():
@@ -7531,6 +7545,16 @@ def build_channel_cmd(url, out_dir, min_dur, resolution, folder_override="", bre
     return cmd
 
 
+def _get_streams_url(url):
+    """Return the /streams tab URL for a channel, or None if not a channel URL."""
+    _u = url.rstrip("/")
+    if "/@" in _u or "/channel/" in _u or "/c/" in _u or "/user/" in _u:
+        # Strip existing tab suffix if present (e.g. /videos, /shorts)
+        _u = re.sub(r'/(videos|shorts|streams|playlists|community|podcasts|channels)$', '', _u)
+        return _u + "/streams"
+    return None
+
+
 def build_video_cmd(url, out_dir, resolution, add_date=False, custom_name=None, date_file=True):
     fmt = build_format_string(resolution)
 
@@ -9208,6 +9232,20 @@ def start_sync_all():
                                                      live_ids=live_ids,
                                                      on_batch_ready=_sc_batch_cb,
                                                      compress_batch_size=_sc_bsize)
+
+                    # Also check /streams tab for past livestreams
+                    _streams_url = _get_streams_url(url)
+                    if _streams_url and not cancel_event.is_set():
+                        _streams_cmd = build_channel_cmd(_streams_url, out_dir, min_dur, res, folder_ovr,
+                                                         break_on_existing=is_initialized and sync_complete,
+                                                         max_dur=ch.get("max_duration", 0),
+                                                         split_years=ch.get("split_years", False),
+                                                         split_months=ch.get("split_months", False))
+                        _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
+                                                          compress_batch_size=_sc_bsize)
+                        if _s_dl:
+                            c_dl = (c_dl or 0) + _s_dl
+
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl
 
@@ -11387,6 +11425,19 @@ def _run_autorun():
                                                      live_ids=live_ids,
                                                      on_batch_ready=_sc_batch_cb,
                                                      compress_batch_size=_sc_bsize)
+
+                    # Also check /streams tab for past livestreams
+                    _streams_url = _get_streams_url(url)
+                    if _streams_url and not cancel_event.is_set():
+                        _streams_cmd = build_channel_cmd(_streams_url, out_dir, min_dur, res, folder_ovr,
+                                                         break_on_existing=is_init and sync_complete,
+                                                         max_dur=ch.get("max_duration", 0),
+                                                         split_years=ch.get("split_years", False),
+                                                         split_months=ch.get("split_months", False))
+                        _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
+                                                          compress_batch_size=_sc_bsize)
+                        if _s_dl:
+                            c_dl = (c_dl or 0) + _s_dl
 
                 if c_dl:
                     ch_dl_map[ch_name] += c_dl

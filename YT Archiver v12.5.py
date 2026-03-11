@@ -534,10 +534,25 @@ def log_simple_status(text):
                     at_bottom = True
 
                 log_box.config(state="normal")
+
+                # Save whisper/encode progress so they stay below the sync line
+                _saved_parts = []
+                for _tag in ("whisper_progress", "whisper_pct", "whisper_dots", "encode_progress"):
+                    _r = log_box.tag_ranges(_tag)
+                    while _r:
+                        _saved_parts.append((log_box.get(_r[0], _r[1]), _tag))
+                        log_box.delete(_r[0], _r[1])
+                        _r = log_box.tag_ranges(_tag)
+
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
                     log_box.delete(ranges[0], ranges[1])
                 log_box.insert(tk.END, text, "simplestatus")
+
+                # Re-insert whisper/encode progress at the bottom (after sync line)
+                if _saved_parts:
+                    for _s_text, _s_tag in _saved_parts:
+                        log_box.insert(tk.END, _s_text, _s_tag)
 
                 if at_bottom:
                     log_box.see(tk.END)
@@ -577,10 +592,26 @@ def _update_encode_progress(text):
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
+
+                # Save whisper progress so it stays at the very bottom
+                _saved_wp = []
+                for _tag in ("whisper_progress", "whisper_pct", "whisper_dots"):
+                    _r = log_box.tag_ranges(_tag)
+                    while _r:
+                        _saved_wp.append((log_box.get(_r[0], _r[1]), _tag))
+                        log_box.delete(_r[0], _r[1])
+                        _r = log_box.tag_ranges(_tag)
+
                 ranges = log_box.tag_ranges("encode_progress")
                 if ranges:
                     log_box.delete(ranges[0], ranges[1])
                 log_box.insert(tk.END, text, "encode_progress")
+
+                # Re-insert whisper progress at the bottom (after encode line)
+                if _saved_wp:
+                    for _s_text, _s_tag in _saved_wp:
+                        log_box.insert(tk.END, _s_text, _s_tag)
+
                 log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -1596,7 +1627,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.4 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.5 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9762,14 +9793,23 @@ def _show_queue_menu(event=None):
 
     # Shared state for drag-to-reorder and live refresh
     _drag = {"active": False, "src_sync_idx": -1, "src_widget": None}
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": [], "mw_bind_id": None}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": [], "mw_bind_id": None, "active_lbl": None}
 
     def _build_content():
         """Build or rebuild queue popup content. Skips if nothing changed."""
         items = _get_queue_items()
-        snapshot = [(lbl, src, idx) for lbl, src, idx in items]
+        # Strip animated dots from snapshot so dot cycling doesn't trigger full rebuilds
+        snapshot = [(lbl.rstrip("."), src, idx) for lbl, src, idx in items]
         if _state["last_snapshot"] == snapshot:
-            return  # No change
+            # Just update the dot animation on the active item's label widget
+            _albl = _state.get("active_lbl")
+            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running):
+                try:
+                    _fresh = f"▶ {_active_label(_current_job['label'], with_dots=True)}"
+                    _albl.config(text=f"  1. {_fresh}")
+                except Exception:
+                    pass
+            return  # No structural change
         _state["last_snapshot"] = snapshot
 
         # Unbind old mousewheel before rebuilding
@@ -9822,6 +9862,7 @@ def _show_queue_menu(event=None):
                                    font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
                     lbl.pack(side="left", fill="x", expand=True)
                     _widgets.append({"row": row, "lbl": lbl, "source": source, "idx": idx})
+                    _state["active_lbl"] = lbl  # track for dot-only updates
                 else:
                     handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
                                       font=("Segoe UI", 10), cursor="fleur", pady=2)
@@ -10321,7 +10362,7 @@ def _show_gpu_menu(event=None):
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
 
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None}
 
     def _mt_from_popup():
         popup.destroy()
@@ -10348,9 +10389,18 @@ def _show_gpu_menu(event=None):
         """Build or rebuild GPU popup content. Skips if nothing changed."""
         items = _get_gpu_queue_items()
         btn_state = ("running_paused" if _gpu_pause.is_set() else "running") if _gpu_running else "idle"
-        snapshot = [(lbl, idx) for lbl, idx in items] + [("__btn__", btn_state)]
+        # Strip animated dots from snapshot so dot cycling doesn't trigger full rebuilds
+        snapshot = [(lbl.rstrip("."), idx) for lbl, idx in items] + [("__btn__", btn_state)]
         if _state["last_snapshot"] == snapshot:
-            return
+            # Just update the dot animation on the active item's label widget
+            _albl = _state.get("active_lbl")
+            if _albl and _gpu_running and _gpu_current.get("label"):
+                try:
+                    _fresh = f"▶ {_active_label(_gpu_current['label'], with_dots=True)}"
+                    _albl.config(text=f"  1. {_fresh}")
+                except Exception:
+                    pass
+            return  # No structural change
         _state["last_snapshot"] = snapshot
 
         # Unbind old mousewheel before rebuilding
@@ -10411,6 +10461,7 @@ def _show_gpu_menu(event=None):
                     lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#6abf6a",
                                    font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
                     lbl.pack(side="left", fill="x", expand=True)
+                    _state["active_lbl"] = lbl  # track for dot-only updates
                 else:
                     lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
                                    font=("Segoe UI", 9), anchor="w", padx=4, pady=2)

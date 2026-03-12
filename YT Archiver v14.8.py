@@ -5961,6 +5961,15 @@ def _punctuate_text(text):
         return text
 
 
+def _whisper_punct_fixup(text):
+    """Run punctuation model on Whisper output only if it lacks punctuation."""
+    if not text:
+        return text
+    if any(ch in text for ch in ",.?"):
+        return text
+    return _punctuate_text(text)
+
+
 def _fetch_auto_captions(video_id, temp_dir):
     """Fetch YouTube captions (manual or auto-generated) for a video. Returns text or None."""
     temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
@@ -6859,6 +6868,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
                         text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
                         _clear_whisper_progress()  # Remove progress line now that file is done
+                        if text:
+                            text = _whisper_punct_fixup(text)
                         source = "Whisper"
 
                         if not text:
@@ -7271,6 +7282,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                 log(f"  Whisper returned empty result.\n", "red")
                 return
 
+            text = _whisper_punct_fixup(text)
+
             try:
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(text)
@@ -7476,6 +7489,9 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                 if _ce.is_set():
                     log(f"\n  Cancelled.\n", "red")
                     return
+
+                if text:
+                    text = _whisper_punct_fixup(text)
 
                 if not text:
                     # Write exclusion entry so this video is skipped on future transcribes

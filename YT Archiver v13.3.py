@@ -13152,9 +13152,12 @@ def _load_queue_state():
             log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
             if gpu_restored:
                 _pause_str = " (paused)" if _gpu_pause.is_set() else ""
-                log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str} — click 💻 to start.\n", "simpleline_green")
+                log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str}.\n", "simpleline_green")
             _update_queue_btn()
             _update_gpu_btn()
+            # Auto-open GPU popup so user can see Start/Resume buttons
+            if gpu_restored and 'root' in globals() and root.winfo_exists():
+                root.after(300, _show_gpu_menu)
             return True
     except Exception:
         pass

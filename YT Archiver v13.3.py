@@ -76,8 +76,22 @@ CHANNEL_DEFAULTS = {"resolution": "720", "mode": "full", "min_duration": 0, "max
                     "split_years": False, "split_months": False, "auto_transcribe": False,
                     "compress_enabled": False, "compress_level": "", "compress_output_res": ""}
 
-# Compression presets: level → MB per hour of video
-_COMPRESS_LEVELS = {"Low": 1200, "High": 700, "Extreme": 300}
+# Compression presets: resolution → quality tier → MB per hour of video
+_COMPRESS_PRESETS = {
+    "1080": {"Generous": 1200, "Average": 700,  "Below Average": 300},
+    "720":  {"Generous": 800,  "Average": 475,  "Below Average": 200},
+    "480":  {"Generous": 500,  "Average": 300,  "Below Average": 130},
+    "360":  {"Generous": 375,  "Average": 225,  "Below Average": 100},
+    "240":  {"Generous": 250,  "Average": 150,  "Below Average": 65},
+    "144":  {"Generous": 150,  "Average": 90,   "Below Average": 40},
+}
+_QUALITY_OPTIONS = ["Generous", "Average", "Below Average"]
+_LEVEL_MIGRATION = {"Low": "Generous", "High": "Average", "Extreme": "Below Average"}
+
+def _get_compress_bitrate(quality, output_res):
+    """Get MB/hr for a quality level at a given output resolution."""
+    res_key = output_res if output_res in _COMPRESS_PRESETS else "1080"
+    return _COMPRESS_PRESETS.get(res_key, _COMPRESS_PRESETS["1080"]).get(quality, 700)
 
 RESOLUTION_OPTIONS = ["144", "240", "360", "480", "720", "1080", "1440", "2160", "best"]
 active_processes = []
@@ -1129,6 +1143,16 @@ def save_config(cfg):
 
 config = load_config()
 
+# Migrate old compress level names → new quality names
+_config_migrated = False
+for _ch_mig in config.get("channels", []):
+    _old_lv = _ch_mig.get("compress_level", "")
+    if _old_lv in _LEVEL_MIGRATION:
+        _ch_mig["compress_level"] = _LEVEL_MIGRATION[_old_lv]
+        _config_migrated = True
+if _config_migrated:
+    save_config(config)
+
 try:
     from ctypes import windll
 
@@ -1659,7 +1683,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.2 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.3 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2323,7 +2347,7 @@ def refresh_channel_dropdowns():
                 from_str = "—"
 
             # Compress column — checkmark if any compression settings enabled
-            compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _COMPRESS_LEVELS else "—"
+            compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _QUALITY_OPTIONS else "—"
 
             # Transcribed status column — only show Running/Queued for transcription tasks, not encode
             auto_t = c.get("auto_transcribe", False)
@@ -2393,9 +2417,10 @@ def _set_edit_mode(ch):
     new_split_months_var.set(ch.get("split_months", False))
     new_auto_transcribe_var.set(ch.get("auto_transcribe", False))
     new_compress_var.set(ch.get("compress_enabled", False))
-    new_compress_level_var.set(ch.get("compress_level", ""))
     _cr = ch.get("compress_output_res", "")
-    new_compress_res_var.set(f"{_cr}p" if _cr else "Original")
+    new_compress_res_var.set(f"{_cr}p" if _cr else "Original")  # set Res first → triggers quality combo enable
+    _raw_level = ch.get("compress_level", "")
+    new_compress_level_var.set(_LEVEL_MIGRATION.get(_raw_level, _raw_level))
     new_compress_batch_var.set(str(ch.get("compress_batch_size", 20)))
     add_channel_btn.config(text="💾 Update channel", state="normal", style="Warn.TButton")
     add_outer.config(text="Edit channel")
@@ -2432,7 +2457,7 @@ def _clear_edit_mode():
     new_auto_transcribe_var.set(False)
     new_compress_var.set(False)
     new_compress_level_var.set("")
-    new_compress_res_var.set("Original")
+    new_compress_res_var.set("")
     new_compress_batch_var.set("20")
     add_channel_btn.config(text="Add channel", style="TButton", state="disabled")
     add_outer.config(text="Add channel")
@@ -3015,7 +3040,7 @@ def add_channel():
     # Offer to re-download & compress existing videos if compress settings changed
     if editing:
         _compress_changed = (
-            _new_compress and _new_c_level in _COMPRESS_LEVELS and
+            _new_compress and _new_c_level in _QUALITY_OPTIONS and
             (not _old_compress or _old_c_level != _new_c_level or _old_c_res != _new_c_res)
         )
         if _compress_changed:
@@ -3032,11 +3057,12 @@ def add_channel():
                     _bl_res = ch.get("resolution", "720")
                     _bl_res_label = "Best" if _bl_res == "best" else f"{_bl_res}p"
                     _bl_out_label = f" → {_new_c_res}p output" if _new_c_res else ""
+                    _bl_bitrate = _get_compress_bitrate(_new_c_level, _new_c_res)
                     _bl_ask = messagebox.askyesno(
                         "Apply to Existing Videos",
                         f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
                         f"Re-download at {_bl_res_label}{_bl_out_label}, "
-                        f"compress level: {_new_c_level}.",
+                        f"quality: {_new_c_level} (~{_bl_bitrate} MB/hr).",
                         parent=root
                     )
                     if _bl_ask:
@@ -3046,7 +3072,7 @@ def add_channel():
                             "ch_url": url,
                             "folder": _bl_folder,
                             "resolution": _bl_res,
-                            "bitrate_mbhr": _COMPRESS_LEVELS[_new_c_level],
+                            "bitrate_mbhr": _bl_bitrate,
                             "output_res": _new_c_res,
                             "split_years": new_years,
                             "split_months": new_months,
@@ -3314,14 +3340,14 @@ def sync_single_channel():
             _sc_level = ch.get("compress_level", "")
             _sc_batch_cb = None
             _sc_bsize = ch.get("compress_batch_size", 20)
-            if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+            if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                 _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                 _sc_prompt_shown = [False]
                 def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                     _b = count // _bs
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": _ch["name"], "ch_url": _ch["url"],
-                        "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                        "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
                         "output_res": _ch.get("compress_output_res", ""),
                         "split_years": _ch.get("split_years", False),
                         "split_months": _ch.get("split_months", False),
@@ -3437,11 +3463,11 @@ def sync_single_channel():
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _COMPRESS_LEVELS:
+                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
                     _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": ch["name"], "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _COMPRESS_LEVELS[_c_level],
+                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
@@ -5123,9 +5149,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
         _current_output_res = output_res
 
         log(f"\n=== Backlog Compress: {ch_name} ===\n", "header")
-        _lvl_name = next((k for k, v in _COMPRESS_LEVELS.items() if v == _current_bitrate), f"{_current_bitrate} MB/hr")
+        _res_key = _current_output_res if _current_output_res in _COMPRESS_PRESETS else "1080"
+        _presets_for_res = _COMPRESS_PRESETS.get(_res_key, _COMPRESS_PRESETS["1080"])
+        _lvl_name = next((k for k, v in _presets_for_res.items() if v == _current_bitrate), f"{_current_bitrate} MB/hr")
         _res_label = f"{_current_output_res}p" if _current_output_res else "Original"
-        log(f"  Level: {_lvl_name}  |  Output: {_res_label}  |  Download: {resolution}\n", "simpleline")
+        log(f"  Quality: {_lvl_name} ({_current_bitrate} MB/hr)  |  Output: {_res_label}  |  Download: {resolution}\n", "simpleline")
 
         # ── Step 1: Scan local video files ──
         local_files = {}
@@ -5525,18 +5553,35 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                             row = tk.Frame(dlg, bg=C_BG)
                             row.pack(padx=16, pady=4)
-                            tk.Label(row, text="Level:", bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
-                            _lv = tk.StringVar(value=next((k for k, v in _COMPRESS_LEVELS.items() if v == _current_bitrate), "High"))
-                            _combo(row, textvariable=_lv, values=["Low", "High", "Extreme"], state="readonly", width=10).pack(side="left", padx=(0, 12))
-                            tk.Label(row, text="Output:", bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+                            # Res dropdown (first)
+                            tk.Label(row, text="Res:", bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
                             _rv = tk.StringVar(value=f"{_current_output_res}p" if _current_output_res else "Original")
-                            _combo(row, textvariable=_rv, values=["Original", "144p", "240p", "360p", "480p", "720p", "1080p"], state="readonly", width=10).pack(side="left")
+                            _rv_combo = _combo(row, textvariable=_rv, values=["Original", "144p", "240p", "360p", "480p", "720p", "1080p"],
+                                               state="readonly", width=10)
+                            _rv_combo.pack(side="left", padx=(0, 12))
+                            # Quality dropdown (second, depends on Res)
+                            tk.Label(row, text="Quality:", bg=C_BG, fg=C_DIM, font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+                            _dlg_res_key = _current_output_res if _current_output_res in _COMPRESS_PRESETS else "1080"
+                            _dlg_presets = _COMPRESS_PRESETS.get(_dlg_res_key, _COMPRESS_PRESETS["1080"])
+                            _init_quality = next((k for k, v in _dlg_presets.items() if v == _current_bitrate), "Average")
+                            _lv = tk.StringVar(value=_init_quality)
+                            _lv_combo = _combo(row, textvariable=_lv, values=_QUALITY_OPTIONS, state="readonly", width=14)
+                            _lv_combo.pack(side="left")
+
+                            def _on_dlg_res_change(*_):
+                                rv_raw = _rv.get()
+                                rk = rv_raw.replace("p", "") if rv_raw != "Original" else "1080"
+                                _lv_combo.config(values=_QUALITY_OPTIONS)
+                                cur_q = _lv.get()
+                                if cur_q not in _COMPRESS_PRESETS.get(rk, _COMPRESS_PRESETS["1080"]):
+                                    _lv.set("Average")
+                            _rv.trace_add("write", _on_dlg_res_change)
 
                             def _ok():
                                 lv = _lv.get()
                                 rv = _rv.get()
-                                new_br = _COMPRESS_LEVELS.get(lv, _current_bitrate)
                                 new_or = rv.replace("p", "") if rv != "Original" else ""
+                                new_br = _get_compress_bitrate(lv, new_or)
                                 _new_settings[0] = (new_br, new_or)
                                 dlg.destroy()
 
@@ -5571,9 +5616,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         total_errors -= batch_errors
                         total_orig_bytes -= batch_orig
                         total_new_bytes -= batch_new
-                        _lvl_name = next((k for k, v in _COMPRESS_LEVELS.items() if v == _current_bitrate), f"{_current_bitrate} MB/hr")
+                        _res_key = _current_output_res if _current_output_res in _COMPRESS_PRESETS else "1080"
+                        _presets_for_res = _COMPRESS_PRESETS.get(_res_key, _COMPRESS_PRESETS["1080"])
+                        _lvl_name = next((k for k, v in _presets_for_res.items() if v == _current_bitrate), f"{_current_bitrate} MB/hr")
                         _res_label = f"{_current_output_res}p" if _current_output_res else "Original"
-                        log(f"\n  Retrying batch 1 with: {_lvl_name}, {_res_label}\n", "header")
+                        log(f"\n  Retrying batch 1 with: {_lvl_name} ({_current_bitrate} MB/hr), {_res_label}\n", "header")
                         continue  # Redo the while loop with new settings
                     # User confirmed — break inner loop, proceed to next batch
                     break
@@ -7233,19 +7280,20 @@ compress_cb = ttk.Checkbutton(compress_row, text="Compress after download",
                                variable=new_compress_var)
 compress_cb.pack(side="left", padx=(4, 8))
 
-_compress_level_label = tk.Label(compress_row, text="Level:", bg=C_SURFACE, fg=C_DIM,
-                                  font=("Segoe UI", 9))
-_compress_level_combo = _combo(compress_row, textvariable=new_compress_level_var,
-                                values=["Low", "High", "Extreme"], state="readonly", width=8)
-_ToolTip(_compress_level_combo, "Low = ~1200 MB/hr · High = ~700 MB/hr · Extreme = ~300 MB/hr\nAV1 NVENC, preset p6, two-pass, 128k AAC audio")
-
 _COMPRESS_RES_OPTIONS = ["Original", "144p", "240p", "360p", "480p", "720p", "1080p"]
-_compress_output_label = tk.Label(compress_row, text="Output:", bg=C_SURFACE, fg=C_DIM,
-                                   font=("Segoe UI", 9))
+_compress_res_label = tk.Label(compress_row, text="Res:", bg=C_SURFACE, fg=C_DIM,
+                                font=("Segoe UI", 9))
 _compress_res_combo = _combo(compress_row, textvariable=new_compress_res_var,
                               values=_COMPRESS_RES_OPTIONS, state="readonly", width=8)
-new_compress_res_var.set("Original")
+new_compress_res_var.set("")
 _ToolTip(_compress_res_combo, "Output resolution (Original = keep source resolution)")
+
+_compress_quality_label = tk.Label(compress_row, text="Quality:", bg=C_SURFACE, fg=C_DIM,
+                                    font=("Segoe UI", 9))
+_compress_quality_combo = _combo(compress_row, textvariable=new_compress_level_var,
+                                  values=[], state="disabled", width=14)
+_quality_tooltip = _ToolTip(_compress_quality_combo,
+    "Select a resolution first to see quality options")
 
 _compress_batch_label = tk.Label(compress_row, text="Batch:", bg=C_SURFACE, fg=C_DIM,
                                   font=("Segoe UI", 9))
@@ -7255,23 +7303,45 @@ new_compress_batch_var.set("20")
 _ToolTip(_compress_batch_combo, "Compress every N downloads during bulk syncs.\nSmaller = more frequent GPU tasks, larger = fewer.")
 
 
+def _on_compress_res_change(*_):
+    """When resolution changes, enable Quality combo and update its tooltip."""
+    res_raw = new_compress_res_var.get()
+    if not res_raw:
+        _compress_quality_combo.config(state="disabled")
+        _compress_quality_combo["values"] = []
+        new_compress_level_var.set("")
+        _quality_tooltip.text = "Select a resolution first to see quality options"
+        return
+    res_key = res_raw.replace("p", "") if res_raw != "Original" else "1080"
+    presets = _COMPRESS_PRESETS.get(res_key, _COMPRESS_PRESETS["1080"])
+    _compress_quality_combo.config(state="readonly")
+    _compress_quality_combo["values"] = _QUALITY_OPTIONS
+    current_q = new_compress_level_var.get()
+    if current_q not in presets:
+        new_compress_level_var.set("Average")
+    tip_lines = " · ".join(f"{q} = ~{presets[q]} MB/hr" for q in _QUALITY_OPTIONS)
+    _quality_tooltip.text = f"{tip_lines}\nAV1 NVENC, preset p6, two-pass, 128k AAC audio"
+
+new_compress_res_var.trace_add("write", _on_compress_res_change)
+
+
 def _toggle_compress_entry(*_):
     if new_compress_var.get():
-        _compress_level_label.pack(side="left", padx=(0, 4))
-        _compress_level_combo.pack(side="left", padx=(0, 8))
-        _compress_output_label.pack(side="left", padx=(0, 4))
+        _compress_res_label.pack(side="left", padx=(0, 4))
         _compress_res_combo.pack(side="left", padx=(0, 8))
+        _compress_quality_label.pack(side="left", padx=(0, 4))
+        _compress_quality_combo.pack(side="left", padx=(0, 8))
         _compress_batch_label.pack(side="left", padx=(0, 4))
         _compress_batch_combo.pack(side="left", padx=(0, 8))
     else:
-        _compress_level_label.pack_forget()
-        _compress_level_combo.pack_forget()
-        _compress_output_label.pack_forget()
+        _compress_res_label.pack_forget()
         _compress_res_combo.pack_forget()
+        _compress_quality_label.pack_forget()
+        _compress_quality_combo.pack_forget()
         _compress_batch_label.pack_forget()
         _compress_batch_combo.pack_forget()
         new_compress_level_var.set("")
-        new_compress_res_var.set("Original")
+        new_compress_res_var.set("")
         new_compress_batch_var.set("20")
 
 
@@ -9339,14 +9409,14 @@ def start_sync_all():
                 _sc_level = ch.get("compress_level", "")
                 _sc_batch_cb = None
                 _sc_bsize = ch.get("compress_batch_size", 20)
-                if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+                if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
                     def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                         _b = count // _bs
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
-                            "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                            "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
                             "output_res": _ch.get("compress_output_res", ""),
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
@@ -9442,11 +9512,11 @@ def start_sync_all():
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _COMPRESS_LEVELS:
+                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
                     _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": ch_name, "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _COMPRESS_LEVELS[_c_level],
+                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
@@ -11622,14 +11692,14 @@ def _run_autorun():
                 _sc_level = ch.get("compress_level", "")
                 _sc_batch_cb = None
                 _sc_bsize = ch.get("compress_batch_size", 20)
-                if ch.get("compress_enabled", False) and _sc_level in _COMPRESS_LEVELS:
+                if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
                     def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                         _b = count // _bs
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
-                            "folder": _f, "bitrate_mbhr": _COMPRESS_LEVELS[_lv],
+                            "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
                             "output_res": _ch.get("compress_output_res", ""),
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
@@ -11725,12 +11795,12 @@ def _run_autorun():
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _COMPRESS_LEVELS:
+                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
                     ch_name_ac = ch.get("name", "")
                     _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_ac))
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": ch_name_ac, "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _COMPRESS_LEVELS[_c_level],
+                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),

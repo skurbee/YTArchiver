@@ -6671,6 +6671,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _current_job["label"] = None
                 _current_job["url"] = None
                 _update_queue_btn()
+            if root.winfo_exists():
+                root.after(0, refresh_channel_dropdowns)
             if not _sync_mode and root.winfo_exists():
                 root.after(0, _sync_task_finished)
             # Process any queued jobs in insertion order (only when not in sync_mode)

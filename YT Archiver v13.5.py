@@ -1683,7 +1683,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.4 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.5 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2362,8 +2362,9 @@ def refresh_channel_dropdowns():
                 _cur_item = _gpu_current_item
                 if _cur_item and _cur_item.get("type") in ("transcribe", "mt"):
                     _is_running_t = True
-            # Check standalone transcription (non-GPU path)
-            if not _is_running_t and _transcribe_running and _current_job.get("url") == ch_url_t:
+            # Check standalone transcription (non-GPU path) — skip during sync/reorg
+            # since _current_job["url"] is shared and may belong to the sync, not transcription
+            if not _is_running_t and _transcribe_running and not _sync_running and not _reorg_running and _current_job.get("url") == ch_url_t:
                 _is_running_t = True
             if not _is_queued_t:
                 with _transcribe_queue_lock:
@@ -2832,7 +2833,7 @@ def _chan_ctx_show(event):
         # Menu indices: 0=Sync, 1=Edit, 2=Open folder, 3=Open URL, 4=separator,
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
         #               10=separator, 11=Transcribe, 12=separator, 13=Remove
-        # Dynamic label: show "Add to job queue" when a sync/reorg is running
+        # Dynamic label: show "Add to Sync List" when a sync/reorg is running
         if _sync_running or _reorg_running:
             # Check if this channel is already queued or actively syncing
             _ch_url = ch.get("url", "")
@@ -2840,11 +2841,11 @@ def _chan_ctx_show(event):
                 _already_queued = any(q["url"] == _ch_url for q in _sync_queue)
             _already_syncing = _current_job.get("url") == _ch_url
             if _already_queued or _already_syncing:
-                _chan_ctx_menu.entryconfig(0, label="Already in job queue",
+                _chan_ctx_menu.entryconfig(0, label="Already in Sync List",
                                           state="normal", foreground=C_DIM,
                                           command=lambda: None)
             else:
-                _chan_ctx_menu.entryconfig(0, label="Add to job queue",
+                _chan_ctx_menu.entryconfig(0, label="Add to Sync List",
                                           state="normal", foreground=C_TEXT,
                                           command=_chan_ctx_sync_now)
         else:
@@ -4381,7 +4382,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
                 with _queue_order_lock:
                     _queue_order.append(("reorg", ch_url or channel_name))
-                log(f"\n=== Added {channel_name} reorganize to job queue ===\n", "header")
+                log(f"\n=== Added {channel_name} reorganize to Sync List ===\n", "header")
             else:
                 log(f"  ⚠ {channel_name} is already in the reorganize queue.\n", "simpleline")
         _update_queue_btn()
@@ -6178,7 +6179,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
                 with _queue_order_lock:
                     _queue_order.append(("transcribe", ch_url))
-                log(f"\n=== Added {ch_name} transcription to job queue ===\n", "header")
+                log(f"\n=== Added {ch_name} transcription to Sync List ===\n", "header")
             else:
                 log(f"  ⚠ {ch_name} is already in the transcription queue.\n", "simpleline")
         _update_queue_btn()
@@ -9102,7 +9103,7 @@ def start_sync_all():
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
         _what = "transcription" if _transcribe_running else "reorganize"
-        log(f"\n=== Sync added to job queue ({_what} in progress) ===\n", "header")
+        log(f"\n=== Sync added to Sync List ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
         _update_queue_btn()
         return
@@ -9949,7 +9950,7 @@ def _remove_queue_item(source, idx):
 
 
 def _confirm_remove(source, idx, label):
-    if messagebox.askyesno("Remove from Queue", f"Remove \"{label}\" from the job queue?"):
+    if messagebox.askyesno("Remove from Queue", f"Remove \"{label}\" from the Sync List?"):
         _remove_queue_item(source, idx)
 
 
@@ -10567,7 +10568,8 @@ def _show_gpu_menu(event=None):
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
 
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None, "widgets": []}
+    _drag = {"active": False, "src_widget_idx": -1, "src_widget": None}
 
     def _mt_from_popup():
         popup.destroy()
@@ -10657,6 +10659,7 @@ def _show_gpu_menu(event=None):
             inner = tk.Frame(canvas, bg="#2d2d2d")
             canvas.create_window((0, 0), window=inner, anchor="nw")
 
+            _widgets = []
             for i, (label, idx) in enumerate(items):
                 row = tk.Frame(inner, bg="#2d2d2d")
                 row.pack(fill="x")
@@ -10667,25 +10670,122 @@ def _show_gpu_menu(event=None):
                                    font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
                     lbl.pack(side="left", fill="x", expand=True)
                     _state["active_lbl"] = lbl  # track for dot-only updates
+                    _widgets.append({"row": row, "lbl": lbl, "handle": None, "source": "current", "idx": idx})
                 else:
-                    lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
+                    handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
+                                      font=("Segoe UI", 10), cursor="fleur", pady=2)
+                    handle.pack(side="left")
+
+                    lbl = tk.Label(row, text=f" {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
                                    font=("Segoe UI", 9), anchor="w", padx=4, pady=2)
                     lbl.pack(side="left", fill="x", expand=True)
 
+                    _widgets.append({"row": row, "lbl": lbl, "handle": handle, "source": "gpu", "idx": idx})
+
                     # Hover highlight
-                    def _enter(e, r=row, l=lbl):
-                        r.config(bg="#444444"); l.config(bg="#444444")
-                    def _leave(e, r=row, l=lbl):
-                        r.config(bg="#2d2d2d"); l.config(bg="#2d2d2d")
-                    for w in (row, lbl):
+                    def _enter(e, r=row, l=lbl, h=handle):
+                        if not _drag["active"]:
+                            r.config(bg="#444444"); l.config(bg="#444444")
+                            if h: h.config(bg="#444444")
+                    def _leave(e, r=row, l=lbl, h=handle):
+                        if not _drag["active"]:
+                            r.config(bg="#2d2d2d"); l.config(bg="#2d2d2d")
+                            if h: h.config(bg="#2d2d2d")
+                    for w in ([row, lbl] + ([handle] if handle else [])):
                         w.bind("<Enter>", _enter)
                         w.bind("<Leave>", _leave)
 
                     # Right-click to remove
                     def _remove(e, qi=idx, lb=label):
                         _confirm_gpu_remove(qi, lb)
-                    for w in (row, lbl):
+                    for w in ([row, lbl] + ([handle] if handle else [])):
                         w.bind("<Button-3>", _remove)
+
+                    # Drag-to-reorder
+                    def _make_drag_bindings(r, l, h):
+                        def _find_my_widget_index():
+                            for wi_idx, wi in enumerate(_state["widgets"]):
+                                if wi["row"] is r:
+                                    return wi_idx
+                            return -1
+
+                        def _on_press(e):
+                            _drag["active"] = True
+                            _drag["src_widget_idx"] = _find_my_widget_index()
+                            _drag["src_widget"] = r
+                            r.config(bg="#555555"); l.config(bg="#555555")
+                            if h: h.config(bg="#555555")
+
+                        def _on_motion(e):
+                            if not _drag["active"]:
+                                return
+                            y = e.y_root
+                            for wi in _state["widgets"]:
+                                if wi["source"] == "current" or wi["row"] == _drag["src_widget"]:
+                                    continue
+                                try:
+                                    wy = wi["row"].winfo_rooty()
+                                    wh2 = wi["row"].winfo_height()
+                                    if wy <= y <= wy + wh2:
+                                        wi["row"].config(bg="#3a5a3a"); wi["lbl"].config(bg="#3a5a3a")
+                                        if wi.get("handle"): wi["handle"].config(bg="#3a5a3a")
+                                    else:
+                                        wi["row"].config(bg="#2d2d2d"); wi["lbl"].config(bg="#2d2d2d")
+                                        if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
+                                except Exception:
+                                    pass
+
+                        def _on_release(e):
+                            if not _drag["active"]:
+                                return
+                            _drag["active"] = False
+                            for wi in _state["widgets"]:
+                                try:
+                                    wi["row"].config(bg="#2d2d2d"); wi["lbl"].config(bg="#2d2d2d")
+                                    if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
+                                except Exception:
+                                    pass
+                            y = e.y_root
+                            target_widget_idx = None
+                            for wi_idx, wi in enumerate(_state["widgets"]):
+                                if wi["source"] == "current":
+                                    continue
+                                try:
+                                    wy = wi["row"].winfo_rooty()
+                                    wh2 = wi["row"].winfo_height()
+                                    if wy <= y <= wy + wh2:
+                                        target_widget_idx = wi_idx
+                                        break
+                                except Exception:
+                                    pass
+                            src_wi = _drag["src_widget_idx"]
+                            if target_widget_idx is not None and target_widget_idx != src_wi:
+                                has_current = (_state["widgets"][0]["source"] == "current") if _state["widgets"] else False
+                                src_qo = (src_wi - 1) if has_current else src_wi
+                                dst_qo = (target_widget_idx - 1) if has_current else target_widget_idx
+                                with _gpu_queue_lock:
+                                    if 0 <= src_qo < len(_gpu_queue) and 0 <= dst_qo < len(_gpu_queue):
+                                        moved = _gpu_queue.pop(src_qo)
+                                        _gpu_queue.insert(dst_qo, moved)
+                                # Update labels in-place
+                                new_items = _get_gpu_queue_items()
+                                _state["last_snapshot"] = [(lb.rstrip("."), ix) for lb, ix in new_items] + [("__btn__", "__unchanged__")]
+                                for j, (new_label, new_idx) in enumerate(new_items):
+                                    if j < len(_state["widgets"]):
+                                        wi = _state["widgets"][j]
+                                        prefix = "  " if new_idx == -1 else " "
+                                        wi["lbl"].config(text=f"{prefix}{j + 1}. {new_label}")
+                                        wi["idx"] = new_idx
+                                _save_queue_state()
+
+                        for w in [h, l, r]:
+                            w.bind("<ButtonPress-1>", _on_press)
+                            w.bind("<B1-Motion>", _on_motion)
+                            w.bind("<ButtonRelease-1>", _on_release)
+
+                    _make_drag_bindings(row, lbl, handle)
+
+            _state["widgets"] = _widgets
 
             inner.update_idletasks()
             canvas.configure(scrollregion=canvas.bbox("all"))
@@ -10700,7 +10800,7 @@ def _show_gpu_menu(event=None):
 
             # Footer hint
             has_queued = any(idx != -1 for _, idx in items)
-            hint_text = "  Right-click to remove" if has_queued else ""
+            hint_text = "  Drag to reorder · Right-click to remove" if has_queued else ""
             hint = tk.Label(wrapper, text=hint_text, bg="#2d2d2d", fg="#4a4f5a",
                             font=("Segoe UI", 8), anchor="w")
             hint.pack(fill="x", padx=4, pady=(2, 2))
@@ -10772,7 +10872,7 @@ def _show_gpu_menu(event=None):
     # --- Live refresh (double-buffered — no flicker) ---
     def _refresh():
         try:
-            if popup.winfo_exists():
+            if popup.winfo_exists() and not _drag["active"]:
                 _build_content()
             if popup.winfo_exists():
                 _reposition_gpu_popup()

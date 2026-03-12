@@ -1779,7 +1779,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.0 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.1 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2180,7 +2180,7 @@ chan_scrollbar = ttk.Scrollbar(chan_list_frame, orient="vertical")
 chan_scrollbar.grid(row=0, column=1, sticky="ns")
 
 settings_chan_tree = ttk.Treeview(chan_list_frame, style="Recent.Treeview",
-                                  columns=("folder", "res", "min", "max", "from", "compress", "transcribed", "last_sync", "url"),
+                                  columns=("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "url"),
                                   show="headings", selectmode="browse",
                                   yscrollcommand=chan_scrollbar.set)
 settings_chan_tree.grid(row=0, column=0, sticky="nsew")
@@ -2191,7 +2191,6 @@ _CHAN_COL_LABELS = {
     "res": "Res",
     "min": "Min",
     "max": "Max",
-    "from": "Date Limit",
     "transcribed": "Transcribed",
     "last_sync": "Last Sync",
     "url": "URL"
@@ -2262,9 +2261,9 @@ settings_chan_tree.heading("folder", text="Folder", anchor="w", command=lambda: 
 settings_chan_tree.heading("res", text="Res", anchor="w", command=lambda: _sort_chan_tree("res", False))
 settings_chan_tree.heading("min", text="Min", anchor="w", command=lambda: _sort_chan_tree("min", False))
 settings_chan_tree.heading("max", text="Max", anchor="w", command=lambda: _sort_chan_tree("max", False))
-settings_chan_tree.heading("from", text="Date Limit", anchor="w", command=lambda: _sort_chan_tree("from", False))
 settings_chan_tree.heading("compress", text="Compress", anchor="center")
-settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w")
+settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w",
+                           command=lambda: _sort_chan_tree("transcribed", False))
 settings_chan_tree.heading("last_sync", text="Last Sync", anchor="w",
                            command=lambda: _sort_chan_tree("last_sync", False))
 settings_chan_tree.heading("url", text="URL", anchor="w")
@@ -2273,7 +2272,6 @@ settings_chan_tree.column("folder", stretch=False, width=170, anchor="w")
 settings_chan_tree.column("res", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("min", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
-settings_chan_tree.column("from", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
@@ -2436,14 +2434,6 @@ def refresh_channel_dropdowns():
                 except Exception:
                     ls_str = ls_raw[:12]
 
-            # Date limit column
-            date_after = c.get("date_after", "")
-            mode = c.get("mode", "sub")
-            if mode == "date" and date_after:
-                from_str = "✓"
-            else:
-                from_str = "—"
-
             # Compress column — checkmark if any compression settings enabled
             compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _QUALITY_OPTIONS else "—"
 
@@ -2467,10 +2457,13 @@ def refresh_channel_dropdowns():
             if not _is_queued_t:
                 with _transcribe_queue_lock:
                     _is_queued_t = any(q[1] == ch_url_t for q in _transcribe_queue)
+            t_pending = c.get("transcription_pending", 0)
             if _is_running_t:
                 trans_str = "Running"
             elif _is_queued_t:
                 trans_str = "Queued"
+            elif t_complete and t_pending > 0:
+                trans_str = f"✓ -{t_pending}"
             elif t_complete:
                 trans_str = "✓ Done" if auto_t else "✓"
             elif auto_t:
@@ -2479,7 +2472,7 @@ def refresh_channel_dropdowns():
                 trans_str = "—"
 
             tag = "odd" if i % 2 else "even"
-            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, from_str, compress_str, trans_str, ls_str, c['url']),
+            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, c['url']),
                                       tags=(tag,))
 
     if _chan_sort_state["col"]:
@@ -2578,7 +2571,7 @@ def on_channel_double_click(event):
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][8]
+    target_url = item['values'][7]
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -2676,7 +2669,7 @@ def _chan_ctx_sync_now():
         return
     # Match the channel in the treeview to visually select it before syncing
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][8] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2899,7 +2892,7 @@ def _chan_ctx_remove():
         return
     # Select the channel in the tree so remove_channel() can find it
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][8] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -2914,7 +2907,7 @@ def _chan_ctx_show(event):
     if row:
         settings_chan_tree.selection_set(row)
         on_chan_list_select(None)
-        target_url = settings_chan_tree.item(row)['values'][8]
+        target_url = settings_chan_tree.item(row)['values'][7]
         with config_lock:
             for c in config.get("channels", []):
                 if c["url"] == target_url:
@@ -3185,7 +3178,7 @@ def sync_single_channel():
     if not sel:
         return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][8]
+    target_url = item['values'][7]
 
     with config_lock:
         ch = None
@@ -3556,9 +3549,9 @@ def sync_single_channel():
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
 
-                # New videos downloaded — clear transcription_complete flag
+                # New videos downloaded — track pending transcription count
                 if c_dl > 0:
-                    ch["transcription_complete"] = False
+                    ch["transcription_pending"] = ch.get("transcription_pending", 0) + c_dl
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 _c_level = ch.get("compress_level", "")
@@ -3684,7 +3677,7 @@ def _process_sync_queue():
     def _start_queued():
         global _sync_running
         for item in settings_chan_tree.get_children():
-            if settings_chan_tree.item(item)['values'][8] == next_ch["url"]:
+            if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
                 settings_chan_tree.selection_set(item)
                 on_chan_list_select(None)
                 break
@@ -3788,7 +3781,7 @@ def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][8]
+    target_url = item['values'][7]
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -6285,6 +6278,9 @@ def _add_to_gpu_queue(item, _quiet=False):
     log(f"=== Added to GPU Tasks: {label} ===\n", "header")
     _update_gpu_btn()
     _save_queue_state()
+    # Refresh channel list so Transcribed column shows "Queued" immediately
+    if item.get("type") in ("transcribe", "mt") and root.winfo_exists():
+        root.after(50, refresh_channel_dropdowns)
     # Autorun: auto-start GPU processing if enabled and not already running
     if not _gpu_running and config.get("autorun_gpu", False):
         if root.winfo_exists():
@@ -6398,6 +6394,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     for _cfg_ch in config.get("channels", []):
                         if _cfg_ch.get("url") == ch_url:
                             _cfg_ch["transcription_complete"] = True
+                            _cfg_ch["transcription_pending"] = 0
                             break
                     save_config(config)
                 return
@@ -6794,9 +6791,27 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         source = "Whisper"
 
                         if not text:
-                            log(f"  [{idx}/{total}] {fname} — Whisper returned empty. Skipping.\n", "simpleline")
-                            _transcription_log.append((fname, source, time.time() - _t_vid_start, "empty result"))
-                            err_count += 1
+                            # Write exclusion entry so this video is skipped on future transcribes
+                            log(f"  [{idx}/{total}] {fname} — no speech detected, excluding.\n", "simpleline")
+                            _transcription_log.append((fname, source, time.time() - _t_vid_start, "excluded — no speech"))
+                            try:
+                                _excl_mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                                _excl_year, _excl_month = _excl_mtime.year, _excl_mtime.month
+                                _excl_date = _excl_mtime.strftime("%Y%m%d")
+                                _excl_txt, _excl_sub = _get_transcript_filename(
+                                    ch_name, folder, split_years, split_months, combined,
+                                    year=_excl_year, month=_excl_month)
+                                os.makedirs(_excl_sub, exist_ok=True)
+                                _excl_date_fmt = _format_upload_date(_excl_date)
+                                _excl_dur_fmt = _format_duration(dur_str)
+                                _excl_entry = f"===({fname}), {_excl_date_fmt}, {_excl_dur_fmt}, (NO AUDIO DATA — EXCLUDED)===\n[No speech detected]\n\n\n"
+                                with open(_excl_txt, "a", encoding="utf-8") as _ef:
+                                    _ef.write(_excl_entry)
+                                _modified_txt_files.add(_excl_txt)
+                                done_count += 1
+                            except Exception as _excl_e:
+                                log(f"    ⚠ Could not write exclusion: {_excl_e}\n", "red")
+                                err_count += 1
                             continue
 
                         # Get date from file mtime
@@ -6867,6 +6882,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         for _cfg_ch in config.get("channels", []):
                             if _cfg_ch.get("url") == ch_url:
                                 _cfg_ch["transcription_complete"] = True
+                                _cfg_ch["transcription_pending"] = 0
                                 break
                         save_config(config)
 
@@ -7367,8 +7383,17 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     return
 
                 if not text:
-                    log(f"    ⚠ Whisper returned empty result, skipping.\n", "red")
-                    _skipped += 1
+                    # Write exclusion entry so this video is skipped on future transcribes
+                    log(f"    no speech detected, excluding.\n", "simpleline")
+                    try:
+                        _excl_date_fmt = _format_upload_date(upload_date)
+                        _excl_dur_fmt = _format_duration(dur_str)
+                        _excl_entry = f"===({fname}), {_excl_date_fmt}, {_excl_dur_fmt}, (NO AUDIO DATA — EXCLUDED)===\n[No speech detected]\n\n\n"
+                        with open(out_path, "a", encoding="utf-8") as _ef:
+                            _ef.write(_excl_entry)
+                        _transcribed += 1
+                    except Exception:
+                        _skipped += 1
                     continue
 
                 # Build entry in channel transcription format
@@ -9692,13 +9717,13 @@ def start_sync_all():
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
 
-                # New videos downloaded — clear transcription_complete flag
+                # New videos downloaded — track pending transcription count
                 if c_dl > 0:
-                    ch["transcription_complete"] = False
+                    ch["transcription_pending"] = ch.get("transcription_pending", 0) + c_dl
                     with config_lock:
                         for _cfg_ch in config.get("channels", []):
                             if _cfg_ch.get("url") == url:
-                                _cfg_ch["transcription_complete"] = False
+                                _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
@@ -12159,12 +12184,12 @@ def _run_autorun():
                 if root.winfo_exists():
                     root.after(0, refresh_channel_dropdowns)
 
-                # New videos downloaded — clear transcription_complete flag
+                # New videos downloaded — track pending transcription count
                 if c_dl > 0:
                     with config_lock:
                         for _cfg_ch in config.get("channels", []):
                             if _cfg_ch.get("url") == url:
-                                _cfg_ch["transcription_complete"] = False
+                                _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded

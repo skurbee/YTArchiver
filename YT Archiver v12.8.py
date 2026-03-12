@@ -6663,6 +6663,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()  # Free GPU memory (skip in sync_mode — GPU worker manages this)
                 _stop_punct_process()   # Free GPU memory
@@ -6949,6 +6950,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             log(f"\n  Manual transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
                 _tray_stop_spin()
@@ -7153,6 +7155,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             log(f"\n  Manual folder transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
                 _tray_stop_spin()

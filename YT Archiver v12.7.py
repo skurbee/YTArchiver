@@ -432,6 +432,29 @@ def _stop_whisper_dot_anim():
         _whisper_dots["job"] = None
 
 
+def _clear_whisper_progress():
+    """Clear the whisper progress line and stop its dot animation (used on cancel)."""
+    _stop_whisper_dot_anim()
+    def _write():
+        try:
+            if 'log_box' in globals() and log_box.winfo_exists():
+                log_box.config(state="normal")
+                for _tag in ("whisper_dots", "whisper_pct", "whisper_progress"):
+                    while True:
+                        _r = log_box.tag_ranges(_tag)
+                        if not _r:
+                            break
+                        log_box.delete(_r[0], _r[1])
+                log_box.config(state="disabled")
+        except Exception:
+            pass
+    try:
+        if 'root' in globals() and root.winfo_exists():
+            _ui_queue.append(_write)
+    except Exception:
+        pass
+
+
 def log_progress_bar(current, total):
     def _write():
         try:
@@ -1627,7 +1650,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.5 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.7 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4409,22 +4432,34 @@ _whisper_model_choice = "large-v3"  # selected model — set via dialog before t
 _ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
+# Uses faster-whisper (CTranslate2 backend) for ~4x speedup + built-in VAD to prevent hallucination loops
 _WHISPER_SCRIPT = r'''
-import sys, json, io, re
+import sys, json, os, io
 
-# Save real stdout for our JSON protocol. Whisper's verbose=True uses print()
-# which goes to sys.stdout, so we must redirect it to a dummy to avoid mixing
-# Whisper's text output with our JSON messages on the pipe.
+# Save real stdout for our JSON protocol, redirect stdout/stderr to suppress
+# any prints from huggingface_hub downloads, tqdm bars, or import warnings
 _out = sys.stdout
 sys.stdout = io.StringIO()
+sys.stderr = io.StringIO()
 
-import whisper, torch
+# faster-whisper uses CTranslate2 — no PyTorch needed for inference
+from faster_whisper import WhisperModel
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-import os as _os
-_model_name = _os.environ.get("WHISPER_MODEL", "large-v3")
-model = whisper.load_model(_model_name, device=device)
-_out.write(json.dumps({"status": "ready", "device": device}) + "\n")
+_model_name = os.environ.get("WHISPER_MODEL", "large-v3")
+_device = os.environ.get("WHISPER_DEVICE", "cuda")
+_compute = os.environ.get("WHISPER_COMPUTE", "float16")
+
+try:
+    model = WhisperModel(_model_name, device=_device, compute_type=_compute)
+except Exception:
+    _device = "cpu"
+    _compute = "default"
+    model = WhisperModel(_model_name, device=_device, compute_type=_compute)
+
+# Restore stderr for real errors during transcription, keep stdout suppressed
+sys.stderr = sys.__stderr__
+
+_out.write(json.dumps({"status": "ready", "device": _device}) + "\n")
 _out.flush()
 
 for line in sys.stdin:
@@ -4441,44 +4476,32 @@ for line in sys.stdin:
     if not path:
         continue
     try:
-        class _ProgressCapture:
-            """Replaces sys.stdout to intercept Whisper's verbose print() calls,
-            parse segment timestamps, and send progress % via the real pipe."""
-            def __init__(self, dur, out):
-                self.dur = dur
-                self.out = out
-                self.last_pct = -1
-            def write(self, text):
-                if self.dur <= 0:
-                    return
-                m = re.search(r'-->\s*(\d+):(\d+\.\d+)\]', text)
-                if m:
-                    current = int(m.group(1)) * 60 + float(m.group(2))
-                    pct = min(99, int(current / self.dur * 100))
-                    if pct > self.last_pct:
-                        self.last_pct = pct
-                        self.out.write(json.dumps({"status": "progress", "pct": pct}) + "\n")
-                        self.out.flush()
-            def flush(self):
-                pass
-            def isatty(self):
-                return False
+        segments_gen, info = model.transcribe(
+            path,
+            language="en",
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+            condition_on_previous_text=True,
+            no_speech_threshold=0.6,
+        )
+        # info.duration is the total audio length in seconds
+        total_dur = info.duration if info.duration and info.duration > 0 else duration
+        all_segments = []
+        last_pct = -1
+        for seg in segments_gen:
+            all_segments.append(seg)
+            if total_dur > 0:
+                pct = min(99, int(seg.end / total_dur * 100))
+                if pct > last_pct:
+                    last_pct = pct
+                    _out.write(json.dumps({"status": "progress", "pct": pct}) + "\n")
+                    _out.flush()
 
-        # Whisper verbose=True uses print() → sys.stdout for segment text.
-        # Redirect stdout to our progress parser, stderr to a dummy.
-        old_stderr = sys.stderr
-        sys.stdout = _ProgressCapture(duration, _out)
-        sys.stderr = io.StringIO()  # swallow any tqdm/warnings on stderr
-        result = model.transcribe(path, language="en", verbose=True)
-        sys.stderr = old_stderr
-        sys.stdout = io.StringIO()  # reset to dummy
-
-        segments = result.get("segments", [])
-        text = " ".join(seg["text"].strip() for seg in segments if seg.get("text", "").strip())
+        text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
         _out.write(json.dumps({"status": "ok", "text": text}) + "\n")
         _out.flush()
     except Exception as e:
-        sys.stderr = old_stderr if 'old_stderr' in dir() else sys.__stderr__
         _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
         _out.flush()
 '''
@@ -4670,12 +4693,13 @@ def _stop_punct_process():
 
 
 def _check_whisper_installed():
-    """Check if openai-whisper + CUDA PyTorch is installed under Python 3.11."""
+    """Check if faster-whisper + CUDA CTranslate2 is installed under Python 3.11."""
     if not os.path.exists(_WHISPER_PYTHON):
         return False
     try:
         result = subprocess.run(
-            [_WHISPER_PYTHON, "-c", "import whisper, torch; print(torch.cuda.is_available())"],
+            [_WHISPER_PYTHON, "-c",
+             "from faster_whisper import WhisperModel; import ctranslate2; print(ctranslate2.get_cuda_device_count() > 0)"],
             capture_output=True, text=True, timeout=30, startupinfo=startupinfo
         )
         return result.returncode == 0 and "True" in result.stdout
@@ -4684,12 +4708,18 @@ def _check_whisper_installed():
 
 
 def _install_whisper_blocking():
-    """Install openai-whisper + CUDA PyTorch under Python 3.11. Returns True on success."""
+    """Install faster-whisper + CUDA PyTorch (for punctuation) under Python 3.11. Returns True on success."""
     if not os.path.exists(_WHISPER_PYTHON):
         log(f"  ⚠ Python 3.11 not found at {_WHISPER_PYTHON}\n", "red")
         return False
     try:
-        # Step 1: Install CUDA PyTorch
+        # Step 0: Remove old openai-whisper if installed (cleanup, saves disk space)
+        subprocess.run(
+            [_WHISPER_PYTHON, "-m", "pip", "uninstall", "-y", "openai-whisper"],
+            capture_output=True, text=True, timeout=120, startupinfo=startupinfo
+        )
+
+        # Step 1: Install CUDA PyTorch (still needed for punctuation subprocess)
         log("  Installing CUDA PyTorch under Python 3.11...\n", "simpleline")
         torch_result = subprocess.run(
             [_WHISPER_PYTHON, "-m", "pip", "install",
@@ -4703,17 +4733,17 @@ def _install_whisper_blocking():
             log(f"  ⚠ CUDA PyTorch install failed: {torch_result.stderr[:300]}\n", "red")
             return False
 
-        # Step 2: Install openai-whisper
-        log("  Installing Whisper AI...\n", "simpleline")
+        # Step 2: Install faster-whisper (CTranslate2 backend — ~4x faster than openai-whisper)
+        log("  Installing faster-whisper...\n", "simpleline")
         result = subprocess.run(
-            [_WHISPER_PYTHON, "-m", "pip", "install", "openai-whisper"],
+            [_WHISPER_PYTHON, "-m", "pip", "install", "faster-whisper"],
             capture_output=True, text=True, timeout=600, startupinfo=startupinfo
         )
         if result.returncode == 0:
-            log("  ✓ Whisper AI installed successfully.\n", "simpleline_green")
+            log("  ✓ faster-whisper installed successfully.\n", "simpleline_green")
             return True
         else:
-            log(f"  ⚠ Whisper install failed: {result.stderr[:500]}\n", "red")
+            log(f"  ⚠ faster-whisper install failed: {result.stderr[:500]}\n", "red")
             return False
     except Exception as e:
         log(f"  ⚠ Whisper install error: {e}\n", "red")
@@ -4728,9 +4758,11 @@ def _start_whisper_process():
 
     try:
         _model = _whisper_model_choice
-        log(f"  Loading Whisper model ({_model}) on GPU... this takes ~10 sec\n", "simpleline")
+        log(f"  Loading faster-whisper model ({_model}) on GPU... (first run downloads model)\n", "simpleline")
         _env = os.environ.copy()
         _env["WHISPER_MODEL"] = _model
+        _env["WHISPER_DEVICE"] = "cuda"
+        _env["WHISPER_COMPUTE"] = "float16"
         _whisper_proc = subprocess.Popen(
             [_WHISPER_PYTHON, "-c", _WHISPER_SCRIPT],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -6359,10 +6391,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _btn_frame.pack(fill="x", padx=20)
 
                         _models = [
-                            ("tiny",     "Fastest  (~30-50× realtime)",  "tiny"),
-                            ("small",    "Fast  (~15-20× realtime)",     "small"),
-                            ("medium",   "Balanced  (~7-10× realtime)",  "medium"),
-                            ("large-v3", "Best quality  (~3-5× realtime)", "large-v3"),
+                            ("tiny",     "Fastest  (~120-200× realtime)",  "tiny"),
+                            ("small",    "Fast  (~60-80× realtime)",     "small"),
+                            ("medium",   "Balanced  (~28-40× realtime)",  "medium"),
+                            ("large-v3", "Best quality  (~12-20× realtime)", "large-v3"),
                         ]
 
                         _DEFAULT_MODEL = "small"
@@ -6472,7 +6504,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _install_result[0] = messagebox.askyesno(
                                     "Install Whisper AI",
                                     f"{len(unmatched)} video(s) need Whisper AI for transcription.\n\n"
-                                    "Whisper requires ~1.5 GB of downloads.\n\n"
+                                    "Whisper requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                                     "Install now? (These videos will be skipped if you decline)")
                             if root.winfo_exists():
                                 root.after(0, _ask_install)
@@ -6855,7 +6887,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                     _install_result[0] = messagebox.askyesno(
                         "Install Whisper AI",
                         "Whisper AI is required for transcription.\n\n"
-                        "This requires ~1.5 GB of downloads.\n\n"
+                        "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
                 if root.winfo_exists():
@@ -6999,7 +7031,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     _install_result[0] = messagebox.askyesno(
                         "Install Whisper AI",
                         "Whisper AI is required for transcription.\n\n"
-                        "This requires ~1.5 GB of downloads.\n\n"
+                        "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
                 if root.winfo_exists():
@@ -9555,6 +9587,7 @@ def stop_downloads():
     if not _gpu_running:
         _stop_whisper_process()  # Kill Whisper subprocess on cancel (only if GPU isn't using it)
         _stop_punct_process()   # Kill punctuation subprocess on cancel
+        _clear_whisper_progress()  # Remove stale whisper progress line from log
     _current_job["label"] = None
     _current_job["url"] = None
     _tray_stop_spin()
@@ -9613,6 +9646,27 @@ _queue_popup = {"win": None}  # Track the popup window
 
 queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="SyncQ.TButton")
 # Packed later after _last_sync_spacer is created
+
+# --- Sync badge (green circle with count) ---
+_sync_badge = tk.Label(queue_btn, text="", bg="#3a5a3a", fg="#ffffff",
+                       font=("Segoe UI", 7, "bold"), padx=2, pady=0,
+                       borderwidth=0, highlightthickness=0)
+_sync_badge_count = {"n": -1}  # track last displayed count to avoid redundant updates
+
+
+def _update_sync_badge():
+    """Update the green badge count on the Sync Tasks button."""
+    items = _get_queue_items()
+    n = len(items)
+    if n == _sync_badge_count["n"]:
+        return  # no change
+    _sync_badge_count["n"] = n
+    if n > 0:
+        _sync_badge.config(text=str(n) if n <= 99 else "99+")
+        _sync_badge.place(relx=1.0, rely=0.0, anchor="ne", x=-1, y=1)
+        _sync_badge.lift()
+    else:
+        _sync_badge.place_forget()
 
 
 def _active_label(label, with_dots=False):
@@ -10148,7 +10202,7 @@ _ToolTip(queue_btn, "Sync Tasks")
 
 
 def _update_queue_btn():
-    """Update sync tasks button state (blink, popup refresh). Button is always visible."""
+    """Update sync tasks button state (badge, blink, popup refresh). Button is always visible."""
     def _do():
         try:
             items = _get_queue_items()
@@ -10157,6 +10211,9 @@ def _update_queue_btn():
                 if _queue_popup["win"] and _queue_popup["win"].winfo_exists():
                     _queue_popup["win"].destroy()
                     _queue_popup["win"] = None
+
+            # Update badge count
+            _update_sync_badge()
 
             # Manage sync blink animation
             _is_running = _sync_running or _reorg_running
@@ -10175,7 +10232,7 @@ gpu_btn = ttk.Button(btn_frame, text="💻", width=3, style="Gpu.TButton")
 # Packed later after _last_sync_spacer is created
 
 # --- GPU badge (red circle with count) ---
-_gpu_badge = tk.Label(gpu_btn, text="", bg="#cc2222", fg="#ffffff",
+_gpu_badge = tk.Label(gpu_btn, text="", bg="#6b1a1a", fg="#ffffff",
                       font=("Segoe UI", 7, "bold"), padx=2, pady=0,
                       borderwidth=0, highlightthickness=0)
 _gpu_badge_count = {"n": -1}  # track last displayed count to avoid redundant updates
@@ -10993,6 +11050,7 @@ def _gpu_cancel_handler():
     with _gpu_queue_lock:
         _gpu_queue.clear()
     _stop_whisper_process()
+    _clear_whisper_progress()  # Remove stale whisper progress line from log
     log("\n⛔ Cancelling GPU Tasks...\n", "red")
     _update_gpu_btn()
 
@@ -11992,7 +12050,11 @@ _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_
 
 
 def _sync_mini_logs_from_main():
-    """Mirror the last 4 lines from the main log_box to both mini logs."""
+    """Mirror the last 4 lines from the main log_box to both mini logs.
+
+    Uses dump() to preserve multi-tag lines (e.g. whisper progress where
+    the percentage has a different color tag than the surrounding text).
+    """
     try:
         if 'log_box' not in globals() or not log_box.winfo_exists():
             return
@@ -12015,24 +12077,41 @@ def _sync_mini_logs_from_main():
 
         start_line = max(1, total_lines - 3)  # last 4 lines
 
-        # Extract text and primary tag for each line
-        lines_data = []
-        for line_num in range(start_line, total_lines + 1):
-            line_start = f"{line_num}.0"
-            line_end = f"{line_num}.end"
-            line_text = log_box.get(line_start, line_end)
-            if not line_text and line_num == total_lines:
-                continue  # skip empty trailing line
-            if line_num < total_lines:
-                line_text += "\n"
-            # Find the primary tag for this line
-            tags_at = log_box.tag_names(line_start)
-            line_tag = None
-            for t in _ALL_LOG_TAGS:
-                if t in tags_at:
-                    line_tag = t
-                    break
-            lines_data.append((line_text, line_tag))
+        # Use dump() to extract text with tag transitions preserved
+        _allowed = set(_ALL_LOG_TAGS)
+        segments = []  # list of (text, tag_or_None)
+        active_tags = set()
+        try:
+            for item in log_box.dump(f"{start_line}.0", "end-1c", tag=True, text=True):
+                kind = item[0]
+                if kind == "tagon" and item[1] in _allowed:
+                    active_tags.add(item[1])
+                elif kind == "tagoff" and item[1] in _allowed:
+                    active_tags.discard(item[1])
+                elif kind == "text":
+                    # Pick the highest-priority active tag
+                    tag = None
+                    for t in _ALL_LOG_TAGS:
+                        if t in active_tags:
+                            tag = t
+                            break
+                    segments.append((item[1], tag))
+        except Exception:
+            # Fallback: simple line-by-line copy without multi-tag support
+            segments = []
+            for line_num in range(start_line, total_lines + 1):
+                line_text = log_box.get(f"{line_num}.0", f"{line_num}.end")
+                if not line_text and line_num == total_lines:
+                    continue
+                if line_num < total_lines:
+                    line_text += "\n"
+                tags_at = log_box.tag_names(f"{line_num}.0")
+                line_tag = None
+                for t in _ALL_LOG_TAGS:
+                    if t in tags_at:
+                        line_tag = t
+                        break
+                segments.append((line_text, line_tag))
 
         # Write to both mini logs
         for ml in (subs_mini_log, recent_mini_log):
@@ -12041,7 +12120,7 @@ def _sync_mini_logs_from_main():
                     continue
                 ml.config(state="normal")
                 ml.delete("1.0", tk.END)
-                for text, tag in lines_data:
+                for text, tag in segments:
                     if tag:
                         ml.insert(tk.END, text, tag)
                     else:

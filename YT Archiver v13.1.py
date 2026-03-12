@@ -1650,7 +1650,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.0 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.1 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10272,9 +10272,11 @@ def _update_gpu_badge():
         _gpu_badge.place_forget()
 
 
-# --- Sync/GPU button blink animations (independent timers) ---
-_sync_blink = {"active": False, "on": False, "job": None}
-_gpu_blink = {"active": False, "on": False, "job": None}
+# --- Sync/GPU button blink animation (unified timer — always in sync) ---
+# Blink = running, solid color = paused, default bg = idle
+_sync_blink = {"active": False}
+_gpu_blink = {"active": False}
+_blink_clock = {"on": False, "job": None}
 
 # Dedicated style for Sync Tasks button — same as Emoji.TButton but we toggle its background
 style.configure("SyncQ.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
@@ -10287,63 +10289,56 @@ style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 
 style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 
-def _sync_blink_tick():
-    """Independent blink timer for the Sync Tasks button."""
+def _blink_tick():
+    """Unified blink clock — toggles both Sync and GPU buttons in phase.
+    Running = blink, Paused = solid color, Idle = default bg."""
     try:
         if not root.winfo_exists():
-            _sync_blink["job"] = None
+            _blink_clock["job"] = None
             return
-        _sync_blink["on"] = not _sync_blink["on"]
-        is_on = _sync_blink["on"]
+        _blink_clock["on"] = not _blink_clock["on"]
+        is_on = _blink_clock["on"]
 
-        if is_on:
-            style.configure("SyncQ.TButton", background="#3a5a3a")
-            style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
-        else:
-            style.configure("SyncQ.TButton", background=C_BTN)
-            style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
-
+        # Sync Tasks button
         if _sync_blink["active"]:
             if pause_event.is_set():
-                _delay = 200 if is_on else 1800  # ~10% duty cycle when paused
+                # Paused → solid color
+                style.configure("SyncQ.TButton", background="#3a5a3a")
+                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+            elif is_on:
+                style.configure("SyncQ.TButton", background="#3a5a3a")
+                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
             else:
-                _delay = 700  # 50% duty cycle when running
-            _sync_blink["job"] = root.after(_delay, _sync_blink_tick)
-        else:
-            _sync_blink["on"] = False
-            _sync_blink["job"] = None
-    except Exception:
-        _sync_blink["job"] = None
+                style.configure("SyncQ.TButton", background=C_BTN)
+                style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-
-def _gpu_blink_tick():
-    """Independent blink timer for the GPU Tasks button."""
-    try:
-        if not root.winfo_exists():
-            _gpu_blink["job"] = None
-            return
-        _gpu_blink["on"] = not _gpu_blink["on"]
-        is_on = _gpu_blink["on"]
-
-        if gpu_btn.winfo_ismapped():
-            if is_on:
+        # GPU Tasks button
+        if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
+            if _gpu_pause.is_set():
+                # Paused → solid color
+                style.configure("Gpu.TButton", background="#6b1a1a")
+                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+            elif is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
                 style.configure("Gpu.TButton", background=C_BTN)
                 style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        if _gpu_blink["active"]:
-            if _gpu_pause.is_set():
-                _delay = 200 if is_on else 1800  # ~10% duty cycle when paused
-            else:
-                _delay = 700  # 50% duty cycle when running
-            _gpu_blink["job"] = root.after(_delay, _gpu_blink_tick)
+        if _sync_blink["active"] or _gpu_blink["active"]:
+            _blink_clock["job"] = root.after(700, _blink_tick)
         else:
-            _gpu_blink["on"] = False
-            _gpu_blink["job"] = None
+            _blink_clock["on"] = False
+            _blink_clock["job"] = None
     except Exception:
-        _gpu_blink["job"] = None
+        _blink_clock["job"] = None
+
+
+def _ensure_blink_running():
+    """Start the unified blink clock if it's not already ticking."""
+    if _blink_clock["job"] is None and root.winfo_exists():
+        _blink_clock["on"] = False
+        _blink_clock["job"] = root.after(0, _blink_tick)
 
 
 def _sync_blink_start():
@@ -10351,9 +10346,7 @@ def _sync_blink_start():
     if _sync_blink["active"]:
         return
     _sync_blink["active"] = True
-    if _sync_blink["job"] is None and root.winfo_exists():
-        _sync_blink["on"] = False
-        _sync_blink["job"] = root.after(0, _sync_blink_tick)
+    _ensure_blink_running()
 
 
 def _sync_blink_stop():
@@ -10371,9 +10364,7 @@ def _gpu_blink_start():
     if _gpu_blink["active"]:
         return
     _gpu_blink["active"] = True
-    if _gpu_blink["job"] is None and root.winfo_exists():
-        _gpu_blink["on"] = False
-        _gpu_blink["job"] = root.after(0, _gpu_blink_tick)
+    _ensure_blink_running()
 
 
 def _gpu_blink_stop():

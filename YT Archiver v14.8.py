@@ -124,6 +124,7 @@ _tray_spin_idx = 0
 _reorg_queue = []  # list of (channel_name, folder_path, target_years, target_months, ch_url, recheck_dates) tuples
 _reorg_queue_lock = threading.Lock()
 _current_job = {"label": None, "url": None}  # currently processing job label + channel URL for queue display
+_current_sync_ch = None  # full channel dict of the currently syncing channel (for persistence on close)
 _last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts from last internal_run_cmd_blocking
 _queue_items_removed = False  # tracks if user removed items from sync queue during a manual sync
 _transcribe_running = False
@@ -367,13 +368,19 @@ def log(text, tag=None):
                         log_box.delete(dl_ranges[0], dl_ranges[1])
 
                 # Save whisper progress content before clearing (to re-insert after new content)
+                # Collect all ranges across tags, sorted by position, to preserve interleaved order
                 _saved_wp_parts = []  # list of (text, tag) to re-insert
+                _wp_ranges = []
                 for _wp_tag in ("whisper_progress", "whisper_pct", "whisper_dots"):
                     _wr = log_box.tag_ranges(_wp_tag)
-                    while _wr:
-                        _saved_wp_parts.append((log_box.get(_wr[0], _wr[1]), _wp_tag))
-                        log_box.delete(_wr[0], _wr[1])
-                        _wr = log_box.tag_ranges(_wp_tag)
+                    for _ri in range(0, len(_wr), 2):
+                        _wp_ranges.append((_wr[_ri], _wr[_ri + 1], _wp_tag))
+                _wp_ranges.sort(key=lambda r: log_box.index(r[0]))
+                for _start, _end, _wp_tag in _wp_ranges:
+                    _saved_wp_parts.append((log_box.get(_start, _end), _wp_tag))
+                # Delete in reverse order to preserve positions
+                for _start, _end, _ in reversed(_wp_ranges):
+                    log_box.delete(_start, _end)
                 _had_whisper = bool(_saved_wp_parts)
                 if _had_whisper:
                     _stop_whisper_dot_anim()
@@ -604,13 +611,18 @@ def log_simple_status(text):
                 log_box.config(state="normal")
 
                 # Save whisper/encode progress so they stay below the sync line
+                # Collect all ranges sorted by position to preserve interleaved order
                 _saved_parts = []
+                _all_ranges = []
                 for _tag in ("whisper_progress", "whisper_pct", "whisper_dots", "encode_progress"):
                     _r = log_box.tag_ranges(_tag)
-                    while _r:
-                        _saved_parts.append((log_box.get(_r[0], _r[1]), _tag))
-                        log_box.delete(_r[0], _r[1])
-                        _r = log_box.tag_ranges(_tag)
+                    for _ri in range(0, len(_r), 2):
+                        _all_ranges.append((_r[_ri], _r[_ri + 1], _tag))
+                _all_ranges.sort(key=lambda r: log_box.index(r[0]))
+                for _start, _end, _tag in _all_ranges:
+                    _saved_parts.append((log_box.get(_start, _end), _tag))
+                for _start, _end, _ in reversed(_all_ranges):
+                    log_box.delete(_start, _end)
 
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
@@ -666,13 +678,18 @@ def _update_encode_progress(text):
                 log_box.config(state="normal")
 
                 # Save whisper progress so it stays at the very bottom
+                # Collect all ranges sorted by position to preserve interleaved order
                 _saved_wp = []
+                _wp_ranges = []
                 for _tag in ("whisper_progress", "whisper_pct", "whisper_dots"):
                     _r = log_box.tag_ranges(_tag)
-                    while _r:
-                        _saved_wp.append((log_box.get(_r[0], _r[1]), _tag))
-                        log_box.delete(_r[0], _r[1])
-                        _r = log_box.tag_ranges(_tag)
+                    for _ri in range(0, len(_r), 2):
+                        _wp_ranges.append((_r[_ri], _r[_ri + 1], _tag))
+                _wp_ranges.sort(key=lambda r: log_box.index(r[0]))
+                for _start, _end, _tag in _wp_ranges:
+                    _saved_wp.append((log_box.get(_start, _end), _tag))
+                for _start, _end, _ in reversed(_wp_ranges):
+                    log_box.delete(_start, _end)
 
                 # Delete existing encode progress/pct/dots ranges
                 for _etag in ("encode_dots", "encode_pct", "encode_progress"):
@@ -1835,7 +1852,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.7 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.8 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3273,12 +3290,14 @@ def sync_single_channel():
     _sync_running = True
     _current_job["label"] = f"Sync {ch['name']}"
     _current_job["url"] = ch["url"]
+    global _current_sync_ch
+    _current_sync_ch = copy.deepcopy(ch)
     _tray_start_spin()
     _update_tray_tooltip(f"YT Archiver — Syncing {ch['name']}")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _single_worker():
-        global _sync_running
+        global _sync_running, _current_sync_ch
         try:
             out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
@@ -3677,6 +3696,7 @@ def sync_single_channel():
 
                 if not _queue_started:
                     _sync_running = False
+                    _current_sync_ch = None
                     if root.winfo_exists():
                         def _on_single_sync_done():
                             _validate_download_btn()
@@ -7326,16 +7346,39 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                 log(f"  Folder not found: {folder_path}\n", "red")
                 return
 
-            # Gather video/audio files, sorted by name
-            files = sorted([f for f in os.listdir(folder_path)
-                            if os.path.isfile(os.path.join(folder_path, f))
-                            and os.path.splitext(f)[1].lower() in _VID_EXTS])
+            # Gather video/audio files, sorted chronologically by file modification date
+            all_files = [f for f in os.listdir(folder_path)
+                         if os.path.isfile(os.path.join(folder_path, f))
+                         and os.path.splitext(f)[1].lower() in _VID_EXTS]
+            files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(folder_path, f)))
 
             if not files:
                 log(f"  No video/audio files found in folder.\n", "red")
                 return
 
             out_path = os.path.join(folder_path, f"{folder_name} Transcript.txt")
+
+            # Check existing transcript for already-transcribed files (skip on re-run)
+            _existing_titles = set()
+            if os.path.isfile(out_path):
+                try:
+                    with open(out_path, "r", encoding="utf-8") as _ef:
+                        for _line in _ef:
+                            _m = re.match(r'^===\((.+?)\),', _line)
+                            if _m:
+                                _existing_titles.add(_m.group(1))
+                except Exception:
+                    pass
+            if _existing_titles:
+                _before_count = len(files)
+                files = [f for f in files if os.path.splitext(f)[0] not in _existing_titles]
+                _skipped_existing = _before_count - len(files)
+                if _skipped_existing:
+                    log(f"  Skipping {_skipped_existing} already-transcribed file(s)\n", "simpleline")
+                if not files:
+                    log(f"  All files already transcribed.\n", "simpleline_green")
+                    return
+
             log(f"  Found {len(files)} files to transcribe\n", "simpleline")
             log(f"  Output: {folder_name} Transcript.txt\n\n", "simpleline")
 
@@ -9397,7 +9440,7 @@ def start_sync_all():
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _sync_worker():
-        global _sync_running
+        global _sync_running, _current_sync_ch
         try:
             out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
@@ -9468,6 +9511,7 @@ def start_sync_all():
                 ch_dl_map[ch_name] = 0
                 _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
+                _current_sync_ch = copy.deepcopy(ch)
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
                 log(f"  Checking channel...\n", "dim")
@@ -9881,6 +9925,7 @@ def start_sync_all():
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
                 _sync_running = False
+                _current_sync_ch = None
                 _current_job["label"] = None
                 _current_job["url"] = None
                 _update_queue_btn()
@@ -9933,7 +9978,8 @@ def _clear_all_logs():
     log_box.config(state="normal")
     log_box.delete("1.0", tk.END)
     log_box.config(state="disabled")
-    clear_log_btn.pack_forget()
+    if 'clear_log_btn' in globals():
+        clear_log_btn.grid_forget()
     if 'subs_mini_log' in globals():
         for ml in (subs_mini_log, recent_mini_log):
             try:
@@ -9947,22 +9993,22 @@ def _clear_all_logs():
 def _show_clear_log_if_needed():
     """Show Clear log button only when the log has content."""
     try:
+        if 'clear_log_btn' not in globals():
+            return
         content = log_box.get("1.0", "end-1c").strip()
         if content and not clear_log_btn.winfo_ismapped():
-            clear_log_btn.pack(side="left", padx=(0, 6), after=sync_btn)
+            clear_log_btn.grid(row=0, column=3, sticky="e", padx=(0, 4))
         elif not content and clear_log_btn.winfo_ismapped():
-            clear_log_btn.pack_forget()
+            clear_log_btn.grid_forget()
     except Exception:
         pass
 
 
-clear_log_btn = ttk.Button(btn_frame, text="Clear log", command=_clear_all_logs)
-_ToolTip(clear_log_btn, "Clear the log output")
-# Starts hidden — shown when log has content
+# clear_log_btn created later after autorun_frame exists (placed next to auto-sync dropdown)
 
 
 def stop_downloads():
-    global _sync_running, _reorg_running, _transcribe_running
+    global _sync_running, _reorg_running, _transcribe_running, _current_sync_ch
     pause_event.clear()
 
     # Clear any queued syncs, video downloads, reorg, and transcription jobs
@@ -9985,6 +10031,7 @@ def stop_downloads():
     _reorg_running = False
     _transcribe_running = False
     _transcribe_sync_controlled = False
+    _current_sync_ch = None
     if not _gpu_running:
         _stop_whisper_process()  # Kill Whisper subprocess on cancel (only if GPU isn't using it)
         _stop_punct_process()   # Kill punctuation subprocess on cancel
@@ -10527,10 +10574,60 @@ def _show_queue_menu(event=None):
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
                                   cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                def _confirm_cancel_sync():
+                    # Count total items (current + queued)
+                    _total = 0
+                    if _sync_pipeline_active:
+                        _total += 1  # currently running job
+                    with _sync_queue_lock:
+                        _total += len(_sync_queue)
+                    with _reorg_queue_lock:
+                        _total += len(_reorg_queue)
+                    with _transcribe_queue_lock:
+                        _total += len(_transcribe_queue)
+                    with _mt_queue_lock:
+                        _total += len(_mt_queue)
+                    if _total >= 2:
+                        _choice = [None]
+                        _cdlg = tk.Toplevel(root)
+                        _cdlg.title("Cancel Queue")
+                        _cdlg.configure(bg=C_BG)
+                        _cdlg.resizable(False, False)
+                        _cdlg.grab_set()
+                        _cdlg.transient(root)
+                        tk.Label(_cdlg, text="Cancelling clears the queue. Are you sure?",
+                                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10),
+                                 padx=20, pady=16).pack()
+                        _cb_row = tk.Frame(_cdlg, bg=C_BG)
+                        _cb_row.pack(pady=(0, 14))
+                        def _do_pause():
+                            _choice[0] = "pause"
+                            _cdlg.destroy()
+                        def _do_yes():
+                            _choice[0] = "yes"
+                            _cdlg.destroy()
+                        tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
+                                  activebackground="#3a5e84", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                  padx=14, pady=4, cursor="hand2",
+                                  command=_do_pause).pack(side="left", padx=(0, 8))
+                        tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                  activebackground="#a52a2a", activeforeground="#ffffff",
+                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                  padx=14, pady=4, cursor="hand2",
+                                  command=_do_yes).pack(side="left")
+                        _cdlg.protocol("WM_DELETE_WINDOW", _cdlg.destroy)
+                        _cdlg.wait_window()
+                        if _choice[0] == "pause":
+                            toggle_pause()
+                            return
+                        elif _choice[0] != "yes":
+                            return  # closed without choosing
+                    stop_downloads()
                 tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
                           activebackground="#a52a2a", activeforeground="#ffffff",
                           relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                          cursor="hand2", command=stop_downloads).pack(side="left")
+                          cursor="hand2", command=_confirm_cancel_sync).pack(side="left")
         else:
             empty = tk.Label(wrapper, text="  (empty)", bg="#2d2d2d", fg="#666666",
                              font=("Segoe UI", 9), anchor="w")
@@ -11160,10 +11257,53 @@ def _show_gpu_menu(event=None):
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
                                   cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                def _confirm_cancel_gpu():
+                    _total = 0
+                    if _gpu_running:
+                        _total += 1  # currently running GPU task
+                    with _gpu_queue_lock:
+                        _total += len(_gpu_queue)
+                    if _total >= 2:
+                        _choice = [None]
+                        _cdlg = tk.Toplevel(root)
+                        _cdlg.title("Cancel GPU Tasks")
+                        _cdlg.configure(bg=C_BG)
+                        _cdlg.resizable(False, False)
+                        _cdlg.grab_set()
+                        _cdlg.transient(root)
+                        tk.Label(_cdlg, text="Cancelling clears the queue. Are you sure?",
+                                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10),
+                                 padx=20, pady=16).pack()
+                        _cb_row = tk.Frame(_cdlg, bg=C_BG)
+                        _cb_row.pack(pady=(0, 14))
+                        def _do_pause():
+                            _choice[0] = "pause"
+                            _cdlg.destroy()
+                        def _do_yes():
+                            _choice[0] = "yes"
+                            _cdlg.destroy()
+                        tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
+                                  activebackground="#3a5e84", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                  padx=14, pady=4, cursor="hand2",
+                                  command=_do_pause).pack(side="left", padx=(0, 8))
+                        tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                  activebackground="#a52a2a", activeforeground="#ffffff",
+                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                  padx=14, pady=4, cursor="hand2",
+                                  command=_do_yes).pack(side="left")
+                        _cdlg.protocol("WM_DELETE_WINDOW", _cdlg.destroy)
+                        _cdlg.wait_window()
+                        if _choice[0] == "pause":
+                            _gpu_pause_handler()
+                            return
+                        elif _choice[0] != "yes":
+                            return  # closed without choosing
+                    _gpu_cancel_handler()
                 tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
                           activebackground="#a52a2a", activeforeground="#ffffff",
                           relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                          cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
+                          cursor="hand2", command=_confirm_cancel_gpu).pack(side="left")
         else:
             empty = tk.Label(wrapper, text="  (empty)", bg="#2d2d2d", fg="#666666",
                              font=("Segoe UI", 9), anchor="w")
@@ -11724,6 +11864,10 @@ autorun_countdown_var = tk.StringVar(value="")
 ttk.Label(autorun_frame, textvariable=autorun_countdown_var, style="Dim.TLabel", width=22).grid(
     row=0, column=2, sticky="w", padx=(0, 4))
 
+clear_log_btn = ttk.Button(autorun_frame, text="Clear log", command=_clear_all_logs)
+_ToolTip(clear_log_btn, "Clear the log output")
+# Starts hidden — shown when log has content via _show_clear_log_if_needed()
+
 
 def _clear_autorun_history():
     with config_lock:
@@ -11934,7 +12078,7 @@ def _run_autorun():
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _auto_worker():
-        global _autorun_active, _sync_running
+        global _autorun_active, _sync_running, _current_sync_ch
         _autorun_active = True
         ch_dl_map = {}
         try:
@@ -11961,6 +12105,7 @@ def _run_autorun():
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
                 _current_job["url"] = ch.get("url")
+                _current_sync_ch = copy.deepcopy(ch)
 
                 # GPU batch limit: skip channel if too many unprocessed encode batches
                 _c_level_bl = ch.get("compress_level", "")
@@ -12348,6 +12493,7 @@ def _run_autorun():
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
                 _sync_running = False
+                _current_sync_ch = None
 
                 # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
@@ -13653,6 +13799,15 @@ def on_closing():
                 has_queue = True
     if not has_queue and _gpu_running:
         has_queue = True
+
+    # Re-queue the currently-processing sync channel so it persists through restart
+    if _current_sync_ch is not None and _sync_running:
+        with _sync_queue_lock:
+            if not any(q["url"] == _current_sync_ch["url"] for q in _sync_queue):
+                _sync_queue.insert(0, _current_sync_ch)
+                with _queue_order_lock:
+                    _queue_order.insert(0, ("sync", _current_sync_ch["url"]))
+                has_queue = True
 
     # Re-queue the currently-processing GPU item so it persists through restart
     if _gpu_current_item is not None:

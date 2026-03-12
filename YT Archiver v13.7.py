@@ -68,8 +68,11 @@ DEFAULT_CONFIG = {
     "recent_downloads": [],
     "autorun_interval": 0,
     "autorun_history": [],
-    "log_mode": "Simple"
+    "log_mode": "Simple",
+    "autorun_gpu": False
 }
+
+GPU_BATCH_LIMIT = 5  # max unprocessed encode batches per channel before sync skips it
 
 RECENT_MAX = 1000
 CHANNEL_DEFAULTS = {"resolution": "720", "mode": "full", "min_duration": 0, "max_duration": 0,
@@ -1683,7 +1686,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.5 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.7 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6075,6 +6078,21 @@ def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
     return _result[0] is True
 
 
+def _count_gpu_encode_batches(ch_url):
+    """Count unprocessed encode/backlog_encode batches for a channel in the GPU queue."""
+    count = 0
+    with _gpu_queue_lock:
+        for q in _gpu_queue:
+            if q.get("ch_url") == ch_url and q["type"] in ("encode", "backlog_encode"):
+                count += 1
+    # Also count the currently-running item if it's an encode for this channel
+    if _gpu_running and _gpu_current_item:
+        _ci = _gpu_current_item
+        if _ci.get("ch_url") == ch_url and _ci.get("type") in ("encode", "backlog_encode"):
+            count += 1
+    return count
+
+
 def _add_to_gpu_queue(item, _quiet=False):
     """Add a task to the GPU Tasks queue and show the GPU button.
     _quiet: if True, suppress duplicate warning logs (used by incremental compress callback).
@@ -6137,6 +6155,10 @@ def _add_to_gpu_queue(item, _quiet=False):
     log(f"=== Added to GPU Tasks: {label} ===\n", "header")
     _update_gpu_btn()
     _save_queue_state()
+    # Autorun: auto-start GPU processing if enabled and not already running
+    if not _gpu_running and config.get("autorun_gpu", False):
+        if root.winfo_exists():
+            root.after(100, _gpu_start)
 
 
 def _process_transcribe_queue():
@@ -6638,6 +6660,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _pe.is_set() and not _ce.is_set():
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
                         text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
+                        _clear_whisper_progress()  # Remove progress line now that file is done
                         source = "Whisper"
 
                         if not text:
@@ -7019,6 +7042,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
 
             text = _whisper_transcribe(file_path, duration=_dur_secs, title=fname,
                                        cancel_ev=_ce, pause_ev=_pe)
+            _clear_whisper_progress()  # Remove progress line now that file is done
 
             if not text:
                 log(f"  Whisper returned empty result.\n", "red")
@@ -7194,6 +7218,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                 # Transcribe
                 text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname,
                                            cancel_ev=_ce, pause_ev=_pe)
+                _clear_whisper_progress()  # Remove progress line now that file is done
 
                 if _ce.is_set():
                     log(f"\n  Cancelled.\n", "red")
@@ -7301,7 +7326,7 @@ _compress_batch_label = tk.Label(compress_row, text="Batch:", bg=C_SURFACE, fg=C
 _compress_batch_combo = _combo(compress_row, textvariable=new_compress_batch_var,
                                 values=["1", "5", "10", "20", "50"], state="readonly", width=4)
 new_compress_batch_var.set("20")
-_ToolTip(_compress_batch_combo, "Compress every N downloads during bulk syncs.\nSmaller = more frequent GPU tasks, larger = fewer.")
+_ToolTip(_compress_batch_combo, "Compress every N downloads during bulk syncs.\nSmaller = more frequent GPU tasks, larger = fewer.\nSync will skip a channel if it has 5+ unprocessed\nbatches in GPU Tasks to avoid filling storage.")
 
 
 def _on_compress_res_change(*_):
@@ -9166,9 +9191,14 @@ def start_sync_all():
             _update_queue_btn()
 
             processed = 0
+            _gpu_skip_count = 0  # consecutive GPU batch limit skips
             while not cancel_event.is_set():
                 with _sync_queue_lock:
                     if not _sync_queue:
+                        break
+                    # All remaining channels are being skipped due to GPU batch limit
+                    if _gpu_skip_count > 0 and _gpu_skip_count >= len(_sync_queue):
+                        log(f"\n  ⏭ All remaining channels skipped — GPU batch limit reached. Start GPU Tasks to continue.\n", "dim")
                         break
                     ch = _sync_queue.pop(0)
                     current_total = processed + 1 + len(_sync_queue)
@@ -9178,6 +9208,23 @@ def start_sync_all():
                     except ValueError:
                         pass
                 _update_queue_btn()
+
+                # GPU batch limit: skip channel if too many unprocessed encode batches
+                _c_level_bl = ch.get("compress_level", "")
+                if ch.get("compress_enabled", False) and _c_level_bl in _QUALITY_OPTIONS:
+                    _pending_batches = _count_gpu_encode_batches(ch.get("url", ""))
+                    if _pending_batches >= GPU_BATCH_LIMIT:
+                        _skip_name = ch.get("name", "?")
+                        log(f"\n  ⏭ Skipping {_skip_name} — {_pending_batches} unprocessed GPU batches (limit: {GPU_BATCH_LIMIT})\n", "dim")
+                        with _sync_queue_lock:
+                            _sync_queue.append(ch)
+                        with _queue_order_lock:
+                            _queue_order.append(("sync", ch["url"]))
+                        _update_queue_btn()
+                        _gpu_skip_count += 1
+                        continue
+
+                _gpu_skip_count = 0  # reset on successful processing
                 processed += 1
                 i = processed
 
@@ -10435,13 +10482,9 @@ def _blink_tick():
                 style.configure("SyncQ.TButton", background=C_BTN)
                 style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # GPU Tasks button
+        # GPU Tasks button — keep blinking even when paused (GPU still busy until encode stops)
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if _gpu_pause.is_set():
-                # Paused → solid color
-                style.configure("Gpu.TButton", background="#6b1a1a")
-                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
-            elif is_on:
+            if is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
@@ -10636,6 +10679,19 @@ def _show_gpu_menu(event=None):
                   cursor="hand2", command=_mt_from_popup, padx=4)
         _folder_btn.pack(side="right")
         _ToolTip(_folder_btn, "Manual Transcription")
+        # Autorun checkbox — auto-start GPU Tasks when items are added
+        _autorun_var = tk.BooleanVar(value=config.get("autorun_gpu", False))
+        def _toggle_autorun_gpu():
+            val = _autorun_var.get()
+            config["autorun_gpu"] = val
+            save_config(config)
+        _autorun_cb = tk.Checkbutton(hdr, text="Auto", bg="#2d2d2d", fg="#888888",
+                                      selectcolor="#2d2d2d", activebackground="#2d2d2d",
+                                      activeforeground="#cccccc", font=("Segoe UI", 8),
+                                      variable=_autorun_var, command=_toggle_autorun_gpu,
+                                      bd=0, highlightthickness=0, pady=0, padx=2)
+        _autorun_cb.pack(side="right")
+        _ToolTip(_autorun_cb, "Auto-start GPU Tasks when new items are added")
 
         if items:
             max_visible = 10
@@ -11623,6 +11679,14 @@ def _run_autorun():
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
                 _current_job["url"] = ch.get("url")
+
+                # GPU batch limit: skip channel if too many unprocessed encode batches
+                _c_level_bl = ch.get("compress_level", "")
+                if ch.get("compress_enabled", False) and _c_level_bl in _QUALITY_OPTIONS:
+                    _pending_batches = _count_gpu_encode_batches(ch.get("url", ""))
+                    if _pending_batches >= GPU_BATCH_LIMIT:
+                        log(f"\n  ⏭ Skipping {ch_name} — {_pending_batches} unprocessed GPU batches (limit: {GPU_BATCH_LIMIT})\n", "dim")
+                        continue
 
                 log(f"\n--- [{i}/{len(channels)}] SYNCING: {ch_name} ---\n", "header")
                 _update_tray_tooltip(f"YT Archiver — [{i}/{len(channels)}] {ch_name}")

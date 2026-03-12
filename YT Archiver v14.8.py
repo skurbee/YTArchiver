@@ -202,11 +202,21 @@ class _ToolTip:
 # can deadlock with the main thread's event processing on Windows).
 _ui_queue = collections.deque()
 
+# Plain-Python flag: True while root window is alive.  Worker threads
+# check this instead of root.winfo_exists() (which is a Tcl call that
+# acquires the interpreter lock and can cause crashes when racing with
+# the main thread).  Set to False in on_closing() before root.destroy().
+_root_alive = True
+
 # Thread-safe cache of log_mode_var.get() == "Simple".
 # Worker threads read this instead of calling log_mode_var.get(), which
 # would acquire the Tcl interpreter lock on every call (hundreds/sec
 # during downloads).  Updated on the main thread via trace callback.
 _is_simple_mode = False
+
+# Thread-safe cache of the autorun interval label (e.g. "Off", "30 min").
+# Read by pystray menu callbacks instead of autorun_interval_var.get().
+_cached_autorun_label = "Off"
 
 # Persistent auto-scroll flag — survives yview fluctuations during batch UI queue processing
 _log_at_bottom = True
@@ -323,7 +333,7 @@ def log(text, tag=None):
                         if not _whisper_dots["active"]:
                             _whisper_dots["active"] = True
                             _whisper_dots["idx"] = 0
-                            if 'root' in globals() and root.winfo_exists():
+                            if _root_alive:
                                 _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
                     else:
                         log_box.insert(tk.END, text, "whisper_progress")
@@ -403,7 +413,7 @@ def log(text, tag=None):
                     if not _whisper_dots["active"]:
                         _whisper_dots["active"] = True
                         _whisper_dots["idx"] = 0
-                        if 'root' in globals() and root.winfo_exists():
+                        if _root_alive:
                             _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
 
                 if _autorun_active and (not _is_simple_mode):
@@ -437,7 +447,7 @@ def log(text, tag=None):
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
         elif sys.stdout:
             sys.stdout.write(text)
@@ -501,7 +511,7 @@ def _clear_whisper_progress():
         except Exception:
             pass
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -538,7 +548,7 @@ def log_progress_bar(current, total):
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -573,7 +583,7 @@ def log_dl_progress(msg):
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -593,7 +603,7 @@ def clear_transient_lines():
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -641,7 +651,7 @@ def log_simple_status(text):
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -660,7 +670,7 @@ def clear_simple_status():
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -719,7 +729,7 @@ def _update_encode_progress(text):
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
                         _encode_dots["idx"] = 0
-                        if 'root' in globals() and root.winfo_exists():
+                        if _root_alive:
                             _encode_dots["job"] = root.after(350, _encode_dot_tick)
                 else:
                     # No percentage (unknown duration) — still show with animation
@@ -731,7 +741,7 @@ def _update_encode_progress(text):
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
                         _encode_dots["idx"] = 0
-                        if 'root' in globals() and root.winfo_exists():
+                        if _root_alive:
                             _encode_dots["job"] = root.after(350, _encode_dot_tick)
 
                 # Re-insert whisper progress at the bottom (after encode line)
@@ -745,7 +755,7 @@ def _update_encode_progress(text):
         except Exception:
             pass
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -802,7 +812,7 @@ def _clear_encode_progress():
         except Exception:
             pass
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -822,7 +832,7 @@ def _clear_simpledownload_lines():
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -1498,41 +1508,41 @@ def _update_tray_tooltip(text):
 
 def _tray_sync_subbed(icon, item):
     """Tray menu action: Sync Subbed."""
-    if root.winfo_exists():
-        root.after(0, start_sync_all)
+    if _root_alive:
+        _ui_queue.append(start_sync_all)
 
 
 def _tray_quit(icon, item):
     """Tray menu action: Quit."""
-    if root.winfo_exists():
-        root.after(0, lambda: on_closing())
+    if _root_alive:
+        _ui_queue.append(lambda: on_closing())
 
 
 def _tray_show_window(icon, item):
     """Tray menu action: Show/focus the main window."""
-    if root.winfo_exists():
+    if _root_alive:
         def _show():
             root.deiconify()
             root.lift()
             root.focus_force()
-        root.after(0, _show)
+        _ui_queue.append(_show)
 
 
 def _get_autorun_checked(label):
     """Return a function that checks if the current autorun label matches."""
     def _check(item):
-        return autorun_interval_var.get() == label
+        return _cached_autorun_label == label
     return _check
 
 
 def _set_autorun(label):
     """Return a callback that sets the autorun interval from the tray menu."""
     def _cb(icon, item):
-        if root.winfo_exists():
+        if _root_alive:
             def _apply():
                 autorun_interval_var.set(label)
                 _on_autorun_change()
-            root.after(0, _apply)
+            _ui_queue.append(_apply)
     return _cb
 
 
@@ -2777,8 +2787,8 @@ def _chan_ctx_update_split(ch_url, split_years, split_months):
                 cfg_ch["split_months"] = split_months
                 break
     save_config(config)
-    if root.winfo_exists():
-        root.after(0, refresh_channel_dropdowns)
+    if _root_alive:
+        _ui_queue.append(refresh_channel_dropdowns)
 
 
 def _chan_ctx_org_by_year():
@@ -3697,7 +3707,7 @@ def sync_single_channel():
                 if not _queue_started:
                     _sync_running = False
                     _current_sync_ch = None
-                    if root.winfo_exists():
+                    if _root_alive:
                         def _on_single_sync_done():
                             _validate_download_btn()
                             sync_btn.config(state="normal")
@@ -3710,7 +3720,7 @@ def sync_single_channel():
                             else:
                                 _update_tray_tooltip("YT Archiver — Idle")
 
-                            _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
+                            _iv = AUTORUN_OPTIONS.get(_cached_autorun_label, 0)
                             if _iv:
                                 _schedule_autorun(_iv)
 
@@ -3762,7 +3772,7 @@ def _process_sync_queue():
         _sync_running = False
         sync_single_channel()
 
-    if root.winfo_exists():
+    if _root_alive:
         _ui_queue.append(_start_queued)
     return True
 
@@ -5967,7 +5977,12 @@ def _whisper_punct_fixup(text):
         return text
     if any(ch in text for ch in ",.?"):
         return text
-    return _punctuate_text(text)
+    if _punct_proc is None or _punct_proc.poll() is not None:
+        return text  # Punctuation model not loaded — skip
+    try:
+        return _punctuate_text(text)
+    except Exception:
+        return text
 
 
 def _fetch_auto_captions(video_id, temp_dir):
@@ -6200,7 +6215,7 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
 
         _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
-    if root.winfo_exists():
+    if _root_alive:
         _ui_queue.append(_ask)
         while _model_result[0] is None and not cancel_event.is_set():
             time.sleep(0.1)
@@ -6767,7 +6782,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
-                    if root.winfo_exists():
+                    if _root_alive:
                         _ui_queue.append(_ask_model)
                         while _model_result[0] is None and not _ce.is_set():
                             time.sleep(0.1)
@@ -6816,7 +6831,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     f"{len(unmatched)} video(s) need Whisper AI for transcription.\n\n"
                                     "Whisper requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                                     "Install now? (These videos will be skipped if you decline)")
-                            if root.winfo_exists():
+                            if _root_alive:
                                 _ui_queue.append(_ask_install)
                                 while _install_result[0] is None and not _ce.is_set():
                                     time.sleep(0.1)
@@ -7909,7 +7924,7 @@ def _validate_download_btn():
 
 
 def _trigger_validation(*_):
-    if 'root' in globals() and root.winfo_exists():
+    if _root_alive:
         _validate_add_btn()
         _validate_download_btn()
 
@@ -8114,7 +8129,7 @@ def _log_scan_status(checked, matched, date_disp, title):
             pass
 
     try:
-        if 'root' in globals() and root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(_write)
     except Exception:
         pass
@@ -8167,7 +8182,7 @@ def internal_run_subscribe_before_date(url, date_str):
                         pass
 
                 try:
-                    if 'root' in globals() and root.winfo_exists():
+                    if _root_alive:
                         _ui_queue.append(_write)
                 except Exception:
                     pass
@@ -8760,7 +8775,7 @@ def run_cmd(cmd, is_single_video=False):
                 _cleanup_partial_files(os.path.dirname(out_path))
             except (ValueError, IndexError):
                 pass
-        if root.winfo_exists():
+        if _root_alive:
             def _done():
                 _validate_download_btn()
                 _sync_task_finished()
@@ -9834,7 +9849,7 @@ def start_sync_all():
                                 cfg_ch["initialized"] = True
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
-                if root.winfo_exists():
+                if _root_alive:
                     _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
@@ -9924,7 +9939,7 @@ def start_sync_all():
                         config["last_sync"] = _ts
                     save_config(config)
                 _dl = session_totals["dl"]
-                if root.winfo_exists():
+                if _root_alive:
                     _ui_queue.append(refresh_channel_dropdowns)
                     if not _queue_items_removed:
                         _ui_queue.append(lambda ts=_ts: _update_last_sync_display(ts))
@@ -9955,7 +9970,7 @@ def start_sync_all():
                 elif not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
-                if not _queue_started and root.winfo_exists():
+                if not _queue_started and _root_alive:
                     def _on_manual_sync_done():
                         _validate_download_btn()
                         sync_btn.config(state="normal", text="🔄 Sync Subbed")
@@ -9967,7 +9982,7 @@ def start_sync_all():
                         else:
                             _update_tray_tooltip("YT Archiver — Idle")
 
-                        _iv = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
+                        _iv = AUTORUN_OPTIONS.get(_cached_autorun_label, 0)
                         if _iv:
                             _schedule_autorun(_iv)
 
@@ -11914,6 +11929,11 @@ ttk.Label(autorun_frame, text="Auto-sync:", style="Dim.TLabel").grid(row=0, colu
 _saved_interval = config.get("autorun_interval", 0)
 _saved_label = next((k for k, v in AUTORUN_OPTIONS.items() if v == _saved_interval), "Off")
 autorun_interval_var = tk.StringVar(value=_saved_label)
+_cached_autorun_label = _saved_label  # initialise thread-safe cache
+def _sync_autorun_cache(*_):
+    global _cached_autorun_label
+    _cached_autorun_label = autorun_interval_var.get()
+autorun_interval_var.trace_add("write", _sync_autorun_cache)
 autorun_combo = _combo(autorun_frame, textvariable=autorun_interval_var,
                        values=AUTORUN_LABELS, state="readonly", width=8)
 autorun_combo.grid(row=0, column=1, padx=(0, 16))
@@ -12024,7 +12044,7 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
         if len(hist) > AUTORUN_HISTORY_MAX:
             config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
-    if root.winfo_exists():
+    if _root_alive:
         _ui_queue.append(_refresh_autorun_history)
 
 
@@ -12053,7 +12073,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
         if len(hist) > AUTORUN_HISTORY_MAX:
             config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
-    if root.winfo_exists():
+    if _root_alive:
         _ui_queue.append(_refresh_autorun_history)
 
 
@@ -12451,7 +12471,7 @@ def _run_autorun():
                                 cfg_ch["initialized"] = True
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
-                if root.winfo_exists():
+                if _root_alive:
                     _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
@@ -12545,7 +12565,7 @@ def _run_autorun():
             save_config(config)
 
             # Always update display timestamps
-            if root.winfo_exists():
+            if _root_alive:
                 _ui_queue.append(refresh_channel_dropdowns)
                 _ui_queue.append(lambda ts=_ts: _update_last_sync_display(ts))
 
@@ -12563,7 +12583,7 @@ def _run_autorun():
                 elif not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
-                if root.winfo_exists() and not _queue_started:
+                if _root_alive and not _queue_started:
                     _iv = interval_mins
                     _dl_count = session_totals["dl"]
                     def _on_auto_done(iv=_iv, dl=_dl_count):
@@ -13437,7 +13457,7 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                 notebook.tab(tab_recent, text=f"  Recent ({new_download_count})  ")
                 _update_tray_badge()
 
-        if root.winfo_exists(): _ui_queue.append(_sync)
+        if _root_alive: _ui_queue.append(_sync)
 
     threading.Thread(target=_delayed_record, daemon=True).start()
 
@@ -13485,7 +13505,7 @@ def check_dependencies():
                     globals()["Image"] = _img
                     globals()["ImageDraw"] = _drw
                     HAS_TRAY = True
-                    if root.winfo_exists():
+                    if _root_alive:
                         _ui_queue.append(_setup_tray_icon)
                 except ImportError:
                     pass
@@ -13592,7 +13612,7 @@ def _check_channel_folders():
         if root.winfo_exists():
             root.after(0, refresh_channel_dropdowns)
 
-    if root.winfo_exists():
+    if _root_alive:
         _ui_queue.append(_prompt_missing)
         # Wait for the dialogs to complete before continuing startup
         try:
@@ -13738,7 +13758,7 @@ def run_startup_updates():
         log("--- Startup checks complete, ready to download ---\n", "simpleline_green")
 
         # Enable sync button now that startup is complete
-        if root.winfo_exists():
+        if _root_alive:
             _ui_queue.append(lambda: sync_btn.config(state="normal"))
 
         # Restore preserved queue from previous session if any
@@ -13839,6 +13859,9 @@ def _load_queue_state():
 
 
 def on_closing():
+    global _root_alive
+    _root_alive = False  # Tell worker threads to stop touching Tkinter immediately
+
     # Check if there are queued jobs
     has_queue = False
     with _sync_queue_lock:

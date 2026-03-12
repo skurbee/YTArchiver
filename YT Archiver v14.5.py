@@ -127,6 +127,7 @@ _current_job = {"label": None, "url": None}  # currently processing job label + 
 _last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts from last internal_run_cmd_blocking
 _queue_items_removed = False  # tracks if user removed items from sync queue during a manual sync
 _transcribe_running = False
+_transcribe_sync_controlled = False  # True when current transcription responds to pause_event/cancel_event (not GPU-driven)
 _transcribe_queue = []  # list of (ch_name, ch_url, folder, split_years, split_months, combined) tuples
 _transcribe_queue_lock = threading.Lock()
 _mt_queue = []  # list of file paths (str) for manual transcription
@@ -1791,7 +1792,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.4 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.5 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6338,10 +6339,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         return
 
     def _worker():
-        global _transcribe_running, _whisper_model_choice
+        global _transcribe_running, _transcribe_sync_controlled, _whisper_model_choice
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _transcribe_sync_controlled = (cancel_ev is None)  # True when sync pipeline, False when GPU-driven
         if not _sync_mode:
             _current_job["label"] = f"Transcribe {ch_name}"
             _current_job["url"] = ch_url
@@ -6925,6 +6927,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _transcribe_sync_controlled = False
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()  # Free GPU memory (skip in sync_mode — GPU worker manages this)
@@ -7084,10 +7087,11 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
     fname = os.path.splitext(os.path.basename(file_path))[0]
 
     def _worker():
-        global _transcribe_running, _whisper_model_choice
+        global _transcribe_running, _transcribe_sync_controlled, _whisper_model_choice
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _transcribe_sync_controlled = (cancel_ev is None)
         if not _sync_mode:
             _current_job["label"] = f"M.T. {fname}"
             _current_job["url"] = None
@@ -7217,6 +7221,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             log(f"\n  Manual transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _transcribe_sync_controlled = False
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
@@ -7256,10 +7261,11 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                  ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
 
     def _worker():
-        global _transcribe_running, _whisper_model_choice
+        global _transcribe_running, _transcribe_sync_controlled, _whisper_model_choice
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _transcribe_sync_controlled = (cancel_ev is None)
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {folder_name}")
 
@@ -7437,6 +7443,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             log(f"\n  Manual folder transcription error: {e}\n", "red")
         finally:
             _transcribe_running = False
+            _transcribe_sync_controlled = False
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
@@ -9931,6 +9938,7 @@ def stop_downloads():
     _sync_running = False
     _reorg_running = False
     _transcribe_running = False
+    _transcribe_sync_controlled = False
     if not _gpu_running:
         _stop_whisper_process()  # Kill Whisper subprocess on cancel (only if GPU isn't using it)
         _stop_punct_process()   # Kill punctuation subprocess on cancel
@@ -10438,8 +10446,10 @@ def _show_queue_menu(event=None):
             hint.pack(fill="x", padx=4, pady=(2, 2))
 
             # Footer buttons — show when running (Pause/Cancel) or queued (Start/Cancel)
+            # Only count transcription as "sync-running" if it's sync-controlled (not GPU-driven)
+            _sync_pipeline_active = _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled)
             _show_sync_btns = False
-            if _sync_running or _reorg_running or _transcribe_running:
+            if _sync_pipeline_active:
                 _show_sync_btns = True
             else:
                 _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue)
@@ -10450,7 +10460,7 @@ def _show_queue_menu(event=None):
                 btn_row = tk.Frame(wrapper, bg="#2d2d2d")
                 btn_row.pack(fill="x", padx=4, pady=(4, 6))
 
-                if not (_sync_running or _reorg_running or _transcribe_running):
+                if not _sync_pipeline_active:
                     # Not running but has queued items — show Start
                     def _start_sync_queue():
                         popup.destroy()

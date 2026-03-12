@@ -1650,7 +1650,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.8 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.0 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2322,12 +2322,19 @@ def refresh_channel_dropdowns():
             t_complete = c.get("transcription_complete", False)
             _is_queued_t = False
             _is_running_t = False
+            # Check GPU Tasks queue
             with _gpu_queue_lock:
                 _is_queued_t = any(q.get("ch_url") == ch_url_t and q["type"] in ("transcribe", "mt") for q in _gpu_queue)
             if _gpu_running and _gpu_current.get("ch_url") == ch_url_t:
                 _cur_item = _gpu_current_item
                 if _cur_item and _cur_item.get("type") in ("transcribe", "mt"):
                     _is_running_t = True
+            # Check standalone transcription (non-GPU path)
+            if not _is_running_t and _transcribe_running and _current_job.get("url") == ch_url_t:
+                _is_running_t = True
+            if not _is_queued_t:
+                with _transcribe_queue_lock:
+                    _is_queued_t = any(q[1] == ch_url_t for q in _transcribe_queue)
             if _is_running_t:
                 trans_str = "Running"
             elif _is_queued_t:
@@ -6132,6 +6139,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _update_queue_btn()
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
+        if root.winfo_exists():
+            root.after(0, refresh_channel_dropdowns)
         _whisper_available = None  # None = not checked yet
 
         try:
@@ -10263,10 +10272,9 @@ def _update_gpu_badge():
         _gpu_badge.place_forget()
 
 
-# --- Sync Tasks button blink animation (subtle) ---
-_sync_blink = {"active": False}
-_gpu_blink = {"active": False}
-_blink_clock = {"on": False, "job": None}  # unified blink clock for both buttons
+# --- Sync/GPU button blink animations (independent timers) ---
+_sync_blink = {"active": False, "on": False, "job": None}
+_gpu_blink = {"active": False, "on": False, "job": None}
 
 # Dedicated style for Sync Tasks button — same as Emoji.TButton but we toggle its background
 style.configure("SyncQ.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
@@ -10279,26 +10287,45 @@ style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 
 style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 
-def _blink_tick():
-    """Unified blink clock — toggles both Sync and GPU buttons in phase."""
+def _sync_blink_tick():
+    """Independent blink timer for the Sync Tasks button."""
     try:
         if not root.winfo_exists():
-            _blink_clock["job"] = None
+            _sync_blink["job"] = None
             return
-        _blink_clock["on"] = not _blink_clock["on"]
-        is_on = _blink_clock["on"]
+        _sync_blink["on"] = not _sync_blink["on"]
+        is_on = _sync_blink["on"]
 
-        # Sync Tasks button
+        if is_on:
+            style.configure("SyncQ.TButton", background="#3a5a3a")
+            style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+        else:
+            style.configure("SyncQ.TButton", background=C_BTN)
+            style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+
         if _sync_blink["active"]:
-            if is_on:
-                style.configure("SyncQ.TButton", background="#3a5a3a")
-                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+            if pause_event.is_set():
+                _delay = 200 if is_on else 1800  # ~10% duty cycle when paused
             else:
-                style.configure("SyncQ.TButton", background=C_BTN)
-                style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+                _delay = 700  # 50% duty cycle when running
+            _sync_blink["job"] = root.after(_delay, _sync_blink_tick)
+        else:
+            _sync_blink["on"] = False
+            _sync_blink["job"] = None
+    except Exception:
+        _sync_blink["job"] = None
 
-        # GPU Tasks button
-        if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
+
+def _gpu_blink_tick():
+    """Independent blink timer for the GPU Tasks button."""
+    try:
+        if not root.winfo_exists():
+            _gpu_blink["job"] = None
+            return
+        _gpu_blink["on"] = not _gpu_blink["on"]
+        is_on = _gpu_blink["on"]
+
+        if gpu_btn.winfo_ismapped():
             if is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
@@ -10306,21 +10333,17 @@ def _blink_tick():
                 style.configure("Gpu.TButton", background=C_BTN)
                 style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # Keep ticking while at least one blink is active
-        if _sync_blink["active"] or _gpu_blink["active"]:
-            _blink_clock["job"] = root.after(700, _blink_tick)
+        if _gpu_blink["active"]:
+            if _gpu_pause.is_set():
+                _delay = 200 if is_on else 1800  # ~10% duty cycle when paused
+            else:
+                _delay = 700  # 50% duty cycle when running
+            _gpu_blink["job"] = root.after(_delay, _gpu_blink_tick)
         else:
-            _blink_clock["on"] = False
-            _blink_clock["job"] = None
+            _gpu_blink["on"] = False
+            _gpu_blink["job"] = None
     except Exception:
-        _blink_clock["job"] = None
-
-
-def _ensure_blink_running():
-    """Start the unified blink clock if it's not already ticking."""
-    if _blink_clock["job"] is None and root.winfo_exists():
-        _blink_clock["on"] = False
-        _blink_clock["job"] = root.after(0, _blink_tick)
+        _gpu_blink["job"] = None
 
 
 def _sync_blink_start():
@@ -10328,7 +10351,9 @@ def _sync_blink_start():
     if _sync_blink["active"]:
         return
     _sync_blink["active"] = True
-    _ensure_blink_running()
+    if _sync_blink["job"] is None and root.winfo_exists():
+        _sync_blink["on"] = False
+        _sync_blink["job"] = root.after(0, _sync_blink_tick)
 
 
 def _sync_blink_stop():
@@ -10346,7 +10371,9 @@ def _gpu_blink_start():
     if _gpu_blink["active"]:
         return
     _gpu_blink["active"] = True
-    _ensure_blink_running()
+    if _gpu_blink["job"] is None and root.winfo_exists():
+        _gpu_blink["on"] = False
+        _gpu_blink["job"] = root.after(0, _gpu_blink_tick)
 
 
 def _gpu_blink_stop():
@@ -10806,6 +10833,8 @@ def _gpu_start():
                         _gpu_current["label"] = f"Transcribe {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
+                        if root.winfo_exists():
+                            root.after(0, refresh_channel_dropdowns)
                         _start_transcription(
                             item["ch_name"], item["ch_url"], item["folder"],
                             item["split_years"], item["split_months"], item["combined"],

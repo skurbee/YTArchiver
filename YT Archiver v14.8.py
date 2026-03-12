@@ -9979,7 +9979,7 @@ def _clear_all_logs():
     log_box.delete("1.0", tk.END)
     log_box.config(state="disabled")
     if 'clear_log_btn' in globals():
-        clear_log_btn.grid_forget()
+        clear_log_btn.pack_forget()
     if 'subs_mini_log' in globals():
         for ml in (subs_mini_log, recent_mini_log):
             try:
@@ -9997,14 +9997,14 @@ def _show_clear_log_if_needed():
             return
         content = log_box.get("1.0", "end-1c").strip()
         if content and not clear_log_btn.winfo_ismapped():
-            clear_log_btn.grid(row=0, column=3, sticky="e", padx=(0, 4))
+            clear_log_btn.pack(side="left", padx=(6, 0), after=sync_btn)
         elif not content and clear_log_btn.winfo_ismapped():
-            clear_log_btn.grid_forget()
+            clear_log_btn.pack_forget()
     except Exception:
         pass
 
 
-# clear_log_btn created later after autorun_frame exists (placed next to auto-sync dropdown)
+# clear_log_btn created later after btn_frame/sync_btn exist (packed next to sync button)
 
 
 def stop_downloads():
@@ -11891,7 +11891,7 @@ AUTORUN_MINUTES = list(AUTORUN_OPTIONS.values())
 
 autorun_frame = ttk.Frame(tab_download)
 autorun_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 2))
-autorun_frame.columnconfigure(3, weight=1)
+autorun_frame.columnconfigure(4, weight=1)
 
 ttk.Label(autorun_frame, text="Auto-sync:", style="Dim.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
 
@@ -11904,11 +11904,12 @@ autorun_combo.grid(row=0, column=1, padx=(0, 16))
 
 autorun_countdown_var = tk.StringVar(value="")
 ttk.Label(autorun_frame, textvariable=autorun_countdown_var, style="Dim.TLabel", width=22).grid(
-    row=0, column=2, sticky="w", padx=(0, 4))
+    row=0, column=3, sticky="w", padx=(0, 4))
 
-clear_log_btn = ttk.Button(autorun_frame, text="Clear log", command=_clear_all_logs)
+clear_log_btn = ttk.Button(btn_frame, text="Clear log", command=_clear_all_logs)
 _ToolTip(clear_log_btn, "Clear the log output")
 # Starts hidden — shown when log has content via _show_clear_log_if_needed()
+# Packed into btn_frame (next to sync_btn) rather than autorun_frame
 
 
 def _clear_autorun_history():
@@ -11921,9 +11922,9 @@ def _clear_autorun_history():
 autorun_clear_btn = ttk.Button(autorun_frame, text="Clear", command=_clear_autorun_history,
                                style="TButton", padding=[4, 1])
 
-ttk.Label(autorun_frame, text="Log:", style="Dim.TLabel").grid(row=0, column=4, sticky="e", padx=(0, 6))
+ttk.Label(autorun_frame, text="Log:", style="Dim.TLabel").grid(row=0, column=5, sticky="e", padx=(0, 6))
 _log_mode_frame = ttk.Frame(autorun_frame)
-_log_mode_frame.grid(row=0, column=5, sticky="w")
+_log_mode_frame.grid(row=0, column=6, sticky="w")
 ttk.Radiobutton(_log_mode_frame, text="Verbose", variable=log_mode_var, value="Verbose").pack(side="left", padx=(0, 8))
 ttk.Radiobutton(_log_mode_frame, text="Simple", variable=log_mode_var, value="Simple").pack(side="left")
 
@@ -11974,7 +11975,7 @@ def _refresh_autorun_history():
     current_panes = [str(p) for p in log_paned.panes()]
 
     if history:
-        autorun_clear_btn.grid(row=0, column=3, sticky="w", padx=(0, 16))
+        autorun_clear_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
         # Bring the frame back if it's not currently shown
         if str(autorun_history_frame) not in current_panes:
             log_paned.insert(0, autorun_history_frame, weight=0)

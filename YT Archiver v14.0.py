@@ -139,12 +139,14 @@ _gpu_running = False
 _gpu_cancel = threading.Event()
 _gpu_pause = threading.Event()
 _gpu_popup = {"win": None}
+_gpu_actively_encoding = False  # True while ffmpeg/whisper is processing a file (for blink vs solid)
 _gpu_current = {"label": None, "ch_url": None}  # currently processing GPU task
 _gpu_current_item = None  # full dict of the item currently being processed (for persistence)
 _whisper_model = None  # unused legacy, kept for compat
 _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
 _punct_proc = None  # persistent punctuation subprocess (model stays loaded on GPU)
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
+_skip_current = threading.Event()  # set when user wants to skip the current job and move to next in queue
 
 # Unified queue ordering — tracks insertion order across all queue types.
 # Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video", url_or_key).
@@ -209,6 +211,8 @@ _log_at_bottom = True
 
 # Whisper progress dot animation state
 _whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
+# Encode progress dot animation state
+_encode_dots = {"active": False, "idx": 0, "job": None}
 
 # Whisper transcription progress counter (for simple mode prefix)
 _whisper_counter = {"idx": 0, "total": 0}
@@ -217,6 +221,9 @@ _whisper_counter = {"idx": 0, "total": 0}
 def _flush_ui_queue():
     """Process pending UI callbacks on the main thread with a time budget."""
     try:
+        # Drop oldest entries if queue grows too large (prevents unbounded memory growth)
+        while len(_ui_queue) > 5000:
+            _ui_queue.popleft()
         deadline = time.monotonic() + 0.012  # 12ms budget per tick
         while time.monotonic() < deadline:
             try:
@@ -396,6 +403,14 @@ def log(text, tag=None):
                         line_count = int(log_box.index("end-1c").split(".")[0])
                         if line_count > 20:
                             log_box.delete("1.0", f"{line_count - 20}.0")
+                    except Exception:
+                        pass
+                else:
+                    # Cap verbose log at 10000 lines to prevent unbounded memory growth
+                    try:
+                        line_count = int(log_box.index("end-1c").split(".")[0])
+                        if line_count > 10000:
+                            log_box.delete("1.0", f"{line_count - 8000}.0")
                     except Exception:
                         pass
 
@@ -636,7 +651,11 @@ def clear_simple_status():
 
 
 def _update_encode_progress(text):
-    """Update the in-place encoding progress line (replaces previous progress)."""
+    """Update the in-place encoding progress line (replaces previous progress).
+
+    Renders the percentage in green bold (like the whisper progress line) with
+    animated trailing dots.
+    """
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -651,17 +670,56 @@ def _update_encode_progress(text):
                         log_box.delete(_r[0], _r[1])
                         _r = log_box.tag_ranges(_tag)
 
-                ranges = log_box.tag_ranges("encode_progress")
-                if ranges:
-                    log_box.delete(ranges[0], ranges[1])
-                log_box.insert(tk.END, text, "encode_progress")
+                # Delete existing encode progress/pct/dots ranges
+                for _etag in ("encode_dots", "encode_pct", "encode_progress"):
+                    while True:
+                        _er = log_box.tag_ranges(_etag)
+                        if not _er:
+                            break
+                        log_box.delete(_er[0], _er[1])
+
+                # Split percentage out and render it green+bold
+                import re as _re_ep
+                _ep_match = _re_ep.search(r'(\d+%)', text)
+                if _ep_match:
+                    _before = text[:_ep_match.start()]
+                    _pct_str = _ep_match.group(1)
+                    _after_raw = text[_ep_match.end():]
+                    # Strip trailing dots/newline — we animate those separately
+                    _suffix = _after_raw.rstrip(".\n ").rstrip()
+                    log_box.insert(tk.END, _before, "encode_progress")
+                    log_box.insert(tk.END, _pct_str, "encode_pct")
+                    if _suffix:
+                        log_box.insert(tk.END, _suffix, "encode_progress")
+                    # Animated dots
+                    _dot_chars = [".", "..", "..."]
+                    _d = _dot_chars[_encode_dots["idx"] % 3]
+                    log_box.insert(tk.END, _d + "\n", "encode_dots")
+                    if not _encode_dots["active"]:
+                        _encode_dots["active"] = True
+                        _encode_dots["idx"] = 0
+                        if 'root' in globals() and root.winfo_exists():
+                            _encode_dots["job"] = root.after(350, _encode_dot_tick)
+                else:
+                    # No percentage (unknown duration) — still show with animation
+                    _stripped = text.rstrip(".\n ").rstrip()
+                    log_box.insert(tk.END, _stripped, "encode_progress")
+                    _dot_chars = [".", "..", "..."]
+                    _d = _dot_chars[_encode_dots["idx"] % 3]
+                    log_box.insert(tk.END, _d + "\n", "encode_dots")
+                    if not _encode_dots["active"]:
+                        _encode_dots["active"] = True
+                        _encode_dots["idx"] = 0
+                        if 'root' in globals() and root.winfo_exists():
+                            _encode_dots["job"] = root.after(350, _encode_dot_tick)
 
                 # Re-insert whisper progress at the bottom (after encode line)
                 if _saved_wp:
                     for _s_text, _s_tag in _saved_wp:
                         log_box.insert(tk.END, _s_text, _s_tag)
 
-                log_box.see(tk.END)
+                if _log_at_bottom:
+                    log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -672,15 +730,50 @@ def _update_encode_progress(text):
         pass
 
 
+def _encode_dot_tick():
+    """Animate the trailing dots on the encode progress line."""
+    if not _encode_dots["active"]:
+        return
+    _encode_dots["idx"] = (_encode_dots["idx"] + 1) % 3
+    _dot_chars = [".", "..", "..."]
+    def _tick():
+        try:
+            if 'log_box' in globals() and log_box.winfo_exists():
+                log_box.config(state="normal")
+                _dr = log_box.tag_ranges("encode_dots")
+                if _dr:
+                    log_box.delete(_dr[0], _dr[1])
+                    log_box.insert(_dr[0], _dot_chars[_encode_dots["idx"]] + "\n", "encode_dots")
+                log_box.config(state="disabled")
+        except Exception:
+            pass
+    _ui_queue.append(_tick)
+    if _encode_dots["active"] and 'root' in globals():
+        try:
+            _encode_dots["job"] = root.after(350, _encode_dot_tick)
+        except Exception:
+            pass
+
+
 def _clear_encode_progress():
-    """Clear the encoding progress line."""
+    """Clear the encoding progress line and stop dot animation."""
+    _encode_dots["active"] = False
+    if _encode_dots["job"]:
+        try:
+            root.after_cancel(_encode_dots["job"])
+        except Exception:
+            pass
+        _encode_dots["job"] = None
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
-                ranges = log_box.tag_ranges("encode_progress")
-                if ranges:
-                    log_box.delete(ranges[0], ranges[1])
+                for _etag in ("encode_dots", "encode_pct", "encode_progress"):
+                    while True:
+                        _er = log_box.tag_ranges(_etag)
+                        if not _er:
+                            break
+                        log_box.delete(_er[0], _er[1])
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -1686,7 +1779,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.7 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.0 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2020,7 +2113,9 @@ log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_TEXT, font=("Consolas", 9))
-log_box.tag_configure("encode_progress", foreground=C_LOG_DIM, font=("Consolas", 9))
+log_box.tag_configure("encode_progress", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("encode_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
+log_box.tag_configure("encode_dots", foreground=C_TEXT, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -3524,7 +3619,11 @@ def sync_single_channel():
                 # Keep _sync_running=True until we confirm nothing else is queued,
                 # to prevent a race where another sync starts in the gap.
                 _queue_started = False
-                if not cancel_event.is_set():
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _queue_started = _process_next_queued()
+                elif not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
                 if not _queue_started:
@@ -4422,7 +4521,11 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                     _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
                 root.after(0, _reorg_done)
             # Process any queued jobs in insertion order
-            if not cancel_event.is_set():
+            if _skip_current.is_set():
+                _skip_current.clear()
+                cancel_event.clear()
+                _process_next_queued()
+            elif not cancel_event.is_set():
                 _process_next_queued()
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -4900,7 +5003,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
     cancel_ev/pause_ev: optional threading.Events.
     _sync_mode: if True, run directly (blocking) instead of spawning a thread.
     """
-    global _ffmpeg_proc
+    global _ffmpeg_proc, _gpu_actively_encoding
 
     _VIDEO_EXTS_COMPRESS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
 
@@ -4956,7 +5059,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         audio_kbps = 128  # fixed AAC audio bitrate
         video_kbps = max(int(target_total_kbps - audio_kbps), 50)  # minimum 50 kbps video
 
-        log(f"  Video bitrate: {video_kbps} kbps, Audio: {audio_kbps} kbps\n", "simpleline")
+        log(f"  Video bitrate: ~{video_kbps} kbps (VBR), Audio: {audio_kbps} kbps\n", "simpleline")
 
         # ── Step 4: Process each file ──
         done_count = 0
@@ -4996,7 +5099,10 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 cmd += ["-vf", f"scale=-2:{output_res}"]
             cmd += [
                 "-c:v", "av1_nvenc",
+                "-rc", "vbr",
+                "-cq", "32",
                 "-b:v", f"{video_kbps}k",
+                "-maxrate", f"{int(video_kbps * 1.5)}k",
                 "-preset", "p6",
                 "-multipass", "2",
                 "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -5011,6 +5117,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     startupinfo=startupinfo, encoding="utf-8", errors="replace"
                 )
                 _ffmpeg_proc = proc
+                _gpu_actively_encoding = True
                 _encode_t0 = time.time()
 
                 # Parse progress from stderr
@@ -5048,8 +5155,13 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         else:
                             _update_encode_progress(f"    Encoding{_d}\n")
 
-                proc.wait()
+                try:
+                    proc.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
                 _ffmpeg_proc = None
+                _gpu_actively_encoding = False
                 _clear_encode_progress()
                 _encode_elapsed = time.time() - _encode_t0
 
@@ -5079,7 +5191,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         done_count += 1
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
-                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, took {_elapsed_str})\n", "simpleline_green")
+                        _rt_str = f", {duration / _encode_elapsed:.1f}x realtime" if duration > 0 and _encode_elapsed > 0 else ""
+                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, {dur_str}, took {_elapsed_str}{_rt_str})\n", "simpleline_green")
                     except Exception as e:
                         err_count += 1
                         log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -5141,7 +5254,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
     then processes in batches: download at new quality → ffmpeg AV1 NVENC → replace.
     Shows batch size stats and prompts user to confirm after first batch.
     """
-    global _ffmpeg_proc
+    global _ffmpeg_proc, _gpu_actively_encoding
 
     _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
 
@@ -5385,7 +5498,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         ffmpeg_cmd += ["-vf", f"scale=-2:{_out_res}"]
                     ffmpeg_cmd += [
                         "-c:v", "av1_nvenc",
+                        "-rc", "vbr",
+                        "-cq", "32",
                         "-b:v", f"{video_kbps}k",
+                        "-maxrate", f"{int(video_kbps * 1.5)}k",
                         "-preset", "p6",
                         "-multipass", "2",
                         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -5400,6 +5516,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             startupinfo=startupinfo, encoding="utf-8", errors="replace"
                         )
                         _ffmpeg_proc = proc
+                        _gpu_actively_encoding = True
                         _bl_encode_t0 = time.time()
 
                         _bl_time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
@@ -5437,8 +5554,13 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                     _update_encode_progress(f"    Encoding{_d}\n")
 
                         if not _ce.is_set():
-                            proc.wait()
+                            try:
+                                proc.wait(timeout=300)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait(timeout=10)
                         _ffmpeg_proc = None
+                        _gpu_actively_encoding = False
                         _clear_encode_progress()
                         _bl_encode_elapsed = time.time() - _bl_encode_t0
 
@@ -5459,7 +5581,9 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 o_mb = orig_size / (1024 * 1024)
                                 n_mb = new_size / (1024 * 1024)
                                 _bl_ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
-                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, took {_bl_elapsed_str})\n", "simpleline_green")
+                                _bl_dur_str = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
+                                _bl_rt_str = f", {_bl_duration / _bl_encode_elapsed:.1f}x realtime" if _bl_duration > 0 and _bl_encode_elapsed > 0 else ""
+                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, {_bl_dur_str}, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_green")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
                                 batch_errors += 1
@@ -5677,6 +5801,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
     title is shown in the progress line so the user knows which video is being processed.
     cancel_ev/pause_ev default to the global cancel_event/pause_event if not provided.
     """
+    global _gpu_actively_encoding
     _ce = cancel_ev or cancel_event
     _pe = pause_ev or pause_event
     global _whisper_proc
@@ -5691,6 +5816,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces
         _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+        _gpu_actively_encoding = True
         log(f"{_wp}Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
@@ -5700,6 +5826,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         while True:
             response_line = _whisper_proc.stdout.readline().strip()
             if not response_line:
+                _gpu_actively_encoding = False
                 return None
             result = _json.loads(response_line)
             if result.get("status") == "progress":
@@ -5713,12 +5840,15 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 continue
             elif result.get("status") == "ok":
                 log(f"{_wp}Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
+                _gpu_actively_encoding = False
                 return result.get("text") or None
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
+                _gpu_actively_encoding = False
                 return None
     except Exception as e:
         log(f"  ⚠ Whisper communication error: {e}\n", "red")
+        _gpu_actively_encoding = False
         _stop_whisper_process()  # Kill broken process, will restart on next call
         return None
 
@@ -6780,18 +6910,24 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if not _sync_mode:
                 _stop_whisper_process()  # Free GPU memory (skip in sync_mode — GPU worker manages this)
                 _stop_punct_process()   # Free GPU memory
-                _tray_stop_spin()
-                _update_tray_tooltip("YT Archiver — Idle")
-                _current_job["label"] = None
-                _current_job["url"] = None
+                if not _sync_running:
+                    _tray_stop_spin()
+                    _update_tray_tooltip("YT Archiver — Idle")
+                    _current_job["label"] = None
+                    _current_job["url"] = None
                 _update_queue_btn()
             if root.winfo_exists():
                 root.after(0, refresh_channel_dropdowns)
             if not _sync_mode and root.winfo_exists():
                 root.after(0, _sync_task_finished)
             # Process any queued jobs in insertion order (only when not in sync_mode)
-            if not _sync_mode and not _ce.is_set():
-                _process_next_queued()
+            if not _sync_mode:
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _process_next_queued()
+                elif not _ce.is_set():
+                    _process_next_queued()
 
     if _sync_mode:
         _worker()  # Run synchronously — caller is the GPU worker thread
@@ -7067,15 +7203,21 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
-                _tray_stop_spin()
-                _update_tray_tooltip("YT Archiver \u2014 Idle")
-                _current_job["label"] = None
-                _current_job["url"] = None
+                if not _sync_running:
+                    _tray_stop_spin()
+                    _update_tray_tooltip("YT Archiver \u2014 Idle")
+                    _current_job["label"] = None
+                    _current_job["url"] = None
                 _update_queue_btn()
             if not _sync_mode and root.winfo_exists():
                 root.after(0, _sync_task_finished)
-            if not _sync_mode and not _ce.is_set():
-                _process_next_queued()
+            if not _sync_mode:
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _process_next_queued()
+                elif not _ce.is_set():
+                    _process_next_queued()
 
     if _sync_mode:
         _worker()  # Run synchronously — caller is the GPU worker thread
@@ -7273,8 +7415,9 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
-                _tray_stop_spin()
-                _update_tray_tooltip("YT Archiver — Idle")
+                if not _sync_running:
+                    _tray_stop_spin()
+                    _update_tray_tooltip("YT Archiver — Idle")
 
     if _sync_mode:
         _worker()
@@ -9659,7 +9802,11 @@ def start_sync_all():
 
                 # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
-                if not cancel_event.is_set():
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _queue_started = _process_next_queued()
+                elif not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
                 if not _queue_started and root.winfo_exists():
@@ -9781,6 +9928,26 @@ def stop_downloads():
             else:
                 p.kill()
     log("\n⛔ Cancelling Syncs...\n", "red")
+
+
+def _skip_current_job():
+    """Cancel only the currently running job and proceed to the next queued item."""
+    _skip_current.set()
+    cancel_event.set()
+    pause_event.clear()
+
+    # Kill active download processes (but don't clear queues)
+    with proc_lock:
+        procs = list(active_processes)
+    for p in procs:
+        if p.poll() is None:
+            if os.name == "nt":
+                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 startupinfo=startupinfo)
+            else:
+                p.kill()
+    log("\n⏭ Skipping current job...\n", "red")
 
 
 def _fmt_time():
@@ -10085,6 +10252,14 @@ def _show_queue_menu(event=None):
                     lbl.pack(side="left", fill="x", expand=True)
                     _widgets.append({"row": row, "lbl": lbl, "source": source, "idx": idx})
                     _state["active_lbl"] = lbl  # track for dot-only updates
+
+                    # Right-click on current (running) item to skip it and move to next
+                    def _skip_current_click(e):
+                        popup.destroy()
+                        if messagebox.askyesno("Skip Current", "Cancel the current job and move to the next one in queue?"):
+                            _skip_current_job()
+                    for w in [row, lbl]:
+                        w.bind("<Button-3>", _skip_current_click)
                 else:
                     handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
                                       font=("Segoe UI", 10), cursor="fleur", pady=2)
@@ -10482,9 +10657,13 @@ def _blink_tick():
                 style.configure("SyncQ.TButton", background=C_BTN)
                 style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # GPU Tasks button — keep blinking even when paused (GPU still busy until encode stops)
+        # GPU Tasks button — blink while actively encoding/transcribing, solid when paused & idle
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if is_on:
+            if _gpu_pause.is_set() and not _gpu_actively_encoding:
+                # Paused and GPU truly idle → solid color
+                style.configure("Gpu.TButton", background="#6b1a1a")
+                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+            elif is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
@@ -11125,15 +11304,27 @@ def _gpu_start():
                 _gpu_current["label"] = None
                 _gpu_current["ch_url"] = None
                 _gpu_current_item = None
-                _stop_whisper_process()
-                _stop_punct_process()
-                _stop_ffmpeg_process()
+                try:
+                    _stop_whisper_process()
+                except Exception:
+                    pass
+                try:
+                    _stop_punct_process()
+                except Exception:
+                    pass
+                try:
+                    _stop_ffmpeg_process()
+                except Exception:
+                    pass
                 _tray_stop_spin()
                 _update_tray_tooltip("YT Archiver — Idle")
                 _update_gpu_btn()
                 _save_queue_state()
-                if root.winfo_exists():
-                    root.after(0, _sync_task_finished)
+                try:
+                    if root.winfo_exists():
+                        root.after(0, _sync_task_finished)
+                except Exception:
+                    pass
 
         threading.Thread(target=_gpu_worker, daemon=True).start()
         return
@@ -12069,7 +12260,11 @@ def _run_autorun():
 
                 # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
-                if not cancel_event.is_set():
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _queue_started = _process_next_queued()
+                elif not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
                 if root.winfo_exists() and not _queue_started:

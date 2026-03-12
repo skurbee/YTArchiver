@@ -10595,6 +10595,8 @@ def _show_queue_menu(event=None):
                         _cdlg.resizable(False, False)
                         _cdlg.grab_set()
                         _cdlg.transient(root)
+                        _cdlg.update_idletasks()
+                        _apply_dark_title_bar(_cdlg)
                         tk.Label(_cdlg, text="Cancelling clears the queue. Are you sure?",
                                  bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10),
                                  padx=20, pady=16).pack()
@@ -10606,17 +10608,36 @@ def _show_queue_menu(event=None):
                         def _do_yes():
                             _choice[0] = "yes"
                             _cdlg.destroy()
-                        tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
-                                  activebackground="#3a5e84", activeforeground="#cccccc",
-                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
-                                  padx=14, pady=4, cursor="hand2",
-                                  command=_do_pause).pack(side="left", padx=(0, 8))
-                        tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
-                                  activebackground="#a52a2a", activeforeground="#ffffff",
-                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
-                                  padx=14, pady=4, cursor="hand2",
-                                  command=_do_yes).pack(side="left")
+                        def _do_no():
+                            _cdlg.destroy()
+                        if _sync_pipeline_active:
+                            tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                      activebackground="#a52a2a", activeforeground="#ffffff",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_yes).pack(side="left", padx=(0, 8))
+                            tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
+                                      activebackground="#3a5e84", activeforeground="#cccccc",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_pause).pack(side="left")
+                        else:
+                            tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                      activebackground="#a52a2a", activeforeground="#ffffff",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_yes).pack(side="left", padx=(0, 8))
+                            tk.Button(_cb_row, text="No", bg="#2a4a6b", fg="#cccccc",
+                                      activebackground="#3a5e84", activeforeground="#cccccc",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_no).pack(side="left")
                         _cdlg.protocol("WM_DELETE_WINDOW", _cdlg.destroy)
+                        # Center on root window
+                        _cdlg.update_idletasks()
+                        _rx = root.winfo_rootx() + root.winfo_width() // 2
+                        _ry = root.winfo_rooty() + root.winfo_height() // 2
+                        _cdlg.geometry(f"+{_rx - _cdlg.winfo_width() // 2}+{_ry - _cdlg.winfo_height() // 2}")
                         _cdlg.wait_window()
                         if _choice[0] == "pause":
                             toggle_pause()
@@ -11271,6 +11292,8 @@ def _show_gpu_menu(event=None):
                         _cdlg.resizable(False, False)
                         _cdlg.grab_set()
                         _cdlg.transient(root)
+                        _cdlg.update_idletasks()
+                        _apply_dark_title_bar(_cdlg)
                         tk.Label(_cdlg, text="Cancelling clears the queue. Are you sure?",
                                  bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10),
                                  padx=20, pady=16).pack()
@@ -11282,17 +11305,36 @@ def _show_gpu_menu(event=None):
                         def _do_yes():
                             _choice[0] = "yes"
                             _cdlg.destroy()
-                        tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
-                                  activebackground="#3a5e84", activeforeground="#cccccc",
-                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
-                                  padx=14, pady=4, cursor="hand2",
-                                  command=_do_pause).pack(side="left", padx=(0, 8))
-                        tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
-                                  activebackground="#a52a2a", activeforeground="#ffffff",
-                                  relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
-                                  padx=14, pady=4, cursor="hand2",
-                                  command=_do_yes).pack(side="left")
+                        def _do_no():
+                            _cdlg.destroy()
+                        if _gpu_running:
+                            tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                      activebackground="#a52a2a", activeforeground="#ffffff",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_yes).pack(side="left", padx=(0, 8))
+                            tk.Button(_cb_row, text="Pause", bg="#2a4a6b", fg="#cccccc",
+                                      activebackground="#3a5e84", activeforeground="#cccccc",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_pause).pack(side="left")
+                        else:
+                            tk.Button(_cb_row, text="Yes", bg="#8b1a1a", fg="#ffffff",
+                                      activebackground="#a52a2a", activeforeground="#ffffff",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_yes).pack(side="left", padx=(0, 8))
+                            tk.Button(_cb_row, text="No", bg="#2a4a6b", fg="#cccccc",
+                                      activebackground="#3a5e84", activeforeground="#cccccc",
+                                      relief="flat", bd=0, font=("Segoe UI", 9, "bold"),
+                                      padx=14, pady=4, cursor="hand2",
+                                      command=_do_no).pack(side="left")
                         _cdlg.protocol("WM_DELETE_WINDOW", _cdlg.destroy)
+                        # Center on root window
+                        _cdlg.update_idletasks()
+                        _rx = root.winfo_rootx() + root.winfo_width() // 2
+                        _ry = root.winfo_rooty() + root.winfo_height() // 2
+                        _cdlg.geometry(f"+{_rx - _cdlg.winfo_width() // 2}+{_ry - _cdlg.winfo_height() // 2}")
                         _cdlg.wait_window()
                         if _choice[0] == "pause":
                             _gpu_pause_handler()

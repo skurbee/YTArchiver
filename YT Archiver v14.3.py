@@ -1779,7 +1779,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.1 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.3 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3448,7 +3448,7 @@ def sync_single_channel():
                     if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                         _sc_prompt_shown[0] = True
                         if _ask_start_gpu_tasks(count):
-                            root.after(0, _gpu_start)
+                            _ui_queue.append(_gpu_start)
 
             if not cancel_event.is_set() and not _all_cached_done:
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
@@ -3546,8 +3546,7 @@ def sync_single_channel():
                     # Don't update global "Last Full Sync" for single channel syncs —
                     # that should only be set when a full sync-subbed run completes.
                 save_config(config)
-                if root.winfo_exists():
-                    root.after(0, refresh_channel_dropdowns)
+                _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
                 if c_dl > 0:
@@ -3638,7 +3637,7 @@ def sync_single_channel():
                             if _iv:
                                 _schedule_autorun(_iv)
 
-                        root.after(0, _on_single_sync_done)
+                        _ui_queue.append(_on_single_sync_done)
 
                 # Process any videos queued during the sync (only if no queued sync took over)
                 if not cancel_event.is_set() and not _queue_started:
@@ -3687,7 +3686,7 @@ def _process_sync_queue():
         sync_single_channel()
 
     if root.winfo_exists():
-        root.after(100, _start_queued)
+        _ui_queue.append(_start_queued)
     return True
 
 
@@ -3741,8 +3740,7 @@ def _process_video_dl_queue():
         sync_single_btn.config(state="disabled")
         _update_queue_btn()
 
-    if root.winfo_exists():
-        root.after(0, _show_dl_ui)
+    _ui_queue.append(_show_dl_ui)
 
     for cmd, is_single in queued:
         if cancel_event.is_set():
@@ -3757,12 +3755,12 @@ def _process_video_dl_queue():
             except (ValueError, IndexError):
                 pass
             break
-        if is_single and root.winfo_exists():
+        if is_single:
             def _clear_url():
                 url_var.set("")
                 url_entry.event_generate("<FocusOut>")
                 vid_custom_name_var.set("")
-            root.after(0, _clear_url)
+            _ui_queue.append(_clear_url)
 
     # Reset UI from main thread
     def _done_dl_ui():
@@ -3773,8 +3771,7 @@ def _process_video_dl_queue():
         _sync_task_finished()
         on_chan_list_select(None)
 
-    if root.winfo_exists():
-        root.after(0, _done_dl_ui)
+    _ui_queue.append(_done_dl_ui)
 
 
 def remove_channel():
@@ -4251,7 +4248,7 @@ def _fix_file_dates(channel_url, folder_path):
                 pass
 
         if root.winfo_exists():
-            root.after(0, lambda: _animate_fetch_dots())
+            _ui_queue.append(lambda: _animate_fetch_dots())
 
         for line in proc.stdout:
             if cancel_event.is_set():
@@ -4488,10 +4485,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
         _reorg_running = True
         try:
             cancel_event.clear()
-            if root.winfo_exists():
-                def _reorg_start_ui():
-                    _update_queue_btn()
-                root.after(0, _reorg_start_ui)
+            _ui_queue.append(lambda: _update_queue_btn())
             if recheck_dates and ch_url:
                 _fix_file_dates(ch_url, folder_path)
                 if cancel_event.is_set():
@@ -4502,17 +4496,16 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                 _chan_ctx_update_split(ch_url, target_years, target_months)
         finally:
             _reorg_running = False
-            if root.winfo_exists():
-                def _reorg_done():
-                    _sync_task_finished()
-                    if _reorg_done_job["id"]:
-                        try:
-                            root.after_cancel(_reorg_done_job["id"])
-                        except Exception:
-                            pass
-                    reorg_done_label.pack(side="left", padx=(4, 0))
-                    _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
-                root.after(0, _reorg_done)
+            def _reorg_done():
+                _sync_task_finished()
+                if _reorg_done_job["id"]:
+                    try:
+                        root.after_cancel(_reorg_done_job["id"])
+                    except Exception:
+                        pass
+                reorg_done_label.pack(side="left", padx=(4, 0))
+                _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
+            _ui_queue.append(_reorg_done)
             # Process any queued jobs in insertion order
             if _skip_current.is_set():
                 _skip_current.clear()
@@ -5649,7 +5642,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         result = messagebox.askyesno("Backlog Compression", msg, parent=root)
                         _confirm_result[0] = True if result else "redo"
 
-                    root.after(0, _ask_confirm)
+                    _ui_queue.append(_ask_confirm)
                     while _confirm_result[0] is None and not _ce.is_set():
                         time.sleep(0.25)
 
@@ -5722,7 +5715,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             dlg.update_idletasks()
                             dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
 
-                        root.after(0, _ask_new_settings)
+                        _ui_queue.append(_ask_new_settings)
                         while _new_settings[0] is None and not _ce.is_set():
                             time.sleep(0.25)
 
@@ -6123,7 +6116,7 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
         _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
     if root.winfo_exists():
-        root.after(0, _ask)
+        _ui_queue.append(_ask)
         while _model_result[0] is None and not cancel_event.is_set():
             time.sleep(0.1)
 
@@ -6194,7 +6187,7 @@ def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
         dlg.update_idletasks()
         dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
 
-    root.after(0, _show)
+    _ui_queue.append(_show)
     _ce = cancel_ev or cancel_event
     while _result[0] is None and not _ce.is_set():
         time.sleep(0.25)
@@ -6344,14 +6337,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _update_queue_btn()
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
-        if root.winfo_exists():
-            root.after(0, refresh_channel_dropdowns)
+        _ui_queue.append(refresh_channel_dropdowns)
         _whisper_available = None  # None = not checked yet
 
         try:
             _ce.clear()
-            if not _sync_mode and root.winfo_exists():
-                root.after(0, _update_queue_btn)
+            if not _sync_mode:
+                _ui_queue.append(_update_queue_btn)
 
             log(f"\n{'='*60}\n", "header")
             log(f"  TRANSCRIBING: {ch_name}\n", "header")
@@ -6688,7 +6680,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(_DEFAULT_MODEL))
 
                     if root.winfo_exists():
-                        root.after(0, _ask_model)
+                        _ui_queue.append(_ask_model)
                         while _model_result[0] is None and not _ce.is_set():
                             time.sleep(0.1)
 
@@ -6737,7 +6729,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     "Whisper requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                                     "Install now? (These videos will be skipped if you decline)")
                             if root.winfo_exists():
-                                root.after(0, _ask_install)
+                                _ui_queue.append(_ask_install)
                                 while _install_result[0] is None and not _ce.is_set():
                                     time.sleep(0.1)
                                 if _install_result[0]:
@@ -6932,10 +6924,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _current_job["label"] = None
                     _current_job["url"] = None
                 _update_queue_btn()
-            if root.winfo_exists():
-                root.after(0, refresh_channel_dropdowns)
-            if not _sync_mode and root.winfo_exists():
-                root.after(0, _sync_task_finished)
+            _ui_queue.append(refresh_channel_dropdowns)
+            if not _sync_mode:
+                _ui_queue.append(_sync_task_finished)
             # Process any queued jobs in insertion order (only when not in sync_mode)
             if not _sync_mode:
                 if _skip_current.is_set():
@@ -7095,8 +7086,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
 
         try:
             _ce.clear()
-            if not _sync_mode and root.winfo_exists():
-                root.after(0, _update_queue_btn)
+            if not _sync_mode:
+                _ui_queue.append(_update_queue_btn)
 
             log(f"\n{'='*60}\n", "header")
             log(f"  MANUAL TRANSCRIPTION: {fname}\n", "header")
@@ -7161,16 +7152,15 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                         "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
-                if root.winfo_exists():
-                    root.after(0, _ask_install)
-                    while _install_result[0] is None and not _ce.is_set():
-                        time.sleep(0.1)
-                    if not _install_result[0]:
-                        log(f"  Transcription cancelled \u2014 Whisper not installed.\n", "red")
-                        return
-                    if not _install_whisper_blocking():
-                        log(f"  Failed to install Whisper.\n", "red")
-                        return
+                _ui_queue.append(_ask_install)
+                while _install_result[0] is None and not _ce.is_set():
+                    time.sleep(0.1)
+                if not _install_result[0]:
+                    log(f"  Transcription cancelled \u2014 Whisper not installed.\n", "red")
+                    return
+                if not _install_whisper_blocking():
+                    log(f"  Failed to install Whisper.\n", "red")
+                    return
 
             # Get duration for progress reporting
             _dur_secs = 0
@@ -7225,8 +7215,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                     _current_job["label"] = None
                     _current_job["url"] = None
                 _update_queue_btn()
-            if not _sync_mode and root.winfo_exists():
-                root.after(0, _sync_task_finished)
+            if not _sync_mode:
+                _ui_queue.append(_sync_task_finished)
             if not _sync_mode:
                 if _skip_current.is_set():
                     _skip_current.clear()
@@ -7313,16 +7303,15 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                         "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
-                if root.winfo_exists():
-                    root.after(0, _ask_install)
-                    while _install_result[0] is None and not _ce.is_set():
-                        time.sleep(0.1)
-                    if not _install_result[0]:
-                        log(f"  Transcription cancelled — Whisper not installed.\n", "red")
-                        return
-                    if not _install_whisper_blocking():
-                        log(f"  Failed to install Whisper.\n", "red")
-                        return
+                _ui_queue.append(_ask_install)
+                while _install_result[0] is None and not _ce.is_set():
+                    time.sleep(0.1)
+                if not _install_result[0]:
+                    log(f"  Transcription cancelled — Whisper not installed.\n", "red")
+                    return
+                if not _install_whisper_blocking():
+                    log(f"  Failed to install Whisper.\n", "red")
+                    return
 
             _stop_whisper_process()
             log(f"  Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
@@ -7835,17 +7824,17 @@ def do_preview_folder():
                     if not folder_override_var.get().strip(): folder_override_var.set(detected_name)
 
                 if name and proc.returncode == 0:
-                    root.after(0, lambda: _update_ui(name))
+                    _ui_queue.append(lambda: _update_ui(name))
                 else:
-                    root.after(0, lambda: folder_preview_var.set("couldn't detect — check URL"))
+                    _ui_queue.append(lambda: folder_preview_var.set("couldn't detect — check URL"))
             except subprocess.TimeoutExpired:
                 if proc: proc.kill()
-                root.after(0, lambda: folder_preview_var.set("Timeout"))
+                _ui_queue.append(lambda: folder_preview_var.set("Timeout"))
         except Exception as e:
-            root.after(0, lambda err=e: folder_preview_var.set(f"error: {err}"))
+            _ui_queue.append(lambda err=e: folder_preview_var.set(f"error: {err}"))
         finally:
             cleanup_process(proc)
-            root.after(0, lambda: preview_btn.config(state="normal") if preview_btn.winfo_exists() else None)
+            _ui_queue.append(lambda: preview_btn.config(state="normal") if preview_btn.winfo_exists() else None)
 
     threading.Thread(target=_probe, daemon=True).start()
 
@@ -8656,14 +8645,14 @@ def run_cmd(cmd, is_single_video=False):
                     sync_btn.config(state="normal")
                 on_chan_list_select(None)
 
-            root.after(0, _done)
+            _ui_queue.append(_done)
             if is_single_video:
                 def _clear_url():
                     url_var.set("")
                     url_entry.event_generate("<FocusOut>")
                     vid_custom_name_var.set("")
 
-                root.after(0, _clear_url)
+                _ui_queue.append(_clear_url)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -8724,6 +8713,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
             # Pause check runs even when yt-dlp produces no output
             if pause_event.is_set() and not cancel_event.is_set():
+                clear_transient_lines()
                 log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pauselog")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
@@ -9397,6 +9387,7 @@ def start_sync_all():
                 i = processed
 
                 if pause_event.is_set():
+                    clear_transient_lines()
                     log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pauselog")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
@@ -9641,7 +9632,7 @@ def start_sync_all():
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
                             if _ask_start_gpu_tasks(count):
-                                root.after(0, _gpu_start)
+                                _ui_queue.append(_gpu_start)
 
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
@@ -9715,7 +9706,7 @@ def start_sync_all():
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
                 if root.winfo_exists():
-                    root.after(0, refresh_channel_dropdowns)
+                    _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
                 if c_dl > 0:
@@ -9805,9 +9796,9 @@ def start_sync_all():
                     save_config(config)
                 _dl = session_totals["dl"]
                 if root.winfo_exists():
-                    root.after(0, refresh_channel_dropdowns)
+                    _ui_queue.append(refresh_channel_dropdowns)
                     if not _queue_items_removed:
-                        root.after(0, lambda ts=_ts: _update_last_sync_display(ts))
+                        _ui_queue.append(lambda ts=_ts: _update_last_sync_display(ts))
                 _plural = "s" if _dl != 1 else ""
                 show_notification(
                     "YT Archiver — Sync complete",
@@ -9850,7 +9841,7 @@ def start_sync_all():
                         if _iv:
                             _schedule_autorun(_iv)
 
-                    root.after(0, _on_manual_sync_done)
+                    _ui_queue.append(_on_manual_sync_done)
 
                 # Process any videos queued during the sync (only if no queued sync took over)
                 if not cancel_event.is_set() and not _queue_started:
@@ -10610,8 +10601,10 @@ def _update_queue_btn():
                 _sync_blink_stop()
         except Exception:
             pass
-    if root.winfo_exists():
-        root.after(0, _do)
+    try:
+        _ui_queue.append(_do)
+    except Exception:
+        pass
 
 
 # --- GPU Tasks Button ---
@@ -10761,8 +10754,10 @@ def _update_gpu_btn():
                 _gpu_blink_stop()
         except Exception:
             pass
-    if root.winfo_exists():
-        root.after(0, _do)
+    try:
+        _ui_queue.append(_do)
+    except Exception:
+        pass
 
 
 def _get_gpu_queue_items():
@@ -11306,8 +11301,7 @@ def _gpu_start():
                         _gpu_current["label"] = f"Transcribe {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
-                        if root.winfo_exists():
-                            root.after(0, refresh_channel_dropdowns)
+                        _ui_queue.append(refresh_channel_dropdowns)
                         _start_transcription(
                             item["ch_name"], item["ch_url"], item["folder"],
                             item["split_years"], item["split_months"], item["combined"],
@@ -11346,8 +11340,7 @@ def _gpu_start():
                 _update_gpu_btn()
                 _save_queue_state()
                 try:
-                    if root.winfo_exists():
-                        root.after(0, _sync_task_finished)
+                    _ui_queue.append(_sync_task_finished)
                 except Exception:
                     pass
 
@@ -11560,8 +11553,7 @@ def _gpu_start():
             _update_gpu_btn()
             _save_queue_state()
             # Safety: ensure main cancel/pause buttons are hidden after GPU work
-            if root.winfo_exists():
-                root.after(0, _sync_task_finished)
+            _ui_queue.append(_sync_task_finished)
 
     threading.Thread(target=_gpu_worker, daemon=True).start()
 
@@ -11758,7 +11750,7 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
             config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
     if root.winfo_exists():
-        root.after(0, _refresh_autorun_history)
+        _ui_queue.append(_refresh_autorun_history)
 
 
 _record_autorun = _record_sync
@@ -11787,7 +11779,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
             config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
     if root.winfo_exists():
-        root.after(0, _refresh_autorun_history)
+        _ui_queue.append(_refresh_autorun_history)
 
 
 def _tick_countdown():
@@ -11855,7 +11847,7 @@ def _run_autorun():
     cancel_event.clear()
 
     if root.winfo_exists():
-        root.after(0, lambda: (
+        _ui_queue.append(lambda: (
             sync_btn.config(state="disabled", text="⏳ Auto-syncing..."),
             _update_queue_btn(),
         ))
@@ -11885,6 +11877,7 @@ def _run_autorun():
                     break
 
                 if pause_event.is_set():
+                    clear_transient_lines()
                     log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pauselog")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
@@ -12107,7 +12100,7 @@ def _run_autorun():
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
                             if _ask_start_gpu_tasks(count):
-                                root.after(0, _gpu_start)
+                                _ui_queue.append(_gpu_start)
 
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
@@ -12182,7 +12175,7 @@ def _run_autorun():
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
                 if root.winfo_exists():
-                    root.after(0, refresh_channel_dropdowns)
+                    _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
                 if c_dl > 0:
@@ -12276,8 +12269,8 @@ def _run_autorun():
 
             # Always update display timestamps
             if root.winfo_exists():
-                root.after(0, refresh_channel_dropdowns)
-                root.after(0, lambda ts=_ts: _update_last_sync_display(ts))
+                _ui_queue.append(refresh_channel_dropdowns)
+                _ui_queue.append(lambda ts=_ts: _update_last_sync_display(ts))
 
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
@@ -12305,7 +12298,7 @@ def _run_autorun():
                             _update_tray_tooltip(f"YT Archiver — {dl} new video{'s' if dl != 1 else ''} downloaded")
                         else:
                             _update_tray_tooltip("YT Archiver — Idle")
-                    root.after(0, _on_auto_done)
+                    _ui_queue.append(_on_auto_done)
 
                 # Process any videos queued during the sync (only if no queued sync took over)
                 if not cancel_event.is_set() and not _queue_started:
@@ -13166,7 +13159,7 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                 notebook.tab(tab_recent, text=f"  Recent ({new_download_count})  ")
                 _update_tray_badge()
 
-        if root.winfo_exists(): root.after(0, _sync)
+        if root.winfo_exists(): _ui_queue.append(_sync)
 
     threading.Thread(target=_delayed_record, daemon=True).start()
 
@@ -13215,7 +13208,7 @@ def check_dependencies():
                     globals()["ImageDraw"] = _drw
                     HAS_TRAY = True
                     if root.winfo_exists():
-                        root.after(0, _setup_tray_icon)
+                        _ui_queue.append(_setup_tray_icon)
                 except ImportError:
                     pass
             threading.Thread(target=_install_tray, daemon=True).start()
@@ -13322,7 +13315,7 @@ def _check_channel_folders():
             root.after(0, refresh_channel_dropdowns)
 
     if root.winfo_exists():
-        root.after(0, _prompt_missing)
+        _ui_queue.append(_prompt_missing)
         # Wait for the dialogs to complete before continuing startup
         try:
             result_q.get(timeout=300)
@@ -13465,7 +13458,7 @@ def run_startup_updates():
 
         # Enable sync button now that startup is complete
         if root.winfo_exists():
-            root.after(0, lambda: sync_btn.config(state="normal"))
+            _ui_queue.append(lambda: sync_btn.config(state="normal"))
 
         # Restore preserved queue from previous session if any
         _load_queue_state()

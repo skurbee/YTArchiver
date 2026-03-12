@@ -1650,7 +1650,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v12.7 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v12.8 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4758,7 +4758,10 @@ def _start_whisper_process():
 
     try:
         _model = _whisper_model_choice
-        log(f"  Loading faster-whisper model ({_model}) on GPU... (first run downloads model)\n", "simpleline")
+        _hf_cache = os.path.join(os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")), "hub")
+        _model_cached = os.path.isdir(os.path.join(_hf_cache, f"models--Systran--faster-whisper-{_model}"))
+        _dl_hint = "" if _model_cached else " (first run downloads model)"
+        log(f"  Loading faster-whisper model ({_model}) on GPU...{_dl_hint}\n", "simpleline")
         _env = os.environ.copy()
         _env["WHISPER_MODEL"] = _model
         _env["WHISPER_DEVICE"] = "cuda"
@@ -6178,7 +6181,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _cfg_ch.get("url") == ch_url:
                             _cfg_ch["transcription_complete"] = True
                             break
-                    save_config()
+                    save_config(config)
                 return
 
             if _ce.is_set():
@@ -6622,7 +6625,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             if _cfg_ch.get("url") == ch_url:
                                 _cfg_ch["transcription_complete"] = True
                                 break
-                        save_config()
+                        save_config(config)
 
             # ── Transcription Summary ──
             if _transcription_log:
@@ -9644,7 +9647,7 @@ def _sync_task_finished():
 # --- Sync Tasks Button ---
 _queue_popup = {"win": None}  # Track the popup window
 
-queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="SyncQ.TButton")
+queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="SyncQ.TButton", takefocus=False)
 # Packed later after _last_sync_spacer is created
 
 # --- Sync badge (green circle with count) ---
@@ -10228,7 +10231,7 @@ def _update_queue_btn():
 
 
 # --- GPU Tasks Button ---
-gpu_btn = ttk.Button(btn_frame, text="💻", width=3, style="Gpu.TButton")
+gpu_btn = ttk.Button(btn_frame, text="💻", width=3, style="Gpu.TButton", takefocus=False)
 # Packed later after _last_sync_spacer is created
 
 # --- GPU badge (red circle with count) ---

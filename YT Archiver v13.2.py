@@ -187,6 +187,9 @@ _ui_queue = collections.deque()
 # during downloads).  Updated on the main thread via trace callback.
 _is_simple_mode = False
 
+# Persistent auto-scroll flag — survives yview fluctuations during batch UI queue processing
+_log_at_bottom = True
+
 # Whisper progress dot animation state
 _whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
 
@@ -229,14 +232,20 @@ def _sync_mini_logs_timer():
 
 def log(text, tag=None):
     def _write():
+        global _log_at_bottom
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
-                # Save scroll state before manipulating
+                # Update persistent auto-scroll flag with hysteresis
                 try:
                     yview = log_box.yview()
-                    at_bottom = yview[1] >= 0.99
+                    if yview[1] >= 0.99:
+                        _log_at_bottom = True
+                    elif yview[1] < 0.90:
+                        _log_at_bottom = False
+                    # Between 0.90-0.99: keep previous value (handles batch processing)
                 except Exception:
-                    at_bottom = True
+                    pass
+                at_bottom = _log_at_bottom
 
                 log_box.config(state="normal")
 
@@ -1650,7 +1659,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.1 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.2 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6284,12 +6293,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 idx += 1
 
                 # Pause check
+                _pl = "GPU Tasks" if _sync_mode else "Sync"
                 if _pe.is_set() and not _ce.is_set():
-                    log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pauselog")
                     while _pe.is_set() and not _ce.is_set():
                         time.sleep(0.25)
                     if not _ce.is_set():
-                        log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                        log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                 if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
@@ -6356,7 +6366,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                 _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                 _src_part = f"{source},"
-                log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
+                if _is_simple_mode:
+                    _prefix = f"  [{idx}/{total}] "
+                    _suffix = f"done ({_src_part} {_ve_str})"
+                    _body_width = 58 - len(_prefix)
+                    _name_dash = f"{fname} — "
+                    if len(_name_dash) > _body_width:
+                        _name_dash = fname[:_body_width - 6] + "... — "
+                    else:
+                        _name_dash = _name_dash.ljust(_body_width)
+                    log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_green")
+                else:
+                    log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -6533,12 +6554,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         idx += 1
 
                         # Pause check
+                        _pl = "GPU Tasks" if _sync_mode else "Sync"
                         if _pe.is_set() and not _ce.is_set():
-                            log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                            log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pauselog")
                             while _pe.is_set() and not _ce.is_set():
                                 time.sleep(0.25)
                             if not _ce.is_set():
-                                log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                                log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                         if _ce.is_set():
                             log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                             break
@@ -6607,7 +6629,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                         _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                         _src_part = f"{source},"
-                        log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
+                        if _is_simple_mode:
+                            _prefix = f"  [{idx}/{total}] "
+                            _suffix = f"done ({_src_part} {_ve_str})"
+                            _body_width = 58 - len(_prefix)
+                            _name_dash = f"{fname} — "
+                            if len(_name_dash) > _body_width:
+                                _name_dash = fname[:_body_width - 6] + "... — "
+                            else:
+                                _name_dash = _name_dash.ljust(_body_width)
+                            log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_green")
+                        else:
+                            log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
                 else:
                     err_count += len(unmatched)
 
@@ -8427,11 +8460,11 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
             # Pause check runs even when yt-dlp produces no output
             if pause_event.is_set() and not cancel_event.is_set():
-                log(f"  ⏸ Paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pauselog")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
                 if not cancel_event.is_set():
-                    log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                    log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
             if cancel_event.is_set():
                 break
 
@@ -9078,12 +9111,12 @@ def start_sync_all():
                 i = processed
 
                 if pause_event.is_set():
-                    log(f"  ⏸ Paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pauselog")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set():
                         break
-                    log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                    log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch["name"]
                 ch_dl_map[ch_name] = 0
@@ -10757,11 +10790,11 @@ def _gpu_start():
             try:
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                        log(f"  ⏸ GPU Tasks paused.\n", "pauselog")
+                        log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                             time.sleep(0.25)
                         if not _gpu_cancel.is_set():
-                            log(f"  ▶ GPU Tasks resuming...\n", "pauselog")
+                            log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
                         log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
@@ -10969,11 +11002,11 @@ def _gpu_start():
             while True:
                 # Pause check
                 if _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                    log(f"  ⏸ GPU Tasks paused.\n", "pauselog")
+                    log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         time.sleep(0.25)
                     if not _gpu_cancel.is_set():
-                        log(f"  ▶ GPU Tasks resuming...\n", "pauselog")
+                        log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _gpu_cancel.is_set():
                     log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
@@ -11391,12 +11424,12 @@ def _run_autorun():
                     break
 
                 if pause_event.is_set():
-                    log(f"  ⏸ Paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pauselog")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set():
                         break
-                    log(f"  ▶ Resuming at {_fmt_time()}...\n", "pauselog")
+                    log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
@@ -12108,7 +12141,8 @@ def _sync_mini_logs_from_main():
         # Use dump() to extract text with tag transitions preserved
         _allowed = set(_ALL_LOG_TAGS)
         segments = []  # list of (text, tag_or_None)
-        active_tags = set()
+        # Seed active_tags with tags already active at the start of the dump range
+        active_tags = set(t for t in _ALL_LOG_TAGS if t in log_box.tag_names(f"{start_line}.0"))
         try:
             for item in log_box.dump(f"{start_line}.0", "end-1c", tag=True, text=True):
                 kind = item[0]

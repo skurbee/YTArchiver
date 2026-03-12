@@ -1683,7 +1683,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v13.3 - 03.11.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v13.4 - 03.11.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10182,21 +10182,40 @@ def _show_queue_menu(event=None):
                             font=("Segoe UI", 8), anchor="w")
             hint.pack(fill="x", padx=4, pady=(2, 2))
 
-            # Footer buttons (Pause/Resume, Cancel) — only shown when sync is running
-            if _sync_running or _reorg_running:
+            # Footer buttons — show when running (Pause/Cancel) or queued (Start/Cancel)
+            _show_sync_btns = False
+            if _sync_running or _reorg_running or _transcribe_running:
+                _show_sync_btns = True
+            else:
+                _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue)
+                if _has_queued:
+                    _show_sync_btns = True
+
+            if _show_sync_btns:
                 btn_row = tk.Frame(wrapper, bg="#2d2d2d")
                 btn_row.pack(fill="x", padx=4, pady=(4, 6))
 
-                if pause_event.is_set():
-                    tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                if not (_sync_running or _reorg_running or _transcribe_running):
+                    # Not running but has queued items — show Start
+                    def _start_sync_queue():
+                        popup.destroy()
+                        cancel_event.clear()
+                        _process_next_queued()
+                    tk.Button(btn_row, text="\u25B6 Start", bg="#3a6a3a", fg="#cccccc",
                               activebackground="#4a8a4a", activeforeground="#cccccc",
                               relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                              cursor="hand2", command=_start_sync_queue).pack(side="left", padx=(4, 4))
                 else:
-                    tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
-                              activebackground="#3a5e84", activeforeground="#cccccc",
-                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                    if pause_event.is_set():
+                        tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                                  activebackground="#4a8a4a", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                                  cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                    else:
+                        tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
+                                  activebackground="#3a5e84", activeforeground="#cccccc",
+                                  relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                                  cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
                 tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
                           activebackground="#a52a2a", activeforeground="#ffffff",
                           relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
@@ -10714,10 +10733,10 @@ def _show_gpu_menu(event=None):
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
                                   cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
-                    tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
-                              activebackground="#a52a2a", activeforeground="#ffffff",
-                              relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                              cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
+                tk.Button(btn_row, text="\u26D4 Cancel", bg="#8b1a1a", fg="#ffffff",
+                          activebackground="#a52a2a", activeforeground="#ffffff",
+                          relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
+                          cursor="hand2", command=_gpu_cancel_handler).pack(side="left")
         else:
             empty = tk.Label(wrapper, text="  (empty)", bg="#2d2d2d", fg="#666666",
                              font=("Segoe UI", 9), anchor="w")
@@ -13155,9 +13174,6 @@ def _load_queue_state():
                 log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str}.\n", "simpleline_green")
             _update_queue_btn()
             _update_gpu_btn()
-            # Auto-open GPU popup so user can see Start/Resume buttons
-            if gpu_restored and 'root' in globals() and root.winfo_exists():
-                root.after(300, _show_gpu_menu)
             return True
     except Exception:
         pass

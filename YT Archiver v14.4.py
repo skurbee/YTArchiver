@@ -465,12 +465,15 @@ def _whisper_dot_tick():
 def _stop_whisper_dot_anim():
     """Stop the whisper dot animation."""
     _whisper_dots["active"] = False
-    if _whisper_dots["job"]:
-        try:
-            root.after_cancel(_whisper_dots["job"])
-        except Exception:
-            pass
-        _whisper_dots["job"] = None
+    _old_job = _whisper_dots.get("job")
+    _whisper_dots["job"] = None
+    if _old_job:
+        def _do_cancel():
+            try:
+                root.after_cancel(_old_job)
+            except Exception:
+                pass
+        _ui_queue.append(_do_cancel)
 
 
 def _clear_whisper_progress():
@@ -758,12 +761,15 @@ def _encode_dot_tick():
 def _clear_encode_progress():
     """Clear the encoding progress line and stop dot animation."""
     _encode_dots["active"] = False
-    if _encode_dots["job"]:
-        try:
-            root.after_cancel(_encode_dots["job"])
-        except Exception:
-            pass
-        _encode_dots["job"] = None
+    _old_job = _encode_dots.get("job")
+    _encode_dots["job"] = None
+    if _old_job:
+        def _do_cancel():
+            try:
+                root.after_cancel(_old_job)
+            except Exception:
+                pass
+        _ui_queue.append(_do_cancel)
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -859,28 +865,34 @@ def _simple_anim_tick():
 
 
 def _start_simple_anim(channel, idx, total):
-    if _simple_anim_state["job"]:
-        try:
-            root.after_cancel(_simple_anim_state["job"])
-        except Exception:
-            pass
+    _old_job = _simple_anim_state.get("job")
     _simple_anim_state.update({"active": True, "channel": channel,
                                "idx": idx, "total": total, "dots": 0,
                                "dl_current": 0, "ch_total": 0, "page_num": 0,
                                "enum_page": 0, "enum_count": 0, "batch_size": 0,
                                "job": None})
-    if root.winfo_exists():
-        _simple_anim_state["job"] = root.after(0, _simple_anim_tick)
+    def _do_start():
+        if _old_job:
+            try:
+                root.after_cancel(_old_job)
+            except Exception:
+                pass
+        if _simple_anim_state["active"] and root.winfo_exists():
+            _simple_anim_state["job"] = root.after(0, _simple_anim_tick)
+    _ui_queue.append(_do_start)
 
 
 def _stop_simple_anim():
     _simple_anim_state["active"] = False
-    if _simple_anim_state["job"]:
-        try:
-            root.after_cancel(_simple_anim_state["job"])
-        except Exception:
-            pass
-        _simple_anim_state["job"] = None
+    _old_job = _simple_anim_state.get("job")
+    _simple_anim_state["job"] = None
+    if _old_job:
+        def _do_cancel():
+            try:
+                root.after_cancel(_old_job)
+            except Exception:
+                pass
+        _ui_queue.append(_do_cancel)
 
 
 def _update_simple_dl(dl_current, ch_total, batch_size=0):
@@ -1779,7 +1791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.3 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.4 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3219,11 +3231,12 @@ def sync_single_channel():
     _current_job["url"] = ch["url"]
     _tray_start_spin()
     _update_tray_tooltip(f"YT Archiver — Syncing {ch['name']}")
+    _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _single_worker():
         global _sync_running
         try:
-            out_dir = outdir_var.get().strip() or BASE_DIR
+            out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
                 log(f"ERROR: Cannot write to '{out_dir}'.\n", "red")
                 return
@@ -4073,19 +4086,20 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
 
     if is_simple:
         _reorg_anim_active[0] = True
-        if root.winfo_exists():
-            _reorg_anim_job[0] = root.after(0, _reorg_anim_tick)
+        def _start_reorg_anim():
+            if root.winfo_exists():
+                _reorg_anim_job[0] = root.after(0, _reorg_anim_tick)
+        _ui_queue.append(_start_reorg_anim)
 
     for i, (filepath, mtime, folder_year, folder_month) in enumerate(all_files):
         if cancel_event.is_set():
             log(f"  ⚠ Reorganization cancelled.\n", "red")
             # Stop the animation
             _reorg_anim_active[0] = False
-            if _reorg_anim_job[0]:
-                try:
-                    root.after_cancel(_reorg_anim_job[0])
-                except Exception:
-                    pass
+            _old_rj = _reorg_anim_job[0]
+            _reorg_anim_job[0] = None
+            if _old_rj:
+                _ui_queue.append(lambda j=_old_rj: root.after_cancel(j) if root.winfo_exists() else None)
             if is_simple:
                 log_simple_status("")
             return False
@@ -4162,11 +4176,10 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
 
     # Stop the animation
     _reorg_anim_active[0] = False
-    if _reorg_anim_job[0]:
-        try:
-            root.after_cancel(_reorg_anim_job[0])
-        except Exception:
-            pass
+    _old_rj = _reorg_anim_job[0]
+    _reorg_anim_job[0] = None
+    if _old_rj:
+        _ui_queue.append(lambda j=_old_rj: root.after_cancel(j) if root.winfo_exists() else None)
     # Clear the animated status line
     if is_simple:
         log_simple_status("")
@@ -4299,11 +4312,10 @@ def _fix_file_dates(channel_url, folder_path):
 
         # Stop the dot animation
         _fetch_anim["active"] = False
-        if _fetch_anim["job"] and root.winfo_exists():
-            try:
-                root.after_cancel(_fetch_anim["job"])
-            except Exception:
-                pass
+        _old_fetch_job = _fetch_anim.get("job")
+        _fetch_anim["job"] = None
+        if _old_fetch_job:
+            _ui_queue.append(lambda j=_old_fetch_job: root.after_cancel(j) if root.winfo_exists() else None)
 
         proc.wait()
         cleanup_process(proc)
@@ -6272,12 +6284,11 @@ def _add_to_gpu_queue(item, _quiet=False):
     _update_gpu_btn()
     _save_queue_state()
     # Refresh channel list so Transcribed column shows "Queued" immediately
-    if item.get("type") in ("transcribe", "mt") and root.winfo_exists():
-        root.after(50, refresh_channel_dropdowns)
+    if item.get("type") in ("transcribe", "mt"):
+        _ui_queue.append(refresh_channel_dropdowns)
     # Autorun: auto-start GPU processing if enabled and not already running
     if not _gpu_running and config.get("autorun_gpu", False):
-        if root.winfo_exists():
-            root.after(100, _gpu_start)
+        _ui_queue.append(_gpu_start)
 
 
 def _process_transcribe_queue():
@@ -8981,8 +8992,10 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         try:
                             if '_merge_anim' in dir() and _merge_anim.get("active"):
                                 _merge_anim["active"] = False
-                                if _merge_anim.get("job") and root.winfo_exists():
-                                    root.after_cancel(_merge_anim["job"])
+                                _old_merge_job = _merge_anim.get("job")
+                                _merge_anim["job"] = None
+                                if _old_merge_job:
+                                    _ui_queue.append(lambda j=_old_merge_job: root.after_cancel(j) if root.winfo_exists() else None)
                                 clear_simple_status()
                         except Exception:
                             pass
@@ -9057,8 +9070,10 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 if _merge_anim["active"] and root.winfo_exists():
                                     _merge_anim["job"] = root.after(500, _merge_anim_tick)
 
-                        if root.winfo_exists():
-                            _merge_anim["job"] = root.after(0, _merge_anim_tick)
+                        def _start_merge_anim():
+                            if root.winfo_exists():
+                                _merge_anim["job"] = root.after(0, _merge_anim_tick)
+                        _ui_queue.append(_start_merge_anim)
 
             if "recorded in the archive" in line:
                 skip_count += 1
@@ -9326,11 +9341,12 @@ def start_sync_all():
     _current_job["label"] = "Full Sub Sync"
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Syncing...")
+    _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _sync_worker():
         global _sync_running
         try:
-            out_dir = outdir_var.get().strip() or BASE_DIR
+            out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
                 log(f"ERROR: Cannot write to '{out_dir}'. Sync aborted.\n", "red")
                 return
@@ -11859,13 +11875,14 @@ def _run_autorun():
     _sync_running = True
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Auto-syncing...")
+    _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _auto_worker():
         global _autorun_active, _sync_running
         _autorun_active = True
         ch_dl_map = {}
         try:
-            out_dir = outdir_var.get().strip() or BASE_DIR
+            out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
                 log(f"ERROR: Cannot write to autorun target '{out_dir}'.\n", "red")
                 return

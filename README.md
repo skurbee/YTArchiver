@@ -31,6 +31,7 @@ HQ Compressor mode now fully functional.
 Instead of downloading @ low res from YT, you can download at high res then compress locally for higher quality to filesize ratio than youtube gives.
 Can retroactivly apply new settings to already downloaded videos. Processes them in batches of 20.
 Download 20 vids, compress 20 vids, replace those 20 in the channel folder. rinse and repeat until whole channel now reflects new settings
+
 Transcribe channels and output it to .txt files (following org structure that channel is in)
 
 this is maybe 2% me and 98% claude-code :)

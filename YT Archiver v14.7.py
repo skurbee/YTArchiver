@@ -915,6 +915,9 @@ def _cleanup_partial_files(directory):
         # Catch .mp4.part, .webm.part etc (double extension partials)
         if '.part' in name:
             return True
+        # Catch .temp.mp4, .temp.webm etc (yt-dlp mid-download temp files)
+        if '.temp.' in name.lower():
+            return True
         # Intermediate format files like .f136.mp4, .f251.webm
         if re.search(r'\.f\d+(\.\w+)?$', name):
             return True
@@ -956,6 +959,46 @@ def _cleanup_partial_files(directory):
 
     if cleaned:
         log(f"  🧹 Cleaned up {cleaned} partial file(s).\n", "dim")
+
+
+def _startup_cleanup_temps():
+    """Scan all channel folders on startup and remove leftover partial/temp files."""
+    try:
+        out_dir = config.get("output_dir", "").strip() or BASE_DIR
+        if not os.path.isdir(out_dir):
+            return
+        channels = config.get("channels", [])
+        if not channels:
+            return
+        total_cleaned = 0
+        for ch in channels:
+            folder_name = sanitize_folder(ch.get("folder_override", "") or ch.get("name", ""))
+            ch_folder = os.path.join(out_dir, folder_name)
+            if not os.path.isdir(ch_folder):
+                continue
+            # Inline scan without the sleep delay that _cleanup_partial_files uses
+            for dirpath, _, files in os.walk(ch_folder):
+                for f in files:
+                    name = f
+                    is_partial = (
+                        name.endswith('.part') or name.endswith('.temp') or name.endswith('.ytdl')
+                        or '.part' in name or '.temp.' in name.lower()
+                        or bool(re.search(r'\.f\d+(\.\w+)?$', name))
+                    )
+                    if not is_partial:
+                        base, ext = os.path.splitext(name)
+                        if ext.lower() in ('.webm', '.m4a', '.mp4') and re.search(r'\.f\d+$', base):
+                            is_partial = True
+                    if is_partial:
+                        try:
+                            os.remove(os.path.join(dirpath, f))
+                            total_cleaned += 1
+                        except OSError:
+                            pass
+        if total_cleaned:
+            log(f"  🧹 Cleaned up {total_cleaned} leftover temp file(s) from previous sessions.\n", "dim")
+    except Exception:
+        pass
 
 
 def _fetch_video_title(vid_id):
@@ -1792,7 +1835,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.5 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v14.7 - 03.12.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5020,8 +5063,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         for dirpath, _, files in os.walk(folder):
             for f in files:
                 if f.lower().endswith(_VIDEO_EXTS_COMPRESS):
-                    # Skip temp files from previous interrupted runs
-                    if "_TEMP_COMPRESS" in f:
+                    # Skip temp files from previous interrupted runs or partial downloads
+                    if "_TEMP_COMPRESS" in f or ".temp." in f.lower() or ".part" in f.lower():
                         continue
                     fpath = os.path.join(dirpath, f)
                     local_files[f] = fpath
@@ -5277,7 +5320,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             dirnames[:] = [d for d in dirnames if d != "_BACKLOG_TEMP"]
             for f in files:
                 if f.lower().endswith(_VIDEO_EXTS):
-                    if "_TEMP_COMPRESS" in f or "_BACKLOG_TEMP" in f:
+                    if "_TEMP_COMPRESS" in f or "_BACKLOG_TEMP" in f or ".temp." in f.lower() or ".part" in f.lower():
                         continue
                     fpath = os.path.join(dirpath, f)
                     local_files[f] = fpath
@@ -6369,6 +6412,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             for dirpath, _, files in os.walk(folder):
                 for f in files:
                     if f.lower().endswith(_VIDEO_EXTS):
+                        # Skip partial/temp files from interrupted downloads
+                        if ".temp." in f.lower() or ".part" in f.lower():
+                            continue
                         fname_no_ext = os.path.splitext(f)[0]
                         local_files[fname_no_ext] = os.path.join(dirpath, f)
 
@@ -13480,6 +13526,9 @@ def run_startup_updates():
 
         # Check that each subscribed channel's folder still exists
         _check_channel_folders()
+
+        # Clean up any leftover partial/temp files from interrupted downloads
+        _startup_cleanup_temps()
 
         log("--- Startup checks complete, ready to download ---\n", "simpleline_green")
 

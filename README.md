@@ -4,7 +4,7 @@ Built entirely with Claude-Code.
 
 I put some pictures on the wiki.
 
-I now use it in replacement of 4kVideoDownloader+ to download/archive full YT channels. 
+I now use it to download/transcribe/compress/archive full YT channels. 
 
 USE:
 

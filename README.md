@@ -38,10 +38,4 @@ this is maybe 2% me and 98% claude-code :)
 Uses CUDA for all GPU stuff. 
 
 
-I will list found but unpatched issues here:
-
-1. not a big fan how the main log jumps around when clearing lines in simple log mode
-
-2. 
-
 

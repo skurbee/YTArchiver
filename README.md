@@ -1,10 +1,12 @@
 # YTArchiverTool
-A personal project to replace 4KVideoDownloader+ with some extra features that I needed built in, built entirely with Claude-Code.
+A personal project to replace 4KVideoDownloader+, with some extra features that I needed built in.
+Built entirely with Claude-Code.
 
 I put some pictures on the wiki.
 
-What started out as a simple script has turned into a YT-DLP GUI with some features I wanted added on top. I now use it in replacement of 4kVideoDownloader+ to download/archive full YT channels. 
+I now use it in replacement of 4kVideoDownloader+ to download/archive full YT channels. 
 
+USE:
 Add channel to sub list
 
 Choose resolution to download that channel at

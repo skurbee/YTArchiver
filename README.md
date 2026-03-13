@@ -7,6 +7,7 @@ I put some pictures on the wiki.
 I now use it in replacement of 4kVideoDownloader+ to download/archive full YT channels. 
 
 USE:
+
 Add channel to sub list
 
 Choose resolution to download that channel at

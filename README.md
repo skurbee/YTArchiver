@@ -11,7 +11,7 @@ Choose resolution to download that channel at
 
 Set Max/Min duration limits to cut out shorts/live
 
-Choose starting date to download-(if you don't want the first few years of a channel for example)
+Choose starting date to download- if you don't want the first few years of a channel, for example
 
 Compress after download- if you want to download @ 1080 then compress to a higher quality 360p output than yt gives, for example
 

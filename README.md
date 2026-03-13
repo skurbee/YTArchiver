@@ -1,6 +1,6 @@
 # YTArchiverTool
 A personal project to replace 4KVideoDownloader+, with some extra features that I needed built in.
-Built entirely with Claude-Code.
+Built with Claude-Code and a lil copilot
 
 I put some pictures on the wiki.
 

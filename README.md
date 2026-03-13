@@ -1,17 +1,21 @@
 # YTArchiverTool
-A personal project to replace 4KVideoDownloader+ with some features that I needed, built entirely with Claude-Code.
+A personal project to replace 4KVideoDownloader+ with some extra features that I needed built in, built entirely with Claude-Code.
 
 What started out as a simple script has turned into a somewhat complex YT-DLP GUI with some features I wanted added on top. I now use it in replacement of 4kVideoDownloader+ to download/archive YT channels.
 
-Sub to a channel-
+Add channel to sub list
 
-Choose resolution to download that channel at-
+Choose resolution to download that channel at
 
-Limit shortest/longest video to cut out shorts/live-
+Set Max/Min duration limits to cut out shorts/live
 
 Choose starting date to download-(if you don't want the first few years of a channel for example)
 
-Can organize (and re-organize!) downloaded channels into Years/Months
+Compress after download- if you want to download @ 1080 then compress to a higher quality 360p output than yt gives, for example
+
+Auto-sync subscribed channels timer, with seperate log to show activity and history
+
+Can organize/re-organize downloaded channels into Years/Months folders
 
 can retroactively change file dates to YT upload dates- if you're switching over from 4kVD
 
@@ -23,16 +27,10 @@ When downloading a large channel for the first time, it caches the video IDs. Th
 
 you can of course still manually download single videos
 
-Auto-Sync with log to show history
+seperage sync-tasks and gpu-tasks editable queues
 
-editable sync-queue and GPU-queue
+Transcribe full channels, and have the option to transcribe new downloads from that channel. Uses YT auto-captions + punctuation model when possible, falls back to whisper (with model options, per channel)
 
-HQ Compressor mode now fully functional.
-Instead of downloading @ low res from YT, you can download at high res then compress locally for higher quality to filesize ratio than youtube gives.
-Can retroactivly apply new settings to already downloaded videos. Processes them in batches of 20.
-Download 20 vids, compress 20 vids, replace those 20 in the channel folder. rinse and repeat until whole channel now reflects new settings
-
-Transcribe channels and output it to .txt files (following org structure that channel is in)
 
 this is maybe 2% me and 98% claude-code :)
 

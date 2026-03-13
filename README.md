@@ -40,6 +40,6 @@ this is maybe 2% me and 98% claude-code :)
 
 Uses CUDA for all GPU stuff. 
 
-I use it packedd in an exe w the icon, but if it's just in the same /dir it'll still work. It's for the taskbar
+I use it packed in an .exe with the icon, but if it's just in the same /dir it'll still work. It's for the taskbar
 
 

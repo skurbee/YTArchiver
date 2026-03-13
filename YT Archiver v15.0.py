@@ -270,7 +270,7 @@ def _sync_mini_logs_timer():
 
 def log(text, tag=None):
     def _write():
-        global _log_at_bottom
+        global _log_at_bottom, _log_scroll_freeze
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 # Update persistent auto-scroll flag with hysteresis
@@ -285,6 +285,8 @@ def log(text, tag=None):
                     pass
                 at_bottom = _log_at_bottom
 
+                # Freeze scrollbar layout during batch delete/insert to prevent visual jitter
+                _log_scroll_freeze = True
                 log_box.config(state="normal")
 
                 use_tag = tag
@@ -339,6 +341,8 @@ def log(text, tag=None):
                                 _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
                     else:
                         log_box.insert(tk.END, text, "whisper_progress")
+                    _log_scroll_freeze = False
+                    _auto_scrollbar(log_scroll, *log_box.yview())
                     if at_bottom:
                         log_box.see(tk.END)
                     log_box.config(state="disabled")
@@ -346,23 +350,26 @@ def log(text, tag=None):
 
                 if _is_simple_mode:
                     if use_tag == "header" and "---" in text:
+                        _log_scroll_freeze = False
                         log_box.config(state="disabled")
                         return
 
-                    if use_tag not in ("red", "simpleline", "simpleline_green", "summary", "header",
+                    if use_tag not in ("red", "simpleline", "simpleline_green", "simpleline_blue",
+                                       "summary", "header",
                                        "simpledownload", "pauselog", "livestream", "filterskip",
                                        "transcribe_using"):
                         if "SUMMARY:" not in text and "TOTAL SESSION" not in text and "===" not in text:
+                            _log_scroll_freeze = False
                             log_box.config(state="disabled")
                             return
 
-                    if use_tag in ("simpleline", "simpleline_green", "transcribe_using"):
+                    if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             log_box.delete(ranges[0], ranges[1])
 
                     # Purge "using/fetching" lines when a done line arrives
-                    if use_tag == "simpleline_green":
+                    if use_tag in ("simpleline_green", "simpleline_blue"):
                         for _tu_tag in ("transcribe_using",):
                             while True:
                                 _tu_r = log_box.tag_ranges(_tu_tag)
@@ -370,7 +377,7 @@ def log(text, tag=None):
                                     break
                                 log_box.delete(_tu_r[0], _tu_r[1])
 
-                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "red", "summary", "transcribe_using"):
+                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "simpleline_blue", "red", "summary", "transcribe_using"):
                         dl_ranges = log_box.tag_ranges("dlprogress")
                         if dl_ranges:
                             log_box.delete(dl_ranges[0], dl_ranges[1])
@@ -434,7 +441,14 @@ def log(text, tag=None):
                     except Exception:
                         pass
 
-                if at_bottom:
+                # Unfreeze scrollbar layout now that batch ops are done
+                _log_scroll_freeze = False
+                _auto_scrollbar(log_scroll, *log_box.yview())
+
+                # Skip auto-scroll for transient status messages (e.g. "Adding punctuation...")
+                # to prevent snapping back when user has scrolled up
+                _skip_scroll = (use_tag == "transcribe_using" and "Adding punctuation" in text)
+                if at_bottom and not _skip_scroll:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
 
@@ -447,6 +461,7 @@ def log(text, tag=None):
                 sys.stdout.flush()
         except Exception:
             # Ensure log_box is always re-disabled after an error mid-write
+            _log_scroll_freeze = False
             try:
                 if 'log_box' in globals() and log_box.winfo_exists():
                     log_box.config(state="disabled")
@@ -860,7 +875,12 @@ def _simple_anim_tick():
             return
 
         if pause_event.is_set():
-            return  # just return; finally block handles rescheduling
+            # Show static paused state instead of animated dots
+            i = _simple_anim_state["idx"]
+            n = _simple_anim_state["total"]
+            ch = _simple_anim_state["channel"]
+            log_simple_status(f"[{i}/{n}] PAUSED: {ch}\n")
+            return  # finally block handles rescheduling
         d = _DOTS[_simple_anim_state["dots"] % 3]
         _simple_anim_state["dots"] += 1
         i = _simple_anim_state["idx"]
@@ -1473,9 +1493,14 @@ def _tray_spin_loop():
 def _tray_start_spin(red=False):
     """Start the spinning animation on the tray icon.
     red=True uses a bold red spinner (for transcription / heavy GPU work).
+    Red always takes priority over blue — if GPU tasks are running, a sync
+    call with red=False will not downgrade to blue.
     """
     global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red, _tray_spin_thread
     if not HAS_TRAY or _tray_icon is None:
+        return
+    # Red (GPU) always takes priority — don't downgrade to blue if GPU is active
+    if not red and _gpu_running and _tray_spin_use_red:
         return
     _tray_spin_use_red = red
     _tray_spin_active = True
@@ -1487,9 +1512,16 @@ def _tray_start_spin(red=False):
         _tray_spin_thread.start()
 
 
-def _tray_stop_spin():
-    """Stop spinning and restore the base or badge icon."""
+def _tray_stop_spin(force=False):
+    """Stop spinning and restore the base or badge icon.
+    If GPU tasks just finished but sync is still running, fall back to blue spin
+    (unless force=True, which is used for pause).
+    """
     global _tray_spin_active
+    # If sync is still running, fall back to blue spin instead of stopping
+    if not force and _sync_running:
+        _tray_start_spin(red=False)
+        return
     _tray_spin_active = False
     _tray_spin_stop_ev.set()  # signal spin thread to exit
     _update_tray_badge()
@@ -1652,6 +1684,7 @@ C_WARN = "#6b3a10"
 C_LOG_BG = "#0a0b0d"
 C_LOG_TXT = "#7a8494"
 C_LOG_GREEN = "#3dd68c"
+C_LOG_BLUE = "#6cb4ee"
 C_LOG_DIM = "#272a2f"
 C_LOG_RED = "#ff6b6b"
 C_LOG_HEAD = "#a0aabb"
@@ -1876,7 +1909,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v14.8 - 03.12.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.0 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2167,7 +2200,12 @@ autorun_history_listbox.bind("<<ListboxSelect>>", _deselect_history)
 autorun_history_listbox.bind("<Button-1>", lambda e: "break")
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
+_log_scroll_freeze = False  # suppress scrollbar grid toggling during batch log ops
+
 def _auto_scrollbar(scrollbar, first, last):
+    if _log_scroll_freeze:
+        scrollbar.set(first, last)
+        return
     if float(first) <= 0.0 and float(last) >= 1.0:
         scrollbar.grid_remove()
     else:
@@ -2187,7 +2225,7 @@ log_scroll.grid_remove()  # hidden initially
 log_box = tk.Text(log_frame, state="disabled",
                   bg=C_LOG_BG, fg=C_LOG_TXT, font=("Consolas", 9),
                   relief="flat", bd=0, highlightthickness=0, padx=8, pady=6,
-                  selectbackground=C_BTN, selectforeground=C_TEXT,
+                  selectbackground=C_BTN, selectforeground=C_TEXT, wrap="none",
                   yscrollcommand=lambda f, l: _auto_scrollbar(log_scroll, f, l))
 log_box.grid(row=0, column=0, sticky="nsew")
 log_scroll.config(command=log_box.yview)
@@ -2204,6 +2242,7 @@ log_box.tag_configure("dlprogress", foreground=C_TEXT)
 log_box.tag_configure("simplestatus", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
 log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
+log_box.tag_configure("simpleline_blue", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("transcribe_using", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
@@ -3052,12 +3091,29 @@ def _chan_ctx_show(event):
 
         # Transcribe menu item (index 11) — now routes to GPU Tasks
         _ch_url_t = ch.get("url", "")
+        # Check if this channel has any downloaded videos
+        _ch_folder = _chan_ctx_get_folder()
+        _has_videos = False
+        if _ch_folder and os.path.isdir(_ch_folder):
+            _VIDEO_EXTS_CHECK = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
+            for _root_d, _dirs_d, _files_d in os.walk(_ch_folder):
+                if any(f.lower().endswith(_VIDEO_EXTS_CHECK) for f in _files_d):
+                    _has_videos = True
+                    break
         # Check if this channel is already being transcribed via GPU Tasks
         _is_active_gpu = _gpu_running and _gpu_current.get("label") and _ch_url_t and _ch_url_t in (_gpu_current.get("label") or "")
         with _gpu_queue_lock:
             _already_in_gpu = any(q.get("ch_url") == _ch_url_t for q in _gpu_queue)
             _gpu_has_items = bool(_gpu_queue)
-        if _is_active_gpu:
+        if not _has_videos:
+            _chan_ctx_menu.entryconfig(11, label="Transcribe Channel  (sync first)",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
+            try:
+                _chan_ctx_menu.entryconfig(11, activeforeground=C_DIM)
+            except Exception:
+                pass
+        elif _is_active_gpu:
             _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
@@ -5278,7 +5334,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
                         _rt_str = f", {duration / _encode_elapsed:.1f}x realtime" if duration > 0 and _encode_elapsed > 0 else ""
-                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, {dur_str}, took {_elapsed_str}{_rt_str})\n", "simpleline_green")
+                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, {dur_str}, took {_elapsed_str}{_rt_str})\n", "simpleline_blue")
                     except Exception as e:
                         err_count += 1
                         log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -5669,7 +5725,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 _bl_ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
                                 _bl_dur_str = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
                                 _bl_rt_str = f", {_bl_duration / _bl_encode_elapsed:.1f}x realtime" if _bl_duration > 0 and _bl_encode_elapsed > 0 else ""
-                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, {_bl_dur_str}, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_green")
+                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, {_bl_dur_str}, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_blue")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
                                 batch_errors += 1
@@ -5989,7 +6045,10 @@ def _whisper_punct_fixup(text):
     """Run punctuation model on Whisper output only if it lacks punctuation."""
     if not text:
         return text
-    if any(ch in text for ch in ",.?"):
+    # Require meaningful punctuation density, not just a single stray comma.
+    # At least 1 punctuation mark per ~200 chars (and at least 3 total).
+    _p_count = sum(1 for ch in text if ch in ',.!?;')
+    if _p_count >= max(3, len(text) // 200):
         return text
     if _punct_proc is None or _punct_proc.poll() is not None:
         return text  # Punctuation model not loaded — skip
@@ -5997,6 +6056,30 @@ def _whisper_punct_fixup(text):
         return _punctuate_text(text)
     except Exception:
         return text
+
+
+def _check_internet(timeout=5):
+    """Quick connectivity check. Returns True if internet is reachable."""
+    for host in ("https://www.google.com", "https://dns.google"):
+        try:
+            urllib.request.urlopen(host, timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_internet(cancel_ev, pause_ev, log_fn=None):
+    """Block until internet is restored or cancel is set. Returns True if restored, False if cancelled."""
+    if log_fn:
+        log_fn(f"  ⚠ Internet connection lost — pausing until restored...\n", "red")
+    while not cancel_ev.is_set():
+        if _check_internet(timeout=5):
+            if log_fn:
+                log_fn(f"  ✓ Internet restored — resuming.\n", "simpleline_green")
+            return True
+        time.sleep(3)
+    return False
 
 
 def _fetch_auto_captions(video_id, temp_dir):
@@ -6587,6 +6670,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
+            _prior_done = len(already_done)  # count of videos transcribed before this session
             done_count = 0
             err_count = 0
             idx = 0
@@ -6617,11 +6701,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 source = "auto-captions"
 
                 if not text:
-                    # Auto-captions failed — Whisper this file instead
-                    log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "transcribe_using")
-                    unmatched.append((fname, fpath))
-                    idx -= 1   # give back the slot — this file will be counted in Phase B
-                    continue
+                    # Check if failure is due to internet outage before queuing for Whisper
+                    if not _check_internet(timeout=5):
+                        if _wait_for_internet(_ce, _pe, log_fn=log):
+                            # Internet restored — retry this file
+                            text = _fetch_auto_captions(vid_id, temp_dir)
+                        else:
+                            break  # cancelled
+                    if not text:
+                        # Auto-captions genuinely unavailable — Whisper this file instead
+                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "transcribe_using")
+                        unmatched.append((fname, fpath))
+                        idx -= 1   # give back the slot — this file will be counted in Phase B
+                        continue
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
@@ -6681,9 +6773,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _name_dash = fname[:_body_width - 6] + "... — "
                     else:
                         _name_dash = _name_dash.ljust(_body_width)
-                    log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_green")
+                    log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
-                    log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
+                    log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -6965,9 +7057,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _name_dash = fname[:_body_width - 6] + "... — "
                             else:
                                 _name_dash = _name_dash.ljust(_body_width)
-                            log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_green")
+                            log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:
-                            log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_green")
+                            log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
                 else:
                     err_count += len(unmatched)
 
@@ -7026,7 +7118,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # Record in autorun history
             if done_count > 0 or err_count > 0:
                 _t_rec_elapsed = time.time() - _t_total_start
-                _record_transcription(done_count, err_count, _t_rec_elapsed,
+                _record_transcription(done_count + _prior_done, err_count, _t_rec_elapsed,
                                       channel_name=ch_name, skipped=0)
 
         except Exception as e:
@@ -7323,7 +7415,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             elapsed = time.time() - _t_start
             _m, _s = divmod(int(elapsed), 60)
             _time_str = f"{_m}min {_s:02d}sec" if _m else f"{_s}sec"
-            log(f"\n  Transcript saved: {os.path.basename(out_path)} ({_time_str})\n", "simpleline_green")
+            log(f"\n  Transcript saved: {os.path.basename(out_path)} ({_time_str})\n", "simpleline_blue")
 
         except Exception as e:
             log(f"\n  Manual transcription error: {e}\n", "red")
@@ -7768,6 +7860,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("summary", {"foreground": C_LOG_SUM, "font": ("Consolas", 9, "italic")}),
                              ("simpleline", {"foreground": C_TEXT}),
                              ("simpleline_green", {"foreground": C_LOG_GREEN}),
+                             ("simpleline_blue", {"foreground": C_LOG_BLUE}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
@@ -10217,7 +10310,12 @@ def _get_queue_items():
     items = []
     # Show currently processing item first
     if _current_job["label"]:
-        _active_lbl = _active_label(_current_job["label"], with_dots=True) if (_sync_running or _reorg_running or _transcribe_running) else _current_job["label"]
+        if (_sync_running or _reorg_running or _transcribe_running) and pause_event.is_set():
+            _active_lbl = _current_job["label"] + " (Paused)"
+        elif _sync_running or _reorg_running or _transcribe_running:
+            _active_lbl = _active_label(_current_job["label"], with_dots=True)
+        else:
+            _active_lbl = _current_job["label"]
         items.append((f"▶ {_active_lbl}", "current", -1))
 
     # Build lookup maps from type-specific queues, keyed by URL
@@ -11533,10 +11631,12 @@ def _gpu_start():
             try:
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                        _tray_stop_spin(force=True)  # stop blinking while paused
                         log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                             time.sleep(0.25)
                         if not _gpu_cancel.is_set():
+                            _tray_start_spin(red=True)  # resume blinking
                             log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
@@ -11755,10 +11855,12 @@ def _gpu_start():
             while True:
                 # Pause check
                 if _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                    _tray_stop_spin(force=True)  # stop blinking while paused
                     log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         time.sleep(0.25)
                     if not _gpu_cancel.is_set():
+                        _tray_start_spin(red=True)  # resume blinking
                         log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _gpu_cancel.is_set():
@@ -12870,6 +12972,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("summary", {"foreground": C_LOG_SUM, "font": ("Consolas", 9, "italic")}),
                              ("simpleline", {"foreground": C_TEXT}),
                              ("simpleline_green", {"foreground": C_LOG_GREEN}),
+                             ("simpleline_blue", {"foreground": C_LOG_BLUE}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
@@ -12883,7 +12986,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 
 # All known log tags for mini-log mirroring (priority order for detection)
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
-                 "simpledownload", "simplestatus", "dlprogress", "scanline",
+                 "simpleline_blue", "simpledownload", "simplestatus", "dlprogress", "scanline",
                  "pauselog", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "transcribe_using")
 
@@ -13787,6 +13890,11 @@ root.after(200, run_startup_updates)
 def _save_queue_state():
     """Save current queue state to disk for restoration on next launch."""
     queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "order": [], "gpu": []}
+    # Include the currently-running sync channel so it survives crashes
+    if _current_sync_ch is not None and _sync_running:
+        with _sync_queue_lock:
+            if not any(q["url"] == _current_sync_ch["url"] for q in _sync_queue):
+                queue_data["sync"].append(copy.deepcopy(_current_sync_ch))
     with _sync_queue_lock:
         for ch in _sync_queue:
             queue_data["sync"].append(copy.deepcopy(ch))
@@ -13799,12 +13907,22 @@ def _save_queue_state():
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
+    # Include the currently-running GPU item so it survives crashes
+    if _gpu_current_item is not None:
+        with _gpu_queue_lock:
+            queue_data["gpu"].append(copy.deepcopy(_gpu_current_item))
     with _gpu_queue_lock:
         for item in _gpu_queue:
             queue_data["gpu"].append(copy.deepcopy(item))
     queue_data["gpu_paused"] = _gpu_pause.is_set()
     with _queue_order_lock:
-        queue_data["order"] = list(_queue_order)
+        saved_order = list(_queue_order)
+    # Prepend the currently-running item's order entry (it was removed from
+    # _queue_order when it started running, so it would otherwise become an
+    # orphan on load and appear AFTER queued items instead of before them)
+    if _current_sync_ch is not None and _sync_running:
+        saved_order.insert(0, ("sync", _current_sync_ch["url"]))
+    queue_data["order"] = saved_order
     try:
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
@@ -13896,19 +14014,11 @@ def on_closing():
     if not has_queue and _gpu_running:
         has_queue = True
 
-    # Re-queue the currently-processing sync channel so it persists through restart
+    # Include currently-running items in has_queue check
     if _current_sync_ch is not None and _sync_running:
-        with _sync_queue_lock:
-            if not any(q["url"] == _current_sync_ch["url"] for q in _sync_queue):
-                _sync_queue.insert(0, _current_sync_ch)
-                with _queue_order_lock:
-                    _queue_order.insert(0, ("sync", _current_sync_ch["url"]))
-                has_queue = True
-
-    # Re-queue the currently-processing GPU item so it persists through restart
+        has_queue = True
     if _gpu_current_item is not None:
-        with _gpu_queue_lock:
-            _gpu_queue.insert(0, _gpu_current_item)
+        has_queue = True
 
     if has_queue:
         _save_queue_state()

@@ -588,19 +588,12 @@ def log_dl_progress(msg):
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
-                try:
-                    at_bottom = log_box.yview()[1] >= 0.99
-                except Exception:
-                    at_bottom = True
-
                 log_box.config(state="normal")
                 ranges = log_box.tag_ranges("dlprogress")
                 _dl_pos = None
-                _was_replace = False
                 if ranges:
                     _dl_pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    _was_replace = True
                 if _dl_pos:
                     log_box.insert(_dl_pos, msg, "dlprogress")
                 elif _is_simple_mode:
@@ -612,9 +605,8 @@ def log_dl_progress(msg):
                 else:
                     log_box.insert(tk.END, msg, "dlprogress")
 
-                # Only auto-scroll when inserting new content (not replacing in-place)
-                if at_bottom and not _was_replace:
-                    log_box.see(tk.END)
+                # Never auto-scroll for download progress — it replaces in-place
+                # and shouldn't snap the user back to the bottom
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -657,11 +649,12 @@ def log_simple_status(text):
 
                 log_box.config(state="normal")
 
-                # Save whisper/encode progress so they stay below the sync line
+                # Save encode/whisper progress so they stay above the sync line
                 # Collect all ranges sorted by position to preserve interleaved order
                 _saved_parts = []
                 _all_ranges = []
-                for _tag in ("whisper_progress", "whisper_pct", "whisper_dots", "encode_progress"):
+                for _tag in ("encode_progress", "encode_pct", "encode_dots",
+                             "whisper_progress", "whisper_pct", "whisper_dots"):
                     _r = log_box.tag_ranges(_tag)
                     for _ri in range(0, len(_r), 2):
                         _all_ranges.append((_r[_ri], _r[_ri + 1], _tag))
@@ -672,19 +665,21 @@ def log_simple_status(text):
                     log_box.delete(_start, _end)
 
                 ranges = log_box.tag_ranges("simplestatus")
-                _was_ss_replace = False
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
                     log_box.insert(_pos, text, "simplestatus")
-                    _was_ss_replace = True
                 else:
                     log_box.insert(tk.END, text, "simplestatus")
 
-                # Re-insert whisper/encode progress at the bottom (after sync line)
+                # Re-insert encode/whisper progress BEFORE simplestatus so it stays above
                 if _saved_parts:
+                    _ss_r2 = log_box.tag_ranges("simplestatus")
+                    _ins_pt = log_box.index(_ss_r2[0]) if _ss_r2 else tk.END
                     for _s_text, _s_tag in _saved_parts:
-                        log_box.insert(tk.END, _s_text, _s_tag)
+                        log_box.insert(_ins_pt, _s_text, _s_tag)
+                        if _ins_pt != tk.END:
+                            _ins_pt = log_box.index(f"{_ins_pt} + {len(_s_text)}c")
 
                 # Only auto-scroll when inserting new content (not replacing in-place)
                 if at_bottom and not _was_ss_replace:
@@ -752,6 +747,10 @@ def _update_encode_progress(text):
                             break
                         log_box.delete(_er[0], _er[1])
 
+                # Determine insert position — before simplestatus so SYNCING line stays at bottom
+                _ss_r = log_box.tag_ranges("simplestatus")
+                _enc_pos = log_box.index(_ss_r[0]) if _ss_r else tk.END
+
                 # Split percentage out and render it green+bold
                 import re as _re_ep
                 _ep_match = _re_ep.search(r'(\d+%)', text)
@@ -761,14 +760,19 @@ def _update_encode_progress(text):
                     _after_raw = text[_ep_match.end():]
                     # Strip trailing dots/newline — we animate those separately
                     _suffix = _after_raw.rstrip(".\n ").rstrip()
-                    log_box.insert(tk.END, _before, "encode_progress")
-                    log_box.insert(tk.END, _pct_str, "encode_pct")
+                    # Build parts list, then insert sequentially at _enc_pos
+                    _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
                     if _suffix:
-                        log_box.insert(tk.END, _suffix, "encode_progress")
-                    # Animated dots
+                        _parts.append((_suffix, "encode_progress"))
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
-                    log_box.insert(tk.END, _d + "\n", "encode_dots")
+                    _parts.append((_d + "\n", "encode_dots"))
+                    # Insert all parts — each subsequent insert goes after the previous
+                    _ins = _enc_pos
+                    for _ptxt, _ptag in _parts:
+                        log_box.insert(_ins, _ptxt, _ptag)
+                        if _ins != tk.END:
+                            _ins = log_box.index(f"{_ins} + {len(_ptxt)}c")
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
                         _encode_dots["idx"] = 0
@@ -777,10 +781,13 @@ def _update_encode_progress(text):
                 else:
                     # No percentage (unknown duration) — still show with animation
                     _stripped = text.rstrip(".\n ").rstrip()
-                    log_box.insert(tk.END, _stripped, "encode_progress")
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
-                    log_box.insert(tk.END, _d + "\n", "encode_dots")
+                    _ins = _enc_pos
+                    log_box.insert(_ins, _stripped, "encode_progress")
+                    if _ins != tk.END:
+                        _ins = log_box.index(f"{_ins} + {len(_stripped)}c")
+                    log_box.insert(_ins, _d + "\n", "encode_dots")
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
                         _encode_dots["idx"] = 0
@@ -1935,7 +1942,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.8 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.9 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3617,8 +3624,9 @@ def sync_single_channel():
             if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                 _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                 _sc_prompt_shown = [False]
-                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
-                    _b = count // _bs
+                _sc_batch_offset = _get_max_encode_batch(url)
+                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
+                    _b = count // _bs + _off
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": _ch["name"], "ch_url": _ch["url"],
                         "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -3675,10 +3683,13 @@ def sync_single_channel():
             if cancel_event.is_set():
                 _stop_simple_anim()
                 clear_transient_lines()
-                log("\nSyncs cancelled by user.\n", "red")
+                if _skip_current.is_set():
+                    pass  # "Skipping" message already logged by _skip_current_job()
+                else:
+                    log("\nSyncs cancelled by user.\n", "red")
                 _cleanup_partial_files(out_dir)
-                # Save batch resume if large channel and enough progress was made
-                if ch_total > 200 or batch_limited:
+                # Save batch resume if large channel and enough progress was made (but not on skip)
+                if not _skip_current.is_set() and (ch_total > 200 or batch_limited):
                     _cancel_total = _last_run_counts["dl"] + _last_run_counts["skip"] + _last_run_counts["dur"] + _last_run_counts["err"]
                     if _cancel_total > 50:
                         if _batch_cache_ids:
@@ -3744,7 +3755,7 @@ def sync_single_channel():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
                         "batch_size": _sc_bsize,
                     }, _quiet=True)
 
@@ -6636,6 +6647,17 @@ def _count_gpu_encode_batches(ch_url):
         if _ci.get("ch_url") == ch_url and _ci.get("type") in ("encode", "backlog_encode"):
             count += 1
     return count
+
+
+def _get_max_encode_batch(ch_url):
+    """Return the highest batch_num already queued (or running) for a channel's encode tasks, or 0."""
+    with _gpu_queue_lock:
+        nums = [q.get("batch_num", 0) for q in _gpu_queue
+                if q.get("ch_url") == ch_url and q.get("type") == "encode" and q.get("batch_num") is not None]
+        _cur = _gpu_current_item
+        if _cur and _cur.get("ch_url") == ch_url and _cur.get("type") == "encode" and _cur.get("batch_num") is not None:
+            nums.append(_cur["batch_num"])
+    return max(nums) if nums else 0
 
 
 def _add_to_gpu_queue(item, _quiet=False):
@@ -10022,7 +10044,14 @@ def start_sync_all():
 
             processed = 0
             _gpu_skip_count = 0  # consecutive GPU batch limit skips
-            while not cancel_event.is_set():
+            while True:
+                # Check cancel — but if it's a skip, clear and continue to next channel
+                if cancel_event.is_set():
+                    if _skip_current.is_set():
+                        _skip_current.clear()
+                        cancel_event.clear()
+                    else:
+                        break
                 with _sync_queue_lock:
                     if not _sync_queue:
                         break
@@ -10063,8 +10092,12 @@ def start_sync_all():
                     log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pauselog")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
-                    if cancel_event.is_set():
+                    if cancel_event.is_set() and not _skip_current.is_set():
                         break
+                    if _skip_current.is_set():
+                        _skip_current.clear()
+                        cancel_event.clear()
+                        continue
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch["name"]
@@ -10120,7 +10153,12 @@ def start_sync_all():
                     log(f"First sync: Archiving existing backlog...\n", "green")
                     success = internal_run_subscribe_blocking(url)
 
-                    if cancel_event.is_set(): break
+                    if cancel_event.is_set():
+                        if _skip_current.is_set():
+                            _skip_current.clear()
+                            cancel_event.clear()
+                            continue
+                        break
 
                     if success:
                         with config_lock:
@@ -10144,7 +10182,12 @@ def start_sync_all():
                         "green")
                     success = internal_run_subscribe_before_date(url, date_after)
 
-                    if cancel_event.is_set(): break
+                    if cancel_event.is_set():
+                        if _skip_current.is_set():
+                            _skip_current.clear()
+                            cancel_event.clear()
+                            continue
+                        break
 
                     if success:
                         with config_lock:
@@ -10292,8 +10335,9 @@ def start_sync_all():
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
-                        _b = count // _bs
+                    _sc_batch_offset = _get_max_encode_batch(url)
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
+                        _b = count // _bs + _off
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -10400,7 +10444,7 @@ def start_sync_all():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
                         "batch_size": _sc_bsize,
                     }, _quiet=True)
 
@@ -12955,8 +12999,9 @@ def _run_autorun():
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
-                        _b = count // _bs
+                    _sc_batch_offset = _get_max_encode_batch(url)
+                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
+                        _b = count // _bs + _off
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -13064,7 +13109,7 @@ def _run_autorun():
                         "output_res": ch.get("compress_output_res", ""),
                         "split_years": ch.get("split_years", False),
                         "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1,
+                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
                         "batch_size": _sc_bsize,
                     }, _quiet=True)
 

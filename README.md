@@ -35,6 +35,7 @@ you can of course still manually download single videos
 seperage sync-tasks and gpu-tasks editable queues
 
 Transcribe full channels, and have the option to transcribe new downloads from that channel. Uses YT auto-captions + punctuation model when possible, falls back to whisper (with model options, per channel)
+Outputs transcriptions into 'readable' .txt files, and a hidden .json file with the same info, but with timestamps and things. 
 
 on download fail, it pings a few things to test internet. if it's out, it auto-pauses everything until back online
 

@@ -3642,9 +3642,8 @@ def sync_single_channel():
             if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                 _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                 _sc_prompt_shown = [False]
-                _sc_batch_offset = _get_max_encode_batch(url)
-                def _sc_batch_cb(count, _ch=ch, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
-                    _b = count // _bs + _off
+                def _sc_batch_cb(count, batch_paths, _ch=ch, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                    _b = _get_next_compress_batch(_u)
                     _add_to_gpu_queue({
                         "type": "encode", "ch_name": _ch["name"], "ch_url": _ch["url"],
                         "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -3652,6 +3651,7 @@ def sync_single_channel():
                         "split_years": _ch.get("split_years", False),
                         "split_months": _ch.get("split_months", False),
                         "batch_num": _b, "batch_size": _bs,
+                        "target_paths": batch_paths,
                     }, _quiet=True)
                     if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                         _sc_prompt_shown[0] = True
@@ -3764,18 +3764,7 @@ def sync_single_channel():
                     ch["transcription_pending"] = ch.get("transcription_pending", 0) + c_dl
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
-                _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
-                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
-                    _add_to_gpu_queue({
-                        "type": "encode", "ch_name": ch["name"], "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
-                        "output_res": ch.get("compress_output_res", ""),
-                        "split_years": ch.get("split_years", False),
-                        "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
-                        "batch_size": _sc_bsize,
-                    }, _quiet=True)
+                # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded,
                 # add it to the GPU Tasks so the user can process when ready
@@ -5388,7 +5377,8 @@ def _ffprobe_is_compressed(file_path):
 
 
 def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_months,
-                      output_res="", cancel_ev=None, pause_ev=None, _sync_mode=False):
+                      output_res="", cancel_ev=None, pause_ev=None, _sync_mode=False,
+                      target_paths=None, batch_num=None):
     """Compress all un-compressed video files in a channel folder using ffmpeg AV1 NVENC.
 
     bitrate_mbhr: target file size in MB per hour of video.
@@ -5410,19 +5400,29 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         log(f"  Target: {bitrate_mbhr} MB/hr  |  Output: {_res_label}\n", "simpleline")
 
         # ── Step 1: Scan for video files ──
-        local_files = {}
-        for dirpath, _, files in os.walk(folder):
-            for f in files:
-                if f.lower().endswith(_VIDEO_EXTS_COMPRESS):
-                    # Skip temp files from previous interrupted runs or partial downloads
-                    if "_TEMP_COMPRESS" in f or ".temp." in f.lower() or ".part" in f.lower():
-                        continue
-                    fpath = os.path.join(dirpath, f)
-                    local_files[f] = fpath
+        if target_paths:
+            local_files = {}
+            for tp in target_paths:
+                if os.path.exists(tp) and any(tp.lower().endswith(ext) for ext in _VIDEO_EXTS_COMPRESS):
+                    if "_TEMP_COMPRESS" not in tp and ".temp." not in tp.lower() and ".part" not in tp.lower():
+                        local_files[os.path.basename(tp)] = tp
+            if not local_files:
+                log("  No target video files found for this batch.\n", "simpleline")
+                return
+        else:
+            local_files = {}
+            for dirpath, _, files in os.walk(folder):
+                for f in files:
+                    if f.lower().endswith(_VIDEO_EXTS_COMPRESS):
+                        # Skip temp files from previous interrupted runs or partial downloads
+                        if "_TEMP_COMPRESS" in f or ".temp." in f.lower() or ".part" in f.lower():
+                            continue
+                        fpath = os.path.join(dirpath, f)
+                        local_files[f] = fpath
 
-        if not local_files:
-            log("  No video files found to compress.\n", "simpleline")
-            return
+            if not local_files:
+                log("  No video files found to compress.\n", "simpleline")
+                return
 
         log(f"  Found {len(local_files)} video file(s).\n", "simpleline")
 
@@ -5578,9 +5578,15 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     new_size = os.path.getsize(temp_path)
                     ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
 
-                    # Atomic replace
+                    # Atomic replace; preserve original upload-date mtime (ffmpeg creates a
+                    # new file with today's timestamp, which would lose the YT upload date)
                     try:
+                        orig_stat = os.stat(fpath)
                         os.replace(temp_path, fpath)
+                        try:
+                            os.utime(fpath, (orig_stat.st_atime, orig_stat.st_mtime))
+                        except OSError:
+                            pass
                         done_count += 1
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
@@ -5631,6 +5637,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             if err_count:
                 log(f", {err_count} errors", "simpleline_green")
             log(f" ({_t_str})\n", "simpleline_green")
+            _record_compression(ch_name, done_count, err_count, elapsed, batch_num)
 
     if _sync_mode:
         _worker()
@@ -6676,6 +6683,22 @@ def _get_max_encode_batch(ch_url):
         if _cur and _cur.get("ch_url") == ch_url and _cur.get("type") == "encode" and _cur.get("batch_num") is not None:
             nums.append(_cur["batch_num"])
     return max(nums) if nums else 0
+
+
+def _get_next_compress_batch(ch_url):
+    """Increment and return the compression batch sequence number for a channel.
+
+    Persisted in channel config so batch numbers survive app restarts.
+    """
+    seq = 1
+    with config_lock:
+        for ch in config.get("channels", []):
+            if ch.get("url") == ch_url:
+                seq = ch.get("compress_batch_seq", 0) + 1
+                ch["compress_batch_seq"] = seq
+                break
+    save_config(config)
+    return seq
 
 
 def _add_to_gpu_queue(item, _quiet=False):
@@ -9370,6 +9393,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
     _prog_last_ts = 0.0
     _prog_last_pct = -1.0
     _speed_samples = []
+    _tracked_paths = []  # file paths captured at DLTRACK time for per-batch compression
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
@@ -9662,6 +9686,16 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         _prog_last_pct = -1.0
                         _speed_samples.clear()
 
+                        # Track filepath for per-batch compression (fires after merge, so path is final)
+                        if filepath and os.path.exists(filepath) and on_batch_ready and compress_batch_size > 0:
+                            _tracked_paths.append(filepath)
+                            if len(_tracked_paths) % compress_batch_size == 0:
+                                try:
+                                    _batch_start = len(_tracked_paths) - compress_batch_size
+                                    on_batch_ready(dl_count, list(_tracked_paths[_batch_start:]))
+                                except Exception:
+                                    pass
+
                         # Stop merge "Finishing..." animation if running
                         try:
                             if '_merge_anim' in dir() and _merge_anim.get("active"):
@@ -9869,13 +9903,6 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     dl_count += 1
                     session_totals["dl"] += 1
 
-                    # Trigger incremental compress callback every N downloads
-                    if on_batch_ready and dl_count > 0 and dl_count % compress_batch_size == 0:
-                        try:
-                            on_batch_ready(dl_count)
-                        except Exception:
-                            pass
-
                     if is_simple_mode:
                         _update_simple_dl(dl_count, 0, batch_size=compress_batch_size if on_batch_ready else 0)
 
@@ -9890,6 +9917,15 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 proc.wait(timeout=5)
             except Exception:
                 pass
+
+        # Fire final-batch callback for any remaining tracked paths that didn't complete a full batch
+        if on_batch_ready and compress_batch_size > 0 and _tracked_paths:
+            _remaining_count = len(_tracked_paths) % compress_batch_size
+            if _remaining_count > 0:
+                try:
+                    on_batch_ready(dl_count, list(_tracked_paths[-_remaining_count:]))
+                except Exception:
+                    pass
 
         if not cancel_event.is_set():
             clear_transient_lines()
@@ -10353,9 +10389,8 @@ def start_sync_all():
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    _sc_batch_offset = _get_max_encode_batch(url)
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
-                        _b = count // _bs + _off
+                    def _sc_batch_cb(count, batch_paths, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                        _b = _get_next_compress_batch(_u)
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -10363,6 +10398,7 @@ def start_sync_all():
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
                             "batch_num": _b, "batch_size": _bs,
+                            "target_paths": batch_paths,
                         }, _quiet=True)
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
@@ -10453,18 +10489,7 @@ def start_sync_all():
                                 break
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
-                _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
-                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
-                    _add_to_gpu_queue({
-                        "type": "encode", "ch_name": ch_name, "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
-                        "output_res": ch.get("compress_output_res", ""),
-                        "split_years": ch.get("split_years", False),
-                        "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
-                        "batch_size": _sc_bsize,
-                    }, _quiet=True)
+                # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
                 if c_dl > 0 and ch.get("auto_transcribe", False):
@@ -12177,7 +12202,9 @@ def _gpu_start():
                             item["split_years"], item["split_months"],
                             output_res=item.get("output_res", ""),
                             cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            _sync_mode=True
+                            _sync_mode=True,
+                            target_paths=item.get("target_paths"),
+                            batch_num=item.get("batch_num"),
                         )
                     elif item["type"] == "backlog_encode":
                         _gpu_current["label"] = f"Backlog {item['ch_name']}"
@@ -12436,7 +12463,9 @@ def _gpu_start():
                         item["split_years"], item["split_months"],
                         output_res=item.get("output_res", ""),
                         cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                        _sync_mode=True
+                        _sync_mode=True,
+                        target_paths=item.get("target_paths"),
+                        batch_num=item.get("batch_num"),
                     )
                 elif item["type"] == "backlog_encode":
                     _gpu_current["label"] = f"Backlog {item['ch_name']}"
@@ -12703,6 +12732,32 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
         dur = f"took {secs}s"
     ch_part = f"  {channel_name}  —" if channel_name else " "
     line = f"[Transcr.] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    with config_lock:
+        hist = config.setdefault("autorun_history", [])
+        hist.append(line)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+    save_config(config)
+    if _root_alive:
+        _ui_queue.append(_refresh_autorun_history)
+
+
+def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=None):
+    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
+        "%I:%M%p").lower().lstrip("0")
+    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    mins = int(elapsed_secs // 60)
+    secs = int(elapsed_secs % 60)
+    if mins >= 60:
+        hrs = mins // 60
+        rem_mins = mins % 60
+        dur = f"took {hrs}h {rem_mins:02d}m"
+    elif mins:
+        dur = f"took {mins}m {secs:02d}s"
+    else:
+        dur = f"took {secs}s"
+    batch_part = f" Batch {batch_num} —" if batch_num is not None else ""
+    line = f"[Cmprss] {ts}, {date}  —  {ch_name}{batch_part}  {done_count} compressed · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -13020,9 +13075,8 @@ def _run_autorun():
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
                     _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _sc_prompt_shown = [False]
-                    _sc_batch_offset = _get_max_encode_batch(url)
-                    def _sc_batch_cb(count, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize, _off=_sc_batch_offset):
-                        _b = count // _bs + _off
+                    def _sc_batch_cb(count, batch_paths, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
+                        _b = _get_next_compress_batch(_u)
                         _add_to_gpu_queue({
                             "type": "encode", "ch_name": _cn, "ch_url": _u,
                             "folder": _f, "bitrate_mbhr": _get_compress_bitrate(_lv, _ch.get("compress_output_res", "")),
@@ -13030,6 +13084,7 @@ def _run_autorun():
                             "split_years": _ch.get("split_years", False),
                             "split_months": _ch.get("split_months", False),
                             "batch_num": _b, "batch_size": _bs,
+                            "target_paths": batch_paths,
                         }, _quiet=True)
                         if count >= 100 and not _sc_prompt_shown[0] and not _gpu_running:
                             _sc_prompt_shown[0] = True
@@ -13120,19 +13175,7 @@ def _run_autorun():
                                 break
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
-                _c_level = ch.get("compress_level", "")
-                if c_dl > 0 and ch.get("compress_enabled", False) and _c_level in _QUALITY_OPTIONS:
-                    ch_name_ac = ch.get("name", "")
-                    _ac_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_ac))
-                    _add_to_gpu_queue({
-                        "type": "encode", "ch_name": ch_name_ac, "ch_url": url,
-                        "folder": _ac_folder, "bitrate_mbhr": _get_compress_bitrate(_c_level, ch.get("compress_output_res", "")),
-                        "output_res": ch.get("compress_output_res", ""),
-                        "split_years": ch.get("split_years", False),
-                        "split_months": ch.get("split_months", False),
-                        "batch_num": (c_dl - 1) // _sc_bsize + 1 + _get_max_encode_batch(url),
-                        "batch_size": _sc_bsize,
-                    }, _quiet=True)
+                # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
                 # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
                 if c_dl > 0 and ch.get("auto_transcribe", False):

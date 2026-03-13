@@ -1909,7 +1909,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.0 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.1 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4716,6 +4716,127 @@ def _parse_vtt_to_text(vtt_path):
     return " ".join(clean)
 
 
+def _parse_vtt_to_segments(vtt_path):
+    """Parse a .vtt subtitle file into timestamped segments for JSONL output.
+
+    Returns list of {"start": float_secs, "end": float_secs, "text": str}.
+    """
+    import html as _html_mod
+    try:
+        with open(vtt_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except Exception:
+        return []
+
+    def _ts_to_secs(ts_str):
+        """Convert 'HH:MM:SS.mmm' or 'MM:SS.mmm' to float seconds."""
+        parts = ts_str.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return 0.0
+
+    segments = []
+    lines = raw.split("\n")
+    current_start = None
+    current_end = None
+    current_text = []
+    prev_text = ""
+
+    for line in lines:
+        line = line.strip()
+        ts_match = re.match(r'(\d[\d:.]+)\s*-->\s*(\d[\d:.]+)', line)
+        if ts_match:
+            # Flush previous segment
+            if current_text and current_start is not None:
+                joined = " ".join(current_text)
+                if joined != prev_text:
+                    segments.append({"start": current_start, "end": current_end, "text": joined})
+                    prev_text = joined
+            current_start = _ts_to_secs(ts_match.group(1))
+            current_end = _ts_to_secs(ts_match.group(2))
+            current_text = []
+            continue
+        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") or \
+                line.startswith("Kind:") or line.startswith("Language:"):
+            continue
+        if re.match(r'^\d+$', line):
+            continue
+        if 'align:' in line or 'position:' in line:
+            continue
+        cleaned = re.sub(r'<[^>]+>', '', line)
+        cleaned = _html_mod.unescape(cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if cleaned:
+            current_text.append(cleaned)
+
+    # Flush last segment
+    if current_text and current_start is not None:
+        joined = " ".join(current_text)
+        if joined != prev_text:
+            segments.append({"start": current_start, "end": current_end, "text": joined})
+
+    return segments
+
+
+def _get_jsonl_path(txt_path):
+    """Get the hidden JSONL file path corresponding to a transcript .txt path."""
+    dirname = os.path.dirname(txt_path)
+    basename = os.path.basename(txt_path)
+    jsonl_name = "." + basename.replace("Transcript.txt", "Transcript.jsonl")
+    return os.path.join(dirname, jsonl_name)
+
+
+def _hide_file_win(path):
+    """Set the hidden attribute on a file (Windows only)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(path, 0x02)  # FILE_ATTRIBUTE_HIDDEN
+        except Exception:
+            pass
+
+
+def _write_jsonl_entry(jsonl_path, video_id, title, segments):
+    """Append JSONL lines for one video's timestamped segments."""
+    import json as _json
+    try:
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            for seg in segments:
+                line = _json.dumps({
+                    "video_id": video_id or "",
+                    "title": title,
+                    "start": round(seg["start"], 2),
+                    "end": round(seg["end"], 2),
+                    "text": seg["text"]
+                }, ensure_ascii=False)
+                f.write(line + "\n")
+        _hide_file_win(jsonl_path)
+    except Exception:
+        pass
+
+
+def _scan_existing_jsonl(folder_path, ch_name):
+    """Scan JSONL transcript files under folder_path. Return set of video titles already in JSONL."""
+    existing = set()
+    import json as _json
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
+                try:
+                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line:
+                                entry = _json.loads(line)
+                                existing.add(entry.get("title", ""))
+                except Exception:
+                    pass
+    return existing
+
+
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
 _WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
@@ -4790,7 +4911,9 @@ for line in sys.stdin:
                     _out.flush()
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
-        _out.write(json.dumps({"status": "ok", "text": text}) + "\n")
+        seg_data = [{"s": round(seg.start, 2), "e": round(seg.end, 2), "t": seg.text.strip()}
+                     for seg in all_segments if seg.text.strip()]
+        _out.write(json.dumps({"status": "ok", "text": text, "segments": seg_data}) + "\n")
         _out.flush()
     except Exception as e:
         _out.write(json.dumps({"status": "error", "text": str(e)}) + "\n")
@@ -5937,8 +6060,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
 
 def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None):
-    """Transcribe a file using the persistent Whisper subprocess. Returns text or None.
+    """Transcribe a file using the persistent Whisper subprocess.
 
+    Returns (text, segments) where text is str or None, and segments is a list of
+    {"start": float, "end": float, "text": str} dicts (empty list on failure).
     If duration (seconds) is provided, progress percentage is logged in real time.
     title is shown in the progress line so the user knows which video is being processed.
     cancel_ev/pause_ev default to the global cancel_event/pause_event if not provided.
@@ -5969,7 +6094,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             response_line = _whisper_proc.stdout.readline().strip()
             if not response_line:
                 _gpu_actively_encoding = False
-                return None
+                return None, []
             result = _json.loads(response_line)
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
@@ -5983,16 +6108,19 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             elif result.get("status") == "ok":
                 log(f"{_wp}Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
                 _gpu_actively_encoding = False
-                return result.get("text") or None
+                _text = result.get("text") or None
+                _raw_segs = result.get("segments", [])
+                _segments = [{"start": s["s"], "end": s["e"], "text": s["t"]} for s in _raw_segs]
+                return _text, _segments
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
                 _gpu_actively_encoding = False
-                return None
+                return None, []
     except Exception as e:
         log(f"  ⚠ Whisper communication error: {e}\n", "red")
         _gpu_actively_encoding = False
         _stop_whisper_process()  # Kill broken process, will restart on next call
-        return None
+        return None, []
 
 
 # ─── Punctuation restoration (for YouTube auto-captions) ─────────────────────
@@ -6083,7 +6211,11 @@ def _wait_for_internet(cancel_ev, pause_ev, log_fn=None):
 
 
 def _fetch_auto_captions(video_id, temp_dir):
-    """Fetch YouTube captions (manual or auto-generated) for a video. Returns text or None."""
+    """Fetch YouTube captions (manual or auto-generated) for a video.
+
+    Returns (text, segments) where text is str or None, and segments is a list of
+    {"start": float, "end": float, "text": str} dicts (empty list on failure).
+    """
     temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
     cmd = [
         "yt-dlp", "--skip-download",
@@ -6097,22 +6229,23 @@ def _fetch_auto_captions(video_id, temp_dir):
         subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
     except Exception as e:
         log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
-        return None
+        return None, []
 
     # Find any VTT file created for this video
     import glob
     vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
     if not vtt_files:
-        return None
+        return None, []
     vtt_path = vtt_files[0]
 
     text = _parse_vtt_to_text(vtt_path)
+    segments = _parse_vtt_to_segments(vtt_path)
     try:
         for vf in vtt_files:
             os.remove(vf)
     except Exception:
         pass
-    return text if text else None
+    return (text if text else None), segments
 
 
 def _format_upload_date(date_str):
@@ -6579,7 +6712,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if already_done:
                 log(f"  {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
 
-            if not files_to_process:
+            # Check if JSONL backfill is needed for already-transcribed videos
+            _jsonl_existing = _scan_existing_jsonl(folder, ch_name) if already_done else set()
+            _jsonl_needed = already_done - _jsonl_existing if already_done else set()
+
+            if not files_to_process and not _jsonl_needed:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
                 # Mark channel as fully transcribed
                 with config_lock:
@@ -6618,17 +6755,154 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
-            # ── Step 4: Split into matched (captions) vs unmatched (Whisper) ─
-            matched = []    # (filename, filepath, video_id)  — can try auto-captions
-            unmatched = []  # (filename, filepath)            — must use Whisper
-
-            def _normalize_for_match(title):
+            # ── Step 3.5: JSONL backfill + punctuation sweep for already-done ─
+            def _normalize_title(title):
                 """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
                 import unicodedata
                 s = unicodedata.normalize('NFKC', title)
                 s = re.sub(r'[\\/:*?"<>|]', '', s)
                 s = re.sub(r'\s+', ' ', s).strip()
                 return s.lower()
+
+            if _jsonl_needed and yt_title_to_id and not _ce.is_set():
+                # Build normalized YT title → video_id lookup
+                _yt_norm_backfill = {}
+                for yt_title, vid_id in yt_title_to_id.items():
+                    _norm = _normalize_title(yt_title)
+                    if _norm not in _yt_norm_backfill:
+                        _yt_norm_backfill[_norm] = vid_id
+
+                # Match needed titles to video IDs
+                _backfill_list = []
+                for title in _jsonl_needed:
+                    vid_id = yt_title_to_id.get(title)
+                    if not vid_id:
+                        _norm_t = _normalize_title(title)
+                        vid_id = _yt_norm_backfill.get(_norm_t)
+                    if vid_id:
+                        _backfill_list.append((title, vid_id))
+
+                if _backfill_list:
+                    log(f"  Generating searchable .jsonl for {len(_backfill_list)} previously transcribed video(s)...\n", "simpleline")
+                    _bf_temp = os.path.join(folder, "_transcribe_temp")
+                    os.makedirs(_bf_temp, exist_ok=True)
+                    _bf_done = 0
+                    for _bf_title, _bf_vid in _backfill_list:
+                        if _ce.is_set():
+                            break
+                        try:
+                            _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
+                            if _bf_segs:
+                                # Determine which txt file this video belongs to
+                                _bf_fpath = local_files.get(_bf_title)
+                                if _bf_fpath:
+                                    _bf_mtime = datetime.fromtimestamp(os.path.getmtime(_bf_fpath))
+                                    _bf_txt, _ = _get_transcript_filename(
+                                        ch_name, folder, split_years, split_months, combined,
+                                        year=_bf_mtime.year, month=_bf_mtime.month)
+                                else:
+                                    _bf_txt, _ = _get_transcript_filename(
+                                        ch_name, folder, split_years, split_months, combined)
+                                _bf_jsonl = _get_jsonl_path(_bf_txt)
+                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
+                                _bf_done += 1
+                        except Exception:
+                            pass
+                    if _bf_done:
+                        log(f"  ✓ {_bf_done} searchable .jsonl entry/entries generated.\n", "simpleline_green")
+
+            # ── Punctuation sweep for already-transcribed entries ──
+            if already_done and not _ce.is_set():
+                _punct_sweep_needed = False
+                # Scan existing transcript files for entries lacking punctuation
+                _entry_pattern = re.compile(r'^===\((.+?)\),\s*\((\d{2}\.\d{2}\.\d{4})\),\s*\(([^)]*)\),\s*(\([^)]+\))===')
+                _txt_files_to_sweep = []
+                for dirpath, _dirs, files in os.walk(folder):
+                    for f in files:
+                        if f.startswith(ch_name) and f.endswith("Transcript.txt"):
+                            _txt_files_to_sweep.append(os.path.join(dirpath, f))
+
+                _punct_fixes = 0
+                for _sw_path in _txt_files_to_sweep:
+                    try:
+                        with open(_sw_path, "r", encoding="utf-8") as _sf:
+                            _sw_content = _sf.read()
+                    except Exception:
+                        continue
+
+                    _sw_entries = _sw_content.split("\n\n\n")
+                    _sw_modified = False
+                    _new_entries = []
+                    for _sw_entry in _sw_entries:
+                        _sw_entry_stripped = _sw_entry.strip()
+                        if not _sw_entry_stripped:
+                            _new_entries.append(_sw_entry)
+                            continue
+                        # Parse header line and body
+                        _sw_lines = _sw_entry_stripped.split("\n", 1)
+                        if len(_sw_lines) < 2 or not _sw_lines[0].startswith("==="):
+                            _new_entries.append(_sw_entry)
+                            continue
+                        _sw_header = _sw_lines[0]
+                        _sw_body = _sw_lines[1]
+                        # Skip exclusion entries
+                        if "NO AUDIO DATA" in _sw_header:
+                            _new_entries.append(_sw_entry)
+                            continue
+                        # Check punctuation density
+                        _sw_p_count = sum(1 for ch in _sw_body if ch in ',.!?;')
+                        if _sw_p_count >= max(3, len(_sw_body) // 200):
+                            _new_entries.append(_sw_entry)
+                            continue
+                        if len(_sw_body) < 20:
+                            _new_entries.append(_sw_entry)
+                            continue
+                        # Needs punctuation — load model if not already loaded
+                        if not _punct_sweep_needed:
+                            _punct_sweep_needed = True
+                            if not _load_punctuation_model():
+                                break  # Can't load model, skip sweep
+                            log(f"  Running punctuation sweep on previously transcribed entries...\n", "simpleline")
+                        try:
+                            _fixed_body = _punctuate_text(_sw_body)
+                            # Update source tag to note punctuation was added
+                            _new_header = _sw_header.replace("(YT CAPTIONS)", "(YT+PUNCTUATION)")
+                            _new_entries.append(f"{_new_header}\n{_fixed_body}")
+                            _sw_modified = True
+                            _punct_fixes += 1
+                        except Exception:
+                            _new_entries.append(_sw_entry)
+                    if _sw_modified:
+                        try:
+                            _new_content = "\n\n\n".join(_new_entries)
+                            with open(_sw_path, "w", encoding="utf-8") as _sf:
+                                _sf.write(_new_content)
+                        except Exception:
+                            pass
+                if _punct_fixes:
+                    log(f"  ✓ Punctuation added to {_punct_fixes} existing transcript(s).\n", "simpleline_green")
+
+            # If all files were already transcribed, we're done (backfill/sweep was the only work)
+            if not files_to_process:
+                log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                with config_lock:
+                    for _cfg_ch in config.get("channels", []):
+                        if _cfg_ch.get("url") == ch_url:
+                            _cfg_ch["transcription_complete"] = True
+                            _cfg_ch["transcription_pending"] = 0
+                            break
+                    save_config(config)
+                return
+
+            if _ce.is_set():
+                log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                return
+
+            # ── Step 4: Split into matched (captions) vs unmatched (Whisper) ─
+            matched = []    # (filename, filepath, video_id)  — can try auto-captions
+            unmatched = []  # (filename, filepath)            — must use Whisper
+
+            _normalize_for_match = _normalize_title  # alias for step 4
 
             # Build normalized lookup: normalized_yt_title → video_id
             _yt_normalized = {}
@@ -6697,7 +6971,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
-                text = _fetch_auto_captions(vid_id, temp_dir)
+                text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
                 source = "auto-captions"
 
                 if not text:
@@ -6705,7 +6979,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     if not _check_internet(timeout=5):
                         if _wait_for_internet(_ce, _pe, log_fn=log):
                             # Internet restored — retry this file
-                            text = _fetch_auto_captions(vid_id, temp_dir)
+                            text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
                         else:
                             break  # cancelled
                     if not text:
@@ -6757,6 +7031,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
                     err_count += 1
                     continue
+
+                # Write hidden JSONL with timestamps for searchability
+                if _vtt_segments:
+                    _jsonl_path = _get_jsonl_path(txt_path)
+                    _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments)
 
                 _vid_elapsed = time.time() - _t_vid_start
                 _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -6987,7 +7266,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # so inform the user it will pause after the current file finishes.
                         if _pe.is_set() and not _ce.is_set():
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
-                        text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
+                        text, _vtt_segments = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
                         _clear_whisper_progress()  # Remove progress line now that file is done
                         if text:
                             text = _whisper_punct_fixup(text)
@@ -7041,6 +7320,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
                             err_count += 1
                             continue
+
+                        # Write hidden JSONL with timestamps for searchability
+                        if _vtt_segments:
+                            # Whisper videos don't have a YouTube video_id — use empty string
+                            _jsonl_path = _get_jsonl_path(txt_path)
+                            _write_jsonl_entry(_jsonl_path, "", fname, _vtt_segments)
 
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -7395,8 +7680,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             _t_start = time.time()
             log(f"  Transcribing with Whisper ({_whisper_model_choice})...\n", "simpleline")
 
-            text = _whisper_transcribe(file_path, duration=_dur_secs, title=fname,
-                                       cancel_ev=_ce, pause_ev=_pe)
+            text, _ = _whisper_transcribe(file_path, duration=_dur_secs, title=fname,
+                                          cancel_ev=_ce, pause_ev=_pe)
             _clear_whisper_progress()  # Remove progress line now that file is done
 
             if not text:
@@ -7603,8 +7888,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     upload_date = ""
 
                 # Transcribe
-                text = _whisper_transcribe(fpath, duration=_dur_secs, title=fname,
-                                           cancel_ev=_ce, pause_ev=_pe)
+                text, _ = _whisper_transcribe(fpath, duration=_dur_secs, title=fname,
+                                              cancel_ev=_ce, pause_ev=_pe)
                 _clear_whisper_progress()  # Remove progress line now that file is done
 
                 if _ce.is_set():
@@ -10470,7 +10755,10 @@ def _show_queue_menu(event=None):
             _albl = _state.get("active_lbl")
             if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running):
                 try:
-                    _fresh = f"▶ {_active_label(_current_job['label'], with_dots=True)}"
+                    if pause_event.is_set():
+                        _fresh = f"▶ {_current_job['label']} (Paused)"
+                    else:
+                        _fresh = f"▶ {_active_label(_current_job['label'], with_dots=True)}"
                     _albl.config(text=f"  1. {_fresh}")
                 except Exception:
                     pass

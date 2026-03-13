@@ -220,6 +220,7 @@ _cached_autorun_label = "Off"
 
 # Persistent auto-scroll flag — survives yview fluctuations during batch UI queue processing
 _log_at_bottom = True
+_log_user_scrolled = False  # set True by mouse/scrollbar interaction, cleared when user reaches bottom
 
 # Whisper progress dot animation state
 _whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
@@ -271,17 +272,23 @@ def _sync_mini_logs_timer():
 
 def log(text, tag=None):
     def _write():
-        global _log_at_bottom, _log_scroll_freeze
+        global _log_at_bottom, _log_scroll_freeze, _log_user_scrolled
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
-                # Update persistent auto-scroll flag with hysteresis
+                # Update persistent auto-scroll flag
+                # If the user physically scrolled (mouse wheel / scrollbar drag),
+                # only re-enable auto-scroll when they reach the very bottom.
                 try:
                     yview = log_box.yview()
                     if yview[1] >= 0.99:
                         _log_at_bottom = True
+                        _log_user_scrolled = False
+                    elif _log_user_scrolled:
+                        # User actively scrolled away — stay off until they hit bottom
+                        _log_at_bottom = False
                     elif yview[1] < 0.90:
                         _log_at_bottom = False
-                    # Between 0.90-0.99: keep previous value (handles batch processing)
+                    # Between 0.90-0.99 without user scroll: keep previous value
                 except Exception:
                     pass
                 at_bottom = _log_at_bottom
@@ -2262,6 +2269,17 @@ log_box = tk.Text(log_frame, state="disabled",
                   yscrollcommand=lambda f, l: _auto_scrollbar(log_scroll, f, l))
 log_box.grid(row=0, column=0, sticky="nsew")
 log_scroll.config(command=log_box.yview)
+
+# --- Detect user scroll to suppress auto-scroll-to-bottom ---
+def _on_log_user_scroll(event=None):
+    global _log_user_scrolled
+    _log_user_scrolled = True
+
+log_box.bind("<MouseWheel>", _on_log_user_scroll, add="+")       # Windows scroll
+log_box.bind("<Button-4>", _on_log_user_scroll, add="+")         # Linux scroll up
+log_box.bind("<Button-5>", _on_log_user_scroll, add="+")         # Linux scroll down
+log_box.bind("<ButtonPress-1>", _on_log_user_scroll, add="+")    # click in log
+log_scroll.bind("<ButtonPress-1>", _on_log_user_scroll, add="+") # scrollbar drag
 
 log_box.tag_configure("green", foreground=C_LOG_GREEN)
 log_box.tag_configure("dim", foreground=C_LOG_DIM)
@@ -10579,9 +10597,12 @@ sync_btn.pack(side="left", padx=(0, 6))
 _ToolTip(sync_btn, "Sync and download every channel in your Sub list")
 
 def _clear_all_logs():
+    global _log_at_bottom, _log_user_scrolled
     log_box.config(state="normal")
     log_box.delete("1.0", tk.END)
     log_box.config(state="disabled")
+    _log_at_bottom = True
+    _log_user_scrolled = False
     if 'clear_log_btn' in globals():
         clear_log_btn.pack_forget()
     if 'subs_mini_log' in globals():

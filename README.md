@@ -34,8 +34,11 @@ seperage sync-tasks and gpu-tasks editable queues
 Transcribe full channels, and have the option to transcribe new downloads from that channel. Uses YT auto-captions + punctuation model when possible, falls back to whisper (with model options, per channel)
 
 
+
 this is maybe 2% me and 98% claude-code :)
+
 Uses CUDA for all GPU stuff. 
 
+I use it packedd in an exe w the icon, but if it's just in the same /dir it'll still work. It's for the taskbar
 
 

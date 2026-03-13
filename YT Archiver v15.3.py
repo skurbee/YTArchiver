@@ -1909,7 +1909,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.1 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.3 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6783,13 +6783,17 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _backfill_list.append((title, vid_id))
 
                 if _backfill_list:
-                    log(f"  Generating searchable .jsonl for {len(_backfill_list)} previously transcribed video(s)...\n", "simpleline")
+                    _bf_total = len(_backfill_list)
+                    log_simple_status(f"  Generating searchable .jsonl — 0/{_bf_total}...\n")
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
+                    _bf_idx = 0
                     for _bf_title, _bf_vid in _backfill_list:
                         if _ce.is_set():
                             break
+                        _bf_idx += 1
+                        log_simple_status(f"  Generating searchable .jsonl — {_bf_idx}/{_bf_total}...\n")
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
                             if _bf_segs:
@@ -6808,6 +6812,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _bf_done += 1
                         except Exception:
                             pass
+                    clear_simple_status()
                     if _bf_done:
                         log(f"  ✓ {_bf_done} searchable .jsonl entry/entries generated.\n", "simpleline_green")
 
@@ -9666,6 +9671,28 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 f.write(f"youtube {current_vid_id}\n")
                         if not is_simple_mode:
                             log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
+                    continue
+                # Private/unavailable videos — auto-archive so they never reappear
+                if current_vid_id and ("Video unavailable" in line or "This video is private" in line
+                                       or "video is no longer available" in line.lower()):
+                    dur_count += 1
+                    session_totals["dur"] += 1
+                    _vid = current_vid_id
+                    _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
+                    _skipped_dur_titles.append((_skip_title, "Private/unavailable."))
+                    if is_simple_mode:
+                        _skip_tmax = 49
+                        if len(_skip_title) > _skip_tmax:
+                            _skip_title = _skip_title[:_skip_tmax - 3] + "..."
+                        short = f"[SKIP] {_skip_title:<{_skip_tmax}}  -Private/unavailable.\n"
+                        log(short, "filterskip")
+                    else:
+                        log(line, "filterskip")
+                    with io_lock:
+                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                            f.write(f"youtube {current_vid_id}\n")
+                    if not is_simple_mode:
+                        log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 err_count += 1
                 session_totals["err"] += 1

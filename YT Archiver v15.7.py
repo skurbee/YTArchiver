@@ -595,9 +595,11 @@ def log_dl_progress(msg):
                 log_box.config(state="normal")
                 ranges = log_box.tag_ranges("dlprogress")
                 _dl_pos = None
+                _was_replace = False
                 if ranges:
                     _dl_pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
+                    _was_replace = True
                 if _dl_pos:
                     log_box.insert(_dl_pos, msg, "dlprogress")
                 elif _is_simple_mode:
@@ -609,7 +611,8 @@ def log_dl_progress(msg):
                 else:
                     log_box.insert(tk.END, msg, "dlprogress")
 
-                if at_bottom:
+                # Only auto-scroll when inserting new content (not replacing in-place)
+                if at_bottom and not _was_replace:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -668,10 +671,12 @@ def log_simple_status(text):
                     log_box.delete(_start, _end)
 
                 ranges = log_box.tag_ranges("simplestatus")
+                _was_ss_replace = False
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
                     log_box.insert(_pos, text, "simplestatus")
+                    _was_ss_replace = True
                 else:
                     log_box.insert(tk.END, text, "simplestatus")
 
@@ -680,7 +685,8 @@ def log_simple_status(text):
                     for _s_text, _s_tag in _saved_parts:
                         log_box.insert(tk.END, _s_text, _s_tag)
 
-                if at_bottom:
+                # Only auto-scroll when inserting new content (not replacing in-place)
+                if at_bottom and not _was_ss_replace:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -1928,7 +1934,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.6 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.7 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3851,15 +3857,33 @@ def _process_sync_queue():
     # Find and select the channel in the tree, then sync it
     def _start_queued():
         global _sync_running
-        for item in settings_chan_tree.get_children():
-            if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
-                settings_chan_tree.selection_set(item)
-                on_chan_list_select(None)
-                break
-        # Must clear _sync_running before calling sync_single_channel(),
-        # otherwise it sees True and re-queues instead of starting.
-        _sync_running = False
-        sync_single_channel()
+        try:
+            _found = False
+            for item in settings_chan_tree.get_children():
+                if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
+                    settings_chan_tree.selection_set(item)
+                    on_chan_list_select(None)
+                    _found = True
+                    break
+            # Must clear _sync_running before calling sync_single_channel(),
+            # otherwise it sees True and re-queues instead of starting.
+            _sync_running = False
+            if _found:
+                sync_single_channel()
+            else:
+                log(f"  ⚠ Could not find {next_ch.get('name', '?')} in channel list — skipping.\n", "red")
+                # Try next queued item instead of getting stuck
+                _process_next_queued()
+        except Exception as e:
+            _sync_running = False
+            _current_sync_ch = None
+            _current_job["label"] = None
+            _current_job["url"] = None
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
+            _sync_task_finished()
+            _update_queue_btn()
+            log(f"  ⚠ Error starting queued sync: {e}\n", "red")
 
     if _root_alive:
         _ui_queue.append(_start_queued)

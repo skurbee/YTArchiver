@@ -119,7 +119,6 @@ _tray_base_img = None  # PIL Image of the base icon
 _tray_spin_frames = []  # pre-generated spinning animation frames (blue/default)
 _tray_spin_frames_red = []  # pre-generated spinning animation frames (red/transcription)
 _tray_spin_active = False
-_tray_spin_job = None  # threading.Timer for spin animation
 _tray_spin_idx = 0
 _reorg_queue = []  # list of (channel_name, folder_path, target_years, target_months, ch_url, recheck_dates) tuples
 _reorg_queue_lock = threading.Lock()
@@ -240,9 +239,12 @@ def _flush_ui_queue():
         while time.monotonic() < deadline:
             try:
                 fn = _ui_queue.popleft()
-                fn()
             except IndexError:
                 break
+            try:
+                fn()
+            except Exception:
+                pass  # isolate per-callback — one failure must not break others
     except Exception:
         pass
     try:
@@ -444,7 +446,12 @@ def log(text, tag=None):
                 sys.stdout.write(text)
                 sys.stdout.flush()
         except Exception:
-            pass
+            # Ensure log_box is always re-disabled after an error mid-write
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
 
     try:
         if _root_alive:
@@ -465,12 +472,14 @@ def _whisper_dot_tick():
     try:
         if 'log_box' in globals() and log_box.winfo_exists():
             log_box.config(state="normal")
-            # Only replace the dots portion
-            _dr = log_box.tag_ranges("whisper_dots")
-            if _dr:
-                log_box.delete(_dr[0], _dr[1])
-                log_box.insert(_dr[0], _dot_chars[_whisper_dots["idx"]] + "\n", "whisper_dots")
-            log_box.config(state="disabled")
+            try:
+                # Only replace the dots portion
+                _dr = log_box.tag_ranges("whisper_dots")
+                if _dr:
+                    log_box.delete(_dr[0], _dr[1])
+                    log_box.insert(_dr[0], _dot_chars[_whisper_dots["idx"]] + "\n", "whisper_dots")
+            finally:
+                log_box.config(state="disabled")
     except Exception:
         pass
     if _whisper_dots["active"] and 'root' in globals():
@@ -771,11 +780,13 @@ def _encode_dot_tick():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
-                _dr = log_box.tag_ranges("encode_dots")
-                if _dr:
-                    log_box.delete(_dr[0], _dr[1])
-                    log_box.insert(_dr[0], _dot_chars[_encode_dots["idx"]] + "\n", "encode_dots")
-                log_box.config(state="disabled")
+                try:
+                    _dr = log_box.tag_ranges("encode_dots")
+                    if _dr:
+                        log_box.delete(_dr[0], _dr[1])
+                        log_box.insert(_dr[0], _dot_chars[_encode_dots["idx"]] + "\n", "encode_dots")
+                finally:
+                    log_box.config(state="disabled")
         except Exception:
             pass
     _ui_queue.append(_tick)
@@ -906,7 +917,7 @@ def _start_simple_anim(channel, idx, total):
             except Exception:
                 pass
         if _simple_anim_state["active"] and root.winfo_exists():
-            _simple_anim_state["job"] = root.after(0, _simple_anim_tick)
+            _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
     _ui_queue.append(_do_start)
 
 
@@ -1439,45 +1450,48 @@ def _make_badge_icon(base_img, count):
 
 
 _tray_spin_use_red = False  # which frame set is active
+_tray_spin_thread = None    # persistent spin animation thread
+_tray_spin_stop_ev = threading.Event()  # signal spin thread to exit
 
-def _tray_spin_tick():
-    """Advance the spinning animation by one frame."""
-    global _tray_spin_idx, _tray_spin_job
-    _frames = _tray_spin_frames_red if _tray_spin_use_red else _tray_spin_frames
-    if not _tray_spin_active or _tray_icon is None or not _frames:
-        return
-    _tray_spin_idx = (_tray_spin_idx + 1) % len(_frames)
-    try:
-        _tray_icon.icon = _frames[_tray_spin_idx]
-    except Exception:
-        pass
-    # Red flash pulses slower (0.12s × 8 frames = ~1s cycle), blue spins faster
-    _interval = 0.12 if _tray_spin_use_red else 0.18
-    _tray_spin_job = threading.Timer(_interval, _tray_spin_tick)
-    _tray_spin_job.daemon = True
-    _tray_spin_job.start()
+def _tray_spin_loop():
+    """Persistent thread for tray spinning animation (avoids Timer churn)."""
+    global _tray_spin_idx
+    while not _tray_spin_stop_ev.is_set():
+        _frames = _tray_spin_frames_red if _tray_spin_use_red else _tray_spin_frames
+        if not _tray_spin_active or _tray_icon is None or not _frames:
+            break
+        _tray_spin_idx = (_tray_spin_idx + 1) % len(_frames)
+        try:
+            _tray_icon.icon = _frames[_tray_spin_idx]
+        except Exception:
+            pass
+        # Red flash pulses slower (0.12s × 8 frames = ~1s cycle), blue spins faster
+        _interval = 0.12 if _tray_spin_use_red else 0.18
+        _tray_spin_stop_ev.wait(_interval)
 
 
 def _tray_start_spin(red=False):
     """Start the spinning animation on the tray icon.
     red=True uses a bold red spinner (for transcription / heavy GPU work).
     """
-    global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red
+    global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red, _tray_spin_thread
     if not HAS_TRAY or _tray_icon is None:
         return
     _tray_spin_use_red = red
     _tray_spin_active = True
     _tray_spin_idx = 0
-    _tray_spin_tick()
+    # Start persistent spin thread if not already running
+    if _tray_spin_thread is None or not _tray_spin_thread.is_alive():
+        _tray_spin_stop_ev.clear()
+        _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
+        _tray_spin_thread.start()
 
 
 def _tray_stop_spin():
     """Stop spinning and restore the base or badge icon."""
-    global _tray_spin_active, _tray_spin_job
+    global _tray_spin_active
     _tray_spin_active = False
-    if _tray_spin_job:
-        _tray_spin_job.cancel()
-        _tray_spin_job = None
+    _tray_spin_stop_ev.set()  # signal spin thread to exit
     _update_tray_badge()
 
 
@@ -4162,7 +4176,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
         _reorg_anim_active[0] = True
         def _start_reorg_anim():
             if root.winfo_exists():
-                _reorg_anim_job[0] = root.after(0, _reorg_anim_tick)
+                _reorg_anim_job[0] = root.after(500, _reorg_anim_tick)
         _ui_queue.append(_start_reorg_anim)
 
     for i, (filepath, mtime, folder_year, folder_month) in enumerate(all_files):
@@ -9199,7 +9213,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                         def _start_merge_anim():
                             if root.winfo_exists():
-                                _merge_anim["job"] = root.after(0, _merge_anim_tick)
+                                _merge_anim["job"] = root.after(500, _merge_anim_tick)
                         _ui_queue.append(_start_merge_anim)
 
             if "recorded in the archive" in line:
@@ -10922,7 +10936,7 @@ def _ensure_blink_running():
     """Start the unified blink clock if it's not already ticking."""
     if _blink_clock["job"] is None and root.winfo_exists():
         _blink_clock["on"] = False
-        _blink_clock["job"] = root.after(0, _blink_tick)
+        _blink_clock["job"] = root.after(700, _blink_tick)
 
 
 def _sync_blink_start():
@@ -11980,7 +11994,7 @@ def _save_log_mode(*_):
                 _simple_anim_state["active"] = True
                 _simple_anim_state["dots"] = 0
                 if root.winfo_exists():
-                    _simple_anim_state["job"] = root.after(0, _simple_anim_tick)
+                    _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
         else:
             # Switching to Verbose — stop animation and clear status line
             if _simple_anim_state["active"]:
@@ -13900,11 +13914,9 @@ def on_closing():
         _save_queue_state()
 
     # Stop the system tray icon
-    global _tray_spin_active, _tray_spin_job
+    global _tray_spin_active
     _tray_spin_active = False
-    if _tray_spin_job:
-        _tray_spin_job.cancel()
-        _tray_spin_job = None
+    _tray_spin_stop_ev.set()  # signal spin thread to exit
     if _tray_icon is not None:
         try:
             _tray_icon.stop()

@@ -363,9 +363,11 @@ def log(text, tag=None):
                             log_box.config(state="disabled")
                             return
 
+                    _ss_insert_pos = None  # position to insert in-place (anti-jitter)
                     if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
+                            _ss_insert_pos = log_box.index(ranges[0])
                             log_box.delete(ranges[0], ranges[1])
 
                     # Purge "using/fetching" lines when a done line arrives
@@ -411,6 +413,9 @@ def log(text, tag=None):
                         log_box.insert(ss_ranges[0], text, use_tag)
                     else:
                         log_box.insert(tk.END, text, use_tag)
+                elif _is_simple_mode and _ss_insert_pos is not None:
+                    # Insert at the old simplestatus position to avoid jitter
+                    log_box.insert(_ss_insert_pos, text, use_tag)
                 else:
                     log_box.insert(tk.END, text, use_tag)
 
@@ -589,9 +594,13 @@ def log_dl_progress(msg):
 
                 log_box.config(state="normal")
                 ranges = log_box.tag_ranges("dlprogress")
+                _dl_pos = None
                 if ranges:
+                    _dl_pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                if _is_simple_mode:
+                if _dl_pos:
+                    log_box.insert(_dl_pos, msg, "dlprogress")
+                elif _is_simple_mode:
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], msg, "dlprogress")
@@ -660,8 +669,11 @@ def log_simple_status(text):
 
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
+                    _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                log_box.insert(tk.END, text, "simplestatus")
+                    log_box.insert(_pos, text, "simplestatus")
+                else:
+                    log_box.insert(tk.END, text, "simplestatus")
 
                 # Re-insert whisper/encode progress at the bottom (after sync line)
                 if _saved_parts:
@@ -1652,13 +1664,20 @@ def _deferred_tray_setup():
 
 # ─── End system tray icon ────────────────────────────────────────────
 
-window_width = 900
-window_height = 800
+window_width = config.get("window_w", 900)
+window_height = config.get("window_h", 800)
 root.update_idletasks()
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
-x = (screen_width // 2) - (window_width // 2)
-y = (screen_height // 2) - (window_height // 2)
+_saved_x = config.get("window_x")
+_saved_y = config.get("window_y")
+if _saved_x is not None and _saved_y is not None:
+    # Clamp to visible area (in case monitor layout changed)
+    x = max(0, min(_saved_x, screen_width - 100))
+    y = max(0, min(_saved_y, screen_height - 100))
+else:
+    x = (screen_width // 2) - (window_width // 2)
+    y = (screen_height // 2) - (window_height // 2)
 root.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
 C_BG = "#0f1012"
@@ -1909,7 +1928,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.5 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.6 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6852,7 +6871,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 if _backfill_list:
                     _bf_total = len(_backfill_list)
-                    log_simple_status(f"  Generating searchable .jsonl — 0/{_bf_total}...\n")
+                    log(f"  Generating searchable .jsonl for {_bf_total} video(s)...\n", "simpleline")
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
@@ -6861,7 +6880,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _ce.is_set():
                             break
                         _bf_idx += 1
-                        log_simple_status(f"  Generating searchable .jsonl — {_bf_idx}/{_bf_total}...\n")
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
                             if _bf_segs:
@@ -6880,7 +6898,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _bf_done += 1
                         except Exception:
                             pass
-                    clear_simple_status()
                     if _bf_done:
                         log(f"  ✓ {_bf_done} searchable .jsonl entry/entries generated.\n", "simpleline_green")
 
@@ -14375,6 +14392,19 @@ def _load_queue_state():
 
 def on_closing():
     global _root_alive
+    # Save window position and size before closing
+    try:
+        geo = root.geometry()  # e.g. "900x800+100+200"
+        _wh, _pos = geo.split("+", 1)
+        _w, _h = _wh.split("x")
+        _px, _py = _pos.split("+")
+        config["window_w"] = int(_w)
+        config["window_h"] = int(_h)
+        config["window_x"] = int(_px)
+        config["window_y"] = int(_py)
+        save_config(config)
+    except Exception:
+        pass
     _root_alive = False  # Tell worker threads to stop touching Tkinter immediately
 
     # Check if there are queued jobs

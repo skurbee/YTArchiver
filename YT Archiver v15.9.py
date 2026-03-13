@@ -1747,6 +1747,57 @@ def _apply_dark_title_bar(win):
 _apply_dark_title_bar(root)
 
 
+def _dark_askquestion(title, message, yes_text="Yes", no_text="No"):
+    """Show a dark-mode yes/no dialog on the main thread.
+
+    Returns True if Yes was clicked, False otherwise.
+    Must be called from the main (Tk) thread; uses root.wait_window() so the
+    Tk event loop keeps running while the dialog is open.
+    """
+    _result = [None]
+
+    _dlg = tk.Toplevel(root)
+    _dlg.title(title)
+    _dlg.configure(bg=C_BG)
+    _dlg.resizable(False, False)
+    _dlg.transient(root)
+    _dlg.grab_set()
+    _dlg.update_idletasks()
+    _apply_dark_title_bar(_dlg)
+
+    def _dismiss(val):
+        _result[0] = val
+        try:
+            _dlg.destroy()
+        except Exception:
+            pass
+
+    _dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss(False))
+
+    tk.Label(_dlg, text=message, bg=C_BG, fg=C_TEXT,
+             font=("Segoe UI", 10), justify="left",
+             wraplength=420, padx=20, pady=(14, 4)).pack(fill="x")
+
+    btn_row = tk.Frame(_dlg, bg=C_BG)
+    btn_row.pack(padx=20, pady=(6, 14))
+    tk.Button(btn_row, text=yes_text, bg="#3a6a3a", fg="#cccccc",
+              relief="flat", font=("Segoe UI", 9, "bold"),
+              cursor="hand2", command=lambda: _dismiss(True),
+              width=10).pack(side="left", padx=(0, 8))
+    tk.Button(btn_row, text=no_text, bg=C_BTN, fg=C_TEXT,
+              relief="flat", font=("Segoe UI", 9),
+              cursor="hand2", command=lambda: _dismiss(False),
+              width=10).pack(side="left")
+
+    _dlg.update_idletasks()
+    _rx = root.winfo_rootx() + root.winfo_width() // 2
+    _ry = root.winfo_rooty() + root.winfo_height() // 2
+    _dlg.geometry(f"+{_rx - _dlg.winfo_width() // 2}+{_ry - _dlg.winfo_height() // 2}")
+
+    root.wait_window(_dlg)
+    return bool(_result[0])
+
+
 def _entry(parent, maxlen=500, **kw):
     kw.setdefault("bg", C_INPUT)
     kw.setdefault("fg", C_TEXT)
@@ -3354,12 +3405,11 @@ def add_channel():
                     _bl_res_label = "Best" if _bl_res == "best" else f"{_bl_res}p"
                     _bl_out_label = f" → {_new_c_res}p output" if _new_c_res else ""
                     _bl_bitrate = _get_compress_bitrate(_new_c_level, _new_c_res)
-                    _bl_ask = messagebox.askyesno(
+                    _bl_ask = _dark_askquestion(
                         "Apply to Existing Videos",
                         f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
                         f"Re-download at {_bl_res_label}{_bl_out_label}, "
-                        f"quality: {_new_c_level} (~{_bl_bitrate} MB/hr).",
-                        parent=root
+                        f"quality: {_new_c_level} (~{_bl_bitrate} MB/hr)."
                     )
                     if _bl_ask:
                         _add_to_gpu_queue({
@@ -6053,7 +6103,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         else:
                             msg = (f"Batch 1 complete with {batch_errors} error(s).\n\n"
                                    f"Continue for the remaining {len(work_list) - batch_size} videos?")
-                        result = messagebox.askyesno("Backlog Compression", msg, parent=root)
+                        result = _dark_askquestion("Backlog Compression", msg,
+                                                      yes_text="Continue", no_text="Adjust Settings")
                         _confirm_result[0] = True if result else "redo"
 
                     _ui_queue.append(_ask_confirm)

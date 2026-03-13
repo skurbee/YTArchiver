@@ -33,6 +33,7 @@ seperage sync-tasks and gpu-tasks editable queues
 
 Transcribe full channels, and have the option to transcribe new downloads from that channel. Uses YT auto-captions + punctuation model when possible, falls back to whisper (with model options, per channel)
 
+on download fail, it pings a few things to test internet. if it's out, it auto-pauses everything until back online
 
 
 this is maybe 2% me and 98% claude-code :)

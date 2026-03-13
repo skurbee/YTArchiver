@@ -148,6 +148,7 @@ _whisper_model_lock = threading.Lock()  # unused legacy, kept for compat
 _punct_proc = None  # persistent punctuation subprocess (model stays loaded on GPU)
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 _skip_current = threading.Event()  # set when user wants to skip the current job and move to next in queue
+_skip_current_gpu = threading.Event()  # same, for GPU Tasks
 
 # Unified queue ordering — tracks insertion order across all queue types.
 # Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video", url_or_key).
@@ -1934,7 +1935,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.7 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.8 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10642,6 +10643,18 @@ def _skip_current_job():
     log("\n⏭ Skipping current job...\n", "red")
 
 
+def _skip_current_gpu_job():
+    """Cancel only the currently running GPU task and proceed to the next queued item."""
+    _skip_current_gpu.set()
+    _gpu_cancel.set()
+    _gpu_pause.clear()
+
+    # Kill active Whisper/ffmpeg subprocesses (but don't clear the GPU queue)
+    _stop_whisper_process()
+    _stop_ffmpeg_process()
+    log("\n⏭ Skipping current GPU task...\n", "red")
+
+
 def _fmt_time():
     return datetime.now().strftime("%I:%M%p").lstrip("0").lower()
 
@@ -11683,6 +11696,15 @@ def _show_gpu_menu(event=None):
                     lbl.pack(side="left", fill="x", expand=True)
                     _state["active_lbl"] = lbl  # track for dot-only updates
                     _widgets.append({"row": row, "lbl": lbl, "handle": None, "source": "current", "idx": idx})
+
+                    # Right-click on current (running) GPU item to skip it and move to next
+                    def _skip_gpu_click(e):
+                        popup.destroy()
+                        _gpu_popup["win"] = None
+                        if messagebox.askyesno("Skip Current", "Cancel the current GPU task and move to the next one?"):
+                            _skip_current_gpu_job()
+                    for w in [row, lbl]:
+                        w.bind("<Button-3>", _skip_gpu_click)
                 else:
                     handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
                                       font=("Segoe UI", 10), cursor="fleur", pady=2)
@@ -12064,8 +12086,13 @@ def _gpu_start():
                             log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
-                        log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
-                        break
+                        if _skip_current_gpu.is_set():
+                            # Skip current task — clear cancel and continue to next item
+                            _skip_current_gpu.clear()
+                            _gpu_cancel.clear()
+                        else:
+                            log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
+                            break
 
                     with _gpu_queue_lock:
                         if not _gpu_queue:
@@ -12288,8 +12315,12 @@ def _gpu_start():
                         log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _gpu_cancel.is_set():
-                    log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
-                    break
+                    if _skip_current_gpu.is_set():
+                        _skip_current_gpu.clear()
+                        _gpu_cancel.clear()
+                    else:
+                        log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
+                        break
 
                 # Pop next item
                 with _gpu_queue_lock:

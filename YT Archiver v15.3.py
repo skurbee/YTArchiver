@@ -1909,7 +1909,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v15.3 - 03.13.26", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v15.5 - 03.13.26", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4717,7 +4717,11 @@ def _parse_vtt_to_text(vtt_path):
 
 
 def _parse_vtt_to_segments(vtt_path):
-    """Parse a .vtt subtitle file into timestamped segments for JSONL output.
+    """Parse a .vtt subtitle file into merged, deduplicated timestamped segments.
+
+    YouTube VTT uses rolling captions where each cue repeats previous text and
+    adds a few words.  This parser merges overlapping cues so the output has one
+    clean segment per actual phrase with no duplication.
 
     Returns list of {"start": float_secs, "end": float_secs, "text": str}.
     """
@@ -4737,23 +4741,21 @@ def _parse_vtt_to_segments(vtt_path):
             return int(parts[0]) * 60 + float(parts[1])
         return 0.0
 
-    segments = []
+    # Step 1: Parse raw cues from VTT
+    raw_cues = []  # list of (start, end, text)
     lines = raw.split("\n")
     current_start = None
     current_end = None
     current_text = []
-    prev_text = ""
 
     for line in lines:
         line = line.strip()
         ts_match = re.match(r'(\d[\d:.]+)\s*-->\s*(\d[\d:.]+)', line)
         if ts_match:
-            # Flush previous segment
+            # Flush previous cue
             if current_text and current_start is not None:
                 joined = " ".join(current_text)
-                if joined != prev_text:
-                    segments.append({"start": current_start, "end": current_end, "text": joined})
-                    prev_text = joined
+                raw_cues.append((current_start, current_end, joined))
             current_start = _ts_to_secs(ts_match.group(1))
             current_end = _ts_to_secs(ts_match.group(2))
             current_text = []
@@ -4771,11 +4773,64 @@ def _parse_vtt_to_segments(vtt_path):
         if cleaned:
             current_text.append(cleaned)
 
-    # Flush last segment
+    # Flush last cue
     if current_text and current_start is not None:
         joined = " ".join(current_text)
-        if joined != prev_text:
-            segments.append({"start": current_start, "end": current_end, "text": joined})
+        raw_cues.append((current_start, current_end, joined))
+
+    if not raw_cues:
+        return []
+
+    # Step 2: Merge overlapping rolling cues.
+    # YouTube auto-subs emit cues where each new cue's text starts with the
+    # tail of the previous cue's text plus new words.  We detect overlap by
+    # checking if the new cue's text starts with a suffix of the current
+    # accumulated text, and if so, only keep the new words.
+    segments = []
+    seg_start = raw_cues[0][0]
+    seg_end = raw_cues[0][1]
+    seg_text = raw_cues[0][2]
+
+    for i in range(1, len(raw_cues)):
+        _s, _e, _t = raw_cues[i]
+
+        # Check if this cue is a rolling continuation of the current segment.
+        # A rolling cue's text typically starts with a suffix of seg_text.
+        _is_overlap = False
+        if seg_text and _t:
+            # Check if the new cue text starts with the end of the accumulated text
+            # Try matching the last N words of seg_text against the start of _t
+            seg_words = seg_text.split()
+            new_words = _t.split()
+            # Try overlap lengths from large to small
+            max_overlap = min(len(seg_words), len(new_words) - 1)
+            for ol in range(max_overlap, 0, -1):
+                if seg_words[-ol:] == new_words[:ol]:
+                    # Found overlap — append only the new words
+                    extra = " ".join(new_words[ol:])
+                    if extra:
+                        seg_text += " " + extra
+                    seg_end = _e
+                    _is_overlap = True
+                    break
+
+            # Also catch near-zero-duration "echo" cues (e.g., 805.91→805.92)
+            # that just repeat the tail without adding new words
+            if not _is_overlap and (_e - _s) < 0.1:
+                _is_overlap = True  # skip it
+                seg_end = max(seg_end, _e)
+
+        if not _is_overlap:
+            # Flush current segment and start a new one
+            if seg_text.strip():
+                segments.append({"start": seg_start, "end": seg_end, "text": seg_text.strip()})
+            seg_start = _s
+            seg_end = _e
+            seg_text = _t
+
+    # Flush final segment
+    if seg_text.strip():
+        segments.append({"start": seg_start, "end": seg_end, "text": seg_text.strip()})
 
     return segments
 
@@ -6712,7 +6767,20 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if already_done:
                 log(f"  {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
 
-            # Check if JSONL backfill is needed for already-transcribed videos
+            # One-time migration: delete old JSONL files so they get regenerated
+            # with the improved merged-segment parser (v15.4 fix).
+            _migration_key = f"jsonl_v154_migrated_{ch_name}"
+            if already_done and not config.get(_migration_key):
+                for _dp, _dns, _fns in os.walk(folder):
+                    for _fn in _fns:
+                        if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
+                            try:
+                                os.remove(os.path.join(_dp, _fn))
+                            except Exception:
+                                pass
+                with config_lock:
+                    config[_migration_key] = True
+                    save_config(config)
             _jsonl_existing = _scan_existing_jsonl(folder, ch_name) if already_done else set()
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 

@@ -794,6 +794,25 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
                         log_box.insert(_ins_pt, _s_text, _s_tag)
                         if _ins_pt != tk.END:
                             _ins_pt = log_box.index(f"{_ins_pt} + {len(_s_text)}c")
+                    # Re-apply encode_prefix/encode_title overlays lost during save/restore
+                    _ep_r = log_box.tag_ranges("encode_progress")
+                    if _ep_r:
+                        _ep_start = _ep_r[-2]
+                        _ep_text = log_box.get(_ep_r[-2], _ep_r[-1])
+                        _enc_i = _ep_text.find("ENCODING")
+                        if _enc_i >= 0:
+                            # Match ": title (duration) - " or ": title - " after "ENCODING"
+                            _pfx_m = re.match(
+                                r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)(.*)$',
+                                _ep_text[_enc_i + 8:]
+                            )
+                            if _pfx_m:
+                                _pfx_end = log_box.index(f"{_ep_start}+{_enc_i}c")
+                                log_box.tag_add("encode_prefix", _ep_start, _pfx_end)
+                                _ttl_start = log_box.index(f"{_ep_start}+{_enc_i + 8}c")
+                                _ttl_end = log_box.index(
+                                    f"{_ttl_start}+{len(_pfx_m.group(1))}c")
+                                log_box.tag_add("encode_title", _ttl_start, _ttl_end)
 
                 # Re-insert pausestatus at the very bottom (after simplestatus)
                 for _ps_text in _saved_ps:
@@ -2624,6 +2643,8 @@ log_box.tag_configure("encode_suffix", foreground=C_LOG_BLUE, font=("Consolas", 
 # encode_prefix and encode_title must override encode_progress (white over blue)
 log_box.tag_raise("encode_prefix", "encode_progress")
 log_box.tag_raise("encode_title", "encode_progress")
+# simplestatus_green must override simplestatus so SYNCING label stays green
+log_box.tag_raise("simplestatus_green", "simplestatus")
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -11225,7 +11246,7 @@ def _get_queue_items():
     # Show currently processing item first
     if _current_job["label"]:
         if (_sync_running or _reorg_running or _transcribe_running) and pause_event.is_set():
-            _active_lbl = _current_job["label"] + " (Paused)"
+            _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
         elif _sync_running or _reorg_running or _transcribe_running:
             _active_lbl = _active_label(_current_job["label"], with_dots=True)
         else:
@@ -11643,16 +11664,32 @@ def _show_queue_menu(event=None):
                               cursor="hand2", command=_start_sync_queue).pack(side="left", padx=(4, 4))
                     _state["pause_resume_btn"] = None
                 else:
+                    _pr_btn_ref = [None]
+                    def _sync_toggle_pause():
+                        toggle_pause()
+                        # Update button text immediately (no 300ms refresh delay)
+                        try:
+                            _b = _pr_btn_ref[0]
+                            if _b and _b.winfo_exists():
+                                if pause_event.is_set():
+                                    _b.config(text="\u25B6 Resume", bg="#3a6a3a",
+                                              activebackground="#4a8a4a")
+                                else:
+                                    _b.config(text="\u23F8 Pause", bg="#2a4a6b",
+                                              activebackground="#3a5e84")
+                        except Exception:
+                            pass
                     if pause_event.is_set():
                         _sync_pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=toggle_pause)
+                                  cursor="hand2", command=_sync_toggle_pause)
                     else:
                         _sync_pr_btn = tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=toggle_pause)
+                                  cursor="hand2", command=_sync_toggle_pause)
+                    _pr_btn_ref[0] = _sync_pr_btn
                     _sync_pr_btn.pack(side="left", padx=(4, 4))
                     _state["pause_resume_btn"] = _sync_pr_btn
                 def _confirm_cancel_sync():
@@ -11957,10 +11994,10 @@ def _blink_tick():
                 style.configure("SyncQ.TButton", background=C_BTN)
                 style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # GPU Tasks button — blink while GPU is active; go solid when truly paused
-        # (i.e. the worker is in its pause-wait loop between items, not while actively encoding).
+        # GPU Tasks button — blink while actively encoding; go solid when paused between items
+        # (i.e. pause is set AND nothing is actively encoding/transcribing).
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if _gpu_truly_paused:
+            if _gpu_truly_paused or (_gpu_pause.is_set() and not _gpu_actively_encoding):
                 # Worker is waiting in the pause loop — hold solid red
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
@@ -12388,16 +12425,32 @@ def _show_gpu_menu(event=None):
                               cursor="hand2", command=_do_gpu_start).pack(side="left", padx=(4, 4))
                     _state["pause_resume_btn"] = None
                 else:
+                    _gpu_pr_btn_ref = [None]
+                    def _gpu_toggle_pause():
+                        _gpu_pause_handler()
+                        # Update button text immediately (no 1000ms refresh delay)
+                        try:
+                            _b = _gpu_pr_btn_ref[0]
+                            if _b and _b.winfo_exists():
+                                if _gpu_pause.is_set():
+                                    _b.config(text="\u25B6 Resume", bg="#3a6a3a",
+                                              activebackground="#4a8a4a")
+                                else:
+                                    _b.config(text="\u23F8 Pause", bg="#2a4a6b",
+                                              activebackground="#3a5e84")
+                        except Exception:
+                            pass
                     if _gpu_pause.is_set():
                         _pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=_gpu_pause_handler)
+                                  cursor="hand2", command=_gpu_toggle_pause)
                     else:
                         _pr_btn = tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=_gpu_pause_handler)
+                                  cursor="hand2", command=_gpu_toggle_pause)
+                    _gpu_pr_btn_ref[0] = _pr_btn
                     _pr_btn.pack(side="left", padx=(4, 4))
                     _state["pause_resume_btn"] = _pr_btn
                 def _confirm_cancel_gpu():

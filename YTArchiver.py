@@ -712,7 +712,7 @@ def clear_transient_lines():
         pass
 
 
-def log_simple_status(text, extra_tag=None):
+def log_simple_status(text=None, extra_tag=None, segments=None):
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -721,13 +721,16 @@ def log_simple_status(text, extra_tag=None):
                 except Exception:
                     at_bottom = True
 
+                # Compute the full text - either from segments or the text parameter
+                _full_text = "".join(s for s, _ in segments) if segments is not None else (text or "")
+
                 log_box.config(state="normal")
 
                 # Save encode/whisper progress so they stay above the sync line
                 # Collect all ranges sorted by position to preserve interleaved order
                 _saved_parts = []
                 _all_ranges = []
-                for _tag in ("encode_progress", "encode_pct", "encode_dots",
+                for _tag in ("encode_progress", "encode_pct", "encode_dots", "encode_suffix",
                              "whisper_progress", "whisper_pct", "whisper_dots"):
                     _r = log_box.tag_ranges(_tag)
                     for _ri in range(0, len(_r), 2):
@@ -751,19 +754,35 @@ def log_simple_status(text, extra_tag=None):
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(_pos, text, "simplestatus")
+                    log_box.insert(_pos, _full_text, "simplestatus")
                     # Apply extra_tag via tag_add after insert so it covers exactly the
                     # inserted text range — avoids Tkinter's boundary tag-inheritance
                     # ambiguity (inserting at a tag boundary with a tuple can pull adjacent
                     # non-simplestatus lines into the range and cause them to be purged).
-                    if extra_tag and text:
-                        _new_end = log_box.index(f"{_pos}+{len(text)}c")
+                    if segments is not None:
+                        _seg_p = _pos
+                        for _st, _stag in segments:
+                            if _stag and _st:
+                                _se = log_box.index(f"{_seg_p}+{len(_st)}c")
+                                log_box.tag_add(_stag, _seg_p, _se)
+                            if _st:
+                                _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
+                    elif extra_tag and _full_text:
+                        _new_end = log_box.index(f"{_pos}+{len(_full_text)}c")
                         log_box.tag_add(extra_tag, _pos, _new_end)
                 else:
                     _ins_start = log_box.index(tk.END)
-                    log_box.insert(tk.END, text, "simplestatus")
-                    if extra_tag and text:
-                        _new_end = log_box.index(f"{_ins_start}+{len(text)}c")
+                    log_box.insert(tk.END, _full_text, "simplestatus")
+                    if segments is not None:
+                        _seg_p = _ins_start
+                        for _st, _stag in segments:
+                            if _stag and _st:
+                                _se = log_box.index(f"{_seg_p}+{len(_st)}c")
+                                log_box.tag_add(_stag, _seg_p, _se)
+                            if _st:
+                                _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
+                    elif extra_tag and _full_text:
+                        _new_end = log_box.index(f"{_ins_start}+{len(_full_text)}c")
                         log_box.tag_add(extra_tag, _ins_start, _new_end)
 
                 # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
@@ -858,8 +877,8 @@ def _update_encode_progress(text):
                 for _start, _end, _ in reversed(_wp_ranges):
                     log_box.delete(_start, _end)
 
-                # Delete existing encode progress/pct/dots ranges
-                for _etag in ("encode_dots", "encode_pct", "encode_progress"):
+                # Delete existing encode progress/pct/dots/suffix ranges
+                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix"):
                     while True:
                         _er = log_box.tag_ranges(_etag)
                         if not _er:
@@ -879,13 +898,16 @@ def _update_encode_progress(text):
                     _after_raw = text[_ep_match.end():]
                     # Strip trailing dots/newline — we animate those separately
                     _suffix = _after_raw.rstrip(".\n ").rstrip()
-                    # Build parts list, then insert sequentially at _enc_pos
-                    _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
-                    if _suffix:
-                        _parts.append((_suffix, "encode_progress"))
+                    # Build parts list: dots before suffix so pause text appears after animation
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
-                    _parts.append((_d + "\n", "encode_dots"))
+                    _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
+                    if _suffix:
+                        # Dots without newline, then suffix (with newline) after
+                        _parts.append((_d, "encode_dots"))
+                        _parts.append((_suffix + "\n", "encode_suffix"))
+                    else:
+                        _parts.append((_d + "\n", "encode_dots"))
                     # Insert all parts — each subsequent insert goes after the previous
                     _ins = _enc_pos
                     for _ptxt, _ptag in _parts:
@@ -948,7 +970,13 @@ def _encode_dot_tick():
                     _dr = log_box.tag_ranges("encode_dots")
                     if _dr:
                         log_box.delete(_dr[0], _dr[1])
-                        log_box.insert(_dr[0], _dot_chars[_encode_dots["idx"]] + "\n", "encode_dots")
+                        # If an encode_suffix follows (pause text after dots), omit the
+                        # newline from the dots so the suffix stays on the same line
+                        _has_suffix = bool(log_box.tag_ranges("encode_suffix"))
+                        _new_dots = _dot_chars[_encode_dots["idx"]]
+                        if not _has_suffix:
+                            _new_dots += "\n"
+                        log_box.insert(_dr[0], _new_dots, "encode_dots")
                 finally:
                     log_box.config(state="disabled")
         except Exception:
@@ -977,7 +1005,7 @@ def _clear_encode_progress():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
-                for _etag in ("encode_dots", "encode_pct", "encode_progress"):
+                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix"):
                     while True:
                         _er = log_box.tag_ranges(_etag)
                         if not _er:
@@ -1092,23 +1120,49 @@ def _simple_anim_tick():
         _bs = _simple_anim_state.get("batch_size", 0)
         if dl_cur > 0 and _bs > 0:
             _b_num = (dl_cur - 1) // _bs + 1
-            status = f"  Downloading video #{dl_cur} (Batch {_b_num}){d}"
+            status_text = f"  Downloading video #{dl_cur} (Batch {_b_num})"
         elif dl_cur > 0 and ch_tot > 0:
-            status = f"  Downloading video #{dl_cur} of {ch_tot}{d}"
+            status_text = f"  Downloading video #{dl_cur} of {ch_tot}"
         elif dl_cur > 0:
-            status = f"  Downloading{d}"
+            status_text = "  Downloading"
         else:
-            status = f"  {d}"
+            status_text = "  "
 
         enum_page = _simple_anim_state.get("enum_page", 0)
         enum_count = _simple_anim_state.get("enum_count", 0)
         page = _simple_anim_state["page_num"]
         if enum_page > 0:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}  {d}\nEnumerating video IDs, {enum_count:,} found (first run only){d}\n", extra_tag="simplestatus_green")
+            log_simple_status(segments=[
+                (f"[{i}/{n}]", None),
+                (" SYNCING:", "simplestatus_green"),
+                (f" {ch}  ", None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+                (f"Enumerating video IDs, {enum_count:,} found (first run only)", None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+            ])
         elif page > 0:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\nDownloading channel info, Page {page}{d}\n", extra_tag="simplestatus_green")
+            log_simple_status(segments=[
+                (f"[{i}/{n}]", None),
+                (" SYNCING:", "simplestatus_green"),
+                (f" {ch}", None),
+                (status_text, None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+                (f"Downloading channel info, Page {page}", None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+            ])
         else:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\n", extra_tag="simplestatus_green")
+            log_simple_status(segments=[
+                (f"[{i}/{n}]", None),
+                (" SYNCING:", "simplestatus_green"),
+                (f" {ch}", None),
+                (status_text, None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+            ])
     except Exception:
         pass
     finally:
@@ -2530,6 +2584,7 @@ log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9
 log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("encode_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("encode_suffix", foreground=C_LOG_BLUE, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -5777,6 +5832,11 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 _gpu_actively_encoding = True
                 _encode_t0 = time.time()
 
+                # Show a loading state while ffmpeg initializes (can take several minutes)
+                if _is_simple_mode:
+                    _load_info = f"[{idx}/{total}] ENCODING: {fname_short} ({dur_str}) - " if duration > 0 else f"[{idx}/{total}] ENCODING: {fname_short} - "
+                    _update_encode_progress(f"{_load_info}loading\n")
+
                 # Parse progress from stderr
                 _time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
                 last_pct = -1
@@ -5800,19 +5860,19 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                             last_pct = pct
                             _dot_idx += 1
                             _d = _EDOTS[_dot_idx % 3]
-                            _vid_info = f"[{idx}/{total}] {fname_short} ({dur_str}) - " if _is_simple_mode else ""
+                            _vid_info = f"[{idx}/{total}] ENCODING: {fname_short} ({dur_str}) - " if _is_simple_mode else ""
                             if _pe.is_set():
-                                _update_encode_progress(f"    Encoding {_vid_info}{pct}% — will pause after this video{_d}\n")
+                                _update_encode_progress(f"{_vid_info}{pct}% — will pause after this video{_d}\n")
                             else:
-                                _update_encode_progress(f"    Encoding {_vid_info}{pct}%{_d}\n")
+                                _update_encode_progress(f"{_vid_info}{pct}%{_d}\n")
                     elif duration <= 0:
                         _dot_idx += 1
                         _d = _EDOTS[_dot_idx % 3]
-                        _vid_info = f"[{idx}/{total}] {fname_short} - " if _is_simple_mode else ""
+                        _vid_info = f"[{idx}/{total}] ENCODING: {fname_short} - " if _is_simple_mode else ""
                         if _pe.is_set():
-                            _update_encode_progress(f"    Encoding {_vid_info}— will pause after this video{_d}\n")
+                            _update_encode_progress(f"{_vid_info}— will pause after this video{_d}\n")
                         else:
-                            _update_encode_progress(f"    Encoding {_vid_info}{_d}\n")
+                            _update_encode_progress(f"{_vid_info}{_d}\n")
 
                 try:
                     proc.wait(timeout=300)
@@ -6187,6 +6247,20 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         _gpu_actively_encoding = True
                         _bl_encode_t0 = time.time()
 
+                        # Compute vid info strings for progress display and loading state
+                        if _is_simple_mode:
+                            _bl_total = len(work_list)
+                            _bl_idx = batch_start + idx + 1
+                            _bl_dur_short = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
+                            _bl_vid_info_dur = f"[{_bl_idx}/{_bl_total}] ENCODING: {fname_short} ({_bl_dur_short}) - "
+                            _bl_vid_info_nodur = f"[{_bl_idx}/{_bl_total}] ENCODING: {fname_short} - "
+                            # Show loading state while ffmpeg initializes (issue #50)
+                            _bl_load_info = _bl_vid_info_dur if _bl_duration > 0 else _bl_vid_info_nodur
+                            _update_encode_progress(f"{_bl_load_info}loading\n")
+                        else:
+                            _bl_vid_info_dur = ""
+                            _bl_vid_info_nodur = ""
+
                         _bl_time_re = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
                         _bl_last_pct = -1
                         _bl_dot_idx = 0
@@ -6210,16 +6284,16 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                     _bl_dot_idx += 1
                                     _d = _EDOTS[_bl_dot_idx % 3]
                                     if _pe.is_set():
-                                        _update_encode_progress(f"    Encoding {_bl_pct}% — will pause after this video{_d}\n")
+                                        _update_encode_progress(f"{_bl_vid_info_dur}{_bl_pct}% — will pause after this video{_d}\n")
                                     else:
-                                        _update_encode_progress(f"    Encoding {_bl_pct}%{_d}\n")
+                                        _update_encode_progress(f"{_bl_vid_info_dur}{_bl_pct}%{_d}\n")
                             elif _bl_duration <= 0:
                                 _bl_dot_idx += 1
                                 _d = _EDOTS[_bl_dot_idx % 3]
                                 if _pe.is_set():
-                                    _update_encode_progress(f"    Encoding — will pause after this video{_d}\n")
+                                    _update_encode_progress(f"{_bl_vid_info_nodur}— will pause after this video{_d}\n")
                                 else:
-                                    _update_encode_progress(f"    Encoding{_d}\n")
+                                    _update_encode_progress(f"{_bl_vid_info_nodur}{_d}\n")
 
                         if not _ce.is_set():
                             try:
@@ -8606,6 +8680,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
+                             ("encode_suffix", {"foreground": C_LOG_BLUE}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -11790,12 +11865,12 @@ _blink_clock = {"on": False, "job": None}
 # Dedicated style for Sync Tasks button — same as Emoji.TButton but we toggle its background
 style.configure("SyncQ.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
                 font=("Segoe UI Emoji", 11))
-style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 # Dedicated style for GPU button — same as Emoji.TButton but we toggle its background
 style.configure("Gpu.TButton", background=C_BTN, foreground=C_TEXT, padding=[2, 2], relief="flat",
                 font=("Segoe UI Emoji", 11))
-style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
 
 def _blink_tick():
@@ -11813,23 +11888,23 @@ def _blink_tick():
             if pause_event.is_set():
                 # Paused → solid color
                 style.configure("SyncQ.TButton", background="#3a5a3a")
-                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+                style.map("SyncQ.TButton", background=[("pressed", "#3a5a3a"), ("active", "#4a6a4a"), ("disabled", C_BORDER)])
             elif is_on:
                 style.configure("SyncQ.TButton", background="#3a5a3a")
-                style.map("SyncQ.TButton", background=[("active", "#4a6a4a"), ("disabled", C_BORDER)])
+                style.map("SyncQ.TButton", background=[("pressed", "#3a5a3a"), ("active", "#4a6a4a"), ("disabled", C_BORDER)])
             else:
                 style.configure("SyncQ.TButton", background=C_BTN)
-                style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+                style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
         # GPU Tasks button — always blink while the GPU task is running (even when paused
         # between videos), so it doesn't go solid until the current job is truly done.
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
             if is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
-                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
+                style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
                 style.configure("Gpu.TButton", background=C_BTN)
-                style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+                style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
         if _sync_blink["active"] or _gpu_blink["active"]:
             _blink_clock["job"] = root.after(700, _blink_tick)
@@ -11860,7 +11935,7 @@ def _sync_blink_stop():
     _sync_blink["active"] = False
     try:
         style.configure("SyncQ.TButton", background=C_BTN)
-        style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+        style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
     except Exception:
         pass
 
@@ -11878,7 +11953,7 @@ def _gpu_blink_stop():
     _gpu_blink["active"] = False
     try:
         style.configure("Gpu.TButton", background=C_BTN)
-        style.map("Gpu.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
+        style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
     except Exception:
         pass
 
@@ -11962,9 +12037,15 @@ def _show_gpu_menu(event=None):
         _start_manual_transcription()
 
     def _confirm_gpu_remove(idx, label):
-        if messagebox.askyesno("Remove from GPU Tasks",
-                               f"Remove '{label}' from the GPU Tasks?",
-                               parent=popup):
+        with _gpu_queue_lock:
+            _item = _gpu_queue[idx] if idx < len(_gpu_queue) else None
+        if _item and _item.get("type") == "encode":
+            msg = "Are you sure you want to remove unprocessed batches? There is no way to re-add them."
+            title = "Remove Batch"
+        else:
+            msg = f"Remove '{label}' from the GPU Tasks?"
+            title = "Remove from GPU Tasks"
+        if messagebox.askyesno(title, msg, parent=popup):
             _remove_gpu_queue_item(idx)
 
     def _do_gpu_start():
@@ -13849,6 +13930,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
+                             ("encode_suffix", {"foreground": C_LOG_BLUE}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -13861,7 +13943,7 @@ _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_
                  "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_progress", "encode_pct", "encode_dots",
-                 "transcribe_using")
+                 "encode_suffix", "transcribe_using")
 
 
 def _sync_mini_logs_from_main():

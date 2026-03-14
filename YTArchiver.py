@@ -1,4 +1,4 @@
-fimport tkinter as tk
+import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import threading
 import subprocess

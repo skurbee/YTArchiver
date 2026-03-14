@@ -693,6 +693,9 @@ def clear_transient_lines():
                     ranges = log_box.tag_ranges(tag)
                     if ranges:
                         log_box.delete(ranges[0], ranges[1])
+                # Remove any orphaned colour-only tags that outlive their base text tag
+                for orphan_tag in ("simplestatus_green", "dlprogress_pct"):
+                    log_box.tag_remove(orphan_tag, "1.0", tk.END)
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -705,7 +708,6 @@ def clear_transient_lines():
 
 
 def log_simple_status(text, extra_tag=None):
-    _tags = ("simplestatus", extra_tag) if extra_tag else "simplestatus"
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -744,9 +746,20 @@ def log_simple_status(text, extra_tag=None):
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(_pos, text, _tags)
+                    log_box.insert(_pos, text, "simplestatus")
+                    # Apply extra_tag via tag_add after insert so it covers exactly the
+                    # inserted text range — avoids Tkinter's boundary tag-inheritance
+                    # ambiguity (inserting at a tag boundary with a tuple can pull adjacent
+                    # non-simplestatus lines into the range and cause them to be purged).
+                    if extra_tag and text:
+                        _new_end = log_box.index(f"{_pos}+{len(text)}c")
+                        log_box.tag_add(extra_tag, _pos, _new_end)
                 else:
-                    log_box.insert(tk.END, text, _tags)
+                    _ins_start = log_box.index(tk.END)
+                    log_box.insert(tk.END, text, "simplestatus")
+                    if extra_tag and text:
+                        _new_end = log_box.index(f"{_ins_start}+{len(text)}c")
+                        log_box.tag_add(extra_tag, _ins_start, _new_end)
 
                 # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
                 if _saved_parts:
@@ -1482,6 +1495,17 @@ def load_config():
             cfg["recent_downloads"] = []
         if not isinstance(cfg.get("channels"), list):
             cfg["channels"] = []
+
+        # Data migration: min_duration used to be stored in raw seconds (entered directly
+        # by the user with a "Min (s)" label).  It is now stored as whole-minutes * 60.
+        # Values that are already multiples of 60 are unambiguous and need no change.
+        # Values that are positive but less than 60 were sub-minute second-based entries
+        # (e.g. 30 s) — round them up to the nearest minute so nothing is silently lost.
+        for ch in cfg.get("channels", []):
+            _md = ch.get("min_duration", 0)
+            if isinstance(_md, (int, float)) and 0 < _md < 60:
+                ch["min_duration"] = 60  # promote to 1 minute rather than losing to 0
+
         return cfg
 
 
@@ -2012,7 +2036,9 @@ def _digits_only(P):
 
 def _parse_duration(raw):
     """Strip non-digit chars and return int. Returns 0 for empty/invalid."""
-    digits = re.sub(r'\D', '', raw.strip())
+    if not raw:
+        return 0
+    digits = re.sub(r'\D', '', str(raw).strip())
     return int(digits) if digits else 0
 
 
@@ -5573,6 +5599,8 @@ def _ffprobe_duration(file_path):
 
 def _fmt_enc_size(mb):
     """Format a compressed file size in MB, showing GB (2 decimal places) if ≥ 1024 MB."""
+    if mb is None or mb < 0:
+        return "?"
     if mb >= 1024:
         return f"{mb / 1024:.2f} GB"
     return f"{mb:.1f} MB"
@@ -8561,6 +8589,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpleline_blue", {"foreground": C_LOG_BLUE}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
+                             ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
@@ -13802,6 +13832,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpleline_blue", {"foreground": C_LOG_BLUE}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
+                             ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
@@ -13816,8 +13848,12 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
+# simplestatus_green must precede simplestatus so the SYNCING status renders green;
+# dlprogress_pct must precede dlprogress so the progress bar percentage is green.
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
-                 "simpleline_blue", "simpledownload", "simplestatus", "dlprogress", "scanline",
+                 "simpleline_blue", "simpledownload",
+                 "simplestatus_green", "simplestatus",
+                 "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_progress", "encode_pct", "encode_dots",
                  "transcribe_using")

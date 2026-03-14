@@ -364,7 +364,7 @@ def log(text, tag=None):
 
                     if use_tag not in ("red", "simpleline", "simpleline_green", "simpleline_blue",
                                        "summary", "header",
-                                       "simpledownload", "pauselog", "livestream", "filterskip",
+                                       "simpledownload", "pauselog", "pausestatus", "livestream", "filterskip",
                                        "transcribe_using"):
                         if "SUMMARY:" not in text and "TOTAL SESSION" not in text and "===" not in text:
                             _log_scroll_freeze = False
@@ -372,11 +372,16 @@ def log(text, tag=None):
                             return
 
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
-                    if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using"):
+                    if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using", "filterskip"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             _ss_insert_pos = log_box.index(ranges[0])
                             log_box.delete(ranges[0], ranges[1])
+                        else:
+                            # Fallback anchor: insert before pausestatus when simplestatus is absent
+                            _ps_r = log_box.tag_ranges("pausestatus")
+                            if _ps_r:
+                                _ss_insert_pos = log_box.index(_ps_r[0])
 
                     # Purge "using/fetching" lines when a done line arrives
                     if use_tag in ("simpleline_green", "simpleline_blue"):
@@ -420,17 +425,30 @@ def log(text, tag=None):
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], text, use_tag)
                     else:
-                        log_box.insert(tk.END, text, use_tag)
+                        # No simplestatus — insert before pausestatus anchor if present
+                        _ps_r2 = log_box.tag_ranges("pausestatus")
+                        if _ps_r2:
+                            log_box.insert(_ps_r2[0], text, use_tag)
+                        else:
+                            log_box.insert(tk.END, text, use_tag)
                 elif _is_simple_mode and _ss_insert_pos is not None:
-                    # Insert at the old simplestatus position to avoid jitter
+                    # Insert at the old simplestatus/pausestatus position to avoid jitter
                     log_box.insert(_ss_insert_pos, text, use_tag)
+                elif _is_simple_mode and use_tag == "pausestatus":
+                    # pausestatus always goes at the very bottom
+                    log_box.insert(tk.END, text, use_tag)
                 else:
                     log_box.insert(tk.END, text, use_tag)
 
                 # Re-insert whisper progress at the bottom so it stays visible
                 if _had_whisper and _saved_wp_parts:
+                    # Re-insert whisper before pausestatus so it stays above the pause anchor
+                    _ps_for_w = log_box.tag_ranges("pausestatus")
+                    _w_ins_pt = log_box.index(_ps_for_w[0]) if _ps_for_w else tk.END
                     for _wp_text, _wp_tag in _saved_wp_parts:
-                        log_box.insert(tk.END, _wp_text, _wp_tag)
+                        log_box.insert(_w_ins_pt, _wp_text, _wp_tag)
+                        if _w_ins_pt != tk.END:
+                            _w_ins_pt = log_box.index(f"{_w_ins_pt} + {len(_wp_text)}c")
                     # Restart dot animation
                     if not _whisper_dots["active"]:
                         _whisper_dots["active"] = True
@@ -446,11 +464,12 @@ def log(text, tag=None):
                     except Exception:
                         pass
                 else:
-                    # Cap verbose log at 10000 lines to prevent unbounded memory growth
+                    # Cap verbose log at 20000 lines to prevent unbounded memory growth;
+                    # when exceeded, trim to 15000 — enough headroom for large single syncs
                     try:
                         line_count = int(log_box.index("end-1c").split(".")[0])
-                        if line_count > 10000:
-                            log_box.delete("1.0", f"{line_count - 8000}.0")
+                        if line_count > 20000:
+                            log_box.delete("1.0", f"{line_count - 15000}.0")
                     except Exception:
                         pass
 
@@ -674,6 +693,15 @@ def log_simple_status(text):
                 for _start, _end, _ in reversed(_all_ranges):
                     log_box.delete(_start, _end)
 
+                # Save pausestatus so it stays at the very bottom (after simplestatus)
+                _saved_ps = []
+                _ps_ranges = log_box.tag_ranges("pausestatus")
+                if _ps_ranges:
+                    for _ri in range(0, len(_ps_ranges), 2):
+                        _saved_ps.append(log_box.get(_ps_ranges[_ri], _ps_ranges[_ri + 1]))
+                    for _ri in range(len(_ps_ranges) - 2, -1, -2):
+                        log_box.delete(_ps_ranges[_ri], _ps_ranges[_ri + 1])
+
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
                     _pos = log_box.index(ranges[0])
@@ -691,8 +719,12 @@ def log_simple_status(text):
                         if _ins_pt != tk.END:
                             _ins_pt = log_box.index(f"{_ins_pt} + {len(_s_text)}c")
 
+                # Re-insert pausestatus at the very bottom (after simplestatus)
+                for _ps_text in _saved_ps:
+                    log_box.insert(tk.END, _ps_text, "pausestatus")
+
                 # Only auto-scroll when inserting new content (not replacing in-place)
-                if at_bottom and not _was_ss_replace:
+                if at_bottom and not ranges:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -713,6 +745,27 @@ def clear_simple_status():
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
                     log_box.delete(ranges[0], ranges[1])
+                log_box.config(state="disabled")
+        except Exception:
+            pass
+
+    try:
+        if _root_alive:
+            _ui_queue.append(_write)
+    except Exception:
+        pass
+
+
+def clear_pause_status():
+    """Remove the active pause-status anchor line from the log (call before logging resume)."""
+    def _write():
+        try:
+            if 'log_box' in globals() and log_box.winfo_exists():
+                log_box.config(state="normal")
+                _ps_r = log_box.tag_ranges("pausestatus")
+                while _ps_r:
+                    log_box.delete(_ps_r[0], _ps_r[1])
+                    _ps_r = log_box.tag_ranges("pausestatus")
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -757,9 +810,13 @@ def _update_encode_progress(text):
                             break
                         log_box.delete(_er[0], _er[1])
 
-                # Determine insert position — before simplestatus so SYNCING line stays at bottom
+                # Determine insert position — before simplestatus, then pausestatus, then END
                 _ss_r = log_box.tag_ranges("simplestatus")
-                _enc_pos = log_box.index(_ss_r[0]) if _ss_r else tk.END
+                if _ss_r:
+                    _enc_pos = log_box.index(_ss_r[0])
+                else:
+                    _ps_r = log_box.tag_ranges("pausestatus")
+                    _enc_pos = log_box.index(_ps_r[0]) if _ps_r else tk.END
 
                 # Split percentage out and render it green+bold
                 import re as _re_ep
@@ -804,10 +861,14 @@ def _update_encode_progress(text):
                         if _root_alive:
                             _encode_dots["job"] = root.after(350, _encode_dot_tick)
 
-                # Re-insert whisper progress at the bottom (after encode line)
+                # Re-insert whisper progress before pausestatus so it stays above the pause anchor
                 if _saved_wp:
+                    _ps_for_enc_w = log_box.tag_ranges("pausestatus")
+                    _ew_ins_pt = log_box.index(_ps_for_enc_w[0]) if _ps_for_enc_w else tk.END
                     for _s_text, _s_tag in _saved_wp:
-                        log_box.insert(tk.END, _s_text, _s_tag)
+                        log_box.insert(_ew_ins_pt, _s_text, _s_tag)
+                        if _ew_ins_pt != tk.END:
+                            _ew_ins_pt = log_box.index(f"{_ew_ins_pt} + {len(_s_text)}c")
 
                 if _log_at_bottom:
                     log_box.see(tk.END)
@@ -2351,6 +2412,7 @@ log_box.tag_configure("simpleline_blue", foreground=C_LOG_BLUE, font=("Consolas"
 log_box.tag_configure("transcribe_using", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
+log_box.tag_configure("pausestatus", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_TEXT, font=("Consolas", 9))
@@ -5448,9 +5510,10 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
 
-        log(f"\n=== Compressing: {ch_name} ===\n", "header")
-        _res_label = f"{output_res}p" if output_res else "Original"
-        log(f"  Target: {bitrate_mbhr} MB/hr  |  Output: {_res_label}\n", "simpleline")
+        if not _is_simple_mode:
+            log(f"\n=== Compressing: {ch_name} ===\n", "header")
+            _res_label = f"{output_res}p" if output_res else "Original"
+            log(f"  Target: {bitrate_mbhr} MB/hr  |  Output: {_res_label}\n", "simpleline")
 
         # ── Step 1: Scan for video files ──
         if target_paths:
@@ -5477,7 +5540,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 log("  No video files found to compress.\n", "simpleline")
                 return
 
-        log(f"  Found {len(local_files)} video file(s).\n", "simpleline")
+        if not _is_simple_mode:
+            log(f"  Found {len(local_files)} video file(s).\n", "simpleline")
 
         # ── Step 2: Filter out already-compressed files ──
         files_to_compress = {}
@@ -5491,13 +5555,17 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             else:
                 files_to_compress[fname] = fpath
 
-        if skipped:
-            log(f"  {skipped} file(s) already compressed — skipping.\n", "simpleline")
+        if not _is_simple_mode:
+            if skipped:
+                log(f"  {skipped} file(s) already compressed — skipping.\n", "simpleline")
         if not files_to_compress:
             log(f"  ✓ All videos already compressed!\n", "simpleline_green")
             return
 
-        log(f"  {len(files_to_compress)} file(s) to compress.\n", "simpleline")
+        if _is_simple_mode:
+            log(f"\n=== Compressing: {ch_name}, {len(files_to_compress)} files ===\n", "header")
+        else:
+            log(f"  {len(files_to_compress)} file(s) to compress.\n", "simpleline")
 
         # ── Step 3: Calculate target bitrate ──
         # Convert MB/hr to kbps: MB/hr * 1024 * 8 / 3600
@@ -5505,7 +5573,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         audio_kbps = 128  # fixed AAC audio bitrate
         video_kbps = max(int(target_total_kbps - audio_kbps), 50)  # minimum 50 kbps video
 
-        log(f"  Video bitrate: ~{video_kbps} kbps (VBR), Audio: {audio_kbps} kbps\n", "simpleline")
+        if not _is_simple_mode:
+            log(f"  Video bitrate: ~{video_kbps} kbps (VBR), Audio: {audio_kbps} kbps\n", "simpleline")
 
         # ── Step 4: Process each file ──
         done_count = 0
@@ -5528,10 +5597,18 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
 
             # Get duration for progress reporting
             duration = _ffprobe_duration(fpath)
-            dur_str = f"{int(duration // 60)}m{int(duration % 60):02d}s" if duration else "?"
+            if duration:
+                _d_tot_min = int(duration // 60)
+                if _d_tot_min >= 60:
+                    dur_str = f"{_d_tot_min // 60}h{_d_tot_min % 60:02d}m"
+                else:
+                    dur_str = f"{_d_tot_min}m{int(duration % 60):02d}s"
+            else:
+                dur_str = "?"
 
             fname_short = fname if len(fname) <= 50 else fname[:47] + "..."
-            log(f"\n  [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline")
+            if not _is_simple_mode:
+                log(f"\n  [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline")
 
             # Build temp output path
             base, ext = os.path.splitext(fpath)
@@ -5589,17 +5666,19 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                             last_pct = pct
                             _dot_idx += 1
                             _d = _EDOTS[_dot_idx % 3]
+                            _vid_info = f"[{idx}/{total}] {fname_short} ({dur_str}) - " if _is_simple_mode else ""
                             if _pe.is_set():
-                                _update_encode_progress(f"    Encoding {pct}% — will pause after this video{_d}\n")
+                                _update_encode_progress(f"    Encoding {_vid_info}{pct}% — will pause after this video{_d}\n")
                             else:
-                                _update_encode_progress(f"    Encoding {pct}%{_d}\n")
+                                _update_encode_progress(f"    Encoding {_vid_info}{pct}%{_d}\n")
                     elif duration <= 0:
                         _dot_idx += 1
                         _d = _EDOTS[_dot_idx % 3]
+                        _vid_info = f"[{idx}/{total}] {fname_short} - " if _is_simple_mode else ""
                         if _pe.is_set():
-                            _update_encode_progress(f"    Encoding — will pause after this video{_d}\n")
+                            _update_encode_progress(f"    Encoding {_vid_info}— will pause after this video{_d}\n")
                         else:
-                            _update_encode_progress(f"    Encoding{_d}\n")
+                            _update_encode_progress(f"    Encoding {_vid_info}{_d}\n")
 
                 try:
                     proc.wait(timeout=300)
@@ -7193,10 +7272,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Pause check
                 _pl = "GPU Tasks" if _sync_mode else "Sync"
                 if _pe.is_set() and not _ce.is_set():
-                    log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                     while _pe.is_set() and not _ce.is_set():
                         time.sleep(0.25)
                     if not _ce.is_set():
+                        clear_pause_status()
                         log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                 if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
@@ -7467,10 +7547,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # Pause check
                         _pl = "GPU Tasks" if _sync_mode else "Sync"
                         if _pe.is_set() and not _ce.is_set():
-                            log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                            log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                             while _pe.is_set() and not _ce.is_set():
                                 time.sleep(0.25)
                             if not _ce.is_set():
+                                clear_pause_status()
                                 log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                         if _ce.is_set():
                             log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
@@ -8387,6 +8468,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
+                             ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
                              ("whisper_progress", {"foreground": C_TEXT}),
@@ -9483,10 +9565,11 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             # Pause check runs even when yt-dlp produces no output
             if pause_event.is_set() and not cancel_event.is_set():
                 clear_transient_lines()
-                log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
                 if not cancel_event.is_set():
+                    clear_pause_status()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
             if cancel_event.is_set():
                 break
@@ -10203,7 +10286,7 @@ def start_sync_all():
 
                 if pause_event.is_set():
                     clear_transient_lines()
-                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pausestatus")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set() and not _skip_current.is_set():
@@ -10212,6 +10295,7 @@ def start_sync_all():
                         _skip_current.clear()
                         cancel_event.clear()
                         continue
+                    clear_pause_status()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch["name"]
@@ -12229,11 +12313,12 @@ def _gpu_start():
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         _tray_stop_spin(force=True)  # stop blinking while paused
-                        log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                        log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                             time.sleep(0.25)
                         if not _gpu_cancel.is_set():
                             _tray_start_spin(red=True)  # resume blinking
+                            clear_pause_status()
                             log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
@@ -12461,11 +12546,12 @@ def _gpu_start():
                 # Pause check
                 if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                     _tray_stop_spin(force=True)  # stop blinking while paused
-                    log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         time.sleep(0.25)
                     if not _gpu_cancel.is_set():
                         _tray_start_spin(red=True)  # resume blinking
+                        clear_pause_status()
                         log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _gpu_cancel.is_set():
@@ -12927,11 +13013,12 @@ def _run_autorun():
 
                 if pause_event.is_set():
                     clear_transient_lines()
-                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pauselog")
+                    log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pausestatus")
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set():
                         break
+                    clear_pause_status()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch['name']
@@ -13602,6 +13689,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
+                             ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
                              ("whisper_progress", {"foreground": C_TEXT}),
@@ -13613,7 +13701,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # All known log tags for mini-log mirroring (priority order for detection)
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpledownload", "simplestatus", "dlprogress", "scanline",
-                 "pauselog", "livestream", "filterskip", "dim", "whisper_progress",
+                 "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "transcribe_using")
 
 

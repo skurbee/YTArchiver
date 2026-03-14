@@ -458,9 +458,12 @@ def log(text, tag=None):
                 _log_scroll_freeze = False
                 _auto_scrollbar(log_scroll, *log_box.yview())
 
-                # Skip auto-scroll for transient status messages (e.g. "Adding punctuation...")
-                # to prevent snapping back when user has scrolled up
-                _skip_scroll = (use_tag == "transcribe_using" and "Adding punctuation" in text)
+                # Skip auto-scroll for transient/passive messages that shouldn't
+                # disrupt the user's current scroll position
+                _skip_scroll = (
+                    (use_tag == "transcribe_using" and "Adding punctuation" in text) or
+                    (use_tag == "header" and "Added to GPU Tasks:" in text)
+                )
                 if at_bottom and not _skip_scroll:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
@@ -6795,14 +6798,16 @@ def _add_to_gpu_queue(item, _quiet=False):
         elif item["type"] == "mt":
             if item.get("folder_path"):
                 # Folder-based manual transcription
-                if any(q.get("folder_path") == item["folder_path"] and q["type"] == "mt" for q in _gpu_queue):
+                if any(q.get("folder_path") == item["folder_path"] and q["type"] == "mt" for q in _gpu_queue) or \
+                   (_cur and _cur.get("folder_path") == item.get("folder_path") and _cur.get("type") == "mt"):
                     if not _quiet:
                         log(f"  Folder already in GPU Tasks queue.\n", "simpleline")
                     return
                 label = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
             else:
                 # Single-file manual transcription
-                if any(q.get("file_path") == item.get("file_path") for q in _gpu_queue):
+                if any(q.get("file_path") == item.get("file_path") and q["type"] == "mt" for q in _gpu_queue) or \
+                   (_cur and _cur.get("file_path") == item.get("file_path") and _cur.get("type") == "mt"):
                     if not _quiet:
                         log(f"  File already in GPU Tasks queue.\n", "simpleline")
                     return
@@ -7755,7 +7760,9 @@ def _start_manual_transcription():
         file_path = os.path.normpath(file_path)
 
         with _gpu_queue_lock:
-            if any(item.get("file_path") == file_path for item in _gpu_queue):
+            _cur_item = _gpu_current_item
+            if any(item.get("file_path") == file_path and item.get("type") == "mt" for item in _gpu_queue) or \
+               (_cur_item and _cur_item.get("file_path") == file_path and _cur_item.get("type") == "mt"):
                 log(f"  File already in GPU Tasks queue.\n", "simpleline")
                 return
 
@@ -7777,7 +7784,9 @@ def _start_manual_transcription():
             return
 
         with _gpu_queue_lock:
-            if any(item.get("folder_path") == folder_path and item["type"] == "mt" for item in _gpu_queue):
+            _cur_item = _gpu_current_item
+            if any(item.get("folder_path") == folder_path and item["type"] == "mt" for item in _gpu_queue) or \
+               (_cur_item and _cur_item.get("folder_path") == folder_path and _cur_item.get("type") == "mt"):
                 log(f"  Folder already in GPU Tasks queue.\n", "simpleline")
                 return
 
@@ -12215,6 +12224,7 @@ def _gpu_start():
 
         def _gpu_worker():
             global _gpu_running, _gpu_current_item
+            _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
             try:
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
@@ -12445,6 +12455,7 @@ def _gpu_start():
 
     def _gpu_worker():
         global _gpu_running, _gpu_current_item
+        _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
         try:
             while True:
                 # Pause check

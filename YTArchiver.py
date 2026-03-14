@@ -460,7 +460,7 @@ def log(text, tag=None):
                         if _root_alive:
                             _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
 
-                if _autorun_active and (not _is_simple_mode):
+                if _autorun_active and _is_simple_mode:
                     try:
                         line_count = int(log_box.index("end-1c").split(".")[0])
                         if line_count > 20:

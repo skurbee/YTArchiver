@@ -420,7 +420,7 @@ def log(text, tag=None):
                     _stop_whisper_dot_anim()
 
                 if (_is_simple_mode
-                        and use_tag in ("simpledownload", "red", "summary")):
+                        and use_tag in ("simpledownload", "red", "summary", "header")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], text, use_tag)
@@ -710,10 +710,10 @@ def log_simple_status(text):
                 else:
                     log_box.insert(tk.END, text, "simplestatus")
 
-                # Re-insert encode/whisper progress BEFORE simplestatus so it stays above
+                # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
                 if _saved_parts:
-                    _ss_r2 = log_box.tag_ranges("simplestatus")
-                    _ins_pt = log_box.index(_ss_r2[0]) if _ss_r2 else tk.END
+                    _ps_r_ep = log_box.tag_ranges("pausestatus")
+                    _ins_pt = log_box.index(_ps_r_ep[0]) if _ps_r_ep else tk.END
                     for _s_text, _s_tag in _saved_parts:
                         log_box.insert(_ins_pt, _s_text, _s_tag)
                         if _ins_pt != tk.END:
@@ -810,13 +810,9 @@ def _update_encode_progress(text):
                             break
                         log_box.delete(_er[0], _er[1])
 
-                # Determine insert position — before simplestatus, then pausestatus, then END
-                _ss_r = log_box.tag_ranges("simplestatus")
-                if _ss_r:
-                    _enc_pos = log_box.index(_ss_r[0])
-                else:
-                    _ps_r = log_box.tag_ranges("pausestatus")
-                    _enc_pos = log_box.index(_ps_r[0]) if _ps_r else tk.END
+                # Determine insert position — after simplestatus, before pausestatus, then END
+                _ps_r = log_box.tag_ranges("pausestatus")
+                _enc_pos = log_box.index(_ps_r[0]) if _ps_r else tk.END
 
                 # Split percentage out and render it green+bold
                 import re as _re_ep
@@ -1840,7 +1836,7 @@ def _dark_askquestion(title, message, yes_text="Yes", no_text="No"):
 
     tk.Label(_dlg, text=message, bg=C_BG, fg=C_TEXT,
              font=("Segoe UI", 10), justify="left",
-             wraplength=420, padx=20, pady=(14, 4)).pack(fill="x")
+             wraplength=420).pack(fill="x", padx=20, pady=(14, 4))
 
     btn_row = tk.Frame(_dlg, bg=C_BG)
     btn_row.pack(padx=20, pady=(6, 14))

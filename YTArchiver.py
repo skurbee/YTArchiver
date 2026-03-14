@@ -961,6 +961,50 @@ _simple_anim_state = {"active": False, "channel": "", "idx": 0, "total": 0, "dot
                       "dl_current": 0, "ch_total": 0, "page_num": 0, "enum_page": 0, "enum_count": 0}
 _DOTS = ["·  ", "·· ", "···"]
 
+# Startup loading animation (simple mode only)
+_startup_loading = {"active": False, "dots": 0, "job": None}
+
+
+def _startup_loading_tick():
+    try:
+        if not _startup_loading["active"] or not root.winfo_exists():
+            return
+        d = _DOTS[_startup_loading["dots"] % 3]
+        _startup_loading["dots"] += 1
+        log_simple_status(f"  Loading{d}\n")
+    except Exception:
+        pass
+    finally:
+        if _startup_loading["active"] and root.winfo_exists():
+            try:
+                _startup_loading["job"] = root.after(500, _startup_loading_tick)
+            except Exception:
+                pass
+
+
+def _start_startup_loading():
+    if not _is_simple_mode:
+        return
+    _startup_loading["active"] = True
+    _startup_loading["dots"] = 0
+    if _root_alive:
+        try:
+            _startup_loading["job"] = root.after(0, _startup_loading_tick)
+        except Exception:
+            pass
+
+
+def _stop_startup_loading():
+    _startup_loading["active"] = False
+    _old_job = _startup_loading.get("job")
+    _startup_loading["job"] = None
+    if _old_job:
+        try:
+            root.after_cancel(_old_job)
+        except Exception:
+            pass
+    clear_simple_status()
+
 
 def _simple_anim_tick():
     try:
@@ -2617,7 +2661,7 @@ _entry(add_outer, textvariable=new_maxdur_var, width=6,
 ttk.Label(add_outer, text="(Blank = Off)", style="Dim.TLabel").grid(row=3, column=4, columnspan=4, sticky="n",
                                                                     pady=(0, 4))
 
-ttk.Label(add_outer, text="Mode:").grid(row=3, column=0, sticky="nw", padx=(8, 4), pady=(4, 4))
+ttk.Label(add_outer, text="Range:").grid(row=3, column=0, sticky="nw", padx=(8, 4), pady=(4, 4))
 new_mode_var = tk.StringVar(value="sub")
 new_all_var = tk.BooleanVar(value=False)
 new_fromdate_var = tk.BooleanVar(value=False)
@@ -2804,8 +2848,14 @@ def _set_edit_mode(ch):
         date_month_var.set("")
         date_day_var.set("")
     _toggle_date_entry()
-    new_split_years_var.set(ch.get("split_years", False))
-    new_split_months_var.set(ch.get("split_months", False))
+    _sy = ch.get("split_years", False)
+    _sm = ch.get("split_months", False)
+    if _sy and _sm:
+        new_folder_org_var.set("Years/Months")
+    elif _sy:
+        new_folder_org_var.set("Years")
+    else:
+        new_folder_org_var.set("None")
     new_auto_transcribe_var.set(ch.get("auto_transcribe", False))
     new_compress_var.set(ch.get("compress_enabled", False))
     _cr = ch.get("compress_output_res", "")
@@ -2843,8 +2893,7 @@ def _clear_edit_mode():
     date_month_var.set("")
     date_day_var.set("")
     _toggle_date_entry()
-    new_split_years_var.set(False)
-    new_split_months_var.set(False)
+    new_folder_org_var.set("None")
     new_auto_transcribe_var.set(False)
     new_compress_var.set(False)
     new_compress_level_var.set("")
@@ -4235,17 +4284,26 @@ def remove_channel():
 split_row = ttk.Frame(add_outer, style="Raised.TFrame")
 split_row.grid(row=4, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(2, 4))
 
-new_split_years_var = tk.BooleanVar(value=False)
-new_split_months_var = tk.BooleanVar(value=False)
+new_folder_org_var = tk.StringVar(value="None")
 new_auto_transcribe_var = tk.BooleanVar(value=False)
 
-split_years_cb = ttk.Checkbutton(split_row, text="Split folder into years?",
-                                  variable=new_split_years_var)
-split_years_cb.pack(side="left", padx=(4, 16))
+# Computed BooleanVars kept in sync with the dropdown so all existing code that
+# reads new_split_years_var / new_split_months_var continues to work unchanged.
+new_split_years_var = tk.BooleanVar(value=False)
+new_split_months_var = tk.BooleanVar(value=False)
 
-split_months_cb = ttk.Checkbutton(split_row, text="Split years into months?",
-                                   variable=new_split_months_var)
-# Initially hidden — only shown when "Split folder into years?" is checked
+def _on_folder_org_changed(*_):
+    val = new_folder_org_var.get()
+    new_split_years_var.set(val in ("Years", "Years/Months"))
+    new_split_months_var.set(val == "Years/Months")
+
+new_folder_org_var.trace_add("write", _on_folder_org_changed)
+
+ttk.Label(split_row, text="Folder Org:").pack(side="left", padx=(4, 4))
+folder_org_combo = _combo(split_row, textvariable=new_folder_org_var,
+                          values=["None", "Years", "Years/Months"],
+                          state="readonly", width=13)
+folder_org_combo.pack(side="left", padx=(0, 16))
 
 auto_transcribe_cb = ttk.Checkbutton(split_row, text="Auto-transcribe new videos",
                                       variable=new_auto_transcribe_var)
@@ -5719,6 +5777,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
                         _rt_str = f", {duration / _encode_elapsed:.1f}x realtime" if duration > 0 and _encode_elapsed > 0 else ""
+                        if _is_simple_mode:
+                            log(f"    [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline_blue")
                         log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, {dur_str}, took {_elapsed_str}{_rt_str})\n", "simpleline_blue")
                     except Exception as e:
                         err_count += 1
@@ -6111,6 +6171,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 _bl_ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
                                 _bl_dur_str = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
                                 _bl_rt_str = f", {_bl_duration / _bl_encode_elapsed:.1f}x realtime" if _bl_duration > 0 and _bl_encode_elapsed > 0 else ""
+                                if _is_simple_mode:
+                                    log(f"    [{batch_start + idx + 1}/{len(work_list)}] {fname_short} ({_bl_dur_str})\n", "simpleline_blue")
                                 log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, {_bl_dur_str}, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_blue")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -8283,17 +8345,6 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
         threading.Thread(target=_worker, daemon=True).start()
 
 
-def _toggle_split_months(*_):
-    if new_split_years_var.get():
-        split_months_cb.pack(side="left", padx=(0, 4))
-    else:
-        new_split_months_var.set(False)
-        split_months_cb.pack_forget()
-
-
-new_split_years_var.trace_add("write", _toggle_split_months)
-
-
 # --- Compress row (Row 5) ---
 compress_row = ttk.Frame(add_outer, style="Raised.TFrame")
 compress_row.grid(row=5, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(2, 4))
@@ -8448,7 +8499,7 @@ _subs_mini_log_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, p
 _subs_mini_log_frame.columnconfigure(0, weight=1)
 
 subs_mini_log = tk.Text(_subs_mini_log_frame, state="disabled", height=4,
-                         bg=C_LOG_BG, fg=C_LOG_TXT, font=("Consolas", 9),
+                         bg=C_LOG_BG, fg=C_TEXT, font=("Consolas", 9),
                          relief="flat", bd=0, highlightthickness=1,
                          highlightbackground=C_BORDER, highlightcolor=C_BORDER,
                          padx=8, pady=4, wrap="none")
@@ -8470,6 +8521,9 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("whisper_progress", {"foreground": C_TEXT}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_TEXT}),
+                             ("encode_progress", {"foreground": C_LOG_BLUE}),
+                             ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("transcribe_using", {"foreground": C_TEXT})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -8639,7 +8693,7 @@ def _trigger_validation(*_):
 
 url_var.trace_add("write", on_url_change)
 for var in (url_var, new_name_var, new_url_var, new_dur_var, new_maxdur_var, new_res_var, new_mode_var, date_year_var,
-            date_month_var, date_day_var, new_split_years_var, new_split_months_var,
+            date_month_var, date_day_var, new_folder_org_var,
             new_compress_var, new_compress_level_var, new_compress_res_var, new_compress_batch_var):
     var.trace_add("write", _trigger_validation)
 
@@ -11539,7 +11593,12 @@ def _show_queue_menu(event=None):
             popup.destroy()
         except Exception:
             pass
-    _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside_q, add="+")
+    # Delay binding by one event cycle so the button-press that opened
+    # the popup does not immediately fire the "click outside" handler.
+    def _bind_click_outside_q():
+        if popup.winfo_exists():
+            _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside_q, add="+")
+    root.after(10, _bind_click_outside_q)
 
     def _on_popup_destroy(e):
         if e.widget != popup:
@@ -12237,7 +12296,12 @@ def _show_gpu_menu(event=None):
             popup.destroy()
         except Exception:
             pass
-    _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside, add="+")
+    # Delay binding by one event cycle so the button-press that opened
+    # the popup does not immediately fire the "click outside" handler.
+    def _bind_click_outside():
+        if popup.winfo_exists():
+            _state["click_outside_id"] = root.bind("<Button-1>", _on_click_outside, add="+")
+    root.after(10, _bind_click_outside)
 
     def _on_popup_destroy(e):
         if e.widget != popup:
@@ -13669,7 +13733,7 @@ _recent_mini_log_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
 _recent_mini_log_frame.columnconfigure(0, weight=1)
 
 recent_mini_log = tk.Text(_recent_mini_log_frame, state="disabled", height=4,
-                           bg=C_LOG_BG, fg=C_LOG_TXT, font=("Consolas", 9),
+                           bg=C_LOG_BG, fg=C_TEXT, font=("Consolas", 9),
                            relief="flat", bd=0, highlightthickness=1,
                            highlightbackground=C_BORDER, highlightcolor=C_BORDER,
                            padx=8, pady=4, wrap="none")
@@ -13691,6 +13755,9 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("whisper_progress", {"foreground": C_TEXT}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_TEXT}),
+                             ("encode_progress", {"foreground": C_LOG_BLUE}),
+                             ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("transcribe_using", {"foreground": C_TEXT})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -13698,7 +13765,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpledownload", "simplestatus", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
-                 "whisper_pct", "whisper_dots", "transcribe_using")
+                 "whisper_pct", "whisper_dots", "encode_progress", "encode_pct", "encode_dots",
+                 "transcribe_using")
 
 
 def _sync_mini_logs_from_main():
@@ -14583,6 +14651,7 @@ def run_startup_updates():
         _startup_cleanup_temps()
 
         log("--- Startup checks complete, ready to download ---\n", "simpleline_green")
+        _stop_startup_loading()
 
         # Enable sync button now that startup is complete
         if _root_alive:
@@ -14595,6 +14664,7 @@ def run_startup_updates():
 
 
 root.after(200, run_startup_updates)
+root.after(50, _start_startup_loading)
 
 
 def _save_queue_state():

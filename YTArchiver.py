@@ -371,6 +371,10 @@ def log(text, tag=None):
                             log_box.config(state="disabled")
                             return
 
+                    # Strip leading newline from === header lines in simple mode to avoid blank spacers
+                    if use_tag == "header" and "===" in text and text.startswith("\n"):
+                        text = text.lstrip("\n")
+
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
                     if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using", "filterskip"):
                         ranges = log_box.tag_ranges("simplestatus")
@@ -614,6 +618,32 @@ def log_progress_bar(current, total):
 
 
 def log_dl_progress(msg):
+    # Pre-parse the percentage and filled bar positions so we can color them green
+    _pct_match = re.search(r'\d+\.?\d*%', msg)
+    _pct_start = _pct_match.start() if _pct_match else -1
+    _pct_end = _pct_match.end() if _pct_match else -1
+
+    _bar_match = re.search(r'█+', msg)
+    _bar_start = _bar_match.start() if _bar_match else -1
+    _bar_end = _bar_match.end() if _bar_match else -1
+
+    def _apply_pct_tag(insert_pos):
+        """Apply green tag to the filled bar and percentage portions starting at insert_pos."""
+        if _bar_start >= 0:
+            try:
+                log_box.tag_add("dlprogress_pct",
+                                f"{insert_pos}+{_bar_start}c",
+                                f"{insert_pos}+{_bar_end}c")
+            except Exception:
+                pass
+        if _pct_start >= 0:
+            try:
+                log_box.tag_add("dlprogress_pct",
+                                f"{insert_pos}+{_pct_start}c",
+                                f"{insert_pos}+{_pct_end}c")
+            except Exception:
+                pass
+
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -625,14 +655,21 @@ def log_dl_progress(msg):
                     log_box.delete(ranges[0], ranges[1])
                 if _dl_pos:
                     log_box.insert(_dl_pos, msg, "dlprogress")
+                    _apply_pct_tag(_dl_pos)
                 elif _is_simple_mode:
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
-                        log_box.insert(ss_ranges[0], msg, "dlprogress")
+                        _insert_pos = log_box.index(ss_ranges[0])
+                        log_box.insert(_insert_pos, msg, "dlprogress")
+                        _apply_pct_tag(_insert_pos)
                     else:
+                        _insert_pos = log_box.index(tk.END)
                         log_box.insert(tk.END, msg, "dlprogress")
+                        _apply_pct_tag(_insert_pos)
                 else:
+                    _insert_pos = log_box.index(tk.END)
                     log_box.insert(tk.END, msg, "dlprogress")
+                    _apply_pct_tag(_insert_pos)
 
                 # Never auto-scroll for download progress — it replaces in-place
                 # and shouldn't snap the user back to the bottom
@@ -667,7 +704,8 @@ def clear_transient_lines():
         pass
 
 
-def log_simple_status(text):
+def log_simple_status(text, extra_tag=None):
+    _tags = ("simplestatus", extra_tag) if extra_tag else "simplestatus"
     def _write():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -706,9 +744,9 @@ def log_simple_status(text):
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(_pos, text, "simplestatus")
+                    log_box.insert(_pos, text, _tags)
                 else:
-                    log_box.insert(tk.END, text, "simplestatus")
+                    log_box.insert(tk.END, text, _tags)
 
                 # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
                 if _saved_parts:
@@ -1036,9 +1074,9 @@ def _simple_anim_tick():
         _bs = _simple_anim_state.get("batch_size", 0)
         if dl_cur > 0 and _bs > 0:
             _b_num = (dl_cur - 1) // _bs + 1
-            status = f"  Downloading {dl_cur} (Batch {_b_num}){d}"
+            status = f"  Downloading video #{dl_cur} (Batch {_b_num}){d}"
         elif dl_cur > 0 and ch_tot > 0:
-            status = f"  Downloading {dl_cur} of {ch_tot}{d}"
+            status = f"  Downloading video #{dl_cur} of {ch_tot}{d}"
         elif dl_cur > 0:
             status = f"  Downloading{d}"
         else:
@@ -1048,11 +1086,11 @@ def _simple_anim_tick():
         enum_count = _simple_anim_state.get("enum_count", 0)
         page = _simple_anim_state["page_num"]
         if enum_page > 0:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}  {d}\nEnumerating video IDs, {enum_count:,} found (first run only){d}\n")
+            log_simple_status(f"[{i}/{n}] SYNCING: {ch}  {d}\nEnumerating video IDs, {enum_count:,} found (first run only){d}\n", extra_tag="simplestatus_green")
         elif page > 0:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\nDownloading channel info, Page {page}{d}\n")
+            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\nDownloading channel info, Page {page}{d}\n", extra_tag="simplestatus_green")
         else:
-            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\n")
+            log_simple_status(f"[{i}/{n}] SYNCING: {ch}{status}\n", extra_tag="simplestatus_green")
     except Exception:
         pass
     finally:
@@ -2154,7 +2192,7 @@ _combo(chan_opts, textvariable=ch_res_var, values=RESOLUTION_OPTIONS, state="rea
 
 ttk.Label(chan_opts, text="Duration Limit:", style="Dim.TLabel").grid(row=0, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
-ttk.Label(chan_opts, text="Min (s)").grid(row=1, column=4, sticky="e", padx=(4, 2))
+ttk.Label(chan_opts, text="Min (m)").grid(row=1, column=4, sticky="e", padx=(4, 2))
 _vcmd_digits = (root.register(_digits_only), '%P')
 
 ch_dur_var = tk.StringVar(value="")
@@ -2445,20 +2483,22 @@ log_box.tag_configure("livestream", foreground="#f5a023", font=("Consolas", 9, "
 log_box.tag_configure("filterskip", foreground=C_LOG_SUM)
 log_box.tag_configure("scanline", foreground=C_TEXT)
 log_box.tag_configure("dlprogress", foreground=C_TEXT)
+log_box.tag_configure("dlprogress_pct", foreground=C_LOG_GREEN)
 log_box.tag_configure("simplestatus", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
+log_box.tag_configure("simplestatus_green", foreground=C_LOG_GREEN)
 log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("simpleline_blue", foreground=C_LOG_BLUE, font=("Consolas", 9))
-log_box.tag_configure("transcribe_using", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("transcribe_using", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
 log_box.tag_configure("pauselog", foreground=C_LOG_HEAD)
 log_box.tag_configure("pausestatus", foreground=C_LOG_HEAD)
-log_box.tag_configure("whisper_progress", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("whisper_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
-log_box.tag_configure("whisper_dots", foreground=C_TEXT, font=("Consolas", 9))
-log_box.tag_configure("encode_progress", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
-log_box.tag_configure("encode_dots", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("encode_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -2649,7 +2689,7 @@ _combo(add_outer, textvariable=new_res_var, values=RESOLUTION_OPTIONS, state="re
 
 ttk.Label(add_outer, text="Duration Limit:", style="Dim.TLabel").grid(row=1, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
-ttk.Label(add_outer, text="Min (s)").grid(row=2, column=4, sticky="e", padx=(4, 2))
+ttk.Label(add_outer, text="Min (m)").grid(row=2, column=4, sticky="e", padx=(4, 2))
 new_dur_var = tk.StringVar(value="")
 _entry(add_outer, textvariable=new_dur_var, width=6,
        validate="key", validatecommand=_vcmd_digits).grid(row=2, column=5, sticky="w", padx=(0, 4))
@@ -2752,7 +2792,7 @@ def refresh_channel_dropdowns():
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
             display_res = f"{res}p" if res.isdigit() else res
             dur = c.get("min_duration", 0)
-            dur_str = f"{dur}s" if dur else "—"
+            dur_str = f"{dur // 60}m" if dur else "—"
             maxdur = c.get("max_duration", 0)
             maxdur_m = maxdur // 60 if maxdur else 0
             maxdur_str = f"{maxdur_m}m" if maxdur_m else "—"
@@ -2831,7 +2871,7 @@ def _set_edit_mode(ch):
     new_url_var.set(ch["url"])
     new_res_var.set(ch.get("resolution", "720"))
     _min = ch.get("min_duration", 0)
-    new_dur_var.set(str(_min) if _min else "")
+    new_dur_var.set(str(_min // 60) if _min else "")
     _mx_secs = ch.get("max_duration", 0)
     new_maxdur_var.set(str(_mx_secs // 60) if _mx_secs else "")
     _m = ch.get("mode", "full")
@@ -3377,7 +3417,7 @@ def add_channel():
     url = _real_get(_new_url_entry).strip()
     if not name or not url: return
 
-    dur_val = _parse_duration(new_dur_var.get())
+    dur_val = _parse_duration(new_dur_var.get()) * 60
     maxdur_val = _parse_duration(new_maxdur_var.get()) * 60
 
     mode = new_mode_var.get()
@@ -5461,7 +5501,7 @@ def _start_whisper_process():
         _hf_cache = os.path.join(os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")), "hub")
         _model_cached = os.path.isdir(os.path.join(_hf_cache, f"models--Systran--faster-whisper-{_model}"))
         _dl_hint = "" if _model_cached else " (first run downloads model)"
-        log(f"  Loading faster-whisper model ({_model}) on GPU...{_dl_hint}\n", "simpleline")
+        log(f"  Transcribing - Loading Whisper model ({_model}) on GPU...{_dl_hint}\n", "transcribe_using")
         _env = os.environ.copy()
         _env["WHISPER_MODEL"] = _model
         _env["WHISPER_DEVICE"] = "cuda"
@@ -5529,6 +5569,13 @@ def _ffprobe_duration(file_path):
         return float(result.stdout.strip())
     except Exception:
         return 0
+
+
+def _fmt_enc_size(mb):
+    """Format a compressed file size in MB, showing GB (2 decimal places) if ≥ 1024 MB."""
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
 
 
 def _ffprobe_is_compressed(file_path):
@@ -5779,7 +5826,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         _rt_str = f", {duration / _encode_elapsed:.1f}x realtime" if duration > 0 and _encode_elapsed > 0 else ""
                         if _is_simple_mode:
                             log(f"    [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline_blue")
-                        log(f"    ✓ {orig_mb:.1f} MB → {new_mb:.1f} MB ({ratio:.0f}% smaller, {dur_str}, took {_elapsed_str}{_rt_str})\n", "simpleline_blue")
+                        log(f"    ✓ {_fmt_enc_size(orig_mb)} → {_fmt_enc_size(new_mb)} ({ratio:.0f}% smaller, took {_elapsed_str}{_rt_str})\n", "simpleline_blue")
                     except Exception as e:
                         err_count += 1
                         log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -6173,7 +6220,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 _bl_rt_str = f", {_bl_duration / _bl_encode_elapsed:.1f}x realtime" if _bl_duration > 0 and _bl_encode_elapsed > 0 else ""
                                 if _is_simple_mode:
                                     log(f"    [{batch_start + idx + 1}/{len(work_list)}] {fname_short} ({_bl_dur_str})\n", "simpleline_blue")
-                                log(f"    ✓ {o_mb:.1f} MB → {n_mb:.1f} MB ({_bl_ratio:.0f}% smaller, {_bl_dur_str}, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_blue")
+                                log(f"    ✓ {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({_bl_ratio:.0f}% smaller, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_blue")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
                                 batch_errors += 1
@@ -6410,7 +6457,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         # In simple mode, prefix with [idx/total] instead of spaces
         _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
         _gpu_actively_encoding = True
-        log(f"{_wp}Whisper transcribing{_title_part}, 0%...\n", "whisper_progress")
+        log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
@@ -6425,14 +6472,14 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
                 if _ce.is_set():
-                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
+                    log(f"{_wp}Transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
                 elif _pe.is_set():
-                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
+                    log(f"{_wp}Transcribing{_title_part}, {pct}% — will pause after this file...\n", "whisper_progress")
                 else:
-                    log(f"{_wp}Whisper transcribing{_title_part}, {pct}%...\n", "whisper_progress")
+                    log(f"{_wp}Transcribing{_title_part}, {pct}%...\n", "whisper_progress")
                 continue
             elif result.get("status") == "ok":
-                log(f"{_wp}Whisper transcribing{_title_part}, 100%...\n", "whisper_progress")
+                log(f"{_wp}Transcribing{_title_part}, 100%...\n", "whisper_progress")
                 _gpu_actively_encoding = False
                 _text = result.get("text") or None
                 _raw_segs = result.get("segments", [])
@@ -7340,7 +7387,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"    Transcribing [{idx}/{total}] {fname} - fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -7363,7 +7410,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"    Transcribing [{idx}/{total}] {fname} - Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -8518,13 +8565,13 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("whisper_progress", {"foreground": C_TEXT}),
+                             ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_dots", {"foreground": C_TEXT}),
+                             ("whisper_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
-                             ("transcribe_using", {"foreground": C_TEXT})]:
+                             ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -8542,7 +8589,7 @@ def on_channel_select(event):
         url_var.set(ch["url"])
         ch_res_var.set(ch.get("resolution", CHANNEL_DEFAULTS["resolution"]))
         _min = ch.get("min_duration", 0)
-        ch_dur_var.set(str(_min) if _min else "")
+        ch_dur_var.set(str(_min // 60) if _min else "")
         _mx_secs = ch.get("max_duration", 0)
         ch_maxdur_var.set(str(_mx_secs // 60) if _mx_secs else "")
         _m = ch.get("mode", CHANNEL_DEFAULTS["mode"])
@@ -8638,7 +8685,7 @@ def _validate_add_btn():
                         cur_date = (y + mo + dy) if (y or mo or dy) else ""
                         parsed = _parse_date_input(cur_date) or ""
 
-                        dur_val = _parse_duration(new_dur_var.get())
+                        dur_val = _parse_duration(new_dur_var.get()) * 60
 
                         mx_val = _parse_duration(new_maxdur_var.get())
                         mx_str = str(mx_val) if mx_val else ""
@@ -8755,7 +8802,7 @@ def save_channel_prefs():
         for ch in config.get("channels", []):
             if ch["name"] == ch_name:
                 ch["resolution"] = ch_res_var.get()
-                ch["min_duration"] = _parse_duration(ch_dur_var.get())
+                ch["min_duration"] = _parse_duration(ch_dur_var.get()) * 60
                 ch["max_duration"] = _parse_duration(ch_maxdur_var.get()) * 60
                 ch["mode"] = mode_var.get()
                 ch["folder_override"] = sanitize_folder(folder_override_var.get().strip())
@@ -11634,7 +11681,12 @@ def _show_queue_menu(event=None):
     popup.bind("<Destroy>", _on_popup_destroy)
 
 
-queue_btn.config(command=_show_queue_menu)
+def _queue_btn_click(e=None):
+    """Toggle the queue popup — bound to <Button-1> to suppress the pressed-state flicker."""
+    _show_queue_menu()
+    return "break"
+
+queue_btn.bind("<Button-1>", _queue_btn_click, add="+")
 _ToolTip(queue_btn, "Sync Tasks")
 
 
@@ -11734,13 +11786,10 @@ def _blink_tick():
                 style.configure("SyncQ.TButton", background=C_BTN)
                 style.map("SyncQ.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # GPU Tasks button — blink while actively encoding/transcribing, solid when paused & idle
+        # GPU Tasks button — always blink while the GPU task is running (even when paused
+        # between videos), so it doesn't go solid until the current job is truly done.
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if _gpu_pause.is_set() and not _gpu_actively_encoding:
-                # Paused and GPU truly idle → solid color
-                style.configure("Gpu.TButton", background="#6b1a1a")
-                style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
-            elif is_on:
+            if is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
@@ -12337,7 +12386,12 @@ def _show_gpu_menu(event=None):
     popup.bind("<Destroy>", _on_popup_destroy)
 
 
-gpu_btn.config(command=_show_gpu_menu)
+def _gpu_btn_click(e=None):
+    """Toggle the GPU popup — bound to <Button-1> to suppress the pressed-state flicker."""
+    _show_gpu_menu()
+    return "break"
+
+gpu_btn.bind("<Button-1>", _gpu_btn_click, add="+")
 _ToolTip(gpu_btn, "GPU Tasks")
 
 
@@ -13752,13 +13806,13 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("whisper_progress", {"foreground": C_TEXT}),
+                             ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_dots", {"foreground": C_TEXT}),
+                             ("whisper_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
-                             ("transcribe_using", {"foreground": C_TEXT})]:
+                             ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)

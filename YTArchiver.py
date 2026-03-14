@@ -878,7 +878,7 @@ def _update_encode_progress(text):
                     log_box.delete(_start, _end)
 
                 # Delete existing encode progress/pct/dots/suffix ranges
-                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix"):
+                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix", "encode_prefix", "encode_title"):
                     while True:
                         _er = log_box.tag_ranges(_etag)
                         if not _er:
@@ -901,7 +901,22 @@ def _update_encode_progress(text):
                     # Build parts list: dots before suffix so pause text appears after animation
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
-                    _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
+                    # Split _before into white/blue segments:
+                    # "[N/M] " → white, "ENCODING" → blue, ": title" → white, " (dur) - " → blue
+                    _enc_i = _before.find("ENCODING")
+                    _pfx_m = _re_ep.match(
+                        r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)$', _before[_enc_i + 8:]
+                    ) if _enc_i >= 0 else None
+                    if _pfx_m:
+                        _parts = [
+                            (_before[:_enc_i], "encode_prefix"),
+                            ("ENCODING", "encode_progress"),
+                            (_pfx_m.group(1), "encode_title"),
+                            (_pfx_m.group(2), "encode_progress"),
+                            (_pct_str, "encode_pct"),
+                        ]
+                    else:
+                        _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
                     if _suffix:
                         # Dots without newline, then suffix (with newline) after
                         _parts.append((_d, "encode_dots"))
@@ -920,14 +935,32 @@ def _update_encode_progress(text):
                         if _root_alive:
                             _encode_dots["job"] = root.after(350, _encode_dot_tick)
                 else:
-                    # No percentage (unknown duration) — still show with animation
+                    # No percentage (unknown duration or loading state) — show with animation.
+                    # Split "[N/M] ENCODING: title (dur) - suffix" into white/blue segments.
                     _stripped = text.rstrip(".\n ").rstrip()
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
                     _ins = _enc_pos
-                    log_box.insert(_ins, _stripped, "encode_progress")
-                    if _ins != tk.END:
-                        _ins = log_box.index(f"{_ins} + {len(_stripped)}c")
+                    _enc_i2 = _stripped.find("ENCODING")
+                    _sfx_m = _re_ep.match(
+                        r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)(.*)$', _stripped[_enc_i2 + 8:]
+                    ) if _enc_i2 >= 0 else None
+                    if _sfx_m:
+                        _dur_and_rest = _sfx_m.group(2) + _sfx_m.group(3)
+                        for _ptxt, _ptag in [
+                            (_stripped[:_enc_i2], "encode_prefix"),
+                            ("ENCODING", "encode_progress"),
+                            (_sfx_m.group(1), "encode_title"),
+                            (_dur_and_rest, "encode_progress"),
+                        ]:
+                            if _ptxt:
+                                log_box.insert(_ins, _ptxt, _ptag)
+                                if _ins != tk.END:
+                                    _ins = log_box.index(f"{_ins} + {len(_ptxt)}c")
+                    else:
+                        log_box.insert(_ins, _stripped, "encode_progress")
+                        if _ins != tk.END:
+                            _ins = log_box.index(f"{_ins} + {len(_stripped)}c")
                     log_box.insert(_ins, _d + "\n", "encode_dots")
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
@@ -1005,7 +1038,7 @@ def _clear_encode_progress():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
-                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix"):
+                for _etag in ("encode_dots", "encode_pct", "encode_progress", "encode_suffix", "encode_prefix", "encode_title"):
                     while True:
                         _er = log_box.tag_ranges(_etag)
                         if not _er:
@@ -2581,6 +2614,8 @@ log_box.tag_configure("pausestatus", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("encode_prefix", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("encode_title", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("encode_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
@@ -11327,6 +11362,7 @@ def _show_queue_menu(event=None):
         return
 
     popup = tk.Toplevel(root)
+    popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _queue_popup["win"] = popup
@@ -11699,6 +11735,7 @@ def _show_queue_menu(event=None):
             pass
 
     _reposition_queue_popup()
+    popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
     _state["configure_bind_id"] = root.bind("<Configure>", _reposition_queue_popup, add="+")
@@ -11896,10 +11933,14 @@ def _blink_tick():
                 style.configure("SyncQ.TButton", background=C_BTN)
                 style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
-        # GPU Tasks button — always blink while the GPU task is running (even when paused
-        # between videos), so it doesn't go solid until the current job is truly done.
+        # GPU Tasks button — blink while GPU is active; go solid when truly paused
+        # (i.e. the pause is in effect AND ffmpeg/whisper is no longer actively encoding).
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if is_on:
+            if _gpu_pause.is_set() and not _gpu_actively_encoding:
+                # Truly paused between items — hold solid red so it doesn't keep flashing
+                style.configure("Gpu.TButton", background="#6b1a1a")
+                style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
+            elif is_on:
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
             else:
@@ -12024,6 +12065,7 @@ def _show_gpu_menu(event=None):
         return
 
     popup = tk.Toplevel(root)
+    popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
@@ -12417,6 +12459,7 @@ def _show_gpu_menu(event=None):
             pass
 
     _reposition_gpu_popup()
+    popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
     _state["configure_bind_id"] = root.bind("<Configure>", _reposition_gpu_popup, add="+")
@@ -12572,6 +12615,8 @@ def _gpu_start():
                         _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
+                        if _is_simple_mode:
+                            _update_encode_progress("Encode loading\n")
                         _compress_channel(
                             item["ch_name"], item["ch_url"], item["folder"],
                             item["bitrate_mbhr"],
@@ -12586,6 +12631,8 @@ def _gpu_start():
                         _gpu_current["label"] = f"Backlog {item['ch_name']}"
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
+                        if _is_simple_mode:
+                            _update_encode_progress("Encode loading\n")
                         _backlog_compress_channel(
                             item["ch_name"], item["ch_url"], item["folder"],
                             item["resolution"], item["bitrate_mbhr"],

@@ -141,6 +141,7 @@ _gpu_cancel = threading.Event()
 _gpu_pause = threading.Event()
 _gpu_popup = {"win": None}
 _gpu_actively_encoding = False  # True while ffmpeg/whisper is processing a file (for blink vs solid)
+_gpu_truly_paused = False      # True only while the GPU worker is in its pause-wait loop (encode/transcription completed, waiting for resume)
 _gpu_current = {"label": None, "ch_url": None}  # currently processing GPU task
 _gpu_current_item = None  # full dict of the item currently being processed (for persistence)
 _whisper_model = None  # unused legacy, kept for compat
@@ -898,37 +899,41 @@ def _update_encode_progress(text):
                     _after_raw = text[_ep_match.end():]
                     # Strip trailing dots/newline — we animate those separately
                     _suffix = _after_raw.rstrip(".\n ").rstrip()
-                    # Build parts list: dots before suffix so pause text appears after animation
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
-                    # Split _before into white/blue segments:
-                    # "[N/M] " → white, "ENCODING" → blue, ": title" → white, " (dur) - " → blue
+                    # Insert the whole _before as ONE encode_progress range (blue),
+                    # then overlay white tags for "[N/M] " (prefix) and ": title" (title).
                     _enc_i = _before.find("ENCODING")
                     _pfx_m = _re_ep.match(
                         r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)$', _before[_enc_i + 8:]
                     ) if _enc_i >= 0 else None
-                    if _pfx_m:
-                        _parts = [
-                            (_before[:_enc_i], "encode_prefix"),
-                            ("ENCODING", "encode_progress"),
-                            (_pfx_m.group(1), "encode_title"),
-                            (_pfx_m.group(2), "encode_progress"),
-                            (_pct_str, "encode_pct"),
-                        ]
-                    else:
-                        _parts = [(_before, "encode_progress"), (_pct_str, "encode_pct")]
-                    if _suffix:
-                        # Dots without newline, then suffix (with newline) after
-                        _parts.append((_d, "encode_dots"))
-                        _parts.append((_suffix + "\n", "encode_suffix"))
-                    else:
-                        _parts.append((_d + "\n", "encode_dots"))
-                    # Insert all parts — each subsequent insert goes after the previous
                     _ins = _enc_pos
-                    for _ptxt, _ptag in _parts:
-                        log_box.insert(_ins, _ptxt, _ptag)
+                    log_box.insert(_ins, _before, "encode_progress")
+                    if _pfx_m and _enc_i >= 0:
+                        # Use tag_ranges to locate the just-inserted range (works for both
+                        # specific positions and tk.END insertion points).
+                        # tag_ranges returns a flat list of (start, end) pairs; len >= 2 means
+                        # at least one range exists.
+                        _ep_r = log_box.tag_ranges("encode_progress")
+                        if len(_ep_r) >= 2:
+                            _ep_start = _ep_r[-2]  # start of the last encode_progress range
+                            _pfx_end = log_box.index(f"{_ep_start} + {_enc_i}c")
+                            log_box.tag_add("encode_prefix", _ep_start, _pfx_end)
+                            _ttl_start = log_box.index(f"{_ep_start} + {_enc_i + 8}c")
+                            _ttl_end = log_box.index(f"{_ttl_start} + {len(_pfx_m.group(1))}c")
+                            log_box.tag_add("encode_title", _ttl_start, _ttl_end)
+                    if _ins != tk.END:
+                        _ins = log_box.index(f"{_ins} + {len(_before)}c")
+                    log_box.insert(_ins, _pct_str, "encode_pct")
+                    if _ins != tk.END:
+                        _ins = log_box.index(f"{_ins} + {len(_pct_str)}c")
+                    if _suffix:
+                        log_box.insert(_ins, _d, "encode_dots")
                         if _ins != tk.END:
-                            _ins = log_box.index(f"{_ins} + {len(_ptxt)}c")
+                            _ins = log_box.index(f"{_ins} + {len(_d)}c")
+                        log_box.insert(_ins, _suffix + "\n", "encode_suffix")
+                    else:
+                        log_box.insert(_ins, _d + "\n", "encode_dots")
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
                         _encode_dots["idx"] = 0
@@ -936,7 +941,7 @@ def _update_encode_progress(text):
                             _encode_dots["job"] = root.after(350, _encode_dot_tick)
                 else:
                     # No percentage (unknown duration or loading state) — show with animation.
-                    # Split "[N/M] ENCODING: title (dur) - suffix" into white/blue segments.
+                    # Insert as ONE encode_progress range; overlay white tags for prefix and title.
                     _stripped = text.rstrip(".\n ").rstrip()
                     _dot_chars = [".", "..", "..."]
                     _d = _dot_chars[_encode_dots["idx"] % 3]
@@ -945,22 +950,18 @@ def _update_encode_progress(text):
                     _sfx_m = _re_ep.match(
                         r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)(.*)$', _stripped[_enc_i2 + 8:]
                     ) if _enc_i2 >= 0 else None
-                    if _sfx_m:
-                        _dur_and_rest = _sfx_m.group(2) + _sfx_m.group(3)
-                        for _ptxt, _ptag in [
-                            (_stripped[:_enc_i2], "encode_prefix"),
-                            ("ENCODING", "encode_progress"),
-                            (_sfx_m.group(1), "encode_title"),
-                            (_dur_and_rest, "encode_progress"),
-                        ]:
-                            if _ptxt:
-                                log_box.insert(_ins, _ptxt, _ptag)
-                                if _ins != tk.END:
-                                    _ins = log_box.index(f"{_ins} + {len(_ptxt)}c")
-                    else:
-                        log_box.insert(_ins, _stripped, "encode_progress")
-                        if _ins != tk.END:
-                            _ins = log_box.index(f"{_ins} + {len(_stripped)}c")
+                    log_box.insert(_ins, _stripped, "encode_progress")
+                    if _sfx_m and _enc_i2 >= 0:
+                        _ep_r2 = log_box.tag_ranges("encode_progress")
+                        if len(_ep_r2) >= 2:
+                            _ep_start2 = _ep_r2[-2]
+                            _pfx_end2 = log_box.index(f"{_ep_start2} + {_enc_i2}c")
+                            log_box.tag_add("encode_prefix", _ep_start2, _pfx_end2)
+                            _ttl_start2 = log_box.index(f"{_ep_start2} + {_enc_i2 + 8}c")
+                            _ttl_end2 = log_box.index(f"{_ttl_start2} + {len(_sfx_m.group(1))}c")
+                            log_box.tag_add("encode_title", _ttl_start2, _ttl_end2)
+                    if _ins != tk.END:
+                        _ins = log_box.index(f"{_ins} + {len(_stripped)}c")
                     log_box.insert(_ins, _d + "\n", "encode_dots")
                     if not _encode_dots["active"]:
                         _encode_dots["active"] = True
@@ -2614,12 +2615,15 @@ log_box.tag_configure("pausestatus", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_prefix", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_title", foreground=C_TEXT, font=("Consolas", 9))
-log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("encode_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_suffix", foreground=C_LOG_BLUE, font=("Consolas", 9))
+# encode_prefix and encode_title must override encode_progress (white over blue)
+log_box.tag_raise("encode_prefix", "encode_progress")
+log_box.tag_raise("encode_title", "encode_progress")
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -11369,13 +11373,20 @@ def _show_queue_menu(event=None):
 
     # Shared state for drag-to-reorder and live refresh
     _drag = {"active": False, "src_sync_idx": -1, "src_widget": None}
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": [], "mw_bind_id": None, "active_lbl": None}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "widgets": [], "mw_bind_id": None, "active_lbl": None, "pause_resume_btn": None}
 
     def _build_content():
         """Build or rebuild queue popup content. Skips if nothing changed."""
         items = _get_queue_items()
         # Strip animated dots from snapshot so dot cycling doesn't trigger full rebuilds
-        snapshot = [(lbl.rstrip("."), src, idx) for lbl, src, idx in items]
+        # Strip animated dots AND "(Paused)" from snapshot so neither triggers a full rebuild —
+        # the active label widget is updated in-place in the no-structural-change path below.
+        def _snap_label(lbl):
+            s = lbl.rstrip(".")
+            if s.endswith(" (Paused)"):
+                s = s[:-9]
+            return s
+        snapshot = [(_snap_label(lbl), src, idx) for lbl, src, idx in items]
         if _state["last_snapshot"] == snapshot:
             # Just update the dot animation on the active item's label widget
             _albl = _state.get("active_lbl")
@@ -11386,6 +11397,16 @@ def _show_queue_menu(event=None):
                     else:
                         _fresh = f"▶ {_active_label(_current_job['label'], with_dots=True)}"
                     _albl.config(text=f"  1. {_fresh}")
+                except Exception:
+                    pass
+            # Update pause/resume button text in-place to avoid full rebuild flicker
+            _sync_pr_btn = _state.get("pause_resume_btn")
+            if _sync_pr_btn:
+                try:
+                    if pause_event.is_set():
+                        _sync_pr_btn.config(text="\u25B6 Resume", bg="#3a6a3a", activebackground="#4a8a4a")
+                    else:
+                        _sync_pr_btn.config(text="\u23F8 Pause", bg="#2a4a6b", activebackground="#3a5e84")
                 except Exception:
                     pass
             return  # No structural change
@@ -11620,17 +11641,20 @@ def _show_queue_menu(event=None):
                               activebackground="#4a8a4a", activeforeground="#cccccc",
                               relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
                               cursor="hand2", command=_start_sync_queue).pack(side="left", padx=(4, 4))
+                    _state["pause_resume_btn"] = None
                 else:
                     if pause_event.is_set():
-                        tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                        _sync_pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                                  cursor="hand2", command=toggle_pause)
                     else:
-                        tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
+                        _sync_pr_btn = tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=toggle_pause).pack(side="left", padx=(4, 4))
+                                  cursor="hand2", command=toggle_pause)
+                    _sync_pr_btn.pack(side="left", padx=(4, 4))
+                    _state["pause_resume_btn"] = _sync_pr_btn
                 def _confirm_cancel_sync():
                     # Count total items (current + queued)
                     _total = 0
@@ -11934,10 +11958,10 @@ def _blink_tick():
                 style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
         # GPU Tasks button — blink while GPU is active; go solid when truly paused
-        # (i.e. the pause is in effect AND ffmpeg/whisper is no longer actively encoding).
+        # (i.e. the worker is in its pause-wait loop between items, not while actively encoding).
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
-            if _gpu_pause.is_set() and not _gpu_actively_encoding:
-                # Truly paused between items — hold solid red so it doesn't keep flashing
+            if _gpu_truly_paused:
+                # Worker is waiting in the pause loop — hold solid red
                 style.configure("Gpu.TButton", background="#6b1a1a")
                 style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
             elif is_on:
@@ -12070,7 +12094,7 @@ def _show_gpu_menu(event=None):
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
 
-    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None, "widgets": []}
+    _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None, "widgets": [], "pause_resume_btn": None}
     _drag = {"active": False, "src_widget_idx": -1, "src_widget": None}
 
     def _mt_from_popup():
@@ -12103,9 +12127,9 @@ def _show_gpu_menu(event=None):
     def _build_content():
         """Build or rebuild GPU popup content. Skips if nothing changed."""
         items = _get_gpu_queue_items()
-        btn_state = ("running_paused" if _gpu_pause.is_set() else "running") if _gpu_running else "idle"
-        # Strip animated dots from snapshot so dot cycling doesn't trigger full rebuilds
-        snapshot = [(lbl.rstrip("."), idx) for lbl, idx in items] + [("__btn__", btn_state)]
+        # Strip animated dots from snapshot so dot cycling doesn't trigger full rebuilds.
+        # Exclude button state (pause/resume) from snapshot — update button in-place instead.
+        snapshot = [(lbl.rstrip("."), idx) for lbl, idx in items]
         if _state["last_snapshot"] == snapshot:
             # Just update the dot animation on the active item's label widget
             _albl = _state.get("active_lbl")
@@ -12113,6 +12137,16 @@ def _show_gpu_menu(event=None):
                 try:
                     _fresh = f"▶ {_active_label(_gpu_current['label'], with_dots=True)}"
                     _albl.config(text=f"  1. {_fresh}")
+                except Exception:
+                    pass
+            # Update pause/resume button text in-place to avoid full rebuild flicker
+            _pr_btn = _state.get("pause_resume_btn")
+            if _pr_btn and _gpu_running:
+                try:
+                    if _gpu_pause.is_set():
+                        _pr_btn.config(text="\u25B6 Resume", bg="#3a6a3a", activebackground="#4a8a4a")
+                    else:
+                        _pr_btn.config(text="\u23F8 Pause", bg="#2a4a6b", activebackground="#3a5e84")
                 except Exception:
                     pass
             return  # No structural change
@@ -12352,17 +12386,20 @@ def _show_gpu_menu(event=None):
                               activebackground="#4a8a4a", activeforeground="#cccccc",
                               relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
                               cursor="hand2", command=_do_gpu_start).pack(side="left", padx=(4, 4))
+                    _state["pause_resume_btn"] = None
                 else:
                     if _gpu_pause.is_set():
-                        tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
+                        _pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                                  cursor="hand2", command=_gpu_pause_handler)
                     else:
-                        tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
+                        _pr_btn = tk.Button(btn_row, text="\u23F8 Pause", bg="#2a4a6b", fg="#cccccc",
                                   activebackground="#3a5e84", activeforeground="#cccccc",
                                   relief="flat", bd=0, font=("Segoe UI Emoji", 9, "bold"),
-                                  cursor="hand2", command=_gpu_pause_handler).pack(side="left", padx=(4, 4))
+                                  cursor="hand2", command=_gpu_pause_handler)
+                    _pr_btn.pack(side="left", padx=(4, 4))
+                    _state["pause_resume_btn"] = _pr_btn
                 def _confirm_cancel_gpu():
                     _total = 0
                     if _gpu_running:
@@ -12580,15 +12617,17 @@ def _gpu_start():
         _update_gpu_btn()
 
         def _gpu_worker():
-            global _gpu_running, _gpu_current_item
+            global _gpu_running, _gpu_current_item, _gpu_truly_paused
             _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
             try:
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         _tray_stop_spin(force=True)  # stop blinking while paused
                         log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                        _gpu_truly_paused = True
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                             time.sleep(0.25)
+                        _gpu_truly_paused = False
                         if not _gpu_cancel.is_set():
                             _tray_start_spin(red=True)  # resume blinking
                             clear_pause_status()
@@ -12816,7 +12855,7 @@ def _gpu_start():
     _update_gpu_btn()
 
     def _gpu_worker():
-        global _gpu_running, _gpu_current_item
+        global _gpu_running, _gpu_current_item, _gpu_truly_paused
         _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
         try:
             while True:
@@ -12824,8 +12863,10 @@ def _gpu_start():
                 if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                     _tray_stop_spin(force=True)  # stop blinking while paused
                     log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                    _gpu_truly_paused = True
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         time.sleep(0.25)
+                    _gpu_truly_paused = False
                     if not _gpu_cancel.is_set():
                         _tray_start_spin(red=True)  # resume blinking
                         clear_pause_status()

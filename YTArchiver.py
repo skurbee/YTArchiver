@@ -271,6 +271,15 @@ def _sync_mini_logs_timer():
 
 
 def log(text, tag=None):
+    # Pre-strip leading newlines from "===" header lines in simple mode to avoid blank
+    # spacers.  This MUST be done here (before _write is defined) rather than inside
+    # _write().  Assigning to any closure-captured name inside a nested function makes
+    # Python treat that name as a local throughout the entire nested function, so every
+    # subsequent read of `text` (e.g. log_box.insert(..., text, ...)) would raise
+    # UnboundLocalError — silently swallowed by the try/except — suppressing all output.
+    if _is_simple_mode and tag == "header" and "===" in text and text.startswith("\n"):
+        text = text.lstrip("\n")
+
     def _write():
         global _log_at_bottom, _log_scroll_freeze, _log_user_scrolled
         try:
@@ -370,10 +379,6 @@ def log(text, tag=None):
                             _log_scroll_freeze = False
                             log_box.config(state="disabled")
                             return
-
-                    # Strip leading newline from === header lines in simple mode to avoid blank spacers
-                    if use_tag == "header" and "===" in text and text.startswith("\n"):
-                        text = text.lstrip("\n")
 
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
                     if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using", "filterskip"):

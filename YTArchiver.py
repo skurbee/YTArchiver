@@ -11327,6 +11327,7 @@ def _show_queue_menu(event=None):
         return
 
     popup = tk.Toplevel(root)
+    popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _queue_popup["win"] = popup
@@ -11699,6 +11700,7 @@ def _show_queue_menu(event=None):
             pass
 
     _reposition_queue_popup()
+    popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
     _state["configure_bind_id"] = root.bind("<Configure>", _reposition_queue_popup, add="+")
@@ -12024,6 +12026,7 @@ def _show_gpu_menu(event=None):
         return
 
     popup = tk.Toplevel(root)
+    popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
@@ -12417,6 +12420,7 @@ def _show_gpu_menu(event=None):
             pass
 
     _reposition_gpu_popup()
+    popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
     _state["configure_bind_id"] = root.bind("<Configure>", _reposition_gpu_popup, add="+")

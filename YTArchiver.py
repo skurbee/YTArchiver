@@ -618,13 +618,24 @@ def log_progress_bar(current, total):
 
 
 def log_dl_progress(msg):
-    # Pre-parse the percentage position so we can color it green
+    # Pre-parse the percentage and filled bar positions so we can color them green
     _pct_match = re.search(r'\d+\.?\d*%', msg)
     _pct_start = _pct_match.start() if _pct_match else -1
     _pct_end = _pct_match.end() if _pct_match else -1
 
+    _bar_match = re.search(r'█+', msg)
+    _bar_start = _bar_match.start() if _bar_match else -1
+    _bar_end = _bar_match.end() if _bar_match else -1
+
     def _apply_pct_tag(insert_pos):
-        """Apply green tag to the percentage portion starting at insert_pos."""
+        """Apply green tag to the filled bar and percentage portions starting at insert_pos."""
+        if _bar_start >= 0:
+            try:
+                log_box.tag_add("dlprogress_pct",
+                                f"{insert_pos}+{_bar_start}c",
+                                f"{insert_pos}+{_bar_end}c")
+            except Exception:
+                pass
         if _pct_start >= 0:
             try:
                 log_box.tag_add("dlprogress_pct",

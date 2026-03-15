@@ -132,6 +132,9 @@ _transcribe_queue = []  # list of (ch_name, ch_url, folder, split_years, split_m
 _transcribe_queue_lock = threading.Lock()
 _mt_queue = []  # list of file paths (str) for manual transcription
 _mt_queue_lock = threading.Lock()
+_redownload_queue = []  # list of dicts: {"ch_name", "ch_url", "folder", "resolution"}
+_redownload_queue_lock = threading.Lock()
+_redownload_running = False
 
 # GPU Tasks queue — independent from the main job queue
 _gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
@@ -151,8 +154,14 @@ _job_generation = 0  # incremented each time a new sync/job starts; stale worker
 _skip_current = threading.Event()  # set when user wants to skip the current job and move to next in queue
 _skip_current_gpu = threading.Event()  # same, for GPU Tasks
 
+# Disk error auto-pause — detects write errors (e.g. disconnected drive) and
+# pauses all tasks, retrying every 5 minutes until the disk is writable again.
+_disk_error_active = False
+_disk_error_path = None   # output directory to recheck
+_disk_retry_job = None    # root.after() handle for the retry timer
+
 # Unified queue ordering — tracks insertion order across all queue types.
-# Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video", url_or_key).
+# Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video"|"redownload", url_or_key).
 # _get_queue_items() and _process_next_queued() use this for display and execution order.
 _queue_order = []
 _queue_order_lock = threading.Lock()
@@ -1166,6 +1175,8 @@ def _simple_anim_tick():
         if not _simple_anim_state["active"] or not root.winfo_exists():
             return
 
+        _anim_mode = _simple_anim_state.get("mode", "sync")
+
         if pause_event.is_set():
             # Show static paused state instead of animated dots
             i = _simple_anim_state["idx"]
@@ -1180,6 +1191,17 @@ def _simple_anim_tick():
         ch = _simple_anim_state["channel"]
         dl_cur = _simple_anim_state["dl_current"]
         ch_tot = _simple_anim_state["ch_total"]
+
+        if _anim_mode == "redownload":
+            # Redownload mode: [x/total] REDOWNLOADING: channel···
+            log_simple_status(segments=[
+                (f"[{i}/{n}]", None),
+                (" REDOWNLOADING:", "simplestatus_green"),
+                (f" {ch}", None),
+                (d, "simplestatus_green"),
+                ("\n", None),
+            ])
+            return  # finally block handles rescheduling
 
         # Dynamically update total if items were added to the sync queue
         with _sync_queue_lock:
@@ -1241,13 +1263,13 @@ def _simple_anim_tick():
             _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
 
 
-def _start_simple_anim(channel, idx, total):
+def _start_simple_anim(channel, idx, total, mode="sync"):
     _old_job = _simple_anim_state.get("job")
     _simple_anim_state.update({"active": True, "channel": channel,
                                "idx": idx, "total": total, "dots": 0,
                                "dl_current": 0, "ch_total": 0, "page_num": 0,
                                "enum_page": 0, "enum_count": 0, "batch_size": 0,
-                               "job": None})
+                               "mode": mode, "job": None})
     def _do_start():
         if _old_job:
             try:
@@ -3071,6 +3093,14 @@ def _set_edit_mode(ch):
     add_outer.config(text="Edit channel")
     _set_add_details_visible(True)
     cancel_edit_btn.pack(side="left", padx=(0, 8))
+    # Show "Continue Redownload" button if there's an incomplete redownload for this channel
+    _pending_res = _has_pending_redownload(ch.get("url", ""))
+    if _pending_res:
+        _pr_disp = "Best" if _pending_res == "best" else f"{_pending_res}p"
+        continue_redownload_btn.config(text=f"↻ Continue Redownload ({_pr_disp})")
+        continue_redownload_btn.pack(side="left", padx=(0, 8))
+    else:
+        continue_redownload_btn.pack_forget()
     reorg_done_label.pack_forget()
 
     new_name_entry.event_generate("<FocusOut>")
@@ -3107,6 +3137,7 @@ def _clear_edit_mode():
     add_outer.config(text="Add channel")
     _set_add_details_visible(False)
     cancel_edit_btn.pack_forget()
+    continue_redownload_btn.pack_forget()
     try:
         reorg_done_label.pack_forget()
     except Exception:
@@ -3766,13 +3797,7 @@ def add_channel():
                         f"replacing the originals?"
                     )
                     if _rd_ask:
-                        _add_to_gpu_queue({
-                            "type": "backlog_redownload",
-                            "ch_name": name,
-                            "ch_url": url,
-                            "folder": _rd_folder,
-                            "resolution": new_res_val,
-                        })
+                        _add_to_redownload_queue(name, url, _rd_folder, new_res_val)
 
 
 def sync_single_channel():
@@ -4329,8 +4354,13 @@ def _process_next_queued():
                 has_items = bool(_mt_queue)
             if has_items:
                 return _process_mt_queue()
+        elif source == "redownload":
+            with _redownload_queue_lock:
+                has_items = bool(_redownload_queue)
+            if has_items:
+                return _process_redownload_queue()
     # Fallback: try each queue in case _queue_order is out of sync
-    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue()
+    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue() or _process_redownload_queue()
 
 
 def _process_video_dl_queue():
@@ -6656,9 +6686,43 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
     at the new resolution, and replaces the original.  No compression step —
     intended for resolution-only upgrades that are not GPU-taxing.
 
+    Progress is persisted so a cancelled redownload can resume from where it
+    left off (completed video IDs are stored in a progress file).
+
     _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
     """
     _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
+    _PROGRESS_FILE = os.path.join(folder, "_redownload_progress.json")
+
+    def _load_progress():
+        """Load set of already-redownloaded video IDs from progress file."""
+        try:
+            if os.path.exists(_PROGRESS_FILE):
+                with open(_PROGRESS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("resolution") == new_res and data.get("ch_url") == ch_url:
+                    return set(data.get("done_ids", []))
+        except Exception:
+            pass
+        return set()
+
+    def _save_progress(done_ids):
+        """Persist completed video IDs so a cancelled redownload can resume."""
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(_PROGRESS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"ch_url": ch_url, "resolution": new_res,
+                           "done_ids": list(done_ids)}, f)
+        except Exception:
+            pass
+
+    def _clear_progress():
+        """Remove progress file after a complete run."""
+        try:
+            if os.path.exists(_PROGRESS_FILE):
+                os.remove(_PROGRESS_FILE)
+        except Exception:
+            pass
 
     def _worker():
         _ce = cancel_ev or cancel_event
@@ -6751,7 +6815,25 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             log("  No files to process after matching.\n", "simpleline")
             return
 
-        log(f"  Matched {len(work_list)} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+        # ── Resume: skip videos already completed in a previous run ──
+        done_ids = _load_progress()
+        if done_ids:
+            before = len(work_list)
+            work_list = [(vid_id, fp) for vid_id, fp in work_list if vid_id not in done_ids]
+            skipped_prev = before - len(work_list)
+            if skipped_prev:
+                log(f"  Resuming — {skipped_prev} video(s) already redownloaded, {len(work_list)} remaining.\n", "simpleline_green")
+        if not work_list:
+            log("  All files already redownloaded.\n", "simpleline_green")
+            _clear_progress()
+            return
+
+        total_to_do = len(work_list)
+        log(f"  Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+
+        # Start simple mode animation for redownload
+        if _is_simple_mode:
+            _start_simple_anim(ch_name, 1, total_to_do, mode="redownload")
 
         # ── Step 4: Download each video at new resolution and replace ──
         fmt = build_format_string(new_res)
@@ -6773,9 +6855,14 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             if _ce.is_set():
                 break
 
+            # Update simple mode status line
+            if _is_simple_mode:
+                _simple_anim_state["idx"] = idx + 1
+                _simple_anim_state["total"] = total_to_do
+
             orig_fname = os.path.basename(orig_path)
             fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
-            log(f"\n  [{idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline")
+            log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
 
             try:
                 os.makedirs(temp_dir, exist_ok=True)
@@ -6833,12 +6920,18 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     os.replace(dl_path, orig_path)
                     log(f"    ✓ Replaced at {_res_label}.\n", "simpleline_green")
                     done += 1
+                    done_ids.add(vid_id)
+                    _save_progress(done_ids)
                 except Exception as e:
                     log(f"    ⚠ Replace failed: {e}\n", "red")
                     errors += 1
             except Exception as e:
                 log(f"    ⚠ Error: {e}\n", "red")
                 errors += 1
+
+        if _is_simple_mode:
+            _stop_simple_anim()
+            clear_simple_status()
 
         # Cleanup temp dir
         try:
@@ -6847,6 +6940,10 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 _shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
+
+        # Clear progress file if all videos were processed (not cancelled)
+        if not _ce.is_set():
+            _clear_progress()
 
         log(f"\n=== Redownload Complete: {ch_name} — {done} done, {errors} error(s) ===\n", "header")
 
@@ -7403,15 +7500,6 @@ def _add_to_gpu_queue(item, _quiet=False):
                     log(f"  ⚠ {item['ch_name']} backlog is already in the GPU Tasks queue.\n", "simpleline")
                 return
             label = f"Backlog {item['ch_name']}"
-        elif item["type"] == "backlog_redownload":
-            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "backlog_redownload" for q in _gpu_queue) or \
-               (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "backlog_redownload"):
-                if not _quiet:
-                    log(f"  ⚠ {item['ch_name']} redownload is already in the GPU Tasks queue.\n", "simpleline")
-                return
-            _rr_res = item.get("resolution", "")
-            _rr_label = "Best" if _rr_res == "best" else f"{_rr_res}p"
-            label = f"Redownload {item['ch_name']} ({_rr_label})"
         elif item["type"] == "mt":
             if item.get("folder_path"):
                 # Folder-based manual transcription
@@ -7468,7 +7556,129 @@ def _process_transcribe_queue():
     return True
 
 
-def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined,
+def _process_redownload_queue():
+    """Process next queued redownload if any. Returns True if one was started."""
+    with _redownload_queue_lock:
+        if not _redownload_queue:
+            return False
+        item = _redownload_queue.pop(0)
+        remaining = len(_redownload_queue)
+
+    ch_url = item["ch_url"]
+    ch_name = item["ch_name"]
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("redownload", ch_url))
+        except ValueError:
+            pass
+    _rr_res = item.get("resolution", "")
+    _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
+    _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
+    _update_queue_btn()
+    log(f"\n=== Processing queued redownload: {ch_name} ({_rr_disp})", "header")
+    if remaining:
+        log(f" ({remaining} more in queue)", "header")
+    log(f" ===\n", "header")
+    _start_redownload_task(ch_name, ch_url, item["folder"], item["resolution"])
+    return True
+
+
+def _add_to_redownload_queue(ch_name, ch_url, folder, resolution):
+    """Add a redownload task to the Sync-Tasks queue (not GPU queue)."""
+    with _redownload_queue_lock:
+        if any(q["ch_url"] == ch_url for q in _redownload_queue):
+            log(f"  ⚠ {ch_name} redownload is already in the queue.\n", "simpleline")
+            return
+    # Also check if it's the currently running redownload
+    if _redownload_running and _current_job.get("url") == ch_url:
+        log(f"  ⚠ {ch_name} redownload is already running.\n", "simpleline")
+        return
+    _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
+    with _redownload_queue_lock:
+        _redownload_queue.append({
+            "ch_name": ch_name,
+            "ch_url": ch_url,
+            "folder": folder,
+            "resolution": resolution,
+        })
+    with _queue_order_lock:
+        _queue_order.append(("redownload", ch_url))
+    log(f"\n=== Added to Sync List: Redownload {ch_name} ({_rr_disp}) ===\n", "header")
+    _update_queue_btn()
+    _save_queue_state()
+
+    # If nothing else is running, start processing immediately
+    if not _sync_running and not _reorg_running and not _transcribe_running and not _redownload_running:
+        _process_redownload_queue()
+
+
+def _start_redownload_task(ch_name, ch_url, folder, resolution):
+    """Start a redownload task as a sync-pipeline job."""
+    global _redownload_running
+
+    if _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+        _add_to_redownload_queue(ch_name, ch_url, folder, resolution)
+        return
+
+    def _worker():
+        global _redownload_running
+        _redownload_running = True
+        _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
+        _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
+        _current_job["url"] = ch_url
+        _update_queue_btn()
+        _tray_start_spin()
+        _update_tray_tooltip(f"YT Archiver — Redownloading {ch_name}")
+        try:
+            _backlog_redownload_channel(
+                ch_name, ch_url, folder, resolution,
+                cancel_ev=cancel_event, pause_ev=pause_event,
+                _sync_mode=True
+            )
+        except Exception as e:
+            log(f"\n  ⚠ Redownload error: {e}\n", "red")
+        finally:
+            _redownload_running = False
+            _current_job["label"] = None
+            _current_job["url"] = None
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
+
+            # Process next queued item
+            _queue_started = False
+            if _skip_current.is_set():
+                _skip_current.clear()
+                cancel_event.clear()
+                _queue_started = _process_next_queued()
+            elif not cancel_event.is_set():
+                _queue_started = _process_next_queued()
+            if not _queue_started:
+                try:
+                    _ui_queue.append(_sync_task_finished)
+                except Exception:
+                    pass
+            _save_queue_state()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _has_pending_redownload(ch_url):
+    """Check if a channel has an incomplete redownload (progress file exists)."""
+    with config_lock:
+        _rd_base = config.get("output_dir", "").strip() or BASE_DIR
+    for ch in config.get("channels", []):
+        if ch.get("url") == ch_url:
+            folder = os.path.join(_rd_base, sanitize_folder(ch.get("name", "")))
+            pfile = os.path.join(folder, "_redownload_progress.json")
+            if os.path.exists(pfile):
+                try:
+                    with open(pfile, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return data.get("resolution", "")
+                except Exception:
+                    pass
+            break
+    return ""
                          cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False):
     """Start transcribing a channel. Queues if something is already running.
 
@@ -7478,7 +7688,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
     """
     global _transcribe_running
 
-    if not _sync_mode and (_sync_running or _reorg_running or _transcribe_running):
+    if not _sync_mode and (_sync_running or _reorg_running or _transcribe_running or _redownload_running):
         with _transcribe_queue_lock:
             if not any(q[1] == ch_url for q in _transcribe_queue):
                 _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
@@ -8931,6 +9141,26 @@ remove_channel_btn = ttk.Button(action_btn_frame, text="⛔Remove selected", com
 cancel_edit_btn = ttk.Button(action_btn_frame, text="Cancel edit", command=_clear_edit_mode)
 cancel_edit_btn.pack(side="left", padx=(0, 8))
 cancel_edit_btn.pack_forget()
+
+def _continue_redownload():
+    """Triggered by the Continue Redownload button in edit mode."""
+    ch_url = _editing_channel.get("url") or new_url_var.get().strip()
+    ch_name = _editing_channel.get("name") or new_name_var.get().strip()
+    if not ch_url or not ch_name:
+        return
+    pending_res = _has_pending_redownload(ch_url)
+    if not pending_res:
+        log("  No pending redownload to continue.\n", "simpleline")
+        return
+    with config_lock:
+        _rd_base = config.get("output_dir", "").strip() or BASE_DIR
+    _rd_folder = os.path.join(_rd_base, sanitize_folder(ch_name))
+    _add_to_redownload_queue(ch_name, ch_url, _rd_folder, pending_res)
+
+continue_redownload_btn = ttk.Button(action_btn_frame, text="↻ Continue Redownload",
+                                     command=_continue_redownload)
+continue_redownload_btn.pack(side="left", padx=(0, 8))
+continue_redownload_btn.pack_forget()
 
 # ─── Show/hide add-channel detail options ─────────────────
 _add_details_visible = True
@@ -11347,10 +11577,10 @@ def _show_clear_log_if_needed():
 
 
 def stop_downloads():
-    global _sync_running, _reorg_running, _transcribe_running, _current_sync_ch
+    global _sync_running, _reorg_running, _transcribe_running, _redownload_running, _current_sync_ch
     pause_event.clear()
 
-    # Clear any queued syncs, video downloads, reorg, and transcription jobs
+    # Clear any queued syncs, video downloads, reorg, transcription, and redownload jobs
     # (GPU Tasks is independent — cancelled only via its own menu)
     with _sync_queue_lock:
         _sync_queue.clear()
@@ -11362,6 +11592,8 @@ def stop_downloads():
         _transcribe_queue.clear()
     with _mt_queue_lock:
         _mt_queue.clear()
+    with _redownload_queue_lock:
+        _redownload_queue.clear()
     with _queue_order_lock:
         _queue_order.clear()
 
@@ -11369,6 +11601,7 @@ def stop_downloads():
     _sync_running = False
     _reorg_running = False
     _transcribe_running = False
+    _redownload_running = False
     _transcribe_sync_controlled = False
     _current_sync_ch = None
     if not _gpu_running:
@@ -11452,8 +11685,8 @@ def toggle_pause():
 
 
 def _sync_task_finished():
-    """Called when sync/reorg finishes — resets job state and updates sync tasks button."""
-    if not _sync_running and not _reorg_running:
+    """Called when sync/reorg/redownload finishes — resets job state and updates sync tasks button."""
+    if not _sync_running and not _reorg_running and not _redownload_running:
         pause_event.clear()
         _current_job["label"] = None
         _current_job["url"] = None
@@ -11516,16 +11749,16 @@ def _active_label(label, with_dots=False):
 
 def _get_queue_items():
     """Return a list of (label, queue_source, index) for all queued items.
-    queue_source is 'sync', 'reorg', 'video', or 'current' — used for removal.
+    queue_source is 'sync', 'reorg', 'video', 'redownload', or 'current' — used for removal.
     index is the position within that specific queue.
     Items are returned in _queue_order (insertion order), not grouped by type.
     """
     items = []
     # Show currently processing item first
     if _current_job["label"]:
-        if (_sync_running or _reorg_running or _transcribe_running) and pause_event.is_set():
+        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running) and pause_event.is_set():
             _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
-        elif _sync_running or _reorg_running or _transcribe_running:
+        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running:
             _active_lbl = _active_label(_current_job["label"], with_dots=True)
         else:
             _active_lbl = _current_job["label"]
@@ -11570,6 +11803,12 @@ def _get_queue_items():
             video_item = ("Download 1 video", "video", 0)
         elif n_vids > 1:
             video_item = (f"Download {n_vids} videos", "video", 0)
+    redownload_map = {}
+    with _redownload_queue_lock:
+        for i, item in enumerate(_redownload_queue):
+            _rr_res = item.get("resolution", "")
+            _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
+            redownload_map[item["ch_url"]] = (f"Redownload {item['ch_name']} ({_rr_disp})", "redownload", i)
 
     # Emit items in _queue_order (insertion order)
     seen = set()
@@ -11589,6 +11828,8 @@ def _get_queue_items():
             elif source == "video" and video_item:
                 items.append(video_item)
                 video_item = None
+            elif source == "redownload" and key in redownload_map:
+                items.append(redownload_map.pop(key))
 
     # Append any orphaned items (added without _queue_order tracking, e.g. legacy/startup)
     for entry in sync_map.values():
@@ -11598,6 +11839,8 @@ def _get_queue_items():
     for entry in transcribe_map.values():
         items.append(entry)
     for entry in mt_map.values():
+        items.append(entry)
+    for entry in redownload_map.values():
         items.append(entry)
     if video_item:
         items.append(video_item)
@@ -11641,6 +11884,12 @@ def _remove_queue_item(source, idx):
                 _video_dl_queue.clear()
                 removed = "queued videos"
                 removed_key = "batch"
+    elif source == "redownload":
+        with _redownload_queue_lock:
+            if 0 <= idx < len(_redownload_queue):
+                popped = _redownload_queue.pop(idx)
+                removed = popped.get("ch_name", "?")
+                removed_key = popped.get("ch_url")
     if removed_key:
         with _queue_order_lock:
             try:
@@ -11689,7 +11938,7 @@ def _show_queue_menu(event=None):
         if _state["last_snapshot"] == snapshot:
             # Just update the dot animation on the active item's label widget
             _albl = _state.get("active_lbl")
-            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running):
+            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running):
                 try:
                     if pause_event.is_set():
                         _fresh = f"▶ {_current_job['label']} (Paused)"
@@ -12373,10 +12622,6 @@ def _get_gpu_queue_items():
                 items.append((_bl, i))
             elif item["type"] == "backlog_encode":
                 items.append((f"Backlog {item['ch_name']}", i))
-            elif item["type"] == "backlog_redownload":
-                _rr_res = item.get("resolution", "")
-                _rr_label = "Best" if _rr_res == "best" else f"{_rr_res}p"
-                items.append((f"Redownload {item['ch_name']} ({_rr_label})", i))
             elif item["type"] == "mt":
                 if item.get("folder_path"):
                     items.append((f"M.T. {item['folder_name']} ({item['vid_count']} files)", i))
@@ -13013,18 +13258,6 @@ def _gpu_start():
                             item.get("output_res", ""),
                             item["split_years"], item["split_months"],
                             batch_size=item.get("batch_size", 20),
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            _sync_mode=True
-                        )
-                    elif item["type"] == "backlog_redownload":
-                        _rr_res = item.get("resolution", "")
-                        _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
-                        _gpu_current["label"] = f"Redownload {item['ch_name']} ({_rr_disp})"
-                        _gpu_current["ch_url"] = item.get("ch_url")
-                        _update_gpu_btn()
-                        _backlog_redownload_channel(
-                            item["ch_name"], item["ch_url"], item["folder"],
-                            item["resolution"],
                             cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
                             _sync_mode=True
                         )
@@ -15285,7 +15518,7 @@ root.after(50, _start_startup_loading)
 
 def _save_queue_state():
     """Save current queue state to disk for restoration on next launch."""
-    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "order": [], "gpu": []}
+    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "redownload": [], "order": [], "gpu": []}
     # Include the currently-running sync channel so it survives crashes
     if _current_sync_ch is not None and _sync_running:
         with _sync_queue_lock:
@@ -15300,6 +15533,9 @@ def _save_queue_state():
     with _transcribe_queue_lock:
         for args in _transcribe_queue:
             queue_data["transcribe"].append(list(args))
+    with _redownload_queue_lock:
+        for item in _redownload_queue:
+            queue_data["redownload"].append(copy.deepcopy(item))
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
@@ -15355,6 +15591,13 @@ def _load_queue_state():
                 for args in transcribe_items:
                     _transcribe_queue.append(tuple(args))
                     restored += 1
+        redownload_items = queue_data.get("redownload", [])
+        if redownload_items:
+            with _redownload_queue_lock:
+                for item in redownload_items:
+                    if not any(q["ch_url"] == item["ch_url"] for q in _redownload_queue):
+                        _redownload_queue.append(item)
+                        restored += 1
         gpu_items = queue_data.get("gpu", [])
         gpu_restored = 0
         if gpu_items:

@@ -382,7 +382,7 @@ def log(text, tag=None):
                             return
 
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
-                    if use_tag in ("simpleline", "simpleline_green", "simpleline_blue", "transcribe_using", "filterskip"):
+                    if use_tag in ("simpleline", "simpleline_green", "transcribe_using", "filterskip"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             _ss_insert_pos = log_box.index(ranges[0])
@@ -438,7 +438,7 @@ def log(text, tag=None):
                     _stop_whisper_dot_anim()
 
                 if (_is_simple_mode
-                        and use_tag in ("simpledownload", "red", "summary", "header")):
+                        and use_tag in ("simpledownload", "red", "summary", "header", "simpleline_blue")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], text, use_tag)
@@ -498,7 +498,6 @@ def log(text, tag=None):
                 # Skip auto-scroll for transient/passive messages that shouldn't
                 # disrupt the user's current scroll position
                 _skip_scroll = (
-                    (use_tag == "transcribe_using" and "Adding punctuation" in text) or
                     (use_tag == "header" and "Added to GPU Tasks:" in text)
                 )
                 if at_bottom and not _skip_scroll:

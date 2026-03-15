@@ -7383,6 +7383,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _ce.is_set():
                             break
                         _bf_idx += 1
+                        _bf_display = (_bf_title[:52] + "...") if len(_bf_title) > 52 else _bf_title
+                        log(f"  [{_bf_idx}/{_bf_total}] Fetching captions: {_bf_display}\n", "simpleline")
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
                             if _bf_segs:

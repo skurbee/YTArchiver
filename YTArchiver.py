@@ -2298,7 +2298,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.3 - 03.15.26 12:32pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.4 - 03.15.26 4:33pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7581,7 +7581,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
-            # ── Step 3.5: JSONL backfill + punctuation sweep for already-done ─
+            # ── Step 3.5: Title normalization helper + punctuation sweep for already-done ─
             def _normalize_title(title):
                 """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
                 import unicodedata
@@ -7590,7 +7590,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 s = re.sub(r'\s+', ' ', s).strip()
                 return s.lower()
 
-            if _jsonl_needed and yt_title_to_id and not _ce.is_set():
+            def _do_jsonl_backfill():
+                """Generate .jsonl entries for already-transcribed videos that are missing them.
+                Runs after new transcriptions so it doesn't delay resuming a paused session."""
+                if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
+                    return
                 # Build normalized YT title → video_id lookup
                 _yt_norm_backfill = {}
                 for yt_title, vid_id in yt_title_to_id.items():
@@ -7713,9 +7717,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _punct_fixes:
                     log(f"  ✓ Punctuation added to {_punct_fixes} existing transcript(s).\n", "simpleline_green")
 
-            # If all files were already transcribed, we're done (backfill/sweep was the only work)
+            # If all files were already transcribed, run any pending JSONL backfill and finish
             if not files_to_process:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                _do_jsonl_backfill()
                 with config_lock:
                     for _cfg_ch in config.get("channels", []):
                         if _cfg_ch.get("url") == ch_url:
@@ -8184,6 +8189,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Post-process: sort entries chronologically in each .txt file ──
             if _modified_txt_files and done_count > 0:
                 _sort_transcript_entries(_modified_txt_files)
+
+            # ── JSONL backfill: generate entries for videos transcribed in earlier sessions ──
+            _do_jsonl_backfill()
 
             # Cleanup temp dir
             try:
@@ -13498,7 +13506,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
     else:
         dur = f"took {secs}s"
     ch_part = f"  {channel_name}  —" if channel_name else " "
-    line = f"[Transcr.] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    line = f"[Trnscrb] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)

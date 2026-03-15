@@ -2420,7 +2420,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.6 - 03.15.26 5:56pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.7 - 03.15.26 11:34pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3741,8 +3741,11 @@ def add_channel():
     old_split_months = False
     new_years = new_split_years_var.get()
     new_months = new_split_months_var.get()
-    # Track old resolution for redownload dialog
+    # Track old/new resolution for redownload dialog
+    # Capture new_res_val here — _clear_edit_mode() resets new_res_var before the dialog runs
     old_res = ""
+    new_res_val = new_res_var.get()
+    new_compress_batch_val = new_compress_batch_var.get()
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -3872,13 +3875,12 @@ def add_channel():
                             "output_res": _new_c_res,
                             "split_years": new_years,
                             "split_months": new_months,
-                            "batch_size": int(new_compress_batch_var.get() or "20"),
+                            "batch_size": int(new_compress_batch_val or "20"),
                         })
 
         # Offer to re-download existing videos at the new resolution when resolution
         # changed but compression settings did NOT change (compression already
         # includes a re-download step, so we skip this dialog if that dialog ran).
-        new_res_val = new_res_var.get()
         if old_res and old_res != new_res_val and not _compress_changed:
             with config_lock:
                 _rd_base = config.get("output_dir", "").strip() or BASE_DIR
@@ -3893,7 +3895,7 @@ def add_channel():
                     _old_res_label = "Best" if old_res == "best" else f"{old_res}p"
                     _new_res_label = "Best" if new_res_val == "best" else f"{new_res_val}p"
                     _rd_ask = _dark_askquestion(
-                        "Apply to Existing Downloads?",
+                        "Apply to Existing Downloads",
                         f"Resolution changed from {_old_res_label} to {_new_res_label}.\n\n"
                         f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, "
                         f"replacing the originals?"
@@ -4534,7 +4536,7 @@ def remove_channel():
         removed_url = ch_to_remove.get("url", "")
 
     delete_ids = messagebox.askyesno(
-        "Remove channel",
+        "Remove Channel",
         f"Remove \"{removed_name}\" from your subscription list.\n\n"
         "Delete this channel's video IDs from the blocklist?\n\n"
         "• Yes — IDs are removed, so they could be re-downloaded if re-added\n"
@@ -9240,7 +9242,7 @@ sync_single_btn = ttk.Button(action_btn_frame, text="▶ Sync this channel", com
                              style="Sync.TButton", state="disabled")
 # sync_single_btn intentionally not packed — user can right-click channel to sync
 
-remove_channel_btn = ttk.Button(action_btn_frame, text="⛔Remove selected", command=remove_channel, style="Cancel.TButton",
+remove_channel_btn = ttk.Button(action_btn_frame, text="⛔ Remove selected", command=remove_channel, style="Cancel.TButton",
                                 state="disabled")
 
 cancel_edit_btn = ttk.Button(action_btn_frame, text="Cancel edit", command=_clear_edit_mode)
@@ -11066,10 +11068,10 @@ def start_sync_all():
     for key in session_totals: session_totals[key] = 0
     cancel_event.clear()
 
-    sync_btn.config(state="disabled", text="⏳ Syncing.")
+    sync_btn.config(state="disabled", text="⏳ Syncing...")
     _update_queue_btn()
 
-    _dot_cycle = [". ", ".. ", "..."]
+    _dot_cycle = [".", "..", "..."]
     _dot_state = {"i": 0, "job": None}
 
     def _animate_dots():
@@ -15241,7 +15243,7 @@ _recent_ctx_menu.add_command(label="Play video", command=_play_video)
 _recent_ctx_menu.add_command(label="Show in Explorer", command=_show_in_explorer)
 _recent_ctx_menu.add_command(label="Open video on YouTube", command=_open_video_on_yt)
 _recent_ctx_menu.add_separator()
-_recent_ctx_menu.add_command(label="Delete file", command=_delete_selected_files)
+_recent_ctx_menu.add_command(label="Delete File", command=_delete_selected_files)
 
 
 def _recent_ctx_show(event):
@@ -15395,7 +15397,7 @@ def check_dependencies():
                 log("--- Dependency install complete. Restart the app if needed. ---\n", "simpleline_green")
             threading.Thread(target=_install, daemon=True).start()
         else:
-            messagebox.showwarning("Missing", f"{names} not found. The app cannot download videos without {'them' if len(missing) > 1 else 'it'}.")
+            messagebox.showwarning("Missing Dependencies", f"{names} not found. The app cannot download videos without {'them' if len(missing) > 1 else 'it'}.")
 
 
 root.after(100, check_dependencies)

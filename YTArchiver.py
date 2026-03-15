@@ -1552,7 +1552,7 @@ def check_directory_writable(path):
 
 # ─── Disk Error Auto-Pause ─────────────────────────────────
 # Patterns that indicate the output drive is unwritable (disconnected, read-only, etc.)
-_DISK_ERROR_PATTERNS = (
+_DISK_ERROR_PATTERNS = tuple(p.lower() for p in (
     "unable to write data",
     "unable to create directory",
     "Permission denied",
@@ -1560,8 +1560,8 @@ _DISK_ERROR_PATTERNS = (
     "[Errno 22] Invalid argument",
     "[Errno 13]",
     "[WinError 5]",
-)
-_DISK_RETRY_INTERVAL = 300  # seconds (5 minutes)
+))
+_DISK_RETRY_MINUTES = 5
 
 
 def _check_disk_error(text):
@@ -1570,7 +1570,7 @@ def _check_disk_error(text):
         return
     text_lower = text.lower() if text else ""
     for pattern in _DISK_ERROR_PATTERNS:
-        if pattern.lower() in text_lower:
+        if pattern in text_lower:
             threading.Thread(target=_handle_disk_error, daemon=True).start()
             return
 
@@ -1589,7 +1589,7 @@ def _handle_disk_error():
     log("\n" + "█" * 65 + "\n", "red")
     log("█  DISK ERROR DETECTED — All tasks paused.\n", "red")
     log("█  The output drive may be disconnected or read-only.\n", "red")
-    log(f"█  Will retry in {_DISK_RETRY_INTERVAL // 60} minutes...\n", "red")
+    log(f"█  Will retry in {_DISK_RETRY_MINUTES} minutes...\n", "red")
     log("█" * 65 + "\n\n", "red")
 
     # Pause sync-pipeline tasks
@@ -1604,7 +1604,7 @@ def _handle_disk_error():
         global _disk_retry_job
         try:
             if root.winfo_exists():
-                _disk_retry_job = root.after(_DISK_RETRY_INTERVAL * 1000, _disk_retry_check)
+                _disk_retry_job = root.after(_DISK_RETRY_MINUTES * 60_000, _disk_retry_check)
         except Exception:
             pass
     try:
@@ -1638,10 +1638,10 @@ def _disk_retry_check():
             _gpu_pause.clear()
     else:
         # Still unwritable — log and schedule another retry
-        log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_INTERVAL // 60} minutes...\n", "red")
+        log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_MINUTES} minutes...\n", "red")
         try:
             if root.winfo_exists():
-                _disk_retry_job = root.after(_DISK_RETRY_INTERVAL * 1000, _disk_retry_check)
+                _disk_retry_job = root.after(_DISK_RETRY_MINUTES * 60_000, _disk_retry_check)
         except Exception:
             pass
 

@@ -331,6 +331,11 @@ def log(text, tag=None):
                             if not _wr:
                                 break
                             log_box.delete(_wr[0], _wr[1])
+                    # Insert before pausestatus anchor if present so the line stays
+                    # stable relative to the pause notice and doesn't jump when other
+                    # log messages are appended and re-insert whisper at that position.
+                    _ps_r_wp = log_box.tag_ranges("pausestatus")
+                    _wp_ins = log_box.index(_ps_r_wp[0]) if _ps_r_wp else tk.END
                     # Split text to colorize the percentage green
                     import re as _re_wp
                     _wp_match = _re_wp.search(r'(\d+%)', text)
@@ -340,17 +345,23 @@ def log(text, tag=None):
                         # Strip trailing dots/newline — we animate those separately
                         _after_raw = text[_wp_match.end():]
                         _suffix = _after_raw.rstrip(".\n ").rstrip()
-                        log_box.insert(tk.END, _before, "whisper_progress")
-                        log_box.insert(tk.END, _pct_str, "whisper_pct")
+                        log_box.insert(_wp_ins, _before, "whisper_progress")
+                        if _wp_ins != tk.END:
+                            _wp_ins = log_box.index(f"{_wp_ins} + {len(_before)}c")
+                        log_box.insert(_wp_ins, _pct_str, "whisper_pct")
+                        if _wp_ins != tk.END:
+                            _wp_ins = log_box.index(f"{_wp_ins} + {len(_pct_str)}c")
                         if _suffix:
-                            log_box.insert(tk.END, _suffix, "whisper_progress")
+                            log_box.insert(_wp_ins, _suffix, "whisper_progress")
+                            if _wp_ins != tk.END:
+                                _wp_ins = log_box.index(f"{_wp_ins} + {len(_suffix)}c")
                         # Animated dots
                         _dot_chars = [".", "..", "..."]
                         _whisper_dots["base_before"] = _before
                         _whisper_dots["pct_str"] = _pct_str
                         _whisper_dots["suffix"] = _suffix
                         _d = _dot_chars[_whisper_dots["idx"] % 3]
-                        log_box.insert(tk.END, _d + "\n", "whisper_dots")
+                        log_box.insert(_wp_ins, _d + "\n", "whisper_dots")
                         # Start dot animation timer if not already running
                         if not _whisper_dots["active"]:
                             _whisper_dots["active"] = True
@@ -358,7 +369,7 @@ def log(text, tag=None):
                             if _root_alive:
                                 _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
                     else:
-                        log_box.insert(tk.END, text, "whisper_progress")
+                        log_box.insert(_wp_ins, text, "whisper_progress")
                     _log_scroll_freeze = False
                     _auto_scrollbar(log_scroll, *log_box.yview())
                     if at_bottom:
@@ -2287,7 +2298,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.2 - 03.14.26 8:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.3 - 03.15.26 5:12pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3597,6 +3608,8 @@ def add_channel():
     old_split_months = False
     new_years = new_split_years_var.get()
     new_months = new_split_months_var.get()
+    # Track old resolution for redownload dialog
+    old_res = ""
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -3610,6 +3623,7 @@ def add_channel():
 
                     old_split_years = ch.get("split_years", False)
                     old_split_months = ch.get("split_months", False)
+                    old_res = ch.get("resolution", "")
 
                     old_mode = ch.get("mode")
                     old_date_after = ch.get("date_after", "")
@@ -3727,6 +3741,32 @@ def add_channel():
                             "split_months": new_months,
                             "batch_size": int(new_compress_batch_var.get() or "20"),
                         })
+
+        # Offer to re-download existing videos at the new resolution when resolution
+        # changed but compression settings did NOT change (compression already
+        # includes a re-download step, so we skip this dialog if that dialog ran).
+        new_res_val = new_res_var.get()
+        if old_res and old_res != new_res_val and not _compress_changed:
+            with config_lock:
+                _rd_base = config.get("output_dir", "").strip() or BASE_DIR
+            _rd_folder = os.path.join(_rd_base, sanitize_folder(name))
+            if os.path.isdir(_rd_folder):
+                _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
+                _rd_count = 0
+                for _r, _d, _f in os.walk(_rd_folder):
+                    _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+                    _rd_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
+                if _rd_count > 0:
+                    _old_res_label = "Best" if old_res == "best" else f"{old_res}p"
+                    _new_res_label = "Best" if new_res_val == "best" else f"{new_res_val}p"
+                    _rd_ask = _dark_askquestion(
+                        "Apply to Existing Downloads?",
+                        f"Resolution changed from {_old_res_label} to {_new_res_label}.\n\n"
+                        f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, "
+                        f"replacing the originals?"
+                    )
+                    if _rd_ask:
+                        _backlog_redownload_channel(name, url, _rd_folder, new_res_val)
 
 
 def sync_single_channel():
@@ -4145,10 +4185,6 @@ def sync_single_channel():
                 log(f"Downloaded: {session_totals['dl']}, Skipped: {_skip_n}\n", "summary")
                 if session_totals['err'] > 0:
                     log(f"Errors: {session_totals['err']}\n", "summary")
-                if _skipped_list:
-                    log(f"Skipped videos:\n", "summary")
-                    for _i, (_title, _reason) in enumerate(_skipped_list, 1):
-                        log(f"  {_i}. {_title}  — {_reason}\n", "filterskip")
                 log("=" * 45 + "\n", "summary")
                 log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
@@ -6604,6 +6640,207 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
         _worker()
     else:
         threading.Thread(target=_worker, daemon=True).start()
+
+
+def _backlog_redownload_channel(ch_name, ch_url, folder, new_res):
+    """Re-download existing channel videos at a new resolution and replace the old files.
+
+    Scans local video files, matches them to YouTube video IDs, downloads each
+    at the new resolution, and replaces the original.  No compression step —
+    intended for resolution-only upgrades that are not GPU-taxing.
+    """
+    _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
+
+    def _worker():
+        _ce = cancel_event
+        _res_label = "Best" if new_res == "best" else f"{new_res}p"
+        log(f"\n=== Resolution Redownload: {ch_name} ({_res_label}) ===\n", "header")
+
+        # ── Step 1: Scan local video files ──
+        local_files = {}
+        for dirpath, dirnames, files in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if d not in ("_BACKLOG_TEMP", "_TEMP_COMPRESS")]
+            for f in files:
+                if f.lower().endswith(_VIDEO_EXTS) and not f.lower().endswith(".part"):
+                    fpath = os.path.join(dirpath, f)
+                    local_files[f] = fpath
+
+        if not local_files:
+            log("  No video files found.\n", "simpleline")
+            return
+
+        log(f"  Found {len(local_files)} local file(s).\n", "simpleline")
+
+        if _ce.is_set():
+            return
+
+        # ── Step 2: Fetch YouTube video list for ID matching ──
+        log("  Fetching YouTube video list for ID matching...\n", "simpleline")
+        yt_title_to_id = {}
+        try:
+            enum_cmd = [
+                "yt-dlp", "--flat-playlist",
+                "--print", "%(id)s|||%(title)s",
+                "--no-warnings",
+                "--cookies-from-browser", "firefox",
+                ch_url
+            ]
+            enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=600,
+                                       startupinfo=startupinfo)
+            for line in enum_proc.stdout.strip().split("\n"):
+                if "|||" in line:
+                    vid_id, yt_title = line.strip().split("|||", 1)
+                    yt_title_to_id[yt_title.strip()] = vid_id.strip()
+            log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+        except Exception as e:
+            log(f"  ⚠ Could not fetch YouTube list: {e}\n", "red")
+            return
+
+        if _ce.is_set():
+            return
+
+        # ── Step 3: Build normalized lookup and match local files ──
+        norm_lookup = {}
+        for yt_title, vid_id in yt_title_to_id.items():
+            norm = re.sub(r'[^\w]', '', unicodedata.normalize('NFC', yt_title.lower()))
+            norm_lookup[norm] = (vid_id, yt_title)
+            norm_a = _norm_ascii(yt_title)
+            if norm_a != norm and norm_a not in norm_lookup:
+                norm_lookup[norm_a] = (vid_id, yt_title)
+
+        work_list = []
+        skipped_no_match = 0
+        for fname, fpath in local_files.items():
+            base = os.path.splitext(fname)[0]
+            base_nfc = unicodedata.normalize('NFC', base)
+            norm_fname = re.sub(r'[^\w]', '', base_nfc.lower())
+            norm_fname_ascii = _norm_ascii(base_nfc)
+
+            match = norm_lookup.get(norm_fname)
+            if not match and norm_fname_ascii != norm_fname:
+                match = norm_lookup.get(norm_fname_ascii)
+            if not match and len(norm_fname) >= 15:
+                for norm_title, val in norm_lookup.items():
+                    if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title[:len(norm_fname)]):
+                        match = val
+                        break
+            if not match and len(norm_fname_ascii) >= 10:
+                for norm_title, val in norm_lookup.items():
+                    if norm_title.startswith(norm_fname_ascii) or norm_fname_ascii.startswith(norm_title[:len(norm_fname_ascii)]):
+                        match = val
+                        break
+
+            if match:
+                work_list.append((match[0], fpath))
+            else:
+                skipped_no_match += 1
+
+        if skipped_no_match:
+            log(f"  ⚠ {skipped_no_match} file(s) could not be matched to YouTube videos.\n", "red")
+        if not work_list:
+            log("  No files to process after matching.\n", "simpleline")
+            return
+
+        log(f"  Matched {len(work_list)} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+
+        # ── Step 4: Download each video at new resolution and replace ──
+        fmt = build_format_string(new_res)
+        temp_dir = os.path.join(folder, "_BACKLOG_TEMP")
+        done = 0
+        errors = 0
+
+        for idx, (vid_id, orig_path) in enumerate(work_list):
+            if _ce.is_set():
+                break
+
+            if pause_event.is_set():
+                log(f"\n  ⏸ Redownload paused.\n", "pauselog")
+                while pause_event.is_set() and not _ce.is_set():
+                    time.sleep(0.25)
+                if not _ce.is_set():
+                    log(f"  ▶ Redownload resuming...\n", "pauselog")
+
+            if _ce.is_set():
+                break
+
+            orig_fname = os.path.basename(orig_path)
+            fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
+            log(f"\n  [{idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline")
+
+            try:
+                os.makedirs(temp_dir, exist_ok=True)
+            except Exception:
+                pass
+
+            dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
+            vid_url = f"https://www.youtube.com/watch?v={vid_id}"
+            dl_cmd = [
+                "yt-dlp", "--newline", "--no-quiet",
+                "--trim-filenames", "200",
+                "--format", fmt, "--merge-output-format", "mp4",
+                "--ppa", "Merger:-c copy",
+                "--output", dl_path,
+                "--cookies-from-browser", "firefox",
+                "--no-download-archive",
+                vid_url
+            ]
+
+            log(f"    Downloading ({_res_label})...\n", "simpleline")
+            try:
+                dl_proc = spawn_yt_dlp(dl_cmd)
+                with proc_lock:
+                    active_processes.append(dl_proc)
+                for line in dl_proc.stdout:
+                    if _ce.is_set():
+                        dl_proc.terminate()
+                        break
+                dl_proc.wait()
+                with proc_lock:
+                    if dl_proc in active_processes:
+                        active_processes.remove(dl_proc)
+
+                if _ce.is_set():
+                    break
+
+                # yt-dlp may produce a file with a different name after merge
+                if not os.path.exists(dl_path):
+                    found_dl = None
+                    try:
+                        for f_temp in os.listdir(temp_dir):
+                            if f_temp.startswith(vid_id) and not f_temp.endswith("_compressed.mp4"):
+                                found_dl = os.path.join(temp_dir, f_temp)
+                                break
+                    except OSError:
+                        pass
+                    if found_dl:
+                        dl_path = found_dl
+                    else:
+                        log(f"    ⚠ Download failed.\n", "red")
+                        errors += 1
+                        continue
+
+                try:
+                    os.replace(dl_path, orig_path)
+                    log(f"    ✓ Replaced at {_res_label}.\n", "simpleline_green")
+                    done += 1
+                except Exception as e:
+                    log(f"    ⚠ Replace failed: {e}\n", "red")
+                    errors += 1
+            except Exception as e:
+                log(f"    ⚠ Error: {e}\n", "red")
+                errors += 1
+
+        # Cleanup temp dir
+        try:
+            if os.path.isdir(temp_dir):
+                import shutil as _shutil
+                _shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        log(f"\n=== Redownload Complete: {ch_name} — {done} done, {errors} error(s) ===\n", "header")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None):

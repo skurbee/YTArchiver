@@ -549,6 +549,10 @@ def log(text, tag=None):
     except Exception:
         pass
 
+    # Disk error detection — check if this log message indicates a write failure
+    if text and not _disk_error_active:
+        _check_disk_error(text)
+
 
 def _whisper_dot_tick():
     """Animate the trailing dots on the Whisper progress line."""
@@ -1546,6 +1550,102 @@ def check_directory_writable(path):
         return False
 
 
+# ─── Disk Error Auto-Pause ─────────────────────────────────
+# Patterns that indicate the output drive is unwritable (disconnected, read-only, etc.)
+_DISK_ERROR_PATTERNS = (
+    "unable to write data",
+    "unable to create directory",
+    "Permission denied",
+    "Access is denied",
+    "[Errno 22] Invalid argument",
+    "[Errno 13]",
+    "[WinError 5]",
+)
+_DISK_RETRY_INTERVAL = 300  # seconds (5 minutes)
+
+
+def _check_disk_error(text):
+    """Called after every log() — looks for write-failure patterns in the text."""
+    if _disk_error_active:
+        return
+    text_lower = text.lower() if text else ""
+    for pattern in _DISK_ERROR_PATTERNS:
+        if pattern.lower() in text_lower:
+            threading.Thread(target=_handle_disk_error, daemon=True).start()
+            return
+
+
+def _handle_disk_error():
+    """Pause all tasks when a disk write error is detected and start a retry timer."""
+    global _disk_error_active, _disk_error_path, _disk_retry_job
+
+    if _disk_error_active:
+        return  # already handling
+
+    _disk_error_active = True
+    with config_lock:
+        _disk_error_path = config.get("output_dir", "").strip() or BASE_DIR
+
+    log("\n" + "█" * 65 + "\n", "red")
+    log("█  DISK ERROR DETECTED — All tasks paused.\n", "red")
+    log("█  The output drive may be disconnected or read-only.\n", "red")
+    log(f"█  Will retry in {_DISK_RETRY_INTERVAL // 60} minutes...\n", "red")
+    log("█" * 65 + "\n\n", "red")
+
+    # Pause sync-pipeline tasks
+    if not pause_event.is_set():
+        pause_event.set()
+    # Pause GPU tasks
+    if not _gpu_pause.is_set():
+        _gpu_pause.set()
+
+    # Schedule the first retry check on the main thread
+    def _schedule_retry():
+        global _disk_retry_job
+        try:
+            if root.winfo_exists():
+                _disk_retry_job = root.after(_DISK_RETRY_INTERVAL * 1000, _disk_retry_check)
+        except Exception:
+            pass
+    try:
+        _ui_queue.append(_schedule_retry)
+    except Exception:
+        pass
+
+
+def _disk_retry_check():
+    """Periodic retry: test if the output directory is writable again."""
+    global _disk_error_active, _disk_retry_job
+
+    if not _disk_error_active:
+        return
+
+    path = _disk_error_path or (config.get("output_dir", "").strip() or BASE_DIR)
+    if check_directory_writable(path):
+        # Drive is back — resume everything
+        _disk_error_active = False
+        _disk_retry_job = None
+
+        log("\n" + "█" * 65 + "\n", "simpleline_green")
+        log("█  ✓ Disk is writable again — resuming all tasks.\n", "simpleline_green")
+        log("█" * 65 + "\n\n", "simpleline_green")
+
+        # Resume sync-pipeline tasks
+        if pause_event.is_set():
+            pause_event.clear()
+        # Resume GPU tasks
+        if _gpu_pause.is_set():
+            _gpu_pause.clear()
+    else:
+        # Still unwritable — log and schedule another retry
+        log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_INTERVAL // 60} minutes...\n", "red")
+        try:
+            if root.winfo_exists():
+                _disk_retry_job = root.after(_DISK_RETRY_INTERVAL * 1000, _disk_retry_check)
+        except Exception:
+            pass
+
+
 def _remove_ids_from_archive(ids_to_remove):
     """Remove specific video IDs from the download archive file."""
     if not ids_to_remove:
@@ -2320,7 +2420,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.5 - 03.15.26 4:51pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.6 - 03.15.26 10:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3053,6 +3153,7 @@ _editing_channel = {"name": None}
 
 def _set_edit_mode(ch):
     _editing_channel["name"] = ch["name"]
+    _editing_channel["url"] = ch["url"]
     new_name_var.set(ch.get("folder_override", ch["name"]))
     new_url_var.set(ch["url"])
     new_res_var.set(ch.get("resolution", "720"))
@@ -3115,6 +3216,7 @@ def _set_edit_mode(ch):
 
 def _clear_edit_mode():
     _editing_channel["name"] = None
+    _editing_channel["url"] = None
     new_name_var.set("")
     new_url_var.set("")
     new_res_var.set("720")
@@ -3237,7 +3339,7 @@ def _chan_ctx_sync_now():
     ch = _ctx_channel["ch"]
     if not ch:
         return
-    if _sync_running or _reorg_running:
+    if _sync_running or _reorg_running or _redownload_running:
         # Queue the channel for sync after the current operation finishes
         with _sync_queue_lock:
             # Don't queue duplicates
@@ -3508,7 +3610,7 @@ def _chan_ctx_show(event):
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
         #               10=separator, 11=Transcribe, 12=separator, 13=Remove
         # Dynamic label: show "Add to Sync List" when a sync/reorg is running
-        if _sync_running or _reorg_running:
+        if _sync_running or _reorg_running or _redownload_running:
             # Check if this channel is already queued or actively syncing
             _ch_url = ch.get("url", "")
             with _sync_queue_lock:
@@ -3817,7 +3919,7 @@ def sync_single_channel():
         if not ch: return
 
     # If something is already running, queue instead of starting immediately
-    if _sync_running or _reorg_running:
+    if _sync_running or _reorg_running or _redownload_running:
         with _sync_queue_lock:
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
@@ -5120,7 +5222,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
     global _reorg_running
 
     # If a reorg or sync is already running, queue this request
-    if _reorg_running or _sync_running:
+    if _reorg_running or _sync_running or _redownload_running:
         with _reorg_queue_lock:
             if not any(q[0] == channel_name for q in _reorg_queue):
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
@@ -7679,6 +7781,9 @@ def _has_pending_redownload(ch_url):
                     pass
             break
     return ""
+
+
+def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined,
                          cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False):
     """Start transcribing a channel. Queues if something is already running.
 
@@ -10896,7 +11001,7 @@ def start_download():
     url_entry.event_generate("<FocusOut>")
     vid_custom_name_var.set("")
 
-    if _sync_running or _reorg_running:
+    if _sync_running or _reorg_running or _redownload_running:
         # Queue the download for after the current operation finishes
         with _video_dl_queue_lock:
             _video_dl_queue.append((cmd, True))
@@ -10938,7 +11043,7 @@ def start_sync_all():
         return
 
     # If a reorg is running, queue the sync for later
-    if _reorg_running:
+    if _reorg_running or _redownload_running:
         with _sync_queue_lock:
             # Check if a full sync is already queued
             already_queued = len([q for q in _sync_queue if q["url"] in [c["url"] for c in channels]]) >= len(channels)
@@ -10950,7 +11055,7 @@ def start_sync_all():
                     _sync_queue.append(copy.deepcopy(ch))
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
-        _what = "transcription" if _transcribe_running else "reorganize"
+        _what = "transcription" if _transcribe_running else ("redownload" if _redownload_running else "reorganize")
         log(f"\n=== Sync added to Sync List ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
         _update_queue_btn()
@@ -11578,7 +11683,17 @@ def _show_clear_log_if_needed():
 
 def stop_downloads():
     global _sync_running, _reorg_running, _transcribe_running, _redownload_running, _current_sync_ch
+    global _disk_error_active, _disk_retry_job
     pause_event.clear()
+
+    # Clear disk error state so manual cancel fully resets everything
+    _disk_error_active = False
+    if _disk_retry_job:
+        try:
+            root.after_cancel(_disk_retry_job)
+        except Exception:
+            pass
+        _disk_retry_job = None
 
     # Clear any queued syncs, video downloads, reorg, transcription, and redownload jobs
     # (GPU Tasks is independent — cancelled only via its own menu)
@@ -12166,12 +12281,12 @@ def _show_queue_menu(event=None):
 
             # Footer buttons — show when running (Pause/Cancel) or queued (Start/Cancel)
             # Only count transcription as "sync-running" if it's sync-controlled (not GPU-driven)
-            _sync_pipeline_active = _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled)
+            _sync_pipeline_active = _sync_running or _reorg_running or _redownload_running or (_transcribe_running and _transcribe_sync_controlled)
             _show_sync_btns = False
             if _sync_pipeline_active:
                 _show_sync_btns = True
             else:
-                _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue)
+                _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue) or bool(_redownload_queue)
                 if _has_queued:
                     _show_sync_btns = True
 
@@ -12440,7 +12555,7 @@ def _update_queue_btn():
             _update_sync_badge()
 
             # Manage sync blink animation
-            _is_running = _sync_running or _reorg_running
+            _is_running = _sync_running or _reorg_running or _redownload_running
             if _is_running and not _sync_blink["active"]:
                 _sync_blink_start()
             elif not _is_running and _sync_blink["active"]:
@@ -13683,8 +13798,8 @@ def _save_log_mode(*_):
         config["log_mode"] = log_mode_var.get()
     save_config(config)
 
-    # Handle log mode transitions during an active sync
-    if _sync_running:
+    # Handle log mode transitions during an active sync or redownload
+    if _sync_running or _redownload_running:
         if log_mode_var.get() == "Simple":
             # Switching to Simple — restart animation if we have channel info
             if _simple_anim_state.get("channel") and not _simple_anim_state["active"]:
@@ -13852,7 +13967,7 @@ def _run_autorun():
     if not root.winfo_exists():
         return
 
-    if _sync_running:
+    if _sync_running or _redownload_running:
         _autorun_job["id"] = root.after(60_000, _run_autorun)
         return
     interval_mins = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
@@ -14396,7 +14511,7 @@ def on_tab_changed(event):
     if selected == str(tab_download):
         # Re-show cancel/pause buttons if a sync or reorg is still active
         # (they can lose pack state when switching tabs during long operations)
-        if _sync_running or _reorg_running:
+        if _sync_running or _reorg_running or _redownload_running:
             _update_queue_btn()
     elif selected == str(tab_recent):
         if new_download_count > 0:

@@ -401,6 +401,14 @@ def log(text, tag=None):
                                 if not _tu_r:
                                     break
                                 log_box.delete(_tu_r[0], _tu_r[1])
+                    # Replace existing active transcribe status so the same video title
+                    # never appears on two separate lines during status updates.
+                    elif use_tag == "transcribe_using":
+                        while True:
+                            _tu_r = log_box.tag_ranges("transcribe_using")
+                            if not _tu_r:
+                                break
+                            log_box.delete(_tu_r[0], _tu_r[1])
 
                     if use_tag in ("simpledownload", "simpleline", "simpleline_green", "simpleline_blue", "red", "summary", "transcribe_using"):
                         dl_ranges = log_box.tag_ranges("dlprogress")
@@ -803,7 +811,7 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
                         if _enc_i >= 0:
                             # Match ": title (duration) - " or ": title - " after "ENCODING"
                             _pfx_m = re.match(
-                                r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)(.*)$',
+                                r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)(.*)$',
                                 _ep_text[_enc_i + 8:]
                             )
                             if _pfx_m:
@@ -924,7 +932,7 @@ def _update_encode_progress(text):
                     # then overlay white tags for "[N/M] " (prefix) and ": title" (title).
                     _enc_i = _before.find("ENCODING")
                     _pfx_m = _re_ep.match(
-                        r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)$', _before[_enc_i + 8:]
+                        r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)$', _before[_enc_i + 8:]
                     ) if _enc_i >= 0 else None
                     _ins = _enc_pos
                     log_box.insert(_ins, _before, "encode_progress")
@@ -967,7 +975,7 @@ def _update_encode_progress(text):
                     _ins = _enc_pos
                     _enc_i2 = _stripped.find("ENCODING")
                     _sfx_m = _re_ep.match(
-                        r'^(: .+?)(\s+\([^)]+\)\s*-\s*|\s*-\s*)(.*)$', _stripped[_enc_i2 + 8:]
+                        r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)(.*)$', _stripped[_enc_i2 + 8:]
                     ) if _enc_i2 >= 0 else None
                     log_box.insert(_ins, _stripped, "encode_progress")
                     if _sfx_m and _enc_i2 >= 0:
@@ -8738,6 +8746,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
+                             ("encode_prefix", {"foreground": C_TEXT}),
+                             ("encode_title", {"foreground": C_TEXT}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_suffix", {"foreground": C_LOG_BLUE}),
@@ -14069,6 +14079,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_progress", {"foreground": C_LOG_BLUE}),
+                             ("encode_prefix", {"foreground": C_TEXT}),
+                             ("encode_title", {"foreground": C_TEXT}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_suffix", {"foreground": C_LOG_BLUE}),
@@ -14078,12 +14090,14 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # All known log tags for mini-log mirroring (priority order for detection)
 # simplestatus_green must precede simplestatus so the SYNCING status renders green;
 # dlprogress_pct must precede dlprogress so the progress bar percentage is green.
+# encode_prefix/encode_title must precede encode_progress so the white title overlay wins.
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpledownload",
                  "simplestatus_green", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
-                 "whisper_pct", "whisper_dots", "encode_progress", "encode_pct", "encode_dots",
+                 "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
+                 "encode_progress", "encode_pct", "encode_dots",
                  "encode_suffix", "transcribe_using")
 
 

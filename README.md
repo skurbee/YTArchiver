@@ -43,7 +43,7 @@ Uses CUDA for all GPU stuff.
 
 this is maybe 5% me, 85% claude code, 10% copilot
 
-I use it packed in an .exe with the icon, but if it's just in the same /dir it'll still work. It's for the taskbar
+I use it packed in an .exe with the icon & dependancies, but if the icon is just in the same /dir it'll still work. It's for the taskbar
 
 Once I feel like this is truly """done""" I'll upload the .exe
 

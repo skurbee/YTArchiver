@@ -2298,7 +2298,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.3 - 03.15.26 12:32pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.5 - 03.15.26 5:43pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3766,7 +3766,13 @@ def add_channel():
                         f"replacing the originals?"
                     )
                     if _rd_ask:
-                        _backlog_redownload_channel(name, url, _rd_folder, new_res_val)
+                        _add_to_gpu_queue({
+                            "type": "backlog_redownload",
+                            "ch_name": name,
+                            "ch_url": url,
+                            "folder": _rd_folder,
+                            "resolution": new_res_val,
+                        })
 
 
 def sync_single_channel():
@@ -6642,17 +6648,21 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
         threading.Thread(target=_worker, daemon=True).start()
 
 
-def _backlog_redownload_channel(ch_name, ch_url, folder, new_res):
+def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
+                                cancel_ev=None, pause_ev=None, _sync_mode=False):
     """Re-download existing channel videos at a new resolution and replace the old files.
 
     Scans local video files, matches them to YouTube video IDs, downloads each
     at the new resolution, and replaces the original.  No compression step —
     intended for resolution-only upgrades that are not GPU-taxing.
+
+    _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
     """
     _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
 
     def _worker():
-        _ce = cancel_event
+        _ce = cancel_ev or cancel_event
+        _pe = pause_ev or pause_event
         _res_label = "Best" if new_res == "best" else f"{new_res}p"
         log(f"\n=== Resolution Redownload: {ch_name} ({_res_label}) ===\n", "header")
 
@@ -6753,9 +6763,9 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res):
             if _ce.is_set():
                 break
 
-            if pause_event.is_set():
+            if _pe.is_set():
                 log(f"\n  ⏸ Redownload paused.\n", "pauselog")
-                while pause_event.is_set() and not _ce.is_set():
+                while _pe.is_set() and not _ce.is_set():
                     time.sleep(0.25)
                 if not _ce.is_set():
                     log(f"  ▶ Redownload resuming...\n", "pauselog")
@@ -6840,7 +6850,10 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res):
 
         log(f"\n=== Redownload Complete: {ch_name} — {done} done, {errors} error(s) ===\n", "header")
 
-    threading.Thread(target=_worker, daemon=True).start()
+    if _sync_mode:
+        _worker()
+    else:
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None):
@@ -7390,6 +7403,15 @@ def _add_to_gpu_queue(item, _quiet=False):
                     log(f"  ⚠ {item['ch_name']} backlog is already in the GPU Tasks queue.\n", "simpleline")
                 return
             label = f"Backlog {item['ch_name']}"
+        elif item["type"] == "backlog_redownload":
+            if any(q.get("ch_url") == item["ch_url"] and q["type"] == "backlog_redownload" for q in _gpu_queue) or \
+               (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "backlog_redownload"):
+                if not _quiet:
+                    log(f"  ⚠ {item['ch_name']} redownload is already in the GPU Tasks queue.\n", "simpleline")
+                return
+            _rr_res = item.get("resolution", "")
+            _rr_label = "Best" if _rr_res == "best" else f"{_rr_res}p"
+            label = f"Redownload {item['ch_name']} ({_rr_label})"
         elif item["type"] == "mt":
             if item.get("folder_path"):
                 # Folder-based manual transcription
@@ -7581,7 +7603,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
-            # ── Step 3.5: JSONL backfill + punctuation sweep for already-done ─
+            # ── Step 3.5: Title normalization helper + punctuation sweep for already-done ─
             def _normalize_title(title):
                 """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
                 import unicodedata
@@ -7590,7 +7612,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 s = re.sub(r'\s+', ' ', s).strip()
                 return s.lower()
 
-            if _jsonl_needed and yt_title_to_id and not _ce.is_set():
+            def _do_jsonl_backfill():
+                """Generate .jsonl entries for already-transcribed videos that are missing them.
+                Runs after new transcriptions so it doesn't delay resuming a paused session."""
+                if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
+                    return
                 # Build normalized YT title → video_id lookup
                 _yt_norm_backfill = {}
                 for yt_title, vid_id in yt_title_to_id.items():
@@ -7713,9 +7739,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _punct_fixes:
                     log(f"  ✓ Punctuation added to {_punct_fixes} existing transcript(s).\n", "simpleline_green")
 
-            # If all files were already transcribed, we're done (backfill/sweep was the only work)
+            # If all files were already transcribed, run any pending JSONL backfill and finish
             if not files_to_process:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                _do_jsonl_backfill()
                 with config_lock:
                     for _cfg_ch in config.get("channels", []):
                         if _cfg_ch.get("url") == ch_url:
@@ -8184,6 +8211,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Post-process: sort entries chronologically in each .txt file ──
             if _modified_txt_files and done_count > 0:
                 _sort_transcript_entries(_modified_txt_files)
+
+            # ── JSONL backfill: generate entries for videos transcribed in earlier sessions ──
+            _do_jsonl_backfill()
 
             # Cleanup temp dir
             try:
@@ -12343,6 +12373,10 @@ def _get_gpu_queue_items():
                 items.append((_bl, i))
             elif item["type"] == "backlog_encode":
                 items.append((f"Backlog {item['ch_name']}", i))
+            elif item["type"] == "backlog_redownload":
+                _rr_res = item.get("resolution", "")
+                _rr_label = "Best" if _rr_res == "best" else f"{_rr_res}p"
+                items.append((f"Redownload {item['ch_name']} ({_rr_label})", i))
             elif item["type"] == "mt":
                 if item.get("folder_path"):
                     items.append((f"M.T. {item['folder_name']} ({item['vid_count']} files)", i))
@@ -12982,6 +13016,18 @@ def _gpu_start():
                             cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
                             _sync_mode=True
                         )
+                    elif item["type"] == "backlog_redownload":
+                        _rr_res = item.get("resolution", "")
+                        _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
+                        _gpu_current["label"] = f"Redownload {item['ch_name']} ({_rr_disp})"
+                        _gpu_current["ch_url"] = item.get("ch_url")
+                        _update_gpu_btn()
+                        _backlog_redownload_channel(
+                            item["ch_name"], item["ch_url"], item["folder"],
+                            item["resolution"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            _sync_mode=True
+                        )
                     elif item["type"] == "mt":
                         if item.get("folder_path"):
                             _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
@@ -13498,7 +13544,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
     else:
         dur = f"took {secs}s"
     ch_part = f"  {channel_name}  —" if channel_name else " "
-    line = f"[Transcr.] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    line = f"[Trnscrb] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)

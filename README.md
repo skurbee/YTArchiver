@@ -39,10 +39,9 @@ Outputs into 'readable' .txt files, and hidden .json files with the same info, b
 
 on download fail, it pings a few things to test internet. if it's out, it auto-pauses everything until back online
 
-
-this is maybe 2% me and 98% claude-code :)
-
 Uses CUDA for all GPU stuff. 
+
+this is maybe 5% me, 85% claude code, 10% copilot
 
 I use it packed in an .exe with the icon, but if it's just in the same /dir it'll still work. It's for the taskbar
 

@@ -5744,6 +5744,8 @@ def _scan_existing_jsonl(folder_path, ch_name):
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
 _WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
+_whisper_line_queue = None  # queue.Queue for subprocess stdout lines (module-level to avoid race)
+_whisper_last_failed = False  # True when last whisper call was a stall/crash (not "no speech")
 _whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
 _ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
 
@@ -5792,6 +5794,12 @@ for line in sys.stdin:
     if not path:
         continue
     try:
+        # Notify the host immediately so it knows the subprocess is alive.
+        # model.transcribe() with vad_filter=True can block for many minutes
+        # during VAD pre-processing before returning, so this heartbeat must
+        # come BEFORE the call — not after.
+        _out.write(json.dumps({"status": "starting"}) + "\n")
+        _out.flush()
         segments_gen, info = model.transcribe(
             path,
             language="en",
@@ -5803,11 +5811,6 @@ for line in sys.stdin:
         )
         # info.duration is the total audio length in seconds
         total_dur = info.duration if info.duration and info.duration > 0 else duration
-        # Notify the host that the file was accepted and audio analysis is beginning.
-        # This arrives before the potentially long VAD / first-segment phase so the
-        # host knows the subprocess is alive even when progress stays at 0% for a while.
-        _out.write(json.dumps({"status": "starting"}) + "\n")
-        _out.flush()
         all_segments = []
         last_pct = -1
         for seg in segments_gen:
@@ -6075,7 +6078,7 @@ def _install_whisper_blocking():
 
 def _start_whisper_process():
     """Start the persistent Whisper subprocess under Python 3.11. Returns True if ready."""
-    global _whisper_proc
+    global _whisper_proc, _whisper_line_queue
     if _whisper_proc is not None and _whisper_proc.poll() is None:
         return True  # Already running
 
@@ -6089,9 +6092,12 @@ def _start_whisper_process():
         _env["WHISPER_MODEL"] = _model
         _env["WHISPER_DEVICE"] = "cuda"
         _env["WHISPER_COMPUTE"] = "float16"
+        # stderr=DEVNULL prevents a classic pipe-deadlock: CTranslate2's C++ layer
+        # writes warnings/logs to fd 2, and if the pipe buffer fills (nobody reads it)
+        # the subprocess blocks — freezing transcription at 0%.
         _whisper_proc = subprocess.Popen(
             [_WHISPER_PYTHON, "-c", _WHISPER_SCRIPT],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1, startupinfo=startupinfo, env=_env
         )
         # Wait for "ready" message (model loading)
@@ -6101,6 +6107,20 @@ def _start_whisper_process():
             info = _json.loads(ready_line)
             if info.get("status") == "ready":
                 log(f"  ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
+                # Start a single reader thread for the lifetime of this subprocess.
+                # Previous code created a new reader thread per _whisper_transcribe()
+                # call — but old threads kept blocking on readline(), racing with new
+                # threads and "stealing" response lines, causing lost output and stalls.
+                _whisper_line_queue = queue.Queue()
+                _proc_ref = _whisper_proc  # prevent GC / reference issues
+                def _reader():
+                    try:
+                        for _ln in iter(_proc_ref.stdout.readline, ""):
+                            _whisper_line_queue.put(_ln)
+                    except Exception:
+                        pass
+                    _whisper_line_queue.put(None)  # sentinel — stream closed
+                threading.Thread(target=_reader, daemon=True).start()
                 return True
         log("  ⚠ Whisper process did not start correctly.\n", "red")
         return False
@@ -6111,7 +6131,7 @@ def _start_whisper_process():
 
 def _stop_whisper_process():
     """Stop the persistent Whisper subprocess."""
-    global _whisper_proc
+    global _whisper_proc, _whisper_line_queue
     if _whisper_proc is not None:
         try:
             _whisper_proc.stdin.close()
@@ -6123,6 +6143,7 @@ def _stop_whisper_process():
             except Exception:
                 pass
         _whisper_proc = None
+    _whisper_line_queue = None
 
 
 def _stop_ffmpeg_process():
@@ -7321,14 +7342,19 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
     If duration (seconds) is provided, progress percentage is logged in real time.
     title is shown in the progress line so the user knows which video is being processed.
     cancel_ev/pause_ev default to the global cancel_event/pause_event if not provided.
+
+    On process stalls or crashes, sets _whisper_last_failed = True so callers can
+    distinguish a process failure from a legitimate "no speech" result.
     """
-    global _gpu_actively_encoding
+    global _gpu_actively_encoding, _whisper_last_failed
+    _whisper_last_failed = False
     _ce = cancel_ev or cancel_event
     _pe = pause_ev or pause_event
     global _whisper_proc
     if _whisper_proc is None or _whisper_proc.poll() is not None:
         if not _start_whisper_process():
-            return None
+            _whisper_last_failed = True
+            return None, []
     try:
         import json as _json
         _title_disp = title
@@ -7343,29 +7369,32 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
 
-        # Read subprocess output via a background thread so we can apply a stall
-        # timeout.  faster-whisper's VAD pre-processing can legitimately keep the
-        # process silent for many minutes before the first segment is yielded,
-        # which previously made the UI appear frozen at 0%.  If no output arrives
-        # within _WHISPER_STALL_TIMEOUT seconds we assume the process is hung,
-        # kill it, and return None so the caller can skip this file.
-        _line_queue: queue.Queue = queue.Queue()
-        _proc_out = _whisper_proc.stdout  # capture before any potential restart
+        # Use the module-level reader thread + queue (started in _start_whisper_process).
+        # Previous code created a NEW reader thread per call — but old daemon threads
+        # survived, kept blocking on readline() on the SAME stdout pipe, and raced with
+        # the newest thread.  Whichever old thread won the race "stole" the response
+        # line into an unreachable queue, permanently losing it.  After just a few
+        # transcription calls the newest thread had almost zero chance of reading
+        # anything, causing the function to hang forever.
+        if _whisper_line_queue is None:
+            log("  ⚠ Internal error: Whisper reader not initialized.\n", "red")
+            _gpu_actively_encoding = False
+            _whisper_last_failed = True
+            _stop_whisper_process()
+            return None, []
 
-        def _stdout_reader():
+        # Drain any stale data left over from a previous call (shouldn't happen,
+        # but defensive).
+        while True:
             try:
-                for _ln in iter(_proc_out.readline, ""):
-                    _line_queue.put(_ln)
-            except Exception:
-                pass
-            _line_queue.put(None)  # sentinel — stream closed
-
-        threading.Thread(target=_stdout_reader, daemon=True).start()
+                _whisper_line_queue.get_nowait()
+            except queue.Empty:
+                break
 
         # Read responses — may be progress updates before the final result
         while True:
             try:
-                response_line = _line_queue.get(timeout=_WHISPER_STALL_TIMEOUT)
+                response_line = _whisper_line_queue.get(timeout=_WHISPER_STALL_TIMEOUT)
             except queue.Empty:
                 log(
                     f"  ⚠ Whisper stalled (no output for {_WHISPER_STALL_TIMEOUT // 60} min). "
@@ -7373,21 +7402,24 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                     "red",
                 )
                 _gpu_actively_encoding = False
+                _whisper_last_failed = True
                 _stop_whisper_process()  # will be restarted on next call
                 return None, []
 
             if response_line is None:
                 # Subprocess closed stdout unexpectedly
                 _gpu_actively_encoding = False
+                _whisper_last_failed = True
                 return None, []
 
             response_line = response_line.strip()
             if not response_line:
                 _gpu_actively_encoding = False
+                _whisper_last_failed = True
                 return None, []
             result = _json.loads(response_line)
             if result.get("status") == "starting":
-                # Subprocess accepted the file and is about to iterate segments.
+                # Subprocess accepted the file and is about to run VAD + transcribe.
                 # Update the display so the user can see it's actively loading audio
                 # (VAD pre-processing can silently consume several minutes at 0%).
                 log(f"{_wp}Transcribing{_title_part}, 0% — loading...\n", "whisper_progress")
@@ -7411,10 +7443,12 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
                 _gpu_actively_encoding = False
+                _whisper_last_failed = True
                 return None, []
     except Exception as e:
         log(f"  ⚠ Whisper communication error: {e}\n", "red")
         _gpu_actively_encoding = False
+        _whisper_last_failed = True
         _stop_whisper_process()  # Kill broken process, will restart on next call
         return None, []
 
@@ -8748,6 +8782,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         source = "Whisper"
 
                         if not text:
+                            if _whisper_last_failed:
+                                # Process stalled or crashed — do NOT exclude the video
+                                # (it likely has speech; Whisper just failed to process it).
+                                # It will be retried on the next transcription run.
+                                log(f"  [{idx}/{total}] {fname} — Whisper failed, skipping (will retry next run).\n", "red")
+                                _transcription_log.append((fname, source, time.time() - _t_vid_start, "error — process failure"))
+                                err_count += 1
+                                continue
                             # Write exclusion entry so this video is skipped on future transcribes
                             log(f"  [{idx}/{total}] {fname} — no speech detected, excluding.\n", "simpleline")
                             _transcription_log.append((fname, source, time.time() - _t_vid_start, "excluded — no speech"))
@@ -9167,7 +9209,10 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             _clear_whisper_progress()  # Remove progress line now that file is done
 
             if not text:
-                log(f"  Whisper returned empty result.\n", "red")
+                if _whisper_last_failed:
+                    log(f"  Whisper process failed — please try again.\n", "red")
+                else:
+                    log(f"  Whisper returned empty result.\n", "red")
                 return
 
             text = _whisper_punct_fixup(text)
@@ -9382,6 +9427,12 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     text = _whisper_punct_fixup(text)
 
                 if not text:
+                    if _whisper_last_failed:
+                        # Process stalled or crashed — do NOT exclude the video.
+                        # It will be retried on the next transcription run.
+                        log(f"    Whisper failed, skipping (will retry next run).\n", "red")
+                        _skipped += 1
+                        continue
                     # Write exclusion entry so this video is skipped on future transcribes
                     log(f"    no speech detected, excluding.\n", "simpleline")
                     try:

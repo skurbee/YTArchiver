@@ -73,7 +73,9 @@ DEFAULT_CONFIG = {
     "autorun_interval": 0,
     "autorun_history": [],
     "log_mode": "Simple",
-    "autorun_gpu": False
+    "autorun_gpu": False,
+    "chan_col_widths": {},
+    "recent_col_widths": {}
 }
 
 GPU_BATCH_LIMIT = 5  # max unprocessed encode batches per channel before sync skips it
@@ -2568,7 +2570,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.0 - 03.15.26 9:47pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.1 - 03.16.26 5:10am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3121,10 +3123,19 @@ settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
 settings_chan_tree.column("num_vids", stretch=False, width=55, anchor="e")
-settings_chan_tree.column("size_on_disk", stretch=False, width=75, anchor="e")
-settings_chan_tree.column("url", stretch=True, minwidth=100, anchor="w")
+settings_chan_tree.column("size_on_disk", stretch=True, width=75, anchor="e")
+settings_chan_tree.column("url", stretch=False, width=0, minwidth=0, anchor="w")
 settings_chan_tree.tag_configure("odd", background="#0c0f14")
 settings_chan_tree.tag_configure("even", background=C_LOG_BG)
+
+# Apply saved channel treeview column widths from previous session
+_saved_chan_col_widths = config.get("chan_col_widths", {})
+if isinstance(_saved_chan_col_widths, dict):
+    for _col, _w in _saved_chan_col_widths.items():
+        try:
+            settings_chan_tree.column(_col, width=_w)
+        except Exception:
+            pass
 
 add_outer = ttk.LabelFrame(tab_settings, text="Add channel")
 add_outer.grid(row=4, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 4))
@@ -3883,15 +3894,27 @@ def _chan_ctx_show(event):
             _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
+            try:
+                _chan_ctx_menu.entryconfig(11, activeforeground=C_DIM)
+            except Exception:
+                pass
         elif _already_in_gpu:
             _chan_ctx_menu.entryconfig(11, label="Already in GPU Tasks",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
+            try:
+                _chan_ctx_menu.entryconfig(11, activeforeground=C_DIM)
+            except Exception:
+                pass
         else:
             _t_label = "Add Transc. to GPU Tasks" if (_gpu_has_items or _gpu_running) else "Transcribe Channel"
             _chan_ctx_menu.entryconfig(11, label=_t_label,
                                       state="normal", foreground=C_TEXT,
                                       command=_chan_ctx_transcribe)
+            try:
+                _chan_ctx_menu.entryconfig(11, activeforeground=C_TEXT)
+            except Exception:
+                pass
 
         try:
             _chan_ctx_menu.tk_popup(event.x_root, event.y_root)
@@ -5770,7 +5793,7 @@ for line in sys.stdin:
             beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
             no_speech_threshold=0.6,
         )
         # info.duration is the total audio length in seconds
@@ -14883,6 +14906,15 @@ recent_tree.tag_configure("even", background=C_LOG_BG)
 recent_tree.grid(row=0, column=0, sticky="nsew")
 recent_scrollbar.config(command=recent_tree.yview)
 
+# Apply saved recent downloads treeview column widths from previous session
+_saved_recent_col_widths = config.get("recent_col_widths", {})
+if isinstance(_saved_recent_col_widths, dict):
+    for _col, _w in _saved_recent_col_widths.items():
+        try:
+            recent_tree.column(_col, width=_w)
+        except Exception:
+            pass
+
 # Auto-fill title column to use remaining space when window is resized
 _recent_resize_job = {"id": None}
 
@@ -15995,6 +16027,27 @@ def on_closing():
         save_config(config)
     except Exception:
         pass
+
+    # Save column widths for both treeviews
+    try:
+        _chan_widths = {}
+        for _col in ("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "num_vids", "size_on_disk"):
+            try:
+                _chan_widths[_col] = settings_chan_tree.column(_col, "width")
+            except Exception:
+                pass
+        config["chan_col_widths"] = _chan_widths
+        _recent_widths = {}
+        for _col in ("title", "channel", "time", "duration", "size"):
+            try:
+                _recent_widths[_col] = recent_tree.column(_col, "width")
+            except Exception:
+                pass
+        config["recent_col_widths"] = _recent_widths
+        save_config(config)
+    except Exception:
+        pass
+
     _root_alive = False  # Tell worker threads to stop touching Tkinter immediately
 
     # Check if there are queued jobs

@@ -502,6 +502,28 @@ def log(text, tag=None):
                 else:
                     log_box.insert(tk.END, text, use_tag)
 
+                # Apply overlay tags for transcribe_using in simple mode so the
+                # [idx/total] prefix and quoted video title appear white over blue
+                if _is_simple_mode and use_tag == "transcribe_using":
+                    _tu_ranges = log_box.tag_ranges("transcribe_using")
+                    if _tu_ranges:
+                        _tu_start = _tu_ranges[-2]
+                        _tu_text = log_box.get(_tu_ranges[-2], _tu_ranges[-1])
+                        _tu_trans_i = _tu_text.find("Transcribing")
+                        if _tu_trans_i > 0:
+                            # White: [idx/total] prefix before "Transcribing"
+                            log_box.tag_add("transcribe_prefix", _tu_start,
+                                            log_box.index(f"{_tu_start}+{_tu_trans_i}c"))
+                        if _tu_trans_i >= 0:
+                            # White: quoted title "fname" after "Transcribing"
+                            _tu_q_open = _tu_text.find('"', _tu_trans_i + 12)
+                            _tu_q_close = (_tu_text.find('"', _tu_q_open + 1)
+                                           if _tu_q_open >= 0 else -1)
+                            if _tu_q_close > _tu_q_open >= 0:
+                                log_box.tag_add("transcribe_title",
+                                                log_box.index(f"{_tu_start}+{_tu_q_open}c"),
+                                                log_box.index(f"{_tu_start}+{_tu_q_close + 1}c"))
+
                 # Re-insert whisper progress at the bottom so it stays visible
                 if _had_whisper and _saved_wp_parts:
                     # Re-insert whisper before pausestatus so it stays above the pause anchor
@@ -2620,7 +2642,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.5 - 03.16.26 11:54am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.6 - 03.16.26 6:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2976,6 +2998,8 @@ log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9
 log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_prefix", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("whisper_title", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("transcribe_prefix", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("transcribe_title", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_prefix", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_title", foreground=C_TEXT, font=("Consolas", 9))
@@ -2988,6 +3012,9 @@ log_box.tag_raise("encode_title", "encode_progress")
 # whisper_prefix and whisper_title must override whisper_progress (white over blue)
 log_box.tag_raise("whisper_prefix", "whisper_progress")
 log_box.tag_raise("whisper_title", "whisper_progress")
+# transcribe_prefix and transcribe_title must override transcribe_using (white over blue)
+log_box.tag_raise("transcribe_prefix", "transcribe_using")
+log_box.tag_raise("transcribe_title", "transcribe_using")
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
 
@@ -8533,7 +8560,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"    Transcribing [{idx}/{total}] {fname} - fetching captions...\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"  [{idx}/{total}] Transcribing \"{fname}\"  - fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -8556,7 +8583,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"    Transcribing [{idx}/{total}] {fname} - Adding punctuation...\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"  [{idx}/{total}] Transcribing \"{fname}\"  - Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -9769,6 +9796,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_suffix", {"foreground": C_LOG_BLUE}),
+                             ("transcribe_prefix", {"foreground": C_TEXT}),
+                             ("transcribe_title", {"foreground": C_TEXT}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -14312,7 +14341,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
     else:
         dur = f"took {secs}s"
     ch_part = f"  {channel_name}  —" if channel_name else " "
-    line = f"[Trnscrb] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    line = f"[Trnscr] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -15146,6 +15175,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("encode_dots", {"foreground": C_LOG_BLUE}),
                              ("encode_suffix", {"foreground": C_LOG_BLUE}),
+                             ("transcribe_prefix", {"foreground": C_TEXT}),
+                             ("transcribe_title", {"foreground": C_TEXT}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
@@ -15160,7 +15191,7 @@ _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
                  "encode_progress", "encode_pct", "encode_dots",
-                 "encode_suffix", "transcribe_using")
+                 "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using")
 
 
 def _sync_mini_logs_from_main():

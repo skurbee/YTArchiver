@@ -6112,7 +6112,8 @@ def _start_whisper_process():
                 # call — but old threads kept blocking on readline(), racing with new
                 # threads and "stealing" response lines, causing lost output and stalls.
                 _whisper_line_queue = queue.Queue()
-                _proc_ref = _whisper_proc  # prevent GC / reference issues
+                _proc_ref = _whisper_proc  # local ref so the closure reads from THIS
+                                           # process even after _whisper_proc is reset to None
                 def _reader():
                     try:
                         for _ln in iter(_proc_ref.stdout.readline, ""):
@@ -7385,11 +7386,15 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
 
         # Drain any stale data left over from a previous call (shouldn't happen,
         # but defensive).
+        _stale = 0
         while True:
             try:
                 _whisper_line_queue.get_nowait()
+                _stale += 1
             except queue.Empty:
                 break
+        if _stale:
+            log(f"  ⚠ Drained {_stale} stale message(s) from previous Whisper call.\n", "red")
 
         # Read responses — may be progress updates before the final result
         while True:
@@ -7419,7 +7424,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 return None, []
             result = _json.loads(response_line)
             if result.get("status") == "starting":
-                # Subprocess accepted the file and is about to run VAD + transcribe.
+                # Subprocess accepted the file; VAD + transcription is now in progress.
                 # Update the display so the user can see it's actively loading audio
                 # (VAD pre-processing can silently consume several minutes at 0%).
                 log(f"{_wp}Transcribing{_title_part}, 0% — loading...\n", "whisper_progress")

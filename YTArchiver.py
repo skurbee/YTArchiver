@@ -2568,7 +2568,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.9 - 03.15.26 9:30pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.10 - 03.16.26 2:39am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3334,9 +3334,9 @@ def refresh_channel_dropdowns():
             _grand_total_bytes += _ch_bytes
             num_vids_str = f"{_num_vids:,}" if _num_vids else "—"
             if _ch_bytes >= 1024 ** 4:
-                size_str = f"{_ch_bytes / 1024 ** 4:.2f} TB"
+                size_str = f"{_ch_bytes / 1024 ** 4:.1f} TB"
             elif _ch_bytes >= 1024 ** 3:
-                size_str = f"{_ch_bytes / 1024 ** 3:.2f} GB"
+                size_str = f"{_ch_bytes / 1024 ** 3:.1f} GB"
             elif _ch_bytes >= 1024 ** 2:
                 size_str = f"{_ch_bytes / 1024 ** 2:.1f} MB"
             elif _ch_bytes > 0:
@@ -3350,9 +3350,9 @@ def refresh_channel_dropdowns():
 
         # Update total size on disk label
         if _grand_total_bytes >= 1024 ** 4:
-            _total_str = f"Total: {_grand_total_bytes / 1024 ** 4:.2f} TB"
+            _total_str = f"Total: {_grand_total_bytes / 1024 ** 4:.1f} TB"
         elif _grand_total_bytes >= 1024 ** 3:
-            _total_str = f"Total: {_grand_total_bytes / 1024 ** 3:.2f} GB"
+            _total_str = f"Total: {_grand_total_bytes / 1024 ** 3:.1f} GB"
         elif _grand_total_bytes >= 1024 ** 2:
             _total_str = f"Total: {_grand_total_bytes / 1024 ** 2:.1f} MB"
         elif _grand_total_bytes > 0:
@@ -3473,7 +3473,7 @@ def on_channel_double_click(event):
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][9]
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -3571,7 +3571,7 @@ def _chan_ctx_sync_now():
         return
     # Match the channel in the treeview to visually select it before syncing
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][9] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -3794,7 +3794,7 @@ def _chan_ctx_remove():
         return
     # Select the channel in the tree so remove_channel() can find it
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][7] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][9] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -3809,7 +3809,7 @@ def _chan_ctx_show(event):
     if row:
         settings_chan_tree.selection_set(row)
         on_chan_list_select(None)
-        target_url = settings_chan_tree.item(row)['values'][7]
+        target_url = settings_chan_tree.item(row)['values'][9]
         with config_lock:
             for c in config.get("channels", []):
                 if c["url"] == target_url:
@@ -4127,7 +4127,7 @@ def sync_single_channel():
     if not sel:
         return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][9]
 
     with config_lock:
         ch = None
@@ -4621,7 +4621,7 @@ def _process_sync_queue():
         try:
             _found = False
             for item in settings_chan_tree.get_children():
-                if settings_chan_tree.item(item)['values'][7] == next_ch["url"]:
+                if settings_chan_tree.item(item)['values'][9] == next_ch["url"]:
                     settings_chan_tree.selection_set(item)
                     on_chan_list_select(None)
                     _found = True
@@ -4744,7 +4744,7 @@ def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][7]
+    target_url = item['values'][9]
 
     with config_lock:
         channels = config.setdefault("channels", [])

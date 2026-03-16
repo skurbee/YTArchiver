@@ -251,6 +251,10 @@ _whisper_counter = {"idx": 0, "total": 0}
 # VAD pre-processing on very long audio can legitimately take several minutes, so this is generous.
 _WHISPER_STALL_TIMEOUT = 900  # 15 minutes
 
+# Maximum characters shown for a video title/filename in progress status lines.
+# Titles longer than this are truncated with "..." to keep lines from becoming too wide.
+_MAX_TITLE_DISPLAY = 40
+
 
 def _flush_ui_queue():
     """Process pending UI callbacks on the main thread with a time budget."""
@@ -351,11 +355,17 @@ def log(text, tag=None):
                             if not _wr:
                                 break
                             log_box.delete(_wr[0], _wr[1])
-                    # Insert before pausestatus anchor if present so the line stays
-                    # stable relative to the pause notice and doesn't jump when other
-                    # log messages are appended and re-insert whisper at that position.
+                    # Insert after simplestatus (if present) and before pausestatus
+                    # so the line always stays below the sync counter and above the
+                    # pause anchor, even when other log messages arrive mid-update.
                     _ps_r_wp = log_box.tag_ranges("pausestatus")
-                    _wp_ins = log_box.index(_ps_r_wp[0]) if _ps_r_wp else tk.END
+                    _ss_r_wp = log_box.tag_ranges("simplestatus")
+                    if _ps_r_wp:
+                        _wp_ins = log_box.index(_ps_r_wp[0])
+                    elif _ss_r_wp:
+                        _wp_ins = log_box.index(_ss_r_wp[-1])
+                    else:
+                        _wp_ins = tk.END
                     # Split text to colorize the percentage green
                     import re as _re_wp
                     _wp_match = _re_wp.search(r'(\d+%)', text)
@@ -526,9 +536,16 @@ def log(text, tag=None):
 
                 # Re-insert whisper progress at the bottom so it stays visible
                 if _had_whisper and _saved_wp_parts:
-                    # Re-insert whisper before pausestatus so it stays above the pause anchor
+                    # Re-insert after simplestatus (if present) and before pausestatus
+                    # so the transcribing line is always anchored at the bottom.
                     _ps_for_w = log_box.tag_ranges("pausestatus")
-                    _w_ins_pt = log_box.index(_ps_for_w[0]) if _ps_for_w else tk.END
+                    _ss_for_w = log_box.tag_ranges("simplestatus")
+                    if _ps_for_w:
+                        _w_ins_pt = log_box.index(_ps_for_w[0])
+                    elif _ss_for_w:
+                        _w_ins_pt = log_box.index(_ss_for_w[-1])
+                    else:
+                        _w_ins_pt = tk.END
                     for _wp_text, _wp_tag in _saved_wp_parts:
                         log_box.insert(_w_ins_pt, _wp_text, _wp_tag)
                         if _w_ins_pt != tk.END:
@@ -2642,7 +2659,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.7 - 03.16.26 2:37pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.8 - 03.16.26 3:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7439,8 +7456,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
     try:
         import json as _json
         _title_disp = title
-        if _title_disp and len(_title_disp) > 40:
-            _title_disp = _title_disp[:37] + "..."
+        if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
+            _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
         _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces
         _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
@@ -8549,6 +8566,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Phase A: Process matched files (auto-captions first) ────
             for fname, fpath, vid_id in matched:
                 idx += 1
+                _fname_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
 
                 # Pause check
                 _pl = "GPU Tasks" if _sync_mode else "Sync"
@@ -8563,7 +8581,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{fname}\"  - fetching captions...\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -8586,7 +8604,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{fname}\"  - Adding punctuation...\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime

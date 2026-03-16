@@ -2620,7 +2620,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.4 - 03.16.26 11:27am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.5 - 03.16.26 12:42pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7607,6 +7607,7 @@ def _fetch_auto_captions(video_id, temp_dir):
         "--write-sub", "--write-auto-sub", "--sub-lang", "en", "--sub-format", "vtt",
         "-o", temp_base + ".%(ext)s",
         "--no-playlist",
+        "--cookies-from-browser", "firefox",
         f"https://www.youtube.com/watch?v={video_id}"
     ]
 
@@ -8292,6 +8293,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     "yt-dlp", "--flat-playlist",
                     "--print", "%(id)s|||%(title)s",
                     "--no-warnings",
+                    "--cookies-from-browser", "firefox",
                     ch_url
                 ]
                 enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=300, startupinfo=startupinfo)

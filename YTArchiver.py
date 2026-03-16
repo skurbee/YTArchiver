@@ -366,6 +366,19 @@ def log(text, tag=None):
                         _after_raw = text[_wp_match.end():]
                         _suffix = _after_raw.rstrip(".\n ").rstrip()
                         log_box.insert(_wp_ins, _before, "whisper_progress")
+                        # Overlay white tags: [N/M] prefix → whisper_prefix, title → whisper_title
+                        _trans_i = _before.find("Transcribing")
+                        if _trans_i >= 0:
+                            _wp_r = log_box.tag_ranges("whisper_progress")
+                            if len(_wp_r) >= 2:
+                                _wp_start = _wp_r[-2]
+                                if _trans_i > 0:
+                                    log_box.tag_add("whisper_prefix", _wp_start,
+                                                    log_box.index(f"{_wp_start}+{_trans_i}c"))
+                                _ttl_s = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
+                                _ttl_e = log_box.index(f"{_wp_start}+{len(_before)}c")
+                                if log_box.compare(_ttl_s, "<", _ttl_e):
+                                    log_box.tag_add("whisper_title", _ttl_s, _ttl_e)
                         if _wp_ins != tk.END:
                             _wp_ins = log_box.index(f"{_wp_ins} + {len(_before)}c")
                         log_box.insert(_wp_ins, _pct_str, "whisper_pct")
@@ -504,6 +517,8 @@ def log(text, tag=None):
                         _whisper_dots["idx"] = 0
                         if _root_alive:
                             _whisper_dots["job"] = root.after(350, _whisper_dot_tick)
+                    # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
+                    _reapply_whisper_overlays()
 
                 if _autorun_active and _is_simple_mode:
                     try:
@@ -603,6 +618,32 @@ def _stop_whisper_dot_anim():
             except Exception:
                 pass
         _ui_queue.append(_do_cancel)
+
+
+def _reapply_whisper_overlays():
+    """Re-apply whisper_prefix/whisper_title overlays on the whisper_progress range.
+
+    Called after any save/restore cycle so the [N/M] counter and video title
+    portions of the active transcription line remain white over the blue baseline.
+    Must be called with log_box already in normal (editable) state.
+    """
+    if 'log_box' not in globals():
+        return
+    _wp_r = log_box.tag_ranges("whisper_progress")
+    if not _wp_r:
+        return
+    _wp_start = _wp_r[-2]  # start of the last (only) whisper_progress range
+    _wp_text = log_box.get(_wp_r[-2], _wp_r[-1])
+    _trans_i = _wp_text.find("Transcribing")
+    if _trans_i < 0:
+        return
+    if _trans_i > 0:
+        _pfx_end = log_box.index(f"{_wp_start}+{_trans_i}c")
+        log_box.tag_add("whisper_prefix", _wp_start, _pfx_end)
+    _ttl_start = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
+    _ttl_end = log_box.index(f"{_wp_r[-2]}+{len(_wp_text)}c")
+    if log_box.compare(_ttl_start, "<", _ttl_end):
+        log_box.tag_add("whisper_title", _ttl_start, _ttl_end)
 
 
 def _clear_whisper_progress():
@@ -855,6 +896,8 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
                                 _ttl_end = log_box.index(
                                     f"{_ttl_start}+{len(_pfx_m.group(1))}c")
                                 log_box.tag_add("encode_title", _ttl_start, _ttl_end)
+                    # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
+                    _reapply_whisper_overlays()
 
                 # Re-insert pausestatus at the very bottom (after simplestatus)
                 for _ps_text in _saved_ps:
@@ -1045,6 +1088,8 @@ def _update_encode_progress(text):
                         log_box.insert(_ew_ins_pt, _s_text, _s_tag)
                         if _ew_ins_pt != tk.END:
                             _ew_ins_pt = log_box.index(f"{_ew_ins_pt} + {len(_s_text)}c")
+                    # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
+                    _reapply_whisper_overlays()
 
                 if _log_at_bottom:
                     log_box.see(tk.END)
@@ -2575,7 +2620,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.3 - 03.16.26 1:24am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.4 - 03.16.26 4:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2929,6 +2974,8 @@ log_box.tag_configure("pausestatus", foreground=C_LOG_HEAD)
 log_box.tag_configure("whisper_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("whisper_prefix", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("whisper_title", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_progress", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("encode_prefix", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("encode_title", foreground=C_TEXT, font=("Consolas", 9))
@@ -2938,6 +2985,9 @@ log_box.tag_configure("encode_suffix", foreground=C_LOG_BLUE, font=("Consolas", 
 # encode_prefix and encode_title must override encode_progress (white over blue)
 log_box.tag_raise("encode_prefix", "encode_progress")
 log_box.tag_raise("encode_title", "encode_progress")
+# whisper_prefix and whisper_title must override whisper_progress (white over blue)
+log_box.tag_raise("whisper_prefix", "whisper_progress")
+log_box.tag_raise("whisper_title", "whisper_progress")
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
 
@@ -8855,18 +8905,25 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                         _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                         _src_part = f"{source},"
+                        # Duration string e.g. ", (6m 02s)"
+                        _vid_dur_str = ""
+                        if _dur_secs > 0:
+                            _vd_m, _vd_s = divmod(int(_dur_secs), 60)
+                            _vid_dur_str = f", ({_vd_m}m {_vd_s:02d}s)"
+                        # Realtime ratio e.g. ", 3.0x realtime"
+                        _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                         if _is_simple_mode:
                             _prefix = f"  [{idx}/{total}] "
-                            _suffix = f"done ({_src_part} {_ve_str})"
+                            _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                             _body_width = 58 - len(_prefix)
-                            _name_dash = f"{fname} — "
+                            _name_dash = f"{fname}{_vid_dur_str} — "
                             if len(_name_dash) > _body_width:
-                                _name_dash = fname[:_body_width - 6] + "... — "
+                                _name_dash = fname[:_body_width - 6 - len(_vid_dur_str)] + f"...{_vid_dur_str} — "
                             else:
                                 _name_dash = _name_dash.ljust(_body_width)
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:
-                            log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
+                            log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
                 else:
                     err_count += len(unmatched)
 

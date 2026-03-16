@@ -49,6 +49,10 @@ os.makedirs(APP_DATA_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
 QUEUE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_queue.json")
+DISK_CACHE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_disk_cache.json")
+
+# File extensions recognised as channel video/audio content (excludes temp/partial files)
+_CHANNEL_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
 
 startupinfo = None
 if os.name == 'nt':
@@ -1809,7 +1813,144 @@ def save_config(cfg):
             threading.Thread(target=_do_save, daemon=True).start()
 
 
+# ── Disk Usage Cache ─────────────────────────────────────────────────────────
+# Stores per-channel video count and byte totals so the Subs tab loads
+# instantly on every launch.  The cache is written to disk after every update
+# and is invalidated automatically whenever an action changes a channel's
+# folder contents (sync, compress, add, delete, save-prefs).
+_disk_cache: dict = {}          # url -> {"num_vids": int, "size_bytes": int, "last_updated": float}
+_disk_cache_lock = threading.Lock()
+
+
+def _load_disk_cache():
+    """Load the persisted disk-usage cache from disk into _disk_cache."""
+    global _disk_cache
+    try:
+        if os.path.exists(DISK_CACHE_FILE):
+            with open(DISK_CACHE_FILE, "r", encoding="utf-8") as _f:
+                _data = json.load(_f)
+            if isinstance(_data, dict):
+                with _disk_cache_lock:
+                    _disk_cache.update(_data)
+    except (json.JSONDecodeError, OSError, PermissionError):
+        pass  # Corrupt or unreadable cache — will be rebuilt by startup scan
+
+
+def _save_disk_cache():
+    """Persist the in-memory disk-usage cache to disk (background thread)."""
+    def _do():
+        try:
+            with _disk_cache_lock:
+                _snapshot = dict(_disk_cache)
+            _tmp = DISK_CACHE_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                json.dump(_snapshot, _f, indent=2)
+            os.replace(_tmp, DISK_CACHE_FILE)
+        except (OSError, PermissionError) as _e:
+            try:
+                if sys.stdout:
+                    sys.stdout.write(f"Warning: Could not save disk cache: {_e}\n")
+            except Exception:
+                pass
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _scan_channel_disk_info(ch):
+    """Walk a channel's folder and return (num_vids, total_bytes).
+
+    Only counts files with recognised video/audio extensions that are not
+    partial downloads or temporary encode outputs.
+    """
+    _base_dir = config.get("output_dir", "").strip() or BASE_DIR
+    _folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    _ch_folder = os.path.join(_base_dir, _folder_name)
+    _num_vids = 0
+    _ch_bytes = 0
+    try:
+        if os.path.isdir(_ch_folder):
+            for _dp, _dns, _fns in os.walk(_ch_folder):
+                for _fn in _fns:
+                    _fn_lower = _fn.lower()
+                    if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
+                            and ".temp." not in _fn_lower
+                            and ".part" not in _fn_lower):
+                        _num_vids += 1
+                        try:
+                            _ch_bytes += os.path.getsize(os.path.join(_dp, _fn))
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return _num_vids, _ch_bytes
+
+
+def _update_disk_cache_for_channel(ch):
+    """Scan a single channel folder and write the result into the cache.
+
+    Safe to call from any background thread.
+    """
+    _url = ch.get("url", "")
+    if not _url:
+        return
+    _nv, _nb = _scan_channel_disk_info(ch)
+    with _disk_cache_lock:
+        _disk_cache[_url] = {
+            "num_vids": _nv,
+            "size_bytes": _nb,
+            "last_updated": time.time(),
+        }
+    _save_disk_cache()
+
+
+def _invalidate_channel_disk_cache(ch_url):
+    """Remove a channel's cache entry and trigger a background rescan.
+
+    After the rescan the UI is refreshed automatically via _ui_queue.
+    Call this whenever a channel's folder contents may have changed
+    (sync complete, compress complete, folder rename, etc.).
+    """
+    with _disk_cache_lock:
+        _disk_cache.pop(ch_url, None)
+
+    def _rescan():
+        with config_lock:
+            _channels = list(config.get("channels", []))
+        _ch = next((_c for _c in _channels if _c.get("url") == ch_url), None)
+        if _ch:
+            _update_disk_cache_for_channel(_ch)
+            if _root_alive:
+                _ui_queue.append(refresh_channel_dropdowns)
+
+    threading.Thread(target=_rescan, daemon=True).start()
+
+
+def _run_startup_disk_scan():
+    """Scan every channel that has no cached disk info yet.
+
+    Intended to be called from the startup background thread AFTER the UI
+    is fully loaded so the user sees the app immediately.  Channels that
+    already have a cache entry are skipped — only genuinely missing entries
+    are computed.  The Subs tab is refreshed once all missing entries have
+    been filled.
+    """
+    with config_lock:
+        _channels = list(config.get("channels", []))
+    with _disk_cache_lock:
+        _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
+    if not _missing:
+        return
+    log(f"--- Scanning disk for channel info ({len(_missing)} channel(s) not yet cached)... ---\n", "header")
+    for _ch in _missing:
+        if not _root_alive:
+            break
+        _update_disk_cache_for_channel(_ch)
+    if _root_alive:
+        _ui_queue.append(refresh_channel_dropdowns)
+    log("--- Disk scan complete. ---\n", "simpleline_green")
+
+
 config = load_config()
+_load_disk_cache()
 
 # Migrate old compress level names → new quality names
 _config_migrated = False
@@ -2427,7 +2568,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.8 - 03.15.26 9:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.9 - 03.16.26 2:00am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3112,7 +3253,6 @@ def refresh_channel_dropdowns():
 
         settings_chan_tree.delete(*settings_chan_tree.get_children())
         _grand_total_bytes = 0
-        _VIDEO_EXTS_CH = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
         for i, c in enumerate(sorted_channels):
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
             display_res = f"{res}p" if res.isdigit() else res
@@ -3179,27 +3319,18 @@ def refresh_channel_dropdowns():
             else:
                 trans_str = "—"
 
-            # Compute # of vids and size on disk for the channel folder
-            _base_dir = config.get("output_dir", "").strip() or BASE_DIR
-            _folder_name = sanitize_folder(c.get("folder_override", "").strip() or c["name"])
-            _ch_folder = os.path.join(_base_dir, _folder_name)
-            _num_vids = 0
-            _ch_bytes = 0
-            try:
-                if os.path.isdir(_ch_folder):
-                    for _dp, _dns, _fns in os.walk(_ch_folder):
-                        for _fn in _fns:
-                            _fn_lower = _fn.lower()
-                            if (_fn_lower.endswith(_VIDEO_EXTS_CH)
-                                    and ".temp." not in _fn_lower
-                                    and ".part" not in _fn_lower):
-                                _num_vids += 1
-                                try:
-                                    _ch_bytes += os.path.getsize(os.path.join(_dp, _fn))
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
+            # Look up # of vids and size on disk from the cache (populated by
+            # background scan after startup, or by per-channel rescan after actions).
+            # Shows "—" when no entry exists yet (scan still pending).
+            _url_key = c.get("url", "")
+            with _disk_cache_lock:
+                _cached = _disk_cache.get(_url_key)
+            if _cached:
+                _num_vids = _cached["num_vids"]
+                _ch_bytes = _cached["size_bytes"]
+            else:
+                _num_vids = 0
+                _ch_bytes = 0
             _grand_total_bytes += _ch_bytes
             num_vids_str = f"{_num_vids:,}" if _num_vids else "—"
             if _ch_bytes >= 1024 ** 4:
@@ -4371,6 +4502,7 @@ def sync_single_channel():
                     # Don't update global "Last Full Sync" for single channel syncs —
                     # that should only be set when a full sync-subbed run completes.
                 save_config(config)
+                _invalidate_channel_disk_cache(url)
                 _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
@@ -4697,6 +4829,9 @@ def remove_channel():
     refresh_channel_dropdowns()
     save_config(config)
     remove_channel_btn.pack_forget()
+    with _disk_cache_lock:
+        _disk_cache.pop(removed_url, None)
+    _save_disk_cache()
 
     # Remove any queued GPU tasks for this channel
     with _gpu_queue_lock:
@@ -6295,6 +6430,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 log(f", {err_count} errors", "simpleline_green")
             log(f" ({_t_str})\n", "simpleline_green")
             _record_compression(ch_name, done_count, err_count, elapsed, batch_num)
+            _invalidate_channel_disk_cache(ch_url)
 
     if _sync_mode:
         _worker()
@@ -6861,6 +6997,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             if total_errors:
                 log(f"  Errors: {total_errors}\n", "red")
             log("\n", "simpleline")
+            _invalidate_channel_disk_cache(ch_url)
 
     if _sync_mode:
         _worker()
@@ -9669,6 +9806,7 @@ ttk.Label(save_prefs_row, textvariable=save_prefs_label_var, style="Dim.TLabel")
 
 def save_channel_prefs():
     ch_name = chan_var.get()
+    _ch_url = None
     with config_lock:
         for ch in config.get("channels", []):
             if ch["name"] == ch_name:
@@ -9677,8 +9815,11 @@ def save_channel_prefs():
                 ch["max_duration"] = _parse_duration(ch_maxdur_var.get()) * 60
                 ch["mode"] = mode_var.get()
                 ch["folder_override"] = sanitize_folder(folder_override_var.get().strip())
+                _ch_url = ch.get("url")
                 break
     save_config(config)
+    if _ch_url:
+        _invalidate_channel_disk_cache(_ch_url)
     refresh_channel_dropdowns()
     log(f"Saved prefs for {ch_name}\n", "green")
 
@@ -11589,6 +11730,7 @@ def start_sync_all():
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
                 if _root_alive:
+                    _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
@@ -14414,6 +14556,7 @@ def _run_autorun():
                             cfg_ch["last_sync"] = _ts
                 save_config(config)
                 if _root_alive:
+                    _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
 
                 # New videos downloaded — track pending transcription count
@@ -15711,6 +15854,11 @@ def run_startup_updates():
 
         # Restore preserved queue from previous session if any
         _load_queue_state()
+
+        # Scan disk info for any channels not yet in the cache.  This runs
+        # after startup checks are done so the UI is already visible and
+        # usable while the scan proceeds in this background thread.
+        _run_startup_disk_scan()
 
     threading.Thread(target=_update, daemon=True).start()
 

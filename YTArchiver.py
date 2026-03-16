@@ -439,8 +439,11 @@ def log(text, tag=None):
                     if use_tag in ("simpleline", "simpleline_green", "transcribe_using", "filterskip"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
+                            # Record position to insert BEFORE the SYNCING line without
+                            # deleting it — deleting and re-creating simplestatus caused a
+                            # brief grey flash because segment overlay tags were lost between
+                            # the delete and the next animation tick's tag_add calls.
                             _ss_insert_pos = log_box.index(ranges[0])
-                            log_box.delete(ranges[0], ranges[1])
                         else:
                             # Fallback anchor: insert before pausestatus when simplestatus is absent
                             _ps_r = log_box.tag_ranges("pausestatus")
@@ -533,6 +536,17 @@ def log(text, tag=None):
                                 log_box.tag_add("transcribe_title",
                                                 log_box.index(f"{_tu_start}+{_tu_q_open}c"),
                                                 log_box.index(f"{_tu_start}+{_tu_q_close + 1}c"))
+                            else:
+                                # No quoted title (e.g. "Loading Whisper model...") —
+                                # make everything from "Transcribing" to end-of-line white
+                                # so the line isn't entirely blue with no readable content.
+                                _tu_trans_end = log_box.index(
+                                    f"{_tu_start}+{len(_tu_text.rstrip(chr(10)))}c")
+                                _tu_trans_start = log_box.index(
+                                    f"{_tu_start}+{_tu_trans_i}c")
+                                if _tu_trans_start != _tu_trans_end:
+                                    log_box.tag_add("transcribe_title",
+                                                    _tu_trans_start, _tu_trans_end)
 
                 # Re-insert whisper progress at the bottom so it stays visible
                 if _had_whisper and _saved_wp_parts:
@@ -2659,7 +2673,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.8 - 03.16.26 3:06pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.9 - 03.16.26 9:15pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7460,7 +7474,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
         _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces
-        _wp = f"  [{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+        _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
         _gpu_actively_encoding = True
         log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = _json.dumps({"path": audio_path, "duration": duration})
@@ -8395,6 +8409,15 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _bf_done = 0
                     _bf_idx = 0
                     for _bf_title, _bf_vid in _backfill_list:
+                        # Pause check — allows the user to pause during long backfill runs
+                        _bf_pl = "GPU Tasks" if _sync_mode else "Sync"
+                        if _pe.is_set() and not _ce.is_set():
+                            log(f"  ⏸ {_bf_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                            while _pe.is_set() and not _ce.is_set():
+                                time.sleep(0.25)
+                            if not _ce.is_set():
+                                clear_pause_status()
+                                log(f"  ▶ {_bf_pl} resumed at {_fmt_time()}...\n", "pauselog")
                         if _ce.is_set():
                             break
                         _bf_idx += 1

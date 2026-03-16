@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import threading
+import queue
 import subprocess
 import json
 import os
@@ -245,6 +246,10 @@ _encode_dots = {"active": False, "idx": 0, "job": None}
 
 # Whisper transcription progress counter (for simple mode prefix)
 _whisper_counter = {"idx": 0, "total": 0}
+
+# Seconds of silence from the Whisper subprocess before treating it as stalled and restarting.
+# VAD pre-processing on very long audio can legitimately take several minutes, so this is generous.
+_WHISPER_STALL_TIMEOUT = 900  # 15 minutes
 
 
 def _flush_ui_queue():
@@ -2570,7 +2575,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.1 - 03.16.26 12:18am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.2 - 03.16.26 5:33am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5798,6 +5803,11 @@ for line in sys.stdin:
         )
         # info.duration is the total audio length in seconds
         total_dur = info.duration if info.duration and info.duration > 0 else duration
+        # Notify the host that the file was accepted and audio analysis is beginning.
+        # This arrives before the potentially long VAD / first-segment phase so the
+        # host knows the subprocess is alive even when progress stays at 0% for a while.
+        _out.write(json.dumps({"status": "starting"}) + "\n")
+        _out.flush()
         all_segments = []
         last_pct = -1
         for seg in segments_gen:
@@ -7333,13 +7343,55 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
 
+        # Read subprocess output via a background thread so we can apply a stall
+        # timeout.  faster-whisper's VAD pre-processing can legitimately keep the
+        # process silent for many minutes before the first segment is yielded,
+        # which previously made the UI appear frozen at 0%.  If no output arrives
+        # within _WHISPER_STALL_TIMEOUT seconds we assume the process is hung,
+        # kill it, and return None so the caller can skip this file.
+        _line_queue: queue.Queue = queue.Queue()
+        _proc_out = _whisper_proc.stdout  # capture before any potential restart
+
+        def _stdout_reader():
+            try:
+                for _ln in iter(_proc_out.readline, ""):
+                    _line_queue.put(_ln)
+            except Exception:
+                pass
+            _line_queue.put(None)  # sentinel — stream closed
+
+        threading.Thread(target=_stdout_reader, daemon=True).start()
+
         # Read responses — may be progress updates before the final result
         while True:
-            response_line = _whisper_proc.stdout.readline().strip()
+            try:
+                response_line = _line_queue.get(timeout=_WHISPER_STALL_TIMEOUT)
+            except queue.Empty:
+                log(
+                    f"  ⚠ Whisper stalled (no output for {_WHISPER_STALL_TIMEOUT // 60} min). "
+                    f"Restarting process...\n",
+                    "red",
+                )
+                _gpu_actively_encoding = False
+                _stop_whisper_process()  # will be restarted on next call
+                return None, []
+
+            if response_line is None:
+                # Subprocess closed stdout unexpectedly
+                _gpu_actively_encoding = False
+                return None, []
+
+            response_line = response_line.strip()
             if not response_line:
                 _gpu_actively_encoding = False
                 return None, []
             result = _json.loads(response_line)
+            if result.get("status") == "starting":
+                # Subprocess accepted the file and is about to iterate segments.
+                # Update the display so the user can see it's actively loading audio
+                # (VAD pre-processing can silently consume several minutes at 0%).
+                log(f"{_wp}Transcribing{_title_part}, 0% — loading...\n", "whisper_progress")
+                continue
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
                 if _ce.is_set():

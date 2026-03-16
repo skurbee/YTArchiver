@@ -436,7 +436,7 @@ def log(text, tag=None):
                             return
 
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
-                    if use_tag in ("simpleline", "simpleline_green", "transcribe_using", "filterskip"):
+                    if use_tag in ("transcribe_using", "filterskip"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             # Record position to insert BEFORE the SYNCING line without
@@ -495,7 +495,8 @@ def log(text, tag=None):
                     _stop_whisper_dot_anim()
 
                 if (_is_simple_mode
-                        and use_tag in ("simpledownload", "red", "summary", "header", "simpleline_blue")):
+                        and use_tag in ("simpledownload", "red", "summary", "header",
+                                        "simpleline_blue", "simpleline", "simpleline_green")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], text, use_tag)
@@ -2673,7 +2674,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.9 - 03.16.26 4:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.10 - 03.16.26 9:38pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

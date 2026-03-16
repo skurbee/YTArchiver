@@ -805,7 +805,7 @@ def clear_transient_lines():
                     if ranges:
                         log_box.delete(ranges[0], ranges[1])
                 # Remove any orphaned colour-only tags that outlive their base text tag
-                for orphan_tag in ("simplestatus_green", "dlprogress_pct"):
+                for orphan_tag in ("simplestatus_green", "simplestatus_white", "dlprogress_pct"):
                     log_box.tag_remove(orphan_tag, "1.0", tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -1315,9 +1315,9 @@ def _simple_anim_tick():
         page = _simple_anim_state["page_num"]
         if enum_page > 0:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", None),
+                (f"[{i}/{n}]", "simplestatus_white"),
                 (" SYNCING:", "simplestatus_green"),
-                (f" {ch}  ", None),
+                (f" {ch}  ", "simplestatus_white"),
                 (d, "simplestatus_green"),
                 ("\n", None),
                 (f"Enumerating video IDs, {enum_count:,} found (first run only)", None),
@@ -1326,9 +1326,9 @@ def _simple_anim_tick():
             ])
         elif page > 0:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", None),
+                (f"[{i}/{n}]", "simplestatus_white"),
                 (" SYNCING:", "simplestatus_green"),
-                (f" {ch}", None),
+                (f" {ch}", "simplestatus_white"),
                 (status_text, None),
                 (d, "simplestatus_green"),
                 ("\n", None),
@@ -1338,10 +1338,10 @@ def _simple_anim_tick():
             ])
         else:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", None),
+                (f"[{i}/{n}]", "simplestatus_white"),
                 (" SYNCING:", "simplestatus_green"),
-                (f" {ch}", None),
-                (status_text, None),
+                (f" {ch}", "simplestatus_white"),
+                (status_text, "simplestatus_green"),
                 (d, "simplestatus_green"),
                 ("\n", None),
             ])
@@ -2642,7 +2642,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v18.6 - 03.16.26 2:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v18.7 - 03.16.26 7:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2986,6 +2986,7 @@ log_box.tag_configure("dlprogress", foreground=C_TEXT)
 log_box.tag_configure("dlprogress_pct", foreground=C_LOG_GREEN)
 log_box.tag_configure("simplestatus", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
 log_box.tag_configure("simplestatus_green", foreground=C_LOG_GREEN)
+log_box.tag_configure("simplestatus_white", foreground=C_TEXT)
 log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("simpleline_blue", foreground=C_LOG_BLUE, font=("Consolas", 9))
@@ -3017,6 +3018,8 @@ log_box.tag_raise("transcribe_prefix", "transcribe_using")
 log_box.tag_raise("transcribe_title", "transcribe_using")
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
+# simplestatus_white must override simplestatus so [X/X] and channel name stay white
+log_box.tag_raise("simplestatus_white", "simplestatus")
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -8560,7 +8563,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"  [{idx}/{total}] Transcribing \"{fname}\"  - fetching captions...\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{fname}\"  - fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -8583,7 +8586,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 # Restore punctuation to YouTube captions
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"  [{idx}/{total}] Transcribing \"{fname}\"  - Adding punctuation...\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{fname}\"  - Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -9782,6 +9785,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("simplestatus_white", {"foreground": C_TEXT}),
                              ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
@@ -15161,6 +15165,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("simpledownload", {"foreground": C_LOG_GREEN}),
                              ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
                              ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+                             ("simplestatus_white", {"foreground": C_TEXT}),
                              ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
                              ("pauselog", {"foreground": C_LOG_HEAD}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
@@ -15186,7 +15191,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # encode_prefix/encode_title must precede encode_progress so the white title overlay wins.
 _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpledownload",
-                 "simplestatus_green", "simplestatus",
+                 "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",

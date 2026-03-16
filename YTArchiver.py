@@ -885,6 +885,7 @@ def clear_simple_status():
 def clear_pause_status():
     """Remove the active pause-status anchor line from the log (call before logging resume)."""
     def _write():
+        global _log_at_bottom, _log_user_scrolled
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
@@ -893,6 +894,12 @@ def clear_pause_status():
                     log_box.delete(_ps_r[0], _ps_r[1])
                     _ps_r = log_box.tag_ranges("pausestatus")
                 log_box.config(state="disabled")
+                # After clearing the pause anchor, reset auto-scroll so that
+                # resumed-log lines (and completed transcription lines) are
+                # scrolled into view automatically.
+                _log_at_bottom = True
+                _log_user_scrolled = False
+                log_box.see(tk.END)
         except Exception:
             pass
 
@@ -2420,7 +2427,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v17.7 - 03.15.26 6:46pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v17.8 - 03.16.26 1:26am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -2839,7 +2846,12 @@ ttk.Button(tab_settings, text="Browse", command=browse_outdir).grid(row=0, colum
 
 ttk.Separator(tab_settings, orient="horizontal").grid(row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=10)
 
-ttk.Label(tab_settings, text="Subbed Channels:").grid(row=2, column=0, columnspan=3, sticky="sw", padx=12, pady=(4, 0))
+_subbed_header_frame = ttk.Frame(tab_settings)
+_subbed_header_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 0))
+ttk.Label(_subbed_header_frame, text="Subbed Channels:").pack(side="left")
+_total_disk_var = tk.StringVar(value="")
+_total_disk_label = ttk.Label(_subbed_header_frame, textvariable=_total_disk_var, style="Dim.TLabel")
+_total_disk_label.pack(side="right")
 chan_list_frame = ttk.Frame(tab_settings)
 chan_list_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(2, 4))
 chan_list_frame.columnconfigure(0, weight=1)
@@ -2849,7 +2861,7 @@ chan_scrollbar = ttk.Scrollbar(chan_list_frame, orient="vertical")
 chan_scrollbar.grid(row=0, column=1, sticky="ns")
 
 settings_chan_tree = ttk.Treeview(chan_list_frame, style="Recent.Treeview",
-                                  columns=("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "url"),
+                                  columns=("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "num_vids", "size_on_disk", "url"),
                                   show="headings", selectmode="browse",
                                   yscrollcommand=chan_scrollbar.set)
 settings_chan_tree.grid(row=0, column=0, sticky="nsew")
@@ -2862,6 +2874,8 @@ _CHAN_COL_LABELS = {
     "max": "Max",
     "transcribed": "Transcribed",
     "last_sync": "Last Sync",
+    "num_vids": "# Vids",
+    "size_on_disk": "Size",
     "url": "URL"
 }
 _chan_sort_state = {"col": None, "reverse": False}
@@ -2907,6 +2921,23 @@ def _sort_chan_tree(col, reverse):
             return 0
 
         l.sort(key=lambda t: get_ts(t[1]), reverse=reverse)
+    elif col == "num_vids":
+        def parse_num(s):
+            try:
+                return int(s.replace(",", "")) if s and s != "—" else 0
+            except Exception:
+                return 0
+        l.sort(key=lambda t: parse_num(t[0]), reverse=reverse)
+    elif col == "size_on_disk":
+        def parse_size(s):
+            if not s or s == "—": return 0
+            _units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+            try:
+                parts = s.split()
+                return float(parts[0]) * _units.get(parts[1], 1)
+            except Exception:
+                return 0
+        l.sort(key=lambda t: parse_size(t[0]), reverse=reverse)
     else:
         l.sort(key=lambda t: t[0].lower(), reverse=reverse)
 
@@ -2935,6 +2966,10 @@ settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w",
                            command=lambda: _sort_chan_tree("transcribed", False))
 settings_chan_tree.heading("last_sync", text="Last Sync", anchor="w",
                            command=lambda: _sort_chan_tree("last_sync", False))
+settings_chan_tree.heading("num_vids", text="# Vids", anchor="e",
+                           command=lambda: _sort_chan_tree("num_vids", False))
+settings_chan_tree.heading("size_on_disk", text="Size", anchor="e",
+                           command=lambda: _sort_chan_tree("size_on_disk", False))
 settings_chan_tree.heading("url", text="URL", anchor="w")
 
 settings_chan_tree.column("folder", stretch=False, width=170, anchor="w")
@@ -2944,6 +2979,8 @@ settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
+settings_chan_tree.column("num_vids", stretch=False, width=55, anchor="e")
+settings_chan_tree.column("size_on_disk", stretch=False, width=75, anchor="e")
 settings_chan_tree.column("url", stretch=True, minwidth=100, anchor="w")
 settings_chan_tree.tag_configure("odd", background="#0c0f14")
 settings_chan_tree.tag_configure("even", background=C_LOG_BG)
@@ -3074,6 +3111,8 @@ def refresh_channel_dropdowns():
         chan_dropdown["values"] = names
 
         settings_chan_tree.delete(*settings_chan_tree.get_children())
+        _grand_total_bytes = 0
+        _VIDEO_EXTS_CH = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
         for i, c in enumerate(sorted_channels):
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
             display_res = f"{res}p" if res.isdigit() else res
@@ -3140,9 +3179,56 @@ def refresh_channel_dropdowns():
             else:
                 trans_str = "—"
 
+            # Compute # of vids and size on disk for the channel folder
+            _base_dir = config.get("output_dir", "").strip() or BASE_DIR
+            _folder_name = sanitize_folder(c.get("folder_override", "").strip() or c["name"])
+            _ch_folder = os.path.join(_base_dir, _folder_name)
+            _num_vids = 0
+            _ch_bytes = 0
+            try:
+                if os.path.isdir(_ch_folder):
+                    for _dp, _dns, _fns in os.walk(_ch_folder):
+                        for _fn in _fns:
+                            _fn_lower = _fn.lower()
+                            if (_fn_lower.endswith(_VIDEO_EXTS_CH)
+                                    and ".temp." not in _fn_lower
+                                    and ".part" not in _fn_lower):
+                                _num_vids += 1
+                                try:
+                                    _ch_bytes += os.path.getsize(os.path.join(_dp, _fn))
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
+            _grand_total_bytes += _ch_bytes
+            num_vids_str = f"{_num_vids:,}" if _num_vids else "—"
+            if _ch_bytes >= 1024 ** 4:
+                size_str = f"{_ch_bytes / 1024 ** 4:.2f} TB"
+            elif _ch_bytes >= 1024 ** 3:
+                size_str = f"{_ch_bytes / 1024 ** 3:.2f} GB"
+            elif _ch_bytes >= 1024 ** 2:
+                size_str = f"{_ch_bytes / 1024 ** 2:.1f} MB"
+            elif _ch_bytes > 0:
+                size_str = f"{_ch_bytes / 1024:.1f} KB"
+            else:
+                size_str = "—"
+
             tag = "odd" if i % 2 else "even"
-            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, c['url']),
+            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, num_vids_str, size_str, c['url']),
                                       tags=(tag,))
+
+        # Update total size on disk label
+        if _grand_total_bytes >= 1024 ** 4:
+            _total_str = f"Total: {_grand_total_bytes / 1024 ** 4:.2f} TB"
+        elif _grand_total_bytes >= 1024 ** 3:
+            _total_str = f"Total: {_grand_total_bytes / 1024 ** 3:.2f} GB"
+        elif _grand_total_bytes >= 1024 ** 2:
+            _total_str = f"Total: {_grand_total_bytes / 1024 ** 2:.1f} MB"
+        elif _grand_total_bytes > 0:
+            _total_str = f"Total: {_grand_total_bytes / 1024:.1f} KB"
+        else:
+            _total_str = ""
+        _total_disk_var.set(_total_str)
 
     if _chan_sort_state["col"]:
         _sort_chan_tree(_chan_sort_state["col"], _chan_sort_state["reverse"])

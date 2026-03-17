@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.6 - 03.17.26 1:52pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.7 - 03.17.26 2:12pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3708,6 +3708,8 @@ def _clear_edit_mode():
 
 
 def on_channel_double_click(event):
+    if settings_chan_tree.identify_region(event.x, event.y) != "cell":
+        return
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
@@ -8639,6 +8641,27 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
                 return
 
+            # ── Whisper pending cache ────────────────────────────────────
+            # If a previous run identified files needing Whisper but was cancelled before
+            # Phase B ran, load those files so we skip re-fetching captions for them.
+            _whisper_cache_path = os.path.join(folder, "_whisper_pending.json")
+            _whisper_cache_set = set()  # set of fpaths known to need Whisper
+            try:
+                if os.path.exists(_whisper_cache_path):
+                    import json as _cjson
+                    with open(_whisper_cache_path, "r", encoding="utf-8") as _cf:
+                        _cached_entries = _cjson.load(_cf)
+                    # Only keep files still on disk and not yet transcribed
+                    _fp_to_process = set(files_to_process.values())
+                    _whisper_cache_set = {
+                        e["fpath"] for e in _cached_entries
+                        if isinstance(e, dict) and e.get("fpath") and e["fpath"] in _fp_to_process
+                    }
+                    if _whisper_cache_set:
+                        log(f"  Resuming: {len(_whisper_cache_set)} file(s) already identified for Whisper — skipping caption re-check.\n", "simpleline")
+            except Exception:
+                _whisper_cache_set = set()
+
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
             log("  Fetching YouTube video list for caption matching...\n", "simpleline")
             yt_title_to_id = {}  # yt_title -> video_id
@@ -8863,6 +8886,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _yt_normalized[_norm] = vid_id
 
             for fname, fpath in files_to_process.items():
+                # Files in the Whisper cache already failed captions — send directly to Whisper
+                if fpath in _whisper_cache_set:
+                    unmatched.append((fname, fpath))
+                    continue
                 # Try exact match first, then normalized match
                 if fname in yt_title_to_id:
                     matched.append((fname, fpath, yt_title_to_id[fname]))
@@ -8969,7 +8996,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _consec_caption_fails == 5 and _caption_successes > 0:
                             log(f"  ⚠ {_consec_caption_fails} consecutive caption failures — possible rate-limit; slowing down...\n", "red")
                         # Auto-captions genuinely unavailable — Whisper this file instead
-                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim" if _is_simple_mode else "simpleline")
+                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim")
                         unmatched.append((fname, fpath))
                         idx -= 1   # give back the slot — this file will be counted in Phase B
                         continue
@@ -9073,6 +9100,17 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             save_config(config)
                         _stop_punct_process()  # free GPU memory; no GPU task to manage it
                 return  # skip Phase B
+
+            # ── Write Whisper pending cache ──────────────────────────────
+            # Persist the unmatched list so a cancelled/paused run can resume
+            # Phase B without repeating the entire Phase A caption scan.
+            if unmatched:
+                try:
+                    import json as _cjson
+                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                        _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                except Exception:
+                    pass
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -9397,6 +9435,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 pass
 
             if not _ce.is_set():
+                # Phase B complete — clear the Whisper pending cache
+                try:
+                    if os.path.exists(_whisper_cache_path):
+                        os.remove(_whisper_cache_path)
+                except Exception:
+                    pass
                 log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
                 if err_count:
                     log(f", {err_count} skipped", "simpleline_green")

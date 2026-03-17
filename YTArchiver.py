@@ -1679,7 +1679,11 @@ _DISK_ERROR_PATTERNS = tuple(p.lower() for p in (
     "Access is denied",
     "[Errno 22] Invalid argument",
     "[Errno 13]",
+    "[Errno 28]",        # ENOSPC: No space left on device (Linux/Mac)
     "[WinError 5]",
+    "[WinError 112]",    # ERROR_DISK_FULL: There is not enough space on the disk (Windows)
+    "no space left",     # Common yt-dlp/ffmpeg disk-full message
+    "not enough space",  # Windows disk-full in plain English
 ))
 _DISK_RETRY_MINUTES = 5
 
@@ -1783,8 +1787,12 @@ def _remove_ids_from_archive(ids_to_remove):
                 if len(parts) >= 2 and parts[-1] in remove_set:
                     continue  # Skip this line (remove it)
                 new_lines.append(line)
-            with open(ARCHIVE_FILE, "w", encoding="utf-8") as f:
+            # Atomic write: write to temp file then replace, so a crash mid-write
+            # can't leave the archive empty or corrupt.
+            _tmp = ARCHIVE_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
+            os.replace(_tmp, ARCHIVE_FILE)
         except (OSError, PermissionError) as e:
             log(f"  ⚠ Could not update archive file: {e}\n", "red")
 
@@ -2677,7 +2685,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.5 - 03.16.26 9:28pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.6 - 03.16.26 9:54pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3295,7 +3303,7 @@ ttk.Button(_video_nudge_frame, text="→ Send to Download tab",
 ttk.Label(add_outer, text="Resolution:").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=(0, 4))
 new_res_var = tk.StringVar(value="720")
 _combo(add_outer, textvariable=new_res_var, values=RESOLUTION_OPTIONS, state="readonly", width=8).grid(
-    row=2, column=1, sticky="w", padx=(0, 12))
+    row=2, column=1, sticky="w", padx=(0, 4))
 
 
 def _res_check_click():
@@ -3331,7 +3339,7 @@ def _res_check_click():
         _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
 
 
-res_check_btn = ttk.Button(add_outer, text="↺", width=3, command=_res_check_click,
+res_check_btn = ttk.Button(add_outer, text="↺", width=2, command=_res_check_click,
                            takefocus=False)
 res_check_btn.grid(row=2, column=2, sticky="w", padx=(0, 4))
 
@@ -4994,8 +5002,10 @@ def remove_channel():
                                 continue
                             kept.append(l)
                         removed_count = len(lines) - len(kept)
-                        with open(ARCHIVE_FILE, "w", encoding="utf-8") as f_:
+                        _tmp = ARCHIVE_FILE + ".tmp"
+                        with open(_tmp, "w", encoding="utf-8") as f_:
                             f_.writelines(kept)
+                        os.replace(_tmp, ARCHIVE_FILE)
                         log(f"  ✓ Removed {removed_count:,} IDs for \"{removed_name}\" from blocklist.\n", "green")
                     else:
                         log("  ⚠ Archive file not found — nothing to purge.\n", "red")
@@ -8302,6 +8312,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
     def _worker():
         global _redownload_running
         _redownload_running = True
+        cancel_event.clear()  # Reset any stale cancel from a previous Stop so the redownload isn't immediately aborted
         _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
         _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
         _current_job["url"] = ch_url
@@ -16357,8 +16368,9 @@ def _load_queue_state():
         if not os.path.exists(QUEUE_FILE):
             return False
         with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            queue_data = json.load(f)
-        os.remove(QUEUE_FILE)  # Consume the file
+            raw = f.read()
+        os.remove(QUEUE_FILE)  # Consume the file now, before parsing — so a corrupt file doesn't block every launch
+        queue_data = json.loads(raw)
 
         restored = 0
         sync_items = queue_data.get("sync", [])

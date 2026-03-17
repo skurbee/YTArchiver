@@ -8730,9 +8730,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 log(f"  ▶ {_bf_pl} resumed at {_fmt_time()}...\n", "pauselog")
                             # After resume: wipe temp dir so stale state cannot interfere.
                             try:
-                                import shutil as _shutil_bf_resume
                                 if os.path.isdir(_bf_temp):
-                                    _shutil_bf_resume.rmtree(_bf_temp, ignore_errors=True)
+                                    shutil.rmtree(_bf_temp, ignore_errors=True)
                                 os.makedirs(_bf_temp, exist_ok=True)
                             except Exception:
                                 pass
@@ -8933,9 +8932,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     # After resume: wipe temp dir and reset consecutive fail counter
                     # so stale state from the pre-pause session cannot interfere.
                     try:
-                        import shutil as _shutil_resume
                         if os.path.isdir(temp_dir):
-                            _shutil_resume.rmtree(temp_dir, ignore_errors=True)
+                            shutil.rmtree(temp_dir, ignore_errors=True)
                         os.makedirs(temp_dir, exist_ok=True)
                     except Exception:
                         pass

@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.7 - 03.17.26 2:12pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.8 - 03.17.26 2:28pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8936,6 +8936,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             done_count = 0
             err_count = 0
             idx = 0
+            _check_idx = 0       # monotonically increasing caption-check counter (for simple mode [X/Y])
+            _whisper_queued = 0  # how many videos were queued for Whisper during Phase A
             _modified_txt_files = set()  # track which .txt files we wrote to, for post-sort
             _transcription_log = []  # [(fname, source, elapsed_secs, error_str_or_None)]
             _t_total_start = time.time()
@@ -8945,6 +8947,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _caption_successes = 0     # total successes so far (to detect regression)
             for fname, fpath, vid_id in matched:
                 idx += 1
+                _check_idx += 1
                 _fname_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
 
                 # Pause check
@@ -8976,7 +8979,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 elif _consec_caption_fails >= 3:
                     time.sleep(1)
 
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...\n", "transcribe_using")
+                _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _is_simple_mode and _whisper_queued > 0 else ""
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -8998,6 +9002,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # Auto-captions genuinely unavailable — Whisper this file instead
                         log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim")
                         unmatched.append((fname, fpath))
+                        _whisper_queued += 1
                         idx -= 1   # give back the slot — this file will be counted in Phase B
                         continue
 
@@ -13040,7 +13045,7 @@ def _show_queue_menu(event=None):
             canvas_frame.pack(fill="both", expand=True, padx=2)
 
             canvas = tk.Canvas(canvas_frame, bg="#2d2d2d", highlightthickness=0,
-                               height=list_height, width=310)
+                               height=list_height, width=310, yscrollincrement=item_height)
 
             if len(items) > max_visible:
                 scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
@@ -13817,7 +13822,7 @@ def _show_gpu_menu(event=None):
             canvas_frame.pack(fill="both", expand=True, padx=2)
 
             canvas = tk.Canvas(canvas_frame, bg="#2d2d2d", highlightthickness=0,
-                               height=list_height, width=310)
+                               height=list_height, width=310, yscrollincrement=item_height)
 
             if len(items) > max_visible:
                 scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)

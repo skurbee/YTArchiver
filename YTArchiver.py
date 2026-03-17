@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.6 - 03.17.26 1:15pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.6 - 03.17.26 1:52pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8725,8 +8725,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             log(f"  ⏸ {_bf_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                             while _pe.is_set() and not _ce.is_set():
                                 time.sleep(0.25)
+                            clear_pause_status()
                             if not _ce.is_set():
-                                clear_pause_status()
                                 log(f"  ▶ {_bf_pl} resumed at {_fmt_time()}...\n", "pauselog")
                             # After resume: wipe temp dir so stale state cannot interfere.
                             try:
@@ -8926,8 +8926,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                     while _pe.is_set() and not _ce.is_set():
                         time.sleep(0.25)
+                    clear_pause_status()
                     if not _ce.is_set():
-                        clear_pause_status()
                         log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                     # After resume: wipe temp dir and reset consecutive fail counter
                     # so stale state from the pre-pause session cannot interfere.
@@ -8969,7 +8969,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _consec_caption_fails == 5 and _caption_successes > 0:
                             log(f"  ⚠ {_consec_caption_fails} consecutive caption failures — possible rate-limit; slowing down...\n", "red")
                         # Auto-captions genuinely unavailable — Whisper this file instead
-                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "simpleline")
+                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim" if _is_simple_mode else "simpleline")
                         unmatched.append((fname, fpath))
                         idx -= 1   # give back the slot — this file will be counted in Phase B
                         continue
@@ -9254,8 +9254,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                             while _pe.is_set() and not _ce.is_set():
                                 time.sleep(0.25)
+                            clear_pause_status()
                             if not _ce.is_set():
-                                clear_pause_status()
                                 log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
                         if _ce.is_set():
                             log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
@@ -11331,8 +11331,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
+                clear_pause_status()
                 if not cancel_event.is_set():
-                    clear_pause_status()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
             if cancel_event.is_set():
                 break
@@ -14215,9 +14215,9 @@ def _gpu_start():
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                             time.sleep(0.25)
                         _gpu_truly_paused = False
+                        clear_pause_status()
                         if not _gpu_cancel.is_set():
                             _tray_start_spin(red=True)  # resume blinking
-                            clear_pause_status()
                             log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                     if _gpu_cancel.is_set():
@@ -14454,9 +14454,9 @@ def _gpu_start():
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         time.sleep(0.25)
                     _gpu_truly_paused = False
+                    clear_pause_status()
                     if not _gpu_cancel.is_set():
                         _tray_start_spin(red=True)  # resume blinking
-                        clear_pause_status()
                         log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _gpu_cancel.is_set():

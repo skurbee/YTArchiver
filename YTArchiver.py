@@ -500,7 +500,8 @@ def log(text, tag=None):
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header",
-                                        "simpleline_blue", "simpleline", "simpleline_green")):
+                                        "simpleline_blue", "simpleline", "simpleline_green",
+                                        "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
                         log_box.insert(ss_ranges[0], text, use_tag)
@@ -2689,7 +2690,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.9 - 03.16.26 10:45pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.0 - 03.17.26 12:06am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11186,6 +11187,22 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             if "maximum number of downloads" in line_lower:
                 continue
 
+            # Extract video ID before any simple-mode continues so that
+            # current_vid_id is always set when a duration filter fires.
+            # yt-dlp signals each playlist entry with a [youtube:tab] Extracting
+            # URL line that carries the video ID — if that line is skipped by the
+            # simple-mode continue below, the archive write for filtered videos
+            # would use a stale/null ID and the video would be re-scanned every sync.
+            if "[download] Destination:" not in line:
+                m = re.search(r'\[(?:youtube|download|info)\]\s+([a-zA-Z0-9_-]{11}):', line)
+                if m:
+                    current_vid_id = m.group(1)
+            if "Extracting URL:" in line:
+                m = (re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', line)
+                     or re.search(r'/(?:shorts|live|embed)/([a-zA-Z0-9_-]{11})', line))
+                if m:
+                    current_vid_id = m.group(1)
+
             # Track [youtube:tab] page enumeration for simple mode status
             if "[youtube:tab]" in line:
                 _page_m = re.search(r'page\s+(\d+)', line)
@@ -11196,15 +11213,6 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             elif _simple_anim_state.get("page_num", 0) > 0:
                 # Enumeration phase ended, clear page indicator
                 _simple_anim_state["page_num"] = 0
-
-            if "[download] Destination:" not in line:
-                m = re.search(r'\[(?:youtube|download|info)\]\s+([a-zA-Z0-9_-]{11}):', line)
-                if m:
-                    current_vid_id = m.group(1)
-            if "Extracting URL:" in line:
-                m = re.search(r'v=([a-zA-Z0-9_-]{11})', line)
-                if m:
-                    current_vid_id = m.group(1)
 
             if "DLTRACK:::" in line:
                 try:

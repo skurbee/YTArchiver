@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.0 - 03.17.26 3:18pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.1 - 03.17.26 3:30pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8982,7 +8982,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     time.sleep(1)
 
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _is_simple_mode and _whisper_queued > 0 else ""
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{str(_check_idx).rjust(_total_digits)}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...{_w_suffix}\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -9012,7 +9012,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _consec_caption_fails = 0  # reset on success
                 _caption_successes += 1
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{str(_check_idx).rjust(_total_digits)}/{total}] Transcribing \"{_fname_trunc}\"  - Adding punctuation...{_w_suffix}\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - Adding punctuation...{_w_suffix}\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime

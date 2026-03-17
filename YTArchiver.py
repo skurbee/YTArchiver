@@ -1405,7 +1405,7 @@ def _start_simple_anim(channel, idx, total, mode="sync"):
             except Exception:
                 pass
         if _simple_anim_state["active"] and root.winfo_exists():
-            _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
+            _simple_anim_tick()  # fire immediately; reschedules itself at 500ms intervals
     _ui_queue.append(_do_start)
 
 
@@ -2689,7 +2689,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.7 - 03.16.26 10:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.8 - 03.16.26 10:36pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3343,9 +3343,11 @@ def _res_check_click():
         _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
 
 
-res_check_btn = ttk.Button(add_outer, text="↺", width=2, command=_res_check_click,
-                           takefocus=False)
-res_check_btn.grid(row=2, column=2, sticky="w", padx=(0, 4))
+res_check_btn = ttk.Label(add_outer, text="↺", style="Dim.TLabel", cursor="hand2", takefocus=False)
+res_check_btn.bind("<Button-1>", lambda e: _res_check_click())
+res_check_btn.bind("<Enter>", lambda e: res_check_btn.configure(style="TLabel"))
+res_check_btn.bind("<Leave>", lambda e: res_check_btn.configure(style="Dim.TLabel"))
+res_check_btn.grid(row=2, column=2, sticky="w", padx=(2, 4))
 
 ttk.Label(add_outer, text="Duration Limit:", style="Dim.TLabel").grid(row=1, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
@@ -11775,7 +11777,7 @@ def start_sync_all():
     sync_btn.config(state="disabled", text="⏳ Syncing...")
     _update_queue_btn()
 
-    _dot_cycle = [".", "..", "..."]
+    _dot_cycle = [".  ", ".. ", "..."]
     _dot_state = {"i": 0, "job": None}
 
     def _animate_dots():

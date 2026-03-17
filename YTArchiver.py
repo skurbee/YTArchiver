@@ -2677,7 +2677,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.4 - 03.16.26 8:15pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.5 - 03.16.26 9:28pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8475,22 +8475,39 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
             log("  Fetching YouTube video list for caption matching...\n", "simpleline")
             yt_title_to_id = {}  # yt_title -> video_id
-            try:
-                enum_cmd = [
+            def _fetch_yt_title_map(use_cookies):
+                """Fetch title→id map from YouTube playlist. Returns {} on failure."""
+                _cmd = [
                     "yt-dlp", "--flat-playlist",
                     "--print", "%(id)s|||%(title)s",
                     "--no-warnings",
-                    "--cookies-from-browser", "firefox",
-                    ch_url
                 ]
-                enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=300, startupinfo=startupinfo)
-                for line in enum_proc.stdout.strip().split("\n"):
-                    if "|||" in line:
-                        vid_id, yt_title = line.strip().split("|||", 1)
-                        yt_title_to_id[yt_title.strip()] = vid_id.strip()
+                if use_cookies:
+                    _cmd += ["--cookies-from-browser", "firefox"]
+                _cmd.append(ch_url)
+                try:
+                    _proc = subprocess.run(_cmd, capture_output=True, text=True, timeout=300, startupinfo=startupinfo)
+                    _result = {}
+                    for _line in _proc.stdout.strip().split("\n"):
+                        if "|||" in _line:
+                            _vid_id, _yt_title = _line.strip().split("|||", 1)
+                            _vid_id = _vid_id.strip()
+                            _yt_title = _yt_title.strip()
+                            if re.fullmatch(r'[\w-]{11}', _vid_id):
+                                _result[_yt_title] = _vid_id
+                    return _result
+                except Exception as _e:
+                    log(f"  ⚠ Could not fetch YouTube list: {_e}\n", "red")
+                    return {}
+
+            yt_title_to_id = _fetch_yt_title_map(use_cookies=True)
+            if not yt_title_to_id and not _ce.is_set():
+                log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+                yt_title_to_id = _fetch_yt_title_map(use_cookies=False)
+            if not yt_title_to_id:
+                log("  ⚠ Could not retrieve video list — all files will use Whisper.\n", "red")
+            else:
                 log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
-            except Exception as e:
-                log(f"  ⚠ Could not fetch YouTube list: {e}. All files will use Whisper.\n", "red")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -8693,6 +8710,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             total = len(matched) + len(unmatched)
             temp_dir = os.path.join(folder, "_transcribe_temp")
+            # Wipe any stale temp dir from a previous cancelled/interrupted run.
+            # yt-dlp's default no-overwrite behaviour means leftover .vtt files
+            # would cause it to skip the subtitle download entirely, making
+            # _fetch_auto_captions silently return None for those videos.
+            try:
+                import shutil as _shutil_init
+                if os.path.isdir(temp_dir):
+                    _shutil_init.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
             os.makedirs(temp_dir, exist_ok=True)
 
             # Load punctuation model if we have any matched files (for YT captions)

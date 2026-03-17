@@ -2674,7 +2674,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.0 - 03.16.26 4:55pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.1 - 03.16.26 11:35pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7218,6 +7218,39 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         except Exception:
             pass
 
+    def _fetch_yt_list(use_cookies):
+        """Fetch YouTube video list (id→title) using spawn_yt_dlp with cancel support."""
+        enum_cmd = [
+            "yt-dlp", "--flat-playlist",
+            "--print", "%(id)s|||%(title)s",
+            "--no-warnings",
+        ]
+        if use_cookies:
+            enum_cmd += ["--cookies-from-browser", "firefox"]
+        enum_cmd.append(ch_url)
+        proc = spawn_yt_dlp(enum_cmd)
+        if proc is None:
+            return None
+        result = {}
+        try:
+            for line in proc.stdout:
+                if (cancel_ev or cancel_event).is_set():
+                    proc.terminate()
+                    break
+                line = line.strip()
+                if "|||" in line:
+                    vid_id, yt_title = line.split("|||", 1)
+                    vid_id = vid_id.strip()
+                    yt_title = yt_title.strip()
+                    if re.fullmatch(r'[\w-]{11}', vid_id):  # YouTube IDs are exactly 11 chars
+                        result[yt_title] = vid_id
+        finally:
+            proc.wait()
+            with proc_lock:
+                if proc in active_processes:
+                    active_processes.remove(proc)
+        return result
+
     def _worker():
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
@@ -7225,6 +7258,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         log(f"\n=== Resolution Redownload: {ch_name} ({_res_label}) ===\n", "header")
 
         # ── Step 1: Scan local video files ──
+        # Key: filename (without path), Value: full path.  Use the LAST path seen for
+        # any given filename so duplicates across split_year sub-folders are handled.
         local_files = {}
         for dirpath, dirnames, files in os.walk(folder):
             dirnames[:] = [d for d in dirnames if d not in ("_BACKLOG_TEMP", "_TEMP_COMPRESS")]
@@ -7240,34 +7275,47 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         log(f"  Found {len(local_files)} local file(s).\n", "simpleline")
 
         if _ce.is_set():
+            log("  Redownload cancelled before YouTube fetch.\n", "simpleline")
             return
 
         # ── Step 2: Fetch YouTube video list for ID matching ──
+        # Try with cookies first; fall back to without cookies for public channels.
         log("  Fetching YouTube video list for ID matching...\n", "simpleline")
-        yt_title_to_id = {}
-        try:
-            enum_cmd = [
-                "yt-dlp", "--flat-playlist",
-                "--print", "%(id)s|||%(title)s",
-                "--no-warnings",
-                "--cookies-from-browser", "firefox",
-                ch_url
-            ]
-            enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=600,
-                                       startupinfo=startupinfo)
-            for line in enum_proc.stdout.strip().split("\n"):
-                if "|||" in line:
-                    vid_id, yt_title = line.strip().split("|||", 1)
-                    yt_title_to_id[yt_title.strip()] = vid_id.strip()
-            log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
-        except Exception as e:
-            log(f"  ⚠ Could not fetch YouTube list: {e}\n", "red")
-            return
+        yt_title_to_id = _fetch_yt_list(use_cookies=True)
 
         if _ce.is_set():
+            log("  Redownload cancelled during YouTube fetch.\n", "simpleline")
+            return
+
+        if yt_title_to_id is None:
+            log("  ⚠ Could not start yt-dlp (not installed or not on PATH).\n", "red")
+            return
+
+        if not yt_title_to_id:
+            # Retry without cookies — useful for public channels where Firefox
+            # cookies are not configured or cause authentication errors.
+            log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+            yt_title_to_id = _fetch_yt_list(use_cookies=False) or {}
+            if _ce.is_set():
+                log("  Redownload cancelled during YouTube fetch.\n", "simpleline")
+                return
+
+        if not yt_title_to_id:
+            log("  ⚠ Could not retrieve video list from YouTube. Check the channel URL and your internet connection.\n", "red")
+            return
+
+        log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+
+        if _ce.is_set():
+            log("  Redownload cancelled after YouTube fetch.\n", "simpleline")
             return
 
         # ── Step 3: Build normalized lookup and match local files ──
+        # Fuzzy-match cutoff for difflib: 0.92 = high confidence (avoids false positives
+        # on short or similar-sounding titles while still catching minor Unicode/OS
+        # filename-sanitisation differences).
+        _FUZZY_CUTOFF = 0.92
+
         norm_lookup = {}
         for yt_title, vid_id in yt_title_to_id.items():
             norm = re.sub(r'[^\w]', '', unicodedata.normalize('NFC', yt_title.lower()))
@@ -7275,6 +7323,9 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             norm_a = _norm_ascii(yt_title)
             if norm_a != norm and norm_a not in norm_lookup:
                 norm_lookup[norm_a] = (vid_id, yt_title)
+
+        # Pre-build sorted list of norm_lookup keys for difflib matching
+        _norm_keys = list(norm_lookup.keys())
 
         work_list = []
         skipped_no_match = 0
@@ -7287,6 +7338,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             match = norm_lookup.get(norm_fname)
             if not match and norm_fname_ascii != norm_fname:
                 match = norm_lookup.get(norm_fname_ascii)
+            # Prefix matching for truncated filenames (--trim-filenames 200)
             if not match and len(norm_fname) >= 15:
                 for norm_title, val in norm_lookup.items():
                     if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title[:len(norm_fname)]):
@@ -7297,6 +7349,13 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     if norm_title.startswith(norm_fname_ascii) or norm_fname_ascii.startswith(norm_title[:len(norm_fname_ascii)]):
                         match = val
                         break
+            # Fuzzy fallback via difflib — catches minor Unicode/sanitisation differences
+            if not match and len(norm_fname) >= 10 and _norm_keys:
+                _close = difflib.get_close_matches(norm_fname, _norm_keys, n=1, cutoff=_FUZZY_CUTOFF)
+                if not _close:
+                    _close = difflib.get_close_matches(norm_fname_ascii, _norm_keys, n=1, cutoff=_FUZZY_CUTOFF)
+                if _close:
+                    match = norm_lookup[_close[0]]
 
             if match:
                 work_list.append((match[0], fpath))
@@ -7379,8 +7438,10 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             log(f"    Downloading ({_res_label})...\n", "simpleline")
             try:
                 dl_proc = spawn_yt_dlp(dl_cmd)
-                with proc_lock:
-                    active_processes.append(dl_proc)
+                if dl_proc is None:
+                    log(f"    ⚠ Could not start yt-dlp.\n", "red")
+                    errors += 1
+                    continue
                 for line in dl_proc.stdout:
                     if _ce.is_set():
                         dl_proc.terminate()

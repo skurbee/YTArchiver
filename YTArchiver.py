@@ -110,6 +110,10 @@ config_lock = threading.RLock()
 io_lock = threading.Lock()
 
 session_totals = {"dl": 0, "skip": 0, "err": 0, "dur": 0}
+_queue_batch_idx = 0    # current 1-based channel index in a queue-driven batch (0 = not in batch)
+_queue_batch_total = 0  # total channels in current queue-driven batch
+_queue_batch_dl = 0     # accumulated downloads across batch
+_queue_batch_err = 0    # accumulated errors across batch
 new_download_count = 0
 cancel_event = threading.Event()
 pause_event = threading.Event()
@@ -2685,7 +2689,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.6 - 03.16.26 9:54pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.7 - 03.16.26 10:14pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4378,13 +4382,16 @@ def sync_single_channel():
 
     def _single_worker():
         global _sync_running, _current_sync_ch
+        global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err
+        _pfx_i = _queue_batch_idx if _queue_batch_total > 0 else 1
+        _pfx_t = _queue_batch_total if _queue_batch_total > 0 else 1
         try:
             out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
                 log(f"ERROR: Cannot write to '{out_dir}'.\n", "red")
                 return
 
-            log(f"\n--- [1/1] SYNCING: {ch['name']} ---\n", "header")
+            log(f"\n--- [{_pfx_i}/{_pfx_t}] SYNCING: {ch['name']} ---\n", "header")
             log(f"  Checking channel...\n", "dim")
 
             deferred_streams = []
@@ -4422,7 +4429,7 @@ def sync_single_channel():
                     if _is_simple_mode:
                         _stop_simple_anim()
                         _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
-                        log(f"[{1}/{1}] {_cn:<34} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
+                        log(f"[{_pfx_i}/{_pfx_t}] {_cn:<34} —  Downloaded: None, hit daily limit. Resets at {cooldown_str}\n", "simpleline")
                     return
 
             if mode == "sub" and not is_init:
@@ -4631,7 +4638,7 @@ def sync_single_channel():
                         _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
                         _tag = "simpleline_green" if c_dl else "simpleline"
                         _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
-                        log(f"[{1}/{1}] {_cn:<34} —  Downloaded: {_v}\n", _tag)
+                        log(f"[{_pfx_i}/{_pfx_t}] {_cn:<34} —  Downloaded: {_v}\n", _tag)
 
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
@@ -4728,21 +4735,26 @@ def sync_single_channel():
                         "combined": not _at_sy
                     })
 
-                _dl = session_totals["dl"]
-                _plural = "s" if _dl != 1 else ""
-                _notif_msg = f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
-                if _batch_more_remaining:
-                    _notif_msg += " (batch — more remaining)"
-                show_notification("YT Archiver — Sync complete", _notif_msg)
+                if _queue_batch_total > 1:
+                    # Queue batch mode: accumulate totals; defer summary/notification to end
+                    _queue_batch_dl += session_totals["dl"]
+                    _queue_batch_err += session_totals["err"]
+                else:
+                    _dl = session_totals["dl"]
+                    _plural = "s" if _dl != 1 else ""
+                    _notif_msg = f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
+                    if _batch_more_remaining:
+                        _notif_msg += " (batch — more remaining)"
+                    show_notification("YT Archiver — Sync complete", _notif_msg)
 
-                _skipped_list = _last_run_counts.get("skipped_titles", [])
-                _skip_n = len(_skipped_list)
-                log("\n" + "=" * 45 + "\n", "summary")
-                log(f"CHANNEL SUMMARY:\n", "summary")
-                log(f"Downloaded: {session_totals['dl']}, Skipped: {_skip_n}\n", "summary")
-                if session_totals['err'] > 0:
-                    log(f"Errors: {session_totals['err']}\n", "summary")
-                log("=" * 45 + "\n", "summary")
+                    _skipped_list = _last_run_counts.get("skipped_titles", [])
+                    _skip_n = len(_skipped_list)
+                    log("\n" + "=" * 45 + "\n", "summary")
+                    log(f"CHANNEL SUMMARY:\n", "summary")
+                    log(f"Downloaded: {session_totals['dl']}, Skipped: {_skip_n}\n", "summary")
+                    if session_totals['err'] > 0:
+                        log(f"Errors: {session_totals['err']}\n", "summary")
+                    log("=" * 45 + "\n", "summary")
                 log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
             elapsed_single = (datetime.now() - t_start_single).total_seconds()
@@ -4765,18 +4777,39 @@ def sync_single_channel():
                     _queue_started = _process_next_queued()
 
                 if not _queue_started:
+                    # End of queue batch (or single-channel sync) — fire final summary if batch
+                    if _queue_batch_total > 1 and not cancel_event.is_set():
+                        _b_dl = _queue_batch_dl
+                        _b_err = _queue_batch_err
+                        _b_plural = "s" if _b_dl != 1 else ""
+                        log("\n" + "=" * 45 + "\n", "summary")
+                        log(f"TOTAL SYNC SUMMARY:\n", "summary")
+                        log(f"Downloaded: {_b_dl}, Channels synced: {_queue_batch_total}\n", "summary")
+                        if _b_err > 0:
+                            log(f"Errors: {_b_err}\n", "summary")
+                        log("=" * 45 + "\n", "summary")
+                        show_notification(
+                            "YT Archiver — Sync complete",
+                            f"Downloaded {_b_dl} video{_b_plural} across {_queue_batch_total} channels. Errors: {_b_err}"
+                        )
+                    # Capture for tray tooltip before resetting
+                    _final_dl = _queue_batch_dl if _queue_batch_total > 1 else session_totals["dl"]
+                    # Reset batch tracking whenever queue drains
+                    _queue_batch_idx = 0
+                    _queue_batch_total = 0
+                    _queue_batch_dl = 0
+                    _queue_batch_err = 0
                     _sync_running = False
                     _current_sync_ch = None
                     if _root_alive:
-                        def _on_single_sync_done():
+                        def _on_single_sync_done(_fdl=_final_dl):
                             _validate_download_btn()
                             sync_btn.config(state="normal")
                             sync_single_btn.config(state="normal", text="▶ Sync this channel")
                             _sync_task_finished()
                             _tray_stop_spin()
-                            _dl = session_totals["dl"]
-                            if _dl > 0:
-                                _update_tray_tooltip(f"YT Archiver — {_dl} new video{'s' if _dl != 1 else ''} downloaded")
+                            if _fdl > 0:
+                                _update_tray_tooltip(f"YT Archiver — {_fdl} new video{'s' if _fdl != 1 else ''} downloaded")
                             else:
                                 _update_tray_tooltip("YT Archiver — Idle")
 
@@ -4798,6 +4831,7 @@ def sync_single_channel():
 
 def _process_sync_queue():
     """Process next queued sync if any. Returns True if a sync was started."""
+    global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err
     with _sync_queue_lock:
         if not _sync_queue:
             return False
@@ -4808,6 +4842,13 @@ def _process_sync_queue():
             _queue_order.remove(("sync", next_ch["url"]))
         except ValueError:
             pass
+
+    # Track position in queue batch so _single_worker shows correct [i/total] counter
+    if _queue_batch_idx == 0:
+        _queue_batch_dl = 0
+        _queue_batch_err = 0
+    _queue_batch_idx += 1
+    _queue_batch_total = _queue_batch_idx + remaining
 
     if next_ch.get("initialized", False):
         _current_job["label"] = f"Sync {next_ch['name']}"

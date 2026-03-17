@@ -2690,7 +2690,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.0 - 03.17.26 12:06am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.1 - 03.17.26 8:12am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3307,8 +3307,9 @@ ttk.Button(_video_nudge_frame, text="→ Send to Download tab",
 
 ttk.Label(add_outer, text="Resolution:").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=(0, 4))
 new_res_var = tk.StringVar(value="720")
-_combo(add_outer, textvariable=new_res_var, values=RESOLUTION_OPTIONS, state="readonly", width=8).grid(
-    row=2, column=1, sticky="w", padx=(0, 4))
+_res_row_frame = tk.Frame(add_outer, bg=C_SURFACE)
+_res_row_frame.grid(row=2, column=1, sticky="w", pady=(0, 4))
+_combo(_res_row_frame, textvariable=new_res_var, values=RESOLUTION_OPTIONS, state="readonly", width=8).pack(side="left", padx=(0, 4))
 
 
 def _res_check_click():
@@ -3344,11 +3345,11 @@ def _res_check_click():
         _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
 
 
-res_check_btn = ttk.Label(add_outer, text="↺", style="Dim.TLabel", cursor="hand2", takefocus=False)
+res_check_btn = ttk.Label(_res_row_frame, text="↺", style="Dim.TLabel", cursor="hand2", takefocus=False)
 res_check_btn.bind("<Button-1>", lambda e: _res_check_click())
 res_check_btn.bind("<Enter>", lambda e: res_check_btn.configure(style="TLabel"))
 res_check_btn.bind("<Leave>", lambda e: res_check_btn.configure(style="Dim.TLabel"))
-res_check_btn.grid(row=2, column=2, sticky="w", padx=(2, 4))
+res_check_btn.pack(side="left", padx=(2, 0))
 
 ttk.Label(add_outer, text="Duration Limit:", style="Dim.TLabel").grid(row=1, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
@@ -8302,8 +8303,6 @@ def _process_redownload_queue():
             pass
     _rr_res = item.get("resolution", "")
     _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
-    _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
-    _update_queue_btn()
     log(f"\n=== Processing queued redownload: {ch_name} ({_rr_disp})", "header")
     if remaining:
         log(f" ({remaining} more in queue)", "header")
@@ -8349,9 +8348,12 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
         _add_to_redownload_queue(ch_name, ch_url, folder, resolution)
         return
 
+    # Set flag before starting thread to close the race window where a second
+    # call could pass the check above before the thread sets it itself.
+    _redownload_running = True
+
     def _worker():
         global _redownload_running
-        _redownload_running = True
         cancel_event.clear()  # Reset any stale cancel from a previous Stop so the redownload isn't immediately aborted
         _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
         _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"

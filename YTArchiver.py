@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.8 - 03.17.26 2:28pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.9 - 03.17.26 2:54pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8910,6 +8910,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log("\n", "simpleline")
 
             total = len(matched) + len(unmatched)
+            _total_digits = len(str(total))
             temp_dir = os.path.join(folder, "_transcribe_temp")
             # Wipe any stale temp dir from a previous cancelled/interrupted run.
             # yt-dlp's default no-overwrite behaviour means leftover .vtt files
@@ -8937,7 +8938,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             err_count = 0
             idx = 0
             _check_idx = 0       # monotonically increasing caption-check counter (for simple mode [X/Y])
-            _whisper_queued = 0  # how many videos were queued for Whisper during Phase A
+            _whisper_queued = len(unmatched)  # pre-scan unmatched + any that fail captions in Phase A
             _modified_txt_files = set()  # track which .txt files we wrote to, for post-sort
             _transcription_log = []  # [(fname, source, elapsed_secs, error_str_or_None)]
             _t_total_start = time.time()
@@ -8980,7 +8981,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     time.sleep(1)
 
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _is_simple_mode and _whisper_queued > 0 else ""
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...{_w_suffix}\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{str(_check_idx).rjust(_total_digits)}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -9010,7 +9011,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _consec_caption_fails = 0  # reset on success
                 _caption_successes += 1
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - Adding punctuation...\n", "transcribe_using")
+                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{str(_check_idx).rjust(_total_digits)}/{total}] Transcribing \"{_fname_trunc}\"  - Adding punctuation...{_w_suffix}\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -9063,14 +9064,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                 _src_part = f"{source},"
                 if _is_simple_mode:
-                    _prefix = f"  [{idx}/{total}] "
+                    _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
                     _suffix = f"done ({_src_part} {_ve_str})"
-                    _body_width = 58 - len(_prefix)
-                    _name_dash = f"{fname} — "
-                    if len(_name_dash) > _body_width:
-                        _name_dash = fname[:_body_width - 6] + "... — "
-                    else:
-                        _name_dash = _name_dash.ljust(_body_width)
+                    _name_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
+                    _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
                     log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
@@ -9411,14 +9408,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # Realtime ratio e.g. ", 3.0x realtime"
                         _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                         if _is_simple_mode:
-                            _prefix = f"  [{idx}/{total}] "
+                            _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
-                            _body_width = 58 - len(_prefix)
-                            _name_dash = f"{fname}{_vid_dur_str} — "
-                            if len(_name_dash) > _body_width:
-                                _name_dash = fname[:_body_width - 6 - len(_vid_dur_str)] + f"...{_vid_dur_str} — "
-                            else:
-                                _name_dash = _name_dash.ljust(_body_width)
+                            _name_body = f"{fname}{_vid_dur_str}"
+                            _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."
+                            _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:
                             log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")

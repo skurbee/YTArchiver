@@ -2690,7 +2690,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.2 - 03.17.26 10:34am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.3 - 03.17.26 11:26am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3128,6 +3128,10 @@ ttk.Label(_subbed_header_frame, text="Subbed Channels:").pack(side="left")
 _total_disk_var = tk.StringVar(value="")
 _total_disk_label = ttk.Label(_subbed_header_frame, textvariable=_total_disk_var, style="Dim.TLabel")
 _total_disk_label.pack(side="right")
+_refresh_transcr_btn = ttk.Button(_subbed_header_frame, text="↺ Queue Pending Transcriptions",
+                                   command=lambda: _queue_pending_transcriptions())
+_refresh_transcr_btn.pack(side="right", padx=(0, 8))
+_ToolTip(_refresh_transcr_btn, "Add all channels with new unprocessed videos (✓ -X) to GPU transcription queue")
 chan_list_frame = ttk.Frame(tab_settings)
 chan_list_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(2, 4))
 chan_list_frame.columnconfigure(0, weight=1)
@@ -3907,6 +3911,31 @@ def _chan_ctx_reapply_org():
 _chan_ctx_menu.add_command(label="Re-apply Organization", command=_chan_ctx_reapply_org)
 
 _chan_ctx_menu.add_separator()
+
+
+def _queue_pending_transcriptions():
+    """Queue all channels with ✓ -X (new unprocessed videos) for GPU transcription."""
+    out_dir = config.get("output_dir", "")
+    with config_lock:
+        channels = list(config.get("channels", []))
+    added = 0
+    for ch in channels:
+        if ch.get("transcription_complete", False) and ch.get("transcription_pending", 0) > 0:
+            ch_name = ch.get("name", "")
+            ch_url = ch.get("url", "")
+            folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+            sy = ch.get("split_years", False)
+            sm = ch.get("split_months", False)
+            _add_to_gpu_queue({
+                "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+                "folder": folder, "split_years": sy, "split_months": sm,
+                "combined": not sy
+            })
+            added += 1
+    if added:
+        log(f"  ↺ Queued {added} channel(s) with new videos for transcription.\n", "simpleline_green")
+    else:
+        log(f"  No channels with pending transcriptions found.\n", "dim")
 
 
 def _chan_ctx_transcribe():
@@ -4727,17 +4756,17 @@ def sync_single_channel():
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded,
-                # add it to the GPU Tasks so the user can process when ready
-                if c_dl > 0 and ch.get("auto_transcribe", False):
+                # Auto-transcribe: try YT captions inline right after download;
+                # only queue a GPU task if some videos still need Whisper.
+                if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _add_to_gpu_queue({
-                        "type": "transcribe", "ch_name": ch["name"], "ch_url": url,
-                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
-                    })
+                    _start_transcription(
+                        ch["name"], url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
+                        cancel_ev=cancel_event, pause_ev=pause_event,
+                        skip_model_dialog=True, _sync_mode=True, captions_only=True
+                    )
 
                 if _queue_batch_total > 1:
                     # Queue batch mode: accumulate totals; defer summary/notification to end
@@ -8254,9 +8283,13 @@ def _add_to_gpu_queue(item, _quiet=False):
     log(f"=== Added to GPU Tasks: {label} ===\n", "header")
     _update_gpu_btn()
     _save_queue_state()
-    # Refresh channel list so Transcribed column shows "Queued" immediately
-    if item.get("type") in ("transcribe", "mt"):
-        _ui_queue.append(refresh_channel_dropdowns)
+    # Refresh channel list so Transcribed column shows "Queued" immediately.
+    # Use root.after(0) instead of _ui_queue — immune to queue overflow drops.
+    if item.get("type") in ("transcribe", "mt") and _root_alive:
+        try:
+            root.after(0, refresh_channel_dropdowns)
+        except Exception:
+            pass
     # Autorun: auto-start GPU processing if enabled and not already running
     if not _gpu_running and config.get("autorun_gpu", False):
         _ui_queue.append(_gpu_start)
@@ -8415,12 +8448,15 @@ def _has_pending_redownload(ch_url):
 
 
 def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined,
-                         cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False):
+                         cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False,
+                         captions_only=False):
     """Start transcribing a channel. Queues if something is already running.
 
     cancel_ev/pause_ev: optional threading.Events (default to global cancel_event/pause_event).
     skip_model_dialog: if True, skip model selection and use current _whisper_model_choice.
     _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
+    captions_only: if True (always with _sync_mode=True), run only Phase A (auto-captions+punctuation)
+                   inline; queue a GPU task for any videos that still need Whisper, then return.
     """
     global _transcribe_running
 
@@ -8898,6 +8934,37 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
                     log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
+
+            # ── captions_only mode: finish up and optionally queue GPU task for Whisper ──
+            if captions_only:
+                if _modified_txt_files and done_count > 0:
+                    _sort_transcript_entries(_modified_txt_files)
+                _do_jsonl_backfill()
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                if not _ce.is_set():
+                    if unmatched:
+                        log(f"\n  {len(unmatched)} video(s) need Whisper — queuing GPU task...\n", "simpleline")
+                        _add_to_gpu_queue({
+                            "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+                            "folder": folder, "split_years": split_years, "split_months": split_months,
+                            "combined": combined
+                        })
+                    else:
+                        if done_count > 0:
+                            log(f"\n  ✓ {done_count} video(s) captioned inline.\n", "simpleline_green")
+                        with config_lock:
+                            for _cfg_ch in config.get("channels", []):
+                                if _cfg_ch.get("url") == ch_url:
+                                    _cfg_ch["transcription_complete"] = True
+                                    _cfg_ch["transcription_pending"] = 0
+                                    break
+                            save_config(config)
+                        _stop_punct_process()  # free GPU memory; no GPU task to manage it
+                return  # skip Phase B
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -12231,16 +12298,17 @@ def start_sync_all():
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
-                if c_dl > 0 and ch.get("auto_transcribe", False):
+                # Auto-transcribe: try YT captions inline right after download;
+                # only queue a GPU task if some videos still need Whisper.
+                if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _add_to_gpu_queue({
-                        "type": "transcribe", "ch_name": ch_name, "ch_url": url,
-                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
-                    })
+                    _start_transcription(
+                        ch_name, url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
+                        cancel_ev=cancel_event, pause_ev=pause_event,
+                        skip_model_dialog=True, _sync_mode=True, captions_only=True
+                    )
 
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
@@ -15056,17 +15124,18 @@ def _run_autorun():
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: if channel has auto_transcribe enabled and new videos were downloaded
-                if c_dl > 0 and ch.get("auto_transcribe", False):
+                # Auto-transcribe: try YT captions inline right after download;
+                # only queue a GPU task if some videos still need Whisper.
+                if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     ch_name_at = ch.get("name", "")
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_at))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _add_to_gpu_queue({
-                        "type": "transcribe", "ch_name": ch_name_at, "ch_url": url,
-                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
-                    })
+                    _start_transcription(
+                        ch_name_at, url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
+                        cancel_ev=cancel_event, pause_ev=pause_event,
+                        skip_model_dialog=True, _sync_mode=True, captions_only=True
+                    )
 
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")

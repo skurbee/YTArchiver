@@ -686,8 +686,11 @@ def _reapply_whisper_overlays():
     _wp_r = log_box.tag_ranges("whisper_progress")
     if not _wp_r:
         return
-    _wp_start = _wp_r[-2]  # start of the last (only) whisper_progress range
-    _wp_text = log_box.get(_wp_r[-2], _wp_r[-1])
+    # Always use the FIRST whisper_progress range — it contains "[N/M] Transcribing <title>, ".
+    # When a pause/cancel suffix exists it becomes a second range, so _wp_r[-2] would point to
+    # the suffix (which has no "Transcribing") and the function would bail without applying overlays.
+    _wp_start = _wp_r[0]
+    _wp_text = log_box.get(_wp_r[0], _wp_r[1])
     _trans_i = _wp_text.find("Transcribing")
     if _trans_i < 0:
         return
@@ -695,7 +698,7 @@ def _reapply_whisper_overlays():
         _pfx_end = log_box.index(f"{_wp_start}+{_trans_i}c")
         log_box.tag_add("whisper_prefix", _wp_start, _pfx_end)
     _ttl_start = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
-    _ttl_end = log_box.index(f"{_wp_r[-2]}+{len(_wp_text)}c")
+    _ttl_end = _wp_r[1]  # end of the first (prefix+title) range
     if log_box.compare(_ttl_start, "<", _ttl_end):
         log_box.tag_add("whisper_title", _ttl_start, _ttl_end)
 
@@ -2674,7 +2677,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.3 - 03.16.26 7:50pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.4 - 03.16.26 8:15pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16140,6 +16143,10 @@ def run_startup_updates():
             return "unknown"
 
     def _update():
+        # Restore preserved queue immediately so the user sees recovered jobs right away,
+        # rather than waiting for all the startup checks (yt-dlp update, disk scan, etc.)
+        _load_queue_state()
+
         log("--- Checking for yt-dlp updates... ---\n", "header")
         try:
             current_ver = _get_yt_dlp_version()
@@ -16258,9 +16265,6 @@ def run_startup_updates():
         # Enable sync button now that startup is complete
         if _root_alive:
             _ui_queue.append(lambda: sync_btn.config(state="normal"))
-
-        # Restore preserved queue from previous session if any
-        _load_queue_state()
 
         # Scan disk info for any channels not yet in the cache.  This runs
         # after startup checks are done so the UI is already visible and

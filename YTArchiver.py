@@ -2674,7 +2674,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.1 - 03.16.26 7:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.2 - 03.17.26 12:18am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3278,6 +3278,44 @@ ttk.Label(add_outer, text="Resolution:").grid(row=2, column=0, sticky="w", padx=
 new_res_var = tk.StringVar(value="720")
 _combo(add_outer, textvariable=new_res_var, values=RESOLUTION_OPTIONS, state="readonly", width=8).grid(
     row=2, column=1, sticky="w", padx=(0, 12))
+
+
+def _res_check_click():
+    """Scan the channel folder and prompt to redownload existing videos at the selected resolution."""
+    ch_name = _editing_channel.get("name")
+    if not ch_name:
+        return
+    ch_url = _editing_channel.get("url", "")
+    sel_res = new_res_var.get()
+    with config_lock:
+        _rd_base = config.get("output_dir", "").strip() or BASE_DIR
+        ch_folder = ch_name
+        for _ch in config.get("channels", []):
+            if _ch.get("url") == ch_url:
+                ch_folder = _ch.get("folder_override", "").strip() or _ch.get("name", ch_name)
+                break
+    _rd_folder = os.path.join(_rd_base, sanitize_folder(ch_folder))
+    if not os.path.isdir(_rd_folder):
+        return
+    _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
+    _rd_count = 0
+    for _r, _d, _f in os.walk(_rd_folder):
+        _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+        _rd_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
+    if _rd_count == 0:
+        return
+    _new_res_label = "Best" if sel_res == "best" else f"{sel_res}p"
+    _rd_ask = _dark_askquestion(
+        "Re-download at Selected Resolution",
+        f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, replacing the originals?"
+    )
+    if _rd_ask:
+        _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+
+
+res_check_btn = ttk.Button(add_outer, text="↺", width=3, command=_res_check_click,
+                           takefocus=False)
+res_check_btn.grid(row=2, column=2, sticky="w", padx=(0, 4))
 
 ttk.Label(add_outer, text="Duration Limit:", style="Dim.TLabel").grid(row=1, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
@@ -7422,6 +7460,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             except Exception:
                 pass
 
+            orig_size = os.path.getsize(orig_path) if os.path.exists(orig_path) else 0
             dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
             vid_url = f"https://www.youtube.com/watch?v={vid_id}"
             dl_cmd = [
@@ -7472,8 +7511,16 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                         continue
 
                 try:
+                    new_size = os.path.getsize(dl_path)
                     os.replace(dl_path, orig_path)
-                    log(f"    ✓ Replaced at {_res_label}.\n", "simpleline_green")
+                    o_mb = orig_size / (1024 * 1024)
+                    n_mb = new_size / (1024 * 1024)
+                    if orig_size > 0:
+                        _sz_ratio = (new_size / orig_size - 1) * 100
+                        _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
+                        log(f"    ✓ {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({abs(_sz_ratio):.0f}% {_sz_dir})\n", "simpleline_green")
+                    else:
+                        log(f"    ✓ {_fmt_enc_size(n_mb)} (replaced at {_res_label})\n", "simpleline_green")
                     done += 1
                     done_ids.add(vid_id)
                     _save_progress(done_ids)

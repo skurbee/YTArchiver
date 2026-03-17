@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.9 - 03.17.26 2:54pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.0 - 03.17.26 3:18pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8949,7 +8949,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             for fname, fpath, vid_id in matched:
                 idx += 1
                 _check_idx += 1
-                _fname_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
+                _fname_trunc_src = unicodedata.normalize('NFKC', fname)
+                _fname_trunc = _fname_trunc_src if len(_fname_trunc_src) <= _MAX_TITLE_DISPLAY else _fname_trunc_src[:_MAX_TITLE_DISPLAY - 3] + "..."
 
                 # Pause check
                 _pl = "GPU Tasks" if _sync_mode else "Sync"
@@ -9066,7 +9067,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _is_simple_mode:
                     _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
                     _suffix = f"done ({_src_part} {_ve_str})"
-                    _name_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
+                    _name_trunc_src = unicodedata.normalize('NFKC', fname)
+                    _name_trunc = _name_trunc_src if len(_name_trunc_src) <= _MAX_TITLE_DISPLAY else _name_trunc_src[:_MAX_TITLE_DISPLAY - 3] + "..."
                     _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
@@ -9101,7 +9103,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     break
                             save_config(config)
                         _stop_punct_process()  # free GPU memory; no GPU task to manage it
-                return  # skip Phase B
+            # Write whisper pending cache so the GPU task's Whisper run can skip
+            # Phase A caption re-check (cache is loaded at the top of this function).
+            if unmatched:
+                try:
+                    import json as _cjson
+                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                        _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                except Exception:
+                    pass
+            return  # skip Phase B
 
             # ── Write Whisper pending cache ──────────────────────────────
             # Persist the unmatched list so a cancelled/paused run can resume
@@ -9410,7 +9421,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _is_simple_mode:
                             _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
-                            _name_body = f"{fname}{_vid_dur_str}"
+                            _name_body = f"{unicodedata.normalize('NFKC', fname)}{_vid_dur_str}"
                             _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."
                             _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")

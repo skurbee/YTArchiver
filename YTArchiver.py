@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.5 - 03.17.26 12:31pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.6 - 03.17.26 5:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3156,7 +3156,8 @@ _total_disk_label.pack(side="right")
 def _on_total_disk_label_click(_e=None):
     if not _total_disk_var.get():
         return
-    if messagebox.askyesno("Refresh Sizes", "Rescan all channel folder sizes?"):
+    if _dark_askquestion("Refresh Sizes", "Rescan all channel folder sizes?"):
+        log("Scanning disk sizes...\n", "simpleline")
         _rescan_all_disk_sizes()
 _total_disk_label.bind("<Button-1>", _on_total_disk_label_click)
 _ToolTip(_total_disk_label, "Click to rescan all channel folder sizes")
@@ -7901,12 +7902,21 @@ def _fetch_auto_captions(video_id, temp_dir):
     Returns (text, segments) where text is str or None, and segments is a list of
     {"start": float, "end": float, "text": str} dicts (empty list on failure).
 
-    Tries with Firefox cookies first; if no .vtt is produced, retries without
-    cookies (handles locked/expired browser cookie DB after pause or session
-    restore) and with --force-overwrites so a stale partial file is replaced.
+    Tries with Firefox cookies first; if no usable .vtt is produced, retries
+    without cookies (handles locked/expired browser cookie DB after pause or
+    session restore) with --force-overwrites so a stale partial file is replaced.
     """
     temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
     url = f"https://www.youtube.com/watch?v={video_id}"
+    _last_stderr = [""]  # capture stderr for diagnostics
+
+    def _cleanup_temp_files():
+        """Remove ALL temp files for this video_id (not just .vtt)."""
+        try:
+            for f in glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*")):
+                os.remove(f)
+        except Exception:
+            pass
 
     def _run_fetch(use_cookies, force_overwrites=False):
         cmd = [
@@ -7921,27 +7931,45 @@ def _fetch_auto_captions(video_id, temp_dir):
             cmd += ["--cookies-from-browser", "firefox"]
         cmd.append(url)
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
+            _last_stderr[0] = (result.stderr or "").strip()
             return True
         except Exception as e:
             log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
             return False
 
-    # First attempt: with cookies
-    _run_fetch(use_cookies=True)
-    vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
-
-    # Fallback: retry without cookies (e.g. locked/expired browser cookie DB)
-    if not vtt_files:
-        _run_fetch(use_cookies=False, force_overwrites=True)
+    def _try_parse_vtt():
+        """Check for .vtt files and parse if found.  Returns (text, segments, vtt_files)."""
         vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
+        if not vtt_files:
+            return None, [], []
+        vtt_path = vtt_files[0]
+        text = _parse_vtt_to_text(vtt_path)
+        segments = _parse_vtt_to_segments(vtt_path)
+        return text, segments, vtt_files
 
-    if not vtt_files:
-        return None, []
-    vtt_path = vtt_files[0]
+    # First attempt: with cookies + force-overwrites to avoid stale files
+    _run_fetch(use_cookies=True, force_overwrites=True)
+    text, segments, vtt_files = _try_parse_vtt()
 
-    text = _parse_vtt_to_text(vtt_path)
-    segments = _parse_vtt_to_segments(vtt_path)
+    # Fallback: retry without cookies if first attempt produced no usable text.
+    # Covers locked/expired browser cookie DB after pause/resume, session
+    # restore, or stale cookies that cause yt-dlp to download empty subtitle
+    # tracks.  Always cleans up temp files first so yt-dlp starts fresh.
+    if not text:
+        _cleanup_temp_files()
+        _run_fetch(use_cookies=False, force_overwrites=True)
+        text, segments, vtt_files = _try_parse_vtt()
+
+    # Log yt-dlp's error output when both attempts fail (aids diagnostics)
+    if not text and _last_stderr[0]:
+        # Truncate very long stderr to avoid flooding the log
+        _err_preview = _last_stderr[0][:200]
+        if len(_last_stderr[0]) > 200:
+            _err_preview += "..."
+        log(f"    yt-dlp: {_err_preview}\n", "dim")
+
+    # Cleanup temp files
     try:
         for vf in vtt_files:
             os.remove(vf)
@@ -8700,6 +8728,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             if not _ce.is_set():
                                 clear_pause_status()
                                 log(f"  ▶ {_bf_pl} resumed at {_fmt_time()}...\n", "pauselog")
+                            # After resume: wipe temp dir so stale state cannot interfere.
+                            try:
+                                if os.path.isdir(_bf_temp):
+                                    shutil.rmtree(_bf_temp, ignore_errors=True)
+                                os.makedirs(_bf_temp, exist_ok=True)
+                            except Exception:
+                                pass
                         if _ce.is_set():
                             break
                         _bf_idx += 1
@@ -8879,6 +8914,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _t_total_start = time.time()
 
             # ── Phase A: Process matched files (auto-captions first) ────
+            _consec_caption_fails = 0  # track consecutive caption failures for backoff/retry
+            _caption_successes = 0     # total successes so far (to detect regression)
             for fname, fpath, vid_id in matched:
                 idx += 1
                 _fname_trunc = fname if len(fname) <= _MAX_TITLE_DISPLAY else fname[:_MAX_TITLE_DISPLAY - 3] + "..."
@@ -8892,9 +8929,25 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     if not _ce.is_set():
                         clear_pause_status()
                         log(f"  ▶ {_pl} resumed at {_fmt_time()}...\n", "pauselog")
+                    # After resume: wipe temp dir and reset consecutive fail counter
+                    # so stale state from the pre-pause session cannot interfere.
+                    try:
+                        if os.path.isdir(temp_dir):
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        os.makedirs(temp_dir, exist_ok=True)
+                    except Exception:
+                        pass
+                    _consec_caption_fails = 0
                 if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
+
+                # Rate-limit backoff: if many consecutive captions failed, slow down
+                # to avoid hitting YouTube throttling after pause/resume or heavy use.
+                if _consec_caption_fails >= 5:
+                    time.sleep(2)
+                elif _consec_caption_fails >= 3:
+                    time.sleep(1)
 
                 log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - fetching captions...\n", "transcribe_using")
                 _t_vid_start = time.time()
@@ -8911,6 +8964,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         else:
                             break  # cancelled
                     if not text:
+                        _consec_caption_fails += 1
+                        # Warn once when consecutive failures suggest a systemic issue
+                        if _consec_caption_fails == 5 and _caption_successes > 0:
+                            log(f"  ⚠ {_consec_caption_fails} consecutive caption failures — possible rate-limit; slowing down...\n", "red")
                         # Auto-captions genuinely unavailable — Whisper this file instead
                         log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "simpleline")
                         unmatched.append((fname, fpath))
@@ -8918,6 +8975,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         continue
 
                 # Restore punctuation to YouTube captions
+                _consec_caption_fails = 0  # reset on success
+                _caption_successes += 1
                 if _punct_loaded:
                     log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{idx}/{total}] Transcribing \"{_fname_trunc}\"  - Adding punctuation...\n", "transcribe_using")
                     text = _punctuate_text(text)

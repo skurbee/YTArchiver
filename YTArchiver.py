@@ -2024,6 +2024,24 @@ def _update_disk_cache_for_channel(ch):
     _save_disk_cache()
 
 
+def _rescan_all_disk_sizes():
+    """Clear the disk cache for every channel and rebuild it from scratch.
+
+    Runs in a background thread; refreshes the UI when done.
+    """
+    def _worker():
+        with config_lock:
+            channels = list(config.get("channels", []))
+        with _disk_cache_lock:
+            _disk_cache.clear()
+        _save_disk_cache()
+        for _ch in channels:
+            _update_disk_cache_for_channel(_ch)
+        if _root_alive:
+            _ui_queue.append(refresh_channel_dropdowns)
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _invalidate_channel_disk_cache(ch_url):
     """Remove a channel's cache entry and trigger a background rescan.
 
@@ -2628,6 +2646,12 @@ style.configure("Emoji.TButton", background=C_BTN, foreground=C_TEXT, padding=[2
                 font=("Segoe UI Emoji", 11))
 style.map("Emoji.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
+# Small/dim button — compact, de-emphasised (e.g. header utility buttons)
+style.configure("Dim.TButton", background=C_BTN, foreground=C_DIM, padding=[4, 1], relief="flat",
+                font=("Segoe UI", 8))
+style.map("Dim.TButton", background=[("active", C_BTN_HVR), ("disabled", C_BORDER)],
+          foreground=[("active", C_TEXT)])
+
 style.configure("TEntry",
                 fieldbackground=C_INPUT, foreground=C_TEXT, insertcolor=C_TEXT,
                 bordercolor=C_BORDER_LT, lightcolor=C_BORDER_LT, darkcolor=C_INPUT,
@@ -2690,7 +2714,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.3 - 03.17.26 11:26am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.4 - 03.17.26 11:47am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3126,10 +3150,18 @@ _subbed_header_frame = ttk.Frame(tab_settings)
 _subbed_header_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 0))
 ttk.Label(_subbed_header_frame, text="Subbed Channels:").pack(side="left")
 _total_disk_var = tk.StringVar(value="")
-_total_disk_label = ttk.Label(_subbed_header_frame, textvariable=_total_disk_var, style="Dim.TLabel")
+_total_disk_label = ttk.Label(_subbed_header_frame, textvariable=_total_disk_var, style="Dim.TLabel", cursor="hand2")
 _total_disk_label.pack(side="right")
-_refresh_transcr_btn = ttk.Button(_subbed_header_frame, text="↺ Queue Pending Transcriptions",
-                                   command=lambda: _queue_pending_transcriptions())
+def _on_total_disk_label_click(_e=None):
+    if not _total_disk_var.get():
+        return
+    if messagebox.askyesno("Refresh Sizes", "Rescan all channel folder sizes?"):
+        _rescan_all_disk_sizes()
+_total_disk_label.bind("<Button-1>", _on_total_disk_label_click)
+_ToolTip(_total_disk_label, "Click to rescan all channel folder sizes")
+_refresh_transcr_btn = ttk.Button(_subbed_header_frame, text="↺ Queue Pending",
+                                   command=lambda: _queue_pending_transcriptions(),
+                                   style="Dim.TButton")
 _refresh_transcr_btn.pack(side="right", padx=(0, 8))
 _ToolTip(_refresh_transcr_btn, "Add all channels with new unprocessed videos (✓ -X) to GPU transcription queue")
 chan_list_frame = ttk.Frame(tab_settings)
@@ -16541,6 +16573,9 @@ def _load_queue_state():
             if gpu_restored:
                 _pause_str = " (paused)" if _gpu_pause.is_set() else ""
                 log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str}.\n", "simpleline_green")
+                # Refresh channel list so restored GPU tasks show "Queued" in the Transcribed column
+                if _root_alive:
+                    _ui_queue.append(refresh_channel_dropdowns)
             _update_queue_btn()
             _update_gpu_btn()
             return True

@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.1 - 03.17.26 3:30pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.2 - 03.17.26 4:39pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8909,6 +8909,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"  {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
             log("\n", "simpleline")
 
+            # Write initial whisper cache with pre-scan unmatched files so that
+            # a restart mid-Phase A can skip re-checking files already identified.
+            if unmatched:
+                try:
+                    import json as _cjson_pre
+                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                        _cjson_pre.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                except Exception:
+                    pass
+
             total = len(matched) + len(unmatched)
             _total_digits = len(str(total))
             temp_dir = os.path.join(folder, "_transcribe_temp")
@@ -9006,6 +9016,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         unmatched.append((fname, fpath))
                         _whisper_queued += 1
                         idx -= 1   # give back the slot — this file will be counted in Phase B
+                        # Update cache immediately so a restart skips this file in Phase A
+                        try:
+                            import json as _cjson_upd
+                            with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                                _cjson_upd.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                        except Exception:
+                            pass
                         continue
 
                 # Restore punctuation to YouTube captions

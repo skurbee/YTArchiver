@@ -2674,7 +2674,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v19.2 - 03.16.26 7:28pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v19.3 - 03.16.26 7:50pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3273,6 +3273,21 @@ _placeholder(_new_url_entry, "https://www.youtube.com/@handle")
 url_error_var = tk.StringVar(value="")
 url_error_label = ttk.Label(add_outer, textvariable=url_error_var, style="Error.TLabel")
 url_error_label.grid(row=1, column=3, sticky="nw", padx=(0, 8), pady=(0, 4))
+
+# Video URL nudge — shown in place of the error label when user pastes a video URL
+_video_nudge_frame = ttk.Frame(add_outer)
+
+def _go_to_download_video():
+    url_val = new_url_var.get().strip()
+    new_url_var.set("")
+    url_var.set(url_val)
+    notebook.select(tab_download)
+    root.after(50, url_entry.focus_set)
+
+ttk.Label(_video_nudge_frame, text="🎬  Video URL detected.",
+          style="Type.TLabel").pack(side="left", padx=(0, 8))
+ttk.Button(_video_nudge_frame, text="→ Send to Download tab",
+           command=_go_to_download_video).pack(side="left")
 
 ttk.Label(add_outer, text="Resolution:").grid(row=2, column=0, sticky="w", padx=(8, 4), pady=(0, 4))
 new_res_var = tk.StringVar(value="720")
@@ -5035,12 +5050,11 @@ def remove_channel():
         except OSError:
             _size_disp = "unknown size"
 
-        if messagebox.askyesno(
+        if _dark_askquestion(
             "Delete channel folder?",
             f"Would you like to delete this channel's folder as well?\n\n"
-            f"{_ch_folder_path}\n"
-            f"({_size_disp})",
-            icon="warning"
+            f"{_ch_folder_path}\n\n"
+            f"({_size_disp})"
         ):
             try:
                 shutil.rmtree(_ch_folder_path)
@@ -10040,13 +10054,21 @@ def _validate_add_btn():
         is_valid_url = True
 
         if u:
-            if detect_url_type(u) != "channel":
+            _url_kind = detect_url_type(u)
+            if _url_kind == "video":
+                is_valid_url = False
+                url_error_var.set("")
+                _video_nudge_frame.grid(row=1, column=3, sticky="nw", padx=(0, 8), pady=(0, 4))
+            elif _url_kind != "channel":
                 is_valid_url = False
                 url_error_var.set("Invalid URL (must be a youtube channel/playlist)")
+                _video_nudge_frame.grid_remove()
             else:
                 url_error_var.set("")
+                _video_nudge_frame.grid_remove()
         else:
             url_error_var.set("")
+            _video_nudge_frame.grid_remove()
 
         editing = _editing_channel.get("name")
 

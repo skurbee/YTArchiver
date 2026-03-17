@@ -13,6 +13,7 @@ import sys
 import ctypes
 import signal
 import collections
+import glob
 from datetime import datetime
 import unicodedata
 import difflib
@@ -2714,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v20.4 - 03.17.26 11:47am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v20.5 - 03.17.26 5:17pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7899,26 +7900,42 @@ def _fetch_auto_captions(video_id, temp_dir):
 
     Returns (text, segments) where text is str or None, and segments is a list of
     {"start": float, "end": float, "text": str} dicts (empty list on failure).
+
+    Tries with Firefox cookies first; if no .vtt is produced, retries without
+    cookies (handles locked/expired browser cookie DB after pause or session
+    restore) and with --force-overwrites so a stale partial file is replaced.
     """
     temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
-    cmd = [
-        "yt-dlp", "--skip-download",
-        "--write-sub", "--write-auto-sub", "--sub-lang", "en", "--sub-format", "vtt",
-        "-o", temp_base + ".%(ext)s",
-        "--no-playlist",
-        "--cookies-from-browser", "firefox",
-        f"https://www.youtube.com/watch?v={video_id}"
-    ]
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
-    except Exception as e:
-        log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
-        return None, []
+    def _run_fetch(use_cookies, force_overwrites=False):
+        cmd = [
+            "yt-dlp", "--skip-download",
+            "--write-sub", "--write-auto-sub", "--sub-lang", "en", "--sub-format", "vtt",
+            "-o", temp_base + ".%(ext)s",
+            "--no-playlist",
+        ]
+        if force_overwrites:
+            cmd.append("--force-overwrites")
+        if use_cookies:
+            cmd += ["--cookies-from-browser", "firefox"]
+        cmd.append(url)
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=120, startupinfo=startupinfo)
+            return True
+        except Exception as e:
+            log(f"    ⚠ yt-dlp caption fetch error: {e}\n", "red")
+            return False
 
-    # Find any VTT file created for this video
-    import glob
+    # First attempt: with cookies
+    _run_fetch(use_cookies=True)
     vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
+
+    # Fallback: retry without cookies (e.g. locked/expired browser cookie DB)
+    if not vtt_files:
+        _run_fetch(use_cookies=False, force_overwrites=True)
+        vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
+
     if not vtt_files:
         return None, []
     vtt_path = vtt_files[0]
@@ -8895,7 +8912,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             break  # cancelled
                     if not text:
                         # Auto-captions genuinely unavailable — Whisper this file instead
-                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "transcribe_using")
+                        log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "simpleline")
                         unmatched.append((fname, fpath))
                         idx -= 1   # give back the slot — this file will be counted in Phase B
                         continue

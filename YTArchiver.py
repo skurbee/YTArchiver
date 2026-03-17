@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.2 - 03.17.26 4:39pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.3 - 03.17.26 5:07pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9082,7 +9082,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                 _src_part = f"{source},"
                 if _is_simple_mode:
-                    _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
+                    _prefix = f"[{idx}/{total}] "
                     _suffix = f"done ({_src_part} {_ve_str})"
                     _name_trunc_src = unicodedata.normalize('NFKC', fname)
                     _name_trunc = _name_trunc_src if len(_name_trunc_src) <= _MAX_TITLE_DISPLAY else _name_trunc_src[:_MAX_TITLE_DISPLAY - 3] + "..."
@@ -9436,7 +9436,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # Realtime ratio e.g. ", 3.0x realtime"
                         _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                         if _is_simple_mode:
-                            _prefix = f"  [{str(idx).rjust(_total_digits)}/{total}] "
+                            _prefix = f"[{idx}/{total}] "
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                             _name_body = f"{unicodedata.normalize('NFKC', fname)}{_vid_dur_str}"
                             _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."

@@ -2258,8 +2258,8 @@ def _tray_stop_spin(force=False):
     (unless force=True, which is used for pause).
     """
     global _tray_spin_active
-    # If sync is still running, fall back to blue spin instead of stopping
-    if not force and _sync_running:
+    # If any sync-pipeline task is still running, fall back to blue spin instead of stopping
+    if not force and (_sync_running or _reorg_running or _redownload_running):
         _tray_start_spin(red=False)
         return
     _tray_spin_active = False
@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.3 - 03.17.26 5:07pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.4 - 03.17.26 8:38pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3351,7 +3351,10 @@ _combo(_res_row_frame, textvariable=new_res_var, values=RESOLUTION_OPTIONS, stat
 
 
 def _res_check_click():
-    """Scan the channel folder and prompt to redownload existing videos at the selected resolution."""
+    """Scan actual video resolutions in the channel folder and compare to the selected resolution.
+    For 'best', falls back to a simple count-based redownload prompt (no ffprobe scan possible).
+    Otherwise, scans each video with ffprobe and reports how many don't match the target height.
+    """
     ch_name = _editing_channel.get("name")
     if not ch_name:
         return
@@ -3368,19 +3371,78 @@ def _res_check_click():
     if not os.path.isdir(_rd_folder):
         return
     _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
-    _rd_count = 0
+
+    # Collect all video files
+    all_videos = []
     for _r, _d, _f in os.walk(_rd_folder):
         _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
-        _rd_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
-    if _rd_count == 0:
+        for fn in _f:
+            if os.path.splitext(fn)[1].lower() in _vid_exts:
+                all_videos.append(os.path.join(_r, fn))
+    if not all_videos:
         return
-    _new_res_label = "Best" if sel_res == "best" else f"{sel_res}p"
-    _rd_ask = _dark_askquestion(
-        "Re-download at Selected Resolution",
-        f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, replacing the originals?"
-    )
-    if _rd_ask:
-        _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+
+    # 'best' mode: can't determine target height, fall back to simple prompt
+    if sel_res == "best":
+        _rd_ask = _dark_askquestion(
+            "Re-download at Selected Resolution",
+            f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
+        )
+        if _rd_ask:
+            _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+        return
+
+    target_height = int(sel_res)
+    _new_res_label = f"{sel_res}p"
+
+    # Disable button during scan to prevent double-clicks
+    res_check_btn.unbind("<Button-1>")
+    res_check_done_label.pack_forget()
+
+    def _scan():
+        log(f"\n  Scanning {len(all_videos):,} video(s) in {ch_name} for actual resolution...\n", "simpleline")
+        mismatched = []
+        readable = 0
+        errors = 0
+        for i, fpath in enumerate(all_videos, 1):
+            if i % 50 == 0:
+                log(f"  [{i}/{len(all_videos)}] Checked so far...\n", "simpleline")
+            h = _ffprobe_height(fpath)
+            if h == 0:
+                errors += 1
+                continue
+            readable += 1
+            if h != target_height:
+                mismatched.append(fpath)
+
+        def _finish():
+            # Re-enable button
+            res_check_btn.bind("<Button-1>", lambda e: _res_check_click())
+            if errors:
+                log(f"  ⚠ {errors} file(s) could not be read and were skipped.\n", "simpleline")
+            if not mismatched:
+                log(f"  ✓ All {readable:,} video(s) are already at {_new_res_label}.\n", "simpleline_green")
+                if _res_check_done_job["id"]:
+                    try:
+                        root.after_cancel(_res_check_done_job["id"])
+                    except Exception:
+                        pass
+                res_check_done_label.pack(side="left", padx=(4, 0))
+                _res_check_done_job["id"] = root.after(5000, lambda: res_check_done_label.pack_forget())
+            else:
+                mismatch_count = len(mismatched)
+                total_count = len(all_videos)
+                log(f"  {mismatch_count:,}/{total_count:,} video(s) are not at {_new_res_label}.\n", "simpleline")
+                _rd_ask = _dark_askquestion(
+                    "Re-download at Selected Resolution",
+                    f"Redownload {mismatch_count:,}/{total_count:,} video(s) at {_new_res_label}, replacing the originals?"
+                )
+                if _rd_ask:
+                    _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+
+        _ui_queue.append(_finish)
+
+    threading.Thread(target=_scan, daemon=True).start()
 
 
 res_check_btn = ttk.Label(_res_row_frame, text="↺", style="Dim.TLabel", cursor="hand2", takefocus=False)
@@ -3388,6 +3450,9 @@ res_check_btn.bind("<Button-1>", lambda e: _res_check_click())
 res_check_btn.bind("<Enter>", lambda e: res_check_btn.configure(style="TLabel"))
 res_check_btn.bind("<Leave>", lambda e: res_check_btn.configure(style="Dim.TLabel"))
 res_check_btn.pack(side="left", padx=(2, 0))
+_ToolTip(res_check_btn, "Recheck resolution")
+res_check_done_label = ttk.Label(_res_row_frame, text="Done!", style="Green.TLabel")
+_res_check_done_job = {"id": None}
 
 ttk.Label(add_outer, text="Duration Limit:", style="Dim.TLabel").grid(row=1, column=4, columnspan=4, sticky="s",
                                                                       pady=(4, 0))
@@ -6468,6 +6533,21 @@ def _fmt_enc_size(mb):
     return f"{mb:.1f} MB"
 
 
+def _ffprobe_height(file_path):
+    """Get video height in pixels via ffprobe. Returns int or 0 on error."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=height",
+             "-of", "csv=p=0", file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return 0
+
+
 def _ffprobe_is_compressed(file_path):
     """Check if a file has the ytarchiver_compressed metadata marker."""
     try:
@@ -8448,7 +8528,8 @@ def _add_to_redownload_queue(ch_name, ch_url, folder, resolution):
     _save_queue_state()
 
     # If nothing else is running, start processing immediately
-    if not _sync_running and not _reorg_running and not _transcribe_running and not _redownload_running:
+    # GPU-driven transcription (_transcribe_sync_controlled=False) is independent and does not block redownload
+    if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled) and not _redownload_running:
         _process_redownload_queue()
 
 
@@ -8456,7 +8537,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
     """Start a redownload task as a sync-pipeline job."""
     global _redownload_running
 
-    if _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+    if _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled) or _redownload_running:
         _add_to_redownload_queue(ch_name, ch_url, folder, resolution)
         return
 
@@ -9120,16 +9201,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     break
                             save_config(config)
                         _stop_punct_process()  # free GPU memory; no GPU task to manage it
-            # Write whisper pending cache so the GPU task's Whisper run can skip
-            # Phase A caption re-check (cache is loaded at the top of this function).
-            if unmatched:
-                try:
-                    import json as _cjson
-                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
-                        _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
-                except Exception:
-                    pass
-            return  # skip Phase B
+                # Write whisper pending cache so the GPU task's Whisper run can skip
+                # Phase A caption re-check (cache is loaded at the top of this function).
+                if unmatched:
+                    try:
+                        import json as _cjson
+                        with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                            _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                    except Exception:
+                        pass
+                return  # skip Phase B
 
             # ── Write Whisper pending cache ──────────────────────────────
             # Persist the unmatched list so a cancelled/paused run can resume

@@ -67,4 +67,4 @@ Just put the .ico in the same /dir as the .py file when you run. It's for the ta
 and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 
 
-I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. previous version is my version lol
+I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. lil too flowery but eh lol

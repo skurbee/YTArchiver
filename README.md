@@ -24,7 +24,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 - **Year/month folder structure** — option to sort videos into
   `YYYY/MM/` folders
 - **Reorganize tool** — retroactively sort existing files into the correct folder
-  structure based on their metadata. Can be changed at any time.
+  structure based on their metadata. Can be changed & reapplied at any time.
 
 ### Transcription
 - **Auto-captions first** — pulls YouTube's built-in captions when available, with

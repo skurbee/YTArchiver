@@ -14,11 +14,11 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 - **Duration filters** — exclude Shorts, livestreams, or long-form videos by setting
   min/max duration limits
 - **Resolution control** — pick resolution per channel
-- **Redownload Ability** — Can change channel resolution, and retroactively redownload videos to match
-- **Resumable downloads** — smart ID caching means interrupted syncs pick up where
+- **Redownload ability** — Can change channel resolution, and retroactively redownload videos to match
+- **Resumable downloads** — ID caching means interrupted syncs pick up where
   they left off without re-scanning the channel
 - **Gradual downloading** — paced requests to avoid rate limiting and IP blocks
-- **Cookie support** — uses Firefox cookies for age-restricted or member content
+- **Cookie support** — uses Firefox cookies for age-restricted or member content.
 
 ### Organization
 - **Year/month folder structure** — option to sort videos into

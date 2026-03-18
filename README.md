@@ -31,7 +31,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
   punctuation model clean up
 - **Whisper fallback** — runs Whisper locally (on GPU) for videos without
   captions or with poor auto-sub quality; model selectable per channel
-- **Transcript output** — clean `.txt` files alongside each video; a hidden `.jsonl`
+- **Transcript output** — clean `.txt` file that follows channel org structure; a hidden `.jsonl`
   sidecar records per-segment timestamps for future search-and-link functionality
 
 ### Compression

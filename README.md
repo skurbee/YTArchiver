@@ -58,4 +58,4 @@ needed). Built on yt-dlp + ffmpeg for downloading, OpenAI Whisper for transcript
 and tkinter for the UI. Developed primarily with Claude Code.
 
 
-I suck at writing stuff so I asked claude. Not too bad I guess. previous version is my version lol
+I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. previous version is my version lol

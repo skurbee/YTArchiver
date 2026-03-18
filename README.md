@@ -35,7 +35,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
   sidecar records per-segment timestamps for future search-and-link functionality
 
 ### Compression
-- **Compression** — Can opt to download at a higher resolution, and downscale for better
+- **HQ Low Res** — Can opt to download at a higher resolution, and downscale for better
   quality low resolution downloads
 - **GPU encode queue** — separate queue for post-download compression/re-encoding,
   keeping downloads and encoding independent so neither blocks the other

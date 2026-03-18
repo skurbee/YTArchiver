@@ -2259,9 +2259,10 @@ def _tray_start_spin(red=False):
     _tray_spin_use_red = red
     _tray_spin_active = True
     _tray_spin_idx = 0
+    # Always clear stop event so any existing/dying thread keeps running (fixes race with _tray_stop_spin)
+    _tray_spin_stop_ev.clear()
     # Start persistent spin thread if not already running
     if _tray_spin_thread is None or not _tray_spin_thread.is_alive():
-        _tray_spin_stop_ev.clear()
         _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
         _tray_spin_thread.start()
 
@@ -2272,6 +2273,10 @@ def _tray_stop_spin(force=False):
     (unless force=True, which is used for pause).
     """
     global _tray_spin_active
+    # If GPU is still running, fall back to red spin instead of stopping
+    if not force and _gpu_running:
+        _tray_start_spin(red=True)
+        return
     # If any sync-pipeline task is still running, fall back to blue spin instead of stopping
     if not force and (_sync_running or _reorg_running or _redownload_running):
         _tray_start_spin(red=False)
@@ -2792,7 +2797,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.8 - 03.18.26 12:25pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.9 - 03.18.26 3:04pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4685,10 +4690,10 @@ def sync_single_channel():
                                     split_months=ch.get("split_months", False))
             if not cancel_event.is_set():
                 # Always update anim state so switching to Simple mid-sync shows correct channel
-                _simple_anim_state.update({"channel": ch['name'], "idx": 1, "total": 1,
+                _simple_anim_state.update({"channel": ch['name'], "idx": _pfx_i, "total": _pfx_t,
                                            "dl_current": 0, "ch_total": 0})
                 if _is_simple_mode:
-                    _start_simple_anim(ch['name'], 1, 1)
+                    _start_simple_anim(ch['name'], _pfx_i, _pfx_t)
 
                 # Skip prefetch for uninitialized full-mode channels — it always returns 0
                 # and fires 2 yt-dlp calls that may trigger YouTube rate-limiting before enumeration
@@ -4962,7 +4967,8 @@ def sync_single_channel():
                     if session_totals['err'] > 0:
                         log(f"Errors: {session_totals['err']}\n", "summary")
                     log("=" * 45 + "\n", "summary")
-                log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
+                if _queue_batch_total <= 1:
+                    log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
             elapsed_single = (datetime.now() - t_start_single).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_single,
@@ -12180,7 +12186,7 @@ def start_sync_all():
                     _sync_queue.append(copy.deepcopy(ch))
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
-        _what = "transcription" if _transcribe_running else ("redownload" if _redownload_running else "reorganize")
+        _what = "redownload" if _redownload_running else "reorganize"
         log(f"\n=== Sync added to Sync List ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
         _update_queue_btn()

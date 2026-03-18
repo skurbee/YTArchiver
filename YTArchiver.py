@@ -2797,7 +2797,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.9 - 03.18.26 3:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.0 - 03.18.26 6:45pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3072,20 +3072,22 @@ autorun_history_frame.rowconfigure(0, weight=1)
 hist_scroll = ttk.Scrollbar(autorun_history_frame, orient="vertical")
 hist_scroll.grid(row=0, column=1, sticky="ns")
 
-autorun_history_listbox = tk.Listbox(
-    autorun_history_frame, bg=C_INPUT, fg=C_DIM,
-    selectbackground=C_INPUT, selectforeground=C_DIM,
+autorun_history_text = tk.Text(
+    autorun_history_frame, bg=C_INPUT, fg=C_TEXT,
     font=("Consolas", 9), height=2, relief="flat", bd=0, highlightthickness=0,
-    activestyle="none", yscrollcommand=hist_scroll.set)
-autorun_history_listbox.grid(row=0, column=0, sticky="nsew")
-hist_scroll.config(command=autorun_history_listbox.yview)
+    state="disabled", wrap="none", cursor="arrow",
+    yscrollcommand=hist_scroll.set)
+autorun_history_text.grid(row=0, column=0, sticky="nsew")
+hist_scroll.config(command=autorun_history_text.yview)
 
-# Prevent selection (visual-only list)
-def _deselect_history(event=None):
-    autorun_history_listbox.selection_clear(0, tk.END)
+autorun_history_text.tag_configure("hist_blue",    foreground=C_LOG_BLUE)
+autorun_history_text.tag_configure("hist_green",   foreground=C_LOG_GREEN)
+autorun_history_text.tag_configure("hist_amber",   foreground=C_LOG_SUM)
+autorun_history_text.tag_configure("hist_row_alt", background="#0c0f14")
 
-autorun_history_listbox.bind("<<ListboxSelect>>", _deselect_history)
-autorun_history_listbox.bind("<Button-1>", lambda e: "break")
+# Prevent interaction (visual-only)
+autorun_history_text.bind("<Button-1>",  lambda e: "break")
+autorun_history_text.bind("<B1-Motion>", lambda e: "break")
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
 _log_scroll_freeze = False  # suppress scrollbar grid toggling during batch log ops
@@ -14955,16 +14957,64 @@ _autorun_next = {"ts": None}
 AUTORUN_HISTORY_MAX = 100
 
 
+def _insert_hist_line(tw, entry, row_tags):
+    """Insert one activity-log entry into the history Text widget with inline colours."""
+    line = f"  {entry}\n"
+    m = re.match(r'^(\s*\[(\w+)\])(.*)', line)
+    if not m:
+        tw.insert(tk.END, line, row_tags)
+        return
+    prefix, kind, rest = m.group(1), m.group(2), m.group(3)
+
+    # Colour for the [Kind] tag
+    if kind == "Trnscr":
+        prefix_tags = ("hist_blue",) + row_tags
+    elif kind in ("Manual", "Auto"):
+        dl_m = re.search(r'\b(\d+) downloaded\b', rest)
+        dl_count = int(dl_m.group(1)) if dl_m else 0
+        prefix_tags = ("hist_green",) + row_tags if dl_count > 0 else row_tags
+    else:
+        prefix_tags = row_tags
+    tw.insert(tk.END, prefix, prefix_tags)
+
+    # Inline highlight patterns for the rest of the line
+    patterns = []
+    if kind == "Trnscr":
+        patterns.append((r'\b\d+ transcribed\b', "hist_blue"))
+    elif kind in ("Manual", "Auto"):
+        dl_m = re.search(r'\b(\d+) downloaded\b', rest)
+        if dl_m and int(dl_m.group(1)) > 0:
+            patterns.append((r'\b\d+ downloaded\b', "hist_green"))
+    # Amber skipped for any kind, only when non-zero
+    patterns.append((r'\b[1-9]\d* skipped\b', "hist_amber"))
+
+    matches = []
+    for pat, colour in patterns:
+        for mo in re.finditer(pat, rest):
+            matches.append((mo.start(), mo.end(), colour))
+    matches.sort(key=lambda x: x[0])
+
+    pos = 0
+    for start, end, colour in matches:
+        if start > pos:
+            tw.insert(tk.END, rest[pos:start], row_tags)
+        tw.insert(tk.END, rest[start:end], (colour,) + row_tags)
+        pos = end
+    if pos < len(rest):
+        tw.insert(tk.END, rest[pos:], row_tags)
+
+
 def _refresh_autorun_history():
-    autorun_history_listbox.delete(0, tk.END)
+    autorun_history_text.config(state="normal")
+    autorun_history_text.delete("1.0", tk.END)
     with config_lock:
         history = list(config.get("autorun_history", []))
-    for entry in history:
-        autorun_history_listbox.insert(tk.END, f"  {entry}")
-    for i in range(0, autorun_history_listbox.size(), 2):
-        autorun_history_listbox.itemconfig(i, bg="#0c0f14")
+    for idx, entry in enumerate(history):
+        row_tags = ("hist_row_alt",) if idx % 2 == 0 else ()
+        _insert_hist_line(autorun_history_text, entry, row_tags)
+    autorun_history_text.config(state="disabled")
     # Scroll to bottom so newest entry is visible
-    autorun_history_listbox.see(tk.END)
+    autorun_history_text.see(tk.END)
 
     # Get the currently visible panes
     current_panes = [str(p) for p in log_paned.panes()]

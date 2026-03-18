@@ -2797,7 +2797,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.0 - 03.18.26 6:45pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.1 - 03.18.26 6:50pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3075,7 +3075,7 @@ hist_scroll.grid(row=0, column=1, sticky="ns")
 autorun_history_text = tk.Text(
     autorun_history_frame, bg=C_INPUT, fg=C_TEXT,
     font=("Consolas", 9), height=2, relief="flat", bd=0, highlightthickness=0,
-    state="disabled", wrap="none", cursor="arrow",
+    state="disabled", wrap="none", cursor="arrow", insertwidth=0,
     yscrollcommand=hist_scroll.set)
 autorun_history_text.grid(row=0, column=0, sticky="nsew")
 hist_scroll.config(command=autorun_history_text.yview)
@@ -14959,10 +14959,10 @@ AUTORUN_HISTORY_MAX = 100
 
 def _insert_hist_line(tw, entry, row_tags):
     """Insert one activity-log entry into the history Text widget with inline colours."""
-    line = f"  {entry}\n"
+    line = f"  {entry}"
     m = re.match(r'^(\s*\[(\w+)\])(.*)', line)
     if not m:
-        tw.insert(tk.END, line, row_tags)
+        tw.insert(tk.END, line + "\n", row_tags)
         return
     prefix, kind, rest = m.group(1), m.group(2), m.group(3)
 
@@ -15002,6 +15002,7 @@ def _insert_hist_line(tw, entry, row_tags):
         pos = end
     if pos < len(rest):
         tw.insert(tk.END, rest[pos:], row_tags)
+    tw.insert(tk.END, "\n", row_tags)
 
 
 def _refresh_autorun_history():

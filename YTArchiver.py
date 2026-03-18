@@ -1339,9 +1339,9 @@ def _simple_anim_tick():
         if _anim_mode == "redownload":
             # Redownload mode: [x/total] REDOWNLOADING: channel···
             log_simple_status(segments=[
-                (f"[{i}/{n}]", None),
+                (f"[{i}/{n}]", "simplestatus_white"),
                 (" REDOWNLOADING:", "simplestatus_green"),
-                (f" {ch}", None),
+                (f" {ch}", "simplestatus_white"),
                 (d, "simplestatus_green"),
                 ("\n", None),
             ])
@@ -2729,7 +2729,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.6 - 03.17.26 9:39pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.7 - 03.17.26 10:27pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7063,7 +7063,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                     orig_fname = os.path.basename(orig_path)
                     fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
-                    log(f"\n  [{batch_start + idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline")
+                    if not _is_simple_mode:
+                        log(f"\n  [{batch_start + idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline")
 
                     # Download at new quality
                     dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
@@ -7079,7 +7080,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         vid_url
                     ]
 
-                    log(f"    Downloading ({resolution})...\n", "simpleline")
+                    if not _is_simple_mode:
+                        log(f"    Downloading ({resolution})...\n", "simpleline")
                     try:
                         dl_proc = spawn_yt_dlp(dl_cmd)
                         with proc_lock:
@@ -7680,7 +7682,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
 
             orig_fname = os.path.basename(orig_path)
             fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
-            log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+            if not _is_simple_mode:
+                log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
 
             try:
                 os.makedirs(temp_dir, exist_ok=True)
@@ -7701,7 +7704,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 vid_url
             ]
 
-            log(f"    Downloading ({_res_label})...\n", "simpleline")
+            if not _is_simple_mode:
+                log(f"    Downloading ({_res_label})...\n", "simpleline")
             try:
                 dl_proc = spawn_yt_dlp(dl_cmd)
                 if dl_proc is None:
@@ -7742,6 +7746,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     os.replace(dl_path, orig_path)
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
+                    if _is_simple_mode:
+                        log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"

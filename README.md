@@ -43,7 +43,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 ### UI & Workflow
 - **Three-tab layout** — Download, Subs, and Recent tabs, each with a mini activity
   log that mirrors the main log
-- **Simple mode** — a minimal animated status view for distraction-free monitoring
+- **Simple mode** — a minimal log view for easy monitoring
 - **Pause/resume** — pause active downloads mid-session and resume without losing
   progress
 - **Multi-queue system** — sync, download, transcription, reorganization, and GPU

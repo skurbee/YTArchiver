@@ -21,10 +21,10 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 - **Cookie support** — uses Firefox cookies for age-restricted or member content
 
 ### Organization
-- **Year/month folder structure** — videos are automatically sorted into
-  `YYYY/YYYY-MM/` folders at download time
+- **Year/month folder structure** — option to sort videos into
+  `YYYY/YYYY-MM/` folders
 - **Reorganize tool** — retroactively sort existing files into the correct folder
-  structure based on their metadata
+  structure based on their metadata. Can be changed at any time.
 
 ### Transcription
 - **Auto-captions first** — pulls YouTube's built-in captions when available, with

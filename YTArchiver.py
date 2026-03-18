@@ -2715,7 +2715,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.4 - 03.17.26 8:38pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.5 - 03.17.26 9:24pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10366,6 +10366,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("whisper_prefix", {"foreground": C_TEXT}),
+                             ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_LOG_BLUE}),
@@ -15763,6 +15765,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("whisper_prefix", {"foreground": C_TEXT}),
+                             ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
                              ("whisper_dots", {"foreground": C_LOG_BLUE}),
@@ -15785,7 +15789,8 @@ _ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_
                  "simpleline_blue", "simpledownload",
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
-                 "pauselog", "pausestatus", "livestream", "filterskip", "dim", "whisper_progress",
+                 "pauselog", "pausestatus", "livestream", "filterskip", "dim",
+                 "whisper_prefix", "whisper_title", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
                  "encode_progress", "encode_pct", "encode_dots",
                  "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using")

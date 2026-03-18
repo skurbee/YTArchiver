@@ -53,6 +53,19 @@ ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
 QUEUE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_queue.json")
 DISK_CACHE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_disk_cache.json")
 
+# --- Single-instance lock (prevents running two copies at once) ---
+_INSTANCE_MUTEX = None
+if os.name == 'nt':
+    _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\YTArchiver_SingleInstance")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "YT Archiver is already running.\nOnly one instance can run at a time.",
+            "Already Running",
+            0x10  # MB_ICONERROR
+        )
+        sys.exit(0)
+
 # File extensions recognised as channel video/audio content (excludes temp/partial files)
 _CHANNEL_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
 
@@ -147,6 +160,7 @@ _mt_queue_lock = threading.Lock()
 _redownload_queue = []  # list of dicts: {"ch_name", "ch_url", "folder", "resolution"}
 _redownload_queue_lock = threading.Lock()
 _redownload_running = False
+_current_redownload_item = None  # full dict of the currently-running redownload (for persistence on close)
 
 # GPU Tasks queue — independent from the main job queue
 _gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
@@ -2715,7 +2729,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.5 - 03.17.26 9:24pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.6 - 03.17.26 9:39pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8546,8 +8560,9 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
     _redownload_running = True
 
     def _worker():
-        global _redownload_running
+        global _redownload_running, _current_redownload_item
         cancel_event.clear()  # Reset any stale cancel from a previous Stop so the redownload isn't immediately aborted
+        _current_redownload_item = {"ch_name": ch_name, "ch_url": ch_url, "folder": folder, "resolution": resolution}
         _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
         _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
         _current_job["url"] = ch_url
@@ -8564,6 +8579,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
             log(f"\n  ⚠ Redownload error: {e}\n", "red")
         finally:
             _redownload_running = False
+            _current_redownload_item = None
             _current_job["label"] = None
             _current_job["url"] = None
             _tray_stop_spin()
@@ -16599,7 +16615,11 @@ def run_startup_updates():
                     log(line, "green")
                 else:
                     log(line, "dim")
-            proc.wait()
+            try:
+                proc.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                log("  ⚠ yt-dlp update check timed out (45s). Skipping update.\n", "red")
 
             full_output = "".join(update_output).lower()
 
@@ -16717,6 +16737,11 @@ def _save_queue_state():
     with _transcribe_queue_lock:
         for args in _transcribe_queue:
             queue_data["transcribe"].append(list(args))
+    # Include the currently-running redownload so it survives crashes/restarts
+    if _current_redownload_item is not None and _redownload_running:
+        with _redownload_queue_lock:
+            if not any(q["ch_url"] == _current_redownload_item["ch_url"] for q in _redownload_queue):
+                queue_data["redownload"].insert(0, copy.deepcopy(_current_redownload_item))
     with _redownload_queue_lock:
         for item in _redownload_queue:
             queue_data["redownload"].append(copy.deepcopy(item))
@@ -16738,6 +16763,8 @@ def _save_queue_state():
     # orphan on load and appear AFTER queued items instead of before them)
     if _current_sync_ch is not None and _sync_running:
         saved_order.insert(0, ("sync", _current_sync_ch["url"]))
+    if _current_redownload_item is not None and _redownload_running:
+        saved_order.insert(0, ("redownload", _current_redownload_item["ch_url"]))
     queue_data["order"] = saved_order
     try:
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
@@ -16873,6 +16900,12 @@ def on_closing():
             if _gpu_queue:
                 has_queue = True
     if not has_queue and _gpu_running:
+        has_queue = True
+    if not has_queue:
+        with _redownload_queue_lock:
+            if _redownload_queue:
+                has_queue = True
+    if not has_queue and _redownload_running:
         has_queue = True
 
     # Include currently-running items in has_queue check

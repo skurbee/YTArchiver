@@ -2519,6 +2519,69 @@ def _dark_askquestion(title, message, yes_text="Yes", no_text="No"):
     return bool(_result[0])
 
 
+def _dark_missing_channel_dialog(ch_name, expected_path):
+    """Dark-mode dialog for a missing channel folder.
+
+    Returns "remove", "locate", or "skip".
+    Must be called from the main (Tk) thread.
+    """
+    _result = ["skip"]
+
+    _dlg = tk.Toplevel(root)
+    _dlg.title("Missing Channel Folder")
+    _dlg.configure(bg=C_BG)
+    _dlg.resizable(False, False)
+    _dlg.transient(root)
+    _dlg.grab_set()
+    _dlg.update_idletasks()
+    _apply_dark_title_bar(_dlg)
+
+    def _dismiss(val):
+        _result[0] = val
+        try:
+            _dlg.destroy()
+        except Exception:
+            pass
+
+    _dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss("skip"))
+
+    tk.Label(_dlg, text=f"Cannot locate folder for \"{ch_name}\".",
+             bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+             justify="left").pack(fill="x", padx=20, pady=(16, 4))
+    tk.Label(_dlg, text=f"Expected:\n{expected_path}",
+             bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+             justify="left", wraplength=440).pack(fill="x", padx=20, pady=(0, 12))
+
+    # Separator
+    tk.Frame(_dlg, bg=C_BORDER, height=1).pack(fill="x", padx=20, pady=(0, 12))
+
+    btn_row = tk.Frame(_dlg, bg=C_BG)
+    btn_row.pack(padx=20, pady=(0, 16))
+
+    tk.Button(btn_row, text="Remove Channel", bg=C_CANCEL, fg="#dddddd",
+              relief="flat", font=("Segoe UI", 9, "bold"), cursor="hand2",
+              command=lambda: _dismiss("remove"),
+              padx=10, pady=4).pack(side="left", padx=(0, 8))
+
+    tk.Button(btn_row, text="Locate Folder", bg=C_BTN, fg=C_TEXT,
+              relief="flat", font=("Segoe UI", 9), cursor="hand2",
+              command=lambda: _dismiss("locate"),
+              padx=10, pady=4).pack(side="left", padx=(0, 8))
+
+    tk.Button(btn_row, text="Skip", bg=C_BG, fg=C_DIM,
+              relief="flat", font=("Segoe UI", 9), cursor="hand2",
+              command=lambda: _dismiss("skip"),
+              padx=10, pady=4).pack(side="left")
+
+    _dlg.update_idletasks()
+    _rx = root.winfo_rootx() + root.winfo_width() // 2
+    _ry = root.winfo_rooty() + root.winfo_height() // 2
+    _dlg.geometry(f"+{_rx - _dlg.winfo_width() // 2}+{_ry - _dlg.winfo_height() // 2}")
+
+    root.wait_window(_dlg)
+    return _result[0]
+
+
 def _entry(parent, maxlen=500, **kw):
     kw.setdefault("bg", C_INPUT)
     kw.setdefault("fg", C_TEXT)
@@ -2729,7 +2792,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.8 - 03.17.26 11:31pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.8 - 03.18.26 12:25pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3733,10 +3796,7 @@ def _set_edit_mode(ch):
     if _pending_res:
         _pr_disp = "Best" if _pending_res == "best" else f"{_pending_res}p"
         continue_redownload_btn.config(text=f"↻ Continue Redownload ({_pr_disp})")
-        # Defer pack() so it runs after all double-click events (including the trailing
-        # ButtonRelease) are fully processed — prevents the spurious focus-transfer that
-        # caused the button to need two clicks before activating.
-        root.after(0, lambda: continue_redownload_btn.pack(side="left", padx=(0, 8)))
+        continue_redownload_btn.pack(side="left", padx=(0, 8))
     else:
         continue_redownload_btn.pack_forget()
     reorg_done_label.pack_forget()
@@ -4204,15 +4264,11 @@ def _chan_ctx_show(event):
 
         # Transcribe menu item (index 11) — now routes to GPU Tasks
         _ch_url_t = ch.get("url", "")
-        # Check if this channel has any downloaded videos
-        _ch_folder = _chan_ctx_get_folder()
-        _has_videos = False
-        if _ch_folder and os.path.isdir(_ch_folder):
-            _VIDEO_EXTS_CHECK = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
-            for _root_d, _dirs_d, _files_d in os.walk(_ch_folder):
-                if any(f.lower().endswith(_VIDEO_EXTS_CHECK) for f in _files_d):
-                    _has_videos = True
-                    break
+        # Check if this channel has any downloaded videos — use disk cache (populated at startup)
+        # to avoid blocking the UI thread with os.walk on a slow drive.
+        with _disk_cache_lock:
+            _cached_vids = _disk_cache.get(_ch_url_t, {}).get("num_vids", 0)
+        _has_videos = _cached_vids > 0
         # Check if this channel is already being transcribed via GPU Tasks
         _is_active_gpu = _gpu_running and _gpu_current.get("label") and _ch_url_t and _ch_url_t in (_gpu_current.get("label") or "")
         with _gpu_queue_lock:
@@ -7750,7 +7806,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
                     if _is_simple_mode:
-                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                        log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
@@ -16515,22 +16571,14 @@ def _check_channel_folders():
 
     def _prompt_missing():
         for ch_name, ch_url, expected_path in missing:
-            answer = messagebox.askyesnocancel(
-                "Missing Channel Folder",
-                f"Cannot locate folder for \"{ch_name}\".\n\n"
-                f"Expected: {expected_path}\n\n"
-                "• Yes — Remove from Sub list\n"
-                "• No — Browse for the folder\n"
-                "• Cancel — Ignore for now",
-                icon="warning"
-            )
-            if answer is True:
+            answer = _dark_missing_channel_dialog(ch_name, expected_path)
+            if answer == "remove":
                 # Remove from sub list
                 with config_lock:
                     config["channels"] = [c for c in config.get("channels", []) if c["url"] != ch_url]
                 save_config(config)
                 log(f"  Removed \"{ch_name}\" from sub list (folder missing).\n", "dim")
-            elif answer is False:
+            elif answer == "locate":
                 # Browse for folder
                 new_path = filedialog.askdirectory(
                     title=f"Locate folder for \"{ch_name}\"",
@@ -16554,7 +16602,7 @@ def _check_channel_folders():
                             "Invalid Location",
                             f"The selected folder must be inside your output directory:\n{base}"
                         )
-            # else: Cancel — do nothing
+            # else: "skip" — do nothing
         result_q.put(True)
         if root.winfo_exists():
             root.after(0, refresh_channel_dropdowns)
@@ -16716,10 +16764,6 @@ def run_startup_updates():
         # Enable sync button now that startup is complete
         if _root_alive:
             _ui_queue.append(lambda: sync_btn.config(state="normal"))
-
-        # Kick off any jobs restored from the previous session
-        # (redownloads have no periodic trigger, so they must be started here)
-        _process_next_queued()
 
         # Scan disk info for any channels not yet in the cache.  This runs
         # after startup checks are done so the UI is already visible and

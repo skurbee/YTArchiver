@@ -22,7 +22,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 
 ### Organization
 - **Year/month folder structure** — option to sort videos into
-  `YYYY/YYYY-MM/` folders
+  `YYYY/MM/` folders
 - **Reorganize tool** — retroactively sort existing files into the correct folder
   structure based on their metadata. Can be changed at any time.
 

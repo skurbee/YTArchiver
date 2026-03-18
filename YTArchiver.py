@@ -2729,7 +2729,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v21.7 - 03.17.26 10:27pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v21.8 - 03.17.26 11:31pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3733,7 +3733,10 @@ def _set_edit_mode(ch):
     if _pending_res:
         _pr_disp = "Best" if _pending_res == "best" else f"{_pending_res}p"
         continue_redownload_btn.config(text=f"↻ Continue Redownload ({_pr_disp})")
-        continue_redownload_btn.pack(side="left", padx=(0, 8))
+        # Defer pack() so it runs after all double-click events (including the trailing
+        # ButtonRelease) are fully processed — prevents the spurious focus-transfer that
+        # caused the button to need two clicks before activating.
+        root.after(0, lambda: continue_redownload_btn.pack(side="left", padx=(0, 8)))
     else:
         continue_redownload_btn.pack_forget()
     reorg_done_label.pack_forget()
@@ -7747,7 +7750,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
                     if _is_simple_mode:
-                        log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
@@ -16713,6 +16716,10 @@ def run_startup_updates():
         # Enable sync button now that startup is complete
         if _root_alive:
             _ui_queue.append(lambda: sync_btn.config(state="normal"))
+
+        # Kick off any jobs restored from the previous session
+        # (redownloads have no periodic trigger, so they must be started here)
+        _process_next_queued()
 
         # Scan disk info for any channels not yet in the cache.  This runs
         # after startup checks are done so the UI is already visible and

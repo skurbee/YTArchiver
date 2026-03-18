@@ -13,8 +13,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
   or grab the full channel history
 - **Duration filters** — exclude Shorts, livestreams, or long-form videos by setting
   min/max duration limits
-- **Resolution control** — pick your preferred quality per channel; defaults to H.264
-  + AAC for fast, compatible MP4s
+- **Resolution control** — pick resolution per channel
+- **Redownload Ability** — Can change channel resolution, and retroactively redownload videos to match
 - **Resumable downloads** — smart ID caching means interrupted syncs pick up where
   they left off without re-scanning the channel
 - **Gradual downloading** — paced requests to avoid rate limiting and IP blocks

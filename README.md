@@ -57,9 +57,13 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 
 ## Tech Stack
 
-Packaged as a standalone `.exe` with all dependencies bundled (no Python install
-needed). Built on yt-dlp + ffmpeg for downloading, OpenAI Whisper for transcription,
-and tkinter for the UI. Developed primarily with Claude Code.
+Built on yt-dlp + ffmpeg for downloading, OpenAI Whisper for transcription,
+and tkinter for the UI. Developed primarily with Claude Code/Copilot.
+
+I use it packed into an .exe with the icon and dependancies.
+I'll upload the .exe when I feel like this is """done"""
+Just put the .ico in the same /dir as the .py file when you run. It's for the taskbar icon,
+and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 
 
 I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. previous version is my version lol

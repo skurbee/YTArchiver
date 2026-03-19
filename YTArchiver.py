@@ -2802,7 +2802,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.8 - 03.19.26 4:48pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.9 - 03.19.26 5:51pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4842,6 +4842,7 @@ def sync_single_channel():
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
                                                  on_batch_ready=_sc_batch_cb,
                                                  compress_batch_size=_sc_bsize)
+                c_dur = _last_run_counts.get("dur", 0)
 
                 # Also check /streams tab for past livestreams
                 _streams_url = _get_streams_url(url)
@@ -4853,6 +4854,7 @@ def sync_single_channel():
                                                      split_months=ch.get("split_months", False))
                     _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
                                                       compress_batch_size=_sc_bsize)
+                    c_dur += _last_run_counts.get("dur", 0)
                     if _s_dl:
                         c_dl = (c_dl or 0) + _s_dl
 
@@ -4860,6 +4862,8 @@ def sync_single_channel():
                     _stop_simple_anim()
                     if not cancel_event.is_set():
                         _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
+                        if c_dur:
+                            _v += f"  ·  {c_dur} filtered"
                         _tag = "simpleline_green" if c_dl else "simpleline"
                         _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
                         log(f"[{_pfx_i}/{_pfx_t}] {_cn:<34} —  Downloaded: {_v}\n", _tag)
@@ -5029,7 +5033,7 @@ def sync_single_channel():
                         )
                         # Record one combined activity-log entry for the whole batch
                         _b_elapsed = (datetime.now() - _queue_batch_t_start).total_seconds() if _queue_batch_t_start else elapsed_single
-                        _record_sync(_b_dl, _b_err, _b_elapsed, kind="Manual", channel_name="Sync-Subs", skipped=_b_skip)
+                        _record_sync(_b_dl, _b_err, _b_elapsed, kind="Manual", channel_name="Sync-Subbed", skipped=_b_skip)
                     # Capture for tray tooltip before resetting
                     _final_dl = _queue_batch_dl if _queue_batch_total > 1 else session_totals["dl"]
                     # Reset batch tracking whenever queue drains
@@ -11577,6 +11581,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
     _prog_last_pct = -1.0
     _speed_samples = []
     _tracked_paths = []  # file paths captured at DLTRACK time for per-batch compression
+    _local_archived_set = _load_archived_ids()  # used to silently skip already-seen filter-rejected videos
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
@@ -11993,6 +11998,14 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 dur_count += 1
                 session_totals["dur"] += 1
 
+                # If this video was already filter-rejected in a prior run, it's in the archive.
+                # yt-dlp fires --match-filter before checking --download-archive, so it will keep
+                # showing up every sync. Silently count it and move on — same behavior as a video
+                # that's already been downloaded.
+                _already_in_archive = bool(current_vid_id and current_vid_id in _local_archived_set)
+                if _already_in_archive:
+                    continue
+
                 # Determine filter reason by checking the whole yt-dlp line
                 # (works regardless of whether yt-dlp wraps the expression in parens)
                 _has_min = "duration>?" in line or "duration >" in line
@@ -12025,6 +12038,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     with io_lock:
                         with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
                             f.write(f"youtube {current_vid_id}\n")
+                    _local_archived_set.add(current_vid_id)
                     if not is_simple_mode:
                         log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                 continue
@@ -12607,11 +12621,13 @@ def start_sync_all():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dur = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,
                                                      on_batch_ready=_sc_batch_cb,
                                                      compress_batch_size=_sc_bsize)
+                    c_dur = _last_run_counts.get("dur", 0)
 
                     # Also check /streams tab for past livestreams
                     _streams_url = _get_streams_url(url)
@@ -12623,6 +12639,7 @@ def start_sync_all():
                                                          split_months=ch.get("split_months", False))
                         _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
                                                           compress_batch_size=_sc_bsize)
+                        c_dur += _last_run_counts.get("dur", 0)
                         if _s_dl:
                             c_dl = (c_dl or 0) + _s_dl
 
@@ -12638,6 +12655,8 @@ def start_sync_all():
                 if _is_simple_mode:
                     _stop_simple_anim()
                     _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
+                    if c_dur:
+                        _v += f"  ·  {c_dur} filtered"
                     _tag = "simpleline_green" if c_dl else "simpleline"
                     _pad = 34 + len(str(current_total)) - len(str(i))
                     _cn = ch_name if len(ch_name) <= _pad else ch_name[:_pad - 3] + "..."
@@ -12775,7 +12794,7 @@ def start_sync_all():
         finally:
             elapsed_manual = (datetime.now() - t_start_manual).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_manual, kind="Manual",
-                         channel_name="Sync-Subs", skipped=session_totals["dur"])
+                         channel_name="Sync-Subbed", skipped=session_totals["dur"])
 
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
@@ -15097,7 +15116,7 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
     kind_tag = f"[{kind}]".ljust(8)
-    ch_part = f"  {channel_name[:22]:22s}  —" if channel_name else " " * 27
+    ch_part = f"  {channel_name[:22]:^22s}  —" if channel_name else " " * 27
     line = f"{kind_tag} {ts_date} —{ch_part}  {dl:>4} downloaded · {skipped} skipped · {err} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
@@ -15496,11 +15515,13 @@ def _run_autorun():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dur = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,
                                                      on_batch_ready=_sc_batch_cb,
                                                      compress_batch_size=_sc_bsize)
+                    c_dur = _last_run_counts.get("dur", 0)
 
                     # Also check /streams tab for past livestreams
                     _streams_url = _get_streams_url(url)
@@ -15512,6 +15533,7 @@ def _run_autorun():
                                                          split_months=ch.get("split_months", False))
                         _s_dl = internal_run_cmd_blocking(_streams_cmd, on_batch_ready=_sc_batch_cb,
                                                           compress_batch_size=_sc_bsize)
+                        c_dur += _last_run_counts.get("dur", 0)
                         if _s_dl:
                             c_dl = (c_dl or 0) + _s_dl
 
@@ -15527,6 +15549,8 @@ def _run_autorun():
                 if _is_simple_mode:
                     _stop_simple_anim()
                     _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
+                    if c_dur:
+                        _v += f"  ·  {c_dur} filtered"
                     _tag = "simpleline_green" if c_dl else "simpleline"
                     _tot = len(channels)
                     _pad = 34 + len(str(_tot)) - len(str(i))

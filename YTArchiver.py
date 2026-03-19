@@ -128,6 +128,8 @@ _queue_batch_idx = 0    # current 1-based channel index in a queue-driven batch 
 _queue_batch_total = 0  # total channels in current queue-driven batch
 _queue_batch_dl = 0     # accumulated downloads across batch
 _queue_batch_err = 0    # accumulated errors across batch
+_queue_batch_skip = 0   # accumulated skipped (duration-filtered) across batch
+_queue_batch_t_start = None  # datetime when the batch started (for elapsed time in combined record)
 new_download_count = 0
 cancel_event = threading.Event()
 pause_event = threading.Event()
@@ -915,36 +917,37 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
                 if ranges:
                     _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(_pos, _full_text, "simplestatus")
-                    # Apply extra_tag via tag_add after insert so it covers exactly the
-                    # inserted text range — avoids Tkinter's boundary tag-inheritance
-                    # ambiguity (inserting at a tag boundary with a tuple can pull adjacent
-                    # non-simplestatus lines into the range and cause them to be purged).
+                    # Insert each segment with its color tag simultaneously to avoid
+                    # a brief grey flash that occurs if we insert with "simplestatus"
+                    # alone and then apply color tags in a separate step.
                     if segments is not None:
                         _seg_p = _pos
                         for _st, _stag in segments:
-                            if _stag and _st:
-                                _se = log_box.index(f"{_seg_p}+{len(_st)}c")
-                                log_box.tag_add(_stag, _seg_p, _se)
                             if _st:
+                                _stags = ("simplestatus", _stag) if _stag else "simplestatus"
+                                log_box.insert(_seg_p, _st, _stags)
                                 _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
                     elif extra_tag and _full_text:
+                        log_box.insert(_pos, _full_text, "simplestatus")
                         _new_end = log_box.index(f"{_pos}+{len(_full_text)}c")
                         log_box.tag_add(extra_tag, _pos, _new_end)
+                    else:
+                        log_box.insert(_pos, _full_text, "simplestatus")
                 else:
                     _ins_start = log_box.index(tk.END)
-                    log_box.insert(tk.END, _full_text, "simplestatus")
                     if segments is not None:
                         _seg_p = _ins_start
                         for _st, _stag in segments:
-                            if _stag and _st:
-                                _se = log_box.index(f"{_seg_p}+{len(_st)}c")
-                                log_box.tag_add(_stag, _seg_p, _se)
                             if _st:
+                                _stags = ("simplestatus", _stag) if _stag else "simplestatus"
+                                log_box.insert(tk.END, _st, _stags)
                                 _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
                     elif extra_tag and _full_text:
+                        log_box.insert(tk.END, _full_text, "simplestatus")
                         _new_end = log_box.index(f"{_ins_start}+{len(_full_text)}c")
                         log_box.tag_add(extra_tag, _ins_start, _new_end)
+                    else:
+                        log_box.insert(tk.END, _full_text, "simplestatus")
 
                 # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
                 if _saved_parts:
@@ -2272,8 +2275,8 @@ def _tray_stop_spin(force=False):
     (unless force=True, which is used for pause).
     """
     global _tray_spin_active
-    # If GPU is still running, fall back to red spin instead of stopping
-    if not force and _gpu_running:
+    # If GPU is still running (and not paused), fall back to red spin instead of stopping
+    if not force and _gpu_running and not _gpu_truly_paused:
         _tray_start_spin(red=True)
         return
     # If any sync-pipeline task is still running, fall back to blue spin instead of stopping
@@ -2796,7 +2799,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.3 - 03.18.26 8:32pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.4 - 03.18.26 10:12pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4595,7 +4598,7 @@ def sync_single_channel():
 
     def _single_worker():
         global _sync_running, _current_sync_ch
-        global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err
+        global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err, _queue_batch_skip, _queue_batch_t_start
         _pfx_i = _queue_batch_idx if _queue_batch_total > 0 else 1
         _pfx_t = _queue_batch_total if _queue_batch_total > 0 else 1
         try:
@@ -4952,6 +4955,7 @@ def sync_single_channel():
                     # Queue batch mode: accumulate totals; defer summary/notification to end
                     _queue_batch_dl += session_totals["dl"]
                     _queue_batch_err += session_totals["err"]
+                    _queue_batch_skip += session_totals["dur"]
                 else:
                     _dl = session_totals["dl"]
                     _plural = "s" if _dl != 1 else ""
@@ -4972,9 +4976,13 @@ def sync_single_channel():
                     log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
         finally:
             elapsed_single = (datetime.now() - t_start_single).total_seconds()
-            _record_sync(session_totals["dl"], session_totals["err"], elapsed_single,
-                         kind="Manual", channel_name=ch.get("name", ""),
-                         skipped=session_totals["dur"])
+            # Only record individual entry for true single-channel syncs, not queue batches.
+            # Batches (Sync Subbed queued while another sync was running) get one combined
+            # entry recorded at the end so the activity log stays consolidated.
+            if _queue_batch_total <= 1:
+                _record_sync(session_totals["dl"], session_totals["err"], elapsed_single,
+                             kind="Manual", channel_name=ch.get("name", ""),
+                             skipped=session_totals["dur"])
 
             # If a newer job has taken over (user cancelled + started new sync),
             # don't touch any shared state — the new job owns it now.
@@ -4995,6 +5003,7 @@ def sync_single_channel():
                     if _queue_batch_total > 1 and not cancel_event.is_set():
                         _b_dl = _queue_batch_dl
                         _b_err = _queue_batch_err
+                        _b_skip = _queue_batch_skip
                         _b_plural = "s" if _b_dl != 1 else ""
                         log("\n" + "=" * 45 + "\n", "summary")
                         log(f"TOTAL SYNC SUMMARY:\n", "summary")
@@ -5006,6 +5015,9 @@ def sync_single_channel():
                             "YT Archiver — Sync complete",
                             f"Downloaded {_b_dl} video{_b_plural} across {_queue_batch_total} channels. Errors: {_b_err}"
                         )
+                        # Record one combined activity-log entry for the whole batch
+                        _b_elapsed = (datetime.now() - _queue_batch_t_start).total_seconds() if _queue_batch_t_start else elapsed_single
+                        _record_sync(_b_dl, _b_err, _b_elapsed, kind="Manual", skipped=_b_skip)
                     # Capture for tray tooltip before resetting
                     _final_dl = _queue_batch_dl if _queue_batch_total > 1 else session_totals["dl"]
                     # Reset batch tracking whenever queue drains
@@ -5013,6 +5025,8 @@ def sync_single_channel():
                     _queue_batch_total = 0
                     _queue_batch_dl = 0
                     _queue_batch_err = 0
+                    _queue_batch_skip = 0
+                    _queue_batch_t_start = None
                     _sync_running = False
                     _current_sync_ch = None
                     if _root_alive:
@@ -5045,7 +5059,7 @@ def sync_single_channel():
 
 def _process_sync_queue():
     """Process next queued sync if any. Returns True if a sync was started."""
-    global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err
+    global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err, _queue_batch_skip, _queue_batch_t_start
     with _sync_queue_lock:
         if not _sync_queue:
             return False
@@ -5061,6 +5075,8 @@ def _process_sync_queue():
     if _queue_batch_idx == 0:
         _queue_batch_dl = 0
         _queue_batch_err = 0
+        _queue_batch_skip = 0
+        _queue_batch_t_start = datetime.now()
     _queue_batch_idx += 1
     _queue_batch_total = _queue_batch_idx + remaining
 

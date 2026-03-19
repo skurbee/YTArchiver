@@ -4830,6 +4830,7 @@ def sync_single_channel():
                         if _ask_start_gpu_tasks(count):
                             _ui_queue.append(_gpu_start)
 
+            c_dl = 0
             if not cancel_event.is_set() and not _all_cached_done:
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
                                                  on_batch_ready=_sc_batch_cb,
@@ -12584,6 +12585,7 @@ def start_sync_all():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dl = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,
@@ -15459,6 +15461,7 @@ def _run_autorun():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dl = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
                                                      live_ids=live_ids,

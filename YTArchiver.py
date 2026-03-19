@@ -5088,7 +5088,7 @@ def _process_sync_queue():
 
     # Find and select the channel in the tree, then sync it
     def _start_queued():
-        global _sync_running
+        global _sync_running, _current_sync_ch
         try:
             _found = False
             for item in settings_chan_tree.get_children():
@@ -10238,7 +10238,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             # Sort the transcript file by date (newest first)
             if _transcribed > 0 and os.path.isfile(out_path):
                 try:
-                    _sort_transcript_entries(out_path)
+                    _sort_transcript_entries([out_path])
                 except Exception:
                     pass
 
@@ -12840,7 +12840,7 @@ def _show_clear_log_if_needed():
 
 def stop_downloads():
     global _sync_running, _reorg_running, _transcribe_running, _redownload_running, _current_sync_ch
-    global _disk_error_active, _disk_retry_job
+    global _disk_error_active, _disk_retry_job, _transcribe_sync_controlled
     pause_event.clear()
 
     # Clear disk error state so manual cancel fully resets everything

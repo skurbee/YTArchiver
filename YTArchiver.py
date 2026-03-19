@@ -2802,7 +2802,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.5 - 03.18.26 11:31pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.6 - 03.19.26 11:17am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3088,7 +3088,7 @@ hist_scroll.config(command=autorun_history_text.yview)
 autorun_history_text.tag_configure("hist_blue",    foreground=C_LOG_BLUE)
 autorun_history_text.tag_configure("hist_green",   foreground=C_LOG_GREEN)
 autorun_history_text.tag_configure("hist_amber",   foreground=C_LOG_SUM)
-autorun_history_text.tag_configure("hist_row_alt", background="#0c0f14")
+autorun_history_text.tag_configure("hist_row_alt", background="#101520")
 
 # Prevent interaction (visual-only)
 autorun_history_text.bind("<Button-1>",  lambda e: "break")
@@ -15077,8 +15077,10 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
         dur = f"took {mins}m {secs:02d}s"
     else:
         dur = f"took {secs}s"
-    ch_part = f"  {channel_name}  —" if channel_name else " "
-    line = f"[{kind}] {ts}, {date}  —{ch_part}  {dl} downloaded · {skipped} skipped · {err} errors · {dur}"
+    ts_date = f"{ts}, {date}".ljust(16)
+    kind_tag = f"[{kind}]".ljust(8)
+    ch_part = f"  {channel_name[:22]:22s}  —" if channel_name else " " * 27
+    line = f"{kind_tag} {ts_date} —{ch_part}  {dl:>4} downloaded · {skipped} skipped · {err} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -15106,8 +15108,9 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
         dur = f"took {mins}m {secs:02d}s"
     else:
         dur = f"took {secs}s"
-    ch_part = f"  {channel_name}  —" if channel_name else " "
-    line = f"[Trnscr] {ts}, {date}  —{ch_part}  {done_count} transcribed · {skipped} skipped · {err_count} errors · {dur}"
+    ts_date = f"{ts}, {date}".ljust(16)
+    ch_part = f"  {channel_name[:22]:22s}  —" if channel_name else " " * 27
+    line = f"[Trnscr] {ts_date} —{ch_part}  {done_count:>4} transcribed · {skipped} skipped · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -15132,8 +15135,10 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
         dur = f"took {mins}m {secs:02d}s"
     else:
         dur = f"took {secs}s"
+    ts_date = f"{ts}, {date}".ljust(16)
     batch_part = f" Batch {batch_num} —" if batch_num is not None else ""
-    line = f"[Cmprss] {ts}, {date}  —  {ch_name}{batch_part}  {done_count} compressed · {err_count} errors · {dur}"
+    ch_display = f"{ch_name[:22]:22s}"
+    line = f"[Cmprss] {ts_date} —  {ch_display}{batch_part}  {done_count:>4} compressed · {err_count} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)

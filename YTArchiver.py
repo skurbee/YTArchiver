@@ -7167,8 +7167,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         log(f"    Downloading ({resolution})...\n", "simpleline")
                     try:
                         dl_proc = spawn_yt_dlp(dl_cmd)
-                        with proc_lock:
-                            active_processes.append(dl_proc)
+                        if dl_proc is None:
+                            log(f"    ⚠ Could not start yt-dlp.\n", "red")
+                            batch_errors += 1
+                            continue
                         for line in dl_proc.stdout:
                             if _ce.is_set():
                                 dl_proc.terminate()

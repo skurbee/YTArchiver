@@ -2796,7 +2796,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.2 - 03.18.26 7:24pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.3 - 03.18.26 8:32pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11390,7 +11390,7 @@ def _prefetch_livestreams(url):
     try:
         proc = spawn_yt_dlp([
             "yt-dlp", "--flat-playlist", "--no-warnings",
-            "--playlist-end", "30",
+            "--playlist-end", "5",
             "--match-filter", "is_live | is_upcoming",
             "--print", "%(id)s\t%(webpage_url)s",
             "--cookies-from-browser", "firefox",
@@ -11951,6 +11951,11 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     continue
 
             elif "does not pass filter" in line or "not supported between instances of 'int' and 'str'" in line:
+                # Live/upcoming videos hit !is_live / !is_upcoming — LIVESTREAM DETECTED banner
+                # already handles these, and they're intentionally kept out of the archive so they
+                # can be deferred for download. Skip silently to avoid [SKIP] spam every run.
+                if current_vid_id and current_vid_id in live_ids:
+                    continue
                 dur_count += 1
                 session_totals["dur"] += 1
 

@@ -2802,7 +2802,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.6 - 03.19.26 11:17am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.7 - 03.19.26 12:18pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4622,6 +4622,11 @@ def sync_single_channel():
                     live_ids = [vid[0] for vid in live_videos]
                     if max_dur_ch:
                         log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
+                        # Max-dur means these can never be downloaded — archive so they won't show up again
+                        with io_lock:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                for _lid, _lurl in live_videos:
+                                    _af.write(f"youtube {_lid}\n")
                     else:
                         for _lid, _lurl in live_videos:
                             deferred_streams.append((ch, _lurl, _lid))
@@ -4870,6 +4875,10 @@ def sync_single_channel():
                     _ds_out = os.path.join(out_dir, sanitize_folder(_ds_ch.get("folder_override", "") or _ds_name))
                     _ds_cmd = build_video_cmd(_ds_url, _ds_out, _ds_ch.get("resolution", "720"))
                     internal_run_cmd_blocking(_ds_cmd)
+                    # Archive the stream ID after attempt (success or fail) so it won't reappear every sync
+                    with io_lock:
+                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                            _af.write(f"youtube {_ds_id}\n")
 
             _cleanup_batch_file()
 
@@ -5020,7 +5029,7 @@ def sync_single_channel():
                         )
                         # Record one combined activity-log entry for the whole batch
                         _b_elapsed = (datetime.now() - _queue_batch_t_start).total_seconds() if _queue_batch_t_start else elapsed_single
-                        _record_sync(_b_dl, _b_err, _b_elapsed, kind="Manual", skipped=_b_skip)
+                        _record_sync(_b_dl, _b_err, _b_elapsed, kind="Manual", channel_name="Sync-Subs", skipped=_b_skip)
                     # Capture for tray tooltip before resetting
                     _final_dl = _queue_batch_dl if _queue_batch_total > 1 else session_totals["dl"]
                     # Reset batch tracking whenever queue drains
@@ -12360,6 +12369,11 @@ def start_sync_all():
                         live_ids = [vid[0] for vid in live_videos]
                         if max_dur_ch:
                             log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
+                            # Max-dur means these can never be downloaded — archive so they won't show up again
+                            with io_lock:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    for _lid, _lurl in live_videos:
+                                        _af.write(f"youtube {_lid}\n")
                         else:
                             for _lid, _lurl in live_videos:
                                 deferred_streams.append((ch, _lurl, _lid))
@@ -12707,6 +12721,10 @@ def start_sync_all():
                         _ds_ch.get("resolution", "720")
                     )
                     c_dl = internal_run_cmd_blocking(_ds_cmd)
+                    # Archive the stream ID after attempt so it won't reappear every sync
+                    with io_lock:
+                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                            _af.write(f"youtube {_ds_id}\n")
                     if c_dl:
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl
@@ -12757,7 +12775,7 @@ def start_sync_all():
         finally:
             elapsed_manual = (datetime.now() - t_start_manual).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed_manual, kind="Manual",
-                         skipped=session_totals["dur"])
+                         channel_name="Sync-Subs", skipped=session_totals["dur"])
 
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
@@ -15278,6 +15296,11 @@ def _run_autorun():
                         live_ids = [vid[0] for vid in live_videos]
                         if max_dur_ch:
                             log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
+                            # Max-dur means these can never be downloaded — archive so they won't show up again
+                            with io_lock:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    for _lid, _lurl in live_videos:
+                                        _af.write(f"youtube {_lid}\n")
                         else:
                             for _lid, _lurl in live_videos:
                                 deferred_streams.append((ch, _lurl, _lid))
@@ -15588,6 +15611,10 @@ def _run_autorun():
                         _ds_ch.get("resolution", "720")
                     )
                     c_dl = internal_run_cmd_blocking(_ds_cmd)
+                    # Archive the stream ID after attempt so it won't reappear every sync
+                    with io_lock:
+                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                            _af.write(f"youtube {_ds_id}\n")
                     if c_dl:
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl

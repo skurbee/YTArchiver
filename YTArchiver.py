@@ -1909,7 +1909,6 @@ def load_config():
         return cfg
 
 
-_save_config_queue = []
 _save_config_lock = threading.Lock()
 _save_config_thread_running = False
 
@@ -2797,7 +2796,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.1 - 03.18.26 6:50pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.2 - 03.18.26 7:24pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8780,15 +8779,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             # One-time migration: delete old JSONL files so they get regenerated
             # with the improved merged-segment parser (v15.4 fix).
+            # For brand-new channels (already_done is empty), skip deletion but still
+            # set the flag so Phase B (GPU task) doesn't re-trigger and wipe Phase A's files.
             _migration_key = f"jsonl_v154_migrated_{ch_name}"
-            if already_done and not config.get(_migration_key):
-                for _dp, _dns, _fns in os.walk(folder):
-                    for _fn in _fns:
-                        if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
-                            try:
-                                os.remove(os.path.join(_dp, _fn))
-                            except Exception:
-                                pass
+            if not config.get(_migration_key):
+                if already_done:
+                    for _dp, _dns, _fns in os.walk(folder):
+                        for _fn in _fns:
+                            if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
+                                try:
+                                    os.remove(os.path.join(_dp, _fn))
+                                except Exception:
+                                    pass
                 with config_lock:
                     config[_migration_key] = True
                     save_config(config)
@@ -9090,7 +9092,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     pass
 
             total = len(matched) + len(unmatched)
-            _total_digits = len(str(total))
             temp_dir = os.path.join(folder, "_transcribe_temp")
             # Wipe any stale temp dir from a previous cancelled/interrupted run.
             # yt-dlp's default no-overwrite behaviour means leftover .vtt files
@@ -9185,7 +9186,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim")
                         unmatched.append((fname, fpath))
                         _whisper_queued += 1
-                        idx -= 1   # give back the slot — this file will be counted in Phase B
+                        total += 1  # this file will be processed again in Phase B, so bump total
                         # Update cache immediately so a restart skips this file in Phase A
                         try:
                             import json as _cjson_upd

@@ -66,5 +66,6 @@ I'll upload the .exe when I feel like this is """done"""
 Just put the .ico in the same /dir as the .py file when you run. It's for the taskbar icon,
 and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 
+Splitting this monolithic .py file into multiple smaller ones is in the todo list. IDK WHEN, but eventually :)
 
 I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. lil too flowery but eh lol

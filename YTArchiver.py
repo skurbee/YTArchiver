@@ -2802,7 +2802,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.7 - 03.19.26 12:18pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.8 - 03.19.26 4:48pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15649,7 +15649,7 @@ def _run_autorun():
             _autorun_active = False
             elapsed = (datetime.now() - t_start).total_seconds()
             _record_sync(session_totals["dl"], session_totals["err"], elapsed, kind="Auto",
-                         skipped=session_totals["dur"])
+                         channel_name="Sync Subbed", skipped=session_totals["dur"])
             _ts = datetime.now().strftime("%Y-%m-%d %H:%M")
             with config_lock:
                 config["last_sync"] = _ts

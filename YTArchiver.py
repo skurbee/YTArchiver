@@ -1447,12 +1447,13 @@ def _update_simple_dl(dl_current, ch_total, batch_size=0):
     _simple_anim_state["batch_size"] = batch_size
 
 
-def _cleanup_partial_files(directory):
+def _cleanup_partial_files(directory, _is_root=True):
     """Remove .part, .temp, .ytdl and orphaned intermediate format files (.fNNN.ext) left behind by cancelled downloads."""
     if not directory or not os.path.isdir(directory):
         return
-    # Longer delay to let Windows release file locks after process kill
-    time.sleep(1.5)
+    # Longer delay to let Windows release file locks after process kill (only at top level)
+    if _is_root:
+        time.sleep(1.5)
 
     def _is_partial(name):
         if name.endswith('.part') or name.endswith('.temp') or name.endswith('.ytdl'):
@@ -1481,7 +1482,7 @@ def _cleanup_partial_files(directory):
             if not entry.is_file():
                 if entry.is_dir():
                     # Recurse into subdirectories (year/month folders)
-                    _cleanup_partial_files(entry.path)
+                    _cleanup_partial_files(entry.path, _is_root=False)
                 continue
             if _is_partial(entry.name):
                 try:
@@ -1920,6 +1921,8 @@ def save_config(cfg):
     """Queue a config save to run on a background thread so disk I/O never blocks the UI."""
     global _save_config_thread_running
 
+    cfg_snapshot = copy.deepcopy(cfg)
+
     def _do_save():
         global _save_config_thread_running
         try:
@@ -1927,7 +1930,7 @@ def save_config(cfg):
                 try:
                     temp_file = CONFIG_FILE + ".tmp"
                     with open(temp_file, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, indent=2)
+                        json.dump(cfg_snapshot, f, indent=2)
                     os.replace(temp_file, CONFIG_FILE)
                 except (PermissionError, OSError) as e:
                     # Retry once after a brief pause (disk may be momentarily busy)
@@ -1935,7 +1938,7 @@ def save_config(cfg):
                         time.sleep(0.5)
                         temp_file = CONFIG_FILE + ".tmp"
                         with open(temp_file, "w", encoding="utf-8") as f:
-                            json.dump(cfg, f, indent=2)
+                            json.dump(cfg_snapshot, f, indent=2)
                         os.replace(temp_file, CONFIG_FILE)
                     except (PermissionError, OSError) as e2:
                         try:
@@ -2799,7 +2802,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.4 - 03.18.26 10:12pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v22.5 - 03.18.26 11:31pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3302,7 +3305,7 @@ def _sort_chan_tree(col, reverse):
             if s == "best": return 9999
             try:
                 return int(s)
-            except:
+            except Exception:
                 return 0
 
         l.sort(key=lambda t: parse_res(t[0]), reverse=reverse)
@@ -5088,7 +5091,7 @@ def _process_sync_queue():
 
     # Find and select the channel in the tree, then sync it
     def _start_queued():
-        global _sync_running
+        global _sync_running, _current_sync_ch
         try:
             _found = False
             for item in settings_chan_tree.get_children():
@@ -6568,9 +6571,11 @@ def _start_whisper_process():
                 threading.Thread(target=_reader, daemon=True).start()
                 return True
         log("  ⚠ Whisper process did not start correctly.\n", "red")
+        _stop_whisper_process()
         return False
     except Exception as e:
         log(f"  ⚠ Failed to start Whisper process: {e}\n", "red")
+        _stop_whisper_process()
         return False
 
 
@@ -6673,7 +6678,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
     _VIDEO_EXTS_COMPRESS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
 
     def _worker():
-        global _ffmpeg_proc
+        global _ffmpeg_proc, _gpu_actively_encoding
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
 
@@ -6966,7 +6971,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
     _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v")
 
     def _worker():
-        global _ffmpeg_proc
+        global _ffmpeg_proc, _gpu_actively_encoding
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _current_bitrate = bitrate_mbhr
@@ -7957,7 +7962,10 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 _gpu_actively_encoding = False
                 _whisper_last_failed = True
                 return None, []
-            result = _json.loads(response_line)
+            try:
+                result = _json.loads(response_line)
+            except (json.JSONDecodeError, ValueError):
+                continue
             if result.get("status") == "starting":
                 # Subprocess accepted the file; VAD + transcription is now in progress.
                 # Update the display so the user can see it's actively loading audio
@@ -8696,7 +8704,8 @@ def _has_pending_redownload(ch_url):
     """Check if a channel has an incomplete redownload (progress file exists)."""
     with config_lock:
         _rd_base = config.get("output_dir", "").strip() or BASE_DIR
-    for ch in config.get("channels", []):
+        _channels = list(config.get("channels", []))
+    for ch in _channels:
         if ch.get("url") == ch_url:
             folder = os.path.join(_rd_base, sanitize_folder(ch.get("name", "")))
             pfile = os.path.join(folder, "_redownload_progress.json")
@@ -10238,7 +10247,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             # Sort the transcript file by date (newest first)
             if _transcribed > 0 and os.path.isfile(out_path):
                 try:
-                    _sort_transcript_entries(out_path)
+                    _sort_transcript_entries([out_path])
                 except Exception:
                     pass
 
@@ -11871,7 +11880,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                         # Stop merge "Finishing..." animation if running
                         try:
-                            if '_merge_anim' in dir() and _merge_anim.get("active"):
+                            if '_merge_anim' in locals() and _merge_anim.get("active"):
                                 _merge_anim["active"] = False
                                 _old_merge_job = _merge_anim.get("job")
                                 _merge_anim["job"] = None
@@ -15623,6 +15632,8 @@ def _run_autorun():
             if _job_generation == _my_gen:
                 _sync_running = False
                 _current_sync_ch = None
+                _current_job["label"] = None
+                _current_job["url"] = None
 
                 # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False

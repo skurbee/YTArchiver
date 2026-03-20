@@ -1702,6 +1702,7 @@ _DISK_ERROR_PATTERNS = tuple(p.lower() for p in (
     "unable to create directory",
     "Permission denied",
     "Access is denied",
+    "[Errno 9]",         # EBADF: Bad file descriptor — handle invalidated, typically drive disconnect
     "[Errno 22] Invalid argument",
     "[Errno 13]",
     "[Errno 28]",        # ENOSPC: No space left on device (Linux/Mac)
@@ -2803,7 +2804,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.2 - 03.19.26 9:05pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.3 - 03.20.26 12:34am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7851,7 +7852,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
                     if _is_simple_mode:
-                        log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
@@ -9568,6 +9569,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             log(f"  ⏸ Pause requested — waiting for current transcription to finish...\n", "pauselog")
                         text, _vtt_segments = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe)
                         _clear_whisper_progress()  # Remove progress line now that file is done
+                        # Show "Loading next video..." during inter-video processing (punct fixup, file I/O)
+                        # so the log doesn't go dark for ~30s between transcriptions.
+                        if not _ce.is_set() and idx < total:
+                            _wp_next = f"[{idx + 1}/{total}] " if _is_simple_mode and total else "    "
+                            log(f"{_wp_next}Loading next video...\n", "whisper_progress")
                         if text:
                             text = _whisper_punct_fixup(text)
                         source = "Whisper"
@@ -12897,12 +12903,31 @@ _ToolTip(sync_btn, "Sync and download every channel in your Sub list")
 def _clear_all_logs():
     global _log_at_bottom, _log_user_scrolled
     log_box.config(state="normal")
+
+    # Preserve pause/resume lines — collect all pauselog/pausestatus ranges sorted by position
+    _preserved = []
+    _all_pause_ranges = []
+    for _ptag in ("pauselog", "pausestatus"):
+        _pr = log_box.tag_ranges(_ptag)
+        for _pi in range(0, len(_pr), 2):
+            _all_pause_ranges.append((_pr[_pi], _pr[_pi + 1], _ptag))
+    # Sort by position so lines are re-inserted in order
+    _all_pause_ranges.sort(key=lambda x: [int(p) for p in str(x[0]).split(".")])
+    for _ps, _pe_idx, _ptag in _all_pause_ranges:
+        _preserved.append((log_box.get(_ps, _pe_idx), _ptag))
+
     log_box.delete("1.0", tk.END)
+
+    # Re-insert preserved pause/resume lines
+    for _ptext, _ptag in _preserved:
+        log_box.insert(tk.END, _ptext, _ptag)
+
     log_box.config(state="disabled")
     _log_at_bottom = True
     _log_user_scrolled = False
     if 'clear_log_btn' in globals():
-        clear_log_btn.pack_forget()
+        if not _preserved:
+            clear_log_btn.pack_forget()
     if 'subs_mini_log' in globals():
         for ml in (subs_mini_log, recent_mini_log):
             try:
@@ -15240,6 +15265,14 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
         _ui_queue.append(_refresh_autorun_history)
 
 
+def _sync_pipeline_busy():
+    """Return True if any sync-pipeline task is running or has items queued."""
+    if _sync_running or _redownload_running or _reorg_running:
+        return True
+    with _queue_order_lock:
+        return bool(_queue_order)
+
+
 def _tick_countdown():
     try:
         if not root.winfo_exists():
@@ -15248,20 +15281,20 @@ def _tick_countdown():
         if nxt:
             diff = int((nxt - datetime.now()).total_seconds())
             if diff > 0:
-                h, rem = divmod(diff, 3600)
-                m, s = divmod(rem, 60)
-                if h:
-                    _cd_text = f"{h}h {m:02d}m"
-                    autorun_countdown_var.set(f"Next sync in: {_cd_text}")
-                elif m:
-                    _cd_text = f"{m}m {s:02d}s"
-                    autorun_countdown_var.set(f"Next sync in: {_cd_text}")
+                if _sync_pipeline_busy():
+                    autorun_countdown_var.set("Waiting for queue...")
                 else:
-                    _cd_text = f"{s}s"
+                    h, rem = divmod(diff, 3600)
+                    m, s = divmod(rem, 60)
+                    if h:
+                        _cd_text = f"{h}h {m:02d}m"
+                    elif m:
+                        _cd_text = f"{m}m {s:02d}s"
+                    else:
+                        _cd_text = f"{s}s"
                     autorun_countdown_var.set(f"Next sync in: {_cd_text}")
-                # Update tray tooltip with countdown (only if not currently syncing)
-                if not _sync_running:
-                    _update_tray_tooltip(f"YT Archiver — Next sync in {_cd_text}")
+                    if not _sync_running:
+                        _update_tray_tooltip(f"YT Archiver — Next sync in {_cd_text}")
             else:
                 autorun_countdown_var.set("Syncing now...")
         root.after(1_000, _tick_countdown)
@@ -15278,7 +15311,7 @@ def _run_autorun():
     if not root.winfo_exists():
         return
 
-    if _sync_running or _redownload_running:
+    if _sync_pipeline_busy():
         _autorun_job["id"] = root.after(60_000, _run_autorun)
         return
     interval_mins = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)

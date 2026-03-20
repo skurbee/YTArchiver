@@ -2804,7 +2804,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.3 - 03.20.26 12:34am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.4 - 03.20.26 12:47am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7765,6 +7765,25 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         temp_dir = os.path.join(folder, "_BACKLOG_TEMP")
         done = 0
         errors = 0
+        skipped_quality = 0  # videos already at target quality
+
+        # Parse numeric target height once (0 if "best")
+        try:
+            _target_height = int(new_res) if new_res != "best" else 0
+        except (ValueError, TypeError):
+            _target_height = 0
+
+        def _probe_height(path):
+            """Return video height of a file via ffprobe, or 0 on failure."""
+            try:
+                _pr = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                     "-show_entries", "stream=height", "-of", "csv=p=0", path],
+                    capture_output=True, text=True, timeout=15, startupinfo=startupinfo
+                )
+                return int(_pr.stdout.strip())
+            except Exception:
+                return 0
 
         for idx, (vid_id, orig_path) in enumerate(work_list):
             if _ce.is_set():
@@ -7794,6 +7813,20 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 os.makedirs(temp_dir, exist_ok=True)
             except Exception:
                 pass
+
+            # ── Pre-download quality check (numeric targets only) ──────────────
+            # For a specific resolution, probe the existing file. If it's already
+            # at that height there's nothing to do — skip without downloading.
+            if _target_height and os.path.exists(orig_path):
+                _existing_h = _probe_height(orig_path)
+                if _existing_h == _target_height:
+                    if _is_simple_mode:
+                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                    log(f"    ↔ Already at {_target_height}p, skipping.\n", "dim")
+                    skipped_quality += 1
+                    done_ids.add(vid_id)
+                    _save_progress(done_ids)
+                    continue
 
             orig_size = os.path.getsize(orig_path) if os.path.exists(orig_path) else 0
             dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
@@ -7848,6 +7881,27 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
 
                 try:
                     new_size = os.path.getsize(dl_path)
+
+                    # ── Post-download quality check ("best" target only) ────────
+                    # Compare resolution of downloaded file vs original. If yt-dlp
+                    # picked the same height (best available == what we already had),
+                    # discard the download and skip replacement.
+                    if not _target_height and os.path.exists(orig_path):
+                        _dl_h = _probe_height(dl_path)
+                        _orig_h = _probe_height(orig_path)
+                        if _dl_h and _orig_h and _dl_h == _orig_h:
+                            try:
+                                os.remove(dl_path)
+                            except Exception:
+                                pass
+                            if _is_simple_mode:
+                                log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                            log(f"    ↔ Already at best quality ({_dl_h}p), skipping.\n", "dim")
+                            skipped_quality += 1
+                            done_ids.add(vid_id)
+                            _save_progress(done_ids)
+                            continue
+
                     os.replace(dl_path, orig_path)
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
@@ -7885,7 +7939,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         if not _ce.is_set():
             _clear_progress()
 
-        log(f"\n=== Redownload Complete: {ch_name} — {done} done, {errors} error(s) ===\n", "header")
+        _skip_part = f", {skipped_quality} already at quality" if skipped_quality else ""
+        log(f"\n=== Redownload Complete: {ch_name} — {done} done{_skip_part}, {errors} error(s) ===\n", "header")
 
     if _sync_mode:
         _worker()

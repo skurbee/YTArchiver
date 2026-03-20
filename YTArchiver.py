@@ -449,8 +449,8 @@ def log(text, tag=None):
                         return
 
                     if use_tag not in ("red", "simpleline", "simpleline_green", "simpleline_blue",
-                                       "summary", "header",
-                                       "simpledownload", "pauselog", "pausestatus", "livestream", "filterskip",
+                                       "summary", "header", "tx_sep", "tx_head",
+                                       "simpledownload", "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim",
                                        "transcribe_using"):
                         if "SUMMARY:" not in text and "TOTAL SESSION" not in text and "===" not in text:
                             _log_scroll_freeze = False
@@ -458,7 +458,7 @@ def log(text, tag=None):
                             return
 
                     _ss_insert_pos = None  # position to insert in-place (anti-jitter)
-                    if use_tag in ("transcribe_using", "filterskip"):
+                    if use_tag in ("transcribe_using", "filterskip", "filterskip_dim"):
                         ranges = log_box.tag_ranges("simplestatus")
                         if ranges:
                             # Record position to insert BEFORE the SYNCING line without
@@ -517,7 +517,7 @@ def log(text, tag=None):
                     _stop_whisper_dot_anim()
 
                 if (_is_simple_mode
-                        and use_tag in ("simpledownload", "red", "summary", "header",
+                        and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
                                         "simpleline_blue", "simpleline", "simpleline_green",
                                         "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
@@ -2803,7 +2803,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.1 - 03.19.26 7:17pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.2 - 03.19.26 9:05pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3141,9 +3141,12 @@ log_box.tag_configure("green", foreground=C_LOG_GREEN)
 log_box.tag_configure("dim", foreground=C_LOG_DIM)
 log_box.tag_configure("red", foreground=C_LOG_RED)
 log_box.tag_configure("header", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
+log_box.tag_configure("tx_sep", foreground="#ffffff", font=("Consolas", 9, "bold"))
+log_box.tag_configure("tx_head", foreground=C_LOG_BLUE, font=("Consolas", 9, "bold"))
 log_box.tag_configure("summary", foreground=C_LOG_SUM, font=("Consolas", 9, "italic"))
 log_box.tag_configure("livestream", foreground="#f5a023", font=("Consolas", 9, "bold"))
 log_box.tag_configure("filterskip", foreground=C_LOG_SUM)
+log_box.tag_configure("filterskip_dim", foreground="#4a5060")
 log_box.tag_configure("scanline", foreground=C_TEXT)
 log_box.tag_configure("dlprogress", foreground=C_TEXT)
 log_box.tag_configure("dlprogress_pct", foreground=C_LOG_GREEN)
@@ -8779,9 +8782,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if not _sync_mode:
                 _ui_queue.append(_update_queue_btn)
 
-            log(f"\n{'='*60}\n", "header")
-            log(f"  TRANSCRIBING: {ch_name}\n", "header")
-            log(f"{'='*60}\n\n", "header")
+            log(f"\n{'='*60}\n", "tx_sep")
+            log(f"  TRANSCRIBING: {ch_name}\n", "tx_head")
+            log(f"{'='*60}\n\n", "tx_sep")
 
             # ── Step 1: Scan local video files ──────────────────────────
             log("  Scanning local video files...\n", "simpleline")
@@ -10495,6 +10498,9 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("filterskip_dim", {"foreground": "#4a5060"}),
+                             ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
+                             ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
@@ -12053,8 +12059,14 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     _skip_tmax = 49
                     if len(_skip_title) > _skip_tmax:
                         _skip_title = _skip_title[:_skip_tmax - 3] + "..."
-                    short = f"[SKIP] {_skip_title.ljust(_skip_tmax)}  -{_filter_reason}\n"
-                    log(short, "filterskip")
+                    _fr_parts = _filter_reason.split(": ", 1)
+                    log("[SKIP]", "filterskip")
+                    log(f" {_skip_title.ljust(_skip_tmax)}  -", "filterskip_dim")
+                    if len(_fr_parts) == 2:
+                        log("Filtered:", "filterskip")
+                        log(f" {_fr_parts[1]}\n", "filterskip_dim")
+                    else:
+                        log(f"{_filter_reason}\n", "filterskip_dim")
                 else:
                     log(line, "filterskip")
 
@@ -12089,8 +12101,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         _skip_tmax = 49
                         if len(_skip_title) > _skip_tmax:
                             _skip_title = _skip_title[:_skip_tmax - 3] + "..."
-                        short = f"[SKIP] {_skip_title:<{_skip_tmax}}  -Members-only content.\n"
-                        log(short, "filterskip")
+                        log("[SKIP]", "filterskip")
+                        log(f" {_skip_title:<{_skip_tmax}}  -Members-only content.\n", "filterskip_dim")
                     else:
                         log(line, "filterskip")
                     if current_vid_id and current_vid_id not in live_ids:
@@ -12112,8 +12124,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         _skip_tmax = 49
                         if len(_skip_title) > _skip_tmax:
                             _skip_title = _skip_title[:_skip_tmax - 3] + "..."
-                        short = f"[SKIP] {_skip_title:<{_skip_tmax}}  -Private/unavailable.\n"
-                        log(short, "filterskip")
+                        log("[SKIP]", "filterskip")
+                        log(f" {_skip_title:<{_skip_tmax}}  -Private/unavailable.\n", "filterskip_dim")
                     else:
                         log(line, "filterskip")
                     with io_lock:
@@ -14421,8 +14433,13 @@ def _show_gpu_menu(event=None):
     def _reposition_gpu_popup(*_args):
         try:
             if popup.winfo_exists():
+                popup.update_idletasks()
                 x = gpu_btn.winfo_rootx()
                 y = gpu_btn.winfo_rooty() + gpu_btn.winfo_height()
+                pw = popup.winfo_width()
+                sw = popup.winfo_screenwidth()
+                if x + pw > sw:
+                    x = max(0, sw - pw - 2)
                 popup.geometry(f"+{x}+{y}")
         except Exception:
             pass
@@ -16029,6 +16046,9 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("pausestatus", {"foreground": C_LOG_HEAD}),
                              ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                              ("filterskip", {"foreground": C_LOG_SUM}),
+                             ("filterskip_dim", {"foreground": "#4a5060"}),
+                             ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
+                             ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
@@ -16049,11 +16069,11 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # simplestatus_green must precede simplestatus so the SYNCING status renders green;
 # dlprogress_pct must precede dlprogress so the progress bar percentage is green.
 # encode_prefix/encode_title must precede encode_progress so the white title overlay wins.
-_ALL_LOG_TAGS = ("green", "red", "header", "summary", "simpleline", "simpleline_green",
+_ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpledownload",
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
-                 "pauselog", "pausestatus", "livestream", "filterskip", "dim",
+                 "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim", "dim",
                  "whisper_prefix", "whisper_title", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
                  "encode_progress", "encode_pct", "encode_dots",

@@ -48,8 +48,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
   progress
 - **Multi-queue system** — download tasks & GPU tasks (transcription, compression)
   each run in their own queue
-- **System tray** — sits in your tray while running; spinning indicator shows when
-  work is in progress
+- **System tray** — sits in your tray while running; Seperate indicators for downlods
+  & GPU tasks
 - **Internet monitoring** — automatically pauses on connection loss and resumes when
   connectivity is restored
 - **Drive monitoring** — automatically pauses on drive failure, auto resumes when drive

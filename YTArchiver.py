@@ -2242,6 +2242,17 @@ def _tray_spin_loop():
         _frames = _tray_spin_frames_red if _tray_spin_use_red else _tray_spin_frames
         if not _tray_spin_active or _tray_icon is None or not _frames:
             break
+        # If GPU tasks are paused between files (inner task-level pause loop), hold the
+        # base icon instead of continuing to flash — _gpu_truly_paused only covers the
+        # outer worker's pause-wait; this catches pauses inside compress/transcribe loops.
+        if _tray_spin_use_red and _gpu_pause.is_set() and not _gpu_actively_encoding:
+            try:
+                if _tray_base_img is not None:
+                    _tray_icon.icon = _tray_base_img
+            except Exception:
+                pass
+            _tray_spin_stop_ev.wait(0.25)
+            continue
         _tray_spin_idx = (_tray_spin_idx + 1) % len(_frames)
         try:
             _tray_icon.icon = _frames[_tray_spin_idx]
@@ -2805,7 +2816,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.6 - 03.20.26 12:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.7 - 03.20.26 12:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10487,6 +10498,7 @@ def _continue_redownload():
         _rd_base = config.get("output_dir", "").strip() or BASE_DIR
     _rd_folder = os.path.join(_rd_base, sanitize_folder(ch_name))
     _add_to_redownload_queue(ch_name, ch_url, _rd_folder, pending_res)
+    continue_redownload_btn.pack_forget()
 
 continue_redownload_btn = ttk.Button(action_btn_frame, text="↻ Continue Redownload",
                                      command=_continue_redownload)
@@ -15212,7 +15224,8 @@ def _insert_hist_line(tw, entry, row_tags):
     elif kind == "ReDwnl":
         rdl_m = re.search(r'\b(\d+) replaced\b', rest)
         rdl_count = int(rdl_m.group(1)) if rdl_m else 0
-        prefix_tags = ("hist_green",) + row_tags if rdl_count > 0 else row_tags
+        _is_running = "running..." in rest
+        prefix_tags = ("hist_green",) + row_tags if (rdl_count > 0 or _is_running) else row_tags
     else:
         prefix_tags = row_tags
     tw.insert(tk.END, prefix, prefix_tags)
@@ -15226,9 +15239,12 @@ def _insert_hist_line(tw, entry, row_tags):
         if dl_m and int(dl_m.group(1)) > 0:
             patterns.append((r'\b\d+ downloaded\b', "hist_green"))
     elif kind == "ReDwnl":
-        rdl_m = re.search(r'\b(\d+) replaced\b', rest)
-        if rdl_m and int(rdl_m.group(1)) > 0:
-            patterns.append((r'\b\d+ replaced\b', "hist_green"))
+        if "running..." in rest:
+            patterns.append((r'▶ running\.\.\.', "hist_green"))
+        else:
+            rdl_m = re.search(r'\b(\d+) replaced\b', rest)
+            if rdl_m and int(rdl_m.group(1)) > 0:
+                patterns.append((r'\b\d+ replaced\b', "hist_green"))
     # Amber skipped for any kind, only when non-zero
     patterns.append((r'\b[1-9]\d* skipped\b', "hist_amber"))
 
@@ -17158,6 +17174,12 @@ def run_startup_updates():
         # Enable sync button now that startup is complete
         if _root_alive:
             _ui_queue.append(lambda: sync_btn.config(state="normal"))
+
+        # Auto-resume any redownload jobs that were restored from the previous session
+        with _redownload_queue_lock:
+            _rd_pending = bool(_redownload_queue)
+        if _rd_pending and _root_alive and not _sync_pipeline_busy():
+            _ui_queue.append(_process_redownload_queue)
 
         # Scan disk info for any channels not yet in the cache.  This runs
         # after startup checks are done so the UI is already visible and

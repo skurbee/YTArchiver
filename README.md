@@ -7,43 +7,43 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 ## Features
 
 ### Downloading & Channel Management
-- **Channel subscriptions** — subscribe to channels and sync them all with one
-  click; first sync archives existing video IDs so only new uploads get downloaded
+ **Add a channel to sub list, with download options:**
 - **Selective archiving** — set a start date to only pull videos after a certain point,
-  or grab the full channel history
+  grab the full channel history, or only download new videos.
 - **Duration filters** — exclude Shorts, livestreams, or long-form videos by setting
-  min/max duration limits
-- **Resolution control** — pick resolution per channel
-- **Redownload ability** — Can change channel resolution, and retroactively redownload videos to match
-- **Resumable downloads** — ID caching means interrupted syncs pick up where
-  they left off without re-scanning the channel
-- **Gradual downloading** — paced requests to avoid rate limiting and IP blocks
-- **Cookie support** — uses Firefox cookies for age-restricted or member content.
+  min/max duration limits.
+- **Resolution control** — Per channel resolution options
+- **Redownload ability** — Can change channel resolution, and retroactively redownload videos to match new setting.
+- **Resumable downloads** — ID caching, interrupted syncs pick up where
+  they left off without re-scanning the channel.
+- **Gradual downloading** — Paced requests to avoid rate limiting and IP blocks.
+- **Cookie support** — uses Firefox cookies for age-restricted or member content. Also massively helps avoid IP limiting.
 
 ### Organization
-- **Year/month folder structure** — option to sort videos into
-  `YYYY/MM/` folders
-- **Reorganize tool** — retroactively sort existing files into the correct folder
-  structure based on their metadata. Can be changed & reapplied at any time.
+- **Org Options** — option to sort videos into
+  `\YYYY\` or `\YYYY\MM\` folders.
+- **Reorganize tool** —  Re-sort existing downloads into new org structure.
+  Can be changed & reapplied at any time.
 - **Date Fix** — If you already have downloads from 4kVD, this can retroactively change their
-  file date to the YT upload date (fuzzy title matching)
+  file date to the YT upload date (fuzzy title matching).
 
 ### Transcription
 - **Auto-captions first** — pulls YouTube's built-in captions when available, with
-  punctuation model clean up
+  punctuation model clean up.
 - **Whisper fallback** — runs Whisper locally (on GPU) for videos without
-  captions or with poor auto-sub quality; model selectable per channel
-- **Transcript output** — clean `.txt` file that follows channel org structure; a hidden `.jsonl`
-  sidecar records per-segment timestamps for future search-and-link functionality
+  captions or with poor auto-sub quality; model selectable per channel.
+- **Transcript output** — clean 'readable' `.txt` file & a hidden `.jsonl`
+  sidecar that records per-segment timestamps for future search-and-link functionality.
+  With option for output to follow channel org structure, or combine entire channel into one file.
 
 ### Compression
-- **HQ Low Res** — Can opt to download at a higher resolution, and downscale for better
-  quality low resolution downloads
+- **HQ Low Res** — Can opt to download at a higher resolution, then downscale for better
+  quality low resolution videos.
 
 ### UI & Workflow
 - **Three-tab layout** — Download, Subs, and Recent tabs, each with a mini activity
   log that mirrors the main log
-- **Simple mode** — a minimal log view for easy monitoring
+- **Simple log mode** — a minimal log view for easy monitoring
 - **Pause/resume** — pause active downloads mid-session and resume without losing
   progress
 - **Multi-queue system** — download tasks & GPU tasks (transcription, compression)

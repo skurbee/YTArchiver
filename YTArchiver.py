@@ -50,6 +50,7 @@ os.makedirs(APP_DATA_DIR, exist_ok=True)
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
+SEEN_FILTER_TITLES_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_seen_filters.txt")
 QUEUE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_queue.json")
 DISK_CACHE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_disk_cache.json")
 
@@ -2802,7 +2803,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v22.9 - 03.19.26 5:51pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.0 - 03.19.26 7:08pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11399,6 +11400,22 @@ def _load_archived_ids():
     return archived
 
 
+def _load_seen_filter_titles():
+    """Load titles of previously filter-rejected videos so repeat [SKIP]s are suppressed.
+    Returns a set of title strings."""
+    seen = set()
+    try:
+        if os.path.exists(SEEN_FILTER_TITLES_FILE):
+            with open(SEEN_FILTER_TITLES_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    t = line.rstrip("\n")
+                    if t:
+                        seen.add(t)
+    except Exception:
+        pass
+    return seen
+
+
 def _build_batch_file(video_ids):
     """Write video IDs as full YouTube URLs to a temp file for --batch-file.
     Returns file path, or None on error."""
@@ -11581,7 +11598,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
     _prog_last_pct = -1.0
     _speed_samples = []
     _tracked_paths = []  # file paths captured at DLTRACK time for per-batch compression
-    _local_archived_set = _load_archived_ids()  # used to silently skip already-seen filter-rejected videos
+    _local_archived_set = _load_archived_ids()   # ID-based dedup (works when yt-dlp logs the ID)
+    _seen_filter_titles = _load_seen_filter_titles()  # title-based dedup (works even when ID is not logged)
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
@@ -11998,12 +12016,21 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 dur_count += 1
                 session_totals["dur"] += 1
 
-                # If this video was already filter-rejected in a prior run, it's in the archive.
-                # yt-dlp fires --match-filter before checking --download-archive, so it will keep
-                # showing up every sync. Silently count it and move on — same behavior as a video
-                # that's already been downloaded.
-                _already_in_archive = bool(current_vid_id and current_vid_id in _local_archived_set)
-                if _already_in_archive:
+                # Extract title first — it's always present in the filter line and is the
+                # reliable key for dedup. yt-dlp applies !is_live / !is_upcoming directly
+                # from playlist metadata without logging a video ID line, so current_vid_id
+                # is often None for those. Title-based tracking covers all filter types.
+                _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
+                _skip_title_raw = _m_title.group(1).strip() if _m_title else "Unknown"
+
+                # If we've already shown this filter-rejected title before, skip silently.
+                # Same behavior as already-downloaded videos — counted in totals, not itemized.
+                if _skip_title_raw in _seen_filter_titles:
+                    continue
+
+                # Also check ID-based archive as a secondary guard (works for duration filters
+                # where yt-dlp does log the video ID before the filter message).
+                if current_vid_id and current_vid_id in _local_archived_set:
                     continue
 
                 # Determine filter reason by checking the whole yt-dlp line
@@ -12019,9 +12046,6 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 else:
                     _filter_reason = "Filtered: outside duration range."
 
-                # Extract title for summary enumeration (both modes)
-                _m_title = re.search(r'\[download\]\s+(.+?)\s+does not pass filter', line)
-                _skip_title_raw = _m_title.group(1).strip() if _m_title else "Unknown"
                 _skipped_dur_titles.append((_skip_title_raw, _filter_reason))
 
                 if is_simple_mode:
@@ -12034,6 +12058,16 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 else:
                     log(line, "filterskip")
 
+                # Persist the title so future syncs suppress this entry silently.
+                _seen_filter_titles.add(_skip_title_raw)
+                with io_lock:
+                    try:
+                        with open(SEEN_FILTER_TITLES_FILE, "a", encoding="utf-8") as f:
+                            f.write(_skip_title_raw + "\n")
+                    except Exception:
+                        pass
+
+                # Also write to ID archive when the ID is available (duration-based filters).
                 if current_vid_id and current_vid_id not in live_ids:
                     with io_lock:
                         with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:

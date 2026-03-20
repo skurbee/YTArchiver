@@ -7,7 +7,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 ## Features
 
 ### Downloading & Channel Management
-- **Channel subscription system** — subscribe to channels and sync them all with one
+- **Channel subscriptions** — subscribe to channels and sync them all with one
   click; first sync archives existing video IDs so only new uploads get downloaded
 - **Selective archiving** — set a start date to only pull videos after a certain point,
   or grab the full channel history
@@ -25,6 +25,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
   `YYYY/MM/` folders
 - **Reorganize tool** — retroactively sort existing files into the correct folder
   structure based on their metadata. Can be changed & reapplied at any time.
+- **Date Fix** — If you already have downloads from 4kVD, this can retroactively change their
+  file date to the YT upload date (fuzzy title matching)
 
 ### Transcription
 - **Auto-captions first** — pulls YouTube's built-in captions when available, with
@@ -37,8 +39,6 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 ### Compression
 - **HQ Low Res** — Can opt to download at a higher resolution, and downscale for better
   quality low resolution downloads
-- **GPU encode queue** — separate queue for post-download compression/re-encoding,
-  keeping downloads and encoding independent so neither blocks the other
 
 ### UI & Workflow
 - **Three-tab layout** — Download, Subs, and Recent tabs, each with a mini activity
@@ -46,8 +46,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 - **Simple mode** — a minimal log view for easy monitoring
 - **Pause/resume** — pause active downloads mid-session and resume without losing
   progress
-- **Multi-queue system** — sync, download, transcription, reorganization, and GPU
-  tasks each run in their own queue
+- **Multi-queue system** — download tasks & GPU tasks (transcription, compression)
+  each run in their own queue
 - **System tray** — sits in your tray while running; spinning indicator shows when
   work is in progress
 - **Internet monitoring** — automatically pauses on connection loss and resumes when

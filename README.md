@@ -47,7 +47,7 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 - **Pause/resume** — pause active downloads mid-session and resume without losing
   progress
 - **Multi-queue system** — download tasks & GPU tasks (transcription, compression)
-  each run in their own queue
+  each run in their own seperate reorganizable queues
 - **System tray** — sits in your tray while running; Seperate indicators for downlods
   & GPU tasks
 - **Internet monitoring** — automatically pauses on connection loss and resumes when

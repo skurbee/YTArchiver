@@ -164,6 +164,7 @@ _redownload_queue = []  # list of dicts: {"ch_name", "ch_url", "folder", "resolu
 _redownload_queue_lock = threading.Lock()
 _redownload_running = False
 _current_redownload_item = None  # full dict of the currently-running redownload (for persistence on close)
+_redownload_hist_idx = None      # index of the in-progress placeholder in autorun_history
 
 # GPU Tasks queue — independent from the main job queue
 _gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
@@ -2804,7 +2805,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.5 - 03.20.26 1:24am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.6 - 03.20.26 12:13pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7763,6 +7764,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
 
         total_to_do = len(work_list)
         log(f"  Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+        _record_redownload_start(ch_name, _res_label, total_to_do)
+        _rd_start_time = time.time()
 
         # Start simple mode animation for redownload
         if _is_simple_mode:
@@ -7949,6 +7952,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
 
         _skip_part = f", {skipped_quality} already at quality" if skipped_quality else ""
         log(f"\n=== Redownload Complete: {ch_name} — {done} done{_skip_part}, {errors} error(s) ===\n", "header")
+        _record_redownload_finish(ch_name, done, errors, time.time() - _rd_start_time, _res_label, skipped_quality)
 
     if _sync_mode:
         _worker()
@@ -15205,6 +15209,10 @@ def _insert_hist_line(tw, entry, row_tags):
         dl_m = re.search(r'\b(\d+) downloaded\b', rest)
         dl_count = int(dl_m.group(1)) if dl_m else 0
         prefix_tags = ("hist_green",) + row_tags if dl_count > 0 else row_tags
+    elif kind == "ReDwnl":
+        rdl_m = re.search(r'\b(\d+) replaced\b', rest)
+        rdl_count = int(rdl_m.group(1)) if rdl_m else 0
+        prefix_tags = ("hist_green",) + row_tags if rdl_count > 0 else row_tags
     else:
         prefix_tags = row_tags
     tw.insert(tk.END, prefix, prefix_tags)
@@ -15217,6 +15225,10 @@ def _insert_hist_line(tw, entry, row_tags):
         dl_m = re.search(r'\b(\d+) downloaded\b', rest)
         if dl_m and int(dl_m.group(1)) > 0:
             patterns.append((r'\b\d+ downloaded\b', "hist_green"))
+    elif kind == "ReDwnl":
+        rdl_m = re.search(r'\b(\d+) replaced\b', rest)
+        if rdl_m and int(rdl_m.group(1)) > 0:
+            patterns.append((r'\b\d+ replaced\b', "hist_green"))
     # Amber skipped for any kind, only when non-zero
     patterns.append((r'\b[1-9]\d* skipped\b', "hist_amber"))
 
@@ -15348,6 +15360,62 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
         hist.append(line)
         if len(hist) > AUTORUN_HISTORY_MAX:
             config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+    save_config(config)
+    if _root_alive:
+        _ui_queue.append(_refresh_autorun_history)
+
+
+def _record_redownload_start(ch_name, res_label, total_count):
+    """Insert an in-progress placeholder for a redownload job into the activity log."""
+    global _redownload_hist_idx
+    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
+        "%I:%M%p").lower().lstrip("0")
+    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    ts_date = f"{ts}, {date}".ljust(16)
+    ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
+    ch_part = f"  {ch_display:^22s}  —" if ch_name else " " * 27
+    line = f"[ReDwnl] {ts_date} —{ch_part}  {total_count:>4} total        · ▶ running..."
+    with config_lock:
+        hist = config.setdefault("autorun_history", [])
+        hist.append(line)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+            hist = config["autorun_history"]
+        _redownload_hist_idx = len(hist) - 1
+    save_config(config)
+    if _root_alive:
+        _ui_queue.append(_refresh_autorun_history)
+
+
+def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, skipped=0):
+    """Replace the in-progress placeholder with the completed redownload stats."""
+    global _redownload_hist_idx
+    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
+        "%I:%M%p").lower().lstrip("0")
+    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    mins = int(elapsed_secs // 60)
+    secs = int(elapsed_secs % 60)
+    if mins >= 60:
+        hrs = mins // 60
+        rem_mins = mins % 60
+        dur = f"took {hrs}h {rem_mins:02d}m"
+    elif mins:
+        dur = f"took {mins}m {secs:02d}s"
+    else:
+        dur = f"took {secs}s"
+    ts_date = f"{ts}, {date}".ljust(16)
+    ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
+    ch_part = f"  {ch_display:^22s}  —" if ch_name else " " * 27
+    line = f"[ReDwnl] {ts_date} —{ch_part}  {done:>4} {'replaced':<11} · {skipped:>4} skipped ·  {errors} errors · {dur}"
+    with config_lock:
+        hist = config.setdefault("autorun_history", [])
+        if _redownload_hist_idx is not None and 0 <= _redownload_hist_idx < len(hist):
+            hist[_redownload_hist_idx] = line
+        else:
+            hist.append(line)
+            if len(hist) > AUTORUN_HISTORY_MAX:
+                config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+        _redownload_hist_idx = None
     save_config(config)
     if _root_alive:
         _ui_queue.append(_refresh_autorun_history)

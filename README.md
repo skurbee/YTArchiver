@@ -4,6 +4,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 4KVideoDownloader. Download, organize, transcribe, and compress entire channels
 — then keep them in sync as new videos are published.
 
+(Pictures in the Wiki)
+
 ## Features
 
 ### Downloading & Channel Management

@@ -60,9 +60,8 @@ A YouTube channel archiving tool built as a feature-rich alternative to
 Built on yt-dlp + ffmpeg for downloading, OpenAI Whisper for transcription,
 and tkinter for the UI. Developed primarily with Claude Code/Copilot.
 
-I use it packed into an .exe with the icon and dependancies.
-I'll upload the .exe when I feel like this is """done"""
 
+If you use the .py file instead of the exe:
 Just put the .ico in the same /dir as the .py file when you run. It's for the taskbar icon,
 and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 

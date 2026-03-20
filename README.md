@@ -69,23 +69,3 @@ and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 Splitting this monolithic .py file into multiple smaller ones is in the todo list. IDK WHEN, but eventually :)
 
 I suck at writing stuff so I asked claude to write this descripton. Not too bad I guess. lil too flowery but eh lol
-
-## Version History
-
-### v23.5 - 03.20.26
-Verbose mode significantly expanded — active channel line, DLTRACK filepath/URL/duration detail, Whisper queue depth in verbose, page enumeration logging, file move counters, backlog yt-dlp output streaming, running download totals
-
-### v23.4 - 03.20.26
-Skip redownload if already at target quality (pre-ffprobe for numeric, post-ffprobe for best)
-
-### v23.3
-Clear log preserves pause/resume lines; Whisper loading next video indicator; fix redownload log gap; add Errno 9 to disk error patterns; auto-sync waits for queue; fix auto-sync reorg guard
-
-### v23.2
-GPU popup edge detection, TRANSCRIBING banner colors, [SKIP] line two-tone coloring
-
-### v23.1
-Activity log alignment: center channel names, pad stat columns, ellipsis truncation
-
-### v23.0
-Fix repeat [SKIP] via title-based persistent dedup

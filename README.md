@@ -62,6 +62,7 @@ and tkinter for the UI. Developed primarily with Claude Code/Copilot.
 
 
 If you use the .py file instead of the exe:
+
 Just put the .ico in the same /dir as the .py file when you run. It's for the taskbar icon,
 and I'm not sure what it'll do without it. Prob be fine, just sayin :)
 

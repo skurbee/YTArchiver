@@ -2804,7 +2804,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.4 - 03.20.26 12:47am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text="v23.5 - 03.20.26 1:24am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4711,6 +4711,8 @@ def sync_single_channel():
                                            "dl_current": 0, "ch_total": 0})
                 if _is_simple_mode:
                     _start_simple_anim(ch['name'], _pfx_i, _pfx_t)
+                else:
+                    log(f"  ▶ [{_pfx_i}/{_pfx_t}] {ch['name']}\n", "header")
 
                 # Skip prefetch for uninitialized full-mode channels — it always returns 0
                 # and fires 2 yt-dlp calls that may trigger YouTube rate-limiting before enumeration
@@ -5627,7 +5629,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
             moved_count += 1
             if not is_simple:
                 rel_target = os.path.relpath(target_dir, folder_path)
-                log(f"  → Moved: {filename}  →  {rel_target}\n", "green")
+                log(f"  [{moved_count}/{total}] → {filename}  →  {rel_target}\n", "green")
         except (OSError, shutil.Error) as e:
             log(f"  ⚠ Failed to move: {filename} — {e}\n", "red")
             error_count += 1
@@ -6798,7 +6800,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
 
             fname_short = fname if len(fname) <= 50 else fname[:47] + "..."
             if not _is_simple_mode:
-                log(f"\n  [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline")
+                log(f"\n  [{idx}/{total}] {fname} ({dur_str})\n", "simpleline")
 
             # Build temp output path
             base, ext = os.path.splitext(fpath)
@@ -7174,6 +7176,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     # Download at new quality
                     dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
                     vid_url = f"https://www.youtube.com/watch?v={vid_id}"
+                    if not _is_simple_mode:
+                        log(f"    URL:  {vid_url}\n", "dim")
                     dl_cmd = [
                         "yt-dlp", "--newline", "--no-quiet",
                         "--trim-filenames", "200",
@@ -7195,6 +7199,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             if _ce.is_set():
                                 dl_proc.terminate()
                                 break
+                            if not _is_simple_mode:
+                                log(f"  {line.rstrip()}\n", "dim")
                         dl_proc.wait()
                         with proc_lock:
                             if dl_proc in active_processes:
@@ -7262,6 +7268,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             _bl_load_info = _bl_vid_info_dur if _bl_duration > 0 else _bl_vid_info_nodur
                             _update_encode_progress(f"{_bl_load_info}loading\n")
                         else:
+                            _bl_dur_short = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
+                            log(f"    Encoding ({_bl_dur_short})...\n", "simpleline")
                             _bl_vid_info_dur = ""
                             _bl_vid_info_nodur = ""
 
@@ -9260,8 +9268,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 elif _consec_caption_fails >= 3:
                     time.sleep(1)
 
-                _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _is_simple_mode and _whisper_queued > 0 else ""
-                log(f"  [{idx}/{total}] {fname} — fetching captions...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
+                _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _whisper_queued > 0 else ""
+                log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
@@ -9298,7 +9306,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _consec_caption_fails = 0  # reset on success
                 _caption_successes += 1
                 if _punct_loaded:
-                    log(f"    Adding punctuation...\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - Adding punctuation...{_w_suffix}\n", "transcribe_using")
+                    log(f"    Adding punctuation...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - Adding punctuation...{_w_suffix}\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -9613,7 +9621,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             pass
 
                         if not _is_simple_mode:
-                            log(f"  [{idx}/{total}] {fname} — using Whisper...\n", "transcribe_using")
+                            _dur_hint = f" ({dur_str})" if dur_str else ""
+                            log(f"  [{idx}/{total}] {fname}{_dur_hint} — using Whisper...\n", "transcribe_using")
                         _t_vid_start = time.time()
                         # Set counter for simple mode progress prefix
                         _whisper_counter["idx"] = idx
@@ -11754,6 +11763,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 _page_m = re.search(r'page\s+(\d+)', line)
                 if _page_m:
                     _simple_anim_state["page_num"] = int(_page_m.group(1))
+                    if not is_simple_mode:
+                        log(f"  Fetching page {_page_m.group(1)}...\n", "dim")
                 if is_simple_mode:
                     continue
             elif _simple_anim_state.get("page_num", 0) > 0:
@@ -11899,6 +11910,23 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         else:
                             _size_str2 = f"  ({_fmt_size(size_bytes)})" if size_bytes and size_bytes not in ("NA", "None", "none", "") else ""
                             log(f"  ✓ {parts[1]}  —  {channel_name}{_size_str2}\n", "simpledownload")
+                            if filepath and os.path.exists(filepath):
+                                try:
+                                    _rel_fp = os.path.relpath(filepath)
+                                except ValueError:
+                                    _rel_fp = filepath
+                                log(f"    Path: {_rel_fp}\n", "dim")
+                            if video_url:
+                                log(f"    URL:  {video_url}\n", "dim")
+                            _ds = duration_s
+                            if _ds and _ds not in ("NA", "None", "none", ""):
+                                try:
+                                    _dm, _ds2 = divmod(int(float(_ds)), 60)
+                                    _dh, _dm2 = divmod(_dm, 60)
+                                    _dur_detail = f"{_dh}h {_dm2:02d}m {_ds2:02d}s" if _dh else f"{_dm2}m {_ds2:02d}s"
+                                    log(f"    Duration: {_dur_detail}\n", "dim")
+                                except Exception:
+                                    pass
 
                         # Set file mtime to upload date for accurate month-folder sorting
                         # --mtime uses HTTP Last-Modified which can differ from actual upload date
@@ -12222,6 +12250,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                     if is_simple_mode:
                         _update_simple_dl(dl_count, 0, batch_size=compress_batch_size if on_batch_ready else 0)
+                    else:
+                        if dl_count % 10 == 0:
+                            log(f"  ── {dl_count} downloaded so far (this channel)...\n", "dim")
 
             if not is_simple_mode:
                 log(line)
@@ -12599,6 +12630,8 @@ def start_sync_all():
                                                "dl_current": 0, "ch_total": 0})
                     if _is_simple_mode:
                         _start_simple_anim(ch_name, i, current_total)
+                    else:
+                        log(f"  ▶ [{i}/{current_total}] {ch_name}\n", "header")
 
                     # Skip prefetch for uninitialized full-mode channels
                     _skip_prefetch = (mode == "full"
@@ -15534,6 +15567,8 @@ def _run_autorun():
                                                "dl_current": 0, "ch_total": 0})
                     if _is_simple_mode:
                         _start_simple_anim(ch['name'], i, len(channels))
+                    else:
+                        log(f"  ▶ [{i}/{len(channels)}] {ch['name']}\n", "header")
 
                     # Skip prefetch for uninitialized full-mode channels
                     _skip_prefetch = (mode == "full"

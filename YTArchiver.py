@@ -48,6 +48,8 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
+APP_VERSION = "v23.8"
+
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
 SEEN_FILTER_TITLES_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_seen_filters.txt")
@@ -450,7 +452,7 @@ def log(text, tag=None):
                         return
 
                     if use_tag not in ("red", "simpleline", "simpleline_green", "simpleline_blue",
-                                       "summary", "header", "tx_sep", "tx_head",
+                                       "summary", "header", "tx_sep", "tx_head", "update_sep", "update_head",
                                        "simpledownload", "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim",
                                        "transcribe_using"):
                         if "SUMMARY:" not in text and "TOTAL SESSION" not in text and "===" not in text:
@@ -519,7 +521,7 @@ def log(text, tag=None):
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
-                                        "simpleline_blue", "simpleline", "simpleline_green",
+                                        "update_sep", "update_head", "simpleline_blue", "simpleline", "simpleline_green",
                                         "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
@@ -2474,6 +2476,7 @@ C_LOG_DIM = "#272a2f"
 C_LOG_RED = "#ff6b6b"
 C_LOG_HEAD = "#a0aabb"
 C_LOG_SUM = "#f5a623"
+C_LOG_UPDATE = "#38d9e0"
 
 root.configure(bg=C_BG)
 
@@ -2816,7 +2819,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text="v23.7 - 03.20.26 12:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.20.26 10:42pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3156,6 +3159,8 @@ log_box.tag_configure("red", foreground=C_LOG_RED)
 log_box.tag_configure("header", foreground=C_LOG_HEAD, font=("Consolas", 9, "bold"))
 log_box.tag_configure("tx_sep", foreground="#ffffff", font=("Consolas", 9, "bold"))
 log_box.tag_configure("tx_head", foreground=C_LOG_BLUE, font=("Consolas", 9, "bold"))
+log_box.tag_configure("update_sep", foreground=C_LOG_UPDATE, font=("Consolas", 9, "bold"))
+log_box.tag_configure("update_head", foreground=C_LOG_UPDATE, font=("Consolas", 9, "bold"))
 log_box.tag_configure("summary", foreground=C_LOG_SUM, font=("Consolas", 9, "italic"))
 log_box.tag_configure("livestream", foreground="#f5a023", font=("Consolas", 9, "bold"))
 log_box.tag_configure("filterskip", foreground=C_LOG_SUM)
@@ -10587,6 +10592,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("filterskip_dim", {"foreground": "#4a5060"}),
                              ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
                              ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
+                             ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
+                             ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
@@ -16256,6 +16263,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("filterskip_dim", {"foreground": "#4a5060"}),
                              ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
                              ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
+                             ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
+                             ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
@@ -17026,6 +17035,38 @@ def _check_channel_folders():
             pass
 
 
+def _check_app_update():
+    """Check GitHub releases for a newer version of YTArchiver and log a notice if found."""
+    try:
+        import urllib.request as _ur
+        import json as _json
+        req = _ur.Request(
+            "https://api.github.com/repos/skurbee/YTArchiver/releases/latest",
+            headers={"User-Agent": "YTArchiver"}
+        )
+        with _ur.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+        latest_tag = data.get("tag_name", "").strip()       # e.g. "v23.8"
+        release_url = data.get("html_url", "https://github.com/skurbee/YTArchiver/releases/latest")
+        if not latest_tag:
+            return
+
+        def _ver_tuple(s):
+            try:
+                return tuple(int(x) for x in s.lstrip("v").split("."))
+            except ValueError:
+                return (0,)
+
+        if _ver_tuple(latest_tag) > _ver_tuple(APP_VERSION):
+            sep = "=" * 54
+            log(f"\n{sep}\n", "update_sep")
+            log(f"  \u2b06  Update available: {latest_tag}  (you have {APP_VERSION})\n", "update_head")
+            log(f"  Download: {release_url}\n", "update_head")
+            log(f"{sep}\n\n", "update_sep")
+    except Exception:
+        pass  # No network, rate-limited, etc. — silently skip
+
+
 def run_startup_updates():
     def _download_yt_dlp_binary(target_path):
         """Download the latest yt-dlp binary from GitHub to target_path."""
@@ -17162,11 +17203,16 @@ def run_startup_updates():
         except FileNotFoundError:
             log("ffmpeg not found — skipping version check.\n", "red")
 
+        # Check for a newer YTArchiver release on GitHub
+        _check_app_update()
+
         # Check that each subscribed channel's folder still exists
         _check_channel_folders()
 
-        # Clean up any leftover partial/temp files from interrupted downloads
-        _startup_cleanup_temps()
+        # Clean up any leftover partial/temp files from interrupted downloads.
+        # Runs in a background thread so it doesn't block the Loading... screen —
+        # the cleanup log message will appear shortly after startup completes.
+        threading.Thread(target=_startup_cleanup_temps, daemon=True).start()
 
         log("--- Startup checks complete, ready to download ---\n", "simpleline_green")
         _stop_startup_loading()

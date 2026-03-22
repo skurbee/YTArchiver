@@ -1,7 +1,7 @@
 # YTArchiver
 
-A YouTube channel archiving tool built as a feature-rich alternative to
-4KVideoDownloader. Download, organize, transcribe, and compress entire channels
+A YouTube channel archiving tool built as an alternative to
+4KVideoDownloader, plus things I needed for my workflow. Download, organize, transcribe, and compress entire channels
 — then keep them in sync as new videos are published.
 
 (Pictures in the Wiki)

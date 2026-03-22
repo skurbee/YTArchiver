@@ -48,7 +48,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v23.8"
+APP_VERSION = "v23.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -191,6 +191,7 @@ _skip_current_gpu = threading.Event()  # same, for GPU Tasks
 _disk_error_active = False
 _disk_error_path = None   # output directory to recheck
 _disk_retry_job = None    # root.after() handle for the retry timer
+_disk_error_start_time = 0.0  # time.time() when the disk error was first detected
 
 # Unified queue ordering — tracks insertion order across all queue types.
 # Each entry is ("sync"|"reorg"|"transcribe"|"mt"|"video"|"redownload", url_or_key).
@@ -1730,12 +1731,13 @@ def _check_disk_error(text):
 
 def _handle_disk_error():
     """Pause all tasks when a disk write error is detected and start a retry timer."""
-    global _disk_error_active, _disk_error_path, _disk_retry_job
+    global _disk_error_active, _disk_error_path, _disk_retry_job, _disk_error_start_time
 
     if _disk_error_active:
         return  # already handling
 
     _disk_error_active = True
+    _disk_error_start_time = time.time()
     with config_lock:
         _disk_error_path = config.get("output_dir", "").strip() or BASE_DIR
 
@@ -1751,6 +1753,9 @@ def _handle_disk_error():
     # Pause GPU tasks
     if not _gpu_pause.is_set():
         _gpu_pause.set()
+    # Stop the tray spinner immediately — the sync worker thread may still be
+    # blocked waiting for yt-dlp output and won't reach its own pause check yet.
+    _tray_stop_spin(force=True)
 
     # Schedule the first retry check on the main thread
     def _schedule_retry():
@@ -1775,13 +1780,15 @@ def _disk_retry_check():
 
     path = _disk_error_path or (config.get("output_dir", "").strip() or BASE_DIR)
     if check_directory_writable(path):
-        # Drive is back — resume everything
+        # Drive is back — clean up any errored recent entries, then resume
         _disk_error_active = False
         _disk_retry_job = None
 
         log("\n" + "█" * 65 + "\n", "simpleline_green")
         log("█  ✓ Disk is writable again — resuming all tasks.\n", "simpleline_green")
         log("█" * 65 + "\n\n", "simpleline_green")
+
+        _cleanup_disk_error_entries()
 
         # Resume sync-pipeline tasks
         if pause_event.is_set():
@@ -1795,6 +1802,51 @@ def _disk_retry_check():
         try:
             if root.winfo_exists():
                 _disk_retry_job = root.after(_DISK_RETRY_MINUTES * 60_000, _disk_retry_check)
+        except Exception:
+            pass
+
+
+def _cleanup_disk_error_entries():
+    """Remove recent_downloads entries that failed during a disk error (file absent on disk)
+    and de-register their video IDs from the archive so they get re-downloaded on next sync.
+    Only looks at entries recorded after the disk error was first detected."""
+    cutoff = _disk_error_start_time - 30  # 30 s buffer for entries added just before the error
+    ids_to_remove = []
+    titles_retried = []
+
+    with config_lock:
+        recent = config.get("recent_downloads", [])
+        to_keep = []
+        for entry in recent:
+            ts = entry.get("download_ts", 0)
+            fp = entry.get("filepath", "")
+            url = entry.get("video_url", "")
+            title = entry.get("title", "?")
+            # Only consider entries recorded during the disk-error window with no file on disk
+            if ts >= cutoff and (not fp or not os.path.exists(fp)):
+                vid_id = ""
+                if url:
+                    m = re.search(r"[?&]v=([^&]+)", url)
+                    if m:
+                        vid_id = m.group(1)
+                if vid_id:
+                    ids_to_remove.append(vid_id)
+                    titles_retried.append(title)
+                # Drop this entry — it will be re-added after a successful re-download
+            else:
+                to_keep.append(entry)
+        if ids_to_remove:
+            config["recent_downloads"] = to_keep
+
+    if ids_to_remove:
+        _remove_ids_from_archive(ids_to_remove)
+        for t in titles_retried:
+            log(f"  ↩ Queued for retry: {t}\n", "dim")
+        log(f"  ↩ {len(ids_to_remove)} video(s) removed from archive — will retry on next sync.\n", "simpleline_green")
+        save_config(config)
+        try:
+            if 'refresh_recent_list' in globals():
+                _ui_queue.append(refresh_recent_list)
         except Exception:
             pass
 
@@ -2819,7 +2871,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.20.26 10:42pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.22.26 5:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11729,10 +11781,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             if pause_event.is_set() and not cancel_event.is_set():
                 clear_transient_lines()
                 log(f"  ⏸ Sync paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                _tray_stop_spin(force=True)
                 while pause_event.is_set() and not cancel_event.is_set():
                     time.sleep(0.25)
                 clear_pause_status()
                 if not cancel_event.is_set():
+                    _tray_start_spin()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
             if cancel_event.is_set():
                 break
@@ -12515,6 +12569,7 @@ def start_sync_all():
                 if pause_event.is_set():
                     clear_transient_lines()
                     log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{current_total} — click Resume.\n", "pausestatus")
+                    _tray_stop_spin(force=True)
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set() and not _skip_current.is_set():
@@ -12524,6 +12579,7 @@ def start_sync_all():
                         cancel_event.clear()
                         continue
                     clear_pause_status()
+                    _tray_start_spin()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch["name"]
@@ -15550,11 +15606,13 @@ def _run_autorun():
                 if pause_event.is_set():
                     clear_transient_lines()
                     log(f"  ⏸ Sync paused at {_fmt_time()} before channel {i}/{len(channels)} — click Resume.\n", "pausestatus")
+                    _tray_stop_spin(force=True)
                     while pause_event.is_set() and not cancel_event.is_set():
                         time.sleep(0.25)
                     if cancel_event.is_set():
                         break
                     clear_pause_status()
+                    _tray_start_spin()
                     log(f"  ▶ Sync resumed at {_fmt_time()}...\n", "pauselog")
 
                 ch_name = ch['name']

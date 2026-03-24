@@ -16871,8 +16871,9 @@ class _TranscriptionPanel(ttk.Frame):
         if not meta:
             return
         children = self._browse_tree.get_children(iid)
-        # Only populate if the single child is a placeholder
-        if len(children) == 1 and children[0] not in self._browse_items:
+        # Only populate if the single child is the dummy placeholder
+        if (len(children) == 1
+                and self._BROWSE_PLACEHOLDER in self._browse_tree.item(children[0], "tags")):
             self._browse_tree.delete(children[0])
             self._populate_browse_children(iid, meta)
 

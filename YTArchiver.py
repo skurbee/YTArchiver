@@ -4264,11 +4264,18 @@ def _queue_pending_transcriptions():
 
 def _queue_all_transcriptions():
     """Queue ALL channels for GPU transcription (right-click action)."""
-    if not _dark_askquestion("Queue All", "Add ALL channels to transcription queue?"):
-        return
-    out_dir = config.get("output_dir", "")
     with config_lock:
         channels = list(config.get("channels", []))
+    n = len(channels)
+    if n == 0:
+        log(f"  No channels found.\n", "dim")
+        return
+    if not _dark_askquestion(
+            "Queue All",
+            f"Add ALL {n} channel(s) to the transcription queue?\n\n"
+            f"This may take a long time for large libraries."):
+        return
+    out_dir = config.get("output_dir", "")
     added = 0
     for ch in channels:
         ch_name = ch.get("name", "")
@@ -17081,15 +17088,18 @@ class _TranscriptionPanel(ttk.Frame):
 
     # ── Viewer ────────────────────────────────────────────────────────────────
 
+    _TS_LEAD_SECONDS = 5.0  # seconds to seek before the matched word
+
     @staticmethod
     def _interpolate_ts(start, end, seg_text, query):
+        lead = _TranscriptionPanel._TS_LEAD_SECONDS
         if not query or not seg_text or end <= start:
-            return max(0.0, start - 5.0)
+            return max(0.0, start - lead)
         idx = seg_text.lower().find(query.lower())
         if idx < 0:
-            return max(0.0, start - 5.0)
+            return max(0.0, start - lead)
         ts = start + (idx / max(1, len(seg_text))) * (end - start)
-        return max(0.0, ts - 5.0)
+        return max(0.0, ts - lead)
 
     def _get_txt_path(self, jsonl_path):
         d  = os.path.dirname(jsonl_path)

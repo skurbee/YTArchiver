@@ -615,8 +615,8 @@ def log(text, tag=None):
                 if _autorun_active and _is_simple_mode:
                     try:
                         line_count = int(log_box.index("end-1c").split(".")[0])
-                        if line_count > 20:
-                            log_box.delete("1.0", f"{line_count - 20}.0")
+                        if line_count > 500:
+                            log_box.delete("1.0", f"{line_count - 500}.0")
                     except Exception:
                         pass
                 else:
@@ -2902,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 4:05pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 5:27pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16057,6 +16057,7 @@ def _run_autorun():
 
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
+                _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
 

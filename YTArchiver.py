@@ -3360,7 +3360,8 @@ _refresh_transcr_btn = ttk.Button(_subbed_header_frame, text="↺ Queue Pending"
                                    command=lambda: _queue_pending_transcriptions(),
                                    style="Dim.TButton")
 _refresh_transcr_btn.pack(side="right", padx=(0, 8))
-_ToolTip(_refresh_transcr_btn, "Add all channels with new unprocessed videos (✓ -X) to GPU transcription queue")
+_refresh_transcr_btn.bind("<Button-3>", lambda e: _queue_all_transcriptions())
+_ToolTip(_refresh_transcr_btn, "Left-click: queue channels with new videos  ·  Right-click: queue ALL channels")
 chan_list_frame = ttk.Frame(tab_settings)
 chan_list_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(2, 4))
 chan_list_frame.columnconfigure(0, weight=1)
@@ -3502,6 +3503,33 @@ if isinstance(_saved_chan_col_widths, dict):
             settings_chan_tree.column(_col, width=_w)
         except Exception:
             pass
+
+# Auto-resize: stretch the "folder" column to fill remaining width when the window resizes.
+_chan_resize_job = {"id": None}
+
+def _on_chan_tree_configure(event=None):
+    if _chan_resize_job["id"]:
+        try:
+            root.after_cancel(_chan_resize_job["id"])
+        except Exception:
+            pass
+    _chan_resize_job["id"] = root.after(50, _do_chan_resize)
+
+def _do_chan_resize():
+    _chan_resize_job["id"] = None
+    try:
+        total = settings_chan_tree.winfo_width()
+        if total < 50:
+            return
+        other = sum(settings_chan_tree.column(c, "width")
+                    for c in ("res", "min", "max", "compress", "transcribed",
+                              "last_sync", "num_vids", "size_on_disk"))
+        folder_w = max(100, total - other - 22)  # 22 = scrollbar margin
+        settings_chan_tree.column("folder", width=folder_w)
+    except Exception:
+        pass
+
+settings_chan_tree.bind("<Configure>", _on_chan_tree_configure)
 
 add_outer = ttk.LabelFrame(tab_settings, text="Add channel")
 add_outer.grid(row=4, column=0, columnspan=3, sticky="ew", padx=12, pady=(8, 4))
@@ -4232,6 +4260,32 @@ def _queue_pending_transcriptions():
         log(f"  ↺ Queued {added} channel(s) with new videos for transcription.\n", "simpleline_green")
     else:
         log(f"  No channels with pending transcriptions found.\n", "dim")
+
+
+def _queue_all_transcriptions():
+    """Queue ALL channels for GPU transcription (right-click action)."""
+    if not _dark_askquestion("Queue All", "Add ALL channels to transcription queue?"):
+        return
+    out_dir = config.get("output_dir", "")
+    with config_lock:
+        channels = list(config.get("channels", []))
+    added = 0
+    for ch in channels:
+        ch_name = ch.get("name", "")
+        ch_url = ch.get("url", "")
+        folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+        sy = ch.get("split_years", False)
+        sm = ch.get("split_months", False)
+        _add_to_gpu_queue({
+            "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+            "folder": folder, "split_years": sy, "split_months": sm,
+            "combined": not sy
+        })
+        added += 1
+    if added:
+        log(f"  ↺ Queued ALL {added} channel(s) for transcription.\n", "simpleline_green")
+    else:
+        log(f"  No channels found.\n", "dim")
 
 
 def _chan_ctx_transcribe():
@@ -12433,8 +12487,6 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 # can be deferred for download. Skip silently to avoid [SKIP] spam every run.
                 if current_vid_id and current_vid_id in live_ids:
                     continue
-                dur_count += 1
-                session_totals["dur"] += 1
 
                 # Extract title first — it's always present in the filter line and is the
                 # reliable key for dedup. yt-dlp applies !is_live / !is_upcoming directly
@@ -12444,7 +12496,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 _skip_title_raw = _m_title.group(1).strip() if _m_title else "Unknown"
 
                 # If we've already shown this filter-rejected title before, skip silently.
-                # Same behavior as already-downloaded videos — counted in totals, not itemized.
+                # Do NOT count it — the "filtered" counter should only reflect genuinely
+                # new videos the program has never seen before.
                 if _skip_title_raw in _seen_filter_titles:
                     continue
 
@@ -12452,6 +12505,10 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 # where yt-dlp does log the video ID before the filter message).
                 if current_vid_id and current_vid_id in _local_archived_set:
                     continue
+
+                # Only count genuinely new filter-rejected videos (after dedup).
+                dur_count += 1
+                session_totals["dur"] += 1
 
                 # Determine filter reason by checking the whole yt-dlp line
                 # (works regardless of whether yt-dlp wraps the expression in parens)
@@ -16656,6 +16713,13 @@ class _TranscriptionPanel(ttk.Frame):
             btn.config(bg=self._TP_ACCENT if k == key else self._TP_SIDEBAR,
                        fg="white" if k == key else self._TP_FG)
 
+        # Auto-populate frequency words from a recent search and plot automatically
+        if key == "frequency":
+            query = self._search_var.get().strip()
+            if query and not self._freq_words_var.get().strip():
+                self._freq_words_var.set(query)
+                self.after(50, self._do_frequency)
+
     def _refresh_stats_label(self):
         if not self._conn:
             return
@@ -16689,9 +16753,10 @@ class _TranscriptionPanel(ttk.Frame):
         e.pack(side="left", padx=8, ipady=5)
         e.bind("<Return>", lambda _: self._do_search())
 
-        tk.Button(row1, text="Search", command=self._do_search,
+        self._search_btn = tk.Button(row1, text="Search", command=self._do_search,
                   bg=self._TP_ACCENT, fg="white", relief="flat",
-                  font=("Segoe UI", 10, "bold"), padx=14, pady=2).pack(side="left")
+                  font=("Segoe UI", 10, "bold"), padx=14, pady=2)
+        self._search_btn.pack(side="left")
 
         self._search_count = tk.Label(row1, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                       font=("Segoe UI", 9))
@@ -16957,6 +17022,38 @@ class _TranscriptionPanel(ttk.Frame):
                 text="Left-click to read  •  Right-click for actions",
                 fg=self._TP_DIM)
 
+        # Switch Search button to Clear mode
+        self._search_btn.config(
+            text="Clear", bg=self._TP_RED,
+            command=self._clear_search)
+
+    def _clear_search(self):
+        """Reset the search section — clear results, query, filters, and restore Search button."""
+        self._search_var.set("")
+        self._s_channel_var.set("All")
+        self._s_year_from_var.set("")
+        self._s_year_to_var.set("")
+        self._tree.delete(*self._tree.get_children())
+        self._result_meta.clear()
+        self._search_count.config(text="")
+        self._search_status.config(
+            text="Left-click to read  •  Right-click for actions",
+            fg=self._TP_DIM)
+        self._sort_col = None
+        self._sort_asc = True
+        self._update_heading_labels()
+        # Clear the viewer panel
+        self._viewer_title.config(text="Select a result to read")
+        self._viewer_meta.config(text="")
+        self._viewer.config(state="normal")
+        self._viewer.delete("1.0", "end")
+        self._viewer.config(state="disabled")
+        self._viewer_section = None
+        # Restore Search button
+        self._search_btn.config(
+            text="Search", bg=self._TP_ACCENT,
+            command=self._do_search)
+
     def _export_csv(self):
         import csv
         rows = self._tree.get_children()
@@ -16987,11 +17084,12 @@ class _TranscriptionPanel(ttk.Frame):
     @staticmethod
     def _interpolate_ts(start, end, seg_text, query):
         if not query or not seg_text or end <= start:
-            return start
+            return max(0.0, start - 5.0)
         idx = seg_text.lower().find(query.lower())
         if idx < 0:
-            return start
-        return start + (idx / max(1, len(seg_text))) * (end - start)
+            return max(0.0, start - 5.0)
+        ts = start + (idx / max(1, len(seg_text))) * (end - start)
+        return max(0.0, ts - 5.0)
 
     def _get_txt_path(self, jsonl_path):
         d  = os.path.dirname(jsonl_path)
@@ -17023,7 +17121,7 @@ class _TranscriptionPanel(ttk.Frame):
         return None
 
     def _open_vlc(self, video_path, start_time=0):
-        seek = max(0.0, float(start_time) - 5.0)
+        seek = max(0.0, float(start_time))
         for vlc in self._VLC_PATHS:
             try:
                 subprocess.Popen([vlc, os.path.normpath(video_path),
@@ -17242,10 +17340,19 @@ class _TranscriptionPanel(ttk.Frame):
 
         tk.Label(bar, text="Channel:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
-        self._freq_channel_var = tk.StringVar(value="All")
-        self._freq_channel_cb  = ttk.Combobox(bar, textvariable=self._freq_channel_var,
-                                               width=18, state="readonly")
-        self._freq_channel_cb.pack(side="left", padx=(0, 12))
+        self._freq_channel_vars = {}       # channel_name → BooleanVar
+        self._freq_channel_all  = tk.BooleanVar(value=True)
+        self._freq_channel_btn  = tk.Menubutton(
+            bar, text="All ▾", bg=self._TP_BG2, fg=self._TP_FG,
+            activebackground=self._TP_BG3, activeforeground=self._TP_FG,
+            relief="flat", font=("Segoe UI", 9), padx=8, pady=2,
+            indicatoron=False, cursor="hand2", width=18, anchor="w")
+        self._freq_channel_menu = tk.Menu(
+            self._freq_channel_btn, tearoff=0,
+            bg=self._TP_BG3, fg=self._TP_FG,
+            activebackground=self._TP_ACCENT, activeforeground="white")
+        self._freq_channel_btn["menu"] = self._freq_channel_menu
+        self._freq_channel_btn.pack(side="left", padx=(0, 12))
 
         tk.Label(bar, text="Group:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
@@ -17262,15 +17369,21 @@ class _TranscriptionPanel(ttk.Frame):
                      state="readonly").pack(side="left", padx=(0, 12))
 
         self._freq_normalize_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(bar, text="Normalize", variable=self._freq_normalize_var,
+        _norm_cb = tk.Checkbutton(bar, text="Normalize", variable=self._freq_normalize_var,
                        bg=self._TP_BG3, fg=self._TP_DIM, selectcolor=self._TP_BG3,
                        activebackground=self._TP_BG3, activeforeground=self._TP_FG,
-                       font=("Segoe UI", 9)).pack(side="left", padx=(0, 12))
+                       font=("Segoe UI", 9))
+        _norm_cb.pack(side="left", padx=(0, 12))
+        _ToolTip(_norm_cb,
+                 "Normalize adjusts the graph so channels with more content don't dominate.\n"
+                 "Instead of raw mention counts, it shows mentions per 1,000 transcript\n"
+                 "segments — making it fair to compare channels of different sizes.")
 
-        tk.Button(bar, text="Plot", command=self._do_frequency,
+        self._freq_plot_btn = tk.Button(bar, text="Plot", command=self._do_frequency,
                   bg=self._TP_GREEN, fg="white", relief="flat",
                   font=("Segoe UI", 10, "bold"), padx=14,
-                  pady=2).pack(side="left")
+                  pady=2)
+        self._freq_plot_btn.pack(side="left")
 
         self._freq_status = tk.Label(bar, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                      font=("Segoe UI", 9))
@@ -17312,9 +17425,67 @@ class _TranscriptionPanel(ttk.Frame):
         try:
             rows = self._conn.execute(
                 "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
-            self._freq_channel_cb["values"] = ["All"] + [r[0] for r in rows]
+            channels = [r[0] for r in rows]
         except Exception:
-            self._freq_channel_cb["values"] = ["All"]
+            channels = []
+
+        self._freq_channel_menu.delete(0, "end")
+        self._freq_channel_vars.clear()
+
+        def _on_all_toggle():
+            if self._freq_channel_all.get():
+                for v in self._freq_channel_vars.values():
+                    v.set(False)
+            self._refresh_freq_channel_label()
+
+        def _on_ch_toggle(ch_name):
+            any_checked = any(v.get() for v in self._freq_channel_vars.values())
+            self._freq_channel_all.set(not any_checked)
+            self._refresh_freq_channel_label()
+
+        self._freq_channel_menu.add_checkbutton(
+            label="All", variable=self._freq_channel_all,
+            command=_on_all_toggle)
+        self._freq_channel_menu.add_separator()
+        for ch in channels:
+            var = tk.BooleanVar(value=False)
+            self._freq_channel_vars[ch] = var
+            self._freq_channel_menu.add_checkbutton(
+                label=ch, variable=var,
+                command=lambda c=ch: _on_ch_toggle(c))
+
+    def _refresh_freq_channel_label(self):
+        """Update the Menubutton text to reflect the current channel selection."""
+        selected = [ch for ch, v in self._freq_channel_vars.items() if v.get()]
+        if not selected or self._freq_channel_all.get():
+            self._freq_channel_btn.config(text="All ▾")
+        elif len(selected) == 1:
+            name = selected[0]
+            if len(name) > 18:
+                name = name[:15] + "..."
+            self._freq_channel_btn.config(text=f"{name} ▾")
+        else:
+            self._freq_channel_btn.config(text=f"{len(selected)} channels ▾")
+
+    def _get_freq_selected_channels(self):
+        """Return list of selected channel names, or empty list for 'All'."""
+        if self._freq_channel_all.get():
+            return []
+        return [ch for ch, v in self._freq_channel_vars.items() if v.get()]
+
+    def _append_channel_filter(self, sql, params, channels, col="s.channel"):
+        """Append an AND channel filter clause for multi-select channels.
+        If channels is empty, no filter is added (= 'All')."""
+        if not channels:
+            return sql
+        if len(channels) == 1:
+            sql += f" AND {col}=?"
+            params.append(channels[0])
+        else:
+            placeholders = ",".join("?" * len(channels))
+            sql += f" AND {col} IN ({placeholders})"
+            params.extend(channels)
+        return sql
 
     def _do_frequency(self):
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
@@ -17323,7 +17494,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not raw:
             return
         words     = [w.strip() for w in raw.split(",") if w.strip()][:6]
-        channel   = self._freq_channel_var.get()
+        channels  = self._get_freq_selected_channels()
         by_month  = self._freq_group_var.get() == "Month"
         use_bar   = self._freq_chart_var.get() == "Bar"
         normalize = self._freq_normalize_var.get()
@@ -17341,9 +17512,7 @@ class _TranscriptionPanel(ttk.Frame):
                       "WHERE segments_fts MATCH ?) "
                       "AND s.year IS NOT NULL"))
             params = [fts_q]
-            if channel != "All":
-                sql += " AND s.channel=?"
-                params.append(channel)
+            sql = self._append_channel_filter(sql, params, channels)
             try:
                 for r in self._conn.execute(sql, params):
                     all_keys.add(r[0])
@@ -17363,9 +17532,7 @@ class _TranscriptionPanel(ttk.Frame):
                          "WHERE segments_fts MATCH ?) "
                          "AND s.year IS NOT NULL")
                 params = [fts_q]
-                if channel != "All":
-                    sql += " AND s.channel=?"
-                    params.append(channel)
+                sql = self._append_channel_filter(sql, params, channels)
                 try:
                     for r in self._conn.execute(sql, params):
                         all_keys.add(r[0])
@@ -17402,9 +17569,7 @@ class _TranscriptionPanel(ttk.Frame):
                        if by_month else
                        "SELECT year, COUNT(*) FROM segments WHERE year IS NOT NULL")
             tot_params = []
-            if channel != "All":
-                tot_sql += " AND channel=?"
-                tot_params.append(channel)
+            tot_sql = self._append_channel_filter(tot_sql, tot_params, channels, col="channel")
             tot_sql += " GROUP BY year, month" if by_month else " GROUP BY year"
             totals = {r[0]: r[1] for r in self._conn.execute(tot_sql, tot_params)}
         else:
@@ -17430,9 +17595,7 @@ class _TranscriptionPanel(ttk.Frame):
                       "WHERE segments_fts MATCH ?) "
                       "AND s.year IS NOT NULL"))
             params = [fts_q]
-            if channel != "All":
-                sql += " AND s.channel=?"
-                params.append(channel)
+            sql = self._append_channel_filter(sql, params, channels)
             sql += " GROUP BY s.year, s.month" if by_month else " GROUP BY s.year"
             try:
                 counts = {r[0]: r[1] for r in self._conn.execute(sql, params)}
@@ -17469,7 +17632,10 @@ class _TranscriptionPanel(ttk.Frame):
         ylabel = ("Mentions per 1,000 segments" if normalize
                   else "Segment mentions")
         self._ax.set_ylabel(ylabel, color="#888", fontsize=9)
-        ch_label = channel if channel != "All" else "all channels"
+        if channels:
+            ch_label = ", ".join(channels) if len(channels) <= 2 else f"{len(channels)} channels"
+        else:
+            ch_label = "all channels"
         self._ax.set_title(f"Word frequency — {ch_label}", fontsize=11)
         if len(words) > 1:
             self._ax.legend(facecolor=self._TP_BG2, edgecolor="#444",
@@ -17480,6 +17646,26 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_all_keys = all_keys
         self._freq_words    = words
         self._freq_by_month = by_month
+
+        # Switch Plot button to Clear mode
+        self._freq_plot_btn.config(
+            text="Clear", bg=self._TP_RED,
+            command=self._clear_frequency)
+
+    def _clear_frequency(self):
+        """Reset the frequency section — clear chart, words, and restore Plot button."""
+        self._freq_words_var.set("")
+        self._freq_status.config(text="")
+        self._freq_all_keys = []
+        self._freq_words    = []
+        self._freq_by_month = False
+        if self._freq_canvas:
+            self._ax.clear()
+            self._style_freq_ax()
+            self._freq_canvas.draw()
+        self._freq_plot_btn.config(
+            text="Plot", bg=self._TP_GREEN,
+            command=self._do_frequency)
 
     def _on_graph_click(self, event):
         if event.inaxes != self._ax:
@@ -17755,10 +17941,11 @@ _tab_btns: dict = {}  # str(tab widget) → tk.Label
 
 def _make_tab_btn(parent, text, tab, side="left"):
     lbl = tk.Label(parent, text=text, bg=C_BG, fg=C_ACCENT,
-                   font=("Segoe UI", 9), padx=16, pady=7, cursor="hand2")
+                   font=("Segoe UI", 9), padx=16, pady=7, cursor="hand2",
+                   bd=1, relief="solid", highlightthickness=0)
     lbl.bind("<Button-1>", lambda e: notebook.select(tab))
     _tab_btns[str(tab)] = lbl
-    lbl.pack(side=side)
+    lbl.pack(side=side, padx=(0, 1))
     return lbl
 
 _make_tab_btn(_tab_bar, "  Download  ", tab_download)
@@ -17771,9 +17958,11 @@ def _refresh_tab_btns(selected_str=None):
         selected_str = str(notebook.select())
     for tab_str, lbl in _tab_btns.items():
         if tab_str == selected_str:
-            lbl.config(bg=C_SURFACE, fg=C_TEXT, font=("Segoe UI", 9, "bold"))
+            lbl.config(bg=C_SURFACE, fg=C_TEXT, font=("Segoe UI", 9, "bold"),
+                       highlightbackground=C_BORDER_LT)
         else:
-            lbl.config(bg=C_BG, fg=C_ACCENT, font=("Segoe UI", 9))
+            lbl.config(bg=C_BG, fg=C_ACCENT, font=("Segoe UI", 9),
+                       highlightbackground=C_BORDER_LT)
 
 _refresh_tab_btns()
 

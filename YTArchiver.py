@@ -422,6 +422,15 @@ def log(text, tag=None):
                                 if _trans_i > 0:
                                     log_box.tag_add("whisper_prefix", _wp_start,
                                                     log_box.index(f"{_wp_start}+{_trans_i}c"))
+                                    # Re-color [ and ] blue over the white prefix
+                                    if _before[0] == "[":
+                                        _close_b = _before.find("]")
+                                        if _close_b > 0:
+                                            log_box.tag_add("whisper_bracket", _wp_start,
+                                                            log_box.index(f"{_wp_start}+1c"))
+                                            log_box.tag_add("whisper_bracket",
+                                                            log_box.index(f"{_wp_start}+{_close_b}c"),
+                                                            log_box.index(f"{_wp_start}+{_close_b+1}c"))
                                 _ttl_s = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
                                 _ttl_e = log_box.index(f"{_wp_start}+{len(_before)}c")
                                 if log_box.compare(_ttl_s, "<", _ttl_e):
@@ -735,6 +744,15 @@ def _reapply_whisper_overlays():
     if _trans_i > 0:
         _pfx_end = log_box.index(f"{_wp_start}+{_trans_i}c")
         log_box.tag_add("whisper_prefix", _wp_start, _pfx_end)
+        # Re-color [ and ] blue over the white prefix
+        if _wp_text[0] == "[":
+            _close_b = _wp_text.find("]")
+            if _close_b > 0:
+                log_box.tag_add("whisper_bracket", _wp_start,
+                                log_box.index(f"{_wp_start}+1c"))
+                log_box.tag_add("whisper_bracket",
+                                log_box.index(f"{_wp_start}+{_close_b}c"),
+                                log_box.index(f"{_wp_start}+{_close_b+1}c"))
     _ttl_start = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
     _ttl_end = _wp_r[1]  # end of the first (prefix+title) range
     if log_box.compare(_ttl_start, "<", _ttl_end):
@@ -1358,7 +1376,7 @@ def _simple_anim_tick():
         if _anim_mode == "redownload":
             # Redownload mode: [x/total] REDOWNLOADING: channel···
             log_simple_status(segments=[
-                (f"[{i}/{n}]", "simplestatus_white"),
+                ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
                 (" REDOWNLOADING:", "simplestatus_green"),
                 (f" {ch}", "simplestatus_white"),
                 (d, "simplestatus_green"),
@@ -1389,7 +1407,7 @@ def _simple_anim_tick():
         page = _simple_anim_state["page_num"]
         if enum_page > 0:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", "simplestatus_white"),
+                ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
                 (" SYNCING:", "simplestatus_green"),
                 (f" {ch}  ", "simplestatus_white"),
                 (d, "simplestatus_green"),
@@ -1400,7 +1418,7 @@ def _simple_anim_tick():
             ])
         elif page > 0:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", "simplestatus_white"),
+                ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
                 (" SYNCING:", "simplestatus_green"),
                 (f" {ch}", "simplestatus_white"),
                 (status_text, None),
@@ -1412,7 +1430,7 @@ def _simple_anim_tick():
             ])
         else:
             log_simple_status(segments=[
-                (f"[{i}/{n}]", "simplestatus_white"),
+                ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
                 (" SYNCING:", "simplestatus_green"),
                 (f" {ch}", "simplestatus_white"),
                 (status_text, "simplestatus_green"),
@@ -2902,7 +2920,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 5:27pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 6:55pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3265,6 +3283,7 @@ log_box.tag_configure("whisper_progress", foreground=C_LOG_BLUE, font=("Consolas
 log_box.tag_configure("whisper_pct", foreground=C_LOG_GREEN, font=("Consolas", 9, "bold"))
 log_box.tag_configure("whisper_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_prefix", foreground=C_TEXT, font=("Consolas", 9))
+log_box.tag_configure("whisper_bracket", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("whisper_title", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("transcribe_prefix", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("transcribe_title", foreground=C_TEXT, font=("Consolas", 9))
@@ -3280,6 +3299,8 @@ log_box.tag_raise("encode_title", "encode_progress")
 # whisper_prefix and whisper_title must override whisper_progress (white over blue)
 log_box.tag_raise("whisper_prefix", "whisper_progress")
 log_box.tag_raise("whisper_title", "whisper_progress")
+# whisper_bracket re-applies blue to [ and ] over the white whisper_prefix
+log_box.tag_raise("whisper_bracket", "whisper_prefix")
 # transcribe_prefix and transcribe_title must override transcribe_using (white over blue)
 log_box.tag_raise("transcribe_prefix", "transcribe_using")
 log_box.tag_raise("transcribe_title", "transcribe_using")
@@ -11077,6 +11098,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
+                             ("whisper_bracket", {"foreground": C_LOG_BLUE}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
@@ -12932,7 +12954,7 @@ def start_sync_all():
     _my_gen = _job_generation
 
     _sync_running = True
-    _current_job["label"] = "Full Sub Sync"
+    _current_job["label"] = "Sync Subs"
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Syncing...")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
@@ -13021,7 +13043,7 @@ def start_sync_all():
 
                 ch_name = ch["name"]
                 ch_dl_map[ch_name] = 0
-                _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Sync {ch_name}"
+                _current_job["label"] = "Sync Subs"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
 
@@ -15204,6 +15226,7 @@ def _gpu_start():
                 while True:
                     if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                         _tray_stop_spin(force=True)  # stop blinking while paused
+                        _clear_whisper_progress()
                         log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                         _gpu_truly_paused = True
                         while _gpu_pause.is_set() and not _gpu_cancel.is_set():
@@ -15443,6 +15466,7 @@ def _gpu_start():
                 # Pause check
                 if _gpu_pause.is_set() and not _gpu_cancel.is_set():
                     _tray_stop_spin(force=True)  # stop blinking while paused
+                    _clear_whisper_progress()
                     log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                     _gpu_truly_paused = True
                     while _gpu_pause.is_set() and not _gpu_cancel.is_set():
@@ -15998,11 +16022,6 @@ def _run_autorun():
     if not channels:
         return
 
-    if root.winfo_exists():
-        log_box.config(state="normal")
-        log_box.delete("1.0", tk.END)
-        log_box.config(state="disabled")
-
     t_start = datetime.now()
 
     _autorun_next["ts"] = None
@@ -16030,6 +16049,7 @@ def _run_autorun():
     def _auto_worker():
         global _autorun_active, _sync_running, _current_sync_ch
         _autorun_active = True
+        _current_job["label"] = "Sync Subs"
         ch_dl_map = {}
         try:
             out_dir = _captured_outdir
@@ -16057,7 +16077,7 @@ def _run_autorun():
 
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
-                _current_job["label"] = f"Initializing {ch_name}" if not ch.get("initialized", False) else f"Sync {ch_name}"
+                _current_job["label"] = "Sync Subs"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
 
@@ -19315,6 +19335,7 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
                              ("whisper_prefix", {"foreground": C_TEXT}),
+                             ("whisper_bracket", {"foreground": C_LOG_BLUE}),
                              ("whisper_title", {"foreground": C_TEXT}),
                              ("whisper_progress", {"foreground": C_LOG_BLUE}),
                              ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
@@ -19339,7 +19360,7 @@ _ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simp
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim", "dim",
-                 "whisper_prefix", "whisper_title", "whisper_progress",
+                 "whisper_bracket", "whisper_prefix", "whisper_title", "whisper_progress",
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
                  "encode_progress", "encode_pct", "encode_dots",
                  "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using")

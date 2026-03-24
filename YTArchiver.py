@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.2"
+APP_VERSION = "v24.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2903,7 +2903,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 10:36am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 5:07pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16450,6 +16450,9 @@ def _tp_open_db(path):
         created    REAL DEFAULT (strftime('%%s','now')),
         FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_channel ON segments(channel)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr ON segments(channel, year)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr_mo ON segments(channel, year, month)")
     conn.commit()
     return conn
 
@@ -16756,14 +16759,16 @@ class _TranscriptionPanel(ttk.Frame):
     def _refresh_stats_label(self):
         if not self._conn:
             return
-        try:
-            segs = self._conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-            vids = self._conn.execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
-            chs  = self._conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
-            self._stats_label.config(
-                text=f"{segs:,} segments\n{vids:,} videos\n{chs} channels")
-        except Exception:
-            pass
+        def _query():
+            try:
+                segs = self._conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                vids = self._conn.execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+                chs  = self._conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
+                self.after(0, lambda: self._stats_label.config(text=text))
+            except Exception:
+                pass
+        threading.Thread(target=_query, daemon=True).start()
 
     # ── Browse section ────────────────────────────────────────────────────────
 
@@ -16795,6 +16800,7 @@ class _TranscriptionPanel(ttk.Frame):
         bsb.pack(side="right", fill="y")
         self._browse_tree.pack(fill="both", expand=True)
         self._browse_tree.bind("<<TreeviewSelect>>", self._on_browse_select)
+        self._browse_tree.bind("<<TreeviewOpen>>", self._on_browse_open)
         pane.add(left, minsize=200, width=240)
 
         # Right: transcript viewer
@@ -16837,8 +16843,10 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_items = {}  # iid → {"type": "channel"/"year"/"month"/"file", ...}
         return f
 
+    _BROWSE_PLACEHOLDER = "__placeholder__"
+
     def _refresh_browse(self):
-        """Populate the browse tree from the index database."""
+        """Populate the browse tree — lazy: only top-level channels at first."""
         if not self._conn:
             return
         tree = self._browse_tree
@@ -16853,37 +16861,58 @@ class _TranscriptionPanel(ttk.Frame):
         for (ch,) in channels:
             ch_iid = tree.insert("", "end", text=f"📁  {ch}", open=False)
             self._browse_items[ch_iid] = {"type": "channel", "channel": ch}
-            # Fetch years for this channel
+            # Dummy child so the expand arrow appears
+            tree.insert(ch_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+
+    def _on_browse_open(self, event=None):
+        """Lazily populate children when a browse tree node is expanded."""
+        iid = self._browse_tree.focus()
+        meta = self._browse_items.get(iid)
+        if not meta:
+            return
+        children = self._browse_tree.get_children(iid)
+        # Only populate if the single child is a placeholder
+        if len(children) == 1 and children[0] not in self._browse_items:
+            self._browse_tree.delete(children[0])
+            self._populate_browse_children(iid, meta)
+
+    def _populate_browse_children(self, iid, meta):
+        """Load the next level of children for a browse tree node."""
+        tree = self._browse_tree
+        if meta["type"] == "channel":
+            ch = meta["channel"]
             try:
                 years = self._conn.execute(
                     "SELECT DISTINCT year FROM segments WHERE channel=? AND year IS NOT NULL "
                     "ORDER BY year", (ch,)).fetchall()
             except Exception:
-                continue
+                return
             if not years:
-                # No year data — show flat list of titles
-                self._populate_browse_titles(ch_iid, ch, None, None)
-                continue
+                self._populate_browse_titles(iid, ch, None, None)
+                return
             for (yr,) in years:
-                yr_iid = tree.insert(ch_iid, "end", text=f"📅  {yr}", open=False)
+                yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
                 self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr}
-                # Fetch months for this year
-                try:
-                    months = self._conn.execute(
-                        "SELECT DISTINCT month FROM segments WHERE channel=? AND year=? "
-                        "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
-                except Exception:
-                    continue
-                if months and len(months) > 1:
-                    for (mo,) in months:
-                        mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
-                        mo_iid = tree.insert(yr_iid, "end", text=f"📄  {mo_name}", open=False)
-                        self._browse_items[mo_iid] = {
-                            "type": "month", "channel": ch, "year": yr, "month": mo}
-                        self._populate_browse_titles(mo_iid, ch, yr, mo)
-                else:
-                    # Only one month or no months — show titles directly under year
-                    self._populate_browse_titles(yr_iid, ch, yr, None)
+                tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+        elif meta["type"] == "year":
+            ch, yr = meta["channel"], meta["year"]
+            try:
+                months = self._conn.execute(
+                    "SELECT DISTINCT month FROM segments WHERE channel=? AND year=? "
+                    "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
+            except Exception:
+                return
+            if months and len(months) > 1:
+                for (mo,) in months:
+                    mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
+                    mo_iid = tree.insert(iid, "end", text=f"📄  {mo_name}", open=False)
+                    self._browse_items[mo_iid] = {
+                        "type": "month", "channel": ch, "year": yr, "month": mo}
+                    tree.insert(mo_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+            else:
+                self._populate_browse_titles(iid, ch, yr, None)
+        elif meta["type"] == "month":
+            self._populate_browse_titles(iid, meta["channel"], meta["year"], meta["month"])
 
     def _populate_browse_titles(self, parent_iid, channel, year, month):
         """Insert individual video title nodes under a parent browse node."""
@@ -18445,35 +18474,42 @@ class _TranscriptionPanel(ttk.Frame):
     def _refresh_index_stats(self):
         if not self._conn:
             return
-        try:
-            segs  = self._conn.execute(
-                "SELECT COUNT(*) FROM segments").fetchone()[0]
-            vids  = self._conn.execute(
-                "SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
-            chs   = self._conn.execute(
-                "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
-            files = self._conn.execute(
-                "SELECT COUNT(*) FROM indexed_files").fetchone()[0]
-            yr    = self._conn.execute(
-                "SELECT MIN(year), MAX(year) FROM segments "
-                "WHERE year IS NOT NULL").fetchone()
-            yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] else "N/A"
-            db_mb   = (os.path.getsize(_TP_DB_PATH) / 1_048_576
-                       if os.path.exists(_TP_DB_PATH) else 0)
-            text = (f"Segments  : {segs:,}\n"
-                    f"Videos    : {vids:,}\n"
-                    f"Channels  : {chs}\n"
-                    f"JSONL files: {files}\n"
-                    f"Year range: {yr_str}\n"
-                    f"DB size   : {db_mb:.1f} MB\n"
-                    f"DB path   : {_TP_DB_PATH}")
-            self._stats_txt.config(state="normal")
-            self._stats_txt.delete("1.0", "end")
-            self._stats_txt.insert("1.0", text)
-            self._stats_txt.config(state="disabled")
-            self._refresh_stats_label()
-        except Exception:
-            pass
+        def _query():
+            try:
+                segs  = self._conn.execute(
+                    "SELECT COUNT(*) FROM segments").fetchone()[0]
+                vids  = self._conn.execute(
+                    "SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+                chs   = self._conn.execute(
+                    "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                files = self._conn.execute(
+                    "SELECT COUNT(*) FROM indexed_files").fetchone()[0]
+                yr    = self._conn.execute(
+                    "SELECT MIN(year), MAX(year) FROM segments "
+                    "WHERE year IS NOT NULL").fetchone()
+                yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] else "N/A"
+                db_mb   = (os.path.getsize(_TP_DB_PATH) / 1_048_576
+                           if os.path.exists(_TP_DB_PATH) else 0)
+                text = (f"Segments  : {segs:,}\n"
+                        f"Videos    : {vids:,}\n"
+                        f"Channels  : {chs}\n"
+                        f"JSONL files: {files}\n"
+                        f"Year range: {yr_str}\n"
+                        f"DB size   : {db_mb:.1f} MB\n"
+                        f"DB path   : {_TP_DB_PATH}")
+                def _update():
+                    try:
+                        self._stats_txt.config(state="normal")
+                        self._stats_txt.delete("1.0", "end")
+                        self._stats_txt.insert("1.0", text)
+                        self._stats_txt.config(state="disabled")
+                        self._refresh_stats_label()
+                    except Exception:
+                        pass
+                self.after(0, _update)
+            except Exception:
+                pass
+        threading.Thread(target=_query, daemon=True).start()
 
     def _tp_log(self, msg):
         def _do():
@@ -18583,12 +18619,13 @@ notebook.pack(fill="both", expand=True, padx=0, pady=0)
 _tab_btns: dict = {}  # str(tab widget) → tk.Label
 
 def _make_tab_btn(parent, text, tab, side="left"):
-    lbl = tk.Label(parent, text=text, bg=C_BG, fg=C_ACCENT,
+    lbl = tk.Label(parent, text=text, bg=C_BTN, fg=C_ACCENT,
                    font=("Segoe UI", 9), padx=16, pady=7, cursor="hand2",
-                   bd=1, relief="solid", highlightthickness=0)
+                   bd=0, relief="flat",
+                   highlightthickness=1, highlightbackground=C_BORDER_LT)
     lbl.bind("<Button-1>", lambda e: notebook.select(tab))
     _tab_btns[str(tab)] = lbl
-    lbl.pack(side=side, padx=(0, 1))
+    lbl.pack(side=side, padx=(0, 2))
     return lbl
 
 _make_tab_btn(_tab_bar, "  Download  ", tab_download)
@@ -18601,10 +18638,10 @@ def _refresh_tab_btns(selected_str=None):
         selected_str = str(notebook.select())
     for tab_str, lbl in _tab_btns.items():
         if tab_str == selected_str:
-            lbl.config(bg=C_SURFACE, fg=C_TEXT, font=("Segoe UI", 9, "bold"),
-                       highlightbackground=C_BORDER_LT)
+            lbl.config(bg=C_PRIMARY, fg=C_TEXT, font=("Segoe UI", 9, "bold"),
+                       highlightbackground=C_ACCENT)
         else:
-            lbl.config(bg=C_BG, fg=C_ACCENT, font=("Segoe UI", 9),
+            lbl.config(bg=C_BTN, fg=C_ACCENT, font=("Segoe UI", 9),
                        highlightbackground=C_BORDER_LT)
 
 _refresh_tab_btns()

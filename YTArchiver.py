@@ -16797,11 +16797,23 @@ class _TranscriptionPanel(ttk.Frame):
 
         # Right: transcript viewer
         right = tk.Frame(pane, bg=self._TP_BG)
-        self._browse_viewer_title = tk.Label(right, text="Select a transcription to read",
+        # Viewer header with title + inline search
+        vh = tk.Frame(right, bg=self._TP_BG3)
+        vh.pack(fill="x")
+        self._browse_viewer_title = tk.Label(vh, text="Select a transcription to read",
                                              bg=self._TP_BG3, fg=self._TP_FG,
                                              font=("Segoe UI", 11, "bold"), anchor="w",
                                              padx=10, pady=6)
-        self._browse_viewer_title.pack(fill="x")
+        self._browse_viewer_title.pack(side="left", fill="x", expand=True)
+        # Inline find bar
+        self._browse_find_var = tk.StringVar()
+        bf_entry = tk.Entry(vh, textvariable=self._browse_find_var, bg=self._TP_BG2,
+                            fg=self._TP_FG, insertbackground=self._TP_FG, relief="flat",
+                            font=("Segoe UI", 9), width=20)
+        bf_entry.pack(side="right", padx=(0, 8), ipady=2)
+        bf_entry.bind("<Return>", lambda _: self._browse_find())
+        tk.Label(vh, text="Find:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="right", padx=(8, 4))
         vf = tk.Frame(right, bg=self._TP_BG)
         vf.pack(fill="both", expand=True)
         self._browse_viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG,
@@ -16813,6 +16825,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_viewer.tag_configure("header", foreground=self._TP_ACCENT,
                                           font=("Segoe UI", 10, "bold"))
         self._browse_viewer.tag_configure("separator", foreground="#333")
+        self._browse_viewer.tag_configure("find_hit", background="#4a3f00",
+                                          foreground="#ffe066")
         bvsb.pack(side="right", fill="y")
         self._browse_viewer.pack(fill="both", expand=True)
         pane.add(right, minsize=300)
@@ -16921,6 +16935,26 @@ class _TranscriptionPanel(ttk.Frame):
                 self._browse_viewer.insert("end", f"Expected:\n{txt_path}")
         self._browse_viewer.config(state="disabled")
         self._browse_viewer.yview_moveto(0)
+
+    def _browse_find(self):
+        """Highlight all occurrences of the find term in the browse viewer."""
+        query = self._browse_find_var.get().strip()
+        self._browse_viewer.tag_remove("find_hit", "1.0", "end")
+        if not query:
+            return
+        idx = "1.0"
+        first = None
+        while True:
+            pos = self._browse_viewer.search(query, idx, stopindex="end", nocase=True)
+            if not pos:
+                break
+            end_pos = f"{pos}+{len(query)}c"
+            self._browse_viewer.tag_add("find_hit", pos, end_pos)
+            if first is None:
+                first = pos
+            idx = end_pos
+        if first:
+            self._browse_viewer.see(first)
 
     # ── Bookmarks section ─────────────────────────────────────────────────────
 
@@ -17812,7 +17846,7 @@ class _TranscriptionPanel(ttk.Frame):
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
         self._freq_chart_var = tk.StringVar(value="Line")
         ttk.Combobox(bar, textvariable=self._freq_chart_var,
-                     values=["Line", "Bar"], width=6,
+                     values=["Line", "Bar", "Word Cloud"], width=10,
                      state="readonly").pack(side="left", padx=(0, 12))
 
         self._freq_normalize_var = tk.BooleanVar(value=False)
@@ -17946,8 +17980,15 @@ class _TranscriptionPanel(ttk.Frame):
             return
         words     = [w.strip() for w in raw.split(",") if w.strip()][:6]
         channels  = self._get_freq_selected_channels()
+        chart_type = self._freq_chart_var.get()
+
+        # Word Cloud mode — completely different rendering path
+        if chart_type == "Word Cloud":
+            self._do_word_cloud(words, channels)
+            return
+
         by_month  = self._freq_group_var.get() == "Month"
-        use_bar   = self._freq_chart_var.get() == "Bar"
+        use_bar   = chart_type == "Bar"
         normalize = self._freq_normalize_var.get()
 
         all_keys = set()
@@ -18117,6 +18158,107 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_plot_btn.config(
             text="Plot", bg=self._TP_GREEN,
             command=self._do_frequency)
+
+    def _do_word_cloud(self, seed_words, channels):
+        """Render a word cloud using top co-occurring words from transcription segments."""
+        if not _HAS_MPL or not self._conn or not self._freq_canvas:
+            return
+        import random as _rng
+        # Find segments containing the seed words and extract surrounding vocabulary
+        word_counts = {}
+        _stop = {
+            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "is", "it", "i", "you", "he", "she", "we", "they", "that",
+            "this", "was", "are", "be", "been", "being", "have", "has", "had",
+            "do", "does", "did", "will", "would", "could", "should", "may",
+            "might", "shall", "can", "not", "no", "so", "if", "then", "than",
+            "when", "what", "who", "how", "which", "where", "there", "here",
+            "all", "each", "every", "both", "few", "more", "most", "other",
+            "some", "such", "only", "own", "same", "just", "also", "very",
+            "with", "from", "about", "into", "through", "during", "before",
+            "after", "above", "below", "between", "out", "off", "over", "under",
+            "again", "further", "once", "my", "your", "his", "her", "its",
+            "our", "their", "me", "him", "us", "them", "up", "down", "as",
+            "by", "like", "know", "think", "go", "going", "get", "got", "make",
+            "say", "said", "see", "come", "way", "look", "thing", "things",
+            "well", "back", "right", "yeah", "okay", "oh", "uh", "um", "really",
+            "one", "two", "much", "even", "still", "because", "don't", "dont",
+        }
+        for word in seed_words:
+            fts_q = '"' + word.replace('"', '""') + '"'
+            sql = ("SELECT s.text FROM segments s "
+                   "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                   "WHERE segments_fts MATCH ?) LIMIT 2000")
+            params = [fts_q]
+            sql = self._append_channel_filter(sql, params, channels)
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+            except Exception:
+                continue
+            for (text,) in rows:
+                for w in re.findall(r"[a-zA-Z']{3,}", text.lower()):
+                    if w not in _stop and w not in seed_words:
+                        word_counts[w] = word_counts.get(w, 0) + 1
+        # Always include seed words with boosted counts
+        for sw in seed_words:
+            fts_q = '"' + sw.replace('"', '""') + '"'
+            sql = ("SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?")
+            try:
+                cnt = self._conn.execute(sql, (fts_q,)).fetchone()[0]
+            except Exception:
+                cnt = 50
+            word_counts[sw.lower()] = max(word_counts.get(sw.lower(), 0), cnt)
+
+        if not word_counts:
+            self._freq_status.config(text="No data for word cloud.")
+            return
+
+        # Get top 80 words
+        top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:80]
+        max_count = top[0][1] if top else 1
+
+        # Render word cloud using matplotlib text
+        self._ax.clear()
+        self._ax.set_facecolor(self._TP_BG2)
+        self._ax.set_xlim(0, 1)
+        self._ax.set_ylim(0, 1)
+        self._ax.axis("off")
+        palette = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea",
+                   "#89ddff", "#f78c6c", "#82aaff", "#c3e88d", "#ffcb6b",
+                   "#e06c75", "#56b6c2", "#d19a66", "#98c379"]
+        _rng.seed(42)  # deterministic layout
+        positions = []
+        for i, (word, count) in enumerate(top):
+            # Size: 8-28pt based on count proportion
+            size = 8 + 20 * (count / max_count)
+            color = palette[i % len(palette)]
+            # Highlight seed words
+            if word in [sw.lower() for sw in seed_words]:
+                color = "#ffffff"
+                size = min(size * 1.3, 32)
+            # Place words using a spiral-ish layout
+            angle = i * 137.508  # golden angle in degrees
+            r = 0.15 + 0.30 * (i / max(len(top), 1))
+            x = 0.5 + r * _rng.uniform(-1, 1)
+            y = 0.5 + r * _rng.uniform(-1, 1)
+            x = max(0.05, min(0.95, x))
+            y = max(0.05, min(0.95, y))
+            self._ax.text(x, y, word, fontsize=size, color=color,
+                          ha="center", va="center",
+                          fontweight="bold" if count > max_count * 0.5 else "normal",
+                          alpha=0.6 + 0.4 * (count / max_count))
+        ch_label = (", ".join(channels[:2]) if channels else "all channels")
+        self._ax.set_title(f"Word Cloud — {ch_label}", fontsize=11,
+                          color=self._TP_FG)
+        self._fig.tight_layout()
+        self._freq_canvas.draw()
+        self._freq_status.config(text=f"{len(top)} words plotted")
+        self._freq_all_keys = []
+        self._freq_words    = seed_words
+        self._freq_by_month = False
+        self._freq_plot_btn.config(
+            text="Clear", bg=self._TP_RED,
+            command=self._clear_frequency)
 
     def _export_frequency_csv(self):
         """Export the current frequency chart data to a CSV file."""

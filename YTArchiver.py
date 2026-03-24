@@ -19,6 +19,18 @@ import unicodedata
 import difflib
 import hashlib
 import urllib.request
+import sqlite3
+import webbrowser as _webbrowser
+from pathlib import Path
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
 
 # System tray icon (optional — gracefully disabled if not installed)
 try:
@@ -48,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v23.9"
+APP_VERSION = "v24.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -120,7 +132,7 @@ def _get_compress_bitrate(quality, output_res):
     res_key = output_res if output_res in _COMPRESS_PRESETS else "1080"
     return _COMPRESS_PRESETS.get(res_key, _COMPRESS_PRESETS["1080"]).get(quality, 700)
 
-RESOLUTION_OPTIONS = ["144", "240", "360", "480", "720", "1080", "1440", "2160", "best"]
+RESOLUTION_OPTIONS = ["audio", "144", "240", "360", "480", "720", "1080", "1440", "2160", "best"]
 active_processes = []
 proc_lock = threading.Lock()
 config_lock = threading.RLock()
@@ -1891,6 +1903,10 @@ def detect_url_type(url):
 
 
 def build_format_string(resolution):
+    # Audio-only mode: prefer m4a (AAC) then best audio, no video stream
+    if resolution == "audio":
+        return "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
+
     h = f"[height<={resolution}]" if resolution != "best" else ""
 
     # Prefer H.264 video + AAC audio for maximum Windows/MP4 compatibility.
@@ -1916,12 +1932,14 @@ def build_format_string(resolution):
     res_int = int(resolution)
     res_above = None
     res_below = None
-    for i, r in enumerate(RESOLUTION_OPTIONS[:-1]):  # exclude "best"
+    # Skip "audio" in fallback search — it's not a numeric resolution
+    _num_opts = [r for r in RESOLUTION_OPTIONS if r.isdigit()]
+    for i, r in enumerate(_num_opts[:-1] if _num_opts[-1] == "best" else _num_opts):
         if int(r) == res_int:
-            if i + 1 < len(RESOLUTION_OPTIONS) - 1:
-                res_above = RESOLUTION_OPTIONS[i + 1]
+            if i + 1 < len(_num_opts):
+                res_above = _num_opts[i + 1]
             if i > 0:
-                res_below = RESOLUTION_OPTIONS[i - 1]
+                res_below = _num_opts[i - 1]
             break
 
     fallbacks = ""
@@ -2753,14 +2771,15 @@ def _combo(parent, **kw):
 style = ttk.Style()
 style.theme_use("clam")
 
-style.configure("TNotebook", background=C_BG, borderwidth=0)
-style.configure("TNotebook.Tab",
-                background=C_BG, foreground=C_ACCENT,
-                padding=[16, 7], font=("Segoe UI", 9))
-style.map("TNotebook.Tab",
-          background=[("selected", C_SURFACE)],
-          foreground=[("selected", C_TEXT)],
-          font=[("selected", ("Segoe UI", 9, "bold"))])
+style.configure("TNotebook", background=C_BG, borderwidth=0, tabmargins=[0, 0, 0, 0])
+style.layout("TNotebook", [('Notebook.client', {'sticky': 'nswe'})])  # hide built-in tab strip
+style.layout("TNotebook.Tab", [])  # empty tab layout = zero-height, invisible tabs
+style.configure("TNotebook.Tab", padding=[0, 0, 0, 0])
+# Named style applied directly to the notebook widget — more reliable than overriding TNotebook globally
+style.configure("NoTabs.TNotebook", background=C_BG, borderwidth=0, tabmargins=[0, 0, 0, 0])
+style.layout("NoTabs.TNotebook", [('Notebook.client', {'sticky': 'nswe'})])
+style.layout("NoTabs.TNotebook.Tab", [])  # empty tab layout = zero-height, invisible tabs
+style.configure("NoTabs.TNotebook.Tab", padding=[0, 0, 0, 0])
 
 style.configure("TFrame", background=C_SURFACE)
 style.configure("Raised.TFrame", background=C_RAISED)
@@ -2866,17 +2885,30 @@ style.map("Recent.Treeview",
 style.map("Recent.Treeview.Heading",
           background=[("active", C_BTN)])
 
+# Transcriptions panel treeview
+style.configure("TP.Treeview",
+                background="#161719", foreground="#dde1e8", fieldbackground="#161719",
+                borderwidth=0, rowheight=24, font=("Segoe UI", 9))
+style.configure("TP.Treeview.Heading",
+                background="#1c1e21", foreground="#4a9eff", relief="flat",
+                font=("Segoe UI", 9, "bold"), padding=[6, 4])
+style.map("TP.Treeview",
+          background=[("selected", "#4a9eff")],
+          foreground=[("selected", "white")])
+style.map("TP.Treeview.Heading",
+          background=[("active", "#252729")])
+
 header_strip = tk.Frame(root, bg=C_BG, height=42)
 header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.22.26 5:47pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 10:36am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
-notebook = ttk.Notebook(root)
-notebook.pack(fill="both", expand=True, padx=0, pady=0)
+notebook = ttk.Notebook(root, style="NoTabs.TNotebook")
+# notebook is packed after custom tab bar is created below
 
 tab_download = ttk.Frame(notebook)
 notebook.add(tab_download, text="  Download  ")
@@ -3457,7 +3489,7 @@ settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
 settings_chan_tree.column("num_vids", stretch=False, width=55, anchor="e")
-settings_chan_tree.column("size_on_disk", stretch=True, width=75, anchor="e")
+settings_chan_tree.column("size_on_disk", stretch=False, width=82, anchor="e")
 settings_chan_tree.column("url", stretch=False, width=0, minwidth=0, anchor="w")
 settings_chan_tree.tag_configure("odd", background="#0c0f14")
 settings_chan_tree.tag_configure("even", background=C_LOG_BG)
@@ -3721,7 +3753,7 @@ def refresh_channel_dropdowns():
         _grand_total_bytes = 0
         for i, c in enumerate(sorted_channels):
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
-            display_res = f"{res}p" if res.isdigit() else res
+            display_res = f"{res}p" if res.isdigit() else ("Audio" if res == "audio" else res)
             dur = c.get("min_duration", 0)
             dur_str = f"{dur // 60}m" if dur else "—"
             maxdur = c.get("max_duration", 0)
@@ -4895,7 +4927,7 @@ def sync_single_channel():
             _sc_level = ch.get("compress_level", "")
             _sc_batch_cb = None
             _sc_bsize = ch.get("compress_batch_size", 20)
-            if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
+            if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS and ch.get("resolution", "") != "audio":
                 _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                 _sc_prompt_shown = [False]
                 def _sc_batch_cb(count, batch_paths, _ch=ch, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
@@ -5397,6 +5429,42 @@ def remove_channel():
     with _disk_cache_lock:
         _disk_cache.pop(removed_url, None)
     _save_disk_cache()
+
+    # Remove from sync queue (channel was queued but not yet running)
+    with _sync_queue_lock:
+        _before_sync = len(_sync_queue)
+        _sync_queue[:] = [q for q in _sync_queue if q.get("url") != removed_url]
+        _removed_sync = _before_sync - len(_sync_queue)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("sync", removed_url))
+        except ValueError:
+            pass
+    if _removed_sync:
+        log(f"  Removed \"{removed_name}\" from sync queue.\n", "dim")
+        _update_queue_btn()
+
+    # Remove from transcribe queue
+    with _transcribe_queue_lock:
+        _before_tr = len(_transcribe_queue)
+        _transcribe_queue[:] = [q for q in _transcribe_queue if q[1] != removed_url]
+        _removed_tr = _before_tr - len(_transcribe_queue)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("transcribe", removed_url))
+        except ValueError:
+            pass
+
+    # Remove from redownload queue
+    with _redownload_queue_lock:
+        _before_rd = len(_redownload_queue)
+        _redownload_queue[:] = [q for q in _redownload_queue if q.get("ch_url") != removed_url]
+        _removed_rd = _before_rd - len(_redownload_queue)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("redownload", removed_url))
+        except ValueError:
+            pass
 
     # Remove any queued GPU tasks for this channel
     with _gpu_queue_lock:
@@ -6171,6 +6239,7 @@ def _parse_vtt_to_segments(vtt_path):
     # tail of the previous cue's text plus new words.  We detect overlap by
     # checking if the new cue's text starts with a suffix of the current
     # accumulated text, and if so, only keep the new words.
+    _MAX_SEG_SECS = 30.0   # flush a segment if it grows beyond this duration
     segments = []
     seg_start = raw_cues[0][0]
     seg_end = raw_cues[0][1]
@@ -6197,6 +6266,15 @@ def _parse_vtt_to_segments(vtt_path):
                         seg_text += " " + extra
                     seg_end = _e
                     _is_overlap = True
+                    # Cap: if the merged segment has grown beyond the max
+                    # duration, flush it now and restart from this cue.
+                    if (seg_end - seg_start) > _MAX_SEG_SECS:
+                        if seg_text.strip():
+                            segments.append({"start": seg_start, "end": seg_end,
+                                             "text": seg_text.strip()})
+                        seg_start = _s
+                        seg_end = _e
+                        seg_text = _t
                     break
 
             # Also catch near-zero-duration "echo" cues (e.g., 805.91→805.92)
@@ -6259,9 +6337,19 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
 
 
 def _scan_existing_jsonl(folder_path, ch_name):
-    """Scan JSONL transcript files under folder_path. Return set of video titles already in JSONL."""
+    """Scan JSONL transcript files under folder_path.
+
+    Returns (existing_titles, bad_titles) where bad_titles contains any title
+    that has at least one segment with duration > 35 s.  Both the old VTT
+    rolling-cue merger (pre-fix) and raw Whisper output can produce segments
+    far longer than the 30 s cap; these titles are flagged for repair.
+    The threshold is 35 s (not 30 s) to avoid re-flagging segments that are
+    legitimately at the boundary due to silence detection timing.
+    """
     existing = set()
+    bad_titles = set()
     import json as _json
+    _MAX_SEG = 35.0   # above the 30 s cap but catches both VTT and Whisper long segs
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
@@ -6271,10 +6359,106 @@ def _scan_existing_jsonl(folder_path, ch_name):
                             line = line.strip()
                             if line:
                                 entry = _json.loads(line)
-                                existing.add(entry.get("title", ""))
+                                title = entry.get("title", "")
+                                existing.add(title)
+                                if entry.get("end", 0) - entry.get("start", 0) > _MAX_SEG:
+                                    bad_titles.add(title)
                 except Exception:
                     pass
-    return existing
+    return existing, bad_titles
+
+
+def _fix_long_segments_in_jsonl(folder_path, ch_name):
+    """In-place repair: split any segment > 35 s into ≤30 s chunks.
+
+    Used for Whisper-transcribed videos where re-fetching auto-captions is not
+    possible.  The text is split proportionally across the sub-segments so that
+    existing JSONL entries are corrected without requiring re-transcription.
+    Returns the number of segments that were split.
+    """
+    import json as _json
+    _MAX_SEG = 35.0
+    _TARGET = 30.0
+    fixed_count = 0
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
+                continue
+            fpath = os.path.join(dirpath, f)
+            try:
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    raw_lines = fh.readlines()
+                new_lines = []
+                changed = False
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    try:
+                        entry = _json.loads(stripped)
+                    except Exception:
+                        new_lines.append(line)
+                        continue
+                    dur = entry.get("end", 0) - entry.get("start", 0)
+                    if dur <= _MAX_SEG:
+                        new_lines.append(line)
+                        continue
+                    # Split this segment
+                    changed = True
+                    fixed_count += 1
+                    words = entry.get("text", "").split()
+                    seg_start = entry.get("start", 0)
+                    seg_end   = entry.get("end", seg_start + dur)
+                    n_chunks  = max(2, int(dur / _TARGET) + (1 if dur % _TARGET > 1 else 0))
+                    chunk_dur = dur / n_chunks
+                    words_per = max(1, len(words) // n_chunks)
+                    for ci in range(n_chunks):
+                        w0 = ci * words_per
+                        w1 = w0 + words_per if ci < n_chunks - 1 else len(words)
+                        chunk_text = " ".join(words[w0:w1])
+                        if not chunk_text:
+                            continue
+                        cs = round(seg_start + ci * chunk_dur, 2)
+                        ce = round(min(seg_end, seg_start + (ci + 1) * chunk_dur), 2)
+                        sub = dict(entry)
+                        sub["start"] = cs
+                        sub["end"]   = ce
+                        sub["text"]  = chunk_text
+                        new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
+                if changed:
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.writelines(new_lines)
+                    _hide_file_win(fpath)
+            except Exception:
+                pass
+    return fixed_count
+
+
+def _remove_jsonl_entries_for_title(jsonl_path, title):
+    """Rewrite a JSONL file, dropping every line whose title matches *title*.
+    Called before re-writing corrected segments so old bad entries are replaced.
+    """
+    import json as _json
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+        kept = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                try:
+                    if _json.loads(stripped).get("title", "") != title:
+                        kept.append(line)
+                except Exception:
+                    kept.append(line)   # keep malformed lines untouched
+            else:
+                kept.append(line)
+        with open(jsonl_path, "w", encoding="utf-8") as fh:
+            fh.writelines(kept)
+        _hide_file_win(jsonl_path)
+    except Exception:
+        pass
 
 
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
@@ -6359,8 +6543,34 @@ for line in sys.stdin:
                     _out.flush()
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
-        seg_data = [{"s": round(seg.start, 2), "e": round(seg.end, 2), "t": seg.text.strip()}
-                     for seg in all_segments if seg.text.strip()]
+
+        # Split any segment longer than 30 s into equal sub-segments so that
+        # timestamps are accurate enough for video seek (TranscriptionParser).
+        _MAX_SEG = 30.0
+        seg_data = []
+        for seg in all_segments:
+            t = seg.text.strip()
+            if not t:
+                continue
+            dur = seg.end - seg.start
+            if dur <= _MAX_SEG:
+                seg_data.append({"s": round(seg.start, 2), "e": round(seg.end, 2), "t": t})
+            else:
+                # Split proportionally across words
+                words = t.split()
+                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 1 else 0))
+                chunk_dur = dur / n_chunks
+                words_per_chunk = max(1, len(words) // n_chunks)
+                for ci in range(n_chunks):
+                    w_start = ci * words_per_chunk
+                    w_end = w_start + words_per_chunk if ci < n_chunks - 1 else len(words)
+                    chunk_text = " ".join(words[w_start:w_end])
+                    if not chunk_text:
+                        continue
+                    cs = round(seg.start + ci * chunk_dur, 2)
+                    ce = round(min(seg.end, seg.start + (ci + 1) * chunk_dur), 2)
+                    seg_data.append({"s": cs, "e": ce, "t": chunk_text})
+
         _out.write(json.dumps({"status": "ok", "text": text, "segments": seg_data}) + "\n")
         _out.flush()
     except Exception as e:
@@ -8972,7 +9182,22 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 with config_lock:
                     config[_migration_key] = True
                     save_config(config)
-            _jsonl_existing = _scan_existing_jsonl(folder, ch_name) if already_done else set()
+            _jsonl_existing_raw, _jsonl_bad = (
+                _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set()))
+
+            # In-place segment repair: fix any Whisper segments > 35 s that can't be
+            # re-fetched via auto-captions.  This runs before the backfill pass so that
+            # titles fixed in-place are excluded from _jsonl_bad (they no longer need repair).
+            if _jsonl_bad:
+                _inplace_fixed = _fix_long_segments_in_jsonl(folder, ch_name)
+                if _inplace_fixed:
+                    log(f"  ✓ Fixed {_inplace_fixed} long Whisper segment(s) in existing transcripts.\n",
+                        "simpleline_green")
+                    # Re-scan to update bad_titles now that in-place fixes are done
+                    _jsonl_existing_raw, _jsonl_bad = _scan_existing_jsonl(folder, ch_name)
+
+            # Exclude bad-timestamp titles so they get re-fetched and rewritten
+            _jsonl_existing = _jsonl_existing_raw - _jsonl_bad
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
             if not files_to_process and not _jsonl_needed:
@@ -9086,7 +9311,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 if _backfill_list:
                     _bf_total = len(_backfill_list)
-                    log(f"  Generating searchable .jsonl for {_bf_total} video(s)...\n", "simpleline")
+                    _bf_repair_count = sum(1 for t, _ in _backfill_list if t in _jsonl_bad)
+                    if _bf_repair_count:
+                        log(f"  Generating searchable .jsonl for {_bf_total} video(s) "
+                            f"({_bf_repair_count} timestamp repair(s))...\n", "simpleline")
+                    else:
+                        log(f"  Generating searchable .jsonl for {_bf_total} video(s)...\n", "simpleline")
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
@@ -9127,6 +9357,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _bf_txt, _ = _get_transcript_filename(
                                         ch_name, folder, split_years, split_months, combined)
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
+                                # If this title had bad segments, purge old entries first
+                                if _bf_title in _jsonl_bad and os.path.isfile(_bf_jsonl):
+                                    _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
                                 _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
                                 _bf_done += 1
                         except Exception:
@@ -9869,6 +10102,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _record_transcription(done_count + _prior_done, err_count, _t_rec_elapsed,
                                       channel_name=ch_name, skipped=0)
 
+            # Notify transcription panel to offer re-index
+            if done_count > 0 and _tp_panel_ref[0] is not None:
+                _tp_panel_ref[0].prompt_reindex(ch_name)
+
         except Exception as e:
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
         finally:
@@ -10543,19 +10780,26 @@ cancel_edit_btn.pack_forget()
 
 def _continue_redownload():
     """Triggered by the Continue Redownload button in edit mode."""
+    # Immediately disable and show feedback so user knows click registered
+    continue_redownload_btn.config(state="disabled", text="↻ Queuing…")
+    root.update_idletasks()
+
     ch_url = _editing_channel.get("url") or new_url_var.get().strip()
     ch_name = _editing_channel.get("name") or new_name_var.get().strip()
     if not ch_url or not ch_name:
+        continue_redownload_btn.config(state="normal", text="↻ Continue Redownload")
         return
     pending_res = _has_pending_redownload(ch_url)
     if not pending_res:
         log("  No pending redownload to continue.\n", "simpleline")
+        continue_redownload_btn.config(state="normal", text="↻ Continue Redownload")
         return
     with config_lock:
         _rd_base = config.get("output_dir", "").strip() or BASE_DIR
     _rd_folder = os.path.join(_rd_base, sanitize_folder(ch_name))
     _add_to_redownload_queue(ch_name, ch_url, _rd_folder, pending_res)
     continue_redownload_btn.pack_forget()
+    continue_redownload_btn.config(state="normal", text="↻ Continue Redownload")
 
 continue_redownload_btn = ttk.Button(action_btn_frame, text="↻ Continue Redownload",
                                      command=_continue_redownload)
@@ -10947,8 +11191,12 @@ def build_channel_cmd(url, out_dir, min_dur, resolution, folder_override="", bre
 
     cmd = [
         "yt-dlp", "--newline", "--no-quiet", "--mtime", "--ignore-errors",
-        "--trim-filenames", "200", "--format", fmt, "--merge-output-format", "mp4",
-        "--ppa", "Merger:-c copy",
+        "--trim-filenames", "200", "--format", fmt,
+    ]
+    # Audio-only format doesn't need merging or post-processing
+    if resolution != "audio":
+        cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
+    cmd += [
         "--sleep-requests", "0.25",
         "--match-filter", _dur_filter,
         "--output", out_template,
@@ -11002,10 +11250,10 @@ def build_video_cmd(url, out_dir, resolution, add_date=False, custom_name=None, 
     cmd = ["yt-dlp", "--newline", "--no-quiet"]
     if date_file:
         cmd.append("--mtime")
+    cmd += ["--trim-filenames", "200", "--format", fmt]
+    if resolution != "audio":
+        cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
     cmd += [
-        "--trim-filenames", "200",
-        "--format", fmt, "--merge-output-format", "mp4",
-        "--ppa", "Merger:-c copy",
         "--output", os.path.join(out_dir, filename_template),
         "--print",
         "after_video:DLTRACK:::%(title)s:::%(uploader)s:::%(upload_date)s:::%(filesize,filesize_approx)s:::%(duration)s:::%(id)s",
@@ -16089,15 +16337,1451 @@ root.after(1000, _tick_countdown)
 # Now that AUTORUN_LABELS and _on_autorun_change exist, set up the tray icon
 root.after(500, _deferred_tray_setup)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Transcription Panel — embedded transcript search (mirrors TranscriptionParser)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_TP_DB_PATH = os.path.join(APP_DATA_DIR, "transcription_index.db")
+_TP_MONTH_NAMES = ["january", "february", "march", "april", "may", "june",
+                   "july", "august", "september", "october", "november", "december"]
+
+
+def _tp_open_db(path):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS segments (
+        id         INTEGER PRIMARY KEY,
+        video_id   TEXT NOT NULL,
+        title      TEXT NOT NULL,
+        channel    TEXT NOT NULL,
+        year       INTEGER,
+        month      INTEGER,
+        start_time REAL,
+        end_time   REAL,
+        text       TEXT NOT NULL,
+        jsonl_path TEXT
+    )""")
+    conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
+        text,
+        content=segments,
+        content_rowid=id
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS indexed_files (
+        path  TEXT PRIMARY KEY,
+        mtime REAL,
+        segment_count INTEGER
+    )""")
+    conn.commit()
+    return conn
+
+
+def _tp_file_needs_update(conn, path):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    row = conn.execute("SELECT mtime FROM indexed_files WHERE path=?", (path,)).fetchone()
+    return row is None or row[0] != mtime
+
+
+def _tp_parse_path_meta(jsonl_path, archive_roots):
+    """Return (channel, year, month) derived from the file path."""
+    p = Path(jsonl_path)
+    for root_dir in archive_roots:
+        try:
+            parts = p.relative_to(root_dir).parts
+            channel = parts[0] if parts else "Unknown"
+            year = month = None
+            if len(parts) > 1:
+                try:
+                    year = int(parts[1])
+                except ValueError:
+                    pass
+            if len(parts) > 2:
+                try:
+                    month = int(parts[2])
+                except ValueError:
+                    pass
+            if month is None:
+                stem = p.stem.lower().lstrip(".")
+                for i, mn in enumerate(_TP_MONTH_NAMES):
+                    if mn in stem:
+                        month = i + 1
+                        break
+            return channel, year, month
+        except ValueError:
+            continue
+    parts = p.parts
+    channel = parts[-3] if len(parts) >= 3 else "Unknown"
+    year = None
+    try:
+        year = int(parts[-2])
+    except (ValueError, IndexError):
+        pass
+    return channel, year, None
+
+
+def _tp_index_file(conn, jsonl_path, archive_roots):
+    """Index one JSONL file. Returns segment count added."""
+    channel, year, month = _tp_parse_path_meta(jsonl_path, archive_roots)
+    mtime = os.path.getmtime(jsonl_path)
+    old = conn.execute("SELECT id FROM segments WHERE jsonl_path=?", (jsonl_path,)).fetchall()
+    if old:
+        ids = [r[0] for r in old]
+        conn.execute(f"DELETE FROM segments_fts WHERE rowid IN ({','.join('?'*len(ids))})", ids)
+        conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jsonl_path,))
+    count = 0
+    try:
+        with open(jsonl_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    seg = json.loads(line)
+                    text = seg.get("text", "").strip()
+                    if not text:
+                        continue
+                    cur = conn.execute(
+                        "INSERT INTO segments "
+                        "(video_id,title,channel,year,month,start_time,end_time,text,jsonl_path) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (seg.get("video_id", ""), seg.get("title", ""),
+                         channel, year, month,
+                         seg.get("start", 0.0), seg.get("end", 0.0),
+                         text, jsonl_path)
+                    )
+                    conn.execute("INSERT INTO segments_fts(rowid,text) VALUES (?,?)",
+                                 (cur.lastrowid, text))
+                    count += 1
+                except Exception:
+                    continue
+    except Exception:
+        return 0
+    conn.execute(
+        "INSERT OR REPLACE INTO indexed_files(path,mtime,segment_count) VALUES (?,?,?)",
+        (jsonl_path, mtime, count))
+    return count
+
+
+def _tp_find_jsonl_files(roots):
+    files = []
+    for root_dir in roots:
+        if not os.path.isdir(root_dir):
+            continue
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fn in filenames:
+                if fn.endswith(".jsonl"):
+                    files.append(os.path.join(dirpath, fn))
+    return files
+
+
+_tp_panel_ref = [None]
+
+
+class _TranscriptionPanel(ttk.Frame):
+    """Embedded transcription search panel — mirrors TranscriptionParser."""
+
+    _TP_BG      = "#0f1012"
+    _TP_BG2     = "#161719"
+    _TP_BG3     = "#1c1e21"
+    _TP_FG      = "#dde1e8"
+    _TP_DIM     = "#4a4f5a"
+    _TP_ACCENT  = "#4a9eff"
+    _TP_GREEN   = "#3dd68c"
+    _TP_RED     = "#ff6b6b"
+    _TP_SIDEBAR = "#0d1117"
+    _TP_SEL     = "#1a2535"
+
+    _VIDEO_EXTS = ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.m4v', '.wmv', '.m4a']
+    _VLC_PATHS  = [
+        r'C:\Program Files\VideoLAN\VLC\vlc.exe',
+        r'C:\Program Files (x86)\VideoLAN\VLC\vlc.exe',
+        'vlc',
+    ]
+    _HEADER_RE    = re.compile(r'^===\((.+?)\),', re.MULTILINE)
+    _VIEWER_WORDS = 300
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.configure(style="TFrame")
+        self._loaded          = False
+        self._conn            = None
+        self._result_meta     = {}
+        self._sort_col        = None
+        self._sort_asc        = True
+        self._index_running   = False
+        self._viewer_section  = None
+        self._viewer_header   = ""
+        self._viewer_query    = ""
+        self._viewer_win_start = 0
+        self._viewer_win_end   = 0
+        self._freq_all_keys   = []
+        self._freq_words      = []
+        self._freq_by_month   = False
+        self._active_section  = "search"
+        self._pending_reindex = None
+        self._tp_extra_roots  = []
+        self._build_placeholder()
+
+    def _build_placeholder(self):
+        self._placeholder = tk.Frame(self, bg=self._TP_BG)
+        self._placeholder.place(relx=0, rely=0, relwidth=1, relheight=1)
+        tk.Label(self._placeholder, text="Loading transcription index…",
+                 bg=self._TP_BG, fg=self._TP_DIM,
+                 font=("Segoe UI", 12)).place(relx=0.5, rely=0.5, anchor="center")
+
+    def on_shown(self):
+        """Called the first time the Transcriptions tab is selected."""
+        if self._loaded:
+            if self._pending_reindex is not None:
+                self._maybe_offer_reindex(self._pending_reindex)
+                self._pending_reindex = None
+            return
+        self._loaded = True
+        self.update_idletasks()  # render placeholder before thread starts
+        threading.Thread(target=self._load_db_async, daemon=True).start()
+
+    def _load_db_async(self):
+        try:
+            conn = _tp_open_db(_TP_DB_PATH)
+            self._conn = conn
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror(
+                "DB Error", f"Could not open transcription index:\n{e}"))
+            return
+        self.after(0, self._finish_load)
+
+    def _finish_load(self):
+        self._placeholder.place_forget()
+        self._tp_extra_roots = list(config.get("tp_archive_roots", []))
+        self._build_ui()
+        self._refresh_stats_label()
+        if self._pending_reindex is not None:
+            self.after(300, lambda: self._maybe_offer_reindex(self._pending_reindex))
+            self._pending_reindex = None
+
+    def _get_archive_roots(self):
+        roots = []
+        with config_lock:
+            out_dir = config.get("output_dir", "").strip()
+            extra   = config.get("tp_archive_roots", [])
+        if out_dir and os.path.isdir(out_dir):
+            roots.append(out_dir)
+        for r in extra:
+            if r and os.path.isdir(r) and r not in roots:
+                roots.append(r)
+        return roots
+
+    # ── Cross-communication ───────────────────────────────────────────────────
+
+    def prompt_reindex(self, channel_name=""):
+        """Called (from worker thread) when a transcription job finishes."""
+        def _on_main():
+            if not self._loaded:
+                self._pending_reindex = channel_name
+                return
+            self._maybe_offer_reindex(channel_name)
+        self.after(0, _on_main)
+
+    def _maybe_offer_reindex(self, channel_name):
+        name_str = f" for \"{channel_name}\"" if channel_name else ""
+        ans = messagebox.askyesno(
+            "Update Transcription Index",
+            f"Transcription{name_str} is complete.\n\n"
+            "Update the transcription search index now?",
+            parent=self.winfo_toplevel()
+        )
+        if ans:
+            self._show_section("index")
+            self.after(150, self._start_index)
+
+    # ── Build UI ─────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # Sidebar
+        sb = tk.Frame(self, bg=self._TP_SIDEBAR, width=128)
+        sb.grid(row=0, column=0, sticky="ns")
+        sb.grid_propagate(False)
+        self._sidebar = sb
+
+        tk.Label(sb, text="TRANSCRIPTIONS", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
+                 font=("Segoe UI", 7, "bold")).pack(pady=(16, 6), padx=10)
+
+        self._nav_btns = {}
+        for key, label in [("search", "Search"), ("frequency", "Frequency"), ("index", "Index")]:
+            btn = tk.Label(sb, text=label, bg=self._TP_SIDEBAR, fg=self._TP_FG,
+                           font=("Segoe UI", 10), cursor="hand2", anchor="w", padx=14, pady=9)
+            btn.pack(fill="x")
+            btn.bind("<Button-1>", lambda e, k=key: self._show_section(k))
+            btn.bind("<Enter>", lambda e, b=btn, k=key: b.config(
+                bg=self._TP_SEL if k != self._active_section else self._TP_ACCENT))
+            btn.bind("<Leave>", lambda e, b=btn, k=key: b.config(
+                bg=self._TP_ACCENT if k == self._active_section else self._TP_SIDEBAR))
+            self._nav_btns[key] = btn
+
+        self._stats_label = tk.Label(sb, text="", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
+                                     font=("Segoe UI", 7), wraplength=110, justify="left")
+        self._stats_label.pack(side="bottom", padx=8, pady=10)
+
+        # Content area
+        self._content = tk.Frame(self, bg=self._TP_BG)
+        self._content.grid(row=0, column=1, sticky="nsew")
+        self._content.columnconfigure(0, weight=1)
+        self._content.rowconfigure(0, weight=1)
+
+        self._search_frame = self._build_search_section(self._content)
+        self._freq_frame   = self._build_frequency_section(self._content)
+        self._index_frame  = self._build_index_section(self._content)
+
+        self._show_section("search")
+
+    def _show_section(self, key):
+        self._active_section = key
+        frames = {
+            "search":    self._search_frame,
+            "frequency": self._freq_frame,
+            "index":     self._index_frame,
+        }
+        for k, f in frames.items():
+            if k == key:
+                f.grid(row=0, column=0, sticky="nsew")
+            else:
+                f.grid_remove()
+        for k, btn in self._nav_btns.items():
+            btn.config(bg=self._TP_ACCENT if k == key else self._TP_SIDEBAR,
+                       fg="white" if k == key else self._TP_FG)
+
+    def _refresh_stats_label(self):
+        if not self._conn:
+            return
+        try:
+            segs = self._conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+            vids = self._conn.execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+            chs  = self._conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+            self._stats_label.config(
+                text=f"{segs:,} segments\n{vids:,} videos\n{chs} channels")
+        except Exception:
+            pass
+
+    # ── Search section ────────────────────────────────────────────────────────
+
+    def _build_search_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+
+        bar = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=6)
+        bar.pack(fill="x")
+
+        # ── Row 1: search input + action buttons ──────────────────────────
+        row1 = tk.Frame(bar, bg=self._TP_BG3)
+        row1.pack(fill="x", pady=(0, 4))
+
+        tk.Label(row1, text="Search:", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._search_var = tk.StringVar()
+        e = tk.Entry(row1, textvariable=self._search_var, bg=self._TP_BG2, fg=self._TP_FG,
+                     insertbackground=self._TP_FG, relief="flat",
+                     font=("Segoe UI", 11), width=36)
+        e.pack(side="left", padx=8, ipady=5)
+        e.bind("<Return>", lambda _: self._do_search())
+
+        tk.Button(row1, text="Search", command=self._do_search,
+                  bg=self._TP_ACCENT, fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold"), padx=14, pady=2).pack(side="left")
+
+        self._search_count = tk.Label(row1, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                      font=("Segoe UI", 9))
+        self._search_count.pack(side="right", padx=8)
+        tk.Button(row1, text="Export CSV", command=self._export_csv,
+                  bg=self._TP_BG2, fg=self._TP_FG, relief="flat",
+                  font=("Segoe UI", 9), padx=10, pady=2).pack(side="right", padx=(0, 6))
+
+        # ── Row 2: filters ────────────────────────────────────────────────
+        row2 = tk.Frame(bar, bg=self._TP_BG3)
+        row2.pack(fill="x")
+
+        tk.Label(row2, text="Channel:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._s_channel_var = tk.StringVar(value="All")
+        self._s_channel_cb  = ttk.Combobox(row2, textvariable=self._s_channel_var,
+                                            width=20, state="readonly")
+        self._s_channel_cb.pack(side="left")
+
+        tk.Label(row2, text="Year:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 4))
+        self._s_year_from_var = tk.StringVar()
+        tk.Entry(row2, textvariable=self._s_year_from_var, bg=self._TP_BG2, fg=self._TP_FG,
+                 insertbackground=self._TP_FG, relief="flat",
+                 font=("Segoe UI", 9), width=5).pack(side="left")
+        tk.Label(row2, text="–", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=3)
+        self._s_year_to_var = tk.StringVar()
+        tk.Entry(row2, textvariable=self._s_year_to_var, bg=self._TP_BG2, fg=self._TP_FG,
+                 insertbackground=self._TP_FG, relief="flat",
+                 font=("Segoe UI", 9), width=5).pack(side="left")
+
+        pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
+                              sashwidth=5, sashpad=0, relief="flat")
+        pane.pack(fill="both", expand=True, padx=6, pady=(4, 0))
+
+        # Left: results treeview
+        left = tk.Frame(pane, bg=self._TP_BG)
+        cols = ("channel", "date", "title", "snippet")
+        self._tree = ttk.Treeview(left, columns=cols, show="headings",
+                                   selectmode="browse", style="TP.Treeview")
+        for col, label, w, stretch in [
+            ("channel", "Channel", 110, False),
+            ("date",    "Date",     68, False),
+            ("title",   "Title",   190, False),
+            ("snippet", "Snippet", 320, True),
+        ]:
+            self._tree.heading(col, text=label, command=lambda c=col: self._sort_by(c))
+            self._tree.column(col, width=w, minwidth=max(50, w // 2), stretch=stretch)
+        sb2 = ttk.Scrollbar(left, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y")
+        self._tree.pack(fill="both", expand=True)
+        self._tree.bind("<Button-3>", self._on_result_rightclick)
+        self._tree.bind("<<TreeviewSelect>>", lambda _: self._load_viewer())
+        pane.add(left, minsize=280)
+
+        # Right: text viewer
+        right = tk.Frame(pane, bg=self._TP_BG)
+        vh = tk.Frame(right, bg=self._TP_BG3)
+        vh.pack(fill="x")
+        self._viewer_title = tk.Label(vh, text="Select a result to read",
+                                      bg=self._TP_BG3, fg=self._TP_FG,
+                                      font=("Segoe UI", 11, "bold"), anchor="w", padx=10, pady=6)
+        self._viewer_title.pack(side="left", fill="x", expand=True)
+        self._viewer_meta = tk.Label(vh, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                     font=("Segoe UI", 9), anchor="e", padx=10)
+        self._viewer_meta.pack(side="right")
+
+        vc = tk.Frame(right, bg=self._TP_BG)
+        vc.pack(fill="both", expand=True)
+        vc.grid_rowconfigure(1, weight=1)
+        vc.grid_columnconfigure(0, weight=1)
+        self._btn_load_earlier = tk.Button(
+            vc, text="▲  Load more", command=self._viewer_load_earlier,
+            bg="#151618", fg="#555", activeforeground=self._TP_FG,
+            activebackground="#1e2022", relief="flat",
+            font=("Segoe UI", 9), pady=5, cursor="hand2", bd=0)
+        vf = tk.Frame(vc, bg=self._TP_BG)
+        vf.grid(row=1, column=0, sticky="nsew")
+        self._viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG, font=("Segoe UI", 10),
+                               wrap="word", relief="flat", padx=12, pady=10,
+                               state="disabled", cursor="arrow")
+        vsb2 = ttk.Scrollbar(vf, orient="vertical", command=self._viewer.yview)
+        self._viewer.configure(yscrollcommand=vsb2.set)
+        self._viewer.tag_configure("hit",      background="#4a3f00", foreground="#ffe066")
+        self._viewer.tag_configure("header",   foreground=self._TP_ACCENT,
+                                   font=("Segoe UI", 9, "bold"))
+        self._viewer.tag_configure("ellipsis", foreground="#555",
+                                   font=("Segoe UI", 9, "italic"))
+        vsb2.pack(side="right", fill="y")
+        self._viewer.pack(fill="both", expand=True)
+        self._btn_load_later = tk.Button(
+            vc, text="▼  Load more", command=self._viewer_load_later,
+            bg="#151618", fg="#555", activeforeground=self._TP_FG,
+            activebackground="#1e2022", relief="flat",
+            font=("Segoe UI", 9), pady=5, cursor="hand2", bd=0)
+        pane.add(right, minsize=300)
+
+        self._search_status = tk.Label(
+            f, text="Left-click to read  •  Right-click for actions",
+            bg=self._TP_BG, fg=self._TP_DIM, font=("Segoe UI", 9), anchor="w")
+        self._search_status.pack(fill="x", padx=8, pady=4)
+
+        self._update_search_channels()
+        return f
+
+    def _update_search_channels(self):
+        if not self._conn:
+            return
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
+            self._s_channel_cb["values"] = ["All"] + [r[0] for r in rows]
+        except Exception:
+            self._s_channel_cb["values"] = ["All"]
+
+    _SORT_EXPRS = {
+        "channel": "s.channel, s.year, s.month, s.start_time",
+        "date":    None,
+        "title":   "s.title, s.start_time",
+        "snippet": "s.text",
+    }
+
+    def _sort_by(self, col):
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        self._update_heading_labels()
+        if self._search_var.get().strip():
+            self._do_search()
+
+    def _update_heading_labels(self):
+        labels = {"channel": "Channel", "date": "Date",
+                  "title": "Title", "snippet": "Snippet"}
+        for col, base in labels.items():
+            arrow = (" ▲" if self._sort_asc else " ▼") if col == self._sort_col else ""
+            self._tree.heading(col, text=base + arrow)
+
+    def _do_search(self):
+        if not self._conn:
+            return
+        query = self._search_var.get().strip()
+        if not query:
+            return
+        channel   = self._s_channel_var.get()
+        yr_from   = self._s_year_from_var.get().strip()
+        yr_to     = self._s_year_to_var.get().strip()
+
+        if self._sort_col == "date":
+            order_clause = (
+                "COALESCE(s.year,9999) ASC, COALESCE(s.month,99) ASC, s.start_time ASC"
+                if self._sort_asc else
+                "COALESCE(s.year,0) DESC, COALESCE(s.month,0) DESC, s.start_time DESC")
+        else:
+            order_clause = self._SORT_EXPRS.get(self._sort_col)
+
+        SEL = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
+               "s.start_time, s.end_time, s.text, s.jsonl_path FROM segments s ")
+
+        rows = None
+        if order_clause:
+            try:
+                fts_q  = '"' + query.replace('"', '""') + '"'
+                sql    = SEL + ("WHERE s.id IN "
+                                "(SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?)")
+                params = [fts_q]
+                if channel != "All":
+                    sql += " AND s.channel=?"
+                    params.append(channel)
+                if yr_from.isdigit():
+                    sql += " AND s.year >= ?"
+                    params.append(int(yr_from))
+                if yr_to.isdigit():
+                    sql += " AND s.year <= ?"
+                    params.append(int(yr_to))
+                sql  += f" ORDER BY {order_clause} LIMIT 500"
+                rows  = self._conn.execute(sql, params).fetchall()
+            except Exception:
+                rows = None
+
+        if rows is None:
+            try:
+                fts_q  = '"' + query.replace('"', '""') + '"'
+                sql    = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
+                          "s.start_time, s.end_time, s.text, s.jsonl_path "
+                          "FROM segments_fts f JOIN segments s ON f.rowid = s.id "
+                          "WHERE segments_fts MATCH ?")
+                params = [fts_q]
+                if channel != "All":
+                    sql += " AND s.channel=?"
+                    params.append(channel)
+                if yr_from.isdigit():
+                    sql += " AND s.year >= ?"
+                    params.append(int(yr_from))
+                if yr_to.isdigit():
+                    sql += " AND s.year <= ?"
+                    params.append(int(yr_to))
+                sql  += " ORDER BY rank LIMIT 500"
+                rows  = self._conn.execute(sql, params).fetchall()
+            except Exception:
+                sql    = ("SELECT id, video_id, title, channel, year, month, "
+                          "start_time, end_time, text, jsonl_path "
+                          "FROM segments WHERE text LIKE ?")
+                params = [f"%{query}%"]
+                if channel != "All":
+                    sql += " AND channel=?"
+                    params.append(channel)
+                if yr_from.isdigit():
+                    sql += " AND year >= ?"
+                    params.append(int(yr_from))
+                if yr_to.isdigit():
+                    sql += " AND year <= ?"
+                    params.append(int(yr_to))
+                sql  += " LIMIT 500"
+                rows  = self._conn.execute(sql, params).fetchall()
+
+        self._tree.delete(*self._tree.get_children())
+        self._result_meta.clear()
+
+        for row in rows:
+            rid, video_id, title, ch, year, month, start_time, end_time, text, jsonl_path = row
+            date_str = (f"{year}-{month:02d}" if year and month
+                        else str(year) if year else "")
+            q   = query.lower()
+            idx = text.lower().find(q)
+            if idx >= 0:
+                s0      = max(0, idx - 60)
+                snippet = ("…" if s0 > 0 else "") + text[s0:s0 + 160].replace("\n", " ")
+            else:
+                snippet = text[:160].replace("\n", " ")
+
+            txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
+            video_path = self._find_video_file(title, txt_path) if txt_path else None
+
+            iid = self._tree.insert("", "end", values=(ch, date_str, title, snippet))
+            self._result_meta[iid] = {
+                "video_id":   video_id,
+                "start":      start_time or 0,
+                "end":        end_time or start_time or 0,
+                "seg_text":   text,
+                "title":      title,
+                "channel":    ch,
+                "date":       date_str,
+                "jsonl_path": jsonl_path,
+                "txt_path":   txt_path,
+                "video_path": video_path,
+            }
+
+        n         = len(rows)
+        sort_note = (f", sorted by {self._sort_col} "
+                     f"{'↑' if self._sort_asc else '↓'}") if self._sort_col else ""
+        self._search_count.config(
+            text=f"{n} result{'s' if n != 1 else ''}{sort_note}")
+        if n == 500:
+            self._search_status.config(
+                text="Showing 500 results — add filters to narrow down.",
+                fg="#f0a020")
+        else:
+            self._search_status.config(
+                text="Left-click to read  •  Right-click for actions",
+                fg=self._TP_DIM)
+
+    def _export_csv(self):
+        import csv
+        rows = self._tree.get_children()
+        if not rows:
+            messagebox.showinfo("Export CSV", "No results to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save results as CSV", defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["Channel", "Date", "Title", "Snippet",
+                            "video_id", "start_time"])
+                for iid in rows:
+                    vals = self._tree.item(iid, "values")
+                    meta = self._result_meta.get(iid, {})
+                    w.writerow([*vals, meta.get("video_id", ""),
+                                meta.get("start", "")])
+            messagebox.showinfo("Export CSV", f"Saved {len(rows)} rows.")
+        except Exception as e:
+            messagebox.showerror("Export CSV", f"Failed to save:\n{e}")
+
+    # ── Viewer ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _interpolate_ts(start, end, seg_text, query):
+        if not query or not seg_text or end <= start:
+            return start
+        idx = seg_text.lower().find(query.lower())
+        if idx < 0:
+            return start
+        return start + (idx / max(1, len(seg_text))) * (end - start)
+
+    def _get_txt_path(self, jsonl_path):
+        d  = os.path.dirname(jsonl_path)
+        fn = os.path.basename(jsonl_path).lstrip('.')
+        fn = fn[:-5] + 'txt'
+        return os.path.join(d, fn)
+
+    def _find_video_file(self, title, txt_path):
+        if not txt_path:
+            return None
+        d = os.path.dirname(txt_path)
+        for ext in self._VIDEO_EXTS:
+            p = os.path.join(d, title + ext)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _get_txt_section(self, txt_path, title):
+        try:
+            with open(txt_path, encoding='utf-8', errors='replace') as fh:
+                content = fh.read()
+        except Exception:
+            return None
+        matches = list(self._HEADER_RE.finditer(content))
+        for i, m in enumerate(matches):
+            if m.group(1).strip() == title.strip():
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+                return content[m.start():end].strip()
+        return None
+
+    def _open_vlc(self, video_path, start_time=0):
+        seek = max(0.0, float(start_time) - 5.0)
+        for vlc in self._VLC_PATHS:
+            try:
+                subprocess.Popen([vlc, os.path.normpath(video_path),
+                                  f'--start-time={seek:.1f}'])
+                return True
+            except (FileNotFoundError, OSError):
+                continue
+        messagebox.showerror("VLC not found",
+                             "Could not find VLC. Install it or add it to PATH.")
+        return False
+
+    def _on_result_rightclick(self, event):
+        item = self._tree.identify_row(event.y)
+        if not item:
+            return
+        self._tree.selection_set(item)
+        self._load_viewer()
+        self.after(10, lambda: self._show_context_menu(event.x_root, event.y_root))
+
+    def _load_viewer(self):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        meta = self._result_meta.get(sel[0])
+        if not meta:
+            return
+        title    = meta.get("title", "")
+        txt_path = meta.get("txt_path")
+        query    = self._search_var.get().strip().lower()
+
+        self._viewer_title.config(text=title)
+        self._viewer_meta.config(
+            text=f"{meta.get('channel', '')}  •  {meta.get('date', '')}")
+
+        section = self._get_txt_section(txt_path, title) if txt_path else None
+        if not section:
+            self._viewer_section = None
+            self._btn_load_earlier.grid_remove()
+            self._btn_load_later.grid_remove()
+            self._viewer.config(state="normal")
+            self._viewer.delete("1.0", "end")
+            self._viewer.insert("end",
+                "(No .txt file found for this result.)\n\n", "header")
+            if txt_path:
+                self._viewer.insert("end", f"Expected:\n{txt_path}")
+            self._viewer.config(state="disabled")
+            return
+
+        lines       = section.split('\n', 1)
+        header_line = lines[0]
+        body        = lines[1].strip() if len(lines) > 1 else ""
+
+        match_pos = body.lower().find(query) if query else -1
+        if match_pos < 0:
+            match_pos = 0
+
+        win_start = self._pos_n_words_before(body, match_pos, self._VIEWER_WORDS)
+        win_end   = self._pos_n_words_after(
+            body, match_pos + max(len(query), 1), self._VIEWER_WORDS)
+
+        self._viewer_section   = body
+        self._viewer_header    = header_line
+        self._viewer_query     = query
+        self._viewer_win_start = win_start
+        self._viewer_win_end   = win_end
+        self._render_viewer_window()
+
+    @staticmethod
+    def _pos_n_words_before(text, pos, n):
+        count, i, in_space = 0, pos - 1, True
+        while i >= 0 and count < n:
+            if text[i] in (' ', '\n', '\t'):
+                in_space = True
+            elif in_space:
+                count   += 1
+                in_space = False
+            i -= 1
+        return max(0, i + 1)
+
+    @staticmethod
+    def _pos_n_words_after(text, pos, n):
+        count, i, in_word = 0, pos, False
+        while i < len(text) and count < n:
+            if text[i] in (' ', '\n', '\t'):
+                if in_word:
+                    count  += 1
+                    in_word = False
+            else:
+                in_word = True
+            i += 1
+        return min(len(text), i)
+
+    def _render_viewer_window(self):
+        body        = self._viewer_section
+        win_start   = self._viewer_win_start
+        win_end     = self._viewer_win_end
+        query       = self._viewer_query
+        can_earlier = win_start > 0
+        can_later   = win_end < len(body)
+
+        if can_earlier:
+            self._btn_load_earlier.grid(row=0, column=0, sticky="ew")
+        else:
+            self._btn_load_earlier.grid_remove()
+        if can_later:
+            self._btn_load_later.grid(row=2, column=0, sticky="ew")
+        else:
+            self._btn_load_later.grid_remove()
+
+        chunk = body[win_start:win_end]
+        self._viewer.config(state="normal")
+        self._viewer.delete("1.0", "end")
+        self._viewer.insert("end", self._viewer_header + "\n\n", "header")
+        if can_earlier:
+            self._viewer.insert("end", "…\n\n", "ellipsis")
+        self._viewer.insert("end", chunk)
+        if can_later:
+            self._viewer.insert("end", "\n\n…", "ellipsis")
+        if query:
+            idx = "1.0"
+            while True:
+                pos = self._viewer.search(query, idx, stopindex="end", nocase=True)
+                if not pos:
+                    break
+                self._viewer.tag_add("hit", pos, f"{pos}+{len(query)}c")
+                idx = f"{pos}+{len(query)}c"
+            first = self._viewer.tag_ranges("hit")
+            if first:
+                self._viewer.see(first[0])
+        self._viewer.config(state="disabled")
+
+    def _viewer_load_earlier(self):
+        if self._viewer_section is None:
+            return
+        self._viewer_win_start = self._pos_n_words_before(
+            self._viewer_section, self._viewer_win_start, self._VIEWER_WORDS)
+        self._render_viewer_window()
+        self._viewer.after(30, lambda: self._viewer.yview_moveto(0))
+
+    def _viewer_load_later(self):
+        if self._viewer_section is None:
+            return
+        self._viewer_win_end = self._pos_n_words_after(
+            self._viewer_section, self._viewer_win_end, self._VIEWER_WORDS)
+        self._render_viewer_window()
+        self._viewer.after(30, lambda: self._viewer.yview_moveto(1))
+
+    def _show_context_menu(self, x, y):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        meta = self._result_meta.get(sel[0])
+        if not meta:
+            return
+
+        menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                       activebackground=self._TP_ACCENT, activeforeground="white",
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
+
+        has_txt = bool(meta.get("txt_path") and os.path.exists(meta["txt_path"]))
+        if has_txt:
+            menu.add_command(label="  Open .txt  (in viewer)",
+                             command=self._load_viewer)
+            menu.add_command(label="  Open .txt  in Notepad",
+                             command=lambda p=meta["txt_path"]:
+                                 subprocess.Popen(["notepad", p]))
+        else:
+            menu.add_command(label="  Open .txt  (not found)", state="disabled")
+
+        menu.add_separator()
+
+        query = self._search_var.get().strip()
+        ts    = self._interpolate_ts(
+            meta["start"], meta["end"], meta.get("seg_text", ""), query)
+
+        if meta.get("video_path"):
+            menu.add_command(label="  Open Video — Local",
+                             command=lambda t=ts:
+                                 self._open_vlc(meta["video_path"], t))
+        else:
+            menu.add_command(label="  Open Video — Local  (file not found)",
+                             state="disabled")
+
+        if meta.get("video_id"):
+            url = (f"https://www.youtube.com/watch?v={meta['video_id']}"
+                   f"&t={int(ts)}s")
+            menu.add_command(label="  Open Video — YouTube",
+                             command=lambda u=url: _webbrowser.open(u))
+        else:
+            menu.add_command(label="  Open Video — YouTube  (no ID)",
+                             state="disabled")
+
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    # ── Frequency section ─────────────────────────────────────────────────────
+
+    def _build_frequency_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+
+        bar = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
+        bar.pack(fill="x")
+
+        tk.Label(bar, text="Words:", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._freq_words_var = tk.StringVar()
+        e = tk.Entry(bar, textvariable=self._freq_words_var, bg=self._TP_BG2,
+                     fg=self._TP_FG, insertbackground=self._TP_FG,
+                     relief="flat", font=("Segoe UI", 11), width=30)
+        e.pack(side="left", padx=8, ipady=5)
+        e.bind("<Return>", lambda _: self._do_frequency())
+        tk.Label(bar, text="(comma-separated)", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 12))
+
+        tk.Label(bar, text="Channel:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._freq_channel_var = tk.StringVar(value="All")
+        self._freq_channel_cb  = ttk.Combobox(bar, textvariable=self._freq_channel_var,
+                                               width=18, state="readonly")
+        self._freq_channel_cb.pack(side="left", padx=(0, 12))
+
+        tk.Label(bar, text="Group:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._freq_group_var = tk.StringVar(value="Month")
+        ttk.Combobox(bar, textvariable=self._freq_group_var,
+                     values=["Year", "Month"], width=7,
+                     state="readonly").pack(side="left", padx=(0, 12))
+
+        tk.Label(bar, text="Chart:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._freq_chart_var = tk.StringVar(value="Line")
+        ttk.Combobox(bar, textvariable=self._freq_chart_var,
+                     values=["Line", "Bar"], width=6,
+                     state="readonly").pack(side="left", padx=(0, 12))
+
+        self._freq_normalize_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(bar, text="Normalize", variable=self._freq_normalize_var,
+                       bg=self._TP_BG3, fg=self._TP_DIM, selectcolor=self._TP_BG3,
+                       activebackground=self._TP_BG3, activeforeground=self._TP_FG,
+                       font=("Segoe UI", 9)).pack(side="left", padx=(0, 12))
+
+        tk.Button(bar, text="Plot", command=self._do_frequency,
+                  bg=self._TP_GREEN, fg="white", relief="flat",
+                  font=("Segoe UI", 10, "bold"), padx=14,
+                  pady=2).pack(side="left")
+
+        self._freq_status = tk.Label(bar, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                     font=("Segoe UI", 9))
+        self._freq_status.pack(side="right", padx=8)
+
+        if not _HAS_MPL:
+            tk.Label(f, text="matplotlib not installed.\nRun:  pip install matplotlib",
+                     bg=self._TP_BG, fg=self._TP_RED,
+                     font=("Segoe UI", 12)).pack(expand=True)
+            self._freq_canvas = None
+        else:
+            self._fig = Figure(figsize=(10, 4.8), dpi=96, facecolor=self._TP_BG)
+            self._ax  = self._fig.add_subplot(111)
+            self._style_freq_ax()
+            self._freq_canvas = FigureCanvasTkAgg(self._fig, master=f)
+            self._freq_canvas.get_tk_widget().pack(fill="both", expand=True,
+                                                   padx=6, pady=6)
+            self._freq_canvas.draw()
+            self._freq_canvas.mpl_connect("button_press_event",
+                                          self._on_graph_click)
+
+        self._update_freq_channels()
+        return f
+
+    def _style_freq_ax(self):
+        ax = self._ax
+        ax.set_facecolor(self._TP_BG2)
+        ax.tick_params(colors="#888", labelsize=8)
+        ax.xaxis.label.set_color("#888")
+        ax.yaxis.label.set_color("#888")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#444")
+        ax.title.set_color(self._TP_FG)
+        ax.grid(color="#333", linestyle="--", linewidth=0.5, alpha=0.7)
+
+    def _update_freq_channels(self):
+        if not self._conn:
+            return
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
+            self._freq_channel_cb["values"] = ["All"] + [r[0] for r in rows]
+        except Exception:
+            self._freq_channel_cb["values"] = ["All"]
+
+    def _do_frequency(self):
+        if not _HAS_MPL or not self._conn or not self._freq_canvas:
+            return
+        raw = self._freq_words_var.get().strip()
+        if not raw:
+            return
+        words     = [w.strip() for w in raw.split(",") if w.strip()][:6]
+        channel   = self._freq_channel_var.get()
+        by_month  = self._freq_group_var.get() == "Month"
+        use_bar   = self._freq_chart_var.get() == "Bar"
+        normalize = self._freq_normalize_var.get()
+
+        all_keys = set()
+        for word in words:
+            fts_q = '"' + word.replace('"', '""') + '"'
+            sql   = (("SELECT DISTINCT s.year*100+s.month FROM segments s "
+                      "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                      "WHERE segments_fts MATCH ?) "
+                      "AND s.year IS NOT NULL AND s.month IS NOT NULL")
+                     if by_month else
+                     ("SELECT DISTINCT s.year FROM segments s "
+                      "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                      "WHERE segments_fts MATCH ?) "
+                      "AND s.year IS NOT NULL"))
+            params = [fts_q]
+            if channel != "All":
+                sql += " AND s.channel=?"
+                params.append(channel)
+            try:
+                for r in self._conn.execute(sql, params):
+                    all_keys.add(r[0])
+            except Exception:
+                pass
+        all_keys = sorted(all_keys)
+
+        month_fallback = False
+        if not all_keys and by_month:
+            by_month = False
+            month_fallback = True
+            all_keys = set()
+            for word in words:
+                fts_q = '"' + word.replace('"', '""') + '"'
+                sql   = ("SELECT DISTINCT s.year FROM segments s "
+                         "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                         "WHERE segments_fts MATCH ?) "
+                         "AND s.year IS NOT NULL")
+                params = [fts_q]
+                if channel != "All":
+                    sql += " AND s.channel=?"
+                    params.append(channel)
+                try:
+                    for r in self._conn.execute(sql, params):
+                        all_keys.add(r[0])
+                except Exception:
+                    pass
+            all_keys = sorted(all_keys)
+
+        if not all_keys:
+            fts_q = '"' + words[0].replace('"', '""') + '"'
+            try:
+                chk = self._conn.execute(
+                    "SELECT COUNT(*) FROM segments_fts "
+                    "WHERE segments_fts MATCH ?", [fts_q]).fetchone()[0]
+                msg = (f"'{words[0]}': {chk:,} match(es) but none have year data."
+                       if chk > 0 else
+                       f"No data found for: {', '.join(words)}")
+            except Exception:
+                msg = "No data found."
+            self._freq_status.config(text=msg)
+            self._ax.clear()
+            self._style_freq_ax()
+            self._freq_canvas.draw()
+            return
+
+        self._freq_status.config(
+            text="  (no month data — grouped by year)" if month_fallback else "")
+
+        tick_labels = ([f"{k // 100}-{k % 100:02d}" for k in all_keys]
+                       if by_month else [str(k) for k in all_keys])
+
+        if normalize:
+            tot_sql = (("SELECT year*100+month, COUNT(*) FROM segments "
+                        "WHERE year IS NOT NULL AND month IS NOT NULL")
+                       if by_month else
+                       "SELECT year, COUNT(*) FROM segments WHERE year IS NOT NULL")
+            tot_params = []
+            if channel != "All":
+                tot_sql += " AND channel=?"
+                tot_params.append(channel)
+            tot_sql += " GROUP BY year, month" if by_month else " GROUP BY year"
+            totals = {r[0]: r[1] for r in self._conn.execute(tot_sql, tot_params)}
+        else:
+            totals = {}
+
+        self._ax.clear()
+        self._style_freq_ax()
+
+        palette   = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea", "#89ddff"]
+        n_words   = len(words)
+        bar_width = 0.8 / max(n_words, 1)
+        xs        = list(range(len(all_keys)))
+
+        for i, word in enumerate(words):
+            fts_q = '"' + word.replace('"', '""') + '"'
+            sql   = (("SELECT s.year*100+s.month, COUNT(*) FROM segments s "
+                      "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                      "WHERE segments_fts MATCH ?) "
+                      "AND s.year IS NOT NULL AND s.month IS NOT NULL")
+                     if by_month else
+                     ("SELECT s.year, COUNT(*) FROM segments s "
+                      "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                      "WHERE segments_fts MATCH ?) "
+                      "AND s.year IS NOT NULL"))
+            params = [fts_q]
+            if channel != "All":
+                sql += " AND s.channel=?"
+                params.append(channel)
+            sql += " GROUP BY s.year, s.month" if by_month else " GROUP BY s.year"
+            try:
+                counts = {r[0]: r[1] for r in self._conn.execute(sql, params)}
+            except Exception:
+                counts = {}
+            ys = [counts.get(k, 0) for k in all_keys]
+            if normalize:
+                ys = [1000 * c / max(1, totals.get(k, 1))
+                      for c, k in zip(ys, all_keys)]
+            color = palette[i % len(palette)]
+            if use_bar:
+                offset = (i - (n_words - 1) / 2) * bar_width
+                self._ax.bar([x + offset for x in xs], ys,
+                             width=bar_width, color=color,
+                             label=word, alpha=0.85)
+            else:
+                self._ax.plot(xs, ys, marker="o", markersize=4,
+                              linewidth=2, color=color, label=word)
+
+        n = len(tick_labels)
+        try:
+            canvas_w = self._freq_canvas.get_tk_widget().winfo_width()
+        except Exception:
+            canvas_w = 900
+        max_labels = max(4, canvas_w // 55)
+        if n > max_labels:
+            step    = (n + max_labels - 1) // max_labels
+            visible = list(range(0, n, step))
+        else:
+            visible = list(range(n))
+        self._ax.set_xticks(visible)
+        self._ax.set_xticklabels([tick_labels[i] for i in visible],
+                                  rotation=45, ha="right", fontsize=8)
+        ylabel = ("Mentions per 1,000 segments" if normalize
+                  else "Segment mentions")
+        self._ax.set_ylabel(ylabel, color="#888", fontsize=9)
+        ch_label = channel if channel != "All" else "all channels"
+        self._ax.set_title(f"Word frequency — {ch_label}", fontsize=11)
+        if len(words) > 1:
+            self._ax.legend(facecolor=self._TP_BG2, edgecolor="#444",
+                            labelcolor=self._TP_FG, fontsize=9)
+        self._fig.tight_layout()
+        self._freq_canvas.draw()
+
+        self._freq_all_keys = all_keys
+        self._freq_words    = words
+        self._freq_by_month = by_month
+
+    def _on_graph_click(self, event):
+        if event.inaxes != self._ax:
+            return
+        if not self._freq_all_keys or not self._freq_words:
+            return
+        x = event.xdata
+        if x is None:
+            return
+        idx = int(round(x))
+        if idx < 0 or idx >= len(self._freq_all_keys):
+            return
+        key  = self._freq_all_keys[idx]
+        year = key // 100 if self._freq_by_month else key
+        self._s_year_from_var.set(str(year))
+        self._s_year_to_var.set(str(year))
+        self._search_var.set(self._freq_words[0])
+        self._show_section("search")
+        self._do_search()
+
+    # ── Index section ─────────────────────────────────────────────────────────
+
+    def _build_index_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+
+        # Archive roots
+        rf = tk.Frame(f, bg=self._TP_BG2)
+        rf.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(rf, text="Archive Roots", bg=self._TP_BG2, fg=self._TP_ACCENT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=4, pady=(6, 2))
+
+        self._roots_lb = tk.Listbox(rf, bg=self._TP_BG, fg=self._TP_FG,
+                                     selectbackground=self._TP_ACCENT,
+                                     font=("Segoe UI", 9), height=4, relief="flat",
+                                     activestyle="none")
+        self._roots_lb.pack(fill="x", padx=4, pady=(0, 4))
+        self._refresh_roots_listbox()
+
+        btn_r = tk.Frame(rf, bg=self._TP_BG2)
+        btn_r.pack(fill="x", padx=4, pady=(0, 6))
+        for txt, cmd in [("Add Folder", self._tp_add_root),
+                          ("Remove Selected", self._tp_remove_root)]:
+            tk.Button(btn_r, text=txt, command=cmd, bg=self._TP_BG3, fg=self._TP_FG,
+                      relief="flat", font=("Segoe UI", 9),
+                      padx=10, pady=3).pack(side="left", padx=(0, 6))
+
+        # Stats
+        sf = tk.Frame(f, bg=self._TP_BG2)
+        sf.pack(fill="x", padx=14, pady=6)
+        tk.Label(sf, text="Index Stats", bg=self._TP_BG2, fg=self._TP_ACCENT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=4, pady=(6, 2))
+        self._stats_txt = tk.Text(sf, bg=self._TP_BG, fg="#ccc",
+                                   font=("Consolas", 9), height=7,
+                                   relief="flat", state="disabled")
+        self._stats_txt.pack(fill="x", padx=4, pady=(0, 6))
+
+        # Action buttons
+        bf = tk.Frame(f, bg=self._TP_BG, padx=14, pady=6)
+        bf.pack(fill="x")
+        tk.Button(bf, text="Build / Update Index", command=self._start_index,
+                  bg=self._TP_GREEN, fg="white", relief="flat",
+                  font=("Segoe UI", 11, "bold"), padx=18,
+                  pady=5).pack(side="left")
+        tk.Button(bf, text="Rebuild from Scratch",
+                  command=self._confirm_rebuild,
+                  bg=self._TP_BG3, fg=self._TP_FG, relief="flat",
+                  font=("Segoe UI", 10), padx=12,
+                  pady=5).pack(side="left", padx=10)
+        self._idx_progress_var = tk.StringVar()
+        tk.Label(bf, textvariable=self._idx_progress_var, bg=self._TP_BG,
+                 fg=self._TP_DIM, font=("Segoe UI", 9)).pack(side="left", padx=8)
+
+        # Log
+        lf = tk.Frame(f, bg=self._TP_BG)
+        lf.pack(fill="both", expand=True, padx=14, pady=6)
+        tk.Label(lf, text="Log", bg=self._TP_BG, fg=self._TP_ACCENT,
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        log_outer = tk.Frame(lf, bg=self._TP_BG)
+        log_outer.pack(fill="both", expand=True)
+        self._log_txt = tk.Text(log_outer, bg=self._TP_BG2, fg="#bbb",
+                                 font=("Consolas", 9), relief="flat",
+                                 wrap="word", state="normal")
+        log_sb = ttk.Scrollbar(log_outer, orient="vertical",
+                                command=self._log_txt.yview)
+        self._log_txt.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side="right", fill="y")
+        self._log_txt.pack(fill="both", expand=True)
+
+        self._refresh_index_stats()
+        return f
+
+    def _refresh_roots_listbox(self):
+        self._roots_lb.delete(0, "end")
+        with config_lock:
+            out_dir = config.get("output_dir", "").strip()
+        if out_dir:
+            self._roots_lb.insert("end", f"[auto] {out_dir}")
+        for r in self._tp_extra_roots:
+            self._roots_lb.insert("end", r)
+
+    def _tp_add_root(self):
+        folder = filedialog.askdirectory(title="Select Archive Root Folder")
+        if not folder:
+            return
+        if folder not in self._tp_extra_roots:
+            self._tp_extra_roots.append(folder)
+            with config_lock:
+                config["tp_archive_roots"] = list(self._tp_extra_roots)
+            save_config(config)
+            self._refresh_roots_listbox()
+
+    def _tp_remove_root(self):
+        sel = self._roots_lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        with config_lock:
+            out_dir = config.get("output_dir", "").strip()
+        extra_offset = 1 if out_dir else 0
+        extra_idx    = idx - extra_offset
+        if extra_idx < 0:
+            messagebox.showinfo(
+                "Cannot Remove",
+                "The auto-detected output folder cannot be removed here.\n"
+                "Change it in the Download tab settings.")
+            return
+        if extra_idx < len(self._tp_extra_roots):
+            self._tp_extra_roots.pop(extra_idx)
+            with config_lock:
+                config["tp_archive_roots"] = list(self._tp_extra_roots)
+            save_config(config)
+            self._refresh_roots_listbox()
+
+    def _refresh_index_stats(self):
+        if not self._conn:
+            return
+        try:
+            segs  = self._conn.execute(
+                "SELECT COUNT(*) FROM segments").fetchone()[0]
+            vids  = self._conn.execute(
+                "SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+            chs   = self._conn.execute(
+                "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+            files = self._conn.execute(
+                "SELECT COUNT(*) FROM indexed_files").fetchone()[0]
+            yr    = self._conn.execute(
+                "SELECT MIN(year), MAX(year) FROM segments "
+                "WHERE year IS NOT NULL").fetchone()
+            yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] else "N/A"
+            db_mb   = (os.path.getsize(_TP_DB_PATH) / 1_048_576
+                       if os.path.exists(_TP_DB_PATH) else 0)
+            text = (f"Segments  : {segs:,}\n"
+                    f"Videos    : {vids:,}\n"
+                    f"Channels  : {chs}\n"
+                    f"JSONL files: {files}\n"
+                    f"Year range: {yr_str}\n"
+                    f"DB size   : {db_mb:.1f} MB\n"
+                    f"DB path   : {_TP_DB_PATH}")
+            self._stats_txt.config(state="normal")
+            self._stats_txt.delete("1.0", "end")
+            self._stats_txt.insert("1.0", text)
+            self._stats_txt.config(state="disabled")
+            self._refresh_stats_label()
+        except Exception:
+            pass
+
+    def _tp_log(self, msg):
+        def _do():
+            self._log_txt.config(state="normal")
+            self._log_txt.insert("end", msg + "\n")
+            self._log_txt.see("end")
+        self.after(0, _do)
+
+    def _start_index(self, rebuild=False):
+        if self._index_running:
+            messagebox.showinfo("In Progress", "Index build already running.")
+            return
+        roots = self._get_archive_roots()
+        if not roots:
+            messagebox.showwarning(
+                "No Roots",
+                "Set an output folder in the Download tab settings,\n"
+                "or add archive root folders here.")
+            return
+        threading.Thread(target=self._run_index,
+                         args=(roots, rebuild), daemon=True).start()
+
+    def _confirm_rebuild(self):
+        if messagebox.askyesno(
+                "Rebuild Index",
+                "Delete the entire index and rebuild from scratch?\n"
+                "This can take a while for large archives."):
+            self._start_index(rebuild=True)
+
+    def _run_index(self, roots, rebuild):
+        self._index_running = True
+        self.after(0, lambda: self._idx_progress_var.set("Scanning..."))
+        self._tp_log("─── Index build started ───")
+
+        if rebuild:
+            try:
+                self._conn.execute("DELETE FROM segments")
+                self._conn.execute("DELETE FROM segments_fts")
+                self._conn.execute("DELETE FROM indexed_files")
+                self._conn.commit()
+                self._tp_log("Cleared existing index.")
+            except Exception as e:
+                self._tp_log(f"Error clearing index: {e}")
+                self._index_running = False
+                return
+
+        files = _tp_find_jsonl_files(roots)
+        self._tp_log(
+            f"Found {len(files)} JSONL file(s) in {len(roots)} root(s).")
+
+        new_files = skip_files = total_segs = 0
+        for i, fpath in enumerate(files):
+            prog = f"{i + 1}/{len(files)}"
+            self.after(0, lambda p=prog: self._idx_progress_var.set(p))
+            if not _tp_file_needs_update(self._conn, fpath):
+                skip_files += 1
+                continue
+            try:
+                n = _tp_index_file(self._conn, fpath, roots)
+                self._conn.commit()
+                total_segs += n
+                new_files  += 1
+                self._tp_log(
+                    f"  [{prog}] {os.path.basename(fpath)}  ({n:,} segments)")
+            except Exception as e:
+                self._tp_log(
+                    f"  [{prog}] ERROR {os.path.basename(fpath)}: {e}")
+
+        self._tp_log(
+            f"\nDone. {new_files} indexed, {skip_files} up-to-date. "
+            f"{total_segs:,} new segments added.")
+        self.after(0, lambda: self._idx_progress_var.set("Done"))
+        self.after(0, self._refresh_index_stats)
+        self.after(0, self._update_search_channels)
+        self.after(0, self._update_freq_channels)
+        self._index_running = False
+
+    def on_destroy(self):
+        if self._conn:
+            try:
+                self._conn.commit()
+                self._conn.close()
+            except Exception:
+                pass
+
+
 tab_recent = ttk.Frame(notebook)
 notebook.add(tab_recent, text="  Recent  ")
 tab_recent.columnconfigure(0, weight=1)
 tab_recent.rowconfigure(1, weight=1)
 
+# Transcriptions tab — lazy-loaded
+tab_transcriptions = ttk.Frame(notebook)
+notebook.add(tab_transcriptions, text="   Transcriptions  ")
+tab_transcriptions.columnconfigure(0, weight=1)
+tab_transcriptions.rowconfigure(0, weight=1)
+_tp_panel = _TranscriptionPanel(tab_transcriptions)
+_tp_panel.grid(row=0, column=0, sticky="nsew")
+_tp_panel_ref[0] = _tp_panel
+
+# ── Custom tab bar (replaces hidden built-in ttk.Notebook strip) ──────────────
+_tab_bar = tk.Frame(root, bg=C_BG)
+_tab_bar.pack(fill="x", side="top")
+tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
+notebook.pack(fill="both", expand=True, padx=0, pady=0)
+
+_tab_btns: dict = {}  # str(tab widget) → tk.Label
+
+def _make_tab_btn(parent, text, tab, side="left"):
+    lbl = tk.Label(parent, text=text, bg=C_BG, fg=C_ACCENT,
+                   font=("Segoe UI", 9), padx=16, pady=7, cursor="hand2")
+    lbl.bind("<Button-1>", lambda e: notebook.select(tab))
+    _tab_btns[str(tab)] = lbl
+    lbl.pack(side=side)
+    return lbl
+
+_make_tab_btn(_tab_bar, "  Download  ", tab_download)
+_make_tab_btn(_tab_bar, "  Subs  ", tab_settings)
+_make_tab_btn(_tab_bar, "  Recent  ", tab_recent)
+_make_tab_btn(_tab_bar, "   Transcriptions  ", tab_transcriptions, side="right")
+
+def _refresh_tab_btns(selected_str=None):
+    if selected_str is None:
+        selected_str = str(notebook.select())
+    for tab_str, lbl in _tab_btns.items():
+        if tab_str == selected_str:
+            lbl.config(bg=C_SURFACE, fg=C_TEXT, font=("Segoe UI", 9, "bold"))
+        else:
+            lbl.config(bg=C_BG, fg=C_ACCENT, font=("Segoe UI", 9))
+
+_refresh_tab_btns()
+
 
 def on_tab_changed(event):
     global new_download_count
     selected = notebook.select()
+    _refresh_tab_btns(selected)
 
     # When leaving the Recent tab, clear any selection so the user doesn't
     # have to manually deselect before scrolling when they come back.
@@ -16118,6 +17802,8 @@ def on_tab_changed(event):
         if new_download_count > 0:
             new_download_count = 0
             notebook.tab(tab_recent, text="  Recent  ")
+            if _tab_btns.get(str(tab_recent)):
+                _tab_btns[str(tab_recent)].config(text="  Recent  ")
             _update_tray_badge()
             # Clear the "X new videos downloaded" tooltip since user has seen them
             if not _sync_running:
@@ -16126,6 +17812,8 @@ def on_tab_changed(event):
                     pass  # _tick_countdown will update tooltip
                 else:
                     _update_tray_tooltip("YT Archiver — Idle")
+    elif selected == str(tab_transcriptions):
+        _tp_panel.on_shown()
     elif selected == str(tab_settings):
         root.after(10, lambda: notebook.focus_set())
 
@@ -16935,6 +18623,8 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
             if notebook.select() != str(tab_recent):
                 new_download_count += 1
                 notebook.tab(tab_recent, text=f"  Recent ({new_download_count})  ")
+                if _tab_btns.get(str(tab_recent)):
+                    _tab_btns[str(tab_recent)].config(text=f"  Recent ({new_download_count})  ")
                 _update_tray_badge()
 
         if _root_alive: _ui_queue.append(_sync)

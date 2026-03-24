@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.4"
+APP_VERSION = "v24.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2903,7 +2903,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 5:07pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 5:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3482,7 +3482,7 @@ settings_chan_tree.heading("size_on_disk", text="Size", anchor="e",
                            command=lambda: _sort_chan_tree("size_on_disk", False))
 settings_chan_tree.heading("url", text="URL", anchor="w")
 
-settings_chan_tree.column("folder", stretch=False, width=170, anchor="w")
+settings_chan_tree.column("folder", stretch=True, width=170, anchor="w")
 settings_chan_tree.column("res", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("min", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
@@ -3524,7 +3524,7 @@ def _do_chan_resize():
         other = sum(settings_chan_tree.column(c, "width")
                     for c in ("res", "min", "max", "compress", "transcribed",
                               "last_sync", "num_vids", "size_on_disk"))
-        folder_w = max(100, total - other - 22)  # 22 = scrollbar margin
+        folder_w = max(100, total - other - 2)  # 2px margin for subpixel rendering
         settings_chan_tree.column("folder", width=folder_w)
     except Exception:
         pass
@@ -15048,6 +15048,9 @@ def _gpu_start():
     """Start processing the GPU Tasks queue."""
     global _gpu_running, _whisper_model_choice
 
+    if _gpu_running:
+        return
+
     with _gpu_queue_lock:
         if not _gpu_queue:
             return
@@ -16697,7 +16700,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         self._nav_btns = {}
         for key, label in [("browse", "Browse"), ("search", "Search"),
-                            ("frequency", "Frequency"), ("bookmarks", "Bookmarks"),
+                            ("frequency", "Graph"), ("bookmarks", "Bookmarks"),
                             ("index", "Index")]:
             btn = tk.Label(sb, text=label, bg=self._TP_SIDEBAR, fg=self._TP_FG,
                            font=("Segoe UI", 10), cursor="hand2", anchor="w", padx=14, pady=9)
@@ -17929,6 +17932,10 @@ class _TranscriptionPanel(ttk.Frame):
             self._freq_canvas.draw()
             self._freq_canvas.mpl_connect("button_press_event",
                                           self._on_graph_click)
+            self._freq_canvas.mpl_connect("pick_event",
+                                          self._on_wc_pick)
+            self._wc_texts = []      # word cloud text artists for click detection
+            self._wc_channels = []   # channels used for current word cloud
 
         self._update_freq_channels()
         return f
@@ -18023,6 +18030,7 @@ class _TranscriptionPanel(ttk.Frame):
     def _do_frequency(self):
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
             return
+        self._wc_texts = []  # clear word cloud state when switching chart types
         raw = self._freq_words_var.get().strip()
         words     = [w.strip() for w in raw.split(",") if w.strip()][:6] if raw else []
         channels  = self._get_freq_selected_channels()
@@ -18203,6 +18211,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_all_keys = []
         self._freq_words    = []
         self._freq_by_month = False
+        self._wc_texts = []
+        self._wc_channels = []
         if self._freq_canvas:
             self._ax.clear()
             self._style_freq_ax()
@@ -18213,7 +18223,8 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _do_word_cloud(self, seed_words, channels):
         """Render a word cloud using top co-occurring words from transcription segments.
-        If seed_words is empty, samples random segments from the selected channels."""
+        If seed_words is empty, samples random segments from the selected channels.
+        Clicking a word in the cloud re-seeds the cloud with that word (explore connections)."""
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
             return
         import random as _rng
@@ -18236,7 +18247,32 @@ class _TranscriptionPanel(ttk.Frame):
             "say", "said", "see", "come", "way", "look", "thing", "things",
             "well", "back", "right", "yeah", "okay", "oh", "uh", "um", "really",
             "one", "two", "much", "even", "still", "because", "don't", "dont",
+            # Contractions
+            "it's", "its", "that's", "thats", "he's", "hes", "she's", "shes",
+            "i'm", "im", "they're", "theyre", "we're", "were", "you're", "youre",
+            "i've", "ive", "you've", "youve", "we've", "weve", "they've", "theyve",
+            "i'll", "ill", "you'll", "youll", "he'll", "hell", "she'll", "shell",
+            "we'll", "well", "they'll", "theyll", "it'll", "itll",
+            "i'd", "id", "you'd", "youd", "he'd", "hed", "she'd", "shed",
+            "we'd", "wed", "they'd", "theyd",
+            "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't",
+            "werent", "hasn't", "hasnt", "haven't", "havent", "hadn't", "hadnt",
+            "doesn't", "doesnt", "didn't", "didnt", "won't", "wont", "wouldn't",
+            "wouldnt", "can't", "cant", "couldn't", "couldnt", "shouldn't",
+            "shouldnt", "mustn't", "mustnt", "let's", "lets",
+            "there's", "theres", "here's", "heres", "what's", "whats",
+            "who's", "whos", "where's", "wheres", "how's", "hows",
+            "ain't", "aint", "y'all", "yall", "ma'am", "maam",
+            "that'll", "thatll", "who'll", "wholl", "what'll", "whatll",
         }
+
+        def _clean_word(w):
+            """Strip contraction suffixes and filter junk."""
+            w = re.sub(r"'(s|t|re|ve|ll|d|m)$", "", w)
+            if len(w) < 3 or w in _stop:
+                return None
+            return w
+
         seed_lower = {sw.lower() for sw in seed_words}
         if seed_words:
             for word in seed_words:
@@ -18251,8 +18287,9 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     continue
                 for (text,) in rows:
-                    for w in re.findall(r"[a-zA-Z']{3,}", text.lower()):
-                        if w not in _stop and w not in seed_lower:
+                    for raw in re.findall(r"[a-zA-Z']{3,}", text.lower()):
+                        w = _clean_word(raw)
+                        if w and w not in seed_lower:
                             word_counts[w] = word_counts.get(w, 0) + 1
             # Always include seed words with boosted counts
             for sw in seed_words:
@@ -18274,16 +18311,17 @@ class _TranscriptionPanel(ttk.Frame):
             except Exception:
                 rows = []
             for (text,) in rows:
-                for w in re.findall(r"[a-zA-Z']{3,}", text.lower()):
-                    if w not in _stop:
+                for raw in re.findall(r"[a-zA-Z']{3,}", text.lower()):
+                    w = _clean_word(raw)
+                    if w:
                         word_counts[w] = word_counts.get(w, 0) + 1
 
         if not word_counts:
             self._freq_status.config(text="No data for word cloud.")
             return
 
-        # Get top 80 words
-        top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:80]
+        # Get top 150 words
+        top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:150]
         max_count = top[0][1] if top else 1
 
         # Render word cloud using matplotlib text
@@ -18297,12 +18335,12 @@ class _TranscriptionPanel(ttk.Frame):
                    "#e06c75", "#56b6c2", "#d19a66", "#98c379"]
         _rng.seed(42)  # deterministic layout so the cloud doesn't jump on re-plot
         _WC_CENTER = 0.5
-        _WC_MIN_R  = 0.15
-        _WC_R_SCALE = 0.30
-        positions = []
+        _WC_MIN_R  = 0.10
+        _WC_R_SCALE = 0.38
+        self._wc_texts = []  # store text artists for click detection
         for i, (word, count) in enumerate(top):
-            # Size: 8-28pt based on count proportion
-            size = 8 + 20 * (count / max_count)
+            # Size: 6-28pt based on count proportion
+            size = 6 + 22 * (count / max_count)
             color = palette[i % len(palette)]
             # Highlight seed words
             if word in seed_lower:
@@ -18313,22 +18351,32 @@ class _TranscriptionPanel(ttk.Frame):
             r = _WC_MIN_R + _WC_R_SCALE * (i / max(len(top), 1))
             x = _WC_CENTER + r * _rng.uniform(-1, 1)
             y = _WC_CENTER + r * _rng.uniform(-1, 1)
-            x = max(0.05, min(0.95, x))
-            y = max(0.05, min(0.95, y))
-            self._ax.text(x, y, word, fontsize=size, color=color,
+            x = max(0.03, min(0.97, x))
+            y = max(0.03, min(0.97, y))
+            txt = self._ax.text(x, y, word, fontsize=size, color=color,
                           ha="center", va="center",
                           fontweight="bold" if count > max_count * 0.5 else "normal",
-                          alpha=0.6 + 0.4 * (count / max_count))
+                          alpha=0.6 + 0.4 * (count / max_count),
+                          picker=True)
+            self._wc_texts.append(txt)
         ch_label = (", ".join(channels[:2]) if channels else "all channels")
-        self._ax.set_title(f"Word Cloud — {ch_label}", fontsize=11,
+        title_parts = ["Word Cloud"]
+        if seed_words:
+            title_parts.append(f"seeded: {', '.join(seed_words[:3])}")
+        title_parts.append(ch_label)
+        self._ax.set_title(" — ".join(title_parts), fontsize=11,
                           color=self._TP_FG)
+        hint = "Click a word to explore its connections"
+        self._ax.text(0.5, 0.01, hint, fontsize=7, color="#666",
+                      ha="center", va="bottom", transform=self._ax.transAxes)
         self._fig.tight_layout()
         self._freq_canvas.draw()
-        self._freq_status.config(text=f"{len(top)} words plotted")
+        self._freq_status.config(text=f"{len(top)} words plotted  ·  click a word to explore")
         self._freq_all_keys = []
         self._freq_words    = seed_words
         self._freq_by_month = False
         self._freq_plotted_text = self._freq_words_var.get()
+        self._wc_channels = channels  # remember channels for click-to-explore
         self._freq_plot_btn.config(
             text="Clear", bg=self._TP_RED,
             command=self._clear_frequency)
@@ -18372,6 +18420,21 @@ class _TranscriptionPanel(ttk.Frame):
             messagebox.showinfo("Export", f"Saved {len(self._freq_all_keys)} rows.")
         except Exception as e:
             messagebox.showerror("Export", f"Failed to save:\n{e}")
+
+    def _on_wc_pick(self, event):
+        """Handle click on a word cloud text — re-seed the cloud with the clicked word."""
+        if not hasattr(self, '_wc_texts') or not self._wc_texts:
+            return
+        artist = event.artist
+        if artist not in self._wc_texts:
+            return
+        clicked_word = artist.get_text()
+        if not clicked_word:
+            return
+        # Set the clicked word as the new seed and re-run the word cloud
+        self._freq_words_var.set(clicked_word)
+        channels = getattr(self, '_wc_channels', [])
+        self._do_word_cloud([clicked_word], channels)
 
     def _on_graph_click(self, event):
         if event.inaxes != self._ax:

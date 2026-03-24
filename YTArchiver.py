@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.5"
+APP_VERSION = "v24.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2902,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 3:44pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 4:45pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9389,17 +9389,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 s = re.sub(r'\s+', ' ', s).strip()
                 return s.lower()
 
+            # Build normalized YT title → video_id lookup (used by backfill and Pass 2)
+            _yt_norm_backfill = {}
+            if yt_title_to_id:
+                for yt_title, vid_id in yt_title_to_id.items():
+                    _norm = _normalize_title(yt_title)
+                    if _norm not in _yt_norm_backfill:
+                        _yt_norm_backfill[_norm] = vid_id
+
             def _do_jsonl_backfill():
                 """Generate .jsonl entries for already-transcribed videos that are missing them.
                 Runs after new transcriptions so it doesn't delay resuming a paused session."""
                 if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
                     return
-                # Build normalized YT title → video_id lookup
-                _yt_norm_backfill = {}
-                for yt_title, vid_id in yt_title_to_id.items():
-                    _norm = _normalize_title(yt_title)
-                    if _norm not in _yt_norm_backfill:
-                        _yt_norm_backfill[_norm] = vid_id
 
                 # Match needed titles to video IDs
                 _backfill_list = []
@@ -9415,7 +9417,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _bf_total = len(_backfill_list)
                     _bf_repair_count   = sum(1 for t, _ in _backfill_list if t in _jsonl_bad)
                     _bf_rewhisp_count  = sum(1 for t, _ in _backfill_list if t in _jsonl_stale_whisper)
-                    _bf_caption_count  = _bf_total - _bf_rewhisp_count
                     _parts = []
                     if _bf_repair_count:
                         _parts.append(f"{_bf_repair_count} timestamp repair(s)")
@@ -12652,7 +12653,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 elif _has_min and _has_max:
                     _filter_reason = "Filtered: outside duration range."
                 else:
-                    _filter_reason = "Filtered: outside duration range."
+                    _filter_reason = "Filtered."
 
                 _skipped_dur_titles.append((_skip_title_raw, _filter_reason))
 
@@ -17139,6 +17140,10 @@ class _TranscriptionPanel(ttk.Frame):
             # Index every alphanumeric word in the body with its char offset.
             body_words = [(m.group().lower(), m.start())
                           for m in re.finditer(r"[a-zA-Z0-9]+", body)]
+            if not body_words:
+                self._browse_viewer.config(state="disabled")
+                self._browse_viewer.yview_moveto(0)
+                return
             body_cursor = 0   # walk forward only — never resets to 0
             pending = []      # (char_start, data) — char_end filled in next pass
 
@@ -17165,6 +17170,9 @@ class _TranscriptionPanel(ttk.Frame):
 
                 if found is None:
                     found = body_cursor  # last resort — don't go backwards
+
+                if found >= len(body_words):
+                    continue  # cursor ran past end — skip this segment
 
                 char_start = header_char_len + body_words[found][1]
                 pending.append((char_start, (video_id, start, end, seg_text, words_json or "")))
@@ -17481,6 +17489,7 @@ class _TranscriptionPanel(ttk.Frame):
                 "VALUES (?,?,?,?,?,?,?)",
                 (segment_id, video_id, title, channel, start, text, note))
             self._conn.commit()
+            self._refresh_bookmarks()
         except Exception:
             pass
 
@@ -17786,6 +17795,10 @@ class _TranscriptionPanel(ttk.Frame):
                     if yr_to.isdigit():
                         sql += " AND year <= ?"
                         params.append(int(yr_to))
+                    # Build ORDER BY without table alias (no 's.' prefix)
+                    if order_clause:
+                        _like_order = order_clause.replace("s.", "")
+                        sql += f" ORDER BY {_like_order}"
                     sql  += " LIMIT 500"
                     rows  = self._conn.execute(sql, params).fetchall()
             self.after(0, lambda: _populate(rows or []))

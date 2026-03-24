@@ -2903,7 +2903,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 1:02pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:16pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9428,6 +9428,55 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     if _bf_done:
                         log(f"  ✓ {_bf_done} searchable .jsonl entry/entries generated.\n", "simpleline_green")
 
+            # ── Pass 2: Patch empty video_ids in existing JSONL entries ──────────────
+            # Whisper-transcribed videos written before this fix had video_id = "".
+            # If the video is actually a YouTube video (just had no captions), look up
+            # its ID and write it in so the YT timestamp link works in search results.
+            if yt_title_to_id and not _ce.is_set():
+                import json as _pjson
+                _vid_id_patched = 0
+                for _pd, _pdirs, _pfiles in os.walk(folder):
+                    for _pf in _pfiles:
+                        if not (_pf.startswith(".") and ch_name in _pf
+                                and _pf.endswith("Transcript.jsonl")):
+                            continue
+                        _pfpath = os.path.join(_pd, _pf)
+                        try:
+                            with open(_pfpath, "r", encoding="utf-8") as _pfh:
+                                _plines = _pfh.readlines()
+                            _pnew = []
+                            _pchanged = False
+                            for _pl in _plines:
+                                _ps = _pl.strip()
+                                if not _ps:
+                                    _pnew.append(_pl)
+                                    continue
+                                try:
+                                    _pe2 = _pjson.loads(_ps)
+                                except Exception:
+                                    _pnew.append(_pl)
+                                    continue
+                                if _pe2.get("video_id", "") == "":
+                                    _pt = _pe2.get("title", "")
+                                    _pvid = (yt_title_to_id.get(_pt)
+                                             or _yt_norm_backfill.get(_normalize_title(_pt)))
+                                    if _pvid:
+                                        _pe2["video_id"] = _pvid
+                                        _pnew.append(_pjson.dumps(_pe2, ensure_ascii=False) + "\n")
+                                        _pchanged = True
+                                        _vid_id_patched += 1
+                                        continue
+                                _pnew.append(_pl)
+                            if _pchanged:
+                                with open(_pfpath, "w", encoding="utf-8") as _pfh:
+                                    _pfh.writelines(_pnew)
+                                _hide_file_win(_pfpath)
+                        except Exception:
+                            pass
+                if _vid_id_patched:
+                    log(f"  ✓ Linked YouTube IDs for {_vid_id_patched} Whisper segment(s).\n",
+                        "simpleline_green")
+
             # ── Punctuation sweep for already-transcribed entries ──
             if already_done and not _ce.is_set():
                 _punct_sweep_needed = False
@@ -10067,9 +10116,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         # Write hidden JSONL with timestamps for searchability
                         if _vtt_segments:
-                            # Whisper videos don't have a YouTube video_id — use empty string
                             _jsonl_path = _get_jsonl_path(txt_path)
-                            _write_jsonl_entry(_jsonl_path, "", fname, _vtt_segments)
+                            # Use the video's YouTube ID if it exists (YT video with no captions
+                            # available — Whisper was used as fallback). Falls back to "" for
+                            # truly local/offline files that have no YouTube counterpart.
+                            _w_vid_id = (yt_title_to_id.get(fname)
+                                         or _yt_normalized.get(_normalize_for_match(fname), ""))
+                            _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments)
 
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -17606,11 +17659,23 @@ class _TranscriptionPanel(ttk.Frame):
     def _find_video_file(self, title, txt_path):
         if not txt_path:
             return None
+        # Build candidate directories: transcript dir, then up to 2 parents.
+        # Needed because transcripts may live in split_years/split_months
+        # subfolders while the actual video files sit in the channel root.
+        search_dirs = []
         d = os.path.dirname(txt_path)
-        for ext in self._VIDEO_EXTS:
-            p = os.path.join(d, title + ext)
-            if os.path.exists(p):
-                return p
+        for _ in range(3):
+            if d not in search_dirs:
+                search_dirs.append(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        for sd in search_dirs:
+            for ext in self._VIDEO_EXTS:
+                p = os.path.join(sd, title + ext)
+                if os.path.exists(p):
+                    return p
         return None
 
     def _get_txt_section(self, txt_path, title):

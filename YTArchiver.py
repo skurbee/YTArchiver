@@ -18252,7 +18252,7 @@ class _TranscriptionPanel(ttk.Frame):
             "i'm", "im", "they're", "theyre", "we're", "were", "you're", "youre",
             "i've", "ive", "you've", "youve", "we've", "weve", "they've", "theyve",
             "i'll", "ill", "you'll", "youll", "he'll", "hell", "she'll", "shell",
-            "we'll", "well", "they'll", "theyll", "it'll", "itll",
+            "we'll", "they'll", "theyll", "it'll", "itll",  # "well" already listed above
             "i'd", "id", "you'd", "youd", "he'd", "hed", "she'd", "shed",
             "we'd", "wed", "they'd", "theyd",
             "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't",

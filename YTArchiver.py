@@ -16436,6 +16436,8 @@ def _tp_open_db(path):
         mtime REAL,
         segment_count INTEGER
     )""")
+    # Bookmarks deliberately denormalize segment data so they survive index rebuilds.
+    # segment_id is ON DELETE SET NULL — bookmark content persists even if re-indexed.
     conn.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
         id         INTEGER PRIMARY KEY,
         segment_id INTEGER,
@@ -17687,6 +17689,11 @@ class _TranscriptionPanel(ttk.Frame):
     def _render_viewer_window(self):
         body = self._viewer_section
         if not body:
+            self._viewer.config(state="normal")
+            self._viewer.delete("1.0", "end")
+            self._viewer.config(state="disabled")
+            self._btn_load_earlier.grid_remove()
+            self._btn_load_later.grid_remove()
             return
         win_start   = self._viewer_win_start
         win_end     = self._viewer_win_end
@@ -18226,7 +18233,10 @@ class _TranscriptionPanel(ttk.Frame):
         palette = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea",
                    "#89ddff", "#f78c6c", "#82aaff", "#c3e88d", "#ffcb6b",
                    "#e06c75", "#56b6c2", "#d19a66", "#98c379"]
-        _rng.seed(42)  # deterministic layout
+        _rng.seed(42)  # deterministic layout so the cloud doesn't jump on re-plot
+        _WC_CENTER = 0.5
+        _WC_MIN_R  = 0.15
+        _WC_R_SCALE = 0.30
         positions = []
         for i, (word, count) in enumerate(top):
             # Size: 8-28pt based on count proportion
@@ -18238,9 +18248,9 @@ class _TranscriptionPanel(ttk.Frame):
                 size = min(size * 1.3, 32)
             # Place words using a spiral-ish layout
             angle = i * 137.508  # golden angle in degrees
-            r = 0.15 + 0.30 * (i / max(len(top), 1))
-            x = 0.5 + r * _rng.uniform(-1, 1)
-            y = 0.5 + r * _rng.uniform(-1, 1)
+            r = _WC_MIN_R + _WC_R_SCALE * (i / max(len(top), 1))
+            x = _WC_CENTER + r * _rng.uniform(-1, 1)
+            y = _WC_CENTER + r * _rng.uniform(-1, 1)
             x = max(0.05, min(0.95, x))
             y = max(0.05, min(0.95, y))
             self._ax.text(x, y, word, fontsize=size, color=color,

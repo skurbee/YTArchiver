@@ -2902,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 3:24pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6383,13 +6383,16 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
         with open(jsonl_path, "a", encoding="utf-8") as f:
             for seg in segments:
-                line = _json.dumps({
+                entry = {
                     "video_id": video_id or "",
                     "title": title,
                     "start": round(seg["start"], 2),
                     "end": round(seg["end"], 2),
                     "text": seg["text"]
-                }, ensure_ascii=False)
+                }
+                if seg.get("words"):
+                    entry["words"] = seg["words"]
+                line = _json.dumps(entry, ensure_ascii=False)
                 f.write(line + "\n")
         _hide_file_win(jsonl_path)
     except Exception:
@@ -6399,17 +6402,23 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
 def _scan_existing_jsonl(folder_path, ch_name):
     """Scan JSONL transcript files under folder_path.
 
-    Returns (existing_titles, bad_titles) where bad_titles contains any title
-    that has at least one segment with duration > 35 s.  Both the old VTT
-    rolling-cue merger (pre-fix) and raw Whisper output can produce segments
-    far longer than the 30 s cap; these titles are flagged for repair.
-    The threshold is 35 s (not 30 s) to avoid re-flagging segments that are
-    legitimately at the boundary due to silence detection timing.
+    Returns (existing_titles, bad_titles, stale_whisper) where:
+    - bad_titles: any title with a segment > 35 s (needs repair/re-transcription)
+    - stale_whisper: Whisper-transcribed titles (segment > 8 s) that have no
+      per-word timestamps yet — these should be re-Whispered to gain word accuracy.
+      YouTube VTT cues are always short (<5 s), so the >8 s threshold reliably
+      identifies Whisper-only content without needing to track source explicitly.
     """
     existing = set()
     bad_titles = set()
+    stale_whisper = set()
     import json as _json
-    _MAX_SEG = 35.0   # above the 30 s cap but catches both VTT and Whisper long segs
+    _MAX_SEG       = 35.0  # above the 30 s cap but catches both VTT and Whisper long segs
+    _WHISPER_MIN   = 8.0   # segments longer than this are Whisper (not VTT)
+    # Per-title tracking for stale detection: a title is stale only if it has at
+    # least one long segment AND none of its segments carry word timestamps.
+    _has_long_seg  = set()
+    _has_words     = set()
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
@@ -6421,11 +6430,17 @@ def _scan_existing_jsonl(folder_path, ch_name):
                                 entry = _json.loads(line)
                                 title = entry.get("title", "")
                                 existing.add(title)
-                                if entry.get("end", 0) - entry.get("start", 0) > _MAX_SEG:
+                                dur = entry.get("end", 0) - entry.get("start", 0)
+                                if dur > _MAX_SEG:
                                     bad_titles.add(title)
+                                if dur > _WHISPER_MIN:
+                                    _has_long_seg.add(title)
+                                if entry.get("words"):
+                                    _has_words.add(title)
                 except Exception:
                     pass
-    return existing, bad_titles
+    stale_whisper = _has_long_seg - _has_words - bad_titles
+    return existing, bad_titles, stale_whisper
 
 
 def _fix_long_segments_in_jsonl(folder_path, ch_name):
@@ -6588,6 +6603,7 @@ for line in sys.stdin:
             vad_parameters=dict(min_silence_duration_ms=500),
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
+            word_timestamps=True,
         )
         # info.duration is the total audio length in seconds
         total_dur = info.duration if info.duration and info.duration > 0 else duration
@@ -6604,8 +6620,8 @@ for line in sys.stdin:
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
 
-        # Split any segment longer than 30 s into equal sub-segments so that
-        # timestamps are accurate enough for video seek (TranscriptionParser).
+        # Split any segment longer than 30 s into sub-segments using actual word
+        # timestamps where available, falling back to proportional split otherwise.
         _MAX_SEG = 30.0
         seg_data = []
         for seg in all_segments:
@@ -6613,23 +6629,44 @@ for line in sys.stdin:
             if not t:
                 continue
             dur = seg.end - seg.start
+            # Collect word-level timestamps for this segment
+            raw_words = [w for w in (seg.words or []) if w.word.strip()]
             if dur <= _MAX_SEG:
-                seg_data.append({"s": round(seg.start, 2), "e": round(seg.end, 2), "t": t})
+                w_data = [{"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)}
+                          for w in raw_words]
+                seg_data.append({"s": round(seg.start, 2), "e": round(seg.end, 2),
+                                 "t": t, "w": w_data})
+            elif raw_words:
+                # Split at actual word boundaries using real timestamps
+                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 1 else 0))
+                wpc = max(1, len(raw_words) // n_chunks)
+                for ci in range(n_chunks):
+                    wi0 = ci * wpc
+                    wi1 = wi0 + wpc if ci < n_chunks - 1 else len(raw_words)
+                    chunk_ws = raw_words[wi0:wi1]
+                    if not chunk_ws:
+                        continue
+                    chunk_text = " ".join(w.word.strip() for w in chunk_ws)
+                    w_data = [{"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)}
+                              for w in chunk_ws]
+                    seg_data.append({"s": round(chunk_ws[0].start, 2),
+                                     "e": round(chunk_ws[-1].end, 2),
+                                     "t": chunk_text, "w": w_data})
             else:
-                # Split proportionally across words
+                # Fallback: proportional split (no word timestamps available)
                 words = t.split()
                 n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 1 else 0))
                 chunk_dur = dur / n_chunks
-                words_per_chunk = max(1, len(words) // n_chunks)
+                wpc = max(1, len(words) // n_chunks)
                 for ci in range(n_chunks):
-                    w_start = ci * words_per_chunk
-                    w_end = w_start + words_per_chunk if ci < n_chunks - 1 else len(words)
-                    chunk_text = " ".join(words[w_start:w_end])
+                    wi0 = ci * wpc
+                    wi1 = wi0 + wpc if ci < n_chunks - 1 else len(words)
+                    chunk_text = " ".join(words[wi0:wi1])
                     if not chunk_text:
                         continue
                     cs = round(seg.start + ci * chunk_dur, 2)
                     ce = round(min(seg.end, seg.start + (ci + 1) * chunk_dur), 2)
-                    seg_data.append({"s": cs, "e": ce, "t": chunk_text})
+                    seg_data.append({"s": cs, "e": ce, "t": chunk_text, "w": []})
 
         _out.write(json.dumps({"status": "ok", "text": text, "segments": seg_data}) + "\n")
         _out.flush()
@@ -8409,7 +8446,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 _gpu_actively_encoding = False
                 _text = result.get("text") or None
                 _raw_segs = result.get("segments", [])
-                _segments = [{"start": s["s"], "end": s["e"], "text": s["t"]} for s in _raw_segs]
+                _segments = [{"start": s["s"], "end": s["e"], "text": s["t"],
+                              "words": s.get("w", [])} for s in _raw_segs]
                 return _text, _segments
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
@@ -9242,8 +9280,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 with config_lock:
                     config[_migration_key] = True
                     save_config(config)
-            _jsonl_existing_raw, _jsonl_bad = (
-                _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set()))
+            _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = (
+                _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set(), set()))
 
             # In-place segment repair: fix any Whisper segments > 35 s that can't be
             # re-fetched via auto-captions.  This runs before the backfill pass so that
@@ -9254,10 +9292,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"  ✓ Fixed {_inplace_fixed} long Whisper segment(s) in existing transcripts.\n",
                         "simpleline_green")
                     # Re-scan to update bad_titles now that in-place fixes are done
-                    _jsonl_existing_raw, _jsonl_bad = _scan_existing_jsonl(folder, ch_name)
+                    _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
 
-            # Exclude bad-timestamp titles so they get re-fetched and rewritten
-            _jsonl_existing = _jsonl_existing_raw - _jsonl_bad
+            if _jsonl_stale_whisper:
+                log(f"  ↻ {len(_jsonl_stale_whisper)} Whisper transcript(s) lack per-word timestamps — "
+                    f"queuing for re-transcription.\n", "simpleline")
+
+            # Exclude bad-timestamp and stale-whisper titles so they get re-fetched/rewritten
+            _jsonl_existing = _jsonl_existing_raw - _jsonl_bad - _jsonl_stale_whisper
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
             if not files_to_process and not _jsonl_needed:
@@ -16508,6 +16550,11 @@ def _tp_open_db(path):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_channel ON segments(channel)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr ON segments(channel, year)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr_mo ON segments(channel, year, month)")
+    # Migration: add words column for word-level timestamps (added later; safe to ignore if exists)
+    try:
+        conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
+    except Exception:
+        pass
     conn.commit()
     return conn
 
@@ -16579,14 +16626,16 @@ def _tp_index_file(conn, jsonl_path, archive_roots):
                     text = seg.get("text", "").strip()
                     if not text:
                         continue
+                    words_raw = seg.get("words")
+                    words_json = json.dumps(words_raw, ensure_ascii=False) if words_raw else ""
                     cur = conn.execute(
                         "INSERT INTO segments "
-                        "(video_id,title,channel,year,month,start_time,end_time,text,jsonl_path) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        "(video_id,title,channel,year,month,start_time,end_time,text,jsonl_path,words) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (seg.get("video_id", ""), seg.get("title", ""),
                          channel, year, month,
                          seg.get("start", 0.0), seg.get("end", 0.0),
-                         text, jsonl_path)
+                         text, jsonl_path, words_json)
                     )
                     conn.execute("INSERT INTO segments_fts(rowid,text) VALUES (?,?)",
                                  (cur.lastrowid, text))
@@ -16661,6 +16710,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._tp_extra_roots  = []
         self._search_running  = False
         self._bookmarks_data  = []
+        self._browse_seg_map  = []  # [(char_start, char_end, seg_tuple), ...] built at load time
         self._build_placeholder()
 
     def _build_placeholder(self):
@@ -17001,26 +17051,102 @@ class _TranscriptionPanel(ttk.Frame):
         meta = self._browse_items.get(sel[0])
         if not meta or meta["type"] != "title":
             return
-        title     = meta["title"]
-        txt_path  = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
+        title    = meta["title"]
+        txt_path = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
         self._browse_viewer_title.config(text=title)
         self._browse_path_label.config(
             text=f"{meta.get('channel', '')}  •  {txt_path or ''}")
 
-        section = self._get_txt_section(txt_path, title) if txt_path else None
+        # Fetch segments from DB for the position map (double-click seeking).
+        # The viewer itself always shows the .txt body (punctuation-restored).
+        db_rows = []
+        if self._conn:
+            try:
+                db_rows = self._conn.execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (title,)).fetchall()
+            except Exception:
+                db_rows = []
+
         self._browse_viewer.config(state="normal")
         self._browse_viewer.delete("1.0", "end")
+        self._browse_seg_map = []
+
+        section = self._get_txt_section(txt_path, title) if txt_path else None
+        if not section and not db_rows:
+            self._browse_viewer.insert("end",
+                "(No .txt file found for this transcription.)\n\n", "header")
+            if txt_path:
+                self._browse_viewer.insert("end", f"Expected:\n{txt_path}")
+            self._browse_viewer.config(state="disabled")
+            self._browse_viewer.yview_moveto(0)
+            return
+
+        # Display the .txt content exactly as before (header + punctuated body)
+        body = ""
+        header_char_len = 0
         if section:
             lines = section.split('\n', 1)
             header_line = lines[0]
             body = lines[1].strip() if len(lines) > 1 else ""
             self._browse_viewer.insert("end", header_line + "\n\n", "header")
+            header_char_len = len(header_line) + 2
             self._browse_viewer.insert("end", body)
         else:
-            self._browse_viewer.insert("end",
-                "(No .txt file found for this transcription.)\n\n", "header")
-            if txt_path:
-                self._browse_viewer.insert("end", f"Expected:\n{txt_path}")
+            # No .txt yet — show raw segment text as fallback
+            body = " ".join(row[3] for row in db_rows)
+            self._browse_viewer.insert("end", body)
+
+        # Build the segment position map via word-alignment against the displayed
+        # body text.  Punctuation restoration adds commas/periods but never
+        # reorders or changes the actual words, so the body and the DB segment
+        # texts share the same words in the same order.  We scan forward through
+        # the body's word list for each segment's first word (greedy, never
+        # stepping backwards), giving us an exact character range for each segment
+        # without any time-based assumptions.
+        if db_rows and body:
+            # Index every alphanumeric word in the body with its char offset.
+            body_words = [(m.group().lower(), m.start())
+                          for m in re.finditer(r"[a-zA-Z0-9]+", body)]
+            body_cursor = 0   # walk forward only — never resets to 0
+            pending = []      # (char_start, data) — char_end filled in next pass
+
+            for video_id, start, end, seg_text, words_json in db_rows:
+                seg_words = re.findall(r"[a-zA-Z0-9]+", seg_text.lower())
+                if not seg_words:
+                    continue
+                first = seg_words[0]
+
+                # Narrow search: look within the next 150 body words first
+                found = None
+                limit = min(body_cursor + 150, len(body_words))
+                for i in range(body_cursor, limit):
+                    if body_words[i][0] == first:
+                        found = i
+                        break
+
+                # Wide fallback: if the narrow window missed, search the rest
+                if found is None:
+                    for i in range(limit, len(body_words)):
+                        if body_words[i][0] == first:
+                            found = i
+                            break
+
+                if found is None:
+                    found = body_cursor  # last resort — don't go backwards
+
+                char_start = header_char_len + body_words[found][1]
+                pending.append((char_start, (video_id, start, end, seg_text, words_json or "")))
+                body_cursor = found + len(seg_words)
+
+            # Pair each segment's char_start with the next segment's char_start
+            # as its char_end (last segment runs to end of body).
+            for i, (cs, data) in enumerate(pending):
+                ce = (pending[i + 1][0] if i + 1 < len(pending)
+                      else header_char_len + len(body))
+                self._browse_seg_map.append((cs, ce, data))
+
         self._browse_viewer.config(state="disabled")
         self._browse_viewer.yview_moveto(0)
 
@@ -17052,6 +17178,8 @@ class _TranscriptionPanel(ttk.Frame):
         meta = self._browse_items.get(sel[0])
         if not meta or meta["type"] != "title":
             return
+        if not self._browse_seg_map:
+            return
 
         click_idx  = self._browse_viewer.index(f"@{event.x},{event.y}")
         word_start = self._browse_viewer.index(f"{click_idx} wordstart")
@@ -17060,53 +17188,55 @@ class _TranscriptionPanel(ttk.Frame):
         if not word:
             return
 
-        try:
-            ctx_start = self._browse_viewer.index(f"{click_idx} -80c")
-            ctx_end   = self._browse_viewer.index(f"{click_idx} +80c")
-        except Exception:
-            ctx_start, ctx_end = "1.0", "end"
-        context = self._browse_viewer.get(ctx_start, ctx_end)
+        # Resolve click → char offset → segment via the position map built at load time
+        char_offset = int(self._browse_viewer.count("1.0", click_idx, "chars")[0])
+        seg_entry = self._browse_seg_lookup(char_offset)
+        if seg_entry is None:
+            return
+
+        video_id, start_time, end_time, seg_text, words_json = seg_entry
+
+        # Use per-word timestamp if available, else fall back to interpolation
+        ts = self._word_ts_lookup(words_json, word, start_time or 0, end_time or start_time or 0)
 
         title      = meta["title"]
         channel    = meta.get("channel", "")
         jsonl_path = meta.get("jsonl_path")
         txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
-
-        seg = self._find_browse_segment(title, context)
-        if seg is None:
-            return
-
-        video_id, start_time, end_time, seg_text = seg
-        ts = self._interpolate_ts(
-            start_time or 0, end_time or start_time or 0, seg_text, word)
         video_path = self._find_video_file(title, txt_path)
 
         self.after(10, lambda: self._show_browse_open_menu(
             event.x_root, event.y_root,
             video_id, video_path, ts, word, seg_text, title, channel, start_time or 0))
 
-    def _find_browse_segment(self, title, context):
-        """Return (video_id, start, end, text) for the segment whose text best
-        matches the context window around the double-clicked word."""
-        if not self._conn:
+    def _browse_seg_lookup(self, char_offset):
+        """Binary search _browse_seg_map for the segment at char_offset.
+        Returns (video_id, start, end, text, words_json) or None."""
+        import bisect
+        if not self._browse_seg_map:
             return None
-        try:
-            rows = self._conn.execute(
-                "SELECT video_id, start_time, end_time, text FROM segments "
-                "WHERE title=? ORDER BY start_time",
-                (title,)).fetchall()
-        except Exception:
-            return None
-        if not rows:
-            return None
-        ctx_words = set(context.lower().split())
-        best, best_score = rows[0], -1
-        for row in rows:
-            score = len(ctx_words & set(row[3].lower().split()))
-            if score > best_score:
-                best_score = score
-                best = row
-        return best
+        starts = [s[0] for s in self._browse_seg_map]
+        i = bisect.bisect_right(starts, char_offset) - 1
+        if 0 <= i < len(self._browse_seg_map):
+            return self._browse_seg_map[i][2]
+        return None
+
+    def _word_ts_lookup(self, words_json, word, seg_start, seg_end):
+        """Return the best seek timestamp for word within a segment.
+        Uses per-word timestamps when available; falls back to interpolation."""
+        _TS_LEAD = 1.5  # seconds to seek before the matched word
+        if words_json:
+            try:
+                import json as _j
+                word_list = _j.loads(words_json)
+                clean = word.lower().strip(".,!?;:\"'()-")
+                for w in word_list:
+                    if w.get("w", "").lower().strip(".,!?;:\"'()-") == clean:
+                        return max(0.0, w["s"] - _TS_LEAD)
+            except Exception:
+                pass
+        # Fallback: interpolate within segment (old behaviour, larger lead)
+        return self._interpolate_ts(seg_start, seg_end, "", word)
 
     def _show_browse_open_menu(self, x, y, video_id, video_path, ts,
                                 word, seg_text, title, channel, start_time):

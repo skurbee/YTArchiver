@@ -2902,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:25pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16892,6 +16892,7 @@ class _TranscriptionPanel(ttk.Frame):
                                           foreground="#ffe066")
         bvsb.pack(side="right", fill="y")
         self._browse_viewer.pack(fill="both", expand=True)
+        self._browse_viewer.bind("<Double-Button-1>", self._on_browse_word_double_click)
         pane.add(right, minsize=300)
 
         # Internal state for browse tree items
@@ -17042,6 +17043,104 @@ class _TranscriptionPanel(ttk.Frame):
             idx = end_pos
         if first:
             self._browse_viewer.see(first)
+
+    def _on_browse_word_double_click(self, event):
+        """Double-clicking a word in the browse viewer opens the Open Local/YT menu."""
+        sel = self._browse_tree.selection()
+        if not sel:
+            return
+        meta = self._browse_items.get(sel[0])
+        if not meta or meta["type"] != "title":
+            return
+
+        click_idx  = self._browse_viewer.index(f"@{event.x},{event.y}")
+        word_start = self._browse_viewer.index(f"{click_idx} wordstart")
+        word_end   = self._browse_viewer.index(f"{click_idx} wordend")
+        word = self._browse_viewer.get(word_start, word_end).strip()
+        if not word:
+            return
+
+        try:
+            ctx_start = self._browse_viewer.index(f"{click_idx} -80c")
+            ctx_end   = self._browse_viewer.index(f"{click_idx} +80c")
+        except Exception:
+            ctx_start, ctx_end = "1.0", "end"
+        context = self._browse_viewer.get(ctx_start, ctx_end)
+
+        title      = meta["title"]
+        channel    = meta.get("channel", "")
+        jsonl_path = meta.get("jsonl_path")
+        txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
+
+        seg = self._find_browse_segment(title, context)
+        if seg is None:
+            return
+
+        video_id, start_time, end_time, seg_text = seg
+        ts = self._interpolate_ts(
+            start_time or 0, end_time or start_time or 0, seg_text, word)
+        video_path = self._find_video_file(title, txt_path)
+
+        self.after(10, lambda: self._show_browse_open_menu(
+            event.x_root, event.y_root,
+            video_id, video_path, ts, word, seg_text, title, channel, start_time or 0))
+
+    def _find_browse_segment(self, title, context):
+        """Return (video_id, start, end, text) for the segment whose text best
+        matches the context window around the double-clicked word."""
+        if not self._conn:
+            return None
+        try:
+            rows = self._conn.execute(
+                "SELECT video_id, start_time, end_time, text FROM segments "
+                "WHERE title=? ORDER BY start_time",
+                (title,)).fetchall()
+        except Exception:
+            return None
+        if not rows:
+            return None
+        ctx_words = set(context.lower().split())
+        best, best_score = rows[0], -1
+        for row in rows:
+            score = len(ctx_words & set(row[3].lower().split()))
+            if score > best_score:
+                best_score = score
+                best = row
+        return best
+
+    def _show_browse_open_menu(self, x, y, video_id, video_path, ts,
+                                word, seg_text, title, channel, start_time):
+        """Context menu shown after double-clicking a word in the browse viewer."""
+        menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                       activebackground=self._TP_ACCENT, activeforeground="white",
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
+
+        if video_path:
+            menu.add_command(label="  Open Video — Local",
+                             command=lambda: self._open_vlc(video_path, ts))
+        else:
+            menu.add_command(label="  Open Video — Local  (file not found)",
+                             state="disabled")
+
+        if video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}&t={int(ts)}s"
+            menu.add_command(label="  Open Video — YouTube",
+                             command=lambda u=url: _webbrowser.open(u))
+        else:
+            menu.add_command(label="  Open Video — YouTube  (no ID)",
+                             state="disabled")
+
+        menu.add_separator()
+        menu.add_command(label="  📋  Copy Segment Text",
+                         command=lambda: self._copy_to_clipboard(seg_text))
+        menu.add_command(label="  🔖  Bookmark This Segment",
+                         command=lambda: self._add_bookmark(
+                             None, video_id, title, channel, start_time, seg_text))
+
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # ── Bookmarks section ─────────────────────────────────────────────────────
 

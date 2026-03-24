@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.0"
+APP_VERSION = "v24.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -17215,7 +17215,9 @@ class _TranscriptionPanel(ttk.Frame):
         return min(len(text), i)
 
     def _render_viewer_window(self):
-        body        = self._viewer_section
+        body = self._viewer_section
+        if not body:
+            return
         win_start   = self._viewer_win_start
         win_end     = self._viewer_win_end
         query       = self._viewer_query

@@ -9459,8 +9459,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _bf_txt, _ = _get_transcript_filename(
                                         ch_name, folder, split_years, split_months, combined)
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
-                                # If this title had bad segments, purge old entries first
-                                if _bf_title in _jsonl_bad and os.path.isfile(_bf_jsonl):
+                                # If this title had bad segments or stale Whisper entries,
+                                # purge old entries first so we don't accumulate duplicates.
+                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper) \
+                                        and os.path.isfile(_bf_jsonl):
                                     _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
                                 _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
                                 _bf_done += 1

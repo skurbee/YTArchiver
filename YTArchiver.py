@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.1"
+APP_VERSION = "v24.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -16436,6 +16436,18 @@ def _tp_open_db(path):
         mtime REAL,
         segment_count INTEGER
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
+        id         INTEGER PRIMARY KEY,
+        segment_id INTEGER,
+        video_id   TEXT,
+        title      TEXT,
+        channel    TEXT,
+        start_time REAL,
+        text       TEXT,
+        note       TEXT DEFAULT '',
+        created    REAL DEFAULT (strftime('%%s','now')),
+        FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
+    )""")
     conn.commit()
     return conn
 
@@ -16584,9 +16596,11 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_all_keys   = []
         self._freq_words      = []
         self._freq_by_month   = False
-        self._active_section  = "search"
+        self._active_section  = "browse"
         self._pending_reindex = None
         self._tp_extra_roots  = []
+        self._search_running  = False
+        self._bookmarks_data  = []
         self._build_placeholder()
 
     def _build_placeholder(self):
@@ -16677,7 +16691,9 @@ class _TranscriptionPanel(ttk.Frame):
                  font=("Segoe UI", 7, "bold")).pack(pady=(16, 6), padx=10)
 
         self._nav_btns = {}
-        for key, label in [("search", "Search"), ("frequency", "Frequency"), ("index", "Index")]:
+        for key, label in [("browse", "Browse"), ("search", "Search"),
+                            ("frequency", "Frequency"), ("bookmarks", "Bookmarks"),
+                            ("index", "Index")]:
             btn = tk.Label(sb, text=label, bg=self._TP_SIDEBAR, fg=self._TP_FG,
                            font=("Segoe UI", 10), cursor="hand2", anchor="w", padx=14, pady=9)
             btn.pack(fill="x")
@@ -16698,17 +16714,21 @@ class _TranscriptionPanel(ttk.Frame):
         self._content.columnconfigure(0, weight=1)
         self._content.rowconfigure(0, weight=1)
 
-        self._search_frame = self._build_search_section(self._content)
-        self._freq_frame   = self._build_frequency_section(self._content)
-        self._index_frame  = self._build_index_section(self._content)
+        self._browse_frame    = self._build_browse_section(self._content)
+        self._search_frame    = self._build_search_section(self._content)
+        self._freq_frame      = self._build_frequency_section(self._content)
+        self._bookmarks_frame = self._build_bookmarks_section(self._content)
+        self._index_frame     = self._build_index_section(self._content)
 
-        self._show_section("search")
+        self._show_section("browse")
 
     def _show_section(self, key):
         self._active_section = key
         frames = {
+            "browse":    self._browse_frame,
             "search":    self._search_frame,
             "frequency": self._freq_frame,
+            "bookmarks": self._bookmarks_frame,
             "index":     self._index_frame,
         }
         for k, f in frames.items():
@@ -16726,6 +16746,10 @@ class _TranscriptionPanel(ttk.Frame):
             if query and not self._freq_words_var.get().strip():
                 self._freq_words_var.set(query)
                 self.after(50, self._do_frequency)
+        elif key == "bookmarks":
+            self._refresh_bookmarks()
+        elif key == "browse":
+            self._refresh_browse()
 
     def _refresh_stats_label(self):
         if not self._conn:
@@ -16736,6 +16760,403 @@ class _TranscriptionPanel(ttk.Frame):
             chs  = self._conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
             self._stats_label.config(
                 text=f"{segs:,} segments\n{vids:,} videos\n{chs} channels")
+        except Exception:
+            pass
+
+    # ── Browse section ────────────────────────────────────────────────────────
+
+    def _build_browse_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+
+        # Header bar
+        hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
+        hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(hdr, text="Browse Transcriptions", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                           font=("Segoe UI", 9))
+        self._browse_path_label.pack(side="right", padx=8)
+
+        # Content pane with nav on left, viewer on right
+        pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
+                              sashwidth=5, sashpad=0, relief="flat")
+        pane.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+
+        # Left: navigation tree
+        left = tk.Frame(pane, bg=self._TP_BG)
+        self._browse_tree = ttk.Treeview(left, show="tree", selectmode="browse",
+                                          style="TP.Treeview")
+        bsb = ttk.Scrollbar(left, orient="vertical", command=self._browse_tree.yview)
+        self._browse_tree.configure(yscrollcommand=bsb.set)
+        bsb.pack(side="right", fill="y")
+        self._browse_tree.pack(fill="both", expand=True)
+        self._browse_tree.bind("<<TreeviewSelect>>", self._on_browse_select)
+        pane.add(left, minsize=200, width=240)
+
+        # Right: transcript viewer
+        right = tk.Frame(pane, bg=self._TP_BG)
+        self._browse_viewer_title = tk.Label(right, text="Select a transcription to read",
+                                             bg=self._TP_BG3, fg=self._TP_FG,
+                                             font=("Segoe UI", 11, "bold"), anchor="w",
+                                             padx=10, pady=6)
+        self._browse_viewer_title.pack(fill="x")
+        vf = tk.Frame(right, bg=self._TP_BG)
+        vf.pack(fill="both", expand=True)
+        self._browse_viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG,
+                                       font=("Segoe UI", 10), wrap="word",
+                                       relief="flat", padx=12, pady=10,
+                                       state="disabled", cursor="arrow")
+        bvsb = ttk.Scrollbar(vf, orient="vertical", command=self._browse_viewer.yview)
+        self._browse_viewer.configure(yscrollcommand=bvsb.set)
+        self._browse_viewer.tag_configure("header", foreground=self._TP_ACCENT,
+                                          font=("Segoe UI", 10, "bold"))
+        self._browse_viewer.tag_configure("separator", foreground="#333")
+        bvsb.pack(side="right", fill="y")
+        self._browse_viewer.pack(fill="both", expand=True)
+        pane.add(right, minsize=300)
+
+        # Internal state for browse tree items
+        self._browse_items = {}  # iid → {"type": "channel"/"year"/"month"/"file", ...}
+        return f
+
+    def _refresh_browse(self):
+        """Populate the browse tree from the index database."""
+        if not self._conn:
+            return
+        tree = self._browse_tree
+        tree.delete(*tree.get_children())
+        self._browse_items.clear()
+        try:
+            channels = self._conn.execute(
+                "SELECT DISTINCT channel FROM segments ORDER BY channel"
+            ).fetchall()
+        except Exception:
+            return
+        for (ch,) in channels:
+            ch_iid = tree.insert("", "end", text=f"📁  {ch}", open=False)
+            self._browse_items[ch_iid] = {"type": "channel", "channel": ch}
+            # Fetch years for this channel
+            try:
+                years = self._conn.execute(
+                    "SELECT DISTINCT year FROM segments WHERE channel=? AND year IS NOT NULL "
+                    "ORDER BY year", (ch,)).fetchall()
+            except Exception:
+                continue
+            if not years:
+                # No year data — show flat list of titles
+                self._populate_browse_titles(ch_iid, ch, None, None)
+                continue
+            for (yr,) in years:
+                yr_iid = tree.insert(ch_iid, "end", text=f"📅  {yr}", open=False)
+                self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr}
+                # Fetch months for this year
+                try:
+                    months = self._conn.execute(
+                        "SELECT DISTINCT month FROM segments WHERE channel=? AND year=? "
+                        "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
+                except Exception:
+                    continue
+                if months and len(months) > 1:
+                    for (mo,) in months:
+                        mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
+                        mo_iid = tree.insert(yr_iid, "end", text=f"📄  {mo_name}", open=False)
+                        self._browse_items[mo_iid] = {
+                            "type": "month", "channel": ch, "year": yr, "month": mo}
+                        self._populate_browse_titles(mo_iid, ch, yr, mo)
+                else:
+                    # Only one month or no months — show titles directly under year
+                    self._populate_browse_titles(yr_iid, ch, yr, None)
+
+    def _populate_browse_titles(self, parent_iid, channel, year, month):
+        """Insert individual video title nodes under a parent browse node."""
+        try:
+            sql = "SELECT DISTINCT title, jsonl_path FROM segments WHERE channel=?"
+            params = [channel]
+            if year is not None:
+                sql += " AND year=?"
+                params.append(year)
+            if month is not None:
+                sql += " AND month=?"
+                params.append(month)
+            sql += " ORDER BY title"
+            titles = self._conn.execute(sql, params).fetchall()
+        except Exception:
+            return
+        for title, jsonl_path in titles:
+            disp = title if len(title) <= 60 else title[:57] + "..."
+            t_iid = self._browse_tree.insert(parent_iid, "end", text=f"  {disp}")
+            self._browse_items[t_iid] = {
+                "type": "title", "channel": channel, "title": title,
+                "jsonl_path": jsonl_path}
+
+    def _on_browse_select(self, event=None):
+        """When a title node is selected in the browse tree, show its transcription."""
+        sel = self._browse_tree.selection()
+        if not sel:
+            return
+        meta = self._browse_items.get(sel[0])
+        if not meta or meta["type"] != "title":
+            return
+        title     = meta["title"]
+        txt_path  = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
+        self._browse_viewer_title.config(text=title)
+        self._browse_path_label.config(
+            text=f"{meta.get('channel', '')}  •  {txt_path or ''}")
+
+        section = self._get_txt_section(txt_path, title) if txt_path else None
+        self._browse_viewer.config(state="normal")
+        self._browse_viewer.delete("1.0", "end")
+        if section:
+            lines = section.split('\n', 1)
+            header_line = lines[0]
+            body = lines[1].strip() if len(lines) > 1 else ""
+            self._browse_viewer.insert("end", header_line + "\n\n", "header")
+            self._browse_viewer.insert("end", body)
+        else:
+            self._browse_viewer.insert("end",
+                "(No .txt file found for this transcription.)\n\n", "header")
+            if txt_path:
+                self._browse_viewer.insert("end", f"Expected:\n{txt_path}")
+        self._browse_viewer.config(state="disabled")
+        self._browse_viewer.yview_moveto(0)
+
+    # ── Bookmarks section ─────────────────────────────────────────────────────
+
+    def _build_bookmarks_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+
+        # Header bar
+        hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=6)
+        hdr.grid(row=0, column=0, sticky="ew")
+        tk.Label(hdr, text="Bookmarks", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._bm_count_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                        font=("Segoe UI", 9))
+        self._bm_count_label.pack(side="right", padx=8)
+
+        # Content: tree + viewer
+        pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
+                              sashwidth=5, sashpad=0, relief="flat")
+        pane.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+
+        # Left: bookmarks list
+        left = tk.Frame(pane, bg=self._TP_BG)
+        cols = ("channel", "title", "note", "date")
+        self._bm_tree = ttk.Treeview(left, columns=cols, show="headings",
+                                      selectmode="browse", style="TP.Treeview")
+        for col, label, w, stretch in [
+            ("channel", "Channel", 100, False),
+            ("title",   "Title",   180, False),
+            ("note",    "Note",    200, True),
+            ("date",    "Saved",    80, False),
+        ]:
+            self._bm_tree.heading(col, text=label)
+            self._bm_tree.column(col, width=w, minwidth=50, stretch=stretch)
+        bm_sb = ttk.Scrollbar(left, orient="vertical", command=self._bm_tree.yview)
+        self._bm_tree.configure(yscrollcommand=bm_sb.set)
+        bm_sb.pack(side="right", fill="y")
+        self._bm_tree.pack(fill="both", expand=True)
+        self._bm_tree.bind("<<TreeviewSelect>>", self._on_bookmark_select)
+        self._bm_tree.bind("<Button-3>", self._on_bookmark_rightclick)
+        pane.add(left, minsize=280)
+
+        # Right: bookmark detail
+        right = tk.Frame(pane, bg=self._TP_BG)
+        self._bm_detail_title = tk.Label(right, text="Select a bookmark",
+                                         bg=self._TP_BG3, fg=self._TP_FG,
+                                         font=("Segoe UI", 11, "bold"),
+                                         anchor="w", padx=10, pady=6)
+        self._bm_detail_title.pack(fill="x")
+        self._bm_detail_text = tk.Text(right, bg="#1a1c1f", fg=self._TP_FG,
+                                        font=("Segoe UI", 10), wrap="word",
+                                        relief="flat", padx=12, pady=10,
+                                        state="disabled", cursor="arrow")
+        self._bm_detail_text.tag_configure("note", foreground=self._TP_GREEN,
+                                           font=("Segoe UI", 10, "italic"))
+        self._bm_detail_text.tag_configure("meta", foreground=self._TP_DIM,
+                                           font=("Segoe UI", 9))
+        bm_vsb = ttk.Scrollbar(right, orient="vertical",
+                                command=self._bm_detail_text.yview)
+        self._bm_detail_text.configure(yscrollcommand=bm_vsb.set)
+        bm_vsb.pack(side="right", fill="y")
+        self._bm_detail_text.pack(fill="both", expand=True)
+        pane.add(right, minsize=250)
+
+        return f
+
+    def _refresh_bookmarks(self):
+        """Reload bookmarks from the database into the treeview."""
+        if not self._conn:
+            return
+        self._bm_tree.delete(*self._bm_tree.get_children())
+        self._bookmarks_data = []
+        try:
+            rows = self._conn.execute(
+                "SELECT id, segment_id, video_id, title, channel, start_time, text, note, created "
+                "FROM bookmarks ORDER BY created DESC").fetchall()
+        except Exception:
+            return
+        from datetime import datetime as _dt
+        for row in rows:
+            bm_id, seg_id, vid_id, title, ch, start, text, note, created = row
+            try:
+                date_str = _dt.fromtimestamp(created).strftime("%Y-%m-%d")
+            except Exception:
+                date_str = ""
+            disp_title = title if len(title) <= 40 else title[:37] + "..."
+            disp_note  = note if len(note) <= 50 else note[:47] + "..."
+            iid = self._bm_tree.insert("", "end",
+                                        values=(ch, disp_title, disp_note, date_str))
+            self._bookmarks_data.append({
+                "iid": iid, "bm_id": bm_id, "segment_id": seg_id,
+                "video_id": vid_id, "title": title, "channel": ch,
+                "start": start, "text": text, "note": note, "created": created,
+            })
+        self._bm_count_label.config(text=f"{len(rows)} bookmark{'s' if len(rows) != 1 else ''}")
+
+    def _on_bookmark_select(self, event=None):
+        sel = self._bm_tree.selection()
+        if not sel:
+            return
+        bm = next((b for b in self._bookmarks_data if b["iid"] == sel[0]), None)
+        if not bm:
+            return
+        self._bm_detail_title.config(text=bm["title"])
+        self._bm_detail_text.config(state="normal")
+        self._bm_detail_text.delete("1.0", "end")
+        if bm["note"]:
+            self._bm_detail_text.insert("end", f"📝  {bm['note']}\n\n", "note")
+        self._bm_detail_text.insert("end",
+            f"{bm['channel']}  •  {bm['video_id'] or ''}\n", "meta")
+        self._bm_detail_text.insert("end", f"\n{bm['text']}")
+        self._bm_detail_text.config(state="disabled")
+
+    def _on_bookmark_rightclick(self, event):
+        item = self._bm_tree.identify_row(event.y)
+        if not item:
+            return
+        self._bm_tree.selection_set(item)
+        bm = next((b for b in self._bookmarks_data if b["iid"] == item), None)
+        if not bm:
+            return
+        menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                       activebackground=self._TP_ACCENT, activeforeground="white",
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
+        menu.add_command(label="  Edit Note",
+                         command=lambda: self._edit_bookmark_note(bm))
+        menu.add_command(label="  Copy Text",
+                         command=lambda: self._copy_to_clipboard(bm["text"]))
+        menu.add_separator()
+        menu.add_command(label="  Delete Bookmark",
+                         command=lambda: self._delete_bookmark(bm["bm_id"]))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _add_bookmark(self, segment_id, video_id, title, channel, start, text):
+        """Add a bookmark for a search result segment."""
+        if not self._conn:
+            return
+        note = ""
+        # Ask for optional note
+        dlg = tk.Toplevel(self.winfo_toplevel())
+        dlg.title("Add Bookmark")
+        dlg.configure(bg=self._TP_BG3)
+        dlg.resizable(False, False)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        tk.Label(dlg, text="Add a note (optional):", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 10)).pack(padx=16, pady=(12, 4))
+        note_var = tk.StringVar()
+        note_entry = tk.Entry(dlg, textvariable=note_var, bg=self._TP_BG2, fg=self._TP_FG,
+                              insertbackground=self._TP_FG, relief="flat",
+                              font=("Segoe UI", 10), width=40)
+        note_entry.pack(padx=16, ipady=4)
+        note_entry.focus_set()
+        result = [False]
+        def _save():
+            result[0] = True
+            dlg.destroy()
+        note_entry.bind("<Return>", lambda _: _save())
+        btn_row = tk.Frame(dlg, bg=self._TP_BG3)
+        btn_row.pack(padx=16, pady=(8, 12))
+        tk.Button(btn_row, text="Save", command=_save,
+                  bg=self._TP_GREEN, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), padx=12).pack(side="left", padx=(0, 6))
+        tk.Button(btn_row, text="Cancel", command=dlg.destroy,
+                  bg=self._TP_BG2, fg=self._TP_FG, relief="flat",
+                  font=("Segoe UI", 9), padx=12).pack(side="left")
+        dlg.wait_window()
+        if not result[0]:
+            return
+        note = note_var.get().strip()
+        try:
+            self._conn.execute(
+                "INSERT INTO bookmarks (segment_id, video_id, title, channel, start_time, text, note) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (segment_id, video_id, title, channel, start, text, note))
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def _edit_bookmark_note(self, bm):
+        """Edit the note on an existing bookmark."""
+        dlg = tk.Toplevel(self.winfo_toplevel())
+        dlg.title("Edit Bookmark Note")
+        dlg.configure(bg=self._TP_BG3)
+        dlg.resizable(False, False)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        tk.Label(dlg, text="Note:", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 10)).pack(padx=16, pady=(12, 4))
+        note_var = tk.StringVar(value=bm.get("note", ""))
+        note_entry = tk.Entry(dlg, textvariable=note_var, bg=self._TP_BG2, fg=self._TP_FG,
+                              insertbackground=self._TP_FG, relief="flat",
+                              font=("Segoe UI", 10), width=40)
+        note_entry.pack(padx=16, ipady=4)
+        note_entry.focus_set()
+        def _save():
+            try:
+                self._conn.execute(
+                    "UPDATE bookmarks SET note=? WHERE id=?",
+                    (note_var.get().strip(), bm["bm_id"]))
+                self._conn.commit()
+            except Exception:
+                pass
+            dlg.destroy()
+            self._refresh_bookmarks()
+        note_entry.bind("<Return>", lambda _: _save())
+        btn_row = tk.Frame(dlg, bg=self._TP_BG3)
+        btn_row.pack(padx=16, pady=(8, 12))
+        tk.Button(btn_row, text="Save", command=_save,
+                  bg=self._TP_GREEN, fg="white", relief="flat",
+                  font=("Segoe UI", 9, "bold"), padx=12).pack(side="left", padx=(0, 6))
+        tk.Button(btn_row, text="Cancel", command=dlg.destroy,
+                  bg=self._TP_BG2, fg=self._TP_FG, relief="flat",
+                  font=("Segoe UI", 9), padx=12).pack(side="left")
+        dlg.wait_window()
+
+    def _delete_bookmark(self, bm_id):
+        """Remove a bookmark from the database."""
+        if not self._conn:
+            return
+        try:
+            self._conn.execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
+            self._conn.commit()
+        except Exception:
+            pass
+        self._refresh_bookmarks()
+
+    def _copy_to_clipboard(self, text):
+        """Copy text to the system clipboard."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
         except Exception:
             pass
 
@@ -16906,133 +17327,138 @@ class _TranscriptionPanel(ttk.Frame):
             self._tree.heading(col, text=base + arrow)
 
     def _do_search(self):
-        if not self._conn:
+        if not self._conn or self._search_running:
             return
         query = self._search_var.get().strip()
         if not query:
             return
+        self._search_running = True
+        self._search_btn.config(state="disabled", text="Searching…")
+        self._search_count.config(text="")
         channel   = self._s_channel_var.get()
         yr_from   = self._s_year_from_var.get().strip()
         yr_to     = self._s_year_to_var.get().strip()
+        sort_col  = self._sort_col
+        sort_asc  = self._sort_asc
 
-        if self._sort_col == "date":
-            order_clause = (
-                "COALESCE(s.year,9999) ASC, COALESCE(s.month,99) ASC, s.start_time ASC"
-                if self._sort_asc else
-                "COALESCE(s.year,0) DESC, COALESCE(s.month,0) DESC, s.start_time DESC")
-        else:
-            order_clause = self._SORT_EXPRS.get(self._sort_col)
-
-        SEL = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
-               "s.start_time, s.end_time, s.text, s.jsonl_path FROM segments s ")
-
-        rows = None
-        if order_clause:
-            try:
-                fts_q  = '"' + query.replace('"', '""') + '"'
-                sql    = SEL + ("WHERE s.id IN "
-                                "(SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?)")
-                params = [fts_q]
-                if channel != "All":
-                    sql += " AND s.channel=?"
-                    params.append(channel)
-                if yr_from.isdigit():
-                    sql += " AND s.year >= ?"
-                    params.append(int(yr_from))
-                if yr_to.isdigit():
-                    sql += " AND s.year <= ?"
-                    params.append(int(yr_to))
-                sql  += f" ORDER BY {order_clause} LIMIT 500"
-                rows  = self._conn.execute(sql, params).fetchall()
-            except Exception:
-                rows = None
-
-        if rows is None:
-            try:
-                fts_q  = '"' + query.replace('"', '""') + '"'
-                sql    = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
-                          "s.start_time, s.end_time, s.text, s.jsonl_path "
-                          "FROM segments_fts f JOIN segments s ON f.rowid = s.id "
-                          "WHERE segments_fts MATCH ?")
-                params = [fts_q]
-                if channel != "All":
-                    sql += " AND s.channel=?"
-                    params.append(channel)
-                if yr_from.isdigit():
-                    sql += " AND s.year >= ?"
-                    params.append(int(yr_from))
-                if yr_to.isdigit():
-                    sql += " AND s.year <= ?"
-                    params.append(int(yr_to))
-                sql  += " ORDER BY rank LIMIT 500"
-                rows  = self._conn.execute(sql, params).fetchall()
-            except Exception:
-                sql    = ("SELECT id, video_id, title, channel, year, month, "
-                          "start_time, end_time, text, jsonl_path "
-                          "FROM segments WHERE text LIKE ?")
-                params = [f"%{query}%"]
-                if channel != "All":
-                    sql += " AND channel=?"
-                    params.append(channel)
-                if yr_from.isdigit():
-                    sql += " AND year >= ?"
-                    params.append(int(yr_from))
-                if yr_to.isdigit():
-                    sql += " AND year <= ?"
-                    params.append(int(yr_to))
-                sql  += " LIMIT 500"
-                rows  = self._conn.execute(sql, params).fetchall()
-
-        self._tree.delete(*self._tree.get_children())
-        self._result_meta.clear()
-
-        for row in rows:
-            rid, video_id, title, ch, year, month, start_time, end_time, text, jsonl_path = row
-            date_str = (f"{year}-{month:02d}" if year and month
-                        else str(year) if year else "")
-            q   = query.lower()
-            idx = text.lower().find(q)
-            if idx >= 0:
-                s0      = max(0, idx - 60)
-                snippet = ("…" if s0 > 0 else "") + text[s0:s0 + 160].replace("\n", " ")
+        def _run_query():
+            if sort_col == "date":
+                order_clause = (
+                    "COALESCE(s.year,9999) ASC, COALESCE(s.month,99) ASC, s.start_time ASC"
+                    if sort_asc else
+                    "COALESCE(s.year,0) DESC, COALESCE(s.month,0) DESC, s.start_time DESC")
             else:
-                snippet = text[:160].replace("\n", " ")
+                order_clause = self._SORT_EXPRS.get(sort_col)
 
-            txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
-            video_path = self._find_video_file(title, txt_path) if txt_path else None
+            SEL = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
+                   "s.start_time, s.end_time, s.text, s.jsonl_path FROM segments s ")
+            rows = None
+            if order_clause:
+                try:
+                    fts_q  = '"' + query.replace('"', '""') + '"'
+                    sql    = SEL + ("WHERE s.id IN "
+                                    "(SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?)")
+                    params = [fts_q]
+                    if channel != "All":
+                        sql += " AND s.channel=?"
+                        params.append(channel)
+                    if yr_from.isdigit():
+                        sql += " AND s.year >= ?"
+                        params.append(int(yr_from))
+                    if yr_to.isdigit():
+                        sql += " AND s.year <= ?"
+                        params.append(int(yr_to))
+                    sql  += f" ORDER BY {order_clause} LIMIT 500"
+                    rows  = self._conn.execute(sql, params).fetchall()
+                except Exception:
+                    rows = None
+            if rows is None:
+                try:
+                    fts_q  = '"' + query.replace('"', '""') + '"'
+                    sql    = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
+                              "s.start_time, s.end_time, s.text, s.jsonl_path "
+                              "FROM segments_fts f JOIN segments s ON f.rowid = s.id "
+                              "WHERE segments_fts MATCH ?")
+                    params = [fts_q]
+                    if channel != "All":
+                        sql += " AND s.channel=?"
+                        params.append(channel)
+                    if yr_from.isdigit():
+                        sql += " AND s.year >= ?"
+                        params.append(int(yr_from))
+                    if yr_to.isdigit():
+                        sql += " AND s.year <= ?"
+                        params.append(int(yr_to))
+                    sql  += " ORDER BY rank LIMIT 500"
+                    rows  = self._conn.execute(sql, params).fetchall()
+                except Exception:
+                    sql    = ("SELECT id, video_id, title, channel, year, month, "
+                              "start_time, end_time, text, jsonl_path "
+                              "FROM segments WHERE text LIKE ?")
+                    params = [f"%{query}%"]
+                    if channel != "All":
+                        sql += " AND channel=?"
+                        params.append(channel)
+                    if yr_from.isdigit():
+                        sql += " AND year >= ?"
+                        params.append(int(yr_from))
+                    if yr_to.isdigit():
+                        sql += " AND year <= ?"
+                        params.append(int(yr_to))
+                    sql  += " LIMIT 500"
+                    rows  = self._conn.execute(sql, params).fetchall()
+            self.after(0, lambda: _populate(rows or []))
 
-            iid = self._tree.insert("", "end", values=(ch, date_str, title, snippet))
-            self._result_meta[iid] = {
-                "video_id":   video_id,
-                "start":      start_time or 0,
-                "end":        end_time or start_time or 0,
-                "seg_text":   text,
-                "title":      title,
-                "channel":    ch,
-                "date":       date_str,
-                "jsonl_path": jsonl_path,
-                "txt_path":   txt_path,
-                "video_path": video_path,
-            }
+        def _populate(rows):
+            self._search_running = False
+            self._tree.delete(*self._tree.get_children())
+            self._result_meta.clear()
+            for row in rows:
+                rid, video_id, title, ch, year, month, start_time, end_time, text, jsonl_path = row
+                date_str = (f"{year}-{month:02d}" if year and month
+                            else str(year) if year else "")
+                q   = query.lower()
+                idx = text.lower().find(q)
+                if idx >= 0:
+                    s0      = max(0, idx - 60)
+                    snippet = ("…" if s0 > 0 else "") + text[s0:s0 + 160].replace("\n", " ")
+                else:
+                    snippet = text[:160].replace("\n", " ")
+                txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
+                video_path = self._find_video_file(title, txt_path) if txt_path else None
+                iid = self._tree.insert("", "end", values=(ch, date_str, title, snippet))
+                self._result_meta[iid] = {
+                    "video_id":   video_id,
+                    "start":      start_time or 0,
+                    "end":        end_time or start_time or 0,
+                    "seg_text":   text,
+                    "title":      title,
+                    "channel":    ch,
+                    "date":       date_str,
+                    "jsonl_path": jsonl_path,
+                    "txt_path":   txt_path,
+                    "video_path": video_path,
+                    "segment_id": rid,
+                }
+            n         = len(rows)
+            sort_note = (f", sorted by {sort_col} "
+                         f"{'↑' if sort_asc else '↓'}") if sort_col else ""
+            self._search_count.config(
+                text=f"{n} result{'s' if n != 1 else ''}{sort_note}")
+            if n == 500:
+                self._search_status.config(
+                    text="Showing 500 results — add filters to narrow down.",
+                    fg="#f0a020")
+            else:
+                self._search_status.config(
+                    text="Left-click to read  •  Right-click for actions",
+                    fg=self._TP_DIM)
+            # Switch Search button to Clear mode
+            self._search_btn.config(
+                state="normal", text="Clear", bg=self._TP_RED,
+                command=self._clear_search)
 
-        n         = len(rows)
-        sort_note = (f", sorted by {self._sort_col} "
-                     f"{'↑' if self._sort_asc else '↓'}") if self._sort_col else ""
-        self._search_count.config(
-            text=f"{n} result{'s' if n != 1 else ''}{sort_note}")
-        if n == 500:
-            self._search_status.config(
-                text="Showing 500 results — add filters to narrow down.",
-                fg="#f0a020")
-        else:
-            self._search_status.config(
-                text="Left-click to read  •  Right-click for actions",
-                fg=self._TP_DIM)
-
-        # Switch Search button to Clear mode
-        self._search_btn.config(
-            text="Clear", bg=self._TP_RED,
-            command=self._clear_search)
+        threading.Thread(target=_run_query, daemon=True).start()
 
     def _clear_search(self):
         """Reset the search section — clear results, query, filters, and restore Search button."""
@@ -17326,6 +17752,15 @@ class _TranscriptionPanel(ttk.Frame):
             menu.add_command(label="  Open Video — YouTube  (no ID)",
                              state="disabled")
 
+        menu.add_separator()
+        menu.add_command(label="  📋  Copy Segment Text",
+                         command=lambda: self._copy_to_clipboard(meta.get("seg_text", "")))
+        menu.add_command(label="  🔖  Bookmark This Segment",
+                         command=lambda: self._add_bookmark(
+                             meta.get("segment_id"), meta.get("video_id", ""),
+                             meta.get("title", ""), meta.get("channel", ""),
+                             meta.get("start", 0), meta.get("seg_text", "")))
+
         try:
             menu.tk_popup(x, y)
         finally:
@@ -17396,6 +17831,10 @@ class _TranscriptionPanel(ttk.Frame):
                   font=("Segoe UI", 10, "bold"), padx=14,
                   pady=2)
         self._freq_plot_btn.pack(side="left")
+
+        tk.Button(bar, text="Export CSV", command=self._export_frequency_csv,
+                  bg=self._TP_BG2, fg=self._TP_FG, relief="flat",
+                  font=("Segoe UI", 9), padx=10, pady=2).pack(side="left", padx=(6, 0))
 
         self._freq_status = tk.Label(bar, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                      font=("Segoe UI", 9))
@@ -17678,6 +18117,46 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_plot_btn.config(
             text="Plot", bg=self._TP_GREEN,
             command=self._do_frequency)
+
+    def _export_frequency_csv(self):
+        """Export the current frequency chart data to a CSV file."""
+        import csv as _csv
+        if not self._freq_all_keys or not self._freq_words:
+            messagebox.showinfo("Export", "No frequency data to export. Plot something first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save frequency data as CSV", defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            by_month = self._freq_by_month
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = _csv.writer(fh)
+                w.writerow(["Period"] + self._freq_words)
+                for key in self._freq_all_keys:
+                    label = (f"{key // 100}-{key % 100:02d}" if by_month else str(key))
+                    row_data = [label]
+                    for word in self._freq_words:
+                        fts_q = '"' + word.replace('"', '""') + '"'
+                        sql = (("SELECT COUNT(*) FROM segments s "
+                                "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                                "WHERE segments_fts MATCH ?) "
+                                "AND s.year*100+s.month=?")
+                               if by_month else
+                               ("SELECT COUNT(*) FROM segments s "
+                                "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                                "WHERE segments_fts MATCH ?) "
+                                "AND s.year=?"))
+                        try:
+                            cnt = self._conn.execute(sql, (fts_q, key)).fetchone()[0]
+                        except Exception:
+                            cnt = 0
+                        row_data.append(cnt)
+                    w.writerow(row_data)
+            messagebox.showinfo("Export", f"Saved {len(self._freq_all_keys)} rows.")
+        except Exception as e:
+            messagebox.showerror("Export", f"Failed to save:\n{e}")
 
     def _on_graph_click(self, event):
         if event.inaxes != self._ax:

@@ -2902,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 3:24pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 3:44pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9413,12 +9413,16 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 if _backfill_list:
                     _bf_total = len(_backfill_list)
-                    _bf_repair_count = sum(1 for t, _ in _backfill_list if t in _jsonl_bad)
+                    _bf_repair_count   = sum(1 for t, _ in _backfill_list if t in _jsonl_bad)
+                    _bf_rewhisp_count  = sum(1 for t, _ in _backfill_list if t in _jsonl_stale_whisper)
+                    _bf_caption_count  = _bf_total - _bf_rewhisp_count
+                    _parts = []
                     if _bf_repair_count:
-                        log(f"  Generating searchable .jsonl for {_bf_total} video(s) "
-                            f"({_bf_repair_count} timestamp repair(s))...\n", "simpleline")
-                    else:
-                        log(f"  Generating searchable .jsonl for {_bf_total} video(s)...\n", "simpleline")
+                        _parts.append(f"{_bf_repair_count} timestamp repair(s)")
+                    if _bf_rewhisp_count:
+                        _parts.append(f"{_bf_rewhisp_count} Whisper re-transcription(s) for word timestamps")
+                    _suffix = f" ({', '.join(_parts)})" if _parts else ""
+                    log(f"  Generating searchable .jsonl for {_bf_total} video(s){_suffix}...\n", "simpleline")
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
@@ -9444,6 +9448,32 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             break
                         _bf_idx += 1
                         _bf_display = (_bf_title[:52] + "...") if len(_bf_title) > 52 else _bf_title
+
+                        # Stale Whisper titles had no YT captions — that's why they were
+                        # Whispered in the first place.  Skip the caption fetch entirely
+                        # and re-run Whisper so we get per-word timestamps this time.
+                        if _bf_title in _jsonl_stale_whisper:
+                            _bf_fpath = local_files.get(_bf_title)
+                            if _bf_fpath and os.path.isfile(_bf_fpath):
+                                log(f"  [{_bf_idx}/{_bf_total}] Re-transcribing (word timestamps): {_bf_display}\n", "simpleline")
+                                try:
+                                    _bf_mtime_w = datetime.fromtimestamp(os.path.getmtime(_bf_fpath))
+                                    _bf_txt_w, _ = _get_transcript_filename(
+                                        ch_name, folder, split_years, split_months, combined,
+                                        year=_bf_mtime_w.year, month=_bf_mtime_w.month)
+                                    _bf_jsonl_w = _get_jsonl_path(_bf_txt_w)
+                                    _, _w_segs = _whisper_transcribe(
+                                        _bf_fpath, duration=0, title=_bf_title,
+                                        cancel_ev=_ce, pause_ev=_pe)
+                                    if _w_segs:
+                                        if os.path.isfile(_bf_jsonl_w):
+                                            _remove_jsonl_entries_for_title(_bf_jsonl_w, _bf_title)
+                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs)
+                                        _bf_done += 1
+                                except Exception:
+                                    pass
+                            continue  # never fall through to caption fetch for stale Whisper
+
                         log(f"  [{_bf_idx}/{_bf_total}] Fetching captions: {_bf_display}\n", "simpleline")
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
@@ -9459,10 +9489,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _bf_txt, _ = _get_transcript_filename(
                                         ch_name, folder, split_years, split_months, combined)
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
-                                # If this title had bad segments or stale Whisper entries,
-                                # purge old entries first so we don't accumulate duplicates.
-                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper) \
-                                        and os.path.isfile(_bf_jsonl):
+                                # If this title had bad segments, purge old entries first.
+                                if _bf_title in _jsonl_bad and os.path.isfile(_bf_jsonl):
                                     _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
                                 _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
                                 _bf_done += 1

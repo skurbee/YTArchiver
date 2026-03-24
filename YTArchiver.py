@@ -73,12 +73,11 @@ _INSTANCE_MUTEX = None
 if os.name == 'nt':
     _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\YTArchiver_SingleInstance")
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "YT Archiver is already running.\nOnly one instance can run at a time.",
-            "Already Running",
-            0x10  # MB_ICONERROR
-        )
+        # Another instance is running — focus its window and exit silently.
+        _hwnd = ctypes.windll.user32.FindWindowW(None, "YT Archiver")
+        if _hwnd:
+            ctypes.windll.user32.ShowWindow(_hwnd, 9)   # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(_hwnd)
         sys.exit(0)
 
 # File extensions recognised as channel video/audio content (excludes temp/partial files)
@@ -2903,7 +2902,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:16pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 2:25pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20143,7 +20142,15 @@ def _load_queue_state():
 
 
 def on_closing():
-    global _root_alive
+    global _root_alive, _INSTANCE_MUTEX
+    # Release the single-instance mutex immediately so a new launch isn't blocked
+    # during the ~1 s cleanup sleep below.
+    if _INSTANCE_MUTEX is not None:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_INSTANCE_MUTEX)
+        except Exception:
+            pass
+        _INSTANCE_MUTEX = None
     # Save window position and size before closing
     try:
         geo = root.geometry()  # e.g. "900x800+100+200"

@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.3"
+APP_VERSION = "v24.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -16590,8 +16590,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._loaded          = False
         self._conn            = None
         self._result_meta     = {}
-        self._sort_col        = None
-        self._sort_asc        = True
+        self._sort_col        = "date"
+        self._sort_asc        = False
         self._index_running   = False
         self._viewer_section  = None
         self._viewer_header   = ""
@@ -17356,6 +17356,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._search_status.pack(fill="x", padx=8, pady=4)
 
         self._update_search_channels()
+        self._update_heading_labels()
         return f
 
     def _update_search_channels(self):
@@ -17538,8 +17539,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._search_status.config(
             text="Left-click to read  •  Right-click for actions",
             fg=self._TP_DIM)
-        self._sort_col = None
-        self._sort_asc = True
+        self._sort_col = "date"
+        self._sort_asc = False
         self._update_heading_labels()
         # Clear the viewer panel
         self._viewer_title.config(text="Select a result to read")
@@ -17848,6 +17849,8 @@ class _TranscriptionPanel(ttk.Frame):
         tk.Label(bar, text="Words:", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 10)).pack(side="left")
         self._freq_words_var = tk.StringVar()
+        self._freq_words_var.trace_add("write", self._on_freq_words_changed)
+        self._freq_plotted_text = None
         e = tk.Entry(bar, textvariable=self._freq_words_var, bg=self._TP_BG2,
                      fg=self._TP_FG, insertbackground=self._TP_FG,
                      relief="flat", font=("Segoe UI", 11), width=30)
@@ -18009,19 +18012,29 @@ class _TranscriptionPanel(ttk.Frame):
             params.extend(channels)
         return sql
 
+    def _on_freq_words_changed(self, *_args):
+        """Revert the frequency Plot button when the user edits the search text."""
+        if self._freq_plotted_text is not None and self._freq_words_var.get() != self._freq_plotted_text:
+            self._freq_plotted_text = None
+            self._freq_plot_btn.config(
+                text="Plot", bg=self._TP_GREEN,
+                command=self._do_frequency)
+
     def _do_frequency(self):
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
             return
         raw = self._freq_words_var.get().strip()
-        if not raw:
-            return
-        words     = [w.strip() for w in raw.split(",") if w.strip()][:6]
+        words     = [w.strip() for w in raw.split(",") if w.strip()][:6] if raw else []
         channels  = self._get_freq_selected_channels()
         chart_type = self._freq_chart_var.get()
 
         # Word Cloud mode — completely different rendering path
+        # Word Cloud allows empty words (shows overall channel vocabulary)
         if chart_type == "Word Cloud":
             self._do_word_cloud(words, channels)
+            return
+
+        if not raw:
             return
 
         by_month  = self._freq_group_var.get() == "Month"
@@ -18177,12 +18190,14 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_by_month = by_month
 
         # Switch Plot button to Clear mode
+        self._freq_plotted_text = self._freq_words_var.get()
         self._freq_plot_btn.config(
             text="Clear", bg=self._TP_RED,
             command=self._clear_frequency)
 
     def _clear_frequency(self):
         """Reset the frequency section — clear chart, words, and restore Plot button."""
+        self._freq_plotted_text = None
         self._freq_words_var.set("")
         self._freq_status.config(text="")
         self._freq_all_keys = []
@@ -18197,7 +18212,8 @@ class _TranscriptionPanel(ttk.Frame):
             command=self._do_frequency)
 
     def _do_word_cloud(self, seed_words, channels):
-        """Render a word cloud using top co-occurring words from transcription segments."""
+        """Render a word cloud using top co-occurring words from transcription segments.
+        If seed_words is empty, samples random segments from the selected channels."""
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
             return
         import random as _rng
@@ -18221,30 +18237,46 @@ class _TranscriptionPanel(ttk.Frame):
             "well", "back", "right", "yeah", "okay", "oh", "uh", "um", "really",
             "one", "two", "much", "even", "still", "because", "don't", "dont",
         }
-        for word in seed_words:
-            fts_q = '"' + word.replace('"', '""') + '"'
-            sql = ("SELECT s.text FROM segments s "
-                   "WHERE s.id IN (SELECT rowid FROM segments_fts "
-                   "WHERE segments_fts MATCH ?) LIMIT 2000")
-            params = [fts_q]
+        seed_lower = {sw.lower() for sw in seed_words}
+        if seed_words:
+            for word in seed_words:
+                fts_q = '"' + word.replace('"', '""') + '"'
+                sql = ("SELECT s.text FROM segments s "
+                       "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                       "WHERE segments_fts MATCH ?) LIMIT 2000")
+                params = [fts_q]
+                sql = self._append_channel_filter(sql, params, channels)
+                try:
+                    rows = self._conn.execute(sql, params).fetchall()
+                except Exception:
+                    continue
+                for (text,) in rows:
+                    for w in re.findall(r"[a-zA-Z']{3,}", text.lower()):
+                        if w not in _stop and w not in seed_lower:
+                            word_counts[w] = word_counts.get(w, 0) + 1
+            # Always include seed words with boosted counts
+            for sw in seed_words:
+                fts_q = '"' + sw.replace('"', '""') + '"'
+                sql = ("SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?")
+                try:
+                    cnt = self._conn.execute(sql, (fts_q,)).fetchone()[0]
+                except Exception:
+                    cnt = 50
+                word_counts[sw.lower()] = max(word_counts.get(sw.lower(), 0), cnt)
+        else:
+            # No seed words — sample random segments from selected channels
+            sql = "SELECT s.text FROM segments s WHERE 1=1"
+            params = []
             sql = self._append_channel_filter(sql, params, channels)
+            sql += " ORDER BY RANDOM() LIMIT 5000"
             try:
                 rows = self._conn.execute(sql, params).fetchall()
             except Exception:
-                continue
+                rows = []
             for (text,) in rows:
                 for w in re.findall(r"[a-zA-Z']{3,}", text.lower()):
-                    if w not in _stop and w not in seed_words:
+                    if w not in _stop:
                         word_counts[w] = word_counts.get(w, 0) + 1
-        # Always include seed words with boosted counts
-        for sw in seed_words:
-            fts_q = '"' + sw.replace('"', '""') + '"'
-            sql = ("SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?")
-            try:
-                cnt = self._conn.execute(sql, (fts_q,)).fetchone()[0]
-            except Exception:
-                cnt = 50
-            word_counts[sw.lower()] = max(word_counts.get(sw.lower(), 0), cnt)
 
         if not word_counts:
             self._freq_status.config(text="No data for word cloud.")
@@ -18273,7 +18305,7 @@ class _TranscriptionPanel(ttk.Frame):
             size = 8 + 20 * (count / max_count)
             color = palette[i % len(palette)]
             # Highlight seed words
-            if word in [sw.lower() for sw in seed_words]:
+            if word in seed_lower:
                 color = "#ffffff"
                 size = min(size * 1.3, 32)
             # Place words using a spiral-ish layout
@@ -18296,6 +18328,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_all_keys = []
         self._freq_words    = seed_words
         self._freq_by_month = False
+        self._freq_plotted_text = self._freq_words_var.get()
         self._freq_plot_btn.config(
             text="Clear", bg=self._TP_RED,
             command=self._clear_frequency)

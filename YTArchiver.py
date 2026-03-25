@@ -540,37 +540,49 @@ def log(text, tag=None):
                 if _had_whisper:
                     _stop_whisper_dot_anim()
 
-                _text_insert_pos = None  # track where text was inserted for bracket coloring
+                # Place a mark before insertion so we can find the exact position
+                # for bracket coloring — marks survive insert/delete shifts.
+                _did_mark_insert = False
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
                                         "update_sep", "update_head", "simpleline_blue", "simpleline", "simpleline_green",
                                         "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
-                        _text_insert_pos = log_box.index(ss_ranges[0])
+                        log_box.mark_set("_bk_ins", ss_ranges[0])
+                        log_box.mark_gravity("_bk_ins", "left")
+                        _did_mark_insert = True
                         log_box.insert(ss_ranges[0], text, use_tag)
                     else:
                         # No simplestatus — insert before pausestatus anchor if present
                         _ps_r2 = log_box.tag_ranges("pausestatus")
                         if _ps_r2:
-                            _text_insert_pos = log_box.index(_ps_r2[0])
+                            log_box.mark_set("_bk_ins", _ps_r2[0])
+                            log_box.mark_gravity("_bk_ins", "left")
+                            _did_mark_insert = True
                             log_box.insert(_ps_r2[0], text, use_tag)
                         else:
-                            _text_insert_pos = log_box.index(tk.END)
+                            log_box.mark_set("_bk_ins", tk.END)
+                            log_box.mark_gravity("_bk_ins", "left")
+                            _did_mark_insert = True
                             log_box.insert(tk.END, text, use_tag)
                 elif _is_simple_mode and _ss_insert_pos is not None:
                     # Insert at the old simplestatus/pausestatus position to avoid jitter
-                    _text_insert_pos = log_box.index(_ss_insert_pos)
+                    log_box.mark_set("_bk_ins", _ss_insert_pos)
+                    log_box.mark_gravity("_bk_ins", "left")
+                    _did_mark_insert = True
                     log_box.insert(_ss_insert_pos, text, use_tag)
                 elif _is_simple_mode and use_tag == "pausestatus":
                     # pausestatus always goes at the very bottom
                     log_box.insert(tk.END, text, use_tag)
                 else:
-                    _text_insert_pos = log_box.index(tk.END)
+                    log_box.mark_set("_bk_ins", tk.END)
+                    log_box.mark_gravity("_bk_ins", "left")
+                    _did_mark_insert = True
                     log_box.insert(tk.END, text, use_tag)
 
                 # Apply bracket color overlays: green [ ] for syncs, blue [ ] for transcriptions
-                if _text_insert_pos is not None and use_tag in ("simpleline", "simpleline_green", "header",
+                if _did_mark_insert and use_tag in ("simpleline", "simpleline_green", "header",
                                                     "transcribe_using"):
                     import re as _re_bk
                     # Determine bracket type from content
@@ -583,10 +595,12 @@ def log(text, tag=None):
                     if _bk_tag:
                         _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
                         if _bk_m:
+                            # Use the mark we placed before insertion — it points to where the text starts
+                            _bk_base = log_box.index("_bk_ins")
                             _bk_open_off = _bk_m.start()
                             _bk_close_off = _bk_m.end() - 1  # ] is last char of match
-                            _bk_open_pos = log_box.index(f"{_text_insert_pos}+{_bk_open_off}c")
-                            _bk_close_pos = log_box.index(f"{_text_insert_pos}+{_bk_close_off}c")
+                            _bk_open_pos = log_box.index(f"{_bk_base}+{_bk_open_off}c")
+                            _bk_close_pos = log_box.index(f"{_bk_base}+{_bk_close_off}c")
                             log_box.tag_add(_bk_tag, _bk_open_pos,
                                             log_box.index(f"{_bk_open_pos}+1c"))
                             log_box.tag_add(_bk_tag, _bk_close_pos,
@@ -2941,7 +2955,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:31pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:42pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3337,6 +3351,8 @@ log_box.tag_raise("sync_bracket", "simpleline")
 log_box.tag_raise("sync_bracket", "simpleline_green")
 log_box.tag_raise("sync_bracket", "header")
 log_box.tag_raise("trans_bracket", "simpleline")
+log_box.tag_raise("trans_bracket", "simpleline_green")
+log_box.tag_raise("trans_bracket", "header")
 log_box.tag_raise("trans_bracket", "transcribe_using")
 
 
@@ -13806,25 +13822,18 @@ def _get_queue_items():
     Items are returned in _queue_order (insertion order), not grouped by type.
     """
     items = []
-    # Show currently processing item first
-    if _current_job["label"]:
-        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running) and pause_event.is_set():
-            _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
-        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running:
-            _active_lbl = _active_label(_current_job["label"], with_dots=True)
-        else:
-            _active_lbl = _current_job["label"]
-        items.append((f"▶ {_active_lbl}", "current", -1))
 
     # Build lookup maps from type-specific queues, keyed by URL
     # Batch-queued channels (from Sync Subbed / autosync) collapse into one entry
     sync_map = {}
     _batch_first_url = None  # URL key for the collapsed batch entry
     _batch_count = 0
+    _has_batch = False
     with _sync_queue_lock:
         for i, ch in enumerate(_sync_queue):
             if ch.get("_batch"):
                 _batch_count += 1
+                _has_batch = True
                 if _batch_first_url is None:
                     _batch_first_url = ch["url"]
                     sync_map[ch["url"]] = (f"Sync Subs ({_batch_count} channels)", "sync_batch", i)
@@ -13835,10 +13844,28 @@ def _get_queue_items():
             else:
                 lbl = f"Sync {name}"
             sync_map[ch["url"]] = (lbl, "sync", i)
-        # Update the batch label with final count
+        # Update the batch label with final count — include the currently processing channel
         if _batch_first_url and _batch_first_url in sync_map:
             _old = sync_map[_batch_first_url]
-            sync_map[_batch_first_url] = (f"Sync Subs ({_batch_count} channels)", _old[1], _old[2])
+            _batch_total = _batch_count + (1 if _sync_running else 0)  # +1 for channel currently being synced
+            if _sync_running and pause_event.is_set():
+                _batch_lbl = f"▶ Syncing Subs ({_batch_total} channels) (Paused)"
+            elif _sync_running:
+                _dot_phase = int(time.time() * 2) % 3
+                _batch_lbl = f"▶ Syncing Subs ({_batch_total} channels)" + "." * (_dot_phase + 1)
+            else:
+                _batch_lbl = f"Sync Subs ({_batch_total} channels)"
+            sync_map[_batch_first_url] = (_batch_lbl, _old[1], _old[2])
+
+    # Show currently processing item first — but not during batch syncs (batch entry covers it)
+    if _current_job["label"] and not (_has_batch and _sync_running):
+        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running) and pause_event.is_set():
+            _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
+        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+            _active_lbl = _active_label(_current_job["label"], with_dots=True)
+        else:
+            _active_lbl = _current_job["label"]
+        items.append((f"▶ {_active_lbl}", "current", -1))
     reorg_map = {}
     with _reorg_queue_lock:
         for i, args in enumerate(_reorg_queue):

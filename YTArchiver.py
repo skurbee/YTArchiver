@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.7"
+APP_VERSION = "v24.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2049,10 +2049,10 @@ def save_config(cfg):
 
     def _do_save():
         global _save_config_thread_running
+        temp_file = CONFIG_FILE + ".tmp"
         try:
             with config_lock:
                 try:
-                    temp_file = CONFIG_FILE + ".tmp"
                     with open(temp_file, "w", encoding="utf-8") as f:
                         json.dump(cfg_snapshot, f, indent=2)
                     os.replace(temp_file, CONFIG_FILE)
@@ -2060,7 +2060,6 @@ def save_config(cfg):
                     # Retry once after a brief pause (disk may be momentarily busy)
                     try:
                         time.sleep(0.5)
-                        temp_file = CONFIG_FILE + ".tmp"
                         with open(temp_file, "w", encoding="utf-8") as f:
                             json.dump(cfg_snapshot, f, indent=2)
                         os.replace(temp_file, CONFIG_FILE)
@@ -2072,6 +2071,12 @@ def save_config(cfg):
                             pass
         finally:
             _save_config_thread_running = False
+            # Clean up orphaned temp file on failure
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass
 
     with _save_config_lock:
         if not _save_config_thread_running:
@@ -3668,11 +3673,12 @@ def _res_check_click():
     if not all_videos:
         return
 
-    # 'best' mode: can't determine target height, fall back to simple prompt
-    if sel_res == "best":
+    # 'best' and 'audio' modes: can't determine target height, fall back to simple prompt
+    if sel_res in ("best", "audio"):
+        _mode_label = "Best quality" if sel_res == "best" else "Audio-only"
         _rd_ask = _dark_askquestion(
             "Re-download at Selected Resolution",
-            f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
+            f"Re-download {len(all_videos):,} existing video(s) at {_mode_label}, replacing the originals?"
         )
         if _rd_ask:
             _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
@@ -6237,7 +6243,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                     except Exception:
                         pass
                 reorg_done_label.pack(side="left", padx=(4, 0))
-                _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
+                _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget() if reorg_done_label.winfo_exists() else None)
             _ui_queue.append(_reorg_done)
             # Process any queued jobs in insertion order
             if _skip_current.is_set():
@@ -7892,6 +7898,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             dlg.title("Adjust Compression Settings")
                             dlg.configure(bg=C_BG)
                             dlg.resizable(False, False)
+                            dlg.transient(root)
                             dlg.grab_set()
                             dlg.update_idletasks()
                             _apply_dark_title_bar(dlg)
@@ -7948,6 +7955,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                             dlg.update_idletasks()
                             dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
+                            dlg.protocol("WM_DELETE_WINDOW", _cancel)
 
                         _ui_queue.append(_ask_new_settings)
                         while _new_settings[0] is None and not _ce.is_set():
@@ -8891,8 +8899,9 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
                 _pick(_DEFAULT_MODEL)
                 return
             try:
-                _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
-                _countdown["job"] = _dlg.after(1000, _tick)
+                if _dlg.winfo_exists():
+                    _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+                    _countdown["job"] = _dlg.after(1000, _tick)
             except Exception:
                 pass
 
@@ -8957,8 +8966,9 @@ def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
                 _dismiss(False)
                 return
             try:
-                _timer_lbl.config(text=f"Auto-dismissing in {_secs[0]}s...")
-                _timer_job[0] = dlg.after(1000, _tick)
+                if dlg.winfo_exists():
+                    _timer_lbl.config(text=f"Auto-dismissing in {_secs[0]}s...")
+                    _timer_job[0] = dlg.after(1000, _tick)
             except Exception:
                 pass
 
@@ -9760,8 +9770,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         unmatched.append((fname, fpath))
 
             # Sort by file modification time, newest first
-            matched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
-            unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+            def _safe_getmtime(path):
+                try:
+                    return os.path.getmtime(path)
+                except OSError:
+                    return 0.0
+            matched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
+            unmatched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
 
             log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
@@ -10003,7 +10018,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
-                unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                try:
+                    unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                except OSError:
+                    unmatched = [(fn, fp) for fn, fp in unmatched if os.path.exists(fp)]
+                    unmatched.sort(key=lambda x: os.path.getmtime(x[1]) if os.path.exists(x[1]) else 0, reverse=True)
 
                 # ── Model selection ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
@@ -10756,7 +10775,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             all_files = [f for f in os.listdir(folder_path)
                          if os.path.isfile(os.path.join(folder_path, f))
                          and os.path.splitext(f)[1].lower() in _VID_EXTS]
-            files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(folder_path, f)))
+            files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(folder_path, f))
+                           if os.path.exists(os.path.join(folder_path, f)) else 0)
 
             if not files:
                 log(f"  No video/audio files found in folder.\n", "red")
@@ -12070,11 +12090,12 @@ def _load_archived_ids():
     archived = set()
     try:
         if os.path.exists(ARCHIVE_FILE):
-            with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 2:
-                        archived.add(parts[-1])
+            with io_lock:
+                with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            archived.add(parts[-1])
     except Exception:
         pass
     return archived
@@ -12811,7 +12832,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                             log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 # Private/unavailable videos — auto-archive so they never reappear
-                if current_vid_id and ("Video unavailable" in line or "This video is private" in line
+                if current_vid_id and current_vid_id not in live_ids and ("Video unavailable" in line or "This video is private" in line
                                        or "video is no longer available" in line.lower()):
                     dur_count += 1
                     session_totals["dur"] += 1
@@ -16775,7 +16796,10 @@ def _tp_parse_path_meta(jsonl_path, archive_roots):
 def _tp_index_file(conn, jsonl_path, archive_roots):
     """Index one JSONL file. Returns segment count added."""
     channel, year, month = _tp_parse_path_meta(jsonl_path, archive_roots)
-    mtime = os.path.getmtime(jsonl_path)
+    try:
+        mtime = os.path.getmtime(jsonl_path)
+    except OSError:
+        return 0
     old = conn.execute("SELECT id FROM segments WHERE jsonl_path=?", (jsonl_path,)).fetchall()
     if old:
         ids = [r[0] for r in old]
@@ -17445,6 +17469,7 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+            self.after(100, menu.destroy)
 
     # ── Bookmarks section ─────────────────────────────────────────────────────
 
@@ -17581,6 +17606,7 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+            self.after(100, menu.destroy)
 
     def _add_bookmark(self, segment_id, video_id, title, channel, start, text):
         """Add a bookmark for a search result segment."""
@@ -17941,6 +17967,11 @@ class _TranscriptionPanel(ttk.Frame):
 
         def _populate(rows):
             self._search_running = False
+            try:
+                if not self._tree.winfo_exists():
+                    return
+            except Exception:
+                return
             self._tree.delete(*self._tree.get_children())
             self._result_meta.clear()
             for row in rows:
@@ -18312,6 +18343,7 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+            self.after(100, menu.destroy)
 
     # ── Frequency section ─────────────────────────────────────────────────────
 
@@ -20260,7 +20292,25 @@ def run_startup_updates():
         yt_name = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
         dl_url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{yt_name}"
         import urllib.request
-        urllib.request.urlretrieve(dl_url, target_path)
+        import tempfile
+        # Download to temp file first to avoid corrupting the existing binary on failure
+        temp_fd, temp_path = tempfile.mkstemp(suffix=("_" + yt_name), dir=os.path.dirname(target_path) or None)
+        try:
+            os.close(temp_fd)
+            urllib.request.urlretrieve(dl_url, temp_path)
+            # Basic sanity check: yt-dlp binary should be at least 1 MB
+            if os.path.getsize(temp_path) < 1_000_000:
+                raise RuntimeError(f"Downloaded file too small ({os.path.getsize(temp_path)} bytes), likely incomplete")
+            os.replace(temp_path, target_path)
+            if os.name != 'nt':
+                os.chmod(target_path, 0o755)
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            raise
 
     def _get_yt_dlp_version():
         """Get the current yt-dlp version string."""
@@ -20645,6 +20695,13 @@ def on_closing():
     _stop_whisper_process()
     _stop_punct_process()
     _stop_ffmpeg_process()
+
+    # Cleanup transcription panel resources (DB connection, matplotlib figures)
+    if _tp_panel_ref[0] is not None:
+        try:
+            _tp_panel_ref[0].on_destroy()
+        except Exception:
+            pass
 
     # Clear pause so worker threads can exit cleanly
     pause_event.clear()

@@ -1750,7 +1750,7 @@ def check_directory_writable(path):
         os.makedirs(path, exist_ok=True)
         test_file = os.path.join(path, '.write_test')
         try:
-            with open(test_file, 'w') as f:
+            with open(test_file, 'w', encoding='utf-8') as f:
                 f.write('test')
         finally:
             if os.path.exists(test_file):
@@ -5358,8 +5358,8 @@ def _process_sync_queue():
                 sync_single_channel()
             else:
                 log(f"  ⚠ Could not find {next_ch.get('name', '?')} in channel list — skipping.\n", "red")
-                # Try next queued item instead of getting stuck
-                _process_next_queued()
+                # Try next queued item instead of getting stuck (use after() to avoid deep recursion)
+                root.after(0, _process_next_queued)
         except Exception as e:
             _sync_running = False
             _current_sync_ch = None
@@ -20523,10 +20523,16 @@ def _save_queue_state():
         saved_order.insert(0, ("redownload", _current_redownload_item["ch_url"]))
     queue_data["order"] = saved_order
     try:
-        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+        temp_file = QUEUE_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
+        os.replace(temp_file, QUEUE_FILE)
     except Exception:
-        pass
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except Exception:
+            pass
 
 
 def _load_queue_state():

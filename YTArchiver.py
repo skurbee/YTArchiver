@@ -2138,7 +2138,7 @@ def _save_disk_cache():
 
 
 def _scan_channel_disk_info(ch):
-    """Walk a channel's folder and return (num_vids, total_bytes).
+    """Walk a channel's folder and return (num_vids, total_bytes, has_transcripts).
 
     Only counts files with recognised video/audio extensions that are not
     partial downloads or temporary encode outputs.
@@ -2148,6 +2148,7 @@ def _scan_channel_disk_info(ch):
     _ch_folder = os.path.join(_base_dir, _folder_name)
     _num_vids = 0
     _ch_bytes = 0
+    _has_transcripts = False
     try:
         if os.path.isdir(_ch_folder):
             for _dp, _dns, _fns in os.walk(_ch_folder):
@@ -2161,9 +2162,11 @@ def _scan_channel_disk_info(ch):
                             _ch_bytes += os.path.getsize(os.path.join(_dp, _fn))
                         except Exception:
                             pass
+                    elif _fn_lower.endswith("transcript.txt"):
+                        _has_transcripts = True
     except Exception:
         pass
-    return _num_vids, _ch_bytes
+    return _num_vids, _ch_bytes, _has_transcripts
 
 
 def _update_disk_cache_for_channel(ch):
@@ -2174,7 +2177,7 @@ def _update_disk_cache_for_channel(ch):
     _url = ch.get("url", "")
     if not _url:
         return
-    _nv, _nb = _scan_channel_disk_info(ch)
+    _nv, _nb, _has_tx = _scan_channel_disk_info(ch)
     with _disk_cache_lock:
         _disk_cache[_url] = {
             "num_vids": _nv,
@@ -2182,6 +2185,15 @@ def _update_disk_cache_for_channel(ch):
             "last_updated": time.time(),
         }
     _save_disk_cache()
+    # Clear stale transcription_complete flag if no transcript files exist on disk
+    if not _has_tx and ch.get("transcription_complete", False):
+        with config_lock:
+            for _cfg_ch in config.get("channels", []):
+                if _cfg_ch.get("url") == _url:
+                    _cfg_ch["transcription_complete"] = False
+                    _cfg_ch.pop("transcription_pending", None)
+                    break
+        save_config(config)
 
 
 def _rescan_all_disk_sizes():
@@ -2970,7 +2982,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

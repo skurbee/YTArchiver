@@ -540,31 +540,37 @@ def log(text, tag=None):
                 if _had_whisper:
                     _stop_whisper_dot_anim()
 
+                _text_insert_pos = None  # track where text was inserted for bracket coloring
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
                                         "update_sep", "update_head", "simpleline_blue", "simpleline", "simpleline_green",
                                         "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
+                        _text_insert_pos = log_box.index(ss_ranges[0])
                         log_box.insert(ss_ranges[0], text, use_tag)
                     else:
                         # No simplestatus — insert before pausestatus anchor if present
                         _ps_r2 = log_box.tag_ranges("pausestatus")
                         if _ps_r2:
+                            _text_insert_pos = log_box.index(_ps_r2[0])
                             log_box.insert(_ps_r2[0], text, use_tag)
                         else:
+                            _text_insert_pos = log_box.index(tk.END)
                             log_box.insert(tk.END, text, use_tag)
                 elif _is_simple_mode and _ss_insert_pos is not None:
                     # Insert at the old simplestatus/pausestatus position to avoid jitter
+                    _text_insert_pos = log_box.index(_ss_insert_pos)
                     log_box.insert(_ss_insert_pos, text, use_tag)
                 elif _is_simple_mode and use_tag == "pausestatus":
                     # pausestatus always goes at the very bottom
                     log_box.insert(tk.END, text, use_tag)
                 else:
+                    _text_insert_pos = log_box.index(tk.END)
                     log_box.insert(tk.END, text, use_tag)
 
                 # Apply bracket color overlays: green [ ] for syncs, blue [ ] for transcriptions
-                if _is_simple_mode and use_tag in ("simpleline", "simpleline_green", "header",
+                if _text_insert_pos is not None and use_tag in ("simpleline", "simpleline_green", "header",
                                                     "transcribe_using"):
                     import re as _re_bk
                     # Determine bracket type from content
@@ -577,18 +583,14 @@ def log(text, tag=None):
                     if _bk_tag:
                         _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
                         if _bk_m:
-                            # Use the tag ranges to find the just-inserted text position
-                            _bk_ranges = log_box.tag_ranges(use_tag)
-                            if _bk_ranges:
-                                _bk_line_start = _bk_ranges[-2]  # start of last range with this tag
-                                _bk_open_off = _bk_m.start()
-                                _bk_close_off = _bk_m.end() - 1  # ] is last char of match
-                                _bk_open_pos = log_box.index(f"{_bk_line_start}+{_bk_open_off}c")
-                                _bk_close_pos = log_box.index(f"{_bk_line_start}+{_bk_close_off}c")
-                                log_box.tag_add(_bk_tag, _bk_open_pos,
-                                                log_box.index(f"{_bk_open_pos}+1c"))
-                                log_box.tag_add(_bk_tag, _bk_close_pos,
-                                                log_box.index(f"{_bk_close_pos}+1c"))
+                            _bk_open_off = _bk_m.start()
+                            _bk_close_off = _bk_m.end() - 1  # ] is last char of match
+                            _bk_open_pos = log_box.index(f"{_text_insert_pos}+{_bk_open_off}c")
+                            _bk_close_pos = log_box.index(f"{_text_insert_pos}+{_bk_close_off}c")
+                            log_box.tag_add(_bk_tag, _bk_open_pos,
+                                            log_box.index(f"{_bk_open_pos}+1c"))
+                            log_box.tag_add(_bk_tag, _bk_close_pos,
+                                            log_box.index(f"{_bk_close_pos}+1c"))
 
                 # Apply overlay tags for transcribe_using in simple mode so the
                 # [idx/total] prefix and quoted video title appear white over blue
@@ -2939,7 +2941,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:31pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13078,7 +13080,7 @@ def start_sync_all():
 
                 ch_name = ch["name"]
                 ch_dl_map[ch_name] = 0
-                _current_job["label"] = "Sync Subs"
+                _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
 
@@ -16137,7 +16139,7 @@ def _run_autorun():
 
                 ch_name = ch['name']
                 ch_dl_map[ch_name] = 0
-                _current_job["label"] = "Sync Subs"
+                _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
 

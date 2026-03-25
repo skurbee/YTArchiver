@@ -2970,7 +2970,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 4:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:13pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4891,6 +4891,12 @@ def sync_single_channel():
             folder_ovr = ch.get("folder_override", "")
             is_init = ch.get("initialized", False)
             sync_complete = ch.get("sync_complete", True)
+            # If channel completed full initialization, always treat as sync-complete
+            # so --break-on-existing is used.  Without this, a cancelled sync on a
+            # fully-archived channel leaves sync_complete=False, disabling the flag
+            # and forcing yt-dlp to crawl every page of the channel listing.
+            if ch.get("init_complete", False):
+                sync_complete = True
 
             # --- Batch safety: check cooldown for large full-mode channels ---
             batch_limited = False
@@ -13261,6 +13267,8 @@ def start_sync_all():
                 folder_ovr = ch.get("folder_override", "")
                 is_initialized = ch.get("initialized", False)
                 sync_complete = ch.get("sync_complete", True)
+                if ch.get("init_complete", False):
+                    sync_complete = True
 
                 # --- Batch safety: check cooldown for large full-mode channels ---
                 batch_limited = False
@@ -16339,6 +16347,8 @@ def _run_autorun():
                 folder_ovr = ch.get("folder_override", "")
                 is_init = ch.get("initialized", False)
                 sync_complete = ch.get("sync_complete", True)
+                if ch.get("init_complete", False):
+                    sync_complete = True
 
                 # --- Batch safety: check cooldown for large full-mode channels ---
                 batch_limited = False

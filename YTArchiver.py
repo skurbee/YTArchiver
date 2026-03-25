@@ -563,6 +563,33 @@ def log(text, tag=None):
                 else:
                     log_box.insert(tk.END, text, use_tag)
 
+                # Apply bracket color overlays: green [ ] for syncs, blue [ ] for transcriptions
+                if _is_simple_mode and use_tag in ("simpleline", "simpleline_green", "header",
+                                                    "transcribe_using"):
+                    import re as _re_bk
+                    # Determine bracket type from content
+                    _bk_tag = None
+                    if any(kw in text for kw in ("SYNCING:", "Downloaded:", "▶")):
+                        _bk_tag = "sync_bracket"
+                    elif any(kw in text for kw in ("Fetching captions:", "Re-transcribing",
+                                                    "Transcribing", "fetching captions")):
+                        _bk_tag = "trans_bracket"
+                    if _bk_tag:
+                        _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
+                        if _bk_m:
+                            # Use the tag ranges to find the just-inserted text position
+                            _bk_ranges = log_box.tag_ranges(use_tag)
+                            if _bk_ranges:
+                                _bk_line_start = _bk_ranges[-2]  # start of last range with this tag
+                                _bk_open_off = _bk_m.start()
+                                _bk_close_off = _bk_m.end() - 1  # ] is last char of match
+                                _bk_open_pos = log_box.index(f"{_bk_line_start}+{_bk_open_off}c")
+                                _bk_close_pos = log_box.index(f"{_bk_line_start}+{_bk_close_off}c")
+                                log_box.tag_add(_bk_tag, _bk_open_pos,
+                                                log_box.index(f"{_bk_open_pos}+1c"))
+                                log_box.tag_add(_bk_tag, _bk_close_pos,
+                                                log_box.index(f"{_bk_close_pos}+1c"))
+
                 # Apply overlay tags for transcribe_using in simple mode so the
                 # [idx/total] prefix and quoted video title appear white over blue
                 if _is_simple_mode and use_tag == "transcribe_using":
@@ -621,22 +648,14 @@ def log(text, tag=None):
                     # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
                     _reapply_whisper_overlays()
 
-                if _autorun_active and _is_simple_mode:
-                    try:
-                        line_count = int(log_box.index("end-1c").split(".")[0])
-                        if line_count > 500:
-                            log_box.delete("1.0", f"{line_count - 500}.0")
-                    except Exception:
-                        pass
-                else:
-                    # Cap verbose log at 20000 lines to prevent unbounded memory growth;
-                    # when exceeded, trim to 15000 — enough headroom for large single syncs
-                    try:
-                        line_count = int(log_box.index("end-1c").split(".")[0])
-                        if line_count > 20000:
-                            log_box.delete("1.0", f"{line_count - 15000}.0")
-                    except Exception:
-                        pass
+                # Cap verbose log at 20000 lines to prevent unbounded memory growth;
+                # when exceeded, trim to 15000 — enough headroom for large single syncs
+                try:
+                    line_count = int(log_box.index("end-1c").split(".")[0])
+                    if line_count > 20000:
+                        log_box.delete("1.0", f"{line_count - 15000}.0")
+                except Exception:
+                    pass
 
                 # Unfreeze scrollbar layout now that batch ops are done
                 _log_scroll_freeze = False
@@ -3304,10 +3323,19 @@ log_box.tag_raise("whisper_bracket", "whisper_prefix")
 # transcribe_prefix and transcribe_title must override transcribe_using (white over blue)
 log_box.tag_raise("transcribe_prefix", "transcribe_using")
 log_box.tag_raise("transcribe_title", "transcribe_using")
+# Bracket overlay tags — color only the [ ] characters in [X/X] prefixes
+log_box.tag_configure("sync_bracket", foreground=C_LOG_GREEN)
+log_box.tag_configure("trans_bracket", foreground=C_LOG_BLUE)
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
 # simplestatus_white must override simplestatus so [X/X] and channel name stay white
 log_box.tag_raise("simplestatus_white", "simplestatus")
+# Bracket overlays must override base line tags
+log_box.tag_raise("sync_bracket", "simpleline")
+log_box.tag_raise("sync_bracket", "simpleline_green")
+log_box.tag_raise("sync_bracket", "header")
+log_box.tag_raise("trans_bracket", "simpleline")
+log_box.tag_raise("trans_bracket", "transcribe_using")
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -9487,6 +9515,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _, _w_segs = _whisper_transcribe(
                                         _bf_fpath, duration=0, title=_bf_title,
                                         cancel_ev=_ce, pause_ev=_pe)
+                                    _clear_whisper_progress()
                                     if _w_segs:
                                         if os.path.isfile(_bf_jsonl_w):
                                             _remove_jsonl_entries_for_title(_bf_jsonl_w, _bf_title)
@@ -12895,7 +12924,9 @@ def start_sync_all():
             added = 0
             for ch in channels:
                 if not any(q["url"] == ch["url"] for q in _sync_queue):
-                    _sync_queue.append(copy.deepcopy(ch))
+                    _ch_copy = copy.deepcopy(ch)
+                    _ch_copy["_batch"] = True
+                    _sync_queue.append(_ch_copy)
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
                     added += 1
@@ -12913,7 +12944,9 @@ def start_sync_all():
                 return
             for ch in channels:
                 if not any(q["url"] == ch["url"] for q in _sync_queue):
-                    _sync_queue.append(copy.deepcopy(ch))
+                    _ch_copy = copy.deepcopy(ch)
+                    _ch_copy["_batch"] = True
+                    _sync_queue.append(_ch_copy)
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
         _what = "redownload" if _redownload_running else "reorganize"
@@ -12975,7 +13008,9 @@ def start_sync_all():
             with _sync_queue_lock:
                 for ch in channels:
                     if not any(q["url"] == ch["url"] for q in _sync_queue):
-                        _sync_queue.append(copy.deepcopy(ch))
+                        _ch_copy = copy.deepcopy(ch)
+                        _ch_copy["_batch"] = True
+                        _sync_queue.append(_ch_copy)
                         with _queue_order_lock:
                             _queue_order.append(("sync", ch["url"]))
             _update_queue_btn()
@@ -13780,16 +13815,28 @@ def _get_queue_items():
         items.append((f"▶ {_active_lbl}", "current", -1))
 
     # Build lookup maps from type-specific queues, keyed by URL
+    # Batch-queued channels (from Sync Subbed / autosync) collapse into one entry
     sync_map = {}
+    _batch_first_url = None  # URL key for the collapsed batch entry
+    _batch_count = 0
     with _sync_queue_lock:
         for i, ch in enumerate(_sync_queue):
+            if ch.get("_batch"):
+                _batch_count += 1
+                if _batch_first_url is None:
+                    _batch_first_url = ch["url"]
+                    sync_map[ch["url"]] = (f"Sync Subs ({_batch_count} channels)", "sync_batch", i)
+                continue  # skip individual entries for batch items
             name = ch.get("name", "?")
-            mode = ch.get("mode", "full")
             if not ch.get("initialized", False):
                 lbl = f"Initialize {name}"
             else:
                 lbl = f"Sync {name}"
             sync_map[ch["url"]] = (lbl, "sync", i)
+        # Update the batch label with final count
+        if _batch_first_url and _batch_first_url in sync_map:
+            _old = sync_map[_batch_first_url]
+            sync_map[_batch_first_url] = (f"Sync Subs ({_batch_count} channels)", _old[1], _old[2])
     reorg_map = {}
     with _reorg_queue_lock:
         for i, args in enumerate(_reorg_queue):
@@ -13905,6 +13952,17 @@ def _remove_queue_item(source, idx):
                 popped = _redownload_queue.pop(idx)
                 removed = popped.get("ch_name", "?")
                 removed_key = popped.get("ch_url")
+    elif source == "sync_batch":
+        with _sync_queue_lock:
+            batch_urls = [ch["url"] for ch in _sync_queue if ch.get("_batch")]
+            _sync_queue[:] = [ch for ch in _sync_queue if not ch.get("_batch")]
+            if batch_urls:
+                removed = "Sync Subs"
+                _queue_items_removed = True
+                with _queue_order_lock:
+                    _queue_order[:] = [(s, k) for s, k in _queue_order
+                                       if not (s == "sync" and k in set(batch_urls))]
+                removed_key = None  # already cleaned up
     if removed_key:
         with _queue_order_lock:
             try:
@@ -15317,6 +15375,7 @@ def _gpu_start():
                             skip_model_dialog=True, _sync_mode=True
                         )
 
+                    _clear_whisper_progress()  # Remove stale progress line before next iteration / pause check
                     _gpu_current["label"] = None
                     _gpu_current["ch_url"] = None
                     _gpu_current_item = None
@@ -15552,6 +15611,7 @@ def _gpu_start():
                         _sync_mode=True
                     )
 
+                _clear_whisper_progress()  # Remove stale progress line before next iteration / pause check
                 _gpu_current["label"] = None
                 _gpu_current["ch_url"] = None
                 _gpu_current_item = None

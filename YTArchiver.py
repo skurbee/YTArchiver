@@ -1760,6 +1760,14 @@ def check_directory_writable(path):
         return False
 
 
+def _safe_getmtime(path):
+    """Return file mtime, or 0.0 if the file has disappeared."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 # ─── Disk Error Auto-Pause ─────────────────────────────────
 # Patterns that indicate the output drive is unwritable (disconnected, read-only, etc.)
 _DISK_ERROR_PATTERNS = tuple(p.lower() for p in (
@@ -9770,11 +9778,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         unmatched.append((fname, fpath))
 
             # Sort by file modification time, newest first
-            def _safe_getmtime(path):
-                try:
-                    return os.path.getmtime(path)
-                except OSError:
-                    return 0.0
             matched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
             unmatched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
 
@@ -10018,11 +10021,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
-                try:
-                    unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
-                except OSError:
-                    unmatched = [(fn, fp) for fn, fp in unmatched if os.path.exists(fp)]
-                    unmatched.sort(key=lambda x: os.path.getmtime(x[1]) if os.path.exists(x[1]) else 0, reverse=True)
+                unmatched = [(fn, fp) for fn, fp in unmatched if os.path.exists(fp)]
+                unmatched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
 
                 # ── Model selection ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
@@ -10775,8 +10775,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             all_files = [f for f in os.listdir(folder_path)
                          if os.path.isfile(os.path.join(folder_path, f))
                          and os.path.splitext(f)[1].lower() in _VID_EXTS]
-            files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(folder_path, f))
-                           if os.path.exists(os.path.join(folder_path, f)) else 0)
+            files = sorted(all_files, key=lambda f: _safe_getmtime(os.path.join(folder_path, f)))
 
             if not files:
                 log(f"  No video/audio files found in folder.\n", "red")
@@ -20299,8 +20298,9 @@ def run_startup_updates():
             os.close(temp_fd)
             urllib.request.urlretrieve(dl_url, temp_path)
             # Basic sanity check: yt-dlp binary should be at least 1 MB
-            if os.path.getsize(temp_path) < 1_000_000:
-                raise RuntimeError(f"Downloaded file too small ({os.path.getsize(temp_path)} bytes), likely incomplete")
+            fsize = os.path.getsize(temp_path)
+            if fsize < 1_000_000:
+                raise RuntimeError(f"Downloaded file too small ({fsize} bytes), likely incomplete")
             os.replace(temp_path, target_path)
             if os.name != 'nt':
                 os.chmod(target_path, 0o755)
@@ -20522,8 +20522,8 @@ def _save_queue_state():
     if _current_redownload_item is not None and _redownload_running:
         saved_order.insert(0, ("redownload", _current_redownload_item["ch_url"]))
     queue_data["order"] = saved_order
+    temp_file = QUEUE_FILE + ".tmp"
     try:
-        temp_file = QUEUE_FILE + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
         os.replace(temp_file, QUEUE_FILE)

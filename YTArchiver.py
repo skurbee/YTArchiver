@@ -2169,6 +2169,22 @@ def _scan_channel_disk_info(ch):
     return _num_vids, _ch_bytes, _has_transcripts
 
 
+def _channel_has_transcripts(ch):
+    """Quick check if a channel folder contains any Transcript.txt files."""
+    _base_dir = config.get("output_dir", "").strip() or BASE_DIR
+    _folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    _ch_folder = os.path.join(_base_dir, _folder_name)
+    try:
+        if os.path.isdir(_ch_folder):
+            for _dp, _dns, _fns in os.walk(_ch_folder):
+                for _fn in _fns:
+                    if _fn.lower().endswith("transcript.txt"):
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 def _update_disk_cache_for_channel(ch):
     """Scan a single channel folder and write the result into the cache.
 
@@ -2249,16 +2265,37 @@ def _run_startup_disk_scan():
         _channels = list(config.get("channels", []))
     with _disk_cache_lock:
         _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
-    if not _missing:
-        return
-    log(f"--- Scanning disk for channel info ({len(_missing)} channel(s) not yet cached)... ---\n", "header")
-    for _ch in _missing:
-        if not _root_alive:
-            break
-        _update_disk_cache_for_channel(_ch)
-    if _root_alive:
-        _ui_queue.append(refresh_channel_dropdowns)
-    log("--- Disk scan complete. ---\n", "simpleline_green")
+    if _missing:
+        for _ch in _missing:
+            if not _root_alive:
+                break
+            _update_disk_cache_for_channel(_ch)
+        if _root_alive:
+            _ui_queue.append(refresh_channel_dropdowns)
+
+    # Verify transcription_complete flags against actual files on disk.
+    # Only checks channels marked complete — lightweight since it only needs
+    # to find a single Transcript.txt to confirm, not walk the whole tree.
+    _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
+    if _stale:
+        _any_cleared = False
+        for _ch in _stale:
+            if not _root_alive:
+                break
+            _has_tx = _channel_has_transcripts(_ch)
+            if not _has_tx:
+                _url = _ch.get("url", "")
+                with config_lock:
+                    for _cfg_ch in config.get("channels", []):
+                        if _cfg_ch.get("url") == _url:
+                            _cfg_ch["transcription_complete"] = False
+                            _cfg_ch.pop("transcription_pending", None)
+                            break
+                _any_cleared = True
+        if _any_cleared:
+            save_config(config)
+            if _root_alive:
+                _ui_queue.append(refresh_channel_dropdowns)
 
 
 config = load_config()
@@ -2982,7 +3019,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:47pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

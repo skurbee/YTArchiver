@@ -12260,6 +12260,59 @@ def _load_seen_filter_titles():
     return seen
 
 
+def _quick_check_new_uploads(url, check_count=5):
+    """Fast check: fetch the newest *check_count* video IDs from the channel
+    and compare them against the download archive.
+
+    Returns ``True`` if there appear to be new uploads (or if the check fails —
+    safe default), ``False`` if all checked IDs are already archived.
+    """
+    proc = None
+    try:
+        _qc_url = url.rstrip("/")
+        if ("/@" in _qc_url or "/channel/" in _qc_url or "/c/" in _qc_url
+                or "/user/" in _qc_url) and not _qc_url.endswith("/videos"):
+            _qc_url = _qc_url + "/videos"
+        proc = spawn_yt_dlp([
+            "yt-dlp", "--flat-playlist", "--lazy-playlist",
+            "--playlist-end", str(check_count),
+            "--print", "id",
+            "--cookies-from-browser", "firefox",
+            _qc_url
+        ])
+        if not proc:
+            return True  # couldn't check — assume new uploads exist
+        ids = []
+        while True:
+            if cancel_event.is_set():
+                return True
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if re.fullmatch(r'[\w-]{11}', line):
+                ids.append(line)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if not ids:
+            return True  # no IDs returned — assume new uploads exist
+        archived = _load_archived_ids()
+        for vid in ids:
+            if vid not in archived:
+                return True  # found a new video
+        return False
+    except Exception:
+        return True  # error — assume new uploads exist
+    finally:
+        cleanup_process(proc)
+
+
 def _build_batch_file(video_ids):
     """Write video IDs as full YouTube URLs to a temp file for --batch-file.
     Returns file path, or None on error."""
@@ -16444,6 +16497,32 @@ def _run_autorun():
                             cfg_ch["sync_complete"] = False
                 save_config(config)
 
+                # ── Fast path for fully-synced channels ──────────────────
+                # If the channel has been fully initialized (init_complete)
+                # and the last sync completed successfully (sync_complete was
+                # True before we cleared it above), do a quick 5-video check
+                # against the archive.  If all are already downloaded, skip
+                # the expensive full yt-dlp run entirely.
+                _fast_skip = False
+                if (ch.get("init_complete", False) and sync_complete
+                        and mode == "full" and not cancel_event.is_set()):
+                    if not _quick_check_new_uploads(url, check_count=5):
+                        _fast_skip = True
+                        with config_lock:
+                            for cfg_ch in config.get("channels", []):
+                                if cfg_ch["url"] == url:
+                                    cfg_ch["sync_complete"] = True
+                                    cfg_ch["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        save_config(config)
+                        if _is_simple_mode:
+                            _tot = len(channels)
+                            _pad = 34 + len(str(_tot)) - len(str(i))
+                            _cn = ch['name'] if len(ch['name']) <= _pad else ch['name'][:_pad - 3] + "..."
+                            log(f"[{i}/{_tot}] {_cn:<{_pad}} —  Downloaded: no new videos\n", "simpleline")
+                        else:
+                            log(f"  ✓ No new uploads — skipping.\n", "dim")
+                        continue
+
                 cmd = build_channel_cmd(url, out_dir, min_dur, res, folder_ovr,
                                         break_on_existing=is_init and sync_complete,
                                         max_dur=ch.get("max_duration", 0),
@@ -16460,10 +16539,12 @@ def _run_autorun():
                         log(f"  ▶ [{i}/{len(channels)}] {ch['name']}\n", "header")
 
                     # Skip prefetch for uninitialized full-mode channels
+                    # and for fully-synced channels (the count is only used for
+                    # the progress bar; synced channels process very few videos).
                     _skip_prefetch = (mode == "full"
                                       and not ch.get("init_complete", False)
                                       and not is_init)
-                    if _skip_prefetch:
+                    if _skip_prefetch or ch.get("init_complete", False):
                         ch_total = 0
                     else:
                         ch_total = _prefetch_total(url)

@@ -1448,7 +1448,7 @@ def _simple_anim_tick():
         elif dl_cur > 0:
             status_text = "  Downloading"
         else:
-            status_text = "  "
+            status_text = " "
 
         enum_page = _simple_anim_state.get("enum_page", 0)
         enum_count = _simple_anim_state.get("enum_count", 0)
@@ -1457,7 +1457,7 @@ def _simple_anim_tick():
             log_simple_status(segments=[
                 ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
                 (" SYNCING:", "simplestatus_green"),
-                (f" {ch}  ", "simplestatus_white"),
+                (f" {ch} ", "simplestatus_white"),
                 (d, "simplestatus_green"),
                 ("\n", None),
                 (f"Enumerating video IDs, {enum_count:,} found (first run only)", None),
@@ -2970,7 +2970,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5117,12 +5117,17 @@ def sync_single_channel():
                 if _is_simple_mode:
                     _stop_simple_anim()
                     if not cancel_event.is_set():
-                        _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
-                        if c_dur:
-                            _v += f"  ·  {c_dur} filtered"
+                        if c_dl:
+                            _v = f"Downloaded: {c_dl} video{'s' if c_dl != 1 else ''}"
+                            if c_dur:
+                                _v += f"  ·  {c_dur} filtered"
+                        elif c_dur:
+                            _v = f"Filtered {c_dur}"
+                        else:
+                            _v = "no new videos"
                         _tag = "simpleline_green" if c_dl else "simpleline"
                         _cn = ch['name'] if len(ch['name']) <= 34 else ch['name'][:31] + "..."
-                        log(f"[{_pfx_i}/{_pfx_t}] {_cn:<34} —  Downloaded: {_v}\n", _tag)
+                        log(f"[{_pfx_i}/{_pfx_t}] {_cn:<34} —  {_v}\n", _tag)
 
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
@@ -5240,9 +5245,12 @@ def sync_single_channel():
                     _skip_n = len(_skipped_list)
                     log("\n" + "=" * 45 + "\n", "summary")
                     log(f"CHANNEL SUMMARY:\n", "summary")
-                    log(f"Downloaded: {session_totals['dl']}, Skipped: {_skip_n}\n", "summary")
+                    _sum_parts = [f"Downloaded: {session_totals['dl']}", f"Skipped: {_skip_n}"]
+                    if session_totals['dur'] > 0:
+                        _sum_parts.append(f"Filtered: {session_totals['dur']}")
                     if session_totals['err'] > 0:
-                        log(f"Errors: {session_totals['err']}\n", "summary")
+                        _sum_parts.append(f"Errors: {session_totals['err']}")
+                    log(f"{', '.join(_sum_parts)}\n", "summary")
                     log("=" * 45 + "\n", "summary")
                 if _queue_batch_total <= 1:
                     log("\n=== CHANNEL SYNC COMPLETE ===\n", "header")
@@ -5279,9 +5287,12 @@ def sync_single_channel():
                         _b_plural = "s" if _b_dl != 1 else ""
                         log("\n" + "=" * 45 + "\n", "summary")
                         log(f"TOTAL SYNC SUMMARY:\n", "summary")
-                        log(f"Downloaded: {_b_dl}, Channels synced: {_queue_batch_total}\n", "summary")
+                        _sum_parts = [f"Downloaded: {_b_dl}", f"Channels synced: {_queue_batch_total}"]
+                        if _b_skip > 0:
+                            _sum_parts.append(f"Filtered: {_b_skip}")
                         if _b_err > 0:
-                            log(f"Errors: {_b_err}\n", "summary")
+                            _sum_parts.append(f"Errors: {_b_err}")
+                        log(f"{', '.join(_sum_parts)}\n", "summary")
                         log("=" * 45 + "\n", "summary")
                         show_notification(
                             "YT Archiver — Sync complete",
@@ -12940,6 +12951,21 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     if not is_simple_mode:
                         log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
+                # Scheduled livestreams — not a real error, treat as filtered
+                if "This live event will begin in" in line or "Premieres in" in line:
+                    dur_count += 1
+                    session_totals["dur"] += 1
+                    if is_simple_mode:
+                        _vid = current_vid_id or "video"
+                        _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
+                        _skip_tmax = 49
+                        if len(_skip_title) > _skip_tmax:
+                            _skip_title = _skip_title[:_skip_tmax - 3] + "..."
+                        log("[SKIP]", "filterskip")
+                        log(f" {_skip_title:<{_skip_tmax}}  -Scheduled/premiere.\n", "filterskip_dim")
+                    else:
+                        log(line, "filterskip")
+                    continue
                 err_count += 1
                 session_totals["err"] += 1
                 if "Requested format is not available" in line:
@@ -12996,13 +13022,17 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             clear_transient_lines()
             _simple = _is_simple_mode
             if not _simple:
+                _parts = []
                 if dl_count == 0:
-                    if err_count == 0:
-                        log(f"SUMMARY: Downloaded: 0, no new videos\n", "summary")
-                    else:
-                        log(f"SUMMARY: Downloaded: 0, no new videos | Errors: {err_count}\n", "summary")
+                    _parts.append("Downloaded: 0, no new videos")
                 else:
-                    log(f"SUMMARY: Downloaded: {dl_count} | Skipped: {skip_count} | Errors: {err_count}\n", "summary")
+                    _parts.append(f"Downloaded: {dl_count}")
+                    _parts.append(f"Skipped: {skip_count}")
+                if dur_count > 0:
+                    _parts.append(f"Filtered: {dur_count}")
+                if err_count > 0:
+                    _parts.append(f"Errors: {err_count}")
+                log(f"SUMMARY: {' | '.join(_parts)}\n", "summary")
 
     except Exception as e:
         clear_transient_lines()
@@ -13521,13 +13551,18 @@ def start_sync_all():
 
                 if _is_simple_mode:
                     _stop_simple_anim()
-                    _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
-                    if c_dur:
-                        _v += f"  ·  {c_dur} filtered"
+                    if c_dl:
+                        _v = f"Downloaded: {c_dl} video{'s' if c_dl != 1 else ''}"
+                        if c_dur:
+                            _v += f"  ·  {c_dur} filtered"
+                    elif c_dur:
+                        _v = f"Filtered {c_dur}"
+                    else:
+                        _v = "no new videos"
                     _tag = "simpleline_green" if c_dl else "simpleline"
                     _pad = 34 + len(str(current_total)) - len(str(i))
                     _cn = ch_name if len(ch_name) <= _pad else ch_name[:_pad - 3] + "..."
-                    log(f"[{i}/{current_total}] {_cn:<{_pad}} —  Downloaded: {_v}\n", _tag)
+                    log(f"[{i}/{current_total}] {_cn:<{_pad}} —  {_v}\n", _tag)
 
                 # --- Batch safety: handle batch completion ---
                 _batch_more_remaining = False
@@ -13635,9 +13670,12 @@ def start_sync_all():
 
                 log("\n" + "=" * 45 + "\n", "summary")
                 log(f"TOTAL SYNC SUMMARY:\n", "summary")
-                log(f"Downloaded: {session_totals['dl']}, Channels without new videos: {zero_dl}\n", "summary")
+                _sum_parts = [f"Downloaded: {session_totals['dl']}", f"Channels without new videos: {zero_dl}"]
+                if session_totals['dur'] > 0:
+                    _sum_parts.append(f"Filtered: {session_totals['dur']}")
                 if session_totals['err'] > 0:
-                    log(f"Errors: {session_totals['err']}\n", "summary")
+                    _sum_parts.append(f"Errors: {session_totals['err']}")
+                log(f"{', '.join(_sum_parts)}\n", "summary")
                 log("=" * 45 + "\n", "summary")
                 log("\n=== ALL CHANNELS SYNCED ===\n", "header")
 
@@ -16414,7 +16452,7 @@ def _run_autorun():
                             _tot = len(channels)
                             _pad = 34 + len(str(_tot)) - len(str(i))
                             _cn = ch['name'] if len(ch['name']) <= _pad else ch['name'][:_pad - 3] + "..."
-                            log(f"[{i}/{_tot}] {_cn:<{_pad}} —  Downloaded: no new videos\n", "simpleline")
+                            log(f"[{i}/{_tot}] {_cn:<{_pad}} —  no new videos\n", "simpleline")
                         else:
                             log(f"  ✓ No new uploads — skipping.\n", "dim")
                         continue
@@ -16590,14 +16628,19 @@ def _run_autorun():
 
                 if _is_simple_mode:
                     _stop_simple_anim()
-                    _v = "no new videos" if not c_dl else f"{c_dl} video{'s' if c_dl != 1 else ''}"
-                    if c_dur:
-                        _v += f"  ·  {c_dur} filtered"
+                    if c_dl:
+                        _v = f"Downloaded: {c_dl} video{'s' if c_dl != 1 else ''}"
+                        if c_dur:
+                            _v += f"  ·  {c_dur} filtered"
+                    elif c_dur:
+                        _v = f"Filtered {c_dur}"
+                    else:
+                        _v = "no new videos"
                     _tag = "simpleline_green" if c_dl else "simpleline"
                     _tot = len(channels)
                     _pad = 34 + len(str(_tot)) - len(str(i))
                     _cn = ch['name'] if len(ch['name']) <= _pad else ch['name'][:_pad - 3] + "..."
-                    log(f"[{i}/{_tot}] {_cn:<{_pad}} —  Downloaded: {_v}\n", _tag)
+                    log(f"[{i}/{_tot}] {_cn:<{_pad}} —  {_v}\n", _tag)
 
                 # --- Batch safety: handle batch completion ---
                 _batch_more_remaining = False
@@ -16705,9 +16748,12 @@ def _run_autorun():
 
                 log("\n" + "=" * 45 + "\n", "summary")
                 log(f"TOTAL SESSION SUMMARY:\n", "summary")
-                log(f"Downloaded: {session_totals['dl']}, Channels without new videos: {zero_dl}\n", "summary")
+                _sum_parts = [f"Downloaded: {session_totals['dl']}", f"Channels without new videos: {zero_dl}"]
+                if session_totals['dur'] > 0:
+                    _sum_parts.append(f"Filtered: {session_totals['dur']}")
                 if session_totals['err'] > 0:
-                    log(f"Errors: {session_totals['err']}\n", "summary")
+                    _sum_parts.append(f"Errors: {session_totals['err']}")
+                log(f"{', '.join(_sum_parts)}\n", "summary")
                 log("=" * 45 + "\n", "summary")
                 log("\n=== AUTO-SYNC COMPLETE ===\n", "header")
 

@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.6"
+APP_VERSION = "v24.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2952,7 +2952,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 1:03am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6440,8 +6440,15 @@ def _hide_file_win(path):
             pass
 
 
-def _write_jsonl_entry(jsonl_path, video_id, title, segments):
-    """Append JSONL lines for one video's timestamped segments."""
+def _write_jsonl_entry(jsonl_path, video_id, title, segments, source=""):
+    """Append JSONL lines for one video's timestamped segments.
+
+    *source* should be ``"vtt"`` for YouTube auto-caption entries or
+    ``"whisper"`` for Whisper-transcribed entries.  The field is stored in
+    every JSONL line so that ``_scan_existing_jsonl`` can distinguish VTT
+    segments (which may be long after merging) from genuine Whisper content
+    that still needs per-word timestamps.
+    """
     import json as _json
     try:
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
@@ -6454,6 +6461,8 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
                     "end": round(seg["end"], 2),
                     "text": seg["text"]
                 }
+                if source:
+                    entry["source"] = source
                 if seg.get("words"):
                     entry["words"] = seg["words"]
                 line = _json.dumps(entry, ensure_ascii=False)
@@ -6470,8 +6479,12 @@ def _scan_existing_jsonl(folder_path, ch_name):
     - bad_titles: any title with a segment > 35 s (needs repair/re-transcription)
     - stale_whisper: Whisper-transcribed titles (segment > 8 s) that have no
       per-word timestamps yet — these should be re-Whispered to gain word accuracy.
-      YouTube VTT cues are always short (<5 s), so the >8 s threshold reliably
-      identifies Whisper-only content without needing to track source explicitly.
+
+    Detection uses the ``"source"`` field written by ``_write_jsonl_entry``:
+    entries tagged ``"vtt"`` are never considered stale regardless of segment
+    length (VTT segments are merged and can legitimately exceed 8 s).
+    For backward compatibility, entries with **no** source field fall back to
+    the segment-length heuristic (>8 s ⇒ assumed Whisper).
     """
     existing = set()
     bad_titles = set()
@@ -6483,6 +6496,7 @@ def _scan_existing_jsonl(folder_path, ch_name):
     # least one long segment AND none of its segments carry word timestamps.
     _has_long_seg  = set()
     _has_words     = set()
+    _known_vtt     = set()  # titles where at least one entry has source="vtt"
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
@@ -6497,13 +6511,22 @@ def _scan_existing_jsonl(folder_path, ch_name):
                                 dur = entry.get("end", 0) - entry.get("start", 0)
                                 if dur > _MAX_SEG:
                                     bad_titles.add(title)
-                                if dur > _WHISPER_MIN:
+                                _src = entry.get("source", "")
+                                if _src == "vtt":
+                                    _known_vtt.add(title)
+                                # Only flag as potentially stale Whisper if the entry
+                                # does NOT come from VTT.  Entries with no source
+                                # field (pre-existing data) use the old heuristic.
+                                if dur > _WHISPER_MIN and _src != "vtt":
                                     _has_long_seg.add(title)
                                 if entry.get("words"):
                                     _has_words.add(title)
                 except Exception:
                     pass
-    stale_whisper = _has_long_seg - _has_words - bad_titles
+    # A title is stale only if it has long segments from a non-VTT source
+    # and none of its entries carry word-level timestamps.
+    # Titles known to be VTT are never stale (VTT doesn't provide words).
+    stale_whisper = _has_long_seg - _has_words - bad_titles - _known_vtt
     return existing, bad_titles, stale_whisper
 
 
@@ -9464,17 +9487,23 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             def _do_jsonl_backfill():
                 """Generate .jsonl entries for already-transcribed videos that are missing them.
                 Runs after new transcriptions so it doesn't delay resuming a paused session."""
-                if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
+                if not _jsonl_needed or _ce.is_set():
                     return
+                # yt_title_to_id may be empty if playlist fetch failed.  VTT backfill
+                # needs a video ID, but stale-Whisper re-transcription only needs the
+                # local file — so don't bail out entirely when the map is empty.
+                _has_yt_map = bool(yt_title_to_id)
 
                 # Match needed titles to video IDs
                 _backfill_list = []
                 for title in _jsonl_needed:
-                    vid_id = yt_title_to_id.get(title)
+                    vid_id = yt_title_to_id.get(title) if _has_yt_map else ""
                     if not vid_id:
                         _norm_t = _normalize_title(title)
-                        vid_id = _yt_norm_backfill.get(_norm_t)
-                    if vid_id:
+                        vid_id = _yt_norm_backfill.get(_norm_t, "")
+                    # Stale Whisper titles are re-transcribed locally — they don't
+                    # need a YouTube video ID, so always include them.
+                    if vid_id or title in _jsonl_stale_whisper:
                         _backfill_list.append((title, vid_id))
 
                 if _backfill_list:
@@ -9534,7 +9563,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     if _w_segs:
                                         if os.path.isfile(_bf_jsonl_w):
                                             _remove_jsonl_entries_for_title(_bf_jsonl_w, _bf_title)
-                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs)
+                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs, source="whisper")
                                         _bf_done += 1
                                 except Exception:
                                     pass
@@ -9558,7 +9587,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 # If this title had bad segments, purge old entries first.
                                 if _bf_title in _jsonl_bad and os.path.isfile(_bf_jsonl):
                                     _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
-                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
+                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs, source="vtt")
                                 _bf_done += 1
                         except Exception:
                             pass
@@ -9902,7 +9931,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Write hidden JSONL with timestamps for searchability
                 if _vtt_segments:
                     _jsonl_path = _get_jsonl_path(txt_path)
-                    _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments)
+                    _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments, source="vtt")
 
                 _vid_elapsed = time.time() - _t_vid_start
                 _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -10259,7 +10288,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             # truly local/offline files that have no YouTube counterpart.
                             _w_vid_id = (yt_title_to_id.get(fname)
                                          or _yt_normalized.get(_normalize_for_match(fname), ""))
-                            _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments)
+                            _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments, source="whisper")
 
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))

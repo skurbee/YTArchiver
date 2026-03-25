@@ -2265,6 +2265,15 @@ def _run_startup_disk_scan():
         _channels = list(config.get("channels", []))
     with _disk_cache_lock:
         _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
+
+    _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
+    _need_scan = bool(_missing) or bool(_stale)
+
+    if not _need_scan:
+        return
+
+    log("--- Scanning disk info... ---\n", "dim")
+
     if _missing:
         for _ch in _missing:
             if not _root_alive:
@@ -2276,7 +2285,6 @@ def _run_startup_disk_scan():
     # Verify transcription_complete flags against actual files on disk.
     # Only checks channels marked complete — lightweight since it only needs
     # to find a single Transcript.txt to confirm, not walk the whole tree.
-    _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
     if _stale:
         _any_cleared = False
         for _ch in _stale:
@@ -2296,6 +2304,8 @@ def _run_startup_disk_scan():
             save_config(config)
             if _root_alive:
                 _ui_queue.append(refresh_channel_dropdowns)
+
+    log("== Disk scan complete. ==\n", "simpleline_green")
 
 
 config = load_config()
@@ -3019,7 +3029,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 5:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:05pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

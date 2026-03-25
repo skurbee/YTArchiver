@@ -32,6 +32,21 @@ try:
 except ImportError:
     _HAS_MPL = False
 
+# Embedded VLC player (optional — falls back to external VLC if unavailable)
+_HAS_VLC = False
+try:
+    _vlc_lib_dir = None
+    for _vp in [r'C:\Program Files\VideoLAN\VLC', r'C:\Program Files (x86)\VideoLAN\VLC']:
+        if os.path.isfile(os.path.join(_vp, 'libvlc.dll')):
+            _vlc_lib_dir = _vp
+            break
+    if _vlc_lib_dir:
+        os.add_dll_directory(_vlc_lib_dir)
+    import vlc as _vlc_mod
+    _HAS_VLC = True
+except Exception:
+    _vlc_mod = None
+
 # System tray icon (optional — gracefully disabled if not installed)
 try:
     import pystray
@@ -1710,8 +1725,8 @@ def _resume_proc(proc):
 def show_notification(title, message):
     if os.name == 'nt':
         try:
-            safe_title = title.replace("'", "''")
-            safe_message = message.replace("'", "''")
+            safe_title = title.replace("'", "''").replace("`", "``").replace("$", "`$")
+            safe_message = message.replace("'", "''").replace("`", "``").replace("$", "`$")
             # Windows Runtime toast shows "YT Archiver" as app name;
             # fallback to NotifyIcon if WinRT types unavailable
             ps = (
@@ -2277,10 +2292,10 @@ if not os.path.exists(icon_path) and getattr(sys, 'frozen', False):
     # Extract the icon from the running .exe itself via Win32 API.
     try:
         import tempfile
-        from ctypes import windll, c_int, byref
+        from ctypes import windll, c_void_p, byref
         exe_path = sys.executable
-        hicon_small = c_int()
-        hicon_large = c_int()
+        hicon_small = c_void_p()
+        hicon_large = c_void_p()
         windll.shell32.ExtractIconExW(exe_path, 0, byref(hicon_large), byref(hicon_small), 1)
         if hicon_large.value:
             hwnd = windll.user32.GetParent(root.winfo_id())
@@ -2955,7 +2970,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 1:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 4:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3839,8 +3854,8 @@ def _toggle_date_entry():
 
 def refresh_channel_dropdowns():
     with config_lock:
-        sorted_channels = sorted(config.get("channels", []), key=lambda c: c["name"].lower())
-        names = [c["name"] for c in sorted_channels]
+        sorted_channels = sorted(config.get("channels", []), key=lambda c: c.get("name", "").lower())
+        names = [c.get("name", "") for c in sorted_channels]
         chan_dropdown["values"] = names
 
         settings_chan_tree.delete(*settings_chan_tree.get_children())
@@ -4697,7 +4712,7 @@ def add_channel():
                 "compress_enabled": new_compress_var.get(),
                 "compress_level": new_compress_level_var.get(),
                 "compress_output_res": (lambda v: v.replace("p", "") if v != "Original" else "")(new_compress_res_var.get()),
-                "compress_batch_size": int(new_compress_batch_var.get() or "20"),
+                "compress_batch_size": max(1, int(new_compress_batch_var.get() or "20")) if new_compress_batch_var.get().strip().isdigit() else 20,
             })
 
     _clear_edit_mode()
@@ -5547,7 +5562,7 @@ def remove_channel():
             chan_var.set("")
             url_var.set("")
             save_prefs_btn.config(state="disabled")
-        if _editing_channel["name"] == removed_name:
+        if _editing_channel.get("name") == removed_name:
             _clear_edit_mode()
 
     refresh_channel_dropdowns()
@@ -6576,28 +6591,35 @@ def _hide_file_win(path):
 
 
 def _write_jsonl_entry(jsonl_path, video_id, title, segments):
-    """Append JSONL lines for one video's timestamped segments."""
+    """Append JSONL lines for one video's timestamped segments.
+
+    Builds the new lines in memory first, then appends in a single write so a
+    partial disk failure cannot leave a half-written entry in the file.
+    """
     import json as _json
     try:
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        # Build all lines in memory first
+        new_lines = []
+        for seg in segments:
+            entry = {
+                "video_id": video_id or "",
+                "title": title,
+                "start": round(seg["start"], 2),
+                "end": round(seg["end"], 2),
+                "text": seg["text"]
+            }
+            if "words" in seg and seg["words"]:
+                entry["words"] = seg["words"]
+            else:
+                # Always include word timestamps — generate evenly-distributed
+                # ones when real word-level data isn't available.
+                entry["words"] = _generate_distributed_words(
+                    seg["text"], seg["start"], seg["end"])
+            new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
+        # Single write — reduces risk of partial entries on disk errors
         with open(jsonl_path, "a", encoding="utf-8") as f:
-            for seg in segments:
-                entry = {
-                    "video_id": video_id or "",
-                    "title": title,
-                    "start": round(seg["start"], 2),
-                    "end": round(seg["end"], 2),
-                    "text": seg["text"]
-                }
-                if "words" in seg and seg["words"]:
-                    entry["words"] = seg["words"]
-                else:
-                    # Always include word timestamps — generate evenly-distributed
-                    # ones when real word-level data isn't available.
-                    entry["words"] = _generate_distributed_words(
-                        seg["text"], seg["start"], seg["end"])
-                line = _json.dumps(entry, ensure_ascii=False)
-                f.write(line + "\n")
+            f.writelines(new_lines)
         _hide_file_win(jsonl_path)
     except Exception:
         pass
@@ -6606,23 +6628,10 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
 def _scan_existing_jsonl(folder_path, ch_name):
     """Scan JSONL transcript files under folder_path.
 
-    Returns (existing_titles, bad_titles, stale_whisper) where:
-    - bad_titles: any title with a segment > 35 s (needs repair/re-transcription)
-    - stale_whisper: Whisper-transcribed titles (segment > 8 s) that have no
-      per-word timestamps yet — these should be re-Whispered to gain word accuracy.
-      YouTube VTT cues are always short (<5 s), so the >8 s threshold reliably
-      identifies Whisper-only content without needing to track source explicitly.
+    Returns a set of video titles that already have JSONL entries.
     """
     existing = set()
-    bad_titles = set()
-    stale_whisper = set()
     import json as _json
-    _MAX_SEG       = 35.0  # above the 30 s cap but catches both VTT and Whisper long segs
-    _WHISPER_MIN   = 8.0   # segments longer than this are Whisper (not VTT)
-    # Per-title tracking for stale detection: a title is stale only if it has at
-    # least one long segment AND none of its segments carry word timestamps.
-    _has_long_seg  = set()
-    _has_words     = set()
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
@@ -6633,96 +6642,11 @@ def _scan_existing_jsonl(folder_path, ch_name):
                             if line:
                                 entry = _json.loads(line)
                                 title = entry.get("title", "")
-                                existing.add(title)
-                                dur = entry.get("end", 0) - entry.get("start", 0)
-                                if dur > _MAX_SEG:
-                                    bad_titles.add(title)
-                                if dur > _WHISPER_MIN:
-                                    _has_long_seg.add(title)
-                                if "words" in entry:
-                                    _has_words.add(title)
+                                if title:
+                                    existing.add(title)
                 except Exception:
                     pass
-    stale_whisper = _has_long_seg - _has_words - bad_titles
-    return existing, bad_titles, stale_whisper
-
-
-def _fix_long_segments_in_jsonl(folder_path, ch_name):
-    """In-place repair: split any segment > 35 s into ≤30 s chunks.
-
-    Used for Whisper-transcribed videos where re-fetching auto-captions is not
-    possible.  The text is split proportionally across the sub-segments so that
-    existing JSONL entries are corrected without requiring re-transcription.
-    Returns the number of segments that were split.
-    """
-    import json as _json
-    _WORD_TS_BUFFER = 0.5  # seconds of tolerance when scoping words to a sub-segment
-    _MAX_SEG = 35.0
-    _TARGET = 30.0
-    fixed_count = 0
-    for dirpath, _dirs, files in os.walk(folder_path):
-        for f in files:
-            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
-                continue
-            fpath = os.path.join(dirpath, f)
-            try:
-                with open(fpath, "r", encoding="utf-8") as fh:
-                    raw_lines = fh.readlines()
-                new_lines = []
-                changed = False
-                for line in raw_lines:
-                    stripped = line.strip()
-                    if not stripped:
-                        new_lines.append(line)
-                        continue
-                    try:
-                        entry = _json.loads(stripped)
-                    except Exception:
-                        new_lines.append(line)
-                        continue
-                    dur = entry.get("end", 0) - entry.get("start", 0)
-                    if dur <= _MAX_SEG:
-                        new_lines.append(line)
-                        continue
-                    # Split this segment
-                    changed = True
-                    fixed_count += 1
-                    words = entry.get("text", "").split()
-                    seg_start = entry.get("start", 0)
-                    seg_end   = entry.get("end", seg_start + dur)
-                    parent_words = entry.get("words")  # may be None or list
-                    n_chunks  = max(2, int(dur / _TARGET) + (1 if dur % _TARGET > 1 else 0))
-                    chunk_dur = dur / n_chunks
-                    words_per = max(1, len(words) // n_chunks)
-                    for ci in range(n_chunks):
-                        w0 = ci * words_per
-                        w1 = w0 + words_per if ci < n_chunks - 1 else len(words)
-                        chunk_text = " ".join(words[w0:w1])
-                        if not chunk_text:
-                            continue
-                        cs = round(seg_start + ci * chunk_dur, 2)
-                        ce = round(min(seg_end, seg_start + (ci + 1) * chunk_dur), 2)
-                        sub = dict(entry)
-                        sub["start"] = cs
-                        sub["end"]   = ce
-                        sub["text"]  = chunk_text
-                        # Scope the word-level timestamps to this sub-segment's
-                        # time range so seek-on-click resolves correctly.
-                        if parent_words and isinstance(parent_words, list):
-                            scoped = [w for w in parent_words
-                                      if isinstance(w, dict)
-                                      and cs - _WORD_TS_BUFFER <= w.get("s", -1) <= ce + _WORD_TS_BUFFER]
-                            sub["words"] = scoped if scoped else _generate_distributed_words(chunk_text, cs, ce)
-                        else:
-                            sub["words"] = _generate_distributed_words(chunk_text, cs, ce)
-                        new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
-                if changed:
-                    with open(fpath, "w", encoding="utf-8") as fh:
-                        fh.writelines(new_lines)
-                    _hide_file_win(fpath)
-            except Exception:
-                pass
-    return fixed_count
+    return existing
 
 
 def _remove_jsonl_entries_for_title(jsonl_path, title):
@@ -6759,162 +6683,6 @@ def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
                 _remove_jsonl_entries_for_title(os.path.join(dirpath, f), title)
-
-
-def _rescope_words_in_jsonl(folder_path, ch_name):
-    """One-time migration: filter each entry's ``words`` list so that only words
-    within the entry's time range (with a small buffer) remain.
-
-    Previous versions of ``_fix_long_segments_in_jsonl`` copied the *entire*
-    parent word list into each sub-segment.  That caused word-timestamp lookups
-    to resolve to the beginning of the parent segment (often t~0) regardless of
-    where the user clicked.  This pass corrects those entries in-place.
-
-    Returns the number of entries whose word lists were re-scoped.
-    """
-    import json as _json
-    _BUF = 0.5  # seconds of tolerance — matches _WORD_TS_BUFFER in the fix function
-    rescoped = 0
-    for dirpath, _dirs, files in os.walk(folder_path):
-        for f in files:
-            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
-                continue
-            fpath = os.path.join(dirpath, f)
-            try:
-                with open(fpath, "r", encoding="utf-8") as fh:
-                    raw_lines = fh.readlines()
-                new_lines = []
-                changed = False
-                for line in raw_lines:
-                    stripped = line.strip()
-                    if not stripped:
-                        new_lines.append(line)
-                        continue
-                    try:
-                        entry = _json.loads(stripped)
-                    except Exception:
-                        new_lines.append(line)
-                        continue
-                    words = entry.get("words")
-                    if not words or not isinstance(words, list):
-                        new_lines.append(line)
-                        continue
-                    s = entry.get("start", 0)
-                    e = entry.get("end", s)
-                    scoped = [w for w in words
-                              if isinstance(w, dict)
-                              and s - _BUF <= w.get("s", -1) <= e + _BUF]
-                    if len(scoped) < len(words):
-                        entry["words"] = scoped
-                        changed = True
-                        rescoped += 1
-                        new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
-                    else:
-                        new_lines.append(line)
-                if changed:
-                    with open(fpath, "w", encoding="utf-8") as fh:
-                        fh.writelines(new_lines)
-                    _hide_file_win(fpath)
-            except Exception:
-                pass
-    return rescoped
-
-
-def _dedup_jsonl(folder_path, ch_name):
-    """Remove duplicate JSONL entries (same title + same start time).
-
-    Returns the number of duplicate lines removed.
-    """
-    import json as _json
-    removed = 0
-    for dirpath, _dirs, files in os.walk(folder_path):
-        for f in files:
-            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
-                continue
-            fpath = os.path.join(dirpath, f)
-            try:
-                with open(fpath, "r", encoding="utf-8") as fh:
-                    raw_lines = fh.readlines()
-                seen = set()
-                new_lines = []
-                changed = False
-                for line in raw_lines:
-                    stripped = line.strip()
-                    if not stripped:
-                        new_lines.append(line)
-                        continue
-                    try:
-                        entry = _json.loads(stripped)
-                        key = (entry.get("title", ""), round(entry.get("start", 0), 2))
-                        if key in seen:
-                            changed = True
-                            removed += 1
-                            continue
-                        seen.add(key)
-                    except Exception:
-                        pass
-                    new_lines.append(line)
-                if changed:
-                    with open(fpath, "w", encoding="utf-8") as fh:
-                        fh.writelines(new_lines)
-                    _hide_file_win(fpath)
-            except Exception:
-                pass
-    return removed
-
-
-def _fill_missing_words_in_jsonl(folder_path, ch_name):
-    """Add evenly-distributed word timestamps to any JSONL entry that lacks them.
-
-    This ensures every entry in the index has word-level timestamps for the
-    transcript viewer's seek-on-click feature.  Entries that already have a
-    non-empty ``words`` list are left untouched.
-
-    Returns the number of entries that had words added.
-    """
-    import json as _json
-    filled = 0
-    for dirpath, _dirs, files in os.walk(folder_path):
-        for f in files:
-            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
-                continue
-            fpath = os.path.join(dirpath, f)
-            try:
-                with open(fpath, "r", encoding="utf-8") as fh:
-                    raw_lines = fh.readlines()
-                new_lines = []
-                changed = False
-                for line in raw_lines:
-                    stripped = line.strip()
-                    if not stripped:
-                        new_lines.append(line)
-                        continue
-                    try:
-                        entry = _json.loads(stripped)
-                    except Exception:
-                        new_lines.append(line)
-                        continue
-                    existing_words = entry.get("words")
-                    if existing_words and isinstance(existing_words, list) and len(existing_words) > 0:
-                        new_lines.append(line)
-                        continue
-                    text = entry.get("text", "")
-                    s = entry.get("start", 0)
-                    e = entry.get("end", s)
-                    if text.strip() and e > s:
-                        entry["words"] = _generate_distributed_words(text, s, e)
-                        changed = True
-                        filled += 1
-                        new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
-                    else:
-                        new_lines.append(line)
-                if changed:
-                    with open(fpath, "w", encoding="utf-8") as fh:
-                        fh.writelines(new_lines)
-                    _hide_file_win(fpath)
-            except Exception:
-                pass
-    return filled
 
 
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
@@ -7559,9 +7327,10 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             if not _is_simple_mode:
                 log(f"\n  [{idx}/{total}] {fname} ({dur_str})\n", "simpleline")
 
-            # Build temp output path
+            # Build temp output path (keep original extension so os.replace
+            # doesn't leave a container/extension mismatch, e.g. .mkv with MP4 data)
             base, ext = os.path.splitext(fpath)
-            temp_path = base + "_TEMP_COMPRESS.mp4"
+            temp_path = base + "_TEMP_COMPRESS" + ext
 
             # Build ffmpeg command
             cmd = [
@@ -7968,7 +7737,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             # yt-dlp may produce a file with different extension after merge
                             found_dl = None
                             for f_temp in os.listdir(temp_dir):
-                                if f_temp.startswith(vid_id) and not f_temp.endswith("_compressed.mp4"):
+                                if f_temp.startswith(vid_id) and "_compressed" not in f_temp:
                                     found_dl = os.path.join(temp_dir, f_temp)
                                     break
                             if found_dl:
@@ -7982,8 +7751,9 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         batch_errors += 1
                         continue
 
-                    # Compress with ffmpeg
-                    compressed_path = os.path.join(temp_dir, f"{vid_id}_compressed.mp4")
+                    # Compress with ffmpeg (use original extension to avoid container mismatch)
+                    _orig_ext = os.path.splitext(orig_path)[1] or ".mp4"
+                    compressed_path = os.path.join(temp_dir, f"{vid_id}_compressed{_orig_ext}")
 
                     # Get duration for progress reporting
                     _bl_duration = _ffprobe_duration(dl_path)
@@ -8973,11 +8743,25 @@ def _fetch_auto_captions(video_id, temp_dir):
             return False
 
     def _try_parse_vtt():
-        """Check for .vtt files and parse if found.  Returns (text, segments, vtt_files)."""
+        """Check for .vtt files and parse if found.  Returns (text, segments, vtt_files).
+        Prefers auto-generated subs (contain <c> tags with real word timestamps)
+        over manual subs (which only get interpolated timestamps)."""
         vtt_files = glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*.vtt"))
         if not vtt_files:
             return None, [], []
+        # Prefer auto-generated VTT — it has <c> tags with real word timestamps.
+        # Manual subs typically don't have .en-orig in the filename.
         vtt_path = vtt_files[0]
+        if len(vtt_files) > 1:
+            for vf in vtt_files:
+                try:
+                    with open(vf, "r", encoding="utf-8") as _vf:
+                        _sample = _vf.read(2000)
+                    if "<c>" in _sample or "<c " in _sample:
+                        vtt_path = vf  # has <c> tags — real word timestamps
+                        break
+                except Exception:
+                    pass
         text = _parse_vtt_to_text(vtt_path)
         segments = _parse_vtt_to_segments(vtt_path)
         return text, segments, vtt_files
@@ -9004,11 +8788,11 @@ def _fetch_auto_captions(video_id, temp_dir):
         log(f"    yt-dlp: {_err_preview}\n", "dim")
 
     # Cleanup temp files
-    try:
-        for vf in vtt_files:
+    for vf in vtt_files:
+        try:
             os.remove(vf)
-    except Exception:
-        pass
+        except Exception:
+            pass
     return (text if text else None), segments
 
 
@@ -9644,75 +9428,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if already_done:
                 log(f"  {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
 
-            # One-time migration: delete old JSONL files so they get regenerated
-            # with the improved merged-segment parser (v15.4 fix).
-            # For brand-new channels (already_done is empty), skip deletion but still
-            # set the flag so Phase B (GPU task) doesn't re-trigger and wipe Phase A's files.
-            _migration_key = f"jsonl_v154_migrated_{ch_name}"
-            if not config.get(_migration_key):
-                if already_done:
-                    for _dp, _dns, _fns in os.walk(folder):
-                        for _fn in _fns:
-                            if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
-                                try:
-                                    os.remove(os.path.join(_dp, _fn))
-                                except Exception:
-                                    pass
-                with config_lock:
-                    config[_migration_key] = True
-                    save_config(config)
-            # One-time migration: delete JSONL files so they get regenerated with
-            # per-word timestamps extracted from VTT <c> tags.  Without this, old
-            # entries (no "words" field, segments > 8 s) are endlessly re-flagged
-            # as stale_whisper on every run.
-            _wt_key = f"jsonl_word_ts_migrated_{ch_name}"
-            if not config.get(_wt_key):
-                if already_done:
-                    for _dp, _dns, _fns in os.walk(folder):
-                        for _fn in _fns:
-                            if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
-                                try:
-                                    os.remove(os.path.join(_dp, _fn))
-                                except Exception:
-                                    pass
-                with config_lock:
-                    config[_wt_key] = True
-                    save_config(config)
-            # ── One-time JSONL migrations (gated by config key) ───────
-            # Runs: dedup → fix long segments → rescope words → fill missing words.
-            # After this, every JSONL entry has ≤30 s segments and word timestamps.
-            _mig_key = f"jsonl_migrations_v3_{ch_name}"
-            if not config.get(_mig_key) and already_done:
-                log("  Running one-time JSONL cleanup...\n", "simpleline")
-                _dd = _dedup_jsonl(folder, ch_name)
-                if _dd:
-                    log(f"  ✓ Removed {_dd} duplicate JSONL entry/entries.\n", "simpleline_green")
-                _sf = _fix_long_segments_in_jsonl(folder, ch_name)
-                if _sf:
-                    log(f"  ✓ Split {_sf} oversized segment(s) into ≤30 s chunks.\n", "simpleline_green")
-                _rs = _rescope_words_in_jsonl(folder, ch_name)
-                if _rs:
-                    log(f"  ✓ Re-scoped word timestamps in {_rs} entry/entries.\n", "simpleline_green")
-                _fw = _fill_missing_words_in_jsonl(folder, ch_name)
-                if _fw:
-                    log(f"  ✓ Generated word timestamps for {_fw} entry/entries.\n", "simpleline_green")
-                if not _dd and not _sf and not _rs and not _fw:
-                    log("  ✓ JSONL data already clean.\n", "simpleline_green")
-                with config_lock:
-                    config[_mig_key] = True
-                    save_config(config)
-
-            _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = (
-                _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set(), set()))
-
-            # After the one-time migration, bad/stale should be empty.  If any
-            # remain (edge cases), accept them to prevent infinite loops.
-            if _jsonl_bad:
-                _jsonl_bad.clear()
-            if _jsonl_stale_whisper:
-                _jsonl_stale_whisper.clear()
-
-            _jsonl_existing = _jsonl_existing_raw
+            _jsonl_existing = (
+                _scan_existing_jsonl(folder, ch_name) if already_done else set())
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
             if not files_to_process and not _jsonl_needed:
@@ -9829,15 +9546,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 if _backfill_list:
                     _bf_total = len(_backfill_list)
-                    _bf_repair_count   = sum(1 for t, _ in _backfill_list if t in _jsonl_bad)
-                    _bf_rewhisp_count  = sum(1 for t, _ in _backfill_list if t in _jsonl_stale_whisper)
-                    _parts = []
-                    if _bf_repair_count:
-                        _parts.append(f"{_bf_repair_count} timestamp repair(s)")
-                    if _bf_rewhisp_count:
-                        _parts.append(f"{_bf_rewhisp_count} Whisper re-transcription(s) for word timestamps")
-                    _suffix = f" ({', '.join(_parts)})" if _parts else ""
-                    log(f"  Generating searchable .jsonl for {_bf_total} video(s){_suffix}...\n", "simpleline")
+                    log(f"  Generating searchable .jsonl for {_bf_total} video(s)...\n", "simpleline")
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
@@ -10884,7 +10593,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
-        _transcribe_sync_controlled = (cancel_ev is None)
+        _transcribe_sync_controlled = False  # Manual transcription never blocks sync-pipeline jobs
         if not _sync_mode:
             _current_job["label"] = f"M.T. {fname}"
             _current_job["url"] = None
@@ -11063,7 +10772,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
-        _transcribe_sync_controlled = (cancel_ev is None)
+        _transcribe_sync_controlled = False  # Manual folder transcription never blocks sync-pipeline jobs
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {folder_name}")
 
@@ -11277,9 +10986,23 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
             if not _sync_mode:
                 _stop_whisper_process()
+                _stop_punct_process()   # Free GPU memory
                 if not _sync_running:
                     _tray_stop_spin()
                     _update_tray_tooltip("YT Archiver — Idle")
+                    _current_job["label"] = None
+                    _current_job["url"] = None
+                _update_queue_btn()
+            if not _sync_mode:
+                _ui_queue.append(_sync_task_finished)
+            # Process any queued jobs in insertion order (only when not in sync_mode)
+            if not _sync_mode:
+                if _skip_current.is_set():
+                    _skip_current.clear()
+                    cancel_event.clear()
+                    _process_next_queued()
+                elif not _ce.is_set():
+                    _process_next_queued()
 
     if _sync_mode:
         _worker()
@@ -14070,7 +13793,10 @@ def stop_downloads():
     with _queue_order_lock:
         _queue_order.clear()
 
-    # Reset flags immediately so context-menu actions work right after cancel
+    # Signal cancellation FIRST so worker threads see it immediately
+    cancel_event.set()
+
+    # Reset flags so context-menu actions work right after cancel
     _sync_running = False
     _reorg_running = False
     _transcribe_running = False
@@ -14088,8 +13814,6 @@ def stop_downloads():
 
     _update_queue_btn()
     _update_gpu_btn()
-
-    cancel_event.set()
 
     _validate_download_btn()
     sync_btn.config(state="normal", text="🔄 Sync Subbed")
@@ -17402,6 +17126,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_frame      = self._build_frequency_section(self._content)
         self._bookmarks_frame = self._build_bookmarks_section(self._content)
         self._index_frame     = self._build_index_section(self._content)
+        self._player_frame    = self._build_player_section(self._content)
 
         self._show_section("browse")
 
@@ -17413,6 +17138,7 @@ class _TranscriptionPanel(ttk.Frame):
             "frequency": self._freq_frame,
             "bookmarks": self._bookmarks_frame,
             "index":     self._index_frame,
+            "player":    self._player_frame,
         }
         for k, f in frames.items():
             if k == key:
@@ -17422,6 +17148,10 @@ class _TranscriptionPanel(ttk.Frame):
         for k, btn in self._nav_btns.items():
             btn.config(bg=self._TP_ACCENT if k == key else self._TP_SIDEBAR,
                        fg="white" if k == key else self._TP_FG)
+
+        # Stop embedded VLC player when navigating away from it
+        if key != "player" and self._player_active:
+            self._player_stop_vlc()
 
         # Auto-populate frequency words from a recent search and plot automatically
         if key == "frequency":
@@ -17479,6 +17209,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_tree.pack(fill="both", expand=True)
         self._browse_tree.bind("<<TreeviewSelect>>", self._on_browse_select)
         self._browse_tree.bind("<<TreeviewOpen>>", self._on_browse_open)
+        self._browse_tree.bind("<Button-3>", self._on_browse_tree_rightclick)
         pane.add(left, minsize=200, width=240)
 
         # Right: transcript viewer
@@ -17714,6 +17445,62 @@ class _TranscriptionPanel(ttk.Frame):
         if first:
             self._browse_viewer.see(first)
 
+    def _on_browse_tree_rightclick(self, event):
+        """Right-click on a video title in the browse tree → context menu."""
+        item = self._browse_tree.identify_row(event.y)
+        if not item:
+            return
+        self._browse_tree.selection_set(item)
+        meta = self._browse_items.get(item)
+        if not meta or meta["type"] != "title":
+            return
+
+        title      = meta["title"]
+        channel    = meta.get("channel", "")
+        jsonl_path = meta.get("jsonl_path")
+        txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
+        video_path = self._find_video_file(title, txt_path)
+
+        # Fetch DB rows and find video_id
+        _db_rows = None
+        video_id = None
+        if self._conn and title:
+            try:
+                _db_rows = self._conn.execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (title,)).fetchall()
+                if _db_rows:
+                    video_id = _db_rows[0][0]
+            except Exception:
+                pass
+
+        menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                       activebackground=self._TP_ACCENT, activeforeground="white",
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
+
+        if video_path:
+            menu.add_command(label="  ▶  Play from beginning",
+                             command=lambda: self._open_vlc(
+                                 video_path, 0, title=title,
+                                 db_rows=_db_rows))
+        else:
+            menu.add_command(label="  ▶  Play from beginning  (file not found)",
+                             state="disabled")
+
+        if video_id:
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            menu.add_command(label="  Open Video — YouTube",
+                             command=lambda u=url: _webbrowser.open(u))
+        else:
+            menu.add_command(label="  Open Video — YouTube  (no ID)",
+                             state="disabled")
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _on_browse_word_double_click(self, event):
         """Double-clicking a word in the browse viewer opens the Open Local/YT menu."""
         sel = self._browse_tree.selection()
@@ -17790,11 +17577,24 @@ class _TranscriptionPanel(ttk.Frame):
                        activebackground=self._TP_ACCENT, activeforeground="white",
                        disabledforeground=self._TP_DIM, relief="flat", bd=1)
 
+        # Fetch DB rows for embedded player transcript sync
+        _browse_db_rows = None
+        if self._conn and title:
+            try:
+                _browse_db_rows = self._conn.execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (title,)).fetchall()
+            except Exception:
+                pass
+
         if video_path:
-            menu.add_command(label="  Open Video — Local",
-                             command=lambda: self._open_vlc(video_path, ts))
+            menu.add_command(label="  ▶  Play from this point",
+                             command=lambda: self._open_vlc(
+                                 video_path, ts, title=title,
+                                 db_rows=_browse_db_rows))
         else:
-            menu.add_command(label="  Open Video — Local  (file not found)",
+            menu.add_command(label="  ▶  Play from this point  (file not found)",
                              state="disabled")
 
         if video_id:
@@ -18469,7 +18269,13 @@ class _TranscriptionPanel(ttk.Frame):
                 return content[m.start():end].strip()
         return None
 
-    def _open_vlc(self, video_path, start_time=0):
+    def _open_vlc(self, video_path, start_time=0, title="", db_rows=None):
+        """Open video — embedded player if VLC lib available, else external."""
+        if _HAS_VLC:
+            self._open_embedded_player(video_path, start_time, title=title,
+                                       db_rows=db_rows)
+            return True
+        # Fallback: external VLC
         seek = max(0.0, float(start_time))
         for vlc in self._VLC_PATHS:
             try:
@@ -18653,12 +18459,26 @@ class _TranscriptionPanel(ttk.Frame):
         ts    = self._interpolate_ts(
             meta["start"], meta["end"], meta.get("seg_text", ""), query)
 
+        # Fetch DB rows for embedded player
+        _search_db_rows = None
+        _search_title = meta.get("title", "")
+        if self._conn and _search_title:
+            try:
+                _search_db_rows = self._conn.execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (_search_title,)).fetchall()
+            except Exception:
+                pass
+
         if meta.get("video_path"):
-            menu.add_command(label="  Open Video — Local",
+            menu.add_command(label="  ▶  Play from this point",
                              command=lambda t=ts:
-                                 self._open_vlc(meta["video_path"], t))
+                                 self._open_vlc(meta["video_path"], t,
+                                                title=_search_title,
+                                                db_rows=_search_db_rows))
         else:
-            menu.add_command(label="  Open Video — Local  (file not found)",
+            menu.add_command(label="  ▶  Play from this point  (file not found)",
                              state="disabled")
 
         if meta.get("video_id"):
@@ -19237,6 +19057,7 @@ class _TranscriptionPanel(ttk.Frame):
             return
         try:
             by_month = self._freq_by_month
+            channels = self._get_freq_selected_channels()
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 w = _csv.writer(fh)
                 w.writerow(["Period"] + self._freq_words)
@@ -19254,8 +19075,10 @@ class _TranscriptionPanel(ttk.Frame):
                                 "WHERE s.id IN (SELECT rowid FROM segments_fts "
                                 "WHERE segments_fts MATCH ?) "
                                 "AND s.year=?"))
+                        params = [fts_q, key]
+                        sql = self._append_channel_filter(sql, params, channels)
                         try:
-                            cnt = self._conn.execute(sql, (fts_q, key)).fetchone()[0]
+                            cnt = self._conn.execute(sql, params).fetchone()[0]
                         except Exception:
                             cnt = 0
                         row_data.append(cnt)
@@ -19298,6 +19121,518 @@ class _TranscriptionPanel(ttk.Frame):
         self._show_section("search")
         self._do_search()
 
+    # ── Embedded Player section ────────────────────────────────────────────────
+
+    def _build_player_section(self, parent):
+        f = tk.Frame(parent, bg=self._TP_BG)
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=3)   # video area
+        f.rowconfigure(3, weight=2)   # transcript area
+
+        # Header bar with title and close button
+        hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=6)
+        hdr.grid(row=0, column=0, sticky="ew")
+        self._player_title_lbl = tk.Label(hdr, text="Video Player", bg=self._TP_BG3,
+                                          fg=self._TP_FG, font=("Segoe UI", 11, "bold"))
+        self._player_title_lbl.pack(side="left")
+        close_btn = tk.Label(hdr, text="✕ Close", bg=self._TP_BG3, fg=self._TP_DIM,
+                             font=("Segoe UI", 9), cursor="hand2", padx=8)
+        close_btn.pack(side="right")
+        close_btn.bind("<Button-1>", lambda e: self._close_player())
+        close_btn.bind("<Enter>", lambda e: close_btn.config(fg=self._TP_RED))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=self._TP_DIM))
+
+        # Video canvas (VLC renders into this)
+        self._player_canvas = tk.Frame(f, bg="black", width=640, height=360)
+        self._player_canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 0))
+        # Bind click on canvas for play/pause (only works before VLC takes over hwnd)
+        self._player_canvas.bind("<Button-1>", lambda e: self._player_toggle_pause())
+
+        # Controls bar — reset cursor on entry to prevent "stuck" cursor
+        ctrl = tk.Frame(f, bg=self._TP_BG2, pady=6, padx=10, cursor="arrow")
+        ctrl.grid(row=2, column=0, sticky="ew", padx=8)
+        ctrl.bind("<Enter>", lambda e: ctrl.config(cursor="arrow"))
+        ctrl.columnconfigure(2, weight=1)
+
+        self._player_play_btn = tk.Label(ctrl, text="▶", bg=self._TP_BG2,
+                                         fg=self._TP_ACCENT, font=("Segoe UI", 14),
+                                         cursor="hand2")
+        self._player_play_btn.grid(row=0, column=0, padx=(0, 10))
+        self._player_play_btn.bind("<Button-1>", lambda e: self._player_toggle_pause())
+
+        self._player_time_lbl = tk.Label(ctrl, text="0:00 / 0:00", bg=self._TP_BG2,
+                                         fg=self._TP_DIM, font=("Segoe UI", 9))
+        self._player_time_lbl.grid(row=0, column=1, padx=(0, 10))
+
+        self._player_slider = tk.Scale(ctrl, from_=0, to=1000, orient="horizontal",
+                                       bg=self._TP_BG2, fg=self._TP_FG,
+                                       troughcolor=self._TP_BG, highlightthickness=0,
+                                       sliderrelief="flat", bd=0, showvalue=False,
+                                       sliderlength=14, width=10,
+                                       activebackground=self._TP_ACCENT)
+        self._player_slider.grid(row=0, column=2, sticky="ew", padx=(0, 10))
+        self._player_slider.bind("<ButtonRelease-1>", self._player_on_slider_release)
+        self._player_seeking = False
+
+        vol_lbl = tk.Label(ctrl, text="🔊", bg=self._TP_BG2, fg=self._TP_DIM,
+                           font=("Segoe UI", 10))
+        vol_lbl.grid(row=0, column=3, padx=(0, 4))
+        self._player_vol = tk.Scale(ctrl, from_=0, to=100, orient="horizontal",
+                                    bg=self._TP_BG2, fg=self._TP_FG,
+                                    troughcolor=self._TP_BG, highlightthickness=0,
+                                    sliderrelief="flat", bd=0, showvalue=False,
+                                    sliderlength=12, width=8, length=80,
+                                    activebackground=self._TP_ACCENT,
+                                    command=self._player_on_volume)
+        self._player_vol.set(20)
+        self._player_vol.grid(row=0, column=4)
+        self._player_vol_debounce_id = None  # for debouncing volume changes
+
+        # Synced transcript viewer
+        tf = tk.Frame(f, bg=self._TP_BG)
+        tf.grid(row=3, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+        self._player_transcript = tk.Text(tf, bg="#1a1c1f", fg=self._TP_FG,
+                                          font=("Segoe UI", 10), wrap="word",
+                                          relief="flat", padx=12, pady=10,
+                                          state="disabled", cursor="hand2")
+        pt_sb = ttk.Scrollbar(tf, orient="vertical", command=self._player_transcript.yview)
+        self._player_transcript.configure(yscrollcommand=pt_sb.set)
+        pt_sb.grid(row=0, column=1, sticky="ns")
+        self._player_transcript.grid(row=0, column=0, sticky="nsew")
+        self._player_transcript.tag_configure("active_word",
+                                              background=self._TP_ACCENT, foreground="white")
+        self._player_transcript.tag_configure("active_seg",
+                                              background="#1a2535")
+        self._player_transcript.tag_configure("header",
+                                              foreground=self._TP_ACCENT,
+                                              font=("Segoe UI", 10, "bold"))
+        self._player_transcript.bind("<Button-1>", self._player_on_transcript_click)
+
+        # Internal player state
+        self._vlc_instance  = None
+        self._vlc_player    = None
+        self._player_active = False
+        self._player_poll_id = None
+        self._player_words  = []   # [{"w": str, "s": float, "e": float, "tag": str}, ...]
+        self._player_segs   = []   # [(start, end, text, char_start, char_end), ...]
+        self._player_video_path = None
+        self._player_last_word_idx = -1
+
+        self._player_vol_pending = False
+        self._player_seek_pending = 0.0
+
+        return f
+
+    def _open_embedded_player(self, video_path, start_time=0, title="",
+                              db_rows=None):
+        """Open a video in the embedded player with synced transcript."""
+        if not _HAS_VLC:
+            return self._open_vlc(video_path, start_time)
+
+        self._player_video_path = video_path
+        self._player_title_lbl.config(
+            text=title if title else os.path.basename(video_path))
+
+        # ── Build transcript ──────────────────────────────────────────
+        self._player_words = []
+        self._player_segs = []
+        self._player_prev_tag = None  # for efficient highlight removal
+        self._player_transcript.config(state="normal")
+        self._player_transcript.delete("1.0", "end")
+
+        # Strategy: use the .txt file for display (punctuated, complete,
+        # no duplicates), then map word-level timestamps proportionally.
+        body = ""
+        txt_body_found = False
+
+        # Try to find the .txt transcript file from the video path
+        if video_path and title:
+            vdir = os.path.dirname(video_path)
+            # Search for .txt files in the directory and up to 2 parents
+            search_dirs = [vdir]
+            for _ in range(2):
+                p = os.path.dirname(search_dirs[-1])
+                if p != search_dirs[-1]:
+                    search_dirs.append(p)
+            for sd in search_dirs:
+                try:
+                    for fn in os.listdir(sd):
+                        if fn.lower().endswith('.txt') and not fn.startswith('.'):
+                            fpath = os.path.join(sd, fn)
+                            section = self._get_txt_section(fpath, title)
+                            if section:
+                                lines = section.split('\n', 1)
+                                body = lines[1].strip() if len(lines) > 1 else ""
+                                if body:
+                                    txt_body_found = True
+                            if txt_body_found:
+                                break
+                except Exception:
+                    pass
+                if txt_body_found:
+                    break
+
+        if not txt_body_found and db_rows:
+            # Fallback: join seg_text but deduplicate overlapping portions.
+            # Only include seg_text that starts AFTER the previous segment's
+            # end time to avoid rolling-caption duplicates.
+            parts = []
+            max_end = -1.0
+            for vid, start, end, seg_text, words_json in db_rows:
+                if start >= max_end - 0.5:  # new content
+                    parts.append(seg_text)
+                max_end = max(max_end, end)
+            body = " ".join(parts)
+
+        if body:
+            self._player_transcript.insert("end", body + "\n")
+        else:
+            self._player_transcript.insert("end",
+                "(No transcript data available for this video.)\n")
+
+        # ── Build word timing map ─────────────────────────────────────
+        # Collect all words with timestamps from DB, deduplicate, sort.
+        all_words = []
+        if db_rows:
+            for vid, start, end, seg_text, words_json in db_rows:
+                if words_json:
+                    try:
+                        wlist = json.loads(words_json)
+                        for w in wlist:
+                            all_words.append((
+                                w.get("s", start),
+                                w.get("e", end),
+                                w["w"]
+                            ))
+                    except Exception:
+                        pass
+            all_words.sort(key=lambda x: x[0])
+            # Deduplicate by time (overlapping VTT can repeat words)
+            deduped = []
+            for s, e, w in all_words:
+                if deduped and abs(s - deduped[-1][0]) < 0.05:
+                    continue
+                deduped.append((s, e, w))
+            all_words = deduped
+
+        # Map word timestamps to character positions in the displayed body.
+        # Uses sequential forward-matching: a cursor advances through the body
+        # text so each word maps to a position AFTER the previous one.  This
+        # guarantees monotonically increasing positions (no highlight jumping).
+        if all_words and body:
+            body_lower = body.lower()
+            body_len = len(body)
+            cursor = 0       # current search position — only moves forward
+            word_idx = 0
+
+            for s, e, w in all_words:
+                w_lower = w.lower().rstrip(".,!?;:'\"")
+                if not w_lower:
+                    continue
+
+                # Search forward from cursor for this word
+                best_offset = -1
+                search_pos = cursor
+                while search_pos <= body_len - len(w_lower):
+                    idx = body_lower.find(w_lower, search_pos)
+                    if idx == -1:
+                        break
+                    # Verify word boundary
+                    before = body[idx - 1] if idx > 0 else " "
+                    after_i = idx + len(w_lower)
+                    after = body[after_i] if after_i < body_len else " "
+                    if not before.isalpha() and (not after.isalpha()
+                                                  or after in ".,!?;:'\""):
+                        best_offset = idx
+                        break
+                    search_pos = idx + 1
+
+                if best_offset >= 0:
+                    # Determine actual word span (include trailing punctuation)
+                    wend = best_offset + len(w_lower)
+                    while wend < body_len and body[wend] in ".,!?;:'\")-":
+                        wend += 1
+                    tag_name = f"w{word_idx}"
+                    cs = f"1.0+{best_offset}c"
+                    ce = f"1.0+{wend}c"
+                    self._player_transcript.tag_add(tag_name, cs, ce)
+                    self._player_words.append({
+                        "w": w, "s": s, "e": e, "tag": tag_name
+                    })
+                    cursor = wend  # advance cursor past this word
+                    word_idx += 1
+                # If word not found, skip it — don't create a bad mapping
+
+        self._player_transcript.config(state="disabled")
+
+        # Switch to player section
+        self._show_section("player")
+
+        # Initialize VLC — must wait for the canvas to be mapped
+        self.after(100, lambda: self._player_start_vlc(video_path, start_time))
+
+    def _player_start_vlc(self, video_path, start_time=0):
+        """Create VLC instance and start playback."""
+        # Clean up any existing player
+        self._player_stop_vlc()
+
+        try:
+            _vol = self._player_vol.get()
+            self._vlc_instance = _vlc_mod.Instance()
+            self._vlc_player = self._vlc_instance.media_player_new()
+            # Mute until pending volume is applied (prevents loud startup)
+            self._vlc_player.audio_set_mute(True)
+
+            # Embed in the tkinter frame
+            hwnd = self._player_canvas.winfo_id()
+            self._vlc_player.set_hwnd(hwnd)
+
+            # Let mouse/keyboard events pass through to tkinter (click-to-pause)
+            self._vlc_player.video_set_mouse_input(False)
+            self._vlc_player.video_set_key_input(False)
+
+            # Set media
+            media = self._vlc_instance.media_new(video_path)
+            self._vlc_player.set_media(media)
+
+            # Start playback
+            self._vlc_player.play()
+            self._player_active = True
+            self._player_vol_pending = True  # set volume once playing
+
+            # Seek to start time after VLC begins playing
+            if start_time > 0:
+                self._player_seek_pending = float(start_time)
+            else:
+                self._player_seek_pending = 0.0
+
+            # Start polling loop
+            self._player_poll()
+        except Exception as e:
+            messagebox.showerror("Player Error",
+                                 f"Failed to start embedded player:\n{e}\n\n"
+                                 "Falling back to external VLC.")
+            # Fall back directly to external VLC (avoid recursion via _open_vlc)
+            seek = max(0.0, float(start_time))
+            for vlc_path in self._VLC_PATHS:
+                try:
+                    subprocess.Popen([vlc_path, os.path.normpath(video_path),
+                                      f'--start-time={seek:.1f}'])
+                    break
+                except (FileNotFoundError, OSError):
+                    continue
+
+    def _player_stop_vlc(self):
+        """Stop and release the VLC player."""
+        if self._player_poll_id is not None:
+            self.after_cancel(self._player_poll_id)
+            self._player_poll_id = None
+        if self._vlc_player:
+            try:
+                self._vlc_player.stop()
+                self._vlc_player.release()
+            except Exception:
+                pass
+            self._vlc_player = None
+        if self._vlc_instance:
+            try:
+                self._vlc_instance.release()
+            except Exception:
+                pass
+            self._vlc_instance = None
+        self._player_active = False
+
+    def _close_player(self):
+        """Close the player and return to browse."""
+        self._player_stop_vlc()
+        self._player_last_word_idx = -1
+
+        self._show_section("browse")
+
+    def _player_toggle_pause(self):
+        if not self._vlc_player:
+            return
+        if self._vlc_player.is_playing():
+            self._vlc_player.pause()
+            self._player_play_btn.config(text="▶")
+        else:
+            self._vlc_player.play()
+            self._player_play_btn.config(text="⏸")
+
+    def _player_seek(self, time_sec):
+        """Seek to a specific time in seconds."""
+        if not self._vlc_player:
+            return
+        self._vlc_player.set_time(int(time_sec * 1000))
+
+    def _player_on_slider_release(self, event):
+        if not self._vlc_player:
+            return
+        duration = self._vlc_player.get_length()
+        if duration > 0:
+            pos = self._player_slider.get() / 1000.0
+            self._vlc_player.set_position(pos)
+
+    def _player_on_volume(self, val):
+        """Debounced volume change — only calls VLC after slider stops moving."""
+        if self._player_vol_debounce_id is not None:
+            self.after_cancel(self._player_vol_debounce_id)
+        self._player_vol_debounce_id = self.after(
+            50, lambda: self._player_apply_volume(int(float(val))))
+
+    def _player_apply_volume(self, vol):
+        """Actually set VLC volume (called after debounce delay)."""
+        self._player_vol_debounce_id = None
+        if self._vlc_player:
+            try:
+                self._vlc_player.audio_set_volume(vol)
+            except Exception:
+                pass
+
+    def _player_on_transcript_click(self, event):
+        """Click a word in the transcript to seek to it."""
+        if not self._vlc_player or not self._player_words:
+            return
+        idx = self._player_transcript.index(f"@{event.x},{event.y}")
+        # Find which word tag covers this position
+        tags = self._player_transcript.tag_names(idx)
+        for t in tags:
+            if t.startswith("w"):
+                try:
+                    widx = int(t[1:])
+                    if 0 <= widx < len(self._player_words):
+                        seek_time = max(0, self._player_words[widx]["s"] - 0.5)
+                        self._player_seek(seek_time)
+                        # Auto-play if paused
+                        if not self._vlc_player.is_playing():
+                            self._vlc_player.play()
+                            self._player_play_btn.config(text="⏸")
+                        return
+                except ValueError:
+                    pass
+
+    def _fmt_player_time(self, ms):
+        """Format milliseconds to M:SS or H:MM:SS."""
+        s = max(0, ms // 1000)
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _player_poll(self):
+        """Periodic update of slider, time label, and word highlighting."""
+        if not self._player_active or not self._vlc_player:
+            return
+
+        try:
+            state = self._vlc_player.get_state()
+            if state in (_vlc_mod.State.Ended, _vlc_mod.State.Error):
+                self._player_play_btn.config(text="▶")
+                self._player_poll_id = None
+                return
+
+            # Apply pending volume/seek once VLC reports playing
+            if self._vlc_player.is_playing():
+                if getattr(self, '_player_vol_pending', False):
+                    self._vlc_player.audio_set_volume(self._player_vol.get())
+                    self._vlc_player.audio_set_mute(False)
+                    self._player_vol_pending = False
+                seek_t = getattr(self, '_player_seek_pending', 0.0)
+                if seek_t > 0:
+                    self._vlc_player.set_time(int(seek_t * 1000))
+                    self._player_seek_pending = 0.0
+
+            # Update play/pause button
+            if self._vlc_player.is_playing():
+                self._player_play_btn.config(text="⏸")
+            else:
+                self._player_play_btn.config(text="▶")
+
+            # Update time and slider
+            cur_ms = self._vlc_player.get_time()
+            dur_ms = self._vlc_player.get_length()
+            if dur_ms > 0:
+                self._player_time_lbl.config(
+                    text=f"{self._fmt_player_time(cur_ms)} / {self._fmt_player_time(dur_ms)}")
+                pos = self._vlc_player.get_position()
+                self._player_slider.set(int(pos * 1000))
+
+            # Highlight active word
+            cur_sec = cur_ms / 1000.0
+            self._player_highlight_word(cur_sec)
+
+        except Exception:
+            pass
+
+        self._player_poll_id = self.after(30, self._player_poll)
+
+    def _player_highlight_word(self, cur_sec):
+        """Highlight the word currently being spoken — single word, no skipping.
+        Instead of jumping to wherever VLC reports, we step forward one word
+        at a time so every word gets highlighted for at least one poll cycle."""
+        if not self._player_words:
+            return
+
+        # Binary search for the latest word with start <= cur_sec
+        target = -1
+        lo, hi = 0, len(self._player_words) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._player_words[mid]["s"] <= cur_sec:
+                target = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        prev = self._player_last_word_idx
+
+        if target <= prev:
+            # If seeking backward, jump directly
+            if target < prev and target >= 0:
+                pass  # fall through to update below
+            else:
+                return  # no change or still on same word
+
+        # Step forward one word at a time (never skip)
+        if prev >= 0 and target > prev + 1:
+            new_idx = prev + 1  # advance by exactly one
+        else:
+            new_idx = target
+
+        if new_idx == prev:
+            return
+
+        self._player_last_word_idx = new_idx
+
+        # Remove highlight from previous word
+        prev_tag = getattr(self, '_player_prev_tag', None)
+        if prev_tag:
+            try:
+                ranges = self._player_transcript.tag_ranges(prev_tag)
+                if ranges:
+                    self._player_transcript.tag_remove("active_word",
+                                                        ranges[0], ranges[1])
+            except Exception:
+                pass
+
+        # Add highlight to new word
+        if 0 <= new_idx < len(self._player_words):
+            word_data = self._player_words[new_idx]
+            word_tag = word_data["tag"]
+            ranges = self._player_transcript.tag_ranges(word_tag)
+            if ranges:
+                self._player_transcript.tag_add("active_word",
+                                                 ranges[0], ranges[1])
+                # Scroll only every ~5 word changes to avoid jitter
+                if abs(new_idx - (prev if prev >= 0 else 0)) >= 3:
+                    self._player_transcript.see(ranges[0])
+            self._player_prev_tag = word_tag
+        else:
+            self._player_prev_tag = None
+
     # ── Index section ─────────────────────────────────────────────────────────
 
     def _build_index_section(self, parent):
@@ -19314,6 +19649,7 @@ class _TranscriptionPanel(ttk.Frame):
                                      font=("Segoe UI", 9), height=4, relief="flat",
                                      activestyle="none")
         self._roots_lb.pack(fill="x", padx=4, pady=(0, 4))
+        self._roots_lb.bind("<Button-3>", self._roots_lb_rightclick)
         self._refresh_roots_listbox()
 
         btn_r = tk.Frame(rf, bg=self._TP_BG2)
@@ -19359,7 +19695,7 @@ class _TranscriptionPanel(ttk.Frame):
         log_outer.pack(fill="both", expand=True)
         self._log_txt = tk.Text(log_outer, bg=self._TP_BG2, fg="#bbb",
                                  font=("Consolas", 9), relief="flat",
-                                 wrap="word", state="normal")
+                                 wrap="word", state="disabled")
         log_sb = ttk.Scrollbar(log_outer, orient="vertical",
                                 command=self._log_txt.yview)
         self._log_txt.configure(yscrollcommand=log_sb.set)
@@ -19411,6 +19747,122 @@ class _TranscriptionPanel(ttk.Frame):
             save_config(config)
             self._refresh_roots_listbox()
 
+    def _roots_lb_rightclick(self, event):
+        """Right-click context menu on archive roots listbox."""
+        # Select the item under the cursor
+        idx = self._roots_lb.nearest(event.y)
+        if idx < 0:
+            return
+        self._roots_lb.selection_clear(0, "end")
+        self._roots_lb.selection_set(idx)
+
+        # Get the folder path
+        entry_text = self._roots_lb.get(idx)
+        if entry_text.startswith("[auto] "):
+            folder = entry_text[7:]
+        else:
+            folder = entry_text
+
+        if not folder or not os.path.isdir(folder):
+            return
+
+        menu = tk.Menu(self, tearoff=0, bg=self._TP_BG2, fg=self._TP_FG,
+                       activebackground=self._TP_ACCENT, activeforeground="white",
+                       font=("Segoe UI", 10))
+        menu.add_command(
+            label="🗑  Delete All Transcriptions",
+            command=lambda f=folder: self._confirm_delete_all_transcriptions(f))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _confirm_delete_all_transcriptions(self, folder):
+        """Delete all .txt and .jsonl transcript files in a directory tree."""
+        # Count files first
+        txt_files = []
+        jsonl_files = []
+        for dirpath, _dirs, files in os.walk(folder):
+            for f in files:
+                fp = os.path.join(dirpath, f)
+                if f.endswith("Transcript.txt") and not f.startswith("."):
+                    txt_files.append(fp)
+                elif f.endswith("Transcript.jsonl") and f.startswith("."):
+                    jsonl_files.append(fp)
+
+        total = len(txt_files) + len(jsonl_files)
+        if total == 0:
+            messagebox.showinfo("No Transcriptions",
+                                f"No transcript files found in:\n{folder}")
+            return
+
+        msg = (f"This will permanently delete ALL transcript files in:\n\n"
+               f"{folder}\n\n"
+               f"  •  {len(txt_files)} transcript .txt file(s)\n"
+               f"  •  {len(jsonl_files)} hidden .jsonl file(s)\n\n"
+               f"Total: {total} file(s)\n\n"
+               f"This cannot be undone. Are you sure?")
+
+        if not messagebox.askyesno("Delete All Transcriptions", msg,
+                                   icon="warning"):
+            return
+
+        # Second confirmation
+        if not messagebox.askyesno(
+                "Final Confirmation",
+                f"Are you absolutely sure?\n\n"
+                f"All {total} transcript file(s) will be permanently deleted.",
+                icon="warning"):
+            return
+
+        deleted = 0
+        errors = 0
+        for fp in txt_files + jsonl_files:
+            try:
+                # Un-hide before deleting (Windows hidden files)
+                if os.name == "nt":
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetFileAttributesW(fp, 0x80)  # FILE_ATTRIBUTE_NORMAL
+                    except Exception:
+                        pass
+                os.remove(fp)
+                deleted += 1
+            except Exception:
+                errors += 1
+
+        # Clear transcription_complete flag for any channel whose folder
+        # is inside the deleted directory, so the checkmark goes away and
+        # re-transcription is possible without manual config edits.
+        # Also clear one-time migration keys so they re-run on fresh data.
+        folder_norm = os.path.normpath(folder).lower()
+        cleared = 0
+        with config_lock:
+            _out_dir = config.get("output_dir", "").strip() or BASE_DIR
+            for ch in config.get("channels", []):
+                _ch_folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch.get("name", ""))
+                if not _ch_folder_name:
+                    continue
+                ch_folder = os.path.join(_out_dir, _ch_folder_name)
+                if os.path.normpath(ch_folder).lower().startswith(folder_norm):
+                    if ch.get("transcription_complete"):
+                        ch["transcription_complete"] = False
+                        cleared += 1
+                    ch.pop("transcription_pending", None)
+            # Clear JSONL migration keys so they re-run on fresh data
+            keys_to_remove = [k for k in config
+                              if k.startswith(("jsonl_migrations_",
+                                               "jsonl_garbled_fix_",
+                                               "jsonl_hallucination_purge_",
+                                               "jsonl_v154_migrated_"))]
+            for k in keys_to_remove:
+                del config[k]
+            save_config(config)
+
+        result = f"Deleted {deleted} file(s)."
+        if cleared:
+            result += f"\nCleared transcription status for {cleared} channel(s)."
+        if errors:
+            result += f"\n{errors} file(s) could not be deleted."
+        messagebox.showinfo("Transcriptions Deleted", result)
+
     def _refresh_index_stats(self):
         if not self._conn:
             return
@@ -19456,6 +19908,7 @@ class _TranscriptionPanel(ttk.Frame):
             self._log_txt.config(state="normal")
             self._log_txt.insert("end", msg + "\n")
             self._log_txt.see("end")
+            self._log_txt.config(state="disabled")
         self.after(0, _do)
 
     def _start_index(self, rebuild=False):
@@ -20838,10 +21291,19 @@ def _save_queue_state():
     # Prepend the currently-running item's order entry (it was removed from
     # _queue_order when it started running, so it would otherwise become an
     # orphan on load and appear AFTER queued items instead of before them)
-    if _current_sync_ch is not None and _sync_running:
-        saved_order.insert(0, ("sync", _current_sync_ch["url"]))
-    if _current_redownload_item is not None and _redownload_running:
-        saved_order.insert(0, ("redownload", _current_redownload_item["ch_url"]))
+    # Snapshot volatile references to avoid race with worker threads
+    _snap_sync_ch = _current_sync_ch
+    _snap_redownload = _current_redownload_item
+    if _snap_sync_ch is not None and _sync_running:
+        try:
+            saved_order.insert(0, ("sync", _snap_sync_ch["url"]))
+        except (KeyError, TypeError):
+            pass
+    if _snap_redownload is not None and _redownload_running:
+        try:
+            saved_order.insert(0, ("redownload", _snap_redownload["ch_url"]))
+        except (KeyError, TypeError):
+            pass
     queue_data["order"] = saved_order
     try:
         with open(QUEUE_FILE, "w", encoding="utf-8") as f:
@@ -21001,6 +21463,13 @@ def on_closing():
 
     if has_queue:
         _save_queue_state()
+
+    # Stop embedded VLC player if active
+    try:
+        if hasattr(_tp_panel, '_player_stop_vlc'):
+            _tp_panel._player_stop_vlc()
+    except Exception:
+        pass
 
     # Stop the system tray icon
     global _tray_spin_active

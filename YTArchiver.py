@@ -585,11 +585,11 @@ def log(text, tag=None):
                         if _before:
                             log_box.insert(_p, _before, _base_tag)
                             _p = log_box.index(f"{_p}+{len(_before)}c")
-                        log_box.insert(_p, _open_br, _bk_tag)
+                        log_box.insert(_p, _open_br, (_bk_tag, _base_tag))
                         _p = log_box.index(f"{_p}+1c")
                         log_box.insert(_p, _nums, _base_tag)
                         _p = log_box.index(f"{_p}+{len(_nums)}c")
-                        log_box.insert(_p, _close_br, _bk_tag)
+                        log_box.insert(_p, _close_br, (_bk_tag, _base_tag))
                         _p = log_box.index(f"{_p}+1c")
                         if _after:
                             log_box.insert(_p, _after, _base_tag)
@@ -3029,7 +3029,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:05pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:14pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

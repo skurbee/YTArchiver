@@ -540,53 +540,15 @@ def log(text, tag=None):
                 if _had_whisper:
                     _stop_whisper_dot_anim()
 
-                # Place a mark before insertion so we can find the exact position
-                # for bracket coloring — marks survive insert/delete shifts.
-                _did_mark_insert = False
-                if (_is_simple_mode
-                        and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
-                                        "update_sep", "update_head", "simpleline_blue", "simpleline", "simpleline_green",
-                                        "pauselog")):
-                    ss_ranges = log_box.tag_ranges("simplestatus")
-                    if ss_ranges:
-                        log_box.mark_set("_bk_ins", ss_ranges[0])
-                        log_box.mark_gravity("_bk_ins", "left")
-                        _did_mark_insert = True
-                        log_box.insert(ss_ranges[0], text, use_tag)
-                    else:
-                        # No simplestatus — insert before pausestatus anchor if present
-                        _ps_r2 = log_box.tag_ranges("pausestatus")
-                        if _ps_r2:
-                            log_box.mark_set("_bk_ins", _ps_r2[0])
-                            log_box.mark_gravity("_bk_ins", "left")
-                            _did_mark_insert = True
-                            log_box.insert(_ps_r2[0], text, use_tag)
-                        else:
-                            log_box.mark_set("_bk_ins", tk.END)
-                            log_box.mark_gravity("_bk_ins", "left")
-                            _did_mark_insert = True
-                            log_box.insert(tk.END, text, use_tag)
-                elif _is_simple_mode and _ss_insert_pos is not None:
-                    # Insert at the old simplestatus/pausestatus position to avoid jitter
-                    log_box.mark_set("_bk_ins", _ss_insert_pos)
-                    log_box.mark_gravity("_bk_ins", "left")
-                    _did_mark_insert = True
-                    log_box.insert(_ss_insert_pos, text, use_tag)
-                elif _is_simple_mode and use_tag == "pausestatus":
-                    # pausestatus always goes at the very bottom
-                    log_box.insert(tk.END, text, use_tag)
-                else:
-                    log_box.mark_set("_bk_ins", tk.END)
-                    log_box.mark_gravity("_bk_ins", "left")
-                    _did_mark_insert = True
-                    log_box.insert(tk.END, text, use_tag)
-
-                # Apply bracket color overlays: green [ ] for syncs, blue [ ] for transcriptions
-                if _did_mark_insert and use_tag in ("simpleline", "simpleline_green", "header",
-                                                    "transcribe_using"):
+                # --- Determine bracket coloring BEFORE insertion ---
+                # Green [ ] for syncs, blue [ ] for transcriptions.
+                # We split the text into segments so each char gets its tag
+                # at insertion time — no post-hoc tag manipulation needed.
+                _bk_tag = None
+                _bk_m = None
+                if use_tag in ("simpleline", "simpleline_green", "header",
+                               "transcribe_using"):
                     import re as _re_bk
-                    # Determine bracket type from content
-                    _bk_tag = None
                     if any(kw in text for kw in ("SYNCING:", "Downloaded:", "▶")):
                         _bk_tag = "sync_bracket"
                     elif any(kw in text for kw in ("Fetching captions:", "Re-transcribing",
@@ -594,20 +556,52 @@ def log(text, tag=None):
                         _bk_tag = "trans_bracket"
                     if _bk_tag:
                         _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
-                        if _bk_m:
-                            # Use the mark we placed before insertion — it points to where the text starts
-                            _bk_base = log_box.index("_bk_ins")
-                            _bk_open_off = _bk_m.start()
-                            _bk_close_off = _bk_m.end() - 1  # ] is last char of match
-                            _bk_open_pos = log_box.index(f"{_bk_base}+{_bk_open_off}c")
-                            _bk_close_pos = log_box.index(f"{_bk_base}+{_bk_close_off}c")
-                            _bk_open_end = log_box.index(f"{_bk_open_pos}+1c")
-                            _bk_close_end = log_box.index(f"{_bk_close_pos}+1c")
-                            # Remove the base tag from bracket chars so there's no priority conflict
-                            log_box.tag_remove(use_tag, _bk_open_pos, _bk_open_end)
-                            log_box.tag_remove(use_tag, _bk_close_pos, _bk_close_end)
-                            log_box.tag_add(_bk_tag, _bk_open_pos, _bk_open_end)
-                            log_box.tag_add(_bk_tag, _bk_close_pos, _bk_close_end)
+
+                def _segmented_insert(_ins_pos, _txt, _base_tag):
+                    """Insert text at _ins_pos, splitting [N/M] brackets into colored segments."""
+                    if _bk_tag and _bk_m:
+                        _p = _ins_pos
+                        _before = _txt[:_bk_m.start()]
+                        _open_br = _txt[_bk_m.start():_bk_m.start() + 1]     # [
+                        _nums = _txt[_bk_m.start() + 1:_bk_m.end() - 1]       # N/M
+                        _close_br = _txt[_bk_m.end() - 1:_bk_m.end()]         # ]
+                        _after = _txt[_bk_m.end():]
+                        if _before:
+                            log_box.insert(_p, _before, _base_tag)
+                            _p = log_box.index(f"{_p}+{len(_before)}c")
+                        log_box.insert(_p, _open_br, _bk_tag)
+                        _p = log_box.index(f"{_p}+1c")
+                        log_box.insert(_p, _nums, _base_tag)
+                        _p = log_box.index(f"{_p}+{len(_nums)}c")
+                        log_box.insert(_p, _close_br, _bk_tag)
+                        _p = log_box.index(f"{_p}+1c")
+                        if _after:
+                            log_box.insert(_p, _after, _base_tag)
+                    else:
+                        log_box.insert(_ins_pos, _txt, _base_tag)
+
+                if (_is_simple_mode
+                        and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
+                                        "update_sep", "update_head", "simpleline_blue", "simpleline", "simpleline_green",
+                                        "pauselog")):
+                    ss_ranges = log_box.tag_ranges("simplestatus")
+                    if ss_ranges:
+                        _segmented_insert(ss_ranges[0], text, use_tag)
+                    else:
+                        # No simplestatus — insert before pausestatus anchor if present
+                        _ps_r2 = log_box.tag_ranges("pausestatus")
+                        if _ps_r2:
+                            _segmented_insert(_ps_r2[0], text, use_tag)
+                        else:
+                            _segmented_insert(tk.END, text, use_tag)
+                elif _is_simple_mode and _ss_insert_pos is not None:
+                    # Insert at the old simplestatus/pausestatus position to avoid jitter
+                    _segmented_insert(_ss_insert_pos, text, use_tag)
+                elif _is_simple_mode and use_tag == "pausestatus":
+                    # pausestatus always goes at the very bottom
+                    log_box.insert(tk.END, text, use_tag)
+                else:
+                    _segmented_insert(tk.END, text, use_tag)
 
                 # Apply overlay tags for transcribe_using in simple mode so the
                 # [idx/total] prefix and quoted video title appear white over blue
@@ -2958,7 +2952,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:42pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 7:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

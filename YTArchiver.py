@@ -3029,7 +3029,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18399,9 +18399,37 @@ class _TranscriptionPanel(ttk.Frame):
                 return True
             except (FileNotFoundError, OSError):
                 continue
-        messagebox.showerror("VLC not found",
-                             "Could not find VLC. Install it or add it to PATH.")
+        self._show_vlc_not_found()
         return False
+
+    def _show_vlc_not_found(self):
+        """Show a dialog with a download button when VLC is not installed."""
+        import webbrowser
+        dlg = tk.Toplevel(self.winfo_toplevel())
+        dlg.title("VLC not found")
+        dlg.configure(bg=C_BG)
+        dlg.resizable(False, False)
+        dlg.transient(self.winfo_toplevel())
+        dlg.grab_set()
+        tk.Label(dlg, text="VLC media player is required for video playback\nbut was not found on this system.",
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10), wraplength=360, justify="center").pack(pady=(20, 10))
+        tk.Label(dlg, text="Install VLC and restart YT Archiver to enable the player.",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9), wraplength=360, justify="center").pack(pady=(0, 15))
+        btn_frame = tk.Frame(dlg, bg=C_BG)
+        btn_frame.pack(pady=(0, 20))
+        tk.Button(btn_frame, text="Download VLC", bg="#2a6e2a", fg="white",
+                  activebackground="#3a8e3a", activeforeground="white",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=4,
+                  command=lambda: (webbrowser.open("https://www.videolan.org/vlc/"), dlg.destroy())).pack(side="left", padx=8)
+        tk.Button(btn_frame, text="Close", bg=C_ENTRY_BG, fg=C_TEXT,
+                  activebackground=C_BORDER, activeforeground=C_TEXT,
+                  font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
+                  command=dlg.destroy).pack(side="left", padx=8)
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth() + 40, dlg.winfo_reqheight()
+        x = self.winfo_toplevel().winfo_x() + (self.winfo_toplevel().winfo_width() - w) // 2
+        y = self.winfo_toplevel().winfo_y() + (self.winfo_toplevel().winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
 
     def _on_result_rightclick(self, event):
         item = self._tree.identify_row(event.y)
@@ -21016,12 +21044,6 @@ refresh_recent_list()
 
 def check_dependencies():
     global HAS_TRAY
-    missing = []
-    yt_bin = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
-    ff_bin = "ffmpeg.exe" if os.name == 'nt' else "ffmpeg"
-    if not (shutil.which("yt-dlp") or os.path.exists(os.path.join(BASE_DIR, yt_bin))): missing.append("yt-dlp")
-    if not (shutil.which("ffmpeg") or os.path.exists(os.path.join(BASE_DIR, ff_bin))): missing.append("ffmpeg")
-
     # Auto-install tray icon dependencies if missing
     if not HAS_TRAY:
         tray_pkgs = []
@@ -21058,33 +21080,6 @@ def check_dependencies():
                 except ImportError:
                     pass
             threading.Thread(target=_install_tray, daemon=True).start()
-
-    if missing:
-        names = ' and '.join(missing)
-        if messagebox.askyesno("Missing Dependencies",
-                               f"{names} not found.\n\n"
-                               f"Would you like to try installing {'them' if len(missing) > 1 else 'it'} automatically via pip?\n\n"
-                               f"(You can also install manually and restart)"):
-            def _install():
-                for pkg in missing:
-                    log(f"--- Installing {pkg}... ---\n", "header")
-                    try:
-                        proc = subprocess.run(
-                            [sys.executable, "-m", "pip", "install", pkg],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            encoding="utf-8", errors="replace",
-                            startupinfo=startupinfo
-                        )
-                        if proc.returncode == 0:
-                            log(f"  ✓ {pkg} installed successfully.\n", "green")
-                        else:
-                            log(f"  ⚠ Failed to install {pkg}. Install it manually.\n", "red")
-                    except Exception as e:
-                        log(f"  ⚠ Error installing {pkg}: {e}\n", "red")
-                log("--- Dependency install complete. Restart the app if needed. ---\n", "simpleline_green")
-            threading.Thread(target=_install, daemon=True).start()
-        else:
-            messagebox.showwarning("Missing Dependencies", f"{names} not found. The app cannot download videos without {'them' if len(missing) > 1 else 'it'}.")
 
 
 root.after(100, check_dependencies)
@@ -21214,6 +21209,26 @@ def run_startup_updates():
         except Exception:
             return "unknown"
 
+    def _download_ffmpeg(target_dir):
+        """Download ffmpeg essentials from gyan.dev and extract binaries."""
+        import urllib.request, zipfile
+        dl_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+        zip_path = os.path.join(target_dir, "_ffmpeg_download.zip")
+        try:
+            log("  Downloading ffmpeg (~80 MB), this may take a minute...\n", "dim")
+            urllib.request.urlretrieve(dl_url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for name in zf.namelist():
+                    basename = os.path.basename(name)
+                    if basename in ("ffmpeg.exe", "ffprobe.exe"):
+                        with zf.open(name) as src, open(os.path.join(target_dir, basename), 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+        finally:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
     def _update():
         # Restore preserved queue immediately so the user sees recovered jobs right away,
         # rather than waiting for all the startup checks (yt-dlp update, disk scan, etc.)
@@ -21314,7 +21329,16 @@ def run_startup_updates():
                         log(f"  ⚠ Could not download yt-dlp binary: {e}\n", "red")
 
         except FileNotFoundError:
-            log("yt-dlp not found — skipping update check.\n", "red")
+            log("yt-dlp not found — downloading automatically...\n", "header")
+            try:
+                yt_name = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
+                target = os.path.join(BASE_DIR, yt_name)
+                _download_yt_dlp_binary(target)
+                ver = _get_yt_dlp_version()
+                log(f"  ✓ yt-dlp {ver} installed to {BASE_DIR}\n", "green")
+            except Exception as e:
+                log(f"  ⚠ Could not download yt-dlp: {e}\n", "red")
+                log("  Download manually: https://github.com/yt-dlp/yt-dlp/releases\n", "dim")
 
         log("--- Checking ffmpeg is installed... ---\n", "header")
         try:
@@ -21327,7 +21351,20 @@ def run_startup_updates():
             first_line = result.stdout.splitlines()[0] if result.stdout else "unknown"
             log(f"ffmpeg: {first_line}\n", "green")
         except FileNotFoundError:
-            log("ffmpeg not found — skipping version check.\n", "red")
+            log("ffmpeg not found — downloading automatically...\n", "header")
+            try:
+                _download_ffmpeg(BASE_DIR)
+                result = subprocess.run(
+                    ["ffmpeg", "-version"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    encoding="utf-8", errors="replace",
+                    startupinfo=startupinfo
+                )
+                first_line = result.stdout.splitlines()[0] if result.stdout else "unknown"
+                log(f"  ✓ ffmpeg installed: {first_line}\n", "green")
+            except Exception as e:
+                log(f"  ⚠ Could not download ffmpeg: {e}\n", "red")
+                log("  Download manually: https://www.gyan.dev/ffmpeg/builds/\n", "dim")
 
         # Check for a newer YTArchiver release on GitHub
         _check_app_update()

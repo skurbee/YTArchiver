@@ -601,10 +601,13 @@ def log(text, tag=None):
                             _bk_close_off = _bk_m.end() - 1  # ] is last char of match
                             _bk_open_pos = log_box.index(f"{_bk_base}+{_bk_open_off}c")
                             _bk_close_pos = log_box.index(f"{_bk_base}+{_bk_close_off}c")
-                            log_box.tag_add(_bk_tag, _bk_open_pos,
-                                            log_box.index(f"{_bk_open_pos}+1c"))
-                            log_box.tag_add(_bk_tag, _bk_close_pos,
-                                            log_box.index(f"{_bk_close_pos}+1c"))
+                            _bk_open_end = log_box.index(f"{_bk_open_pos}+1c")
+                            _bk_close_end = log_box.index(f"{_bk_close_pos}+1c")
+                            # Remove the base tag from bracket chars so there's no priority conflict
+                            log_box.tag_remove(use_tag, _bk_open_pos, _bk_open_end)
+                            log_box.tag_remove(use_tag, _bk_close_pos, _bk_close_end)
+                            log_box.tag_add(_bk_tag, _bk_open_pos, _bk_open_end)
+                            log_box.tag_add(_bk_tag, _bk_close_pos, _bk_close_end)
 
                 # Apply overlay tags for transcribe_using in simple mode so the
                 # [idx/total] prefix and quoted video title appear white over blue

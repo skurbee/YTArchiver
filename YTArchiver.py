@@ -6598,6 +6598,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
     Returns the number of segments that were split.
     """
     import json as _json
+    _WORD_TS_BUFFER = 0.5  # seconds of tolerance when scoping words to a sub-segment
     _MAX_SEG = 35.0
     _TARGET = 30.0
     fixed_count = 0
@@ -6652,7 +6653,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         if parent_words and isinstance(parent_words, list):
                             scoped = [w for w in parent_words
                                       if isinstance(w, dict)
-                                      and cs - 0.5 <= w.get("s", -1) <= ce + 0.5]
+                                      and cs - _WORD_TS_BUFFER <= w.get("s", -1) <= ce + _WORD_TS_BUFFER]
                             sub["words"] = scoped if scoped else []
                         else:
                             sub.pop("words", None)
@@ -6704,7 +6705,7 @@ def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
 
 def _rescope_words_in_jsonl(folder_path, ch_name):
     """One-time migration: filter each entry's ``words`` list so that only words
-    within the entry's [start-0.5, end+0.5] time range remain.
+    within the entry's time range (with a small buffer) remain.
 
     Previous versions of ``_fix_long_segments_in_jsonl`` copied the *entire*
     parent word list into each sub-segment.  That caused word-timestamp lookups
@@ -6714,6 +6715,7 @@ def _rescope_words_in_jsonl(folder_path, ch_name):
     Returns the number of entries whose word lists were re-scoped.
     """
     import json as _json
+    _BUF = 0.5  # seconds of tolerance — matches _WORD_TS_BUFFER in the fix function
     rescoped = 0
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
@@ -6743,7 +6745,7 @@ def _rescope_words_in_jsonl(folder_path, ch_name):
                     e = entry.get("end", s)
                     scoped = [w for w in words
                               if isinstance(w, dict)
-                              and s - 0.5 <= w.get("s", -1) <= e + 0.5]
+                              and s - _BUF <= w.get("s", -1) <= e + _BUF]
                     if len(scoped) < len(words):
                         entry["words"] = scoped
                         changed = True
@@ -16541,13 +16543,12 @@ def _run_autorun():
                     # Skip prefetch for uninitialized full-mode channels
                     # and for fully-synced channels (the count is only used for
                     # the progress bar; synced channels process very few videos).
-                    _skip_prefetch = (mode == "full"
-                                      and not ch.get("init_complete", False)
-                                      and not is_init)
-                    if _skip_prefetch or ch.get("init_complete", False):
-                        ch_total = 0
-                    else:
+                    _need_prefetch = (not ch.get("init_complete", False)
+                                      and is_init)
+                    if _need_prefetch:
                         ch_total = _prefetch_total(url)
+                    else:
+                        ch_total = 0
 
                     # --- Batch safety: limit large channel downloads ---
                     _batch_pstart = 0

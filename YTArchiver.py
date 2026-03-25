@@ -37,8 +37,9 @@ try:
     import pystray
     from PIL import Image, ImageDraw, ImageFont
     HAS_TRAY = True
-except ImportError:
+except Exception as _tray_import_err:
     HAS_TRAY = False
+    print(f"[TRAY] Import failed: {_tray_import_err}", file=sys.stderr)
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -60,7 +61,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.7"
+APP_VERSION = "v24.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2540,14 +2541,16 @@ def _setup_tray_icon():
         # Run pystray in a background daemon thread
         _tray_thread = threading.Thread(target=_tray_icon.run, daemon=True)
         _tray_thread.start()
-    except Exception:
-        pass
+    except Exception as _tray_err:
+        print(f"[TRAY] Failed to set up tray icon: {_tray_err}", file=sys.stderr)
 
 
 # Defer tray icon setup until after mainloop starts (needs AUTORUN_LABELS which are defined later)
 def _deferred_tray_setup():
     if HAS_TRAY:
         threading.Thread(target=_setup_tray_icon, daemon=True).start()
+    else:
+        print("[TRAY] pystray not available — system tray icon disabled.", file=sys.stderr)
 
 # ─── End system tray icon ────────────────────────────────────────────
 
@@ -2952,7 +2955,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 11:09am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 1:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6485,6 +6488,31 @@ def _parse_vtt_to_segments(vtt_path):
     if seg_text.strip():
         segments.append({"start": seg_start, "end": seg_end, "text": seg_text.strip()})
 
+    # ── Step 2b: Split any segments that still exceed the cap ──
+    # The overlap-merge cap only fires during rolling-cue merges.  Manual subs
+    # (or any non-overlapping content) can produce segments well over the cap.
+    # Split them here so downstream code never sees oversized segments.
+    _capped = []
+    for seg in segments:
+        dur = seg["end"] - seg["start"]
+        if dur <= _MAX_SEG_SECS:
+            _capped.append(seg)
+            continue
+        words = seg["text"].split()
+        n = max(2, int(dur / _MAX_SEG_SECS) + (1 if dur % _MAX_SEG_SECS > 1 else 0))
+        cdur = dur / n
+        wper = max(1, len(words) // n)
+        for ci in range(n):
+            w0 = ci * wper
+            w1 = w0 + wper if ci < n - 1 else len(words)
+            ct = " ".join(words[w0:w1])
+            if not ct:
+                continue
+            cs = round(seg["start"] + ci * cdur, 2)
+            ce = round(min(seg["end"], seg["start"] + (ci + 1) * cdur), 2)
+            _capped.append({"start": cs, "end": ce, "text": ct})
+    segments = _capped
+
     # ── Step 3: Attach per-word timestamps to merged segments ──
     if _all_words:
         _widx = 0
@@ -6499,9 +6527,34 @@ def _parse_vtt_to_segments(vtt_path):
                 _scan += 1
             if seg_words:
                 seg["words"] = seg_words
+            else:
+                seg["words"] = _generate_distributed_words(
+                    seg["text"], seg["start"], seg["end"])
             _widx = _scan
+    else:
+        # No word-level timestamps at all — generate distributed timestamps
+        for seg in segments:
+            seg["words"] = _generate_distributed_words(
+                seg["text"], seg["start"], seg["end"])
 
     return segments
+
+
+def _generate_distributed_words(text, start, end):
+    """Generate evenly-distributed word timestamps from text and a time range.
+
+    Used as a fallback when real word-level timestamps aren't available.
+    Distributes words proportionally across the segment's duration so that
+    clicking any word in the transcript viewer seeks to a reasonable position.
+    """
+    words = text.split()
+    if not words:
+        return []
+    dur = max(end - start, 0.01)
+    step = dur / len(words)
+    return [{"w": w, "s": round(start + i * step, 3),
+             "e": round(start + (i + 1) * step, 3)}
+            for i, w in enumerate(words)]
 
 
 def _get_jsonl_path(txt_path):
@@ -6536,8 +6589,13 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
                     "end": round(seg["end"], 2),
                     "text": seg["text"]
                 }
-                if seg.get("words"):
+                if "words" in seg and seg["words"]:
                     entry["words"] = seg["words"]
+                else:
+                    # Always include word timestamps — generate evenly-distributed
+                    # ones when real word-level data isn't available.
+                    entry["words"] = _generate_distributed_words(
+                        seg["text"], seg["start"], seg["end"])
                 line = _json.dumps(entry, ensure_ascii=False)
                 f.write(line + "\n")
         _hide_file_win(jsonl_path)
@@ -6581,7 +6639,7 @@ def _scan_existing_jsonl(folder_path, ch_name):
                                     bad_titles.add(title)
                                 if dur > _WHISPER_MIN:
                                     _has_long_seg.add(title)
-                                if entry.get("words"):
+                                if "words" in entry:
                                     _has_words.add(title)
                 except Exception:
                     pass
@@ -6654,9 +6712,9 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                             scoped = [w for w in parent_words
                                       if isinstance(w, dict)
                                       and cs - _WORD_TS_BUFFER <= w.get("s", -1) <= ce + _WORD_TS_BUFFER]
-                            sub["words"] = scoped if scoped else []
+                            sub["words"] = scoped if scoped else _generate_distributed_words(chunk_text, cs, ce)
                         else:
-                            sub.pop("words", None)
+                            sub["words"] = _generate_distributed_words(chunk_text, cs, ce)
                         new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
                 if changed:
                     with open(fpath, "w", encoding="utf-8") as fh:
@@ -6760,6 +6818,103 @@ def _rescope_words_in_jsonl(folder_path, ch_name):
             except Exception:
                 pass
     return rescoped
+
+
+def _dedup_jsonl(folder_path, ch_name):
+    """Remove duplicate JSONL entries (same title + same start time).
+
+    Returns the number of duplicate lines removed.
+    """
+    import json as _json
+    removed = 0
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
+                continue
+            fpath = os.path.join(dirpath, f)
+            try:
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    raw_lines = fh.readlines()
+                seen = set()
+                new_lines = []
+                changed = False
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    try:
+                        entry = _json.loads(stripped)
+                        key = (entry.get("title", ""), round(entry.get("start", 0), 2))
+                        if key in seen:
+                            changed = True
+                            removed += 1
+                            continue
+                        seen.add(key)
+                    except Exception:
+                        pass
+                    new_lines.append(line)
+                if changed:
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.writelines(new_lines)
+                    _hide_file_win(fpath)
+            except Exception:
+                pass
+    return removed
+
+
+def _fill_missing_words_in_jsonl(folder_path, ch_name):
+    """Add evenly-distributed word timestamps to any JSONL entry that lacks them.
+
+    This ensures every entry in the index has word-level timestamps for the
+    transcript viewer's seek-on-click feature.  Entries that already have a
+    non-empty ``words`` list are left untouched.
+
+    Returns the number of entries that had words added.
+    """
+    import json as _json
+    filled = 0
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
+                continue
+            fpath = os.path.join(dirpath, f)
+            try:
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    raw_lines = fh.readlines()
+                new_lines = []
+                changed = False
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    try:
+                        entry = _json.loads(stripped)
+                    except Exception:
+                        new_lines.append(line)
+                        continue
+                    existing_words = entry.get("words")
+                    if existing_words and isinstance(existing_words, list) and len(existing_words) > 0:
+                        new_lines.append(line)
+                        continue
+                    text = entry.get("text", "")
+                    s = entry.get("start", 0)
+                    e = entry.get("end", s)
+                    if text.strip() and e > s:
+                        entry["words"] = _generate_distributed_words(text, s, e)
+                        changed = True
+                        filled += 1
+                        new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
+                    else:
+                        new_lines.append(line)
+                if changed:
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.writelines(new_lines)
+                    _hide_file_win(fpath)
+            except Exception:
+                pass
+    return filled
 
 
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
@@ -9523,41 +9678,41 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 with config_lock:
                     config[_wt_key] = True
                     save_config(config)
-            # One-time migration: rescope word-level timestamps in existing JSONL
-            # entries.  A previous bug in _fix_long_segments_in_jsonl copied the
-            # *entire* parent word list into sub-segments, causing seek-on-click
-            # to always resolve to t≈0.  This pass filters each entry's words to
-            # its own [start, end] range.
-            _rs_key = f"jsonl_words_rescoped_{ch_name}"
-            if not config.get(_rs_key):
-                if already_done:
-                    _rs_count = _rescope_words_in_jsonl(folder, ch_name)
-                    if _rs_count:
-                        log(f"  ✓ Re-scoped word timestamps in {_rs_count} existing JSONL entry/entries.\n",
-                            "simpleline_green")
+            # ── One-time JSONL migrations (gated by config key) ───────
+            # Runs: dedup → fix long segments → rescope words → fill missing words.
+            # After this, every JSONL entry has ≤30 s segments and word timestamps.
+            _mig_key = f"jsonl_migrations_v3_{ch_name}"
+            if not config.get(_mig_key) and already_done:
+                log("  Running one-time JSONL cleanup...\n", "simpleline")
+                _dd = _dedup_jsonl(folder, ch_name)
+                if _dd:
+                    log(f"  ✓ Removed {_dd} duplicate JSONL entry/entries.\n", "simpleline_green")
+                _sf = _fix_long_segments_in_jsonl(folder, ch_name)
+                if _sf:
+                    log(f"  ✓ Split {_sf} oversized segment(s) into ≤30 s chunks.\n", "simpleline_green")
+                _rs = _rescope_words_in_jsonl(folder, ch_name)
+                if _rs:
+                    log(f"  ✓ Re-scoped word timestamps in {_rs} entry/entries.\n", "simpleline_green")
+                _fw = _fill_missing_words_in_jsonl(folder, ch_name)
+                if _fw:
+                    log(f"  ✓ Generated word timestamps for {_fw} entry/entries.\n", "simpleline_green")
+                if not _dd and not _sf and not _rs and not _fw:
+                    log("  ✓ JSONL data already clean.\n", "simpleline_green")
                 with config_lock:
-                    config[_rs_key] = True
+                    config[_mig_key] = True
                     save_config(config)
+
             _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set(), set()))
 
-            # In-place segment repair: fix any Whisper segments > 35 s that can't be
-            # re-fetched via auto-captions.  This runs before the backfill pass so that
-            # titles fixed in-place are excluded from _jsonl_bad (they no longer need repair).
+            # After the one-time migration, bad/stale should be empty.  If any
+            # remain (edge cases), accept them to prevent infinite loops.
             if _jsonl_bad:
-                _inplace_fixed = _fix_long_segments_in_jsonl(folder, ch_name)
-                if _inplace_fixed:
-                    log(f"  ✓ Fixed {_inplace_fixed} long Whisper segment(s) in existing transcripts.\n",
-                        "simpleline_green")
-                    # Re-scan to update bad_titles now that in-place fixes are done
-                    _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
-
+                _jsonl_bad.clear()
             if _jsonl_stale_whisper:
-                log(f"  ↻ {len(_jsonl_stale_whisper)} Whisper transcript(s) lack per-word timestamps — "
-                    f"queuing for re-transcription.\n", "simpleline")
+                _jsonl_stale_whisper.clear()
 
-            # Exclude bad-timestamp and stale-whisper titles so they get re-fetched/rewritten
-            _jsonl_existing = _jsonl_existing_raw - _jsonl_bad - _jsonl_stale_whisper
+            _jsonl_existing = _jsonl_existing_raw
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
             if not files_to_process and not _jsonl_needed:
@@ -9658,6 +9813,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             def _do_jsonl_backfill():
                 """Generate .jsonl entries for already-transcribed videos that are missing them.
                 Runs after new transcriptions so it doesn't delay resuming a paused session."""
+                nonlocal _whisper_available
                 if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
                     return
 
@@ -9685,6 +9841,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _bf_temp = os.path.join(folder, "_transcribe_temp")
                     os.makedirs(_bf_temp, exist_ok=True)
                     _bf_done = 0
+                    _bf_skip = 0
                     _bf_idx = 0
                     for _bf_title, _bf_vid in _backfill_list:
                         # Pause check — allows the user to pause during long backfill runs
@@ -9708,57 +9865,60 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _bf_idx += 1
                         _bf_display = (_bf_title[:52] + "...") if len(_bf_title) > 52 else _bf_title
 
-                        # Stale Whisper titles had no YT captions — that's why they were
-                        # Whispered in the first place.  Skip the caption fetch entirely
-                        # and re-run Whisper so we get per-word timestamps this time.
-                        if _bf_title in _jsonl_stale_whisper:
-                            _bf_fpath = local_files.get(_bf_title)
-                            if _bf_fpath and os.path.isfile(_bf_fpath):
-                                log(f"  [{_bf_idx}/{_bf_total}] Re-transcribing (word timestamps): {_bf_display}\n", "simpleline")
-                                try:
-                                    _bf_mtime_w = datetime.fromtimestamp(os.path.getmtime(_bf_fpath))
-                                    _bf_txt_w, _ = _get_transcript_filename(
-                                        ch_name, folder, split_years, split_months, combined,
-                                        year=_bf_mtime_w.year, month=_bf_mtime_w.month)
-                                    _bf_jsonl_w = _get_jsonl_path(_bf_txt_w)
-                                    _, _w_segs = _whisper_transcribe(
-                                        _bf_fpath, duration=0, title=_bf_title,
-                                        cancel_ev=_ce, pause_ev=_pe)
-                                    _clear_whisper_progress()
-                                    if _w_segs:
-                                        _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
-                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs)
-                                        _bf_done += 1
-                                except Exception:
-                                    pass
-                            continue  # never fall through to caption fetch for stale Whisper
-
                         log(f"  [{_bf_idx}/{_bf_total}] Fetching captions: {_bf_display}\n", "simpleline")
+                        _bf_segs = []
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
-                            if _bf_segs:
-                                # Determine which txt file this video belongs to
-                                _bf_fpath = local_files.get(_bf_title)
-                                if _bf_fpath:
-                                    _bf_mtime = datetime.fromtimestamp(os.path.getmtime(_bf_fpath))
-                                    _bf_txt, _ = _get_transcript_filename(
-                                        ch_name, folder, split_years, split_months, combined,
-                                        year=_bf_mtime.year, month=_bf_mtime.month)
-                                else:
-                                    _bf_txt, _ = _get_transcript_filename(
-                                        ch_name, folder, split_years, split_months, combined)
-                                _bf_jsonl = _get_jsonl_path(_bf_txt)
-                                # Purge old entries before writing if this title had bad
-                                # segments or stale word timestamps (avoids duplicates).
-                                # Use all-files removal to handle year-split mismatches.
-                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper):
-                                    _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
-                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
-                                _bf_done += 1
                         except Exception:
                             pass
-                    if _bf_done:
-                        log(f"  ✓ {_bf_done} searchable .jsonl entry/entries generated.\n", "simpleline_green")
+
+                        # Fallback: if no YouTube captions, Whisper the local file
+                        if not _bf_segs:
+                            _bf_local = local_files.get(_bf_title)
+                            if _bf_local and os.path.isfile(_bf_local) and _whisper_available is not False:
+                                if _whisper_available is None:
+                                    _whisper_available = os.path.isfile(_WHISPER_PYTHON)
+                                if _whisper_available:
+                                    log(f"    No captions — Whisper fallback: {_bf_display}\n", "dim")
+                                    try:
+                                        _, _bf_segs = _whisper_transcribe(
+                                            _bf_local, duration=0, title=_bf_title,
+                                            cancel_ev=_ce, pause_ev=_pe)
+                                        _clear_whisper_progress()
+                                    except Exception:
+                                        _bf_segs = []
+
+                        # Determine which transcript file this title belongs to
+                        _bf_fpath = local_files.get(_bf_title)
+                        if _bf_fpath:
+                            _bf_mtime = datetime.fromtimestamp(os.path.getmtime(_bf_fpath))
+                            _bf_txt, _ = _get_transcript_filename(
+                                ch_name, folder, split_years, split_months, combined,
+                                year=_bf_mtime.year, month=_bf_mtime.month)
+                        else:
+                            _bf_txt, _ = _get_transcript_filename(
+                                ch_name, folder, split_years, split_months, combined)
+                        _bf_jsonl = _get_jsonl_path(_bf_txt)
+
+                        if _bf_segs:
+                            _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
+                            _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
+                            _bf_done += 1
+                        else:
+                            # No captions and no local file for Whisper — write a
+                            # minimal placeholder so this title is not retried every run.
+                            _placeholder = [{"start": 0.0, "end": 0.01,
+                                             "text": "(no captions available)"}]
+                            _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
+                            _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _placeholder)
+                            _bf_skip += 1
+                    if _bf_done or _bf_skip:
+                        _parts_msg = []
+                        if _bf_done:
+                            _parts_msg.append(f"{_bf_done} generated")
+                        if _bf_skip:
+                            _parts_msg.append(f"{_bf_skip} skipped (no captions/local file)")
+                        log(f"  ✓ Searchable .jsonl: {', '.join(_parts_msg)}.\n", "simpleline_green")
 
             # ── Pass 2: Patch empty video_ids in existing JSONL entries ──────────────
             # Whisper-transcribed videos written before this fix had video_id = "".
@@ -17040,7 +17200,7 @@ def _tp_index_file(conn, jsonl_path, archive_roots):
                     if not text:
                         continue
                     words_raw = seg.get("words")
-                    words_json = json.dumps(words_raw, ensure_ascii=False) if words_raw else ""
+                    words_json = json.dumps(words_raw, ensure_ascii=False) if words_raw is not None else ""
                     cur = conn.execute(
                         "INSERT INTO segments "
                         "(video_id,title,channel,year,month,start_time,end_time,text,jsonl_path,words) "
@@ -17511,61 +17671,25 @@ class _TranscriptionPanel(ttk.Frame):
             body = " ".join(row[3] for row in db_rows)
             self._browse_viewer.insert("end", body)
 
-        # Build the segment position map via word-alignment against the displayed
-        # body text.  Punctuation restoration adds commas/periods but never
-        # reorders or changes the actual words, so the body and the DB segment
-        # texts share the same words in the same order.  We scan forward through
-        # the body's word list for each segment's first word (greedy, never
-        # stepping backwards), giving us an exact character range for each segment
-        # without any time-based assumptions.
+        # Build the segment position map by proportionally dividing the body
+        # text among DB segments based on each segment's text length.  This is
+        # robust against overlapping VTT segments and punctuation changes.
         if db_rows and body:
-            # Index every alphanumeric word in the body with its char offset.
-            body_words = [(m.group().lower(), m.start())
-                          for m in re.finditer(r"[a-zA-Z0-9]+", body)]
-            if not body_words:
-                self._browse_viewer.config(state="disabled")
-                self._browse_viewer.yview_moveto(0)
-                return
-            body_cursor = 0   # walk forward only — never resets to 0
-            pending = []      # (char_start, data) — char_end filled in next pass
+            total_seg_chars = sum(len(row[3]) for row in db_rows)
+            if total_seg_chars > 0:
+                offset = header_char_len
+                body_chars = len(body)
+                pending = []
+                for video_id, start, end, seg_text, words_json in db_rows:
+                    proportion = len(seg_text) / total_seg_chars
+                    cs = offset
+                    offset += int(proportion * body_chars)
+                    pending.append((cs, (video_id, start, end, seg_text, words_json or "")))
 
-            for video_id, start, end, seg_text, words_json in db_rows:
-                seg_words = re.findall(r"[a-zA-Z0-9]+", seg_text.lower())
-                if not seg_words:
-                    continue
-                first = seg_words[0]
-
-                # Narrow search: look within the next 150 body words first
-                found = None
-                limit = min(body_cursor + 150, len(body_words))
-                for i in range(body_cursor, limit):
-                    if body_words[i][0] == first:
-                        found = i
-                        break
-
-                # Wide fallback: if the narrow window missed, search the rest
-                if found is None:
-                    for i in range(limit, len(body_words)):
-                        if body_words[i][0] == first:
-                            found = i
-                            break
-
-                if found is None:
-                    found = body_cursor  # last resort — don't go backwards
-
-                if found >= len(body_words):
-                    continue  # cursor ran past end — skip this segment
-
-                char_start = header_char_len + body_words[found][1]
-                pending.append((char_start, (video_id, start, end, seg_text, words_json or "")))
-                body_cursor = found + len(seg_words)
-
-            # Pair each segment's char_start with the next segment's char_start
-            # as its char_end (last segment runs to end of body).
-            for i, (cs, data) in enumerate(pending):
-                ce = (pending[i + 1][0] if i + 1 < len(pending)
-                      else header_char_len + len(body))
-                self._browse_seg_map.append((cs, ce, data))
+                for i, (cs, data) in enumerate(pending):
+                    ce = (pending[i + 1][0] if i + 1 < len(pending)
+                          else header_char_len + body_chars)
+                    self._browse_seg_map.append((cs, ce, data))
 
         self._browse_viewer.config(state="disabled")
         self._browse_viewer.yview_moveto(0)

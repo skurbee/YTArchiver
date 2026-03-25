@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.9"
+APP_VERSION = "v24.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -1750,7 +1750,7 @@ def check_directory_writable(path):
         os.makedirs(path, exist_ok=True)
         test_file = os.path.join(path, '.write_test')
         try:
-            with open(test_file, 'w', encoding='utf-8') as f:
+            with open(test_file, 'w') as f:
                 f.write('test')
         finally:
             if os.path.exists(test_file):
@@ -1758,14 +1758,6 @@ def check_directory_writable(path):
         return True
     except (OSError, PermissionError):
         return False
-
-
-def _safe_getmtime(path):
-    """Return file mtime, or 0.0 if the file has disappeared."""
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return 0.0
 
 
 # ─── Disk Error Auto-Pause ─────────────────────────────────
@@ -2057,10 +2049,10 @@ def save_config(cfg):
 
     def _do_save():
         global _save_config_thread_running
-        temp_file = CONFIG_FILE + ".tmp"
         try:
             with config_lock:
                 try:
+                    temp_file = CONFIG_FILE + ".tmp"
                     with open(temp_file, "w", encoding="utf-8") as f:
                         json.dump(cfg_snapshot, f, indent=2)
                     os.replace(temp_file, CONFIG_FILE)
@@ -2068,6 +2060,7 @@ def save_config(cfg):
                     # Retry once after a brief pause (disk may be momentarily busy)
                     try:
                         time.sleep(0.5)
+                        temp_file = CONFIG_FILE + ".tmp"
                         with open(temp_file, "w", encoding="utf-8") as f:
                             json.dump(cfg_snapshot, f, indent=2)
                         os.replace(temp_file, CONFIG_FILE)
@@ -2079,12 +2072,6 @@ def save_config(cfg):
                             pass
         finally:
             _save_config_thread_running = False
-            # Clean up orphaned temp file on failure
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except Exception:
-                pass
 
     with _save_config_lock:
         if not _save_config_thread_running:
@@ -2965,7 +2952,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.24.26 9:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 9:10am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3681,12 +3668,11 @@ def _res_check_click():
     if not all_videos:
         return
 
-    # 'best' and 'audio' modes: can't determine target height, fall back to simple prompt
-    if sel_res in ("best", "audio"):
-        _mode_label = "Best quality" if sel_res == "best" else "Audio-only"
+    # 'best' mode: can't determine target height, fall back to simple prompt
+    if sel_res == "best":
         _rd_ask = _dark_askquestion(
             "Re-download at Selected Resolution",
-            f"Re-download {len(all_videos):,} existing video(s) at {_mode_label}, replacing the originals?"
+            f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
         )
         if _rd_ask:
             _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
@@ -5366,8 +5352,8 @@ def _process_sync_queue():
                 sync_single_channel()
             else:
                 log(f"  ⚠ Could not find {next_ch.get('name', '?')} in channel list — skipping.\n", "red")
-                # Try next queued item instead of getting stuck (use after() to avoid deep recursion)
-                root.after(0, _process_next_queued)
+                # Try next queued item instead of getting stuck
+                _process_next_queued()
         except Exception as e:
             _sync_running = False
             _current_sync_ch = None
@@ -6251,7 +6237,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                     except Exception:
                         pass
                 reorg_done_label.pack(side="left", padx=(4, 0))
-                _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget() if reorg_done_label.winfo_exists() else None)
+                _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
             _ui_queue.append(_reorg_done)
             # Process any queued jobs in insertion order
             if _skip_current.is_set():
@@ -6314,7 +6300,12 @@ def _parse_vtt_to_segments(vtt_path):
     adds a few words.  This parser merges overlapping cues so the output has one
     clean segment per actual phrase with no duplication.
 
-    Returns list of {"start": float_secs, "end": float_secs, "text": str}.
+    YouTube auto-generated VTT embeds per-word timestamps via <c> tags, e.g.:
+      hey<00:00:00.480><c> guys</c><00:00:00.720><c> this</c>
+    These are extracted so each segment includes a "words" list with accurate
+    per-word seek times (format: {"w": word, "s": start, "e": end}).
+
+    Returns list of {"start", "end", "text", "words"} dicts.
     """
     import html as _html_mod
     try:
@@ -6332,12 +6323,14 @@ def _parse_vtt_to_segments(vtt_path):
             return int(parts[0]) * 60 + float(parts[1])
         return 0.0
 
-    # Step 1: Parse raw cues from VTT
-    raw_cues = []  # list of (start, end, text)
+    # ── Step 1: Parse raw cues from VTT ──
+    # Keep both cleaned text (for merge) and raw lines (for word extraction).
+    raw_cues = []  # list of (start, end, text, raw_content_lines)
     lines = raw.split("\n")
     current_start = None
     current_end = None
     current_text = []
+    current_raw = []
 
     for line in lines:
         line = line.strip()
@@ -6346,10 +6339,11 @@ def _parse_vtt_to_segments(vtt_path):
             # Flush previous cue
             if current_text and current_start is not None:
                 joined = " ".join(current_text)
-                raw_cues.append((current_start, current_end, joined))
+                raw_cues.append((current_start, current_end, joined, list(current_raw)))
             current_start = _ts_to_secs(ts_match.group(1))
             current_end = _ts_to_secs(ts_match.group(2))
             current_text = []
+            current_raw = []
             continue
         if not line or line.startswith("WEBVTT") or line.startswith("NOTE") or \
                 line.startswith("Kind:") or line.startswith("Language:"):
@@ -6358,6 +6352,7 @@ def _parse_vtt_to_segments(vtt_path):
             continue
         if 'align:' in line or 'position:' in line:
             continue
+        current_raw.append(line)
         cleaned = re.sub(r'<[^>]+>', '', line)
         cleaned = _html_mod.unescape(cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
@@ -6367,12 +6362,68 @@ def _parse_vtt_to_segments(vtt_path):
     # Flush last cue
     if current_text and current_start is not None:
         joined = " ".join(current_text)
-        raw_cues.append((current_start, current_end, joined))
+        raw_cues.append((current_start, current_end, joined, list(current_raw)))
 
     if not raw_cues:
         return []
 
-    # Step 2: Merge overlapping rolling cues.
+    # ── Step 1b: Extract per-word timestamps from <c> tags ──
+    # In YouTube rolling captions, each cue's NEW words have <timestamp><c> tags.
+    # The prefix text (before any <c> tag) is repeated from the previous cue.
+    # So: only extract tagged words (and the first cue's prefix).
+    _ctag_re = re.compile(r'<(\d[\d:.]+)><c[^>]*>(.*?)</c>')
+    _all_words = []
+    _has_ctags = False
+
+    for cue_idx, (cue_s, cue_e, _, raw_lines) in enumerate(raw_cues):
+        for raw_line in raw_lines:
+            tags = list(_ctag_re.finditer(raw_line))
+            if tags:
+                _has_ctags = True
+                # First cue's untagged prefix is the genuine first word(s)
+                if cue_idx == 0:
+                    first_tag_pos = raw_line.find('<')
+                    if first_tag_pos > 0:
+                        prefix = _html_mod.unescape(raw_line[:first_tag_pos]).strip()
+                        for pw in prefix.split():
+                            pw = pw.strip()
+                            if pw:
+                                _all_words.append({"w": pw, "s": cue_s})
+                # Extract each tagged word with its explicit timestamp
+                for m in tags:
+                    ts = _ts_to_secs(m.group(1))
+                    word_text = _html_mod.unescape(m.group(2)).strip()
+                    for w in word_text.split():
+                        w = w.strip()
+                        if w:
+                            _all_words.append({"w": w, "s": ts})
+
+    # If no <c> tags at all (manual subs), assign cue-start to each word.
+    # Manual subs have short cues (~2-5 s) so this gives decent granularity
+    # and — critically — populates the words field so the entry is not
+    # mistakenly flagged as stale-whisper on future scans.
+    if not _has_ctags:
+        for cue_s, cue_e, text, _ in raw_cues:
+            dur = cue_e - cue_s
+            words_in_cue = text.strip().split()
+            n = len(words_in_cue)
+            for wi, w in enumerate(words_in_cue):
+                # Distribute evenly across the cue duration
+                _all_words.append({
+                    "w": w,
+                    "s": round(cue_s + dur * wi / max(n, 1), 3)
+                })
+
+    # Sort by timestamp and compute end times (each word ends when the next starts)
+    _all_words.sort(key=lambda w: w["s"])
+    for i in range(len(_all_words) - 1):
+        _all_words[i]["e"] = round(_all_words[i + 1]["s"], 3)
+    if _all_words:
+        _all_words[-1]["e"] = round(raw_cues[-1][1], 3)
+        for w in _all_words:
+            w["s"] = round(w["s"], 3)
+
+    # ── Step 2: Merge overlapping rolling cues ──
     # YouTube auto-subs emit cues where each new cue's text starts with the
     # tail of the previous cue's text plus new words.  We detect overlap by
     # checking if the new cue's text starts with a suffix of the current
@@ -6384,7 +6435,7 @@ def _parse_vtt_to_segments(vtt_path):
     seg_text = raw_cues[0][2]
 
     for i in range(1, len(raw_cues)):
-        _s, _e, _t = raw_cues[i]
+        _s, _e, _t, _ = raw_cues[i]
 
         # Check if this cue is a rolling continuation of the current segment.
         # A rolling cue's text typically starts with a suffix of seg_text.
@@ -6433,6 +6484,22 @@ def _parse_vtt_to_segments(vtt_path):
     if seg_text.strip():
         segments.append({"start": seg_start, "end": seg_end, "text": seg_text.strip()})
 
+    # ── Step 3: Attach per-word timestamps to merged segments ──
+    if _all_words:
+        _widx = 0
+        for seg in segments:
+            seg_words = []
+            # Advance past words that ended before this segment
+            while _widx < len(_all_words) and _all_words[_widx]["s"] < seg["start"] - 0.5:
+                _widx += 1
+            _scan = _widx
+            while _scan < len(_all_words) and _all_words[_scan]["s"] <= seg["end"] + 0.5:
+                seg_words.append(_all_words[_scan])
+                _scan += 1
+            if seg_words:
+                seg["words"] = seg_words
+            _widx = _scan
+
     return segments
 
 
@@ -6454,73 +6521,24 @@ def _hide_file_win(path):
             pass
 
 
-def _write_jsonl_entry(jsonl_path, video_id, title, segments, source=""):
-    """Append JSONL lines for one video's timestamped segments.
-
-    *source* should be ``"vtt"`` for YouTube auto-caption entries or
-    ``"whisper"`` for Whisper-transcribed entries.  The field is stored in
-    every JSONL line so that ``_scan_existing_jsonl`` can distinguish VTT
-    segments (which may be long after merging) from genuine Whisper content
-    that still needs per-word timestamps.
-
-    Segments longer than 30 s are automatically split into ≤30 s chunks to
-    prevent them from being flagged as "bad" on the next scan pass.
-    """
+def _write_jsonl_entry(jsonl_path, video_id, title, segments):
+    """Append JSONL lines for one video's timestamped segments."""
     import json as _json
-    _TARGET = 30.0
-    _MAX_SEG = 35.0
     try:
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
         with open(jsonl_path, "a", encoding="utf-8") as f:
             for seg in segments:
-                start = round(seg["start"], 2)
-                end = round(seg["end"], 2)
-                dur = end - start
-                text = seg["text"]
-                words = seg.get("words")
-
-                # Split overly long segments into ≤30 s chunks so they don't
-                # get flagged as bad_titles on the next JSONL scan.
-                if dur > _MAX_SEG:
-                    tok = text.split()
-                    n_chunks = max(2, int(dur / _TARGET) + (1 if dur % _TARGET > 1 else 0))
-                    chunk_dur = dur / n_chunks
-                    words_per = max(1, len(tok) // n_chunks)
-                    for ci in range(n_chunks):
-                        w0 = ci * words_per
-                        w1 = w0 + words_per if ci < n_chunks - 1 else len(tok)
-                        chunk_text = " ".join(tok[w0:w1])
-                        if not chunk_text:
-                            continue
-                        cs = round(start + ci * chunk_dur, 2)
-                        ce = round(min(end, start + (ci + 1) * chunk_dur), 2)
-                        entry = {
-                            "video_id": video_id or "",
-                            "title": title,
-                            "start": cs,
-                            "end": ce,
-                            "text": chunk_text
-                        }
-                        if source:
-                            entry["source"] = source
-                        # Don't carry word timestamps into split chunks —
-                        # they cover the original unsplit segment.
-                        line = _json.dumps(entry, ensure_ascii=False)
-                        f.write(line + "\n")
-                else:
-                    entry = {
-                        "video_id": video_id or "",
-                        "title": title,
-                        "start": start,
-                        "end": end,
-                        "text": text
-                    }
-                    if source:
-                        entry["source"] = source
-                    if words:
-                        entry["words"] = words
-                    line = _json.dumps(entry, ensure_ascii=False)
-                    f.write(line + "\n")
+                entry = {
+                    "video_id": video_id or "",
+                    "title": title,
+                    "start": round(seg["start"], 2),
+                    "end": round(seg["end"], 2),
+                    "text": seg["text"]
+                }
+                if seg.get("words"):
+                    entry["words"] = seg["words"]
+                line = _json.dumps(entry, ensure_ascii=False)
+                f.write(line + "\n")
         _hide_file_win(jsonl_path)
     except Exception:
         pass
@@ -6533,12 +6551,8 @@ def _scan_existing_jsonl(folder_path, ch_name):
     - bad_titles: any title with a segment > 35 s (needs repair/re-transcription)
     - stale_whisper: Whisper-transcribed titles (segment > 8 s) that have no
       per-word timestamps yet — these should be re-Whispered to gain word accuracy.
-
-    Detection uses the ``"source"`` field written by ``_write_jsonl_entry``:
-    entries tagged ``"vtt"`` are never considered stale regardless of segment
-    length (VTT segments are merged and can legitimately exceed 8 s).
-    For backward compatibility, entries with **no** source field fall back to
-    the segment-length heuristic (>8 s ⇒ assumed Whisper).
+      YouTube VTT cues are always short (<5 s), so the >8 s threshold reliably
+      identifies Whisper-only content without needing to track source explicitly.
     """
     existing = set()
     bad_titles = set()
@@ -6550,42 +6564,27 @@ def _scan_existing_jsonl(folder_path, ch_name):
     # least one long segment AND none of its segments carry word timestamps.
     _has_long_seg  = set()
     _has_words     = set()
-    _known_vtt     = set()  # titles where at least one entry has source="vtt"
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
-                fpath = os.path.join(dirpath, f)
                 try:
-                    with open(fpath, "r", encoding="utf-8") as fh:
+                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
                         for line in fh:
                             line = line.strip()
-                            if not line:
-                                continue
-                            try:
+                            if line:
                                 entry = _json.loads(line)
-                            except Exception:
-                                continue  # skip malformed lines, keep scanning
-                            title = entry.get("title", "")
-                            existing.add(title)
-                            dur = entry.get("end", 0) - entry.get("start", 0)
-                            if dur > _MAX_SEG:
-                                bad_titles.add(title)
-                            _src = entry.get("source", "")
-                            if _src == "vtt":
-                                _known_vtt.add(title)
-                            # Only flag as potentially stale Whisper if the entry
-                            # does NOT come from VTT.  Entries with no source
-                            # field (pre-existing data) use the old heuristic.
-                            if dur > _WHISPER_MIN and _src != "vtt":
-                                _has_long_seg.add(title)
-                            if entry.get("words"):
-                                _has_words.add(title)
+                                title = entry.get("title", "")
+                                existing.add(title)
+                                dur = entry.get("end", 0) - entry.get("start", 0)
+                                if dur > _MAX_SEG:
+                                    bad_titles.add(title)
+                                if dur > _WHISPER_MIN:
+                                    _has_long_seg.add(title)
+                                if entry.get("words"):
+                                    _has_words.add(title)
                 except Exception:
                     pass
-    # A title is stale only if it has long segments from a non-VTT source
-    # and none of its entries carry word-level timestamps.
-    # Titles known to be VTT are never stale (VTT doesn't provide words).
-    stale_whisper = _has_long_seg - _has_words - bad_titles - _known_vtt
+    stale_whisper = _has_long_seg - _has_words - bad_titles
     return existing, bad_titles, stale_whisper
 
 
@@ -6611,7 +6610,6 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                     raw_lines = fh.readlines()
                 new_lines = []
                 changed = False
-                _file_fixed = 0
                 for line in raw_lines:
                     stripped = line.strip()
                     if not stripped:
@@ -6628,7 +6626,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         continue
                     # Split this segment
                     changed = True
-                    _file_fixed += 1
+                    fixed_count += 1
                     words = entry.get("text", "").split()
                     seg_start = entry.get("start", 0)
                     seg_end   = entry.get("end", seg_start + dur)
@@ -6647,18 +6645,11 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         sub["start"] = cs
                         sub["end"]   = ce
                         sub["text"]  = chunk_text
-                        # Remove per-word timestamps from split chunks — they
-                        # correspond to the original unsplit segment and are
-                        # no longer accurate after splitting.
-                        sub.pop("words", None)
                         new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
                 if changed:
                     with open(fpath, "w", encoding="utf-8") as fh:
                         fh.writelines(new_lines)
                     _hide_file_win(fpath)
-                    # Only count after successful write so the caller knows
-                    # how many segments were actually persisted to disk.
-                    fixed_count += _file_fixed
             except Exception:
                 pass
     return fixed_count
@@ -7959,7 +7950,6 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             dlg.title("Adjust Compression Settings")
                             dlg.configure(bg=C_BG)
                             dlg.resizable(False, False)
-                            dlg.transient(root)
                             dlg.grab_set()
                             dlg.update_idletasks()
                             _apply_dark_title_bar(dlg)
@@ -8016,7 +8006,6 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                             dlg.update_idletasks()
                             dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
-                            dlg.protocol("WM_DELETE_WINDOW", _cancel)
 
                         _ui_queue.append(_ask_new_settings)
                         while _new_settings[0] is None and not _ce.is_set():
@@ -8960,9 +8949,8 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
                 _pick(_DEFAULT_MODEL)
                 return
             try:
-                if _dlg.winfo_exists():
-                    _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
-                    _countdown["job"] = _dlg.after(1000, _tick)
+                _timer_lbl.config(text=f"Auto-selecting {_DEFAULT_MODEL} in {_countdown['secs']}s...")
+                _countdown["job"] = _dlg.after(1000, _tick)
             except Exception:
                 pass
 
@@ -9027,9 +9015,8 @@ def _ask_start_gpu_tasks(count, cancel_ev=None, timeout=180):
                 _dismiss(False)
                 return
             try:
-                if dlg.winfo_exists():
-                    _timer_lbl.config(text=f"Auto-dismissing in {_secs[0]}s...")
-                    _timer_job[0] = dlg.after(1000, _tick)
+                _timer_lbl.config(text=f"Auto-dismissing in {_secs[0]}s...")
+                _timer_job[0] = dlg.after(1000, _tick)
             except Exception:
                 pass
 
@@ -9438,30 +9425,36 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 with config_lock:
                     config[_migration_key] = True
                     save_config(config)
+            # One-time migration: delete JSONL files so they get regenerated with
+            # per-word timestamps extracted from VTT <c> tags.  Without this, old
+            # entries (no "words" field, segments > 8 s) are endlessly re-flagged
+            # as stale_whisper on every run.
+            _wt_key = f"jsonl_word_ts_migrated_{ch_name}"
+            if not config.get(_wt_key):
+                if already_done:
+                    for _dp, _dns, _fns in os.walk(folder):
+                        for _fn in _fns:
+                            if _fn.startswith(".") and ch_name in _fn and _fn.endswith("Transcript.jsonl"):
+                                try:
+                                    os.remove(os.path.join(_dp, _fn))
+                                except Exception:
+                                    pass
+                with config_lock:
+                    config[_wt_key] = True
+                    save_config(config)
             _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set(), set()))
 
             # In-place segment repair: fix any Whisper segments > 35 s that can't be
             # re-fetched via auto-captions.  This runs before the backfill pass so that
             # titles fixed in-place are excluded from _jsonl_bad (they no longer need repair).
-            _pre_fix_bad = set(_jsonl_bad)  # snapshot before fix
             if _jsonl_bad:
                 _inplace_fixed = _fix_long_segments_in_jsonl(folder, ch_name)
                 if _inplace_fixed:
                     log(f"  ✓ Fixed {_inplace_fixed} long Whisper segment(s) in existing transcripts.\n",
                         "simpleline_green")
-                # Always re-scan after a fix attempt so _jsonl_bad and
-                # _jsonl_stale_whisper reflect the actual on-disk state,
-                # even when the fix reports 0 (e.g. write errors were caught).
-                _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
-                # Titles that were in _jsonl_bad before the fix and are now
-                # cleared from bad should NOT be treated as stale-whisper.
-                # The in-place split intentionally drops per-word timestamps,
-                # but that doesn't mean the video needs full re-transcription
-                # — the segment text is already correct, just chunked.
-                _fixed_titles = _pre_fix_bad - _jsonl_bad
-                if _fixed_titles:
-                    _jsonl_stale_whisper -= _fixed_titles
+                    # Re-scan to update bad_titles now that in-place fixes are done
+                    _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
 
             if _jsonl_stale_whisper:
                 log(f"  ↻ {len(_jsonl_stale_whisper)} Whisper transcript(s) lack per-word timestamps — "
@@ -9569,23 +9562,17 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             def _do_jsonl_backfill():
                 """Generate .jsonl entries for already-transcribed videos that are missing them.
                 Runs after new transcriptions so it doesn't delay resuming a paused session."""
-                if not _jsonl_needed or _ce.is_set():
+                if not _jsonl_needed or not yt_title_to_id or _ce.is_set():
                     return
-                # yt_title_to_id may be empty if playlist fetch failed.  VTT backfill
-                # needs a video ID, but stale-Whisper re-transcription only needs the
-                # local file — so don't bail out entirely when the map is empty.
-                _has_yt_map = bool(yt_title_to_id)
 
                 # Match needed titles to video IDs
                 _backfill_list = []
                 for title in _jsonl_needed:
-                    vid_id = yt_title_to_id.get(title) if _has_yt_map else ""
+                    vid_id = yt_title_to_id.get(title)
                     if not vid_id:
                         _norm_t = _normalize_title(title)
-                        vid_id = _yt_norm_backfill.get(_norm_t, "")
-                    # Stale Whisper titles are re-transcribed locally — they don't
-                    # need a YouTube video ID, so always include them.
-                    if vid_id or title in _jsonl_stale_whisper:
+                        vid_id = _yt_norm_backfill.get(_norm_t)
+                    if vid_id:
                         _backfill_list.append((title, vid_id))
 
                 if _backfill_list:
@@ -9645,7 +9632,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     if _w_segs:
                                         if os.path.isfile(_bf_jsonl_w):
                                             _remove_jsonl_entries_for_title(_bf_jsonl_w, _bf_title)
-                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs, source="whisper")
+                                        _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs)
                                         _bf_done += 1
                                 except Exception:
                                     pass
@@ -9666,11 +9653,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _bf_txt, _ = _get_transcript_filename(
                                         ch_name, folder, split_years, split_months, combined)
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
-                                # Purge old entries so the new VTT data replaces them
-                                # cleanly — prevents duplicates and stale segments.
-                                if os.path.isfile(_bf_jsonl):
+                                # Purge old entries before writing if this title had bad
+                                # segments or stale word timestamps (avoids duplicates).
+                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper) \
+                                        and os.path.isfile(_bf_jsonl):
                                     _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
-                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs, source="vtt")
+                                _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
                                 _bf_done += 1
                         except Exception:
                             pass
@@ -9843,8 +9831,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         unmatched.append((fname, fpath))
 
             # Sort by file modification time, newest first
-            matched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
-            unmatched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
+            matched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+            unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
 
             log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
@@ -10014,7 +10002,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Write hidden JSONL with timestamps for searchability
                 if _vtt_segments:
                     _jsonl_path = _get_jsonl_path(txt_path)
-                    _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments, source="vtt")
+                    _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments)
 
                 _vid_elapsed = time.time() - _t_vid_start
                 _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -10086,8 +10074,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
-                unmatched = [(fn, fp) for fn, fp in unmatched if os.path.exists(fp)]
-                unmatched.sort(key=lambda x: _safe_getmtime(x[1]), reverse=True)
+                unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
 
                 # ── Model selection ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
@@ -10372,7 +10359,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             # truly local/offline files that have no YouTube counterpart.
                             _w_vid_id = (yt_title_to_id.get(fname)
                                          or _yt_normalized.get(_normalize_for_match(fname), ""))
-                            _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments, source="whisper")
+                            _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments)
 
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -10840,7 +10827,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
             all_files = [f for f in os.listdir(folder_path)
                          if os.path.isfile(os.path.join(folder_path, f))
                          and os.path.splitext(f)[1].lower() in _VID_EXTS]
-            files = sorted(all_files, key=lambda f: _safe_getmtime(os.path.join(folder_path, f)))
+            files = sorted(all_files, key=lambda f: os.path.getmtime(os.path.join(folder_path, f)))
 
             if not files:
                 log(f"  No video/audio files found in folder.\n", "red")
@@ -12154,12 +12141,11 @@ def _load_archived_ids():
     archived = set()
     try:
         if os.path.exists(ARCHIVE_FILE):
-            with io_lock:
-                with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            archived.add(parts[-1])
+            with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        archived.add(parts[-1])
     except Exception:
         pass
     return archived
@@ -12896,7 +12882,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                             log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 # Private/unavailable videos — auto-archive so they never reappear
-                if current_vid_id and current_vid_id not in live_ids and ("Video unavailable" in line or "This video is private" in line
+                if current_vid_id and ("Video unavailable" in line or "This video is private" in line
                                        or "video is no longer available" in line.lower()):
                     dur_count += 1
                     session_totals["dur"] += 1
@@ -16860,10 +16846,7 @@ def _tp_parse_path_meta(jsonl_path, archive_roots):
 def _tp_index_file(conn, jsonl_path, archive_roots):
     """Index one JSONL file. Returns segment count added."""
     channel, year, month = _tp_parse_path_meta(jsonl_path, archive_roots)
-    try:
-        mtime = os.path.getmtime(jsonl_path)
-    except OSError:
-        return 0
+    mtime = os.path.getmtime(jsonl_path)
     old = conn.execute("SELECT id FROM segments WHERE jsonl_path=?", (jsonl_path,)).fetchall()
     if old:
         ids = [r[0] for r in old]
@@ -17533,7 +17516,6 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
-            self.after(100, menu.destroy)
 
     # ── Bookmarks section ─────────────────────────────────────────────────────
 
@@ -17670,7 +17652,6 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-            self.after(100, menu.destroy)
 
     def _add_bookmark(self, segment_id, video_id, title, channel, start, text):
         """Add a bookmark for a search result segment."""
@@ -18031,11 +18012,6 @@ class _TranscriptionPanel(ttk.Frame):
 
         def _populate(rows):
             self._search_running = False
-            try:
-                if not self._tree.winfo_exists():
-                    return
-            except Exception:
-                return
             self._tree.delete(*self._tree.get_children())
             self._result_meta.clear()
             for row in rows:
@@ -18407,7 +18383,6 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
-            self.after(100, menu.destroy)
 
     # ── Frequency section ─────────────────────────────────────────────────────
 
@@ -20356,26 +20331,7 @@ def run_startup_updates():
         yt_name = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
         dl_url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{yt_name}"
         import urllib.request
-        import tempfile
-        # Download to temp file first to avoid corrupting the existing binary on failure
-        temp_fd, temp_path = tempfile.mkstemp(suffix=("_" + yt_name), dir=os.path.dirname(target_path) or None)
-        try:
-            os.close(temp_fd)
-            urllib.request.urlretrieve(dl_url, temp_path)
-            # Basic sanity check: yt-dlp binary should be at least 1 MB
-            fsize = os.path.getsize(temp_path)
-            if fsize < 1_000_000:
-                raise RuntimeError(f"Downloaded file too small ({fsize} bytes), likely incomplete")
-            os.replace(temp_path, target_path)
-            if os.name != 'nt':
-                os.chmod(target_path, 0o755)
-        except Exception:
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            raise
+        urllib.request.urlretrieve(dl_url, target_path)
 
     def _get_yt_dlp_version():
         """Get the current yt-dlp version string."""
@@ -20587,17 +20543,11 @@ def _save_queue_state():
     if _current_redownload_item is not None and _redownload_running:
         saved_order.insert(0, ("redownload", _current_redownload_item["ch_url"]))
     queue_data["order"] = saved_order
-    temp_file = QUEUE_FILE + ".tmp"
     try:
-        with open(temp_file, "w", encoding="utf-8") as f:
+        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
-        os.replace(temp_file, QUEUE_FILE)
     except Exception:
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except Exception:
-            pass
+        pass
 
 
 def _load_queue_state():
@@ -20766,13 +20716,6 @@ def on_closing():
     _stop_whisper_process()
     _stop_punct_process()
     _stop_ffmpeg_process()
-
-    # Cleanup transcription panel resources (DB connection, matplotlib figures)
-    if _tp_panel_ref[0] is not None:
-        try:
-            _tp_panel_ref[0].on_destroy()
-        except Exception:
-            pass
 
     # Clear pause so worker threads can exit cleanly
     pause_event.clear()

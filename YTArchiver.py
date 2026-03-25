@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.6"
+APP_VERSION = "v24.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -6449,21 +6449,22 @@ def _parse_vtt_to_segments(vtt_path):
             max_overlap = min(len(seg_words), len(new_words) - 1)
             for ol in range(max_overlap, 0, -1):
                 if seg_words[-ol:] == new_words[:ol]:
-                    # Found overlap — append only the new words
                     extra = " ".join(new_words[ol:])
-                    if extra:
-                        seg_text += " " + extra
-                    seg_end = _e
                     _is_overlap = True
-                    # Cap: if the merged segment has grown beyond the max
-                    # duration, flush it now and restart from this cue.
-                    if (seg_end - seg_start) > _MAX_SEG_SECS:
+                    # Cap: if extending would push beyond the max duration,
+                    # flush the current segment *before* adding new text so
+                    # flushed segments stay ≤ _MAX_SEG_SECS.
+                    if (_e - seg_start) > _MAX_SEG_SECS:
                         if seg_text.strip():
                             segments.append({"start": seg_start, "end": seg_end,
                                              "text": seg_text.strip()})
                         seg_start = _s
                         seg_end = _e
                         seg_text = _t
+                    else:
+                        if extra:
+                            seg_text += " " + extra
+                        seg_end = _e
                     break
 
             # Also catch near-zero-duration "echo" cues (e.g., 805.91→805.92)
@@ -6630,6 +6631,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                     words = entry.get("text", "").split()
                     seg_start = entry.get("start", 0)
                     seg_end   = entry.get("end", seg_start + dur)
+                    parent_words = entry.get("words")  # may be None or list
                     n_chunks  = max(2, int(dur / _TARGET) + (1 if dur % _TARGET > 1 else 0))
                     chunk_dur = dur / n_chunks
                     words_per = max(1, len(words) // n_chunks)
@@ -6645,6 +6647,15 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         sub["start"] = cs
                         sub["end"]   = ce
                         sub["text"]  = chunk_text
+                        # Scope the word-level timestamps to this sub-segment's
+                        # time range so seek-on-click resolves correctly.
+                        if parent_words and isinstance(parent_words, list):
+                            scoped = [w for w in parent_words
+                                      if isinstance(w, dict)
+                                      and cs - 0.5 <= w.get("s", -1) <= ce + 0.5]
+                            sub["words"] = scoped if scoped else []
+                        else:
+                            sub.pop("words", None)
                         new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
                 if changed:
                     with open(fpath, "w", encoding="utf-8") as fh:
@@ -6679,6 +6690,74 @@ def _remove_jsonl_entries_for_title(jsonl_path, title):
         _hide_file_win(jsonl_path)
     except Exception:
         pass
+
+
+def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
+    """Walk all JSONL files for *ch_name* under *folder_path* and remove entries
+    whose title matches *title*.  Needed because year-split routing may differ
+    between initial transcription (upload date) and backfill (file mtime)."""
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
+                _remove_jsonl_entries_for_title(os.path.join(dirpath, f), title)
+
+
+def _rescope_words_in_jsonl(folder_path, ch_name):
+    """One-time migration: filter each entry's ``words`` list so that only words
+    within the entry's [start-0.5, end+0.5] time range remain.
+
+    Previous versions of ``_fix_long_segments_in_jsonl`` copied the *entire*
+    parent word list into each sub-segment.  That caused word-timestamp lookups
+    to resolve to the beginning of the parent segment (often t~0) regardless of
+    where the user clicked.  This pass corrects those entries in-place.
+
+    Returns the number of entries whose word lists were re-scoped.
+    """
+    import json as _json
+    rescoped = 0
+    for dirpath, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if not (f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl")):
+                continue
+            fpath = os.path.join(dirpath, f)
+            try:
+                with open(fpath, "r", encoding="utf-8") as fh:
+                    raw_lines = fh.readlines()
+                new_lines = []
+                changed = False
+                for line in raw_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    try:
+                        entry = _json.loads(stripped)
+                    except Exception:
+                        new_lines.append(line)
+                        continue
+                    words = entry.get("words")
+                    if not words or not isinstance(words, list):
+                        new_lines.append(line)
+                        continue
+                    s = entry.get("start", 0)
+                    e = entry.get("end", s)
+                    scoped = [w for w in words
+                              if isinstance(w, dict)
+                              and s - 0.5 <= w.get("s", -1) <= e + 0.5]
+                    if len(scoped) < len(words):
+                        entry["words"] = scoped
+                        changed = True
+                        rescoped += 1
+                        new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
+                    else:
+                        new_lines.append(line)
+                if changed:
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.writelines(new_lines)
+                    _hide_file_win(fpath)
+            except Exception:
+                pass
+    return rescoped
 
 
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
@@ -9442,6 +9521,21 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 with config_lock:
                     config[_wt_key] = True
                     save_config(config)
+            # One-time migration: rescope word-level timestamps in existing JSONL
+            # entries.  A previous bug in _fix_long_segments_in_jsonl copied the
+            # *entire* parent word list into sub-segments, causing seek-on-click
+            # to always resolve to t≈0.  This pass filters each entry's words to
+            # its own [start, end] range.
+            _rs_key = f"jsonl_words_rescoped_{ch_name}"
+            if not config.get(_rs_key):
+                if already_done:
+                    _rs_count = _rescope_words_in_jsonl(folder, ch_name)
+                    if _rs_count:
+                        log(f"  ✓ Re-scoped word timestamps in {_rs_count} existing JSONL entry/entries.\n",
+                            "simpleline_green")
+                with config_lock:
+                    config[_rs_key] = True
+                    save_config(config)
             _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else (set(), set(), set()))
 
@@ -9630,8 +9724,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                         cancel_ev=_ce, pause_ev=_pe)
                                     _clear_whisper_progress()
                                     if _w_segs:
-                                        if os.path.isfile(_bf_jsonl_w):
-                                            _remove_jsonl_entries_for_title(_bf_jsonl_w, _bf_title)
+                                        _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
                                         _write_jsonl_entry(_bf_jsonl_w, _bf_vid or "", _bf_title, _w_segs)
                                         _bf_done += 1
                                 except Exception:
@@ -9655,9 +9748,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
                                 # Purge old entries before writing if this title had bad
                                 # segments or stale word timestamps (avoids duplicates).
-                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper) \
-                                        and os.path.isfile(_bf_jsonl):
-                                    _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
+                                # Use all-files removal to handle year-split mismatches.
+                                if (_bf_title in _jsonl_bad or _bf_title in _jsonl_stale_whisper):
+                                    _remove_jsonl_entries_for_title_all_files(folder, ch_name, _bf_title)
                                 _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs)
                                 _bf_done += 1
                         except Exception:
@@ -17480,8 +17573,9 @@ class _TranscriptionPanel(ttk.Frame):
                         return max(0.0, w["s"] - _TS_LEAD)
             except Exception:
                 pass
-        # Fallback: interpolate within segment (old behaviour, larger lead)
-        return self._interpolate_ts(seg_start, seg_end, "", word)
+        # Fallback: use segment start with a small lead so the user still
+        # lands very close to the right spot even without word timestamps.
+        return max(0.0, seg_start - _TS_LEAD)
 
     def _show_browse_open_menu(self, x, y, video_id, video_path, ts,
                                 word, seg_text, title, channel, start_time):

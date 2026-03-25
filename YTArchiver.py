@@ -60,7 +60,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.8"
+APP_VERSION = "v24.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -6462,25 +6462,65 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments, source=""):
     every JSONL line so that ``_scan_existing_jsonl`` can distinguish VTT
     segments (which may be long after merging) from genuine Whisper content
     that still needs per-word timestamps.
+
+    Segments longer than 30 s are automatically split into ≤30 s chunks to
+    prevent them from being flagged as "bad" on the next scan pass.
     """
     import json as _json
+    _TARGET = 30.0
+    _MAX_SEG = 35.0
     try:
         os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
         with open(jsonl_path, "a", encoding="utf-8") as f:
             for seg in segments:
-                entry = {
-                    "video_id": video_id or "",
-                    "title": title,
-                    "start": round(seg["start"], 2),
-                    "end": round(seg["end"], 2),
-                    "text": seg["text"]
-                }
-                if source:
-                    entry["source"] = source
-                if seg.get("words"):
-                    entry["words"] = seg["words"]
-                line = _json.dumps(entry, ensure_ascii=False)
-                f.write(line + "\n")
+                start = round(seg["start"], 2)
+                end = round(seg["end"], 2)
+                dur = end - start
+                text = seg["text"]
+                words = seg.get("words")
+
+                # Split overly long segments into ≤30 s chunks so they don't
+                # get flagged as bad_titles on the next JSONL scan.
+                if dur > _MAX_SEG:
+                    tok = text.split()
+                    n_chunks = max(2, int(dur / _TARGET) + (1 if dur % _TARGET > 1 else 0))
+                    chunk_dur = dur / n_chunks
+                    words_per = max(1, len(tok) // n_chunks)
+                    for ci in range(n_chunks):
+                        w0 = ci * words_per
+                        w1 = w0 + words_per if ci < n_chunks - 1 else len(tok)
+                        chunk_text = " ".join(tok[w0:w1])
+                        if not chunk_text:
+                            continue
+                        cs = round(start + ci * chunk_dur, 2)
+                        ce = round(min(end, start + (ci + 1) * chunk_dur), 2)
+                        entry = {
+                            "video_id": video_id or "",
+                            "title": title,
+                            "start": cs,
+                            "end": ce,
+                            "text": chunk_text
+                        }
+                        if source:
+                            entry["source"] = source
+                        # Don't carry word timestamps into split chunks —
+                        # they cover the original unsplit segment.
+                        line = _json.dumps(entry, ensure_ascii=False)
+                        f.write(line + "\n")
+                else:
+                    entry = {
+                        "video_id": video_id or "",
+                        "title": title,
+                        "start": start,
+                        "end": end,
+                        "text": text
+                    }
+                    if source:
+                        entry["source"] = source
+                    if words:
+                        entry["words"] = words
+                    line = _json.dumps(entry, ensure_ascii=False)
+                    f.write(line + "\n")
         _hide_file_win(jsonl_path)
     except Exception:
         pass
@@ -6514,27 +6554,32 @@ def _scan_existing_jsonl(folder_path, ch_name):
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
             if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
+                fpath = os.path.join(dirpath, f)
                 try:
-                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                    with open(fpath, "r", encoding="utf-8") as fh:
                         for line in fh:
                             line = line.strip()
-                            if line:
+                            if not line:
+                                continue
+                            try:
                                 entry = _json.loads(line)
-                                title = entry.get("title", "")
-                                existing.add(title)
-                                dur = entry.get("end", 0) - entry.get("start", 0)
-                                if dur > _MAX_SEG:
-                                    bad_titles.add(title)
-                                _src = entry.get("source", "")
-                                if _src == "vtt":
-                                    _known_vtt.add(title)
-                                # Only flag as potentially stale Whisper if the entry
-                                # does NOT come from VTT.  Entries with no source
-                                # field (pre-existing data) use the old heuristic.
-                                if dur > _WHISPER_MIN and _src != "vtt":
-                                    _has_long_seg.add(title)
-                                if entry.get("words"):
-                                    _has_words.add(title)
+                            except Exception:
+                                continue  # skip malformed lines, keep scanning
+                            title = entry.get("title", "")
+                            existing.add(title)
+                            dur = entry.get("end", 0) - entry.get("start", 0)
+                            if dur > _MAX_SEG:
+                                bad_titles.add(title)
+                            _src = entry.get("source", "")
+                            if _src == "vtt":
+                                _known_vtt.add(title)
+                            # Only flag as potentially stale Whisper if the entry
+                            # does NOT come from VTT.  Entries with no source
+                            # field (pre-existing data) use the old heuristic.
+                            if dur > _WHISPER_MIN and _src != "vtt":
+                                _has_long_seg.add(title)
+                            if entry.get("words"):
+                                _has_words.add(title)
                 except Exception:
                     pass
     # A title is stale only if it has long segments from a non-VTT source
@@ -6566,6 +6611,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                     raw_lines = fh.readlines()
                 new_lines = []
                 changed = False
+                _file_fixed = 0
                 for line in raw_lines:
                     stripped = line.strip()
                     if not stripped:
@@ -6582,7 +6628,7 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         continue
                     # Split this segment
                     changed = True
-                    fixed_count += 1
+                    _file_fixed += 1
                     words = entry.get("text", "").split()
                     seg_start = entry.get("start", 0)
                     seg_end   = entry.get("end", seg_start + dur)
@@ -6601,11 +6647,18 @@ def _fix_long_segments_in_jsonl(folder_path, ch_name):
                         sub["start"] = cs
                         sub["end"]   = ce
                         sub["text"]  = chunk_text
+                        # Remove per-word timestamps from split chunks — they
+                        # correspond to the original unsplit segment and are
+                        # no longer accurate after splitting.
+                        sub.pop("words", None)
                         new_lines.append(_json.dumps(sub, ensure_ascii=False) + "\n")
                 if changed:
                     with open(fpath, "w", encoding="utf-8") as fh:
                         fh.writelines(new_lines)
                     _hide_file_win(fpath)
+                    # Only count after successful write so the caller knows
+                    # how many segments were actually persisted to disk.
+                    fixed_count += _file_fixed
             except Exception:
                 pass
     return fixed_count
@@ -9391,13 +9444,24 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # In-place segment repair: fix any Whisper segments > 35 s that can't be
             # re-fetched via auto-captions.  This runs before the backfill pass so that
             # titles fixed in-place are excluded from _jsonl_bad (they no longer need repair).
+            _pre_fix_bad = set(_jsonl_bad)  # snapshot before fix
             if _jsonl_bad:
                 _inplace_fixed = _fix_long_segments_in_jsonl(folder, ch_name)
                 if _inplace_fixed:
                     log(f"  ✓ Fixed {_inplace_fixed} long Whisper segment(s) in existing transcripts.\n",
                         "simpleline_green")
-                    # Re-scan to update bad_titles now that in-place fixes are done
-                    _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
+                # Always re-scan after a fix attempt so _jsonl_bad and
+                # _jsonl_stale_whisper reflect the actual on-disk state,
+                # even when the fix reports 0 (e.g. write errors were caught).
+                _jsonl_existing_raw, _jsonl_bad, _jsonl_stale_whisper = _scan_existing_jsonl(folder, ch_name)
+                # Titles that were in _jsonl_bad before the fix and are now
+                # cleared from bad should NOT be treated as stale-whisper.
+                # The in-place split intentionally drops per-word timestamps,
+                # but that doesn't mean the video needs full re-transcription
+                # — the segment text is already correct, just chunked.
+                _fixed_titles = _pre_fix_bad - _jsonl_bad
+                if _fixed_titles:
+                    _jsonl_stale_whisper -= _fixed_titles
 
             if _jsonl_stale_whisper:
                 log(f"  ↻ {len(_jsonl_stale_whisper)} Whisper transcript(s) lack per-word timestamps — "
@@ -9602,8 +9666,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _bf_txt, _ = _get_transcript_filename(
                                         ch_name, folder, split_years, split_months, combined)
                                 _bf_jsonl = _get_jsonl_path(_bf_txt)
-                                # If this title had bad segments, purge old entries first.
-                                if _bf_title in _jsonl_bad and os.path.isfile(_bf_jsonl):
+                                # Purge old entries so the new VTT data replaces them
+                                # cleanly — prevents duplicates and stale segments.
+                                if os.path.isfile(_bf_jsonl):
                                     _remove_jsonl_entries_for_title(_bf_jsonl, _bf_title)
                                 _write_jsonl_entry(_bf_jsonl, _bf_vid, _bf_title, _bf_segs, source="vtt")
                                 _bf_done += 1

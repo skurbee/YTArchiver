@@ -17935,7 +17935,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_viewer_title = tk.Label(vh, text="Select a transcription to read",
                                              bg=self._TP_BG3, fg=self._TP_FG,
                                              font=("Segoe UI", 11, "bold"), anchor="w",
-                                             padx=10, pady=6)
+                                             padx=10, pady=6, width=1)
         self._browse_viewer_title.pack(side="left", fill="x", expand=True)
         # Inline find bar
         self._browse_find_var = tk.StringVar()
@@ -18268,20 +18268,62 @@ class _TranscriptionPanel(ttk.Frame):
                 "Cannot re-transcribe.")
             return
 
-        # Ask for Whisper model
-        cancel_ev = threading.Event()
-        model_choice = [None]
-        def _do_ask():
-            m, _ = _ask_whisper_model_dialog(
-                prompt_text=f"Re-transcribe: {title[:60]}",
-                subtitle_text="Select Whisper model for re-transcription",
-                cancel_ev=cancel_ev)
-            model_choice[0] = m
-        # Run in thread to avoid blocking UI
-        t = threading.Thread(target=_do_ask, daemon=True)
-        t.start()
-        t.join()
-        if not model_choice[0]:
+        # Ask for Whisper model — show dialog directly on the main thread.
+        # _ask_whisper_model_dialog uses _ui_queue which requires a background
+        # thread, so we build a simple modal Toplevel here instead.
+        _model_result = [None]
+        _dlg = tk.Toplevel(root)
+        _dlg.title("Whisper Model Selection")
+        _dlg.configure(bg=C_BG)
+        _dlg.resizable(False, False)
+        _dlg.transient(root)
+        _dlg.grab_set()
+        _dlg.update_idletasks()
+        _apply_dark_title_bar(_dlg)
+        _rx = root.winfo_rootx() + root.winfo_width() // 2
+        _ry = root.winfo_rooty() + root.winfo_height() // 2
+        _dlg.geometry(f"+{_rx - 160}+{_ry - 140}")
+
+        tk.Label(_dlg, text=f"Re-transcribe: {title[:60]}",
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                 pady=10, padx=20).pack(fill="x")
+        tk.Label(_dlg, text="Select Whisper model for re-transcription",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+                 padx=20).pack(fill="x")
+
+        _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
+        _btn_frame.pack(fill="x", padx=20)
+
+        _models = [
+            ("tiny",     "Fastest  (~30-50\u00d7 realtime)",    "tiny"),
+            ("small",    "Fast  (~15-20\u00d7 realtime)",       "small"),
+            ("medium",   "Balanced  (~7-10\u00d7 realtime)",    "medium"),
+            ("large-v3", "Best quality  (~3-5\u00d7 realtime)", "large-v3"),
+        ]
+
+        def _pick(m):
+            _model_result[0] = m
+            try:
+                _dlg.destroy()
+            except Exception:
+                pass
+
+        for label, desc, model_id in _models:
+            _row = tk.Frame(_btn_frame, bg=C_BG)
+            _row.pack(fill="x", pady=2)
+            _b = tk.Button(_row, text=label, width=10,
+                           bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                           activeforeground=C_TEXT, relief="flat", bd=0,
+                           font=("Segoe UI", 9, "bold"), cursor="hand2",
+                           command=lambda m=model_id: _pick(m))
+            _b.pack(side="left", padx=(0, 8))
+            tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                     font=("Segoe UI", 9)).pack(side="left")
+
+        _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+        _dlg.wait_window(_dlg)
+
+        if not _model_result[0]:
             return  # User cancelled
 
         chosen_model = model_choice[0]

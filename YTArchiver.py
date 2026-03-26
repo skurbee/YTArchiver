@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.9"
+APP_VERSION = "v25.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 5:43pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 6:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -17946,6 +17946,15 @@ class _TranscriptionPanel(ttk.Frame):
         bf_entry.bind("<Return>", lambda _: self._browse_find())
         tk.Label(vh, text="Find:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="right", padx=(8, 4))
+        # Re-transcribe button — lets user re-transcribe a bad YT caption via Whisper
+        self._browse_retranscribe_btn = tk.Button(
+            vh, text="Re-transcribe", bg="#3a3a3a", fg=self._TP_FG,
+            activebackground="#555555", activeforeground=self._TP_FG,
+            relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
+            state="disabled", command=self._on_retranscribe)
+        self._browse_retranscribe_btn.pack(side="right", padx=(0, 10))
+        # Current browse selection state for re-transcribe
+        self._browse_current_meta = None
         vf = tk.Frame(right, bg=self._TP_BG)
         vf.pack(fill="both", expand=True)
         self._browse_viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG,
@@ -18075,6 +18084,26 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_viewer_title.config(text=title)
         self._browse_path_label.config(
             text=f"{meta.get('channel', '')}  •  {txt_path or ''}")
+
+        # Look up video_id for re-transcribe
+        _vid_id = None
+        if self._conn and title:
+            try:
+                _row = self._db_execute(
+                    "SELECT video_id FROM segments WHERE title=? AND video_id!='' LIMIT 1",
+                    (title,)).fetchone()
+                if _row:
+                    _vid_id = _row[0]
+            except Exception:
+                pass
+        self._browse_current_meta = {
+            "title": title, "channel": meta.get("channel", ""),
+            "txt_path": txt_path, "jsonl_path": meta.get("jsonl_path"),
+            "video_id": _vid_id,
+        }
+        # Enable re-transcribe if we have a video file locally OR a video_id to download from
+        _has_video = bool(self._find_video_file(title, txt_path)) or bool(_vid_id)
+        self._browse_retranscribe_btn.config(state="normal" if _has_video else "disabled")
 
         # Fetch segments from DB for the position map (double-click seeking).
         # The viewer itself always shows the .txt body (punctuation-restored).
@@ -18215,6 +18244,238 @@ class _TranscriptionPanel(ttk.Frame):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _on_retranscribe(self):
+        """Re-transcribe the currently viewed video using Whisper."""
+        meta = self._browse_current_meta
+        if not meta:
+            return
+        title      = meta["title"]
+        txt_path   = meta["txt_path"]
+        jsonl_path = meta["jsonl_path"]
+        video_id   = meta["video_id"]
+        channel    = meta["channel"]
+
+        if not txt_path:
+            messagebox.showerror("Error", "No transcript file path found.")
+            return
+
+        # Find local video file first
+        video_path = self._find_video_file(title, txt_path)
+        if not video_path and not video_id:
+            messagebox.showerror("Error",
+                "No local video file found and no YouTube video ID available.\n"
+                "Cannot re-transcribe.")
+            return
+
+        # Ask for Whisper model
+        cancel_ev = threading.Event()
+        model_choice = [None]
+        def _do_ask():
+            m, _ = _ask_whisper_model_dialog(
+                prompt_text=f"Re-transcribe: {title[:60]}",
+                subtitle_text="Select Whisper model for re-transcription",
+                cancel_ev=cancel_ev)
+            model_choice[0] = m
+        # Run in thread to avoid blocking UI
+        t = threading.Thread(target=_do_ask, daemon=True)
+        t.start()
+        t.join()
+        if not model_choice[0]:
+            return  # User cancelled
+
+        chosen_model = model_choice[0]
+        self._browse_retranscribe_btn.config(state="disabled", text="Working...")
+
+        def _retranscribe_worker():
+            global _whisper_model_choice
+            _temp_audio = None
+            try:
+                audio_path = video_path
+                _dur_secs = 0
+
+                # If no local file, download audio from YouTube
+                if not audio_path and video_id:
+                    self._browse_retranscribe_status("Downloading audio...")
+                    import tempfile
+                    _temp_dir = tempfile.mkdtemp(prefix="ytarch_retrans_")
+                    _temp_audio = os.path.join(_temp_dir, f"{video_id}.m4a")
+                    _dl_cmd = [
+                        "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+                        "-o", _temp_audio, "--no-playlist",
+                        "--cookies-from-browser", "firefox",
+                        f"https://www.youtube.com/watch?v={video_id}",
+                    ]
+                    _dl_result = subprocess.run(
+                        _dl_cmd, capture_output=True, text=True,
+                        timeout=300, startupinfo=startupinfo)
+                    if _dl_result.returncode != 0 or not os.path.exists(_temp_audio):
+                        # Retry without cookies
+                        _dl_cmd2 = [
+                            "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+                            "-o", _temp_audio, "--no-playlist",
+                            f"https://www.youtube.com/watch?v={video_id}",
+                        ]
+                        _dl_result2 = subprocess.run(
+                            _dl_cmd2, capture_output=True, text=True,
+                            timeout=300, startupinfo=startupinfo)
+                        if _dl_result2.returncode != 0 or not os.path.exists(_temp_audio):
+                            self._browse_retranscribe_done(
+                                False, "Failed to download audio from YouTube.")
+                            return
+                    audio_path = _temp_audio
+
+                # Get duration via ffprobe
+                try:
+                    _probe = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-show_entries",
+                         "format=duration", "-of", "csv=p=0", audio_path],
+                        capture_output=True, text=True, timeout=30,
+                        startupinfo=startupinfo)
+                    _dur_secs = float(_probe.stdout.strip())
+                except Exception:
+                    pass
+
+                # Set whisper model and transcribe
+                _prev_model = _whisper_model_choice
+                _whisper_model_choice = chosen_model
+                # Stop existing whisper process so it restarts with new model
+                _stop_whisper_process()
+
+                self._browse_retranscribe_status(f"Transcribing ({chosen_model})...")
+                text, segments = _whisper_transcribe(
+                    audio_path, duration=_dur_secs, title=title)
+
+                # Restore previous model choice
+                _whisper_model_choice = _prev_model
+                _stop_whisper_process()
+
+                if not text:
+                    self._browse_retranscribe_done(
+                        False, "Whisper returned no text — no speech detected?")
+                    return
+
+                # Apply punctuation fixup
+                text = _whisper_punct_fixup(text)
+
+                # --- Replace old entry in .txt ---
+                self._browse_retranscribe_status("Replacing transcript...")
+                self._replace_txt_entry(txt_path, title, text, chosen_model)
+
+                # --- Replace old entry in .jsonl ---
+                if jsonl_path:
+                    self._replace_jsonl_entry(
+                        jsonl_path, title, video_id or "", segments)
+
+                    # --- Re-index this JSONL file in the DB ---
+                    roots = self._get_archive_roots()
+                    with self._db_lock:
+                        _tp_index_file(self._conn, jsonl_path, roots)
+
+                self._browse_retranscribe_done(True)
+
+            except Exception as e:
+                self._browse_retranscribe_done(False, str(e))
+            finally:
+                # Clean up temp audio
+                if _temp_audio:
+                    try:
+                        os.remove(_temp_audio)
+                        os.rmdir(os.path.dirname(_temp_audio))
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_retranscribe_worker, daemon=True).start()
+
+    def _browse_retranscribe_status(self, msg):
+        """Update the re-transcribe button text from a worker thread."""
+        self.after(0, lambda: self._browse_retranscribe_btn.config(text=msg))
+
+    def _browse_retranscribe_done(self, success, error_msg=None):
+        """Called when re-transcription finishes (from worker thread)."""
+        def _finish():
+            self._browse_retranscribe_btn.config(
+                state="normal", text="Re-transcribe")
+            if success:
+                messagebox.showinfo("Re-transcribe",
+                    "Transcription replaced successfully.\n"
+                    "The viewer will now refresh.")
+                # Refresh the viewer to show new content
+                self._on_browse_select()
+            else:
+                messagebox.showerror("Re-transcribe Failed",
+                    error_msg or "Unknown error occurred.")
+        self.after(0, _finish)
+
+    def _replace_txt_entry(self, txt_path, title, new_text, model_name):
+        """Replace a single video's entry in the transcript .txt file."""
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = ""
+
+        # Find and remove the old entry
+        matches = list(self._HEADER_RE.finditer(content))
+        new_content = content
+        for i, m in enumerate(matches):
+            if m.group(1).strip() == title.strip():
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+                new_content = content[:m.start()] + content[end:]
+                break
+
+        # Parse old header for date/duration if available
+        _date_fmt = "(Unknown date)"
+        _dur_fmt = "(Unknown length)"
+        _old_header_re = re.compile(
+            r'^===\(' + re.escape(title) + r'\),\s*(\([^)]*\)),\s*(\([^)]*\)),',
+            re.MULTILINE)
+        _old_match = _old_header_re.search(content)
+        if _old_match:
+            _date_fmt = _old_match.group(1)
+            _dur_fmt = _old_match.group(2)
+
+        # Build new entry
+        _model_tag = f"WHISPER {model_name.upper()}"
+        new_entry = f"===({title}), {_date_fmt}, {_dur_fmt}, ({_model_tag})===\n{new_text}\n\n\n"
+
+        # Append new entry
+        # Ensure content ends cleanly before appending
+        new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
+        new_content += new_entry
+
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+    def _replace_jsonl_entry(self, jsonl_path, title, video_id, new_segments):
+        """Replace a single video's segments in the .jsonl file."""
+        # Read existing lines, filter out old entries for this title
+        old_lines = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                old_lines = f.readlines()
+        except FileNotFoundError:
+            pass
+
+        kept_lines = []
+        for line in old_lines:
+            line_s = line.strip()
+            if not line_s:
+                continue
+            try:
+                seg = json.loads(line_s)
+                if seg.get("title", "").strip() == title.strip():
+                    continue  # Skip old entries for this title
+            except Exception:
+                pass
+            kept_lines.append(line if line.endswith("\n") else line + "\n")
+
+        # Write kept lines back
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+
+        # Append new segments
+        _write_jsonl_entry(jsonl_path, video_id, title, new_segments)
 
     def _on_browse_word_double_click(self, event):
         """Double-clicking a word in the browse viewer opens the Open Local/YT menu."""

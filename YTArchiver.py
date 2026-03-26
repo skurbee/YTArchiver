@@ -560,43 +560,61 @@ def log(text, tag=None):
                 # Green [ ] for syncs, blue [ ] for transcriptions.
                 # We split the text into segments so each char gets its tag
                 # at insertion time — no post-hoc tag manipulation needed.
-                _bk_tag = None
-                _bk_m = None
-                if use_tag in ("simpleline", "simpleline_green", "simpleline_blue",
-                               "header", "transcribe_using"):
-                    import re as _re_bk
-                    if any(kw in text for kw in ("SYNCING:", "Downloaded:", "▶",
-                                                  "no new videos")):
-                        _bk_tag = "sync_bracket"
-                    elif any(kw in text for kw in ("Fetching captions:", "Re-transcribing",
-                                                    "Transcribing", "fetching captions",
-                                                    "done (")):
-                        _bk_tag = "trans_bracket"
-                    if _bk_tag:
-                        _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
-
                 def _segmented_insert(_ins_pos, _txt, _base_tag):
                     """Insert text at _ins_pos, splitting [N/M] brackets into colored segments."""
-                    if _bk_tag and _bk_m:
-                        _p = _ins_pos
-                        _before = _txt[:_bk_m.start()]
-                        _open_br = _txt[_bk_m.start():_bk_m.start() + 1]     # [
-                        _nums = _txt[_bk_m.start() + 1:_bk_m.end() - 1]       # N/M
-                        _close_br = _txt[_bk_m.end() - 1:_bk_m.end()]         # ]
-                        _after = _txt[_bk_m.end():]
-                        if _before:
-                            log_box.insert(_p, _before, _base_tag)
-                            _p = log_box.index(f"{_p}+{len(_before)}c")
-                        log_box.insert(_p, _open_br, (_bk_tag, _base_tag))
-                        _p = log_box.index(f"{_p}+1c")
-                        log_box.insert(_p, _nums, _base_tag)
-                        _p = log_box.index(f"{_p}+{len(_nums)}c")
-                        log_box.insert(_p, _close_br, (_bk_tag, _base_tag))
-                        _p = log_box.index(f"{_p}+1c")
-                        if _after:
-                            log_box.insert(_p, _after, _base_tag)
-                    else:
+                    import re as _re_si
+                    _bk_tag = None
+                    _do_white = False
+                    if _base_tag in ("simpleline", "simpleline_green", "simpleline_blue",
+                                     "header"):
+                        if any(kw in _txt for kw in ("SYNCING:", "Downloaded:", "▶",
+                                                      "no new videos")):
+                            _bk_tag = "sync_bracket"
+                        elif any(kw in _txt for kw in ("Fetching captions:", "Re-transcribing",
+                                                        "Transcribing", "fetching captions",
+                                                        "done (")):
+                            _bk_tag = "trans_bracket"
+                            if _base_tag == "simpleline_blue" and "done (" in _txt:
+                                _do_white = True
+                    if not _bk_tag:
                         log_box.insert(_ins_pos, _txt, _base_tag)
+                        return
+                    _bk_m = _re_si.search(r'\[(\d+/\d+)\]', _txt)
+                    if not _bk_m:
+                        log_box.insert(_ins_pos, _txt, _base_tag)
+                        return
+                    # Build segments: before, [, N/M, ], after
+                    _p = _ins_pos
+                    _before = _txt[:_bk_m.start()]
+                    if _before:
+                        log_box.insert(_p, _before, _base_tag)
+                        _p = log_box.index(f"{_p}+{len(_before)}c")
+                    # [ bracket in green/blue
+                    log_box.insert(_p, "[", _bk_tag)
+                    _p = log_box.index(f"{_p}+1c")
+                    # N/M numbers — white for transcription done lines, base tag otherwise
+                    _nums = _txt[_bk_m.start() + 1:_bk_m.end() - 1]
+                    _nums_tag = "dl_white" if _do_white else _base_tag
+                    log_box.insert(_p, _nums, _nums_tag)
+                    _p = log_box.index(f"{_p}+{len(_nums)}c")
+                    # ] bracket in green/blue
+                    log_box.insert(_p, "]", _bk_tag)
+                    _p = log_box.index(f"{_p}+1c")
+                    # After the bracket: for transcription done lines, split at " — done ("
+                    _after = _txt[_bk_m.end():]
+                    if _do_white and _after:
+                        _dash_idx = _after.find(" — done (")
+                        if _dash_idx >= 0:
+                            _title_part = _after[:_dash_idx]
+                            _done_part = _after[_dash_idx:]
+                            if _title_part:
+                                log_box.insert(_p, _title_part, "dl_white")
+                                _p = log_box.index(f"{_p}+{len(_title_part)}c")
+                            log_box.insert(_p, _done_part, _base_tag)
+                        else:
+                            log_box.insert(_p, _after, _base_tag)
+                    elif _after:
+                        log_box.insert(_p, _after, _base_tag)
 
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
@@ -621,6 +639,7 @@ def log(text, tag=None):
                 else:
                     _segmented_insert(tk.END, text, use_tag)
 
+
                 # Apply overlay tags for transcribe_using in simple mode so the
                 # [idx/total] prefix and quoted video title appear white over blue
                 if _is_simple_mode and use_tag == "transcribe_using":
@@ -628,6 +647,16 @@ def log(text, tag=None):
                     if _tu_ranges:
                         _tu_start = _tu_ranges[-2]
                         _tu_text = log_box.get(_tu_ranges[-2], _tu_ranges[-1])
+                        # Blue brackets on [idx/total]
+                        import re as _re_tu
+                        _tu_bk = _re_tu.search(r'\[(\d+/\d+)\]', _tu_text)
+                        if _tu_bk:
+                            log_box.tag_add("trans_bracket",
+                                            log_box.index(f"{_tu_start}+{_tu_bk.start()}c"),
+                                            log_box.index(f"{_tu_start}+{_tu_bk.start() + 1}c"))
+                            log_box.tag_add("trans_bracket",
+                                            log_box.index(f"{_tu_start}+{_tu_bk.end() - 1}c"),
+                                            log_box.index(f"{_tu_start}+{_tu_bk.end()}c"))
                         _tu_trans_i = _tu_text.find("Transcribing")
                         if _tu_trans_i > 0:
                             # White: [idx/total] prefix before "Transcribing"
@@ -3031,7 +3060,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 7:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 8:16pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3416,8 +3445,9 @@ log_box.tag_raise("whisper_bracket", "whisper_prefix")
 log_box.tag_raise("transcribe_prefix", "transcribe_using")
 log_box.tag_raise("transcribe_title", "transcribe_using")
 # Bracket overlay tags — color only the [ ] characters in [X/X] prefixes
-log_box.tag_configure("sync_bracket", foreground=C_LOG_GREEN)
-log_box.tag_configure("trans_bracket", foreground=C_LOG_BLUE)
+log_box.tag_configure("sync_bracket", foreground=C_LOG_GREEN, font=("Consolas", 9))
+log_box.tag_configure("trans_bracket", foreground=C_LOG_BLUE, font=("Consolas", 9))
+log_box.tag_configure("dl_white", foreground="#ffffff", font=("Consolas", 9))
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
 # simplestatus_white must override simplestatus so [X/X] and channel name stay white
@@ -3432,6 +3462,7 @@ log_box.tag_raise("trans_bracket", "simpleline_green")
 log_box.tag_raise("trans_bracket", "simpleline_blue")
 log_box.tag_raise("trans_bracket", "header")
 log_box.tag_raise("trans_bracket", "transcribe_using")
+log_box.tag_raise("trans_bracket", "transcribe_prefix")
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space

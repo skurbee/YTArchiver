@@ -17956,6 +17956,7 @@ class _TranscriptionPanel(ttk.Frame):
             vh, text="Re-transcribe", bg="#3a3a3a", fg=self._TP_FG,
             activebackground="#555555", activeforeground=self._TP_FG,
             relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
+            width=28, anchor="center",
             state="disabled", command=self._on_retranscribe)
         self._browse_retranscribe_btn.pack(side="right", padx=(0, 10))
         # Current browse selection state for re-transcribe
@@ -18499,6 +18500,14 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _replace_jsonl_entry(self, jsonl_path, title, video_id, new_segments):
         """Replace a single video's segments in the .jsonl file."""
+        # Clear hidden attribute so we can write (re-set by _write_jsonl_entry)
+        if os.name == "nt":
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(
+                    jsonl_path, 0x80)  # FILE_ATTRIBUTE_NORMAL
+            except Exception:
+                pass
+
         # Read existing lines, filter out old entries for this title
         old_lines = []
         try:
@@ -18524,7 +18533,7 @@ class _TranscriptionPanel(ttk.Frame):
         with open(jsonl_path, "w", encoding="utf-8") as f:
             f.writelines(kept_lines)
 
-        # Append new segments
+        # Append new segments (also re-hides the file)
         _write_jsonl_entry(jsonl_path, video_id, title, new_segments)
 
     def _on_browse_word_double_click(self, event):

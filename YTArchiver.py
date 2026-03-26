@@ -8915,7 +8915,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         threading.Thread(target=_worker, daemon=True).start()
 
 
-def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None):
+def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None):
     """Transcribe a file using the persistent Whisper subprocess.
 
     Returns (text, segments) where text is str or None, and segments is a list of
@@ -9017,6 +9017,11 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 continue
             if result.get("status") == "progress":
                 pct = result.get("pct", 0)
+                if progress_cb:
+                    try:
+                        progress_cb(pct)
+                    except Exception:
+                        pass
                 if _ce.is_set():
                     log(f"{_wp}Transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
                 elif _pe.is_set():
@@ -18326,7 +18331,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not _model_result[0]:
             return  # User cancelled
 
-        chosen_model = model_choice[0]
+        chosen_model = _model_result[0]
         self._browse_retranscribe_btn.config(state="disabled", text="Working...")
 
         def _retranscribe_worker():
@@ -18384,9 +18389,12 @@ class _TranscriptionPanel(ttk.Frame):
                 # Stop existing whisper process so it restarts with new model
                 _stop_whisper_process()
 
-                self._browse_retranscribe_status(f"Transcribing ({chosen_model})...")
+                self._browse_retranscribe_status(f"Transcribing ({chosen_model}) 0%...")
+                def _on_progress(pct):
+                    self._browse_retranscribe_status(f"Transcribing ({chosen_model}) {pct}%...")
                 text, segments = _whisper_transcribe(
-                    audio_path, duration=_dur_secs, title=title)
+                    audio_path, duration=_dur_secs, title=title,
+                    progress_cb=_on_progress)
 
                 # Restore previous model choice
                 _whisper_model_choice = _prev_model

@@ -20,6 +20,10 @@ import difflib
 import hashlib
 import urllib.request
 import sqlite3
+import traceback
+import math
+import bisect
+import csv
 import webbrowser as _webbrowser
 from pathlib import Path
 
@@ -76,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v24.8"
+APP_VERSION = "v24.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -89,11 +93,25 @@ _INSTANCE_MUTEX = None
 if os.name == 'nt':
     _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\YTArchiver_SingleInstance")
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        # Another instance is running — focus its window and exit silently.
-        _hwnd = ctypes.windll.user32.FindWindowW(None, "YT Archiver")
-        if _hwnd:
-            ctypes.windll.user32.ShowWindow(_hwnd, 9)   # SW_RESTORE
-            ctypes.windll.user32.SetForegroundWindow(_hwnd)
+        # Another instance is running — focus its window using class-based search.
+        # EnumWindows + class check is more robust than FindWindowW by title alone,
+        # which can false-match if another window happens to share the same title.
+        import ctypes.wintypes
+        _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _find_yta_window(hwnd, _):
+            _cls = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(hwnd, _cls, 256)
+            if _cls.value == "TkTopLevel":
+                _title_len = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if _title_len > 0:
+                    _buf = ctypes.create_unicode_buffer(_title_len + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, _buf, _title_len + 1)
+                    if _buf.value == "YT Archiver":
+                        ctypes.windll.user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        return False  # stop enumeration
+            return True  # continue
+        ctypes.windll.user32.EnumWindows(_WNDENUMPROC(_find_yta_window), 0)
         sys.exit(0)
 
 # File extensions recognised as channel video/audio content (excludes temp/partial files)
@@ -212,6 +230,10 @@ _punct_proc = None  # persistent punctuation subprocess (model stays loaded on G
 _job_generation = 0  # incremented each time a new sync/job starts; stale workers check before cleanup
 _skip_current = threading.Event()  # set when user wants to skip the current job and move to next in queue
 _skip_current_gpu = threading.Event()  # same, for GPU Tasks
+_ffmpeg_lock = threading.Lock()  # protects _ffmpeg_proc and _gpu_actively_encoding
+_whisper_lock = threading.Lock()  # protects _whisper_proc and _whisper_line_queue
+_tray_spin_lock = threading.Lock()  # protects _tray_spin_starting flag
+_session_totals_lock = threading.Lock()  # protects session_totals reset
 
 # Disk error auto-pause — detects write errors (e.g. disconnected drive) and
 # pauses all tasks, retrying every 5 minutes until the disk is writable again.
@@ -291,6 +313,7 @@ _cached_autorun_label = "Off"
 # Persistent auto-scroll flag — survives yview fluctuations during batch UI queue processing
 _log_at_bottom = True
 _log_user_scrolled = False  # set True by mouse/scrollbar interaction, cleared when user reaches bottom
+_log_scroll_freeze = False  # suppress scrollbar grid toggling during batch log ops
 
 # Whisper progress dot animation state
 _whisper_dots = {"base_before": "", "pct_str": "", "active": False, "idx": 0, "job": None}
@@ -312,8 +335,19 @@ _MAX_TITLE_DISPLAY = 40
 def _flush_ui_queue():
     """Process pending UI callbacks on the main thread with a time budget."""
     try:
-        # Drop oldest entries if queue grows too large (prevents unbounded memory growth)
+        # Drop oldest entries if queue grows too large (prevents unbounded memory growth).
+        # Preserve callbacks tagged as important (e.g. refresh_recent_list, refresh_channel_dropdowns)
+        # by only dropping anonymous/lambda callbacks from the front.
         while len(_ui_queue) > 5000:
+            _front = _ui_queue[0]
+            # Keep callbacks tagged as critical (via _critical=True attribute)
+            if getattr(_front, '_critical', False):
+                break
+            # Keep named functions (likely important UI refreshes);
+            # drop lambdas/anonymous and _write closures (log output — expendable)
+            _fname = getattr(_front, '__name__', '')
+            if _fname not in ('<lambda>', '<listcomp>', '_write') and _fname:
+                break
             _ui_queue.popleft()
         deadline = time.monotonic() + 0.012  # 12ms budget per tick
         while time.monotonic() < deadline:
@@ -337,8 +371,7 @@ def _flush_ui_queue():
 def _sync_mini_logs_timer():
     """Sync mini logs on a slow timer instead of per-log-line."""
     try:
-        if '_sync_mini_logs_from_main' in globals():
-            _sync_mini_logs_from_main()
+        _sync_mini_logs_from_main()
     except Exception:
         pass
     try:
@@ -391,7 +424,7 @@ def log(text, tag=None):
                     elif any(x in text for x in
                              ["Channel already initialized", "[download] Destination:", "100%", "✓"]):
                         use_tag = "green"
-                    elif any(x in text for x in ["ERROR:", "Error:", "failed"]):
+                    elif any(x in text for x in ["ERROR:", "Error:", "failed:", "failed."]):
                         use_tag = "red"
                     elif "SYNCING:" in text or "---" in text:
                         use_tag = "header"
@@ -420,8 +453,7 @@ def log(text, tag=None):
                     else:
                         _wp_ins = tk.END
                     # Split text to colorize the percentage green
-                    import re as _re_wp
-                    _wp_match = _re_wp.search(r'(\d+%)', text)
+                    _wp_match = re.search(r'(\d+%)', text)
                     if _wp_match:
                         _before = text[:_wp_match.start()]
                         _pct_str = _wp_match.group(1)
@@ -562,7 +594,6 @@ def log(text, tag=None):
                 # at insertion time — no post-hoc tag manipulation needed.
                 def _segmented_insert(_ins_pos, _txt, _base_tag):
                     """Insert text at _ins_pos, splitting [N/M] brackets into colored segments."""
-                    import re as _re_si
                     _bk_tag = None
                     _do_white = False
                     if _base_tag in ("simpleline", "simpleline_green", "simpleline_blue",
@@ -579,7 +610,7 @@ def log(text, tag=None):
                     if not _bk_tag:
                         log_box.insert(_ins_pos, _txt, _base_tag)
                         return
-                    _bk_m = _re_si.search(r'\[(\d+/\d+)\]', _txt)
+                    _bk_m = re.search(r'\[(\d+/\d+)\]', _txt)
                     if not _bk_m:
                         log_box.insert(_ins_pos, _txt, _base_tag)
                         return
@@ -648,8 +679,7 @@ def log(text, tag=None):
                         _tu_start = _tu_ranges[-2]
                         _tu_text = log_box.get(_tu_ranges[-2], _tu_ranges[-1])
                         # Blue brackets on [idx/total]
-                        import re as _re_tu
-                        _tu_bk = _re_tu.search(r'\[(\d+/\d+)\]', _tu_text)
+                        _tu_bk = re.search(r'\[(\d+/\d+)\]', _tu_text)
                         if _tu_bk:
                             log_box.tag_add("trans_bracket",
                                             log_box.index(f"{_tu_start}+{_tu_bk.start()}c"),
@@ -714,6 +744,9 @@ def log(text, tag=None):
                     line_count = int(log_box.index("end-1c").split(".")[0])
                     if line_count > 20000:
                         log_box.delete("1.0", f"{line_count - 15000}.0")
+                        # Re-apply active overlay tags whose anchors may have
+                        # been destroyed by the trim above.
+                        _reapply_whisper_overlays()
                 except Exception:
                     pass
 
@@ -867,10 +900,6 @@ def log_progress_bar(current, total):
             if 'log_box' in globals() and log_box.winfo_exists():
                 if _is_simple_mode:
                     return
-                try:
-                    at_bottom = log_box.yview()[1] >= 0.99
-                except Exception:
-                    at_bottom = True
 
                 log_box.config(state="normal")
                 ranges = log_box.tag_ranges("scanline")
@@ -885,7 +914,7 @@ def log_progress_bar(current, total):
                     msg = f"  [scanning...  {current:,} checked]\n"
                 log_box.insert(tk.END, msg, "scanline")
 
-                if at_bottom:
+                if _log_at_bottom:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
         except Exception:
@@ -1195,8 +1224,7 @@ def _update_encode_progress(text):
                 _enc_pos = log_box.index(_ps_r[0]) if _ps_r else tk.END
 
                 # Split percentage out and render it green+bold
-                import re as _re_ep
-                _ep_match = _re_ep.search(r'(\d+%)', text)
+                _ep_match = re.search(r'(\d+%)', text)
                 if _ep_match:
                     _before = text[:_ep_match.start()]
                     _pct_str = _ep_match.group(1)
@@ -1208,7 +1236,7 @@ def _update_encode_progress(text):
                     # Insert the whole _before as ONE encode_progress range (blue),
                     # then overlay white tags for "[N/M] " (prefix) and ": title" (title).
                     _enc_i = _before.find("ENCODING")
-                    _pfx_m = _re_ep.match(
+                    _pfx_m = re.match(
                         r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)$', _before[_enc_i + 8:]
                     ) if _enc_i >= 0 else None
                     _ins = _enc_pos
@@ -1251,7 +1279,7 @@ def _update_encode_progress(text):
                     _d = _dot_chars[_encode_dots["idx"] % 3]
                     _ins = _enc_pos
                     _enc_i2 = _stripped.find("ENCODING")
-                    _sfx_m = _re_ep.match(
+                    _sfx_m = re.match(
                         r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)(.*)$', _stripped[_enc_i2 + 8:]
                     ) if _enc_i2 >= 0 else None
                     log_box.insert(_ins, _stripped, "encode_progress")
@@ -1422,12 +1450,15 @@ def _stop_startup_loading():
     _startup_loading["active"] = False
     _old_job = _startup_loading.get("job")
     _startup_loading["job"] = None
-    if _old_job:
-        try:
-            root.after_cancel(_old_job)
-        except Exception:
-            pass
-    clear_simple_status()
+    def _do_stop():
+        if _old_job:
+            try:
+                root.after_cancel(_old_job)
+            except Exception:
+                pass
+        clear_simple_status()
+    # Route through _ui_queue so after_cancel runs on the main thread
+    _ui_queue.append(_do_stop)
 
 
 def _simple_anim_tick():
@@ -1519,8 +1550,11 @@ def _simple_anim_tick():
     except Exception:
         pass
     finally:
-        if _simple_anim_state["active"] and root.winfo_exists():
-            _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
+        try:
+            if _simple_anim_state["active"] and root.winfo_exists():
+                _simple_anim_state["job"] = root.after(500, _simple_anim_tick)
+        except Exception:
+            pass
 
 
 def _start_simple_anim(channel, idx, total, mode="sync"):
@@ -1560,33 +1594,36 @@ def _update_simple_dl(dl_current, ch_total, batch_size=0):
     _simple_anim_state["batch_size"] = batch_size
 
 
+_PARTIAL_FRAG_RE = re.compile(r'\.f\d{1,4}(?:\.\w+)?$')
+
+def _is_partial_file(name):
+    """Return True if *name* looks like a partial/temp download file left by yt-dlp."""
+    low = name.lower()
+    if low.endswith('.part') or low.endswith('.temp') or low.endswith('.ytdl'):
+        return True
+    # Double-extension partials like .mp4.part, .webm.part
+    if '.part' in low:
+        return True
+    # Mid-download temp files like .temp.mp4, .temp.webm
+    if '.temp.' in low:
+        return True
+    # Intermediate format files like .f136.mp4, .f251.webm (bounded digit count)
+    if _PARTIAL_FRAG_RE.search(name):
+        return True
+    # Intermediate fragment with media extension (e.g. video.f136.mp4)
+    base, ext = os.path.splitext(name)
+    if ext.lower() in ('.webm', '.m4a', '.mp4') and re.search(r'\.f\d{1,4}$', base):
+        return True
+    return False
+
+
 def _cleanup_partial_files(directory, _is_root=True):
     """Remove .part, .temp, .ytdl and orphaned intermediate format files (.fNNN.ext) left behind by cancelled downloads."""
     if not directory or not os.path.isdir(directory):
         return
-    # Longer delay to let Windows release file locks after process kill (only at top level)
+    # Brief delay to let Windows release file locks after process kill (only at top level)
     if _is_root:
-        time.sleep(1.5)
-
-    def _is_partial(name):
-        if name.endswith('.part') or name.endswith('.temp') or name.endswith('.ytdl'):
-            return True
-        # Catch .mp4.part, .webm.part etc (double extension partials)
-        if '.part' in name:
-            return True
-        # Catch .temp.mp4, .temp.webm etc (yt-dlp mid-download temp files)
-        if '.temp.' in name.lower():
-            return True
-        # Intermediate format files like .f136.mp4, .f251.webm
-        if re.search(r'\.f\d+(\.\w+)?$', name):
-            return True
-        # Catch muxed temp files like .mp4.temp or leftover .webm fragments
-        base, ext = os.path.splitext(name)
-        if ext.lower() in ('.webm', '.m4a', '.mp4'):
-            # Check if this is an intermediate fragment (has .fNNN before extension)
-            if re.search(r'\.f\d+$', base):
-                return True
-        return False
+        time.sleep(0.5)
 
     cleaned = 0
     failed = []
@@ -1597,7 +1634,7 @@ def _cleanup_partial_files(directory, _is_root=True):
                     # Recurse into subdirectories (year/month folders)
                     _cleanup_partial_files(entry.path, _is_root=False)
                 continue
-            if _is_partial(entry.name):
+            if _is_partial_file(entry.name):
                 try:
                     os.remove(entry.path)
                     cleaned += 1
@@ -1608,7 +1645,7 @@ def _cleanup_partial_files(directory, _is_root=True):
 
     # Retry any files that were still locked on first attempt
     if failed:
-        time.sleep(2.0)
+        time.sleep(1.0)
         for fp in failed:
             try:
                 os.remove(fp)
@@ -1635,20 +1672,10 @@ def _startup_cleanup_temps():
             ch_folder = os.path.join(out_dir, folder_name)
             if not os.path.isdir(ch_folder):
                 continue
-            # Inline scan without the sleep delay that _cleanup_partial_files uses
+            # Scan without the sleep delay that _cleanup_partial_files uses
             for dirpath, _, files in os.walk(ch_folder):
                 for f in files:
-                    name = f
-                    is_partial = (
-                        name.endswith('.part') or name.endswith('.temp') or name.endswith('.ytdl')
-                        or '.part' in name or '.temp.' in name.lower()
-                        or bool(re.search(r'\.f\d+(\.\w+)?$', name))
-                    )
-                    if not is_partial:
-                        base, ext = os.path.splitext(name)
-                        if ext.lower() in ('.webm', '.m4a', '.mp4') and re.search(r'\.f\d+$', base):
-                            is_partial = True
-                    if is_partial:
+                    if _is_partial_file(f):
                         try:
                             os.remove(os.path.join(dirpath, f))
                             total_cleaned += 1
@@ -1691,8 +1718,8 @@ def spawn_yt_dlp(cmd):
         with proc_lock:
             active_processes.append(proc)
         return proc
-    except FileNotFoundError:
-        log("ERROR: yt-dlp or ffmpeg not found. Check Settings or system PATH.\n", "red")
+    except OSError as e:
+        log(f"ERROR: Could not launch yt-dlp: {e}\n", "red")
         return None
 
 
@@ -1717,45 +1744,14 @@ if os.name == 'nt':
         pass
 
 
-def _suspend_proc(proc):
-    """Suspend a process at the OS level. Currently unused — pause relies on
-    pipe backpressure instead (worker stops reading stdout, pipe buffer fills,
-    yt-dlp naturally blocks on its next write). Kept for potential future use."""
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        if os.name == 'nt':
-            PROCESS_SUSPEND_RESUME = 0x0800
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, proc.pid)
-            if handle:
-                ctypes.windll.ntdll.NtSuspendProcess(handle)
-                ctypes.windll.kernel32.CloseHandle(handle)
-        else:
-            os.kill(proc.pid, signal.SIGSTOP)
-    except Exception:
-        pass
-
-
-def _resume_proc(proc):
-    """Resume a previously suspended process. Currently unused — see _suspend_proc."""
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        if os.name == 'nt':
-            PROCESS_SUSPEND_RESUME = 0x0800
-            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, proc.pid)
-            if handle:
-                ctypes.windll.ntdll.NtResumeProcess(handle)
-                ctypes.windll.kernel32.CloseHandle(handle)
-        else:
-            os.kill(proc.pid, signal.SIGCONT)
-    except Exception:
-        pass
-
-
 def show_notification(title, message):
     if os.name == 'nt':
         try:
+            # Strip control characters (newlines, carriage returns, etc.) that break
+            # the PowerShell command string when embedded in single-quoted literals.
+            _ctrl_re = re.compile(r'[\x00-\x1f\x7f]')
+            title = _ctrl_re.sub(' ', title).strip()
+            message = _ctrl_re.sub(' ', message).strip()
             safe_title = title.replace("'", "''").replace("`", "``").replace("$", "`$")
             safe_message = message.replace("'", "''").replace("`", "``").replace("$", "`$")
             # Windows Runtime toast shows "YT Archiver" as app name;
@@ -1800,8 +1796,11 @@ def check_directory_writable(path):
             with open(test_file, 'w') as f:
                 f.write('test')
         finally:
-            if os.path.exists(test_file):
-                os.remove(test_file)
+            try:
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+            except OSError:
+                pass
         return True
     except (OSError, PermissionError):
         return False
@@ -1828,23 +1827,40 @@ _DISK_RETRY_MINUTES = 5
 
 def _check_disk_error(text):
     """Called after every log() — looks for write-failure patterns in the text."""
+    global _disk_error_active
     if _disk_error_active:
         return
-    text_lower = text.lower() if text else ""
+    if not text or len(text) < 8:
+        return  # Too short to contain any disk error pattern
+    text_lower = text.lower()
     for pattern in _DISK_ERROR_PATTERNS:
         if pattern in text_lower:
+            # Use the lock to prevent a thread-storm: multiple log() calls
+            # could all pass the _disk_error_active check before _handle_disk_error
+            # sets it under the lock. This acquire-and-check prevents duplicates.
+            if not _disk_error_lock.acquire(blocking=False):
+                return  # another thread is already handling it
+            try:
+                if _disk_error_active:
+                    return
+                # Don't set _disk_error_active here — let _handle_disk_error be the sole setter
+                # to avoid the race where _handle_disk_error returns immediately.
+            finally:
+                _disk_error_lock.release()
             threading.Thread(target=_handle_disk_error, daemon=True).start()
             return
 
+
+_disk_error_lock = threading.Lock()
 
 def _handle_disk_error():
     """Pause all tasks when a disk write error is detected and start a retry timer."""
     global _disk_error_active, _disk_error_path, _disk_retry_job, _disk_error_start_time
 
-    if _disk_error_active:
-        return  # already handling
-
-    _disk_error_active = True
+    with _disk_error_lock:
+        if _disk_error_active:
+            return  # already handling
+        _disk_error_active = True
     _disk_error_start_time = time.time()
     with config_lock:
         _disk_error_path = config.get("output_dir", "").strip() or BASE_DIR
@@ -1918,6 +1934,8 @@ def _cleanup_disk_error_entries():
     """Remove recent_downloads entries that failed during a disk error (file absent on disk)
     and de-register their video IDs from the archive so they get re-downloaded on next sync.
     Only looks at entries recorded after the disk error was first detected."""
+    if _disk_error_start_time <= 0:
+        return  # No disk error was ever recorded — nothing to clean up
     cutoff = _disk_error_start_time - 30  # 30 s buffer for entries added just before the error
     ids_to_remove = []
     titles_retried = []
@@ -1934,7 +1952,9 @@ def _cleanup_disk_error_entries():
             if ts >= cutoff and (not fp or not os.path.exists(fp)):
                 vid_id = ""
                 if url:
-                    m = re.search(r"[?&]v=([^&]+)", url)
+                    m = (re.search(r"[?&]v=([^&]+)", url)
+                         or re.search(r"youtu\.be/([^?&/]+)", url)
+                         or re.search(r"/shorts/([^?&/]+)", url))
                     if m:
                         vid_id = m.group(1)
                 if vid_id:
@@ -1945,13 +1965,13 @@ def _cleanup_disk_error_entries():
                 to_keep.append(entry)
         if ids_to_remove:
             config["recent_downloads"] = to_keep
+            save_config(config)
 
     if ids_to_remove:
         _remove_ids_from_archive(ids_to_remove)
         for t in titles_retried:
             log(f"  ↩ Queued for retry: {t}\n", "dim")
         log(f"  ↩ {len(ids_to_remove)} video(s) removed from archive — will retry on next sync.\n", "simpleline_green")
-        save_config(config)
         try:
             if 'refresh_recent_list' in globals():
                 _ui_queue.append(refresh_recent_list)
@@ -2028,9 +2048,9 @@ def build_format_string(resolution):
     res_int = int(resolution)
     res_above = None
     res_below = None
-    # Skip "audio" in fallback search — it's not a numeric resolution
+    # Skip "audio" and "best" in fallback search — only numeric resolutions
     _num_opts = [r for r in RESOLUTION_OPTIONS if r.isdigit()]
-    for i, r in enumerate(_num_opts[:-1] if _num_opts[-1] == "best" else _num_opts):
+    for i, r in enumerate(_num_opts):
         if int(r) == res_int:
             if i + 1 < len(_num_opts):
                 res_above = _num_opts[i + 1]
@@ -2063,7 +2083,15 @@ def load_config():
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     if isinstance(loaded, dict):
-                        cfg.update(loaded)
+                        # Recursive merge: preserves new nested defaults from
+                        # DEFAULT_CONFIG while applying the user's saved values.
+                        def _deep_merge(base, override):
+                            for k, v in override.items():
+                                if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+                                    _deep_merge(base[k], v)
+                                else:
+                                    base[k] = v
+                        _deep_merge(cfg, loaded)
             except (json.JSONDecodeError, OSError, PermissionError):
                 pass
         if not isinstance(cfg.get("recent_downloads"), list):
@@ -2086,42 +2114,75 @@ def load_config():
 
 _save_config_lock = threading.Lock()
 _save_config_thread_running = False
+_save_config_pending = None  # holds the most recent snapshot when a save is already in-flight
 
 
 def save_config(cfg):
-    """Queue a config save to run on a background thread so disk I/O never blocks the UI."""
-    global _save_config_thread_running
+    """Queue a config save to run on a background thread so disk I/O never blocks the UI.
+
+    Uses a dirty-flag pattern: if a save is already in-flight, the new snapshot
+    is stored as pending and the worker will flush it after the current write,
+    guaranteeing the final state is never lost.
+    """
+    global _save_config_thread_running, _save_config_pending
 
     cfg_snapshot = copy.deepcopy(cfg)
 
-    def _do_save():
-        global _save_config_thread_running
-        try:
-            with config_lock:
+    def _write_snapshot(snapshot):
+        """Write a single snapshot to disk. Returns True on success."""
+        with config_lock:
+            try:
+                temp_file = CONFIG_FILE + ".tmp"
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_file, CONFIG_FILE)
+                return True
+            except (PermissionError, OSError):
                 try:
+                    time.sleep(0.5)
                     temp_file = CONFIG_FILE + ".tmp"
                     with open(temp_file, "w", encoding="utf-8") as f:
-                        json.dump(cfg_snapshot, f, indent=2)
+                        json.dump(snapshot, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
                     os.replace(temp_file, CONFIG_FILE)
-                except (PermissionError, OSError) as e:
-                    # Retry once after a brief pause (disk may be momentarily busy)
+                    return True
+                except (PermissionError, OSError) as e2:
                     try:
-                        time.sleep(0.5)
-                        temp_file = CONFIG_FILE + ".tmp"
-                        with open(temp_file, "w", encoding="utf-8") as f:
-                            json.dump(cfg_snapshot, f, indent=2)
-                        os.replace(temp_file, CONFIG_FILE)
-                    except (PermissionError, OSError) as e2:
-                        try:
-                            if sys.stdout:
-                                sys.stdout.write(f"ERROR: Could not save config: {e2}\n")
-                        except Exception:
-                            pass
+                        if sys.stdout:
+                            sys.stdout.write(f"ERROR: Could not save config: {e2}\n")
+                    except Exception:
+                        pass
+                    return False
+
+    def _do_save():
+        global _save_config_thread_running, _save_config_pending
+        try:
+            _write_snapshot(cfg_snapshot)
+            # Flush any pending snapshot that arrived while we were writing
+            while True:
+                with _save_config_lock:
+                    pending = _save_config_pending
+                    _save_config_pending = None
+                if pending is None:
+                    break
+                _write_snapshot(pending)
         finally:
-            _save_config_thread_running = False
+            with _save_config_lock:
+                _save_config_thread_running = False
+                # Check one final time in case a save arrived between the
+                # while-loop exit and the lock acquisition above.
+                if _save_config_pending is not None:
+                    _save_config_thread_running = True
+                    threading.Thread(target=_do_save, daemon=True).start()
 
     with _save_config_lock:
-        if not _save_config_thread_running:
+        if _save_config_thread_running:
+            # A save is already in-flight — stash latest snapshot so it gets flushed
+            _save_config_pending = cfg_snapshot
+        else:
             _save_config_thread_running = True
             threading.Thread(target=_do_save, daemon=True).start()
 
@@ -2220,20 +2281,24 @@ def _update_disk_cache_for_channel(ch):
     """Scan a single channel folder and write the result into the cache.
 
     Safe to call from any background thread.
+    Lock ordering: always config_lock before _disk_cache_lock to prevent deadlocks.
     """
     _url = ch.get("url", "")
     if not _url:
         return
     _nv, _nb, _has_tx = _scan_channel_disk_info(ch)
-    with _disk_cache_lock:
-        _disk_cache[_url] = {
-            "num_vids": _nv,
-            "size_bytes": _nb,
-            "last_updated": time.time(),
-        }
+    # Canonical lock order: config_lock first, then _disk_cache_lock
+    with config_lock:
+        _tx_complete_snap = ch.get("transcription_complete", False)
+        with _disk_cache_lock:
+            _disk_cache[_url] = {
+                "num_vids": _nv,
+                "size_bytes": _nb,
+                "last_updated": time.time(),
+            }
     _save_disk_cache()
     # Clear stale transcription_complete flag if no transcript files exist on disk
-    if not _has_tx and ch.get("transcription_complete", False):
+    if not _has_tx and _tx_complete_snap:
         with config_lock:
             for _cfg_ch in config.get("channels", []):
                 if _cfg_ch.get("url") == _url:
@@ -2294,10 +2359,9 @@ def _run_startup_disk_scan():
     """
     with config_lock:
         _channels = list(config.get("channels", []))
+        _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
     with _disk_cache_lock:
         _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
-
-    _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
     _need_scan = bool(_missing) or bool(_stale)
 
     if not _need_scan:
@@ -2426,7 +2490,6 @@ def _generate_flash_frames(base_img, num_frames=8):
     sz = base_img.size[0]
     for i in range(num_frames):
         # Sine wave for smooth pulse: 0.0 → 1.0 → 0.0
-        import math
         t = (math.sin(i / num_frames * 2 * math.pi - math.pi / 2) + 1) / 2  # 0..1
         alpha = int(60 + t * 180)  # range 60..240
         frame = base_img.copy().convert("RGBA")
@@ -2462,17 +2525,24 @@ _tray_spin_use_red = False  # which frame set is active
 _tray_spin_thread = None    # persistent spin animation thread
 _tray_spin_stop_ev = threading.Event()  # signal spin thread to exit
 
+_tray_spin_starting = False  # guard flag to prevent double-thread start
+
 def _tray_spin_loop():
     """Persistent thread for tray spinning animation (avoids Timer churn)."""
-    global _tray_spin_idx
+    global _tray_spin_idx, _tray_spin_starting
+    with _tray_spin_lock:
+        _tray_spin_starting = False
     while not _tray_spin_stop_ev.is_set():
-        _frames = _tray_spin_frames_red if _tray_spin_use_red else _tray_spin_frames
+        with _tray_spin_lock:
+            _use_red = _tray_spin_use_red
+        _frames = _tray_spin_frames_red if _use_red else _tray_spin_frames
         if not _tray_spin_active or _tray_icon is None or not _frames:
-            break
+            _tray_spin_stop_ev.wait(0.25)
+            continue
         # If GPU tasks are paused between files (inner task-level pause loop), hold the
         # base icon instead of continuing to flash — _gpu_truly_paused only covers the
         # outer worker's pause-wait; this catches pauses inside compress/transcribe loops.
-        if _tray_spin_use_red and _gpu_pause.is_set() and not _gpu_actively_encoding:
+        if _use_red and _gpu_pause.is_set() and not _gpu_actively_encoding:
             try:
                 if _tray_base_img is not None:
                     _tray_icon.icon = _tray_base_img
@@ -2486,7 +2556,7 @@ def _tray_spin_loop():
         except Exception:
             pass
         # Red flash pulses slower (0.12s × 8 frames = ~1s cycle), blue spins faster
-        _interval = 0.12 if _tray_spin_use_red else 0.18
+        _interval = 0.12 if _use_red else 0.18
         _tray_spin_stop_ev.wait(_interval)
 
 
@@ -2496,7 +2566,7 @@ def _tray_start_spin(red=False):
     Red always takes priority over blue — if GPU tasks are running, a sync
     call with red=False will not downgrade to blue.
     """
-    global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red, _tray_spin_thread
+    global _tray_spin_active, _tray_spin_idx, _tray_spin_use_red, _tray_spin_thread, _tray_spin_starting
     if not HAS_TRAY or _tray_icon is None:
         return
     # Red (GPU) always takes priority — don't downgrade to blue if GPU is active
@@ -2507,10 +2577,12 @@ def _tray_start_spin(red=False):
     _tray_spin_idx = 0
     # Always clear stop event so any existing/dying thread keeps running (fixes race with _tray_stop_spin)
     _tray_spin_stop_ev.clear()
-    # Start persistent spin thread if not already running
-    if _tray_spin_thread is None or not _tray_spin_thread.is_alive():
-        _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
-        _tray_spin_thread.start()
+    # Start persistent spin thread if not already running (guard flag prevents double-start)
+    with _tray_spin_lock:
+        if not _tray_spin_starting and (_tray_spin_thread is None or not _tray_spin_thread.is_alive()):
+            _tray_spin_starting = True
+            _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
+            _tray_spin_thread.start()
 
 
 def _tray_stop_spin(force=False):
@@ -2523,8 +2595,14 @@ def _tray_stop_spin(force=False):
     if not force and _gpu_running and not _gpu_truly_paused:
         _tray_start_spin(red=True)
         return
-    # If any sync-pipeline task is still running, fall back to blue spin instead of stopping
-    if not force and (_sync_running or _reorg_running or _redownload_running):
+    # If any sync-pipeline task is still running (or queued), fall back to blue spin instead of stopping
+    _has_queued = False
+    try:
+        with _sync_queue_lock:
+            _has_queued = bool(_sync_queue)
+    except Exception:
+        pass
+    if not force and (_sync_running or _reorg_running or _redownload_running or _has_queued):
         _tray_start_spin(red=False)
         return
     _tray_spin_active = False
@@ -2767,7 +2845,7 @@ def _dark_askquestion(title, message, yes_text="Yes", no_text="No"):
     _dlg.update_idletasks()
     _rx = root.winfo_rootx() + root.winfo_width() // 2
     _ry = root.winfo_rooty() + root.winfo_height() // 2
-    _dlg.geometry(f"+{_rx - _dlg.winfo_width() // 2}+{_ry - _dlg.winfo_height() // 2}")
+    _dlg.geometry(f"+{_rx - _dlg.winfo_reqwidth() // 2}+{_ry - _dlg.winfo_reqheight() // 2}")
 
     root.wait_window(_dlg)
     return bool(_result[0])
@@ -2830,7 +2908,7 @@ def _dark_missing_channel_dialog(ch_name, expected_path):
     _dlg.update_idletasks()
     _rx = root.winfo_rootx() + root.winfo_width() // 2
     _ry = root.winfo_rooty() + root.winfo_height() // 2
-    _dlg.geometry(f"+{_rx - _dlg.winfo_width() // 2}+{_ry - _dlg.winfo_height() // 2}")
+    _dlg.geometry(f"+{_rx - _dlg.winfo_reqwidth() // 2}+{_ry - _dlg.winfo_reqheight() // 2}")
 
     root.wait_window(_dlg)
     return _result[0]
@@ -2884,11 +2962,34 @@ def _placeholder(entry, text):
             _active[0] = False
             entry.config(fg=C_TEXT)
 
+    def _on_var_write(*_args):
+        """Re-show placeholder when StringVar is cleared programmatically."""
+        try:
+            content = entry.get()
+            if not content and str(entry.focus_get()) != str(entry):
+                _active[0] = True
+                entry.config(fg=C_DIM)
+                entry.insert(0, text)
+            elif content and content != text:
+                _active[0] = False
+                entry.config(fg=C_TEXT)
+        except Exception:
+            pass
+
     entry._ph_text = text
     entry._ph_active = _active
 
     entry.bind("<FocusIn>", _on_focus_in)
     entry.bind("<FocusOut>", _on_focus_out)
+
+    # Watch the linked StringVar for programmatic changes
+    try:
+        _sv_name = entry.cget("textvariable")
+        if _sv_name:
+            entry.tk.call("trace", "add", "variable", _sv_name, "write",
+                          entry.register(lambda *a: entry.after(1, _on_var_write)))
+    except Exception:
+        pass
 
 
 def _real_get(entry):
@@ -3060,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 9:19pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 5:43pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3240,7 +3341,12 @@ vid_use_yt_title_cb.grid(row=0, column=0, sticky="w", padx=(0, 12))
 vid_custom_name_entry = _entry(vid_name_row, textvariable=vid_custom_name_var, width=36,
                                disabledbackground=C_INPUT, disabledforeground=C_DIM)
 vid_custom_name_entry.grid(row=0, column=1, sticky="ew")
-_placeholder(vid_custom_name_entry, "File Title")
+# Set placeholder attrs manually — the custom handlers below replace _placeholder()
+# to avoid duplicate competing FocusIn/FocusOut bindings.
+vid_custom_name_entry._ph_text = "File Title"
+vid_custom_name_entry._ph_active = [True]
+vid_custom_name_entry.config(fg=C_DIM)
+vid_custom_name_entry.insert(0, "File Title")
 
 
 def _custom_name_focus_in(e):
@@ -3256,7 +3362,7 @@ def _custom_name_click(e):
 
 
 def _custom_name_key(e):
-    if vid_custom_name_entry._ph_active[0]:
+    if vid_custom_name_entry._ph_active[0] and e.char and e.char.isprintable():
         vid_custom_name_entry._ph_active[0] = False
         vid_custom_name_entry.delete(0, "end")
         vid_custom_name_entry.config(fg=C_TEXT)
@@ -3287,11 +3393,11 @@ vid_custom_name_entry.bind("<KeyRelease>", _custom_name_key_release)
 
 def _toggle_custom_name(*_):
     if vid_use_yt_title_var.get():
-        vid_custom_name_entry.config(state="disabled")
         if hasattr(vid_custom_name_entry, "_ph_active") and vid_custom_name_entry._ph_active[0]:
             vid_custom_name_entry.delete(0, "end")
             vid_custom_name_entry._ph_active[0] = False
         vid_custom_name_var.set("")
+        vid_custom_name_entry.config(state="disabled")
     else:
         vid_custom_name_entry.config(state="normal")
         if not _real_get(vid_custom_name_entry):
@@ -3353,7 +3459,6 @@ autorun_history_text.bind("<Button-1>",  lambda e: "break")
 autorun_history_text.bind("<B1-Motion>", lambda e: "break")
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
-_log_scroll_freeze = False  # suppress scrollbar grid toggling during batch log ops
 
 def _auto_scrollbar(scrollbar, first, last):
     if _log_scroll_freeze:
@@ -3592,18 +3697,19 @@ def _sort_chan_tree(col, reverse):
 
         l.sort(key=lambda t: parse_res(t[0]), reverse=reverse)
     elif col == "last_sync":
+        # Batch-read all channel last_sync values under a single lock acquisition
+        with config_lock:
+            _url_to_ls = {c["url"]: c.get("last_sync", "") for c in config.get("channels", [])}
+
         def get_ts(iid):
             url = settings_chan_tree.set(iid, "url")
-            with config_lock:
-                for c in config.get("channels", []):
-                    if c["url"] == url:
-                        ls = c.get("last_sync", "")
-                        if not ls: return 0
-                        try:
-                            return time.mktime(datetime.strptime(ls, "%Y-%m-%d %H:%M").timetuple())
-                        except Exception:
-                            return 0
-            return 0
+            ls = _url_to_ls.get(url, "")
+            if not ls:
+                return 0
+            try:
+                return time.mktime(datetime.strptime(ls, "%Y-%m-%d %H:%M").timetuple())
+            except Exception:
+                return 0
 
         l.sort(key=lambda t: get_ts(t[1]), reverse=reverse)
     elif col == "num_vids":
@@ -3770,24 +3876,27 @@ def _res_check_click():
         return
     _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
 
-    # Collect all video files
-    all_videos = []
-    for _r, _d, _f in os.walk(_rd_folder):
-        _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
-        for fn in _f:
-            if os.path.splitext(fn)[1].lower() in _vid_exts:
-                all_videos.append(os.path.join(_r, fn))
-    if not all_videos:
-        return
-
-    # 'best' mode: can't determine target height, fall back to simple prompt
+    # 'best' mode and non-best mode both need the video list, but os.walk can be
+    # slow on large folders -- move it into the background thread to avoid blocking the UI.
     if sel_res == "best":
-        _rd_ask = _dark_askquestion(
-            "Re-download at Selected Resolution",
-            f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
-        )
-        if _rd_ask:
-            _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+        def _best_scan():
+            all_videos = []
+            for _r, _d, _f in os.walk(_rd_folder):
+                _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+                for fn in _f:
+                    if os.path.splitext(fn)[1].lower() in _vid_exts:
+                        all_videos.append(os.path.join(_r, fn))
+            if not all_videos:
+                return
+            def _ask():
+                _rd_ask = _dark_askquestion(
+                    "Re-download at Selected Resolution",
+                    f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
+                )
+                if _rd_ask:
+                    _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
+            _ui_queue.append(_ask)
+        threading.Thread(target=_best_scan, daemon=True).start()
         return
 
     target_height = int(sel_res)
@@ -3798,6 +3907,16 @@ def _res_check_click():
     res_check_done_label.pack_forget()
 
     def _scan():
+        # Collect all video files (in bg thread to avoid blocking UI)
+        all_videos = []
+        for _r, _d, _f in os.walk(_rd_folder):
+            _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+            for fn in _f:
+                if os.path.splitext(fn)[1].lower() in _vid_exts:
+                    all_videos.append(os.path.join(_r, fn))
+        if not all_videos:
+            _ui_queue.append(lambda: res_check_btn.bind("<Button-1>", lambda e: _res_check_click()))
+            return
         log(f"\n  Scanning {len(all_videos):,} video(s) in {ch_name} for actual resolution...\n", "simpleline")
         mismatched = []
         readable = 0
@@ -3954,6 +4073,15 @@ def refresh_channel_dropdowns():
 
         settings_chan_tree.delete(*settings_chan_tree.get_children())
         _grand_total_bytes = 0
+
+        # Batch lock acquisitions outside the per-channel loop to avoid O(N) lock overhead
+        with _gpu_queue_lock:
+            _gpu_queued_urls = {q.get("ch_url") for q in _gpu_queue if q["type"] in ("transcribe", "mt")}
+        with _transcribe_queue_lock:
+            _tq_urls = {q[1] for q in _transcribe_queue}
+        with _disk_cache_lock:
+            _disk_cache_snap = dict(_disk_cache)
+
         for i, c in enumerate(sorted_channels):
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
             display_res = f"{res}p" if res.isdigit() else ("Audio" if res == "audio" else res)
@@ -3990,11 +4118,9 @@ def refresh_channel_dropdowns():
             auto_t = c.get("auto_transcribe", False)
             ch_url_t = c.get("url", "")
             t_complete = c.get("transcription_complete", False)
-            _is_queued_t = False
+            _is_queued_t = ch_url_t in _gpu_queued_urls
             _is_running_t = False
-            # Check GPU Tasks queue
-            with _gpu_queue_lock:
-                _is_queued_t = any(q.get("ch_url") == ch_url_t and q["type"] in ("transcribe", "mt") for q in _gpu_queue)
+            # Check GPU Tasks queue (already batched above)
             if _gpu_running and _gpu_current.get("ch_url") == ch_url_t:
                 _cur_item = _gpu_current_item
                 if _cur_item and _cur_item.get("type") in ("transcribe", "mt"):
@@ -4004,8 +4130,7 @@ def refresh_channel_dropdowns():
             if not _is_running_t and _transcribe_running and not _sync_running and not _reorg_running and not _redownload_running and _current_job.get("url") == ch_url_t:
                 _is_running_t = True
             if not _is_queued_t:
-                with _transcribe_queue_lock:
-                    _is_queued_t = any(q[1] == ch_url_t for q in _transcribe_queue)
+                _is_queued_t = ch_url_t in _tq_urls
             t_pending = c.get("transcription_pending", 0)
             if _is_running_t:
                 trans_str = "Running"
@@ -4024,8 +4149,7 @@ def refresh_channel_dropdowns():
             # background scan after startup, or by per-channel rescan after actions).
             # Shows "—" when no entry exists yet (scan still pending).
             _url_key = c.get("url", "")
-            with _disk_cache_lock:
-                _cached = _disk_cache.get(_url_key)
+            _cached = _disk_cache_snap.get(_url_key)
             if _cached:
                 _num_vids = _cached["num_vids"]
                 _ch_bytes = _cached["size_bytes"]
@@ -4321,15 +4445,15 @@ def _chan_ctx_org_by_year():
     if not folder or not os.path.isdir(folder):
         log(f"  ⚠ Folder not found: {folder}\n", "red")
         return
-    if not messagebox.askyesno("Organize Folder",
-                               f"Reorganize \"{ch['name']}\" folder by Year?\n\n"
-                               f"This will move all video files into year subfolders."):
+    if not _dark_askquestion("Organize Folder",
+                             f"Reorganize \"{ch['name']}\" folder by Year?\n\n"
+                             f"This will move all video files into year subfolders."):
         return
-    recheck = messagebox.askyesno("Re-check Dates",
-                                  "Would you like to also re-check file dates?\n\n"
-                                  "This fetches exact upload dates from YouTube for each video.\n"
-                                  "It ensures files are dated correctly before organizing.\n\n"
-                                  "⚠ WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
+    recheck = _dark_askquestion("Re-check Dates",
+                                "Would you like to also re-check file dates?\n\n"
+                                "This fetches exact upload dates from YouTube for each video.\n"
+                                "It ensures files are dated correctly before organizing.\n\n"
+                                "WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
     _run_reorganize_auto(ch["name"], folder, target_years=True, target_months=False,
                          ch_url=ch["url"], recheck_dates=recheck)
 
@@ -4342,15 +4466,15 @@ def _chan_ctx_org_by_year_month():
     if not folder or not os.path.isdir(folder):
         log(f"  ⚠ Folder not found: {folder}\n", "red")
         return
-    if not messagebox.askyesno("Organize Folder",
-                               f"Reorganize \"{ch['name']}\" folder by Year/Month?\n\n"
-                               f"This will move all video files into year and month subfolders."):
+    if not _dark_askquestion("Organize Folder",
+                             f"Reorganize \"{ch['name']}\" folder by Year/Month?\n\n"
+                             f"This will move all video files into year and month subfolders."):
         return
-    recheck = messagebox.askyesno("Re-check Dates",
-                                  "Would you like to also re-check file dates?\n\n"
-                                  "This fetches exact upload dates from YouTube for each video.\n"
-                                  "It ensures files are dated correctly before organizing.\n\n"
-                                  "⚠ WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
+    recheck = _dark_askquestion("Re-check Dates",
+                                "Would you like to also re-check file dates?\n\n"
+                                "This fetches exact upload dates from YouTube for each video.\n"
+                                "It ensures files are dated correctly before organizing.\n\n"
+                                "WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
     _run_reorganize_auto(ch["name"], folder, target_years=True, target_months=True,
                          ch_url=ch["url"], recheck_dates=recheck)
 
@@ -4363,9 +4487,9 @@ def _chan_ctx_unorganize():
     if not folder or not os.path.isdir(folder):
         log(f"  ⚠ Folder not found: {folder}\n", "red")
         return
-    if not messagebox.askyesno("Un-Organize Folder",
-                               f"Un-organize \"{ch['name']}\" folder?\n\n"
-                               f"This will move all video files back to the root folder."):
+    if not _dark_askquestion("Un-Organize Folder",
+                             f"Un-organize \"{ch['name']}\" folder?\n\n"
+                             f"This will move all video files back to the root folder."):
         return
     _run_reorganize_auto(ch["name"], folder, target_years=False, target_months=False,
                          ch_url=ch["url"])
@@ -4394,15 +4518,15 @@ def _chan_ctx_reapply_org():
         desc = "Year"
     else:
         desc = "Flat (no subfolders)"
-    if not messagebox.askyesno("Re-apply Organization",
-                               f"Re-apply \"{desc}\" organization to \"{ch['name']}\"?\n\n"
-                               f"This will move any misplaced files to match the current setting."):
+    if not _dark_askquestion("Re-apply Organization",
+                             f"Re-apply \"{desc}\" organization to \"{ch['name']}\"?\n\n"
+                             f"This will move any misplaced files to match the current setting."):
         return
-    recheck = messagebox.askyesno("Re-check Dates",
-                                  "Would you like to also re-check file dates?\n\n"
-                                  "This fetches exact upload dates from YouTube for each video.\n"
-                                  "It ensures files are dated correctly before organizing.\n\n"
-                                  "⚠ WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
+    recheck = _dark_askquestion("Re-check Dates",
+                                "Would you like to also re-check file dates?\n\n"
+                                "This fetches exact upload dates from YouTube for each video.\n"
+                                "It ensures files are dated correctly before organizing.\n\n"
+                                "WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS")
     _run_reorganize_auto(ch["name"], folder, target_years=sy, target_months=sm,
                          ch_url=ch["url"], recheck_dates=recheck)
 
@@ -4414,8 +4538,8 @@ _chan_ctx_menu.add_separator()
 
 def _queue_pending_transcriptions():
     """Queue all channels with ✓ -X (new unprocessed videos) for GPU transcription."""
-    out_dir = config.get("output_dir", "")
     with config_lock:
+        out_dir = config.get("output_dir", "")
         channels = list(config.get("channels", []))
     added = 0
     for ch in channels:
@@ -4450,7 +4574,8 @@ def _queue_all_transcriptions():
             f"Add ALL {n} channel(s) to the transcription queue?\n\n"
             f"This may take a long time for large libraries."):
         return
-    out_dir = config.get("output_dir", "")
+    with config_lock:
+        out_dir = config.get("output_dir", "")
     added = 0
     for ch in channels:
         ch_name = ch.get("name", "")
@@ -4624,7 +4749,7 @@ def _chan_ctx_show(event):
             _cached_vids = _disk_cache.get(_ch_url_t, {}).get("num_vids", 0)
         _has_videos = _cached_vids > 0
         # Check if this channel is already being transcribed via GPU Tasks
-        _is_active_gpu = _gpu_running and _gpu_current.get("label") and _ch_url_t and _ch_url_t in (_gpu_current.get("label") or "")
+        _is_active_gpu = _gpu_running and _gpu_current.get("label") and _ch_url_t and _ch_url_t == _gpu_current.get("ch_url")
         with _gpu_queue_lock:
             _already_in_gpu = any(q.get("ch_url") == _ch_url_t for q in _gpu_queue)
             _gpu_has_items = bool(_gpu_queue)
@@ -4789,6 +4914,8 @@ def add_channel():
                         ch["compress_batch_size"] = int(new_compress_batch_var.get())
                     except (ValueError, TypeError):
                         ch["compress_batch_size"] = 20
+                    # Capture values needed after lock release to avoid stale ch reads
+                    _ch_resolution_snap = ch.get("resolution", "720")
                     break
         else:
             if any(c["name"] == name for c in channels):
@@ -4824,7 +4951,8 @@ def add_channel():
         _run_reorganize_auto(name, folder_path, new_years, new_months)
 
     # Offer to re-download & compress existing videos if compress settings changed
-    if editing:
+    _compress_changed = False
+    if editing and '_new_compress' in locals():
         _compress_changed = (
             _new_compress and _new_c_level in _QUALITY_OPTIONS and
             (not _old_compress or _old_c_level != _new_c_level or _old_c_res != _new_c_res)
@@ -4834,35 +4962,45 @@ def add_channel():
                 _bl_base = config.get("output_dir", "").strip() or BASE_DIR
             _bl_folder = os.path.join(_bl_base, sanitize_folder(name))
             if os.path.isdir(_bl_folder):
-                _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
-                _bl_count = 0
-                for _r, _d, _f in os.walk(_bl_folder):
-                    _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
-                    _bl_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
-                if _bl_count > 0:
-                    _bl_res = ch.get("resolution", "720")
-                    _bl_res_label = "Best" if _bl_res == "best" else f"{_bl_res}p"
-                    _bl_out_label = f" → {_new_c_res}p output" if _new_c_res else ""
-                    _bl_bitrate = _get_compress_bitrate(_new_c_level, _new_c_res)
-                    _bl_ask = _dark_askquestion(
-                        "Apply to Existing Videos",
-                        f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
-                        f"Re-download at {_bl_res_label}{_bl_out_label}, "
-                        f"quality: {_new_c_level} (~{_bl_bitrate} MB/hr)."
-                    )
-                    if _bl_ask:
-                        _add_to_gpu_queue({
-                            "type": "backlog_encode",
-                            "ch_name": name,
-                            "ch_url": url,
-                            "folder": _bl_folder,
-                            "resolution": _bl_res,
-                            "bitrate_mbhr": _bl_bitrate,
-                            "output_res": _new_c_res,
-                            "split_years": new_years,
-                            "split_months": new_months,
-                            "batch_size": int(new_compress_batch_val or "20"),
-                        })
+                # Count videos in a background thread to avoid blocking the main thread
+                _bl_snap = {
+                    "folder": _bl_folder, "name": name, "url": url,
+                    "res": _ch_resolution_snap, "c_level": _new_c_level,
+                    "c_res": _new_c_res, "years": new_years, "months": new_months,
+                    "batch": int(new_compress_batch_val or "20"),
+                }
+                def _count_and_ask(_snap=_bl_snap):
+                    _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
+                    _bl_count = 0
+                    for _r, _d, _f in os.walk(_snap["folder"]):
+                        _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+                        _bl_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
+                    if _bl_count > 0:
+                        def _show_dialog():
+                            _bl_res_label = "Best" if _snap["res"] == "best" else f"{_snap['res']}p"
+                            _bl_out_label = f" → {_snap['c_res']}p output" if _snap["c_res"] else ""
+                            _bl_bitrate = _get_compress_bitrate(_snap["c_level"], _snap["c_res"])
+                            _bl_ask = _dark_askquestion(
+                                "Apply to Existing Videos",
+                                f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
+                                f"Re-download at {_bl_res_label}{_bl_out_label}, "
+                                f"quality: {_snap['c_level']} (~{_bl_bitrate} MB/hr)."
+                            )
+                            if _bl_ask:
+                                _add_to_gpu_queue({
+                                    "type": "backlog_encode",
+                                    "ch_name": _snap["name"],
+                                    "ch_url": _snap["url"],
+                                    "folder": _snap["folder"],
+                                    "resolution": _snap["res"],
+                                    "bitrate_mbhr": _bl_bitrate,
+                                    "output_res": _snap["c_res"],
+                                    "split_years": _snap["years"],
+                                    "split_months": _snap["months"],
+                                    "batch_size": _snap["batch"],
+                                })
+                        root.after(0, _show_dialog)
+                threading.Thread(target=_count_and_ask, daemon=True).start()
 
         # Offer to re-download existing videos at the new resolution when resolution
         # changed but compression settings did NOT change (compression already
@@ -4872,22 +5010,30 @@ def add_channel():
                 _rd_base = config.get("output_dir", "").strip() or BASE_DIR
             _rd_folder = os.path.join(_rd_base, sanitize_folder(name))
             if os.path.isdir(_rd_folder):
-                _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
-                _rd_count = 0
-                for _r, _d, _f in os.walk(_rd_folder):
-                    _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
-                    _rd_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
-                if _rd_count > 0:
-                    _old_res_label = "Best" if old_res == "best" else f"{old_res}p"
-                    _new_res_label = "Best" if new_res_val == "best" else f"{new_res_val}p"
-                    _rd_ask = _dark_askquestion(
-                        "Apply to Existing Downloads",
-                        f"Resolution changed from {_old_res_label} to {_new_res_label}.\n\n"
-                        f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, "
-                        f"replacing the originals?"
-                    )
-                    if _rd_ask:
-                        _add_to_redownload_queue(name, url, _rd_folder, new_res_val)
+                _rd_snap = {
+                    "folder": _rd_folder, "name": name, "url": url,
+                    "old_res": old_res, "new_res_val": new_res_val
+                }
+                def _count_and_ask_rd(_snap=_rd_snap):
+                    _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
+                    _rd_count = 0
+                    for _r, _d, _f in os.walk(_snap["folder"]):
+                        _d[:] = [d for d in _d if d not in ("_TEMP_COMPRESS", "_BACKLOG_TEMP")]
+                        _rd_count += sum(1 for fn in _f if os.path.splitext(fn)[1].lower() in _vid_exts)
+                    if _rd_count > 0:
+                        _old_res_label = "Best" if _snap["old_res"] == "best" else f"{_snap['old_res']}p"
+                        _new_res_label = "Best" if _snap["new_res_val"] == "best" else f"{_snap['new_res_val']}p"
+                        def _ask():
+                            _rd_ask = _dark_askquestion(
+                                "Apply to Existing Downloads",
+                                f"Resolution changed from {_old_res_label} to {_new_res_label}.\n\n"
+                                f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, "
+                                f"replacing the originals?"
+                            )
+                            if _rd_ask:
+                                _add_to_redownload_queue(_snap["name"], _snap["url"], _snap["folder"], _snap["new_res_val"])
+                        _ui_queue.append(_ask)
+                threading.Thread(target=_count_and_ask_rd, daemon=True).start()
 
 
 def sync_single_channel():
@@ -4919,8 +5065,9 @@ def sync_single_channel():
         _update_queue_btn()
         return
 
-    for key in session_totals:
-        session_totals[key] = 0
+    with _session_totals_lock:
+        for key in session_totals:
+            session_totals[key] = 0
     cancel_event.clear()
 
     _schedule_autorun(0)
@@ -5013,7 +5160,7 @@ def sync_single_channel():
                     with config_lock:
                         for cfg_ch in config.get("channels", []):
                             if cfg_ch["url"] == url: cfg_ch["initialized"] = True
-                    save_config(config)
+                        save_config(config)
                     log("Initialization complete.\n", "green")
                 else:
                     log(f"ERROR: Backlog archive failed for {ch['name']}.\n", "red")
@@ -5032,7 +5179,7 @@ def sync_single_channel():
                     with config_lock:
                         for cfg_ch in config.get("channels", []):
                             if cfg_ch["url"] == url: cfg_ch["initialized"] = True
-                    save_config(config)
+                        save_config(config)
                 else:
                     log(f"ERROR: Date-archive failed for {ch['name']}.\n", "red")
                     return
@@ -5041,7 +5188,7 @@ def sync_single_channel():
                 for cfg_ch in config.get("channels", []):
                     if cfg_ch["url"] == url:
                         cfg_ch["sync_complete"] = False
-            save_config(config)
+                save_config(config)
 
             cmd = build_channel_cmd(url, out_dir, min_dur, res, folder_ovr,
                                     break_on_existing=is_init and sync_complete,
@@ -5096,7 +5243,8 @@ def sync_single_channel():
                                 log(f"  Found {len(_new_ids)} new video(s), updating cache.\n", "green")
                                 _new_set = set(_new_ids)
                                 _batch_cache_ids = _new_ids + [x for x in _batch_cache_ids if x not in _new_set]
-                                _batch_start_idx += len(_new_ids)
+                                if _batch_start_idx > 0:
+                                    _batch_start_idx += len(_new_ids)
                                 try:
                                     with open(_get_batch_cache_path(url), "w", encoding="utf-8") as _cf:
                                         _cf.write("\n".join(_batch_cache_ids) + "\n")
@@ -5188,6 +5336,8 @@ def sync_single_channel():
                         if _ask_start_gpu_tasks(count):
                             _ui_queue.append(_gpu_start)
 
+            c_dl = 0
+            c_dur = 0
             if not cancel_event.is_set() and not _all_cached_done:
                 c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total, live_ids=live_ids,
                                                  on_batch_ready=_sc_batch_cb,
@@ -5233,11 +5383,12 @@ def sync_single_channel():
                     log(f"--- LIVESTREAM: {_ds_name} ---\n", "header")
                     _ds_out = os.path.join(out_dir, sanitize_folder(_ds_ch.get("folder_override", "") or _ds_name))
                     _ds_cmd = build_video_cmd(_ds_url, _ds_out, _ds_ch.get("resolution", "720"))
-                    internal_run_cmd_blocking(_ds_cmd)
-                    # Archive the stream ID after attempt (success or fail) so it won't reappear every sync
-                    with io_lock:
-                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                            _af.write(f"youtube {_ds_id}\n")
+                    _ds_dl = internal_run_cmd_blocking(_ds_cmd)
+                    # Only archive the stream ID on successful download so failed ones retry next sync
+                    if _ds_dl:
+                        with io_lock:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                _af.write(f"youtube {_ds_id}\n")
 
             _cleanup_batch_file()
 
@@ -5305,7 +5456,12 @@ def sync_single_channel():
 
                 # New videos downloaded — track pending transcription count
                 if c_dl > 0:
-                    ch["transcription_pending"] = ch.get("transcription_pending", 0) + c_dl
+                    with config_lock:
+                        for _tp_ch in config.get("channels", []):
+                            if _tp_ch["url"] == url:
+                                _tp_ch["transcription_pending"] = _tp_ch.get("transcription_pending", 0) + c_dl
+                                break
+                    save_config(config)
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
@@ -5476,7 +5632,8 @@ def _process_sync_queue():
                     break
             # Must clear _sync_running before calling sync_single_channel(),
             # otherwise it sees True and re-queues instead of starting.
-            _sync_running = False
+            with _sync_queue_lock:
+                _sync_running = False
             if _found:
                 sync_single_channel()
             else:
@@ -5484,7 +5641,8 @@ def _process_sync_queue():
                 # Try next queued item instead of getting stuck
                 _process_next_queued()
         except Exception as e:
-            _sync_running = False
+            with _sync_queue_lock:
+                _sync_running = False
             _current_sync_ch = None
             _current_job["label"] = None
             _current_job["url"] = None
@@ -5556,10 +5714,10 @@ def _process_video_dl_queue():
 
     _ui_queue.append(_show_dl_ui)
 
+    cancel_event.clear()
     for cmd, is_single in queued:
         if cancel_event.is_set():
             break
-        cancel_event.clear()
         internal_run_cmd_blocking(cmd)
         if cancel_event.is_set():
             try:
@@ -5668,16 +5826,16 @@ def remove_channel():
     _ch_folder_path = os.path.join(_base, _ch_folder_name)
 
     with config_lock:
-        config["channels"] = [c for c in config.get("channels", []) if c["name"] != removed_name]
+        config["channels"] = [c for c in config.get("channels", []) if c.get("url") != target_url]
         if chan_var.get() == removed_name:
             chan_var.set("")
             url_var.set("")
             save_prefs_btn.config(state="disabled")
         if _editing_channel.get("name") == removed_name:
             _clear_edit_mode()
+        save_config(config)
 
     refresh_channel_dropdowns()
-    save_config(config)
     remove_channel_btn.pack_forget()
     with _disk_cache_lock:
         _disk_cache.pop(removed_url, None)
@@ -5834,8 +5992,6 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
     if not os.path.isdir(folder_path):
         log(f"  ⚠ Folder not found: {folder_path}\n", "red")
         return
-
-    cancel_event.clear()
 
     log(f"\n--- Reorganizing: {channel_name} ---\n", "header")
 
@@ -6167,7 +6323,16 @@ def _fix_file_dates(channel_url, folder_path):
         if _old_fetch_job:
             _ui_queue.append(lambda j=_old_fetch_job: root.after_cancel(j) if root.winfo_exists() else None)
 
-        proc.wait()
+        if cancel_event.is_set():
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
         cleanup_process(proc)
         proc = None
 
@@ -6209,48 +6374,64 @@ def _fix_file_dates(channel_url, folder_path):
                     upload_date = date_lookup.get(norm_fname_ascii)
 
                 # Try prefix match (--trim-filenames truncates long titles)
-                if not upload_date and len(norm_fname) >= 15:
+                # Skip O(N) prefix scan for very large channels (>5000 videos) to avoid O(N*M) stall
+                if not upload_date and len(norm_fname) >= 15 and len(date_lookup) <= 5000:
                     for norm_title, date_val in date_lookup.items():
-                        if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title[:len(norm_fname)]):
+                        if len(norm_title) >= 15 and (norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title)):
                             upload_date = date_val
                             break
 
                 # Try ASCII prefix match for special character titles
-                if not upload_date and len(norm_fname_ascii) >= 10:
+                if not upload_date and len(norm_fname_ascii) >= 10 and len(date_lookup) <= 5000:
                     for norm_title, date_val in date_lookup.items():
-                        if norm_title.startswith(norm_fname_ascii) or norm_fname_ascii.startswith(norm_title[:len(norm_fname_ascii)]):
+                        if len(norm_title) >= 10 and (norm_title.startswith(norm_fname_ascii) or norm_fname_ascii.startswith(norm_title)):
                             upload_date = date_val
                             break
 
                 # Word-overlap fallback: extract real words from original strings
-                if not upload_date and date_words:
+                # Skip for very large channels (>5000 videos) to avoid O(N*M) stall
+                if not upload_date and date_words and len(date_words) <= 5000:
                     fname_words = set()
                     for _w in re.findall(r'\S+', base_nfc.lower()):
                         _aw = _norm_ascii(_w)
                         if len(_aw) >= 2:
                             fname_words.add(_aw)
-                    if len(fname_words) >= 2:
+                    if len(fname_words) >= 4:
                         best_overlap = 0
                         best_date = None
                         for date_val, title_words, _ in date_words:
+                            if len(title_words) < 4:
+                                continue
                             overlap = len(fname_words & title_words) / max(len(fname_words), len(title_words))
-                            if overlap > best_overlap and overlap >= 0.65:
+                            if overlap > best_overlap and overlap >= 0.80:
                                 best_overlap = overlap
                                 best_date = date_val
                         if best_date:
                             upload_date = best_date
 
-                # SequenceMatcher fallback: catch near-matches from encoding/sanitization diffs
-                if not upload_date and norm_fname_ascii and len(norm_fname_ascii) >= 10:
-                    best_ratio = 0
+                # Substring containment fallback: catch near-matches from encoding/sanitization diffs
+                # Uses bidirectional substring check instead of O(N^2) SequenceMatcher
+                if not upload_date and norm_fname_ascii and len(norm_fname_ascii) >= 10 and len(date_words) <= 5000:
+                    best_len = 0
                     best_date = None
                     for date_val, _, t_ascii in date_words:
                         if not t_ascii:
                             continue
-                        ratio = difflib.SequenceMatcher(None, norm_fname_ascii, t_ascii).ratio()
-                        if ratio > best_ratio and ratio >= 0.80:
-                            best_ratio = ratio
-                            best_date = date_val
+                        # Check if one string contains most of the other (handles truncation/sanitization)
+                        _shorter, _longer = (norm_fname_ascii, t_ascii) if len(norm_fname_ascii) <= len(t_ascii) else (t_ascii, norm_fname_ascii)
+                        if len(_shorter) >= 10 and _shorter in _longer:
+                            if len(_shorter) > best_len:
+                                best_len = len(_shorter)
+                                best_date = date_val
+                        elif len(_shorter) >= 10:
+                            # Check overlap ratio using set intersection of character bigrams
+                            _bi_a = {norm_fname_ascii[j:j+2] for j in range(len(norm_fname_ascii) - 1)}
+                            _bi_b = {t_ascii[j:j+2] for j in range(len(t_ascii) - 1)}
+                            if _bi_a and _bi_b:
+                                _overlap = len(_bi_a & _bi_b) / max(len(_bi_a), len(_bi_b))
+                                if _overlap >= 0.80 and len(t_ascii) > best_len:
+                                    best_len = len(t_ascii)
+                                    best_date = date_val
                     if best_date:
                         upload_date = best_date
 
@@ -6329,8 +6510,13 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
     """Trigger reorganization automatically after updating channel split settings."""
     global _reorg_running
 
-    # If a reorg or sync is already running, queue this request
-    if _reorg_running or _sync_running or _redownload_running:
+    # If a reorg or sync is already running, queue this request.
+    # Note: _already_running check is not fully atomic (flags read under different locks),
+    # but this is benign — worst case we queue a redundant entry or start when another
+    # task finishes between the check and start, which resolves harmlessly.
+    with _reorg_queue_lock:
+        _already_running = _reorg_running or _sync_running or _redownload_running
+    if _already_running:
         with _reorg_queue_lock:
             if not any(q[0] == channel_name for q in _reorg_queue):
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
@@ -6344,9 +6530,13 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
 
     def _worker():
         global _reorg_running
-        _reorg_running = True
+        with _reorg_queue_lock:
+            _reorg_running = True
         try:
-            cancel_event.clear()
+            # If a cancel is already in-flight, respect it and bail out
+            # instead of clearing it (which would erase user cancel intent).
+            if cancel_event.is_set():
+                return
             _ui_queue.append(lambda: _update_queue_btn())
             if recheck_dates and ch_url:
                 _fix_file_dates(ch_url, folder_path)
@@ -6357,7 +6547,8 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
             if success and ch_url:
                 _chan_ctx_update_split(ch_url, target_years, target_months)
         finally:
-            _reorg_running = False
+            with _reorg_queue_lock:
+                _reorg_running = False
             def _reorg_done():
                 _sync_task_finished()
                 if _reorg_done_job["id"]:
@@ -6388,6 +6579,7 @@ def _parse_vtt_to_text(vtt_path):
         with open(vtt_path, "r", encoding="utf-8") as f:
             raw = f.read()
     except Exception:
+        traceback.print_exc()
         return ""
 
     lines = raw.split("\n")
@@ -6414,8 +6606,16 @@ def _parse_vtt_to_text(vtt_path):
         line = re.sub(r'\s+', ' ', line).strip()
         if not line:
             continue
-        # Deduplicate consecutive identical lines (YouTube auto-subs repeat)
-        if line != prev:
+        # Collapse rolling YouTube caption overlaps: if the new line starts
+        # with the previous line's text, it's a rolling cue extension — replace
+        # the previous entry with this longer version instead of appending.
+        if line == prev:
+            continue  # exact duplicate — skip
+        if prev and line.startswith(prev):
+            # Rolling extension — replace previous with the longer version
+            clean[-1] = line
+            prev = line
+        else:
             clean.append(line)
             prev = line
 
@@ -6441,6 +6641,7 @@ def _parse_vtt_to_segments(vtt_path):
         with open(vtt_path, "r", encoding="utf-8") as f:
             raw = f.read()
     except Exception:
+        traceback.print_exc()
         return []
 
     def _ts_to_secs(ts_str):
@@ -6645,6 +6846,9 @@ def _parse_vtt_to_segments(vtt_path):
         for seg in segments:
             seg_words = []
             # Advance past words that ended before this segment
+            # (reset _widx backward if a split sub-segment starts before current _widx)
+            while _widx > 0 and _widx < len(_all_words) and _all_words[_widx]["s"] >= seg["start"] - 0.5:
+                _widx -= 1
             while _widx < len(_all_words) and _all_words[_widx]["s"] < seg["start"] - 0.5:
                 _widx += 1
             _scan = _widx
@@ -6687,7 +6891,8 @@ def _get_jsonl_path(txt_path):
     """Get the hidden JSONL file path corresponding to a transcript .txt path."""
     dirname = os.path.dirname(txt_path)
     basename = os.path.basename(txt_path)
-    jsonl_name = "." + basename.replace("Transcript.txt", "Transcript.jsonl")
+    root_name, _ = os.path.splitext(basename)
+    jsonl_name = "." + root_name + ".jsonl"
     return os.path.join(dirname, jsonl_name)
 
 
@@ -6695,7 +6900,6 @@ def _hide_file_win(path):
     """Set the hidden attribute on a file (Windows only)."""
     if os.name == "nt":
         try:
-            import ctypes
             ctypes.windll.kernel32.SetFileAttributesW(path, 0x02)  # FILE_ATTRIBUTE_HIDDEN
         except Exception:
             pass
@@ -6707,9 +6911,10 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
     Builds the new lines in memory first, then appends in a single write so a
     partial disk failure cannot leave a half-written entry in the file.
     """
-    import json as _json
     try:
-        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        _jsonl_dir = os.path.dirname(jsonl_path)
+        if _jsonl_dir:
+            os.makedirs(_jsonl_dir, exist_ok=True)
         # Build all lines in memory first
         new_lines = []
         for seg in segments:
@@ -6727,13 +6932,16 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
                 # ones when real word-level data isn't available.
                 entry["words"] = _generate_distributed_words(
                     seg["text"], seg["start"], seg["end"])
-            new_lines.append(_json.dumps(entry, ensure_ascii=False) + "\n")
+            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
         # Single write — reduces risk of partial entries on disk errors
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.writelines(new_lines)
         _hide_file_win(jsonl_path)
-    except Exception:
-        pass
+    except Exception as _jsonl_err:
+        try:
+            log(f"  ⚠ JSONL write failed for {video_id}: {_jsonl_err}\n", "red")
+        except Exception:
+            pass
 
 
 def _scan_existing_jsonl(folder_path, ch_name):
@@ -6742,19 +6950,28 @@ def _scan_existing_jsonl(folder_path, ch_name):
     Returns a set of video titles that already have JSONL entries.
     """
     existing = set()
-    import json as _json
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
-            if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
+            if f.startswith("." + ch_name) and f.endswith("Transcript.jsonl"):
+                _jsonl_full = os.path.join(dirpath, f)
                 try:
-                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                    _corrupt_lines = 0
+                    with open(_jsonl_full, "r", encoding="utf-8") as fh:
                         for line in fh:
                             line = line.strip()
                             if line:
-                                entry = _json.loads(line)
-                                title = entry.get("title", "")
-                                if title:
-                                    existing.add(title)
+                                try:
+                                    entry = json.loads(line)
+                                    title = entry.get("title", "")
+                                    if title:
+                                        existing.add(title)
+                                except (json.JSONDecodeError, ValueError):
+                                    _corrupt_lines += 1
+                    if _corrupt_lines:
+                        try:
+                            log(f"  ⚠ {_corrupt_lines} corrupt line(s) in {f} — skipped.\n", "red")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
     return existing
@@ -6763,8 +6980,8 @@ def _scan_existing_jsonl(folder_path, ch_name):
 def _remove_jsonl_entries_for_title(jsonl_path, title):
     """Rewrite a JSONL file, dropping every line whose title matches *title*.
     Called before re-writing corrected segments so old bad entries are replaced.
+    Uses atomic write-to-tmp + os.replace to avoid data loss on crash.
     """
-    import json as _json
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fh:
             lines = fh.readlines()
@@ -6773,17 +6990,19 @@ def _remove_jsonl_entries_for_title(jsonl_path, title):
             stripped = line.strip()
             if stripped:
                 try:
-                    if _json.loads(stripped).get("title", "") != title:
+                    if json.loads(stripped).get("title", "") != title:
                         kept.append(line)
                 except Exception:
                     kept.append(line)   # keep malformed lines untouched
             else:
                 kept.append(line)
-        with open(jsonl_path, "w", encoding="utf-8") as fh:
+        tmp_path = jsonl_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.writelines(kept)
+        os.replace(tmp_path, jsonl_path)
         _hide_file_win(jsonl_path)
     except Exception:
-        pass
+        traceback.print_exc()
 
 
 def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
@@ -6792,7 +7011,7 @@ def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
     between initial transcription (upload date) and backfill (file mtime)."""
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
-            if f.startswith(".") and ch_name in f and f.endswith("Transcript.jsonl"):
+            if f.startswith("." + ch_name) and f.endswith("Transcript.jsonl"):
                 _remove_jsonl_entries_for_title(os.path.join(dirpath, f), title)
 
 
@@ -7086,7 +7305,21 @@ def _start_punct_process():
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, startupinfo=startupinfo
         )
-        ready_line = _punct_proc.stdout.readline().strip()
+        # Use thread+join pattern to avoid indefinite readline block
+        _ready_result = [None]
+        def _read_punct_ready():
+            try:
+                _ready_result[0] = _punct_proc.stdout.readline().strip()
+            except Exception:
+                pass
+        _rt = threading.Thread(target=_read_punct_ready, daemon=True)
+        _rt.start()
+        _rt.join(timeout=120)  # 2 minutes max for model loading
+        ready_line = _ready_result[0] if not _rt.is_alive() else None
+        if _rt.is_alive():
+            log("  ⚠ Punctuation process timed out during startup.\n", "red")
+            _stop_punct_process()
+            return False
         if ready_line:
             info = json.loads(ready_line)
             if info.get("status") == "ready":
@@ -7182,8 +7415,9 @@ def _install_whisper_blocking():
 def _start_whisper_process():
     """Start the persistent Whisper subprocess under Python 3.11. Returns True if ready."""
     global _whisper_proc, _whisper_line_queue
-    if _whisper_proc is not None and _whisper_proc.poll() is None:
-        return True  # Already running
+    with _whisper_lock:
+        if _whisper_proc is not None and _whisper_proc.poll() is None:
+            return True  # Already running
 
     try:
         _model = _whisper_model_choice
@@ -7203,11 +7437,23 @@ def _start_whisper_process():
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1, startupinfo=startupinfo, env=_env
         )
-        # Wait for "ready" message (model loading)
-        ready_line = _whisper_proc.stdout.readline().strip()
+        # Wait for "ready" message (model loading) with timeout to avoid indefinite block
+        _ready_result = [None]
+        def _read_whisper_ready():
+            try:
+                _ready_result[0] = _whisper_proc.stdout.readline().strip()
+            except Exception:
+                pass
+        _wrt = threading.Thread(target=_read_whisper_ready, daemon=True)
+        _wrt.start()
+        _wrt.join(timeout=300)  # 5 minutes max for model download + loading
+        ready_line = _ready_result[0] if not _wrt.is_alive() else None
+        if _wrt.is_alive():
+            log("  ⚠ Whisper process timed out during model loading.\n", "red")
+            _stop_whisper_process()
+            return False
         if ready_line:
-            import json as _json
-            info = _json.loads(ready_line)
+            info = json.loads(ready_line)
             if info.get("status") == "ready":
                 log(f"  ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
                 # Start a single reader thread for the lifetime of this subprocess.
@@ -7217,13 +7463,22 @@ def _start_whisper_process():
                 _whisper_line_queue = queue.Queue()
                 _proc_ref = _whisper_proc  # local ref so the closure reads from THIS
                                            # process even after _whisper_proc is reset to None
-                def _reader():
+                def _reader(_q=_whisper_line_queue):
+                    # _q is captured by default-arg at definition time, so even
+                    # if the global _whisper_line_queue is set to None later,
+                    # this thread still holds a valid reference and can exit.
                     try:
                         for _ln in iter(_proc_ref.stdout.readline, ""):
-                            _whisper_line_queue.put(_ln)
+                            try:
+                                _q.put(_ln)
+                            except Exception:
+                                break  # queue no longer usable — exit
                     except Exception:
                         pass
-                    _whisper_line_queue.put(None)  # sentinel — stream closed
+                    try:
+                        _q.put(None)  # sentinel — stream closed
+                    except Exception:
+                        pass
                 threading.Thread(target=_reader, daemon=True).start()
                 return True
         log("  ⚠ Whisper process did not start correctly.\n", "red")
@@ -7238,33 +7493,40 @@ def _start_whisper_process():
 def _stop_whisper_process():
     """Stop the persistent Whisper subprocess."""
     global _whisper_proc, _whisper_line_queue
-    if _whisper_proc is not None:
+    with _whisper_lock:
+        _proc = _whisper_proc
+        _whisper_proc = None
+        _whisper_line_queue = None
+    if _proc is not None:
         try:
-            _whisper_proc.stdin.close()
-            _whisper_proc.terminate()
-            _whisper_proc.wait(timeout=10)
+            _proc.stdin.close()
+            _proc.terminate()
+            _proc.wait(timeout=10)
         except Exception:
             try:
-                _whisper_proc.kill()
+                _proc.kill()
+                _proc.wait(timeout=10)
             except Exception:
                 pass
-        _whisper_proc = None
-    _whisper_line_queue = None
 
 
 def _stop_ffmpeg_process():
     """Stop the ffmpeg encode subprocess if running."""
-    global _ffmpeg_proc
-    if _ffmpeg_proc is not None:
+    global _ffmpeg_proc, _gpu_actively_encoding
+    with _ffmpeg_lock:
+        _proc = _ffmpeg_proc
+        _ffmpeg_proc = None
+        _gpu_actively_encoding = False
+    if _proc is not None:
         try:
-            _ffmpeg_proc.terminate()
-            _ffmpeg_proc.wait(timeout=10)
+            _proc.terminate()
+            _proc.wait(timeout=10)
         except Exception:
             try:
-                _ffmpeg_proc.kill()
+                _proc.kill()
+                _proc.wait(timeout=10)
             except Exception:
                 pass
-        _ffmpeg_proc = None
 
 
 def _ffprobe_duration(file_path):
@@ -7465,11 +7727,12 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
 
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     startupinfo=startupinfo, encoding="utf-8", errors="replace"
                 )
-                _ffmpeg_proc = proc
-                _gpu_actively_encoding = True
+                with _ffmpeg_lock:
+                    _ffmpeg_proc = proc
+                    _gpu_actively_encoding = True
                 _encode_t0 = time.time()
 
                 # Show a loading state while ffmpeg initializes (can take several minutes)
@@ -7519,8 +7782,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=10)
-                _ffmpeg_proc = None
-                _gpu_actively_encoding = False
+                with _ffmpeg_lock:
+                    _ffmpeg_proc = None
+                    _gpu_actively_encoding = False
                 _clear_encode_progress()
                 _encode_elapsed = time.time() - _encode_t0
 
@@ -7543,6 +7807,16 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     orig_size = os.path.getsize(fpath)
                     new_size = os.path.getsize(temp_path)
                     ratio = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
+
+                    # Safety check: skip replacement if output is suspiciously small
+                    if new_size < 10240 or (orig_size > 0 and new_size < orig_size * 0.01):
+                        log(f"    ⚠ Compressed output too small ({new_size:,} bytes vs {orig_size:,} original) — skipping replacement.\n", "red")
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                        err_count += 1
+                        continue
 
                     # Atomic replace; preserve original upload-date mtime (ffmpeg creates a
                     # new file with today's timestamp, which would lose the YT upload date)
@@ -7582,7 +7856,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 break
             except Exception as e:
                 err_count += 1
-                _ffmpeg_proc = None
+                with _ffmpeg_lock:
+                    _ffmpeg_proc = None
+                    _gpu_actively_encoding = False
                 log(f"    ⚠ Compression error: {e}\n", "red")
                 try:
                     if os.path.exists(temp_path):
@@ -7782,10 +8058,26 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
             _process_batch_result = [None]  # [True=continue, False=redo, None=pending]
 
-            def _process_batch(_bitrate, _out_res):
+            # Store original sizes before first pass so redo uses pre-compression sizes
+            _orig_sizes = {}
+            for _bi, (_vid_id_m, _orig_path_m, _orig_sz) in enumerate(batch):
+                _orig_sizes[_vid_id_m] = _orig_sz
+
+            def _process_batch(_bitrate, _out_res, batch=batch):
                 """Download, compress, replace one batch. Returns (batch_orig, batch_new, errors)."""
                 os.makedirs(temp_dir, exist_ok=True)
-                batch_orig = sum(item[2] for item in batch)
+                # Use stored original sizes so redo safety checks compare against
+                # pre-compression sizes, not post-compression sizes
+                batch_orig = 0
+                for _bi, (_vid_id_m, _orig_path_m, _) in enumerate(batch):
+                    _stored_size = _orig_sizes.get(_vid_id_m, 0)
+                    if _stored_size == 0:
+                        try:
+                            _stored_size = os.path.getsize(_orig_path_m)
+                        except OSError:
+                            _stored_size = 0
+                    batch[_bi] = (_vid_id_m, _orig_path_m, _stored_size)
+                    batch_orig += _stored_size
                 batch_new = 0
                 batch_errors = 0
 
@@ -7830,8 +8122,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         log(f"    Downloading ({resolution})...\n", "simpleline")
                     try:
                         dl_proc = spawn_yt_dlp(dl_cmd)
-                        with proc_lock:
-                            active_processes.append(dl_proc)
+                        if dl_proc is None:
+                            log(f"    ⚠ Could not launch yt-dlp for redownload.\n", "red")
+                            batch_errors += 1
+                            continue
                         for line in dl_proc.stdout:
                             if _ce.is_set():
                                 dl_proc.terminate()
@@ -7888,11 +8182,12 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                     try:
                         proc = subprocess.Popen(
-                            ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             startupinfo=startupinfo, encoding="utf-8", errors="replace"
                         )
-                        _ffmpeg_proc = proc
-                        _gpu_actively_encoding = True
+                        with _ffmpeg_lock:
+                            _ffmpeg_proc = proc
+                            _gpu_actively_encoding = True
                         _bl_encode_t0 = time.time()
 
                         # Compute vid info strings for progress display and loading state
@@ -7951,8 +8246,9 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             except subprocess.TimeoutExpired:
                                 proc.kill()
                                 proc.wait(timeout=10)
-                        _ffmpeg_proc = None
-                        _gpu_actively_encoding = False
+                        with _ffmpeg_lock:
+                            _ffmpeg_proc = None
+                            _gpu_actively_encoding = False
                         _clear_encode_progress()
                         _bl_encode_elapsed = time.time() - _bl_encode_t0
 
@@ -7966,6 +8262,15 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
                         if proc.returncode == 0 and os.path.exists(compressed_path):
                             new_size = os.path.getsize(compressed_path)
+                            # Safety check: skip replacement if output is suspiciously small
+                            if new_size < 10240 or (orig_size > 0 and new_size < orig_size * 0.01):
+                                log(f"    ⚠ Compressed output too small ({new_size:,} bytes vs {orig_size:,} original) — skipping replacement.\n", "red")
+                                try:
+                                    os.remove(compressed_path)
+                                except Exception:
+                                    pass
+                                batch_errors += 1
+                                continue
                             # Replace original file
                             try:
                                 os.replace(compressed_path, orig_path)
@@ -7989,7 +8294,9 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         batch_errors += 1
                         break
                     except Exception as e:
-                        _ffmpeg_proc = None
+                        with _ffmpeg_lock:
+                            _ffmpeg_proc = None
+                            _gpu_actively_encoding = False
                         log(f"    ⚠ Encode error: {e}\n", "red")
                         batch_errors += 1
                     finally:
@@ -8035,7 +8342,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     first_batch = False
                     _confirm_result = [None]  # None=pending, True=continue, "redo"=redo
 
-                    def _ask_confirm():
+                    def _ask_confirm(batch_orig=batch_orig, batch_new=batch_new, batch_errors=batch_errors):
                         if batch_orig > 0 and batch_new > 0:
                             o_mb = batch_orig / (1024 * 1024)
                             n_mb = batch_new / (1024 * 1024)
@@ -8121,6 +8428,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                       relief="flat", font=("Segoe UI", 9, "bold"),
                                       cursor="hand2", command=_cancel).pack(side="left")
 
+                            dlg.protocol("WM_DELETE_WINDOW", _cancel)
                             dlg.update_idletasks()
                             dlg.geometry(f"+{root.winfo_x() + 200}+{root.winfo_y() + 200}")
 
@@ -8550,6 +8858,16 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                             _save_progress(done_ids)
                             continue
 
+                    # Safety check: skip replacement if output is suspiciously small
+                    if new_size < 10240 or (orig_size > 0 and new_size < orig_size * 0.01):
+                        log(f"    ⚠ Downloaded file too small ({new_size:,} bytes vs {orig_size:,} original) — skipping replacement.\n", "red")
+                        try:
+                            os.remove(dl_path)
+                        except Exception:
+                            pass
+                        done_ids.add(vid_id)
+                        _save_progress(done_ids)
+                        continue
                     os.replace(dl_path, orig_path)
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
@@ -8614,21 +8932,23 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
     _ce = cancel_ev or cancel_event
     _pe = pause_ev or pause_event
     global _whisper_proc
-    if _whisper_proc is None or _whisper_proc.poll() is not None:
+    with _whisper_lock:
+        _wp_alive = _whisper_proc is not None and _whisper_proc.poll() is None
+    if not _wp_alive:
         if not _start_whisper_process():
             _whisper_last_failed = True
             return None, []
     try:
-        import json as _json
         _title_disp = title
         if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
             _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
         _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces
         _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
-        _gpu_actively_encoding = True
+        with _ffmpeg_lock:
+            _gpu_actively_encoding = True
         log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
-        request = _json.dumps({"path": audio_path, "duration": duration})
+        request = json.dumps({"path": audio_path, "duration": duration})
         _whisper_proc.stdin.write(request + "\n")
         _whisper_proc.stdin.flush()
 
@@ -8641,7 +8961,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         # anything, causing the function to hang forever.
         if _whisper_line_queue is None:
             log("  ⚠ Internal error: Whisper reader not initialized.\n", "red")
-            _gpu_actively_encoding = False
+            with _ffmpeg_lock:
+                _gpu_actively_encoding = False
             _whisper_last_failed = True
             _stop_whisper_process()
             return None, []
@@ -8668,24 +8989,24 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                     f"Restarting process...\n",
                     "red",
                 )
-                _gpu_actively_encoding = False
+                with _ffmpeg_lock:
+                    _gpu_actively_encoding = False
                 _whisper_last_failed = True
                 _stop_whisper_process()  # will be restarted on next call
                 return None, []
 
             if response_line is None:
                 # Subprocess closed stdout unexpectedly
-                _gpu_actively_encoding = False
+                with _ffmpeg_lock:
+                    _gpu_actively_encoding = False
                 _whisper_last_failed = True
                 return None, []
 
             response_line = response_line.strip()
             if not response_line:
-                _gpu_actively_encoding = False
-                _whisper_last_failed = True
-                return None, []
+                continue  # blank line — keep reading instead of treating as failure
             try:
-                result = _json.loads(response_line)
+                result = json.loads(response_line)
             except (json.JSONDecodeError, ValueError):
                 continue
             if result.get("status") == "starting":
@@ -8705,7 +9026,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 continue
             elif result.get("status") == "ok":
                 log(f"{_wp}Transcribing{_title_part}, 100%...\n", "whisper_progress")
-                _gpu_actively_encoding = False
+                with _ffmpeg_lock:
+                    _gpu_actively_encoding = False
                 _text = result.get("text") or None
                 _raw_segs = result.get("segments", [])
                 _segments = [{"start": s["s"], "end": s["e"], "text": s["t"],
@@ -8713,12 +9035,14 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 return _text, _segments
             else:
                 log(f"  ⚠ Whisper error: {result.get('text', 'unknown')}\n", "red")
-                _gpu_actively_encoding = False
+                with _ffmpeg_lock:
+                    _gpu_actively_encoding = False
                 _whisper_last_failed = True
                 return None, []
     except Exception as e:
         log(f"  ⚠ Whisper communication error: {e}\n", "red")
-        _gpu_actively_encoding = False
+        with _ffmpeg_lock:
+            _gpu_actively_encoding = False
         _whisper_last_failed = True
         _stop_whisper_process()  # Kill broken process, will restart on next call
         return None, []
@@ -8751,12 +9075,33 @@ def _punctuate_text(text):
     global _punct_proc
     if _punct_proc is None or _punct_proc.poll() is not None:
         return text
+    _local_proc = _punct_proc  # capture local reference before spawning thread
     try:
         request = json.dumps({"text": text})
-        _punct_proc.stdin.write(request + "\n")
-        _punct_proc.stdin.flush()
+        _local_proc.stdin.write(request + "\n")
+        _local_proc.stdin.flush()
 
-        response_line = _punct_proc.stdout.readline().strip()
+        # Read response with a 60-second timeout to avoid blocking forever
+        # if the subprocess hangs.
+        _resp_q = queue.Queue()
+        def _read_response():
+            try:
+                _resp_q.put(_local_proc.stdout.readline())
+            except Exception as _e:
+                _resp_q.put(_e)
+        _t = threading.Thread(target=_read_response, daemon=True)
+        _t.start()
+        _t.join(timeout=60)
+        if _t.is_alive():
+            # Subprocess hung — kill it and report
+            log("    ⚠ Punctuation subprocess timed out (60 s), killing it.\n", "red")
+            _stop_punct_process()
+            return text
+
+        _raw = _resp_q.get_nowait()
+        if isinstance(_raw, Exception):
+            raise _raw
+        response_line = _raw.strip()
         if not response_line:
             return text
         result = json.loads(response_line)
@@ -8831,7 +9176,7 @@ def _fetch_auto_captions(video_id, temp_dir):
             for f in glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*")):
                 os.remove(f)
         except Exception:
-            pass
+            traceback.print_exc()
 
     def _run_fetch(use_cookies, force_overwrites=False):
         cmd = [
@@ -9012,15 +9357,18 @@ def _sort_transcript_entries(txt_paths):
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(sorted_content)
         except Exception:
-            pass  # don't break transcription over a sort error
+            traceback.print_exc()  # don't break transcription over a sort error
 
 
 def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
-                              subtitle_text="Manual file transcription"):
+                              subtitle_text="Manual file transcription",
+                              cancel_ev=None):
     """Show model selection dialog for manual transcription.
     Returns (model_string, timed_out) tuple, or (None, False) if cancelled.
     Blocks the calling thread until the user picks.
+    cancel_ev: optional threading.Event to poll for cancellation (defaults to global cancel_event).
     """
+    _cancel = cancel_ev or cancel_event
     _model_result = [None]
     _model_timed_out = [False]
 
@@ -9106,7 +9454,7 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
 
     if _root_alive:
         _ui_queue.append(_ask)
-        while _model_result[0] is None and not cancel_event.is_set():
+        while _model_result[0] is None and not _cancel.is_set():
             time.sleep(0.1)
 
     return _model_result[0], _model_timed_out[0]
@@ -9356,18 +9704,17 @@ def _add_to_redownload_queue(ch_name, ch_url, folder, resolution):
         if any(q["ch_url"] == ch_url for q in _redownload_queue):
             log(f"  ⚠ {ch_name} redownload is already in the queue.\n", "simpleline")
             return
-    # Also check if it's the currently running redownload
-    if _redownload_running and _current_job.get("url") == ch_url:
-        log(f"  ⚠ {ch_name} redownload is already running.\n", "simpleline")
-        return
-    _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
-    with _redownload_queue_lock:
+        # Also check if it's the currently running redownload
+        if _redownload_running and _current_job.get("url") == ch_url:
+            log(f"  ⚠ {ch_name} redownload is already running.\n", "simpleline")
+            return
         _redownload_queue.append({
             "ch_name": ch_name,
             "ch_url": ch_url,
             "folder": folder,
             "resolution": resolution,
         })
+    _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
     with _queue_order_lock:
         _queue_order.append(("redownload", ch_url))
     log(f"\n=== Added to Sync List: Redownload {ch_name} ({_rr_disp}) ===\n", "header")
@@ -9394,7 +9741,10 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
 
     def _worker():
         global _redownload_running, _current_redownload_item
-        cancel_event.clear()  # Reset any stale cancel from a previous Stop so the redownload isn't immediately aborted
+        # Only clear stale cancel if no other operations are running
+        if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled):
+            cancel_event.clear()
+
         _current_redownload_item = {"ch_name": ch_name, "ch_url": ch_url, "folder": folder, "resolution": resolution}
         _rr_disp = "Best" if resolution == "best" else f"{resolution}p"
         _current_job["label"] = f"Redownload {ch_name} ({_rr_disp})"
@@ -9434,7 +9784,10 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
                     pass
             _save_queue_state()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        _redownload_running = False
 
 
 def _has_pending_redownload(ch_url):
@@ -9496,10 +9849,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
         _ui_queue.append(refresh_channel_dropdowns)
         _whisper_available = None  # None = not checked yet
+        _user_skipped_whisper = False  # True if user chose "skip" at Whisper model prompt
 
         try:
-            _ce.clear()
+            # Only clear cancel for standalone (non-sync) transcription jobs;
+            # in sync mode the cancel_event is shared and clearing it would
+            # erase an in-flight cancel from another operation.
             if not _sync_mode:
+                _ce.clear()
                 _ui_queue.append(_update_queue_btn)
 
             log(f"\n{'='*60}\n", "tx_sep")
@@ -9566,9 +9923,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _whisper_cache_set = set()  # set of fpaths known to need Whisper
             try:
                 if os.path.exists(_whisper_cache_path):
-                    import json as _cjson
                     with open(_whisper_cache_path, "r", encoding="utf-8") as _cf:
-                        _cached_entries = _cjson.load(_cf)
+                        _cached_entries = json.load(_cf)
                     # Only keep files still on disk and not yet transcribed
                     _fp_to_process = set(files_to_process.values())
                     _whisper_cache_set = {
@@ -9584,7 +9940,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log("  Fetching YouTube video list for caption matching...\n", "simpleline")
             yt_title_to_id = {}  # yt_title -> video_id
             def _fetch_yt_title_map(use_cookies):
-                """Fetch title→id map from YouTube playlist. Returns {} on failure."""
+                """Fetch title→id map from YouTube playlist. Returns {} on failure.
+                Cancel-aware: polls _ce every second so cancellation doesn't block 5 min."""
                 _cmd = [
                     "yt-dlp", "--flat-playlist",
                     "--print", "%(id)s|||%(title)s",
@@ -9594,11 +9951,40 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _cmd += ["--cookies-from-browser", "firefox"]
                 _cmd.append(ch_url)
                 try:
-                    _proc = subprocess.run(_cmd, capture_output=True, text=True, timeout=300, startupinfo=startupinfo)
+                    _proc = subprocess.Popen(
+                        _cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, startupinfo=startupinfo
+                    )
+                    # Read stdout line-by-line inside the poll loop to prevent
+                    # pipe buffer filling up and causing a deadlock.
+                    _deadline = time.time() + 300
                     _result = {}
-                    for _line in _proc.stdout.strip().split("\n"):
+                    _lines_buf = []
+                    while True:
+                        _line_raw = _proc.stdout.readline()
+                        if _line_raw:
+                            _lines_buf.append(_line_raw)
+                        elif _proc.poll() is not None:
+                            break
+                        if _ce.is_set():
+                            _proc.terminate()
+                            try:
+                                _proc.wait(timeout=5)
+                            except Exception:
+                                _proc.kill()
+                            return {}
+                        if time.time() > _deadline:
+                            _proc.terminate()
+                            try:
+                                _proc.wait(timeout=5)
+                            except Exception:
+                                _proc.kill()
+                            log("  ⚠ YouTube list fetch timed out.\n", "red")
+                            return {}
+                    for _line in _lines_buf:
+                        _line = _line.strip()
                         if "|||" in _line:
-                            _vid_id, _yt_title = _line.strip().split("|||", 1)
+                            _vid_id, _yt_title = _line.split("|||", 1)
                             _vid_id = _vid_id.strip()
                             _yt_title = _yt_title.strip()
                             if re.fullmatch(r'[\w-]{11}', _vid_id):
@@ -9624,7 +10010,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Step 3.5: Title normalization helper + punctuation sweep for already-done ─
             def _normalize_title(title):
                 """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
-                import unicodedata
                 s = unicodedata.normalize('NFKC', title)
                 s = re.sub(r'[\\/:*?"<>|]', '', s)
                 s = re.sub(r'\s+', ' ', s).strip()
@@ -9745,7 +10130,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # If the video is actually a YouTube video (just had no captions), look up
             # its ID and write it in so the YT timestamp link works in search results.
             if yt_title_to_id and not _ce.is_set():
-                import json as _pjson
                 _vid_id_patched = 0
                 for _pd, _pdirs, _pfiles in os.walk(folder):
                     for _pf in _pfiles:
@@ -9764,7 +10148,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _pnew.append(_pl)
                                     continue
                                 try:
-                                    _pe2 = _pjson.loads(_ps)
+                                    _pe2 = json.loads(_ps)
                                 except Exception:
                                     _pnew.append(_pl)
                                     continue
@@ -9774,7 +10158,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                              or _yt_norm_backfill.get(_normalize_title(_pt)))
                                     if _pvid:
                                         _pe2["video_id"] = _pvid
-                                        _pnew.append(_pjson.dumps(_pe2, ensure_ascii=False) + "\n")
+                                        _pnew.append(json.dumps(_pe2, ensure_ascii=False) + "\n")
                                         _pchanged = True
                                         _vid_id_patched += 1
                                         continue
@@ -9784,7 +10168,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _pfh.writelines(_pnew)
                                 _hide_file_win(_pfpath)
                         except Exception:
-                            pass
+                            traceback.print_exc()
                 if _vid_id_patched:
                     log(f"  ✓ Linked YouTube IDs for {_vid_id_patched} Whisper segment(s).\n",
                         "simpleline_green")
@@ -9801,7 +10185,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _txt_files_to_sweep.append(os.path.join(dirpath, f))
 
                 _punct_fixes = 0
+                _punct_model_ok = True
                 for _sw_path in _txt_files_to_sweep:
+                    if not _punct_model_ok:
+                        break
                     try:
                         with open(_sw_path, "r", encoding="utf-8") as _sf:
                             _sw_content = _sf.read()
@@ -9827,6 +10214,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if "NO AUDIO DATA" in _sw_header:
                             _new_entries.append(_sw_entry)
                             continue
+                        # Skip entries already punctuated (by model or Whisper)
+                        if "YT+PUNCTUATION" in _sw_header or "WHISPER" in _sw_header:
+                            _new_entries.append(_sw_entry)
+                            continue
                         # Check punctuation density
                         _sw_p_count = sum(1 for ch in _sw_body if ch in ',.!?;')
                         if _sw_p_count >= max(3, len(_sw_body) // 200):
@@ -9839,6 +10230,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if not _punct_sweep_needed:
                             _punct_sweep_needed = True
                             if not _load_punctuation_model():
+                                _punct_model_ok = False
                                 break  # Can't load model, skip sweep
                             log(f"  Running punctuation sweep on previously transcribed entries...\n", "simpleline")
                         try:
@@ -9906,8 +10298,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         unmatched.append((fname, fpath))
 
             # Sort by file modification time, newest first
-            matched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
-            unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+            def _safe_mtime(x):
+                try:
+                    return os.path.getmtime(x[1])
+                except OSError:
+                    return 0
+            matched.sort(key=_safe_mtime, reverse=True)
+            unmatched.sort(key=_safe_mtime, reverse=True)
 
             log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
@@ -9918,9 +10315,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # a restart mid-Phase A can skip re-checking files already identified.
             if unmatched:
                 try:
-                    import json as _cjson_pre
                     with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
-                        _cjson_pre.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                        json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                 except Exception:
                     pass
 
@@ -9950,6 +10346,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _prior_done = len(already_done)  # count of videos transcribed before this session
             done_count = 0
             err_count = 0
+            _whisper_skip_count = 0  # Whisper failures that will be retried (not real errors)
             idx = 0
             _check_idx = 0       # monotonically increasing caption-check counter (for simple mode [X/Y])
             _whisper_queued = len(unmatched)  # pre-scan unmatched + any that fail captions in Phase A
@@ -10019,12 +10416,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim")
                         unmatched.append((fname, fpath))
                         _whisper_queued += 1
-                        total += 1  # this file will be processed again in Phase B, so bump total
+                        # Don't increment total when re-queuing for Phase B — these files
+                        # are already counted in the total; bumping double-counts them.
                         # Update cache immediately so a restart skips this file in Phase A
                         try:
-                            import json as _cjson_upd
                             with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
-                                _cjson_upd.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                                json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                         except Exception:
                             pass
                         continue
@@ -10101,7 +10498,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _sort_transcript_entries(_modified_txt_files)
                 _do_jsonl_backfill()
                 try:
-                    import shutil
                     shutil.rmtree(temp_dir, ignore_errors=True)
                 except Exception:
                     pass
@@ -10128,9 +10524,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Phase A caption re-check (cache is loaded at the top of this function).
                 if unmatched:
                     try:
-                        import json as _cjson
                         with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
-                            _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                            json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                     except Exception:
                         pass
                 return  # skip Phase B
@@ -10140,16 +10535,20 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # Phase B without repeating the entire Phase A caption scan.
             if unmatched:
                 try:
-                    import json as _cjson
                     with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
-                        _cjson.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                        json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                 except Exception:
                     pass
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
                 # Re-sort unmatched by mtime newest first (Phase A may have added failed items)
-                unmatched.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                def _safe_mtime_u(x):
+                    try:
+                        return os.path.getmtime(x[1])
+                    except OSError:
+                        return 0
+                unmatched.sort(key=_safe_mtime_u, reverse=True)
 
                 # ── Model selection ──
                 log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
@@ -10268,6 +10667,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 elif _model_result[0] == "skip":
                     log(f"  Skipping {len(unmatched)} video(s) without YouTube captions.\n", "simpleline")
                     _whisper_available = False
+                    _user_skipped_whisper = True
                 else:
                     _whisper_model_choice = _model_result[0]
                     # If model changed, stop old process so it relaunches with new model
@@ -10374,9 +10774,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 # Process stalled or crashed — do NOT exclude the video
                                 # (it likely has speech; Whisper just failed to process it).
                                 # It will be retried on the next transcription run.
+                                # Count as skip, not error, so it doesn't block transcription_complete
                                 log(f"  [{idx}/{total}] {fname} — Whisper failed, skipping (will retry next run).\n", "red")
-                                _transcription_log.append((fname, source, time.time() - _t_vid_start, "error — process failure"))
-                                err_count += 1
+                                _transcription_log.append((fname, source, time.time() - _t_vid_start, "skipped — process failure (will retry)"))
+                                _whisper_skip_count += 1
                                 continue
                             # Write exclusion entry so this video is skipped on future transcribes
                             log(f"  [{idx}/{total}] {fname} — no speech detected, excluding.\n", "simpleline")
@@ -10394,6 +10795,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _excl_entry = f"===({fname}), {_excl_date_fmt}, {_excl_dur_fmt}, (NO AUDIO DATA — EXCLUDED)===\n[No speech detected]\n\n\n"
                                 with open(_excl_txt, "a", encoding="utf-8") as _ef:
                                     _ef.write(_excl_entry)
+                                # Write JSONL placeholder so backfill doesn't retry this video
+                                try:
+                                    _excl_jsonl = _get_jsonl_path(_excl_txt)
+                                    _excl_placeholder = [{"start": 0.0, "end": 0.01, "text": "(no speech detected)"}]
+                                    _excl_vid = yt_title_to_id.get(fname, "") if 'yt_title_to_id' in dir() else ""
+                                    _write_jsonl_entry(_excl_jsonl, _excl_vid, fname, _excl_placeholder)
+                                except Exception:
+                                    pass
                                 _modified_txt_files.add(_excl_txt)
                                 done_count += 1
                             except Exception as _excl_e:
@@ -10459,7 +10868,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         else:
                             log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
                 else:
-                    err_count += len(unmatched)
+                    if not _user_skipped_whisper:
+                        err_count += len(unmatched)
 
             # ── Post-process: sort entries chronologically in each .txt file ──
             if _modified_txt_files and done_count > 0:
@@ -10470,7 +10880,6 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             # Cleanup temp dir
             try:
-                import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
                 pass
@@ -10484,9 +10893,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     pass
                 log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
                 if err_count:
-                    log(f", {err_count} skipped", "simpleline_green")
+                    log(f", {err_count} errors", "simpleline_green")
+                if _whisper_skip_count:
+                    log(f", {_whisper_skip_count} skipped (will retry)", "simpleline_green")
                 log(".\n", "simpleline_green")
-                # Mark channel as fully transcribed (only if not cancelled)
+                # Mark channel as fully transcribed (only if not cancelled and no real errors)
+                # Whisper skips (process failures) don't block completion — they retry next run
                 if err_count == 0:
                     with config_lock:
                         for _cfg_ch in config.get("channels", []):
@@ -10523,10 +10935,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log("=" * 50 + "\n", "summary")
 
             # Record in autorun history
-            if done_count > 0 or err_count > 0:
+            if done_count > 0 or err_count > 0 or _whisper_skip_count > 0:
                 _t_rec_elapsed = time.time() - _t_total_start
                 _record_transcription(done_count + _prior_done, err_count, _t_rec_elapsed,
-                                      channel_name=ch_name, skipped=0)
+                                      channel_name=ch_name, skipped=_whisper_skip_count)
 
             # Notify transcription panel to offer re-index
             if done_count > 0 and _tp_panel_ref[0] is not None:
@@ -10713,6 +11125,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         _update_tray_tooltip(f"YT Archiver \u2014 Transcribing {fname}")
 
         try:
+            if _ce.is_set():
+                return
             _ce.clear()
             if not _sync_mode:
                 _ui_queue.append(_update_queue_btn)
@@ -10739,7 +11153,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                 # Model selection dialog
                 model_choice, timed_out = _ask_whisper_model_dialog(
                     prompt_text="Which Whisper model to use?",
-                    subtitle_text=f"Transcribing: {fname}"
+                    subtitle_text=f"Transcribing: {fname}",
+                    cancel_ev=_ce
                 )
                 if _ce.is_set() or model_choice is None:
                     log(f"\n  Cancelled.\n", "red")
@@ -10888,6 +11303,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
         _update_tray_tooltip(f"YT Archiver — Transcribing {folder_name}")
 
         try:
+            if _ce.is_set():
+                return
             _ce.clear()
 
             log(f"\n{'='*60}\n", "header")
@@ -11047,6 +11464,14 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                         _excl_entry = f"===({fname}), {_excl_date_fmt}, {_excl_dur_fmt}, (NO AUDIO DATA — EXCLUDED)===\n[No speech detected]\n\n\n"
                         with open(out_path, "a", encoding="utf-8") as _ef:
                             _ef.write(_excl_entry)
+                        # Write JSONL placeholder so backfill doesn't retry this video
+                        try:
+                            _excl_jsonl = _get_jsonl_path(out_path)
+                            _excl_placeholder = [{"start": 0.0, "end": 0.01, "text": "(no speech detected)"}]
+                            _excl_vid = yt_title_to_id.get(fname, "") if 'yt_title_to_id' in dir() else ""
+                            _write_jsonl_entry(_excl_jsonl, _excl_vid, fname, _excl_placeholder)
+                        except Exception:
+                            pass
                         _transcribed += 1
                     except Exception:
                         _skipped += 1
@@ -11485,7 +11910,7 @@ def _validate_add_btn():
                                 ch.get("compress_enabled", False) == new_compress_var.get() and \
                                 ch.get("compress_level", "") == new_compress_level_var.get() and \
                                 ch.get("compress_output_res", "") == _cur_c_res_val and \
-                                ch.get("compress_batch_size", 20) == int(new_compress_batch_var.get() or "20"):
+                                ch.get("compress_batch_size", 20) == (int(new_compress_batch_var.get()) if new_compress_batch_var.get().strip().isdigit() else 20):
                             is_changed = False
                         break
 
@@ -11590,7 +12015,7 @@ def save_channel_prefs():
                 ch["folder_override"] = sanitize_folder(folder_override_var.get().strip())
                 _ch_url = ch.get("url")
                 break
-    save_config(config)
+        save_config(config)
     if _ch_url:
         _invalidate_channel_disk_cache(_ch_url)
     refresh_channel_dropdowns()
@@ -11816,7 +12241,11 @@ def internal_run_subscribe_before_date(url, date_str):
                 _log_scan_status(checked, len(ids), date_disp, title_trunc)
         first_result.set()
         clear_transient_lines()
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
         if cancel_event.is_set():
             return False
@@ -11845,7 +12274,7 @@ def internal_run_subscribe_before_date(url, date_str):
                 if cfg_ch["url"] == url:
                     cfg_ch["date_archived_ids"] = ids
                     break
-        save_config(config)
+            save_config(config)
 
         log(f"  ✓ Archived {len(new_ids):,} IDs ({len(ids) - len(new_ids):,} already present).\n", "green")
         return True
@@ -11899,7 +12328,7 @@ def _set_batch_cooldown(url):
         for cfg_ch in config.get("channels", []):
             if cfg_ch["url"] == url:
                 cfg_ch["init_batch_after"] = cooldown_dt.isoformat()
-    save_config(config)
+        save_config(config)
     return cooldown_dt
 
 
@@ -11941,7 +12370,7 @@ def _clear_batch_state(url, mark_complete=False):
                 cfg_ch.pop("batch_resume_index", None)
                 if mark_complete:
                     cfg_ch["init_complete"] = True
-    save_config(config)
+        save_config(config)
     _delete_batch_cache(url)
 
 
@@ -11950,7 +12379,7 @@ def _prefetch_total(url):
     try:
         # Target /videos tab specifically to avoid getting tab count (3) instead of video count
         _url = url.rstrip("/")
-        if ("/@" in _url or "/channel/" in _url or "/c/" in _url) and not _url.endswith("/videos"):
+        if ("/@" in _url or "/channel/" in _url or "/c/" in _url or "/user/" in _url) and not _url.endswith("/videos"):
             _url = _url + "/videos"
 
         # Use DEVNULL stderr so stdout only has the playlist_count value
@@ -11992,13 +12421,15 @@ def _prefetch_total(url):
         if count > 0:
             return count
 
+        # Always remove first proc before creating second
+        with proc_lock:
+            try:
+                active_processes.remove(proc)
+            except ValueError:
+                pass
+
         # Fallback: try extracting from JSON metadata if --print didn't work
         if not cancel_event.is_set():
-            with proc_lock:
-                try:
-                    active_processes.remove(proc)
-                except ValueError:
-                    pass
             proc = subprocess.Popen(
                 ["yt-dlp", "--flat-playlist", "--no-warnings", "--playlist-end", "1",
                  "--dump-single-json", "--no-download",
@@ -12011,14 +12442,17 @@ def _prefetch_total(url):
             )
             with proc_lock:
                 active_processes.append(proc)
-            import json as _json
             raw = proc.stdout.read()
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
             try:
-                data = _json.loads(raw)
+                data = json.loads(raw)
                 count = data.get("playlist_count") or data.get("n_entries") or 0
                 if isinstance(count, int) and count > 0:
                     return count
@@ -12347,13 +12781,23 @@ def _prefetch_livestreams(url):
         if not proc:
             return []
         results = []
-        for line in proc.stdout:
+        while True:
             if cancel_event.is_set():
+                break
+            line = proc.stdout.readline()
+            if not line:
                 break
             parts = line.strip().split("\t")
             if len(parts) == 2 and parts[0] and parts[1]:
                 results.append((parts[0], parts[1]))
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         return results
     except Exception:
         return []
@@ -12371,7 +12815,10 @@ def internal_run_subscribe_blocking(url):
             return False
 
         ids = []
-        for line in proc.stdout:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
             if cancel_event.is_set():
                 break
 
@@ -12387,7 +12834,14 @@ def internal_run_subscribe_blocking(url):
             line = line.strip()
             if re.fullmatch(r'[\w-]{11}', line):
                 ids.append(line)
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
         if cancel_event.is_set():
             return False
@@ -12654,6 +13108,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                         # Last resort: match by normalized title in the output directory tree
                         # Handles files with special Unicode characters where path detection failed
+                        # Uses a cached walk result so repeated lookups don't re-scan the tree
                         if not filepath or not os.path.exists(filepath):
                             _title_raw = parts[1].strip()
                             _norm_title = re.sub(r'[^\w]', '', _title_raw.lower())
@@ -12671,26 +13126,37 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                     pass
                                 if _out_base and os.path.isdir(_out_base):
                                     try:
-                                        for _dp, _dns, _fns in os.walk(_out_base):
-                                            for _fn in _fns:
-                                                _fb, _fe = os.path.splitext(_fn)
-                                                if _fe.lower() not in ('.mp4', '.mkv', '.webm'):
-                                                    continue
-                                                _norm_fn = re.sub(r'[^\w]', '', _fb.lower())
-                                                if _norm_fn == _norm_title or (
-                                                    len(_norm_fn) >= 15 and (
-                                                        _norm_title.startswith(_norm_fn) or
-                                                        _norm_fn.startswith(_norm_title[:len(_norm_fn)])
-                                                    )
-                                                ):
-                                                    _cand = os.path.join(_dp, _fn)
-                                                    # Use creation time on Windows (--mtime sets mtime to upload date)
-                                                    _cand_time = os.path.getctime(_cand) if os.name == 'nt' else os.path.getmtime(_cand)
-                                                    if (time.time() - _cand_time) < 600:
-                                                        filepath = _cand
-                                                        break
-                                            if filepath:
-                                                break
+                                        # Cache the walk result per output base; invalidate after 60s
+                                        if not hasattr(internal_run_cmd_blocking, '_walk_cache'):
+                                            internal_run_cmd_blocking._walk_cache = {}
+                                        _wc = internal_run_cmd_blocking._walk_cache
+                                        _wc_key = _out_base
+                                        _wc_entry = _wc.get(_wc_key)
+                                        _now = time.time()
+                                        if not _wc_entry or (_now - _wc_entry[1]) > 60:
+                                            _walk_files = []
+                                            for _dp, _dns, _fns in os.walk(_out_base):
+                                                for _fn in _fns:
+                                                    _fb, _fe = os.path.splitext(_fn)
+                                                    if _fe.lower() in ('.mp4', '.mkv', '.webm'):
+                                                        _walk_files.append((_dp, _fn, _fb, _fe))
+                                            _wc[_wc_key] = (_walk_files, _now)
+                                        else:
+                                            _walk_files = _wc_entry[0]
+                                        for _dp, _fn, _fb, _fe in _walk_files:
+                                            _norm_fn = re.sub(r'[^\w]', '', _fb.lower())
+                                            if _norm_fn == _norm_title or (
+                                                len(_norm_fn) >= 15 and (
+                                                    _norm_title.startswith(_norm_fn) or
+                                                    _norm_fn.startswith(_norm_title[:len(_norm_fn)])
+                                                )
+                                            ):
+                                                _cand = os.path.join(_dp, _fn)
+                                                # Use creation time on Windows (--mtime sets mtime to upload date)
+                                                _cand_time = os.path.getctime(_cand) if os.name == 'nt' else os.path.getmtime(_cand)
+                                                if (time.time() - _cand_time) < 600:
+                                                    filepath = _cand
+                                                    break
                                     except OSError:
                                         pass
 
@@ -12781,7 +13247,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                                         if os.path.isdir(_base_dir):
                                             # Check if template uses year+month or just year
-                                            _has_month = ("%m" in _out_tmpl or "%B" in _out_tmpl)
+                                            _has_month = ("upload_date>%m" in _out_tmpl or "upload_date>%B" in _out_tmpl)
                                             if _has_month:
                                                 _correct_dir = os.path.join(_base_dir, _year, _month_name)
                                             else:
@@ -12791,8 +13257,14 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                             if os.path.normpath(filepath) != os.path.normpath(_correct_path):
                                                 os.makedirs(_correct_dir, exist_ok=True)
                                                 if not os.path.exists(_correct_path):
+                                                    _old_filepath = filepath
                                                     shutil.move(filepath, _correct_path)
                                                     filepath = _correct_path
+                                                    # Update _tracked_paths so per-batch compression uses the new path
+                                                    for _tp_i, _tp_val in enumerate(_tracked_paths):
+                                                        if os.path.normpath(_tp_val) == os.path.normpath(_old_filepath):
+                                                            _tracked_paths[_tp_i] = filepath
+                                                            break
                                                     # Update the record with the corrected path
                                                     with config_lock:
                                                         recent = config.get("recent_downloads", [])
@@ -12839,8 +13311,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     if not is_simple_mode:
                         pass  # Don't log the raw DLTRACK line even in verbose
                     continue
-                except Exception:
-                    pass
+                except Exception as _dltrack_err:
+                    log(f"  ⚠ DLTRACK parse error: {_dltrack_err}\n", "red")
 
             if "[download]" in line and "%" in line and "ETA" in line:
                 m = re.search(r'\[download\]\s+([\d\.]+)%\s+of\s+(.*?)\s+at\s+(.*?)\s+ETA\s+(.*)', line)
@@ -13049,9 +13521,10 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 if "This live event will begin in" in line or "Premieres in" in line:
                     dur_count += 1
                     session_totals["dur"] += 1
+                    _vid = current_vid_id or "video"
+                    _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
+                    _skipped_dur_titles.append((_skip_title, "Scheduled/premiere."))
                     if is_simple_mode:
-                        _vid = current_vid_id or "video"
-                        _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
                         _skip_tmax = 49
                         if len(_skip_title) > _skip_tmax:
                             _skip_title = _skip_title[:_skip_tmax - 3] + "..."
@@ -13059,6 +13532,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         log(f" {_skip_title:<{_skip_tmax}}  -Scheduled/premiere.\n", "filterskip_dim")
                     else:
                         log(line, "filterskip")
+                    if current_vid_id and current_vid_id not in live_ids:
+                        with io_lock:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                                f.write(f"youtube {current_vid_id}\n")
+                        if not is_simple_mode:
+                            log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 err_count += 1
                 session_totals["err"] += 1
@@ -13235,7 +13714,8 @@ def start_sync_all():
 
     _schedule_autorun(0)
 
-    for key in session_totals: session_totals[key] = 0
+    with _session_totals_lock:
+        for key in session_totals: session_totals[key] = 0
     cancel_event.clear()
 
     sync_btn.config(state="disabled", text="⏳ Syncing...")
@@ -13269,6 +13749,8 @@ def start_sync_all():
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Syncing...")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
+
+    t_start_manual = datetime.now()
 
     def _sync_worker():
         global _sync_running, _current_sync_ch
@@ -13328,8 +13810,8 @@ def start_sync_all():
                         log(f"\n  ⏭ Skipping {_skip_name} — {_pending_batches} unprocessed GPU batches (limit: {GPU_BATCH_LIMIT})\n", "dim")
                         with _sync_queue_lock:
                             _sync_queue.append(ch)
-                        with _queue_order_lock:
-                            _queue_order.append(("sync", ch["url"]))
+                            with _queue_order_lock:
+                                _queue_order.append(("sync", ch["url"]))
                         _update_queue_btn()
                         _gpu_skip_count += 1
                         continue
@@ -13526,7 +14008,8 @@ def start_sync_all():
                                     log(f"  Found {len(_new_ids)} new video(s), updating cache.\n", "green")
                                     _new_set = set(_new_ids)
                                     _batch_cache_ids = _new_ids + [x for x in _batch_cache_ids if x not in _new_set]
-                                    _batch_start_idx += len(_new_ids)
+                                    if _batch_start_idx > 0:
+                                        _batch_start_idx += len(_new_ids)
                                     try:
                                         with open(_get_batch_cache_path(url), "w", encoding="utf-8") as _cf:
                                             _cf.write("\n".join(_batch_cache_ids) + "\n")
@@ -13614,6 +14097,7 @@ def start_sync_all():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dl = 0
                 c_dur = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
@@ -13707,6 +14191,7 @@ def start_sync_all():
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
+                    save_config(config)
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
@@ -13723,7 +14208,9 @@ def start_sync_all():
                         skip_model_dialog=True, _sync_mode=True, captions_only=True
                     )
 
+            _in_deferred_streams = False
             if deferred_streams and not cancel_event.is_set():
+                _in_deferred_streams = True
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
                 log(f"  ⚠  DOWNLOADING {len(deferred_streams)} DEFERRED LIVESTREAM(S)  ⚠\n", "livestream")
                 log(f"█" * 55 + "\n\n", "livestream")
@@ -13738,11 +14225,11 @@ def start_sync_all():
                         _ds_ch.get("resolution", "720")
                     )
                     c_dl = internal_run_cmd_blocking(_ds_cmd)
-                    # Archive the stream ID after attempt so it won't reappear every sync
-                    with io_lock:
-                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                            _af.write(f"youtube {_ds_id}\n")
+                    # Only archive the stream ID on successful download so failed ones retry next sync
                     if c_dl:
+                        with io_lock:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                _af.write(f"youtube {_ds_id}\n")
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl
 
@@ -13752,7 +14239,8 @@ def start_sync_all():
                 log("\nSync cancelled.\n", "red")
                 _cleanup_partial_files(out_dir)
                 # Save batch resume if large channel and enough progress was made
-                if ch_total > 200:
+                # (skip if cancel happened during deferred streams — loop vars are stale)
+                if not _in_deferred_streams and ch_total > 200:
                     _cancel_total = _last_run_counts["dl"] + _last_run_counts["skip"] + _last_run_counts["dur"] + _last_run_counts["err"]
                     if _cancel_total > 50:
                         if _batch_cache_ids:
@@ -13799,6 +14287,13 @@ def start_sync_all():
 
             # If a newer job has taken over, don't touch shared state
             if _job_generation == _my_gen:
+                # Clear cancel/skip events before _sync_running so other threads
+                # don't see _sync_running=False while cancel is still set.
+                _was_skip = _skip_current.is_set()
+                if _was_skip:
+                    _skip_current.clear()
+                    cancel_event.clear()
+
                 _sync_running = False
                 _current_sync_ch = None
                 _current_job["label"] = None
@@ -13807,11 +14302,7 @@ def start_sync_all():
 
                 # Check for queued jobs in insertion order before fully finishing
                 _queue_started = False
-                if _skip_current.is_set():
-                    _skip_current.clear()
-                    cancel_event.clear()
-                    _queue_started = _process_next_queued()
-                elif not cancel_event.is_set():
+                if _was_skip or not cancel_event.is_set():
                     _queue_started = _process_next_queued()
 
                 if not _queue_started and _root_alive:
@@ -13836,7 +14327,6 @@ def start_sync_all():
                 if not cancel_event.is_set() and not _queue_started:
                     _process_video_dl_queue()
 
-    t_start_manual = datetime.now()
     threading.Thread(target=_sync_worker, daemon=True).start()
 
 
@@ -13906,7 +14396,7 @@ def _show_clear_log_if_needed():
 
 def stop_downloads():
     global _sync_running, _reorg_running, _transcribe_running, _redownload_running, _current_sync_ch
-    global _disk_error_active, _disk_retry_job
+    global _disk_error_active, _disk_retry_job, _transcribe_sync_controlled
     pause_event.clear()
 
     # Clear disk error state so manual cancel fully resets everything
@@ -13938,11 +14428,10 @@ def stop_downloads():
     # Signal cancellation FIRST so worker threads see it immediately
     cancel_event.set()
 
-    # Reset flags so context-menu actions work right after cancel
-    _sync_running = False
-    _reorg_running = False
-    _transcribe_running = False
-    _redownload_running = False
+    # Worker threads clear their own _reorg_running / _transcribe_running /
+    # _redownload_running flags when they observe cancel_event, to avoid a race
+    # where both the UI thread and the worker write the flag concurrently.
+    # (_sync_running is already handled the same way.)
     _transcribe_sync_controlled = False
     _current_sync_ch = None
     if not _gpu_running:
@@ -13962,16 +14451,24 @@ def stop_downloads():
     sync_single_btn.config(state="normal", text="▶ Sync this channel")
 
     with proc_lock:
-        procs = list(active_processes)
+        procs = [p for p in active_processes if p is not None]
     for p in procs:
-        if p.poll() is None:
-            if os.name == "nt":
-                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=startupinfo)
-            else:
-                p.kill()
+        try:
+            if p.poll() is None:
+                if os.name == "nt":
+                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     startupinfo=startupinfo)
+                else:
+                    p.kill()
+        except Exception:
+            pass
     log("\n⛔ Cancelling Syncs...\n", "red")
+
+    # Restore autorun timer if one was configured (manual cancel shouldn't kill it)
+    _iv = AUTORUN_OPTIONS.get(_cached_autorun_label, 0)
+    if _iv:
+        _schedule_autorun(_iv)
 
 
 def _skip_current_job():
@@ -13982,15 +14479,18 @@ def _skip_current_job():
 
     # Kill active download processes (but don't clear queues)
     with proc_lock:
-        procs = list(active_processes)
+        procs = [p for p in active_processes if p is not None]
     for p in procs:
-        if p.poll() is None:
-            if os.name == "nt":
-                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=startupinfo)
-            else:
-                p.kill()
+        try:
+            if p.poll() is None:
+                if os.name == "nt":
+                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     startupinfo=startupinfo)
+                else:
+                    p.kill()
+        except Exception:
+            pass
     log("\n⏭ Skipping current job...\n", "red")
 
 
@@ -14087,9 +14587,10 @@ def _active_label(label, with_dots=False):
 
 
 def _get_queue_items():
-    """Return a list of (label, queue_source, index) for all queued items.
+    """Return a list of (label, queue_source, index, key) for all queued items.
     queue_source is 'sync', 'reorg', 'video', 'redownload', or 'current' — used for removal.
     index is the position within that specific queue.
+    key is the URL/identifier for robust matching when removing.
     Items are returned in _queue_order (insertion order), not grouped by type.
     """
     items = []
@@ -14107,14 +14608,14 @@ def _get_queue_items():
                 _has_batch = True
                 if _batch_first_url is None:
                     _batch_first_url = ch["url"]
-                    sync_map[ch["url"]] = (f"Sync Subs ({_batch_count} channels)", "sync_batch", i)
+                    sync_map[ch["url"]] = (f"Sync Subs ({_batch_count} channels)", "sync_batch", i, ch["url"])
                 continue  # skip individual entries for batch items
             name = ch.get("name", "?")
             if not ch.get("initialized", False):
                 lbl = f"Initialize {name}"
             else:
                 lbl = f"Sync {name}"
-            sync_map[ch["url"]] = (lbl, "sync", i)
+            sync_map[ch["url"]] = (lbl, "sync", i, ch["url"])
         # Update the batch label with final count — include the currently processing channel
         if _batch_first_url and _batch_first_url in sync_map:
             _old = sync_map[_batch_first_url]
@@ -14126,7 +14627,7 @@ def _get_queue_items():
                 _batch_lbl = f"▶ Syncing Subs ({_batch_total} channels)" + "." * (_dot_phase + 1)
             else:
                 _batch_lbl = f"Sync Subs ({_batch_total} channels)"
-            sync_map[_batch_first_url] = (_batch_lbl, _old[1], _old[2])
+            sync_map[_batch_first_url] = (_batch_lbl, _old[1], _old[2], _old[3])
 
     # Show currently processing item first — but not during batch syncs (batch entry covers it)
     if _current_job["label"] and not (_has_batch and _sync_running):
@@ -14136,7 +14637,7 @@ def _get_queue_items():
             _active_lbl = _active_label(_current_job["label"], with_dots=True)
         else:
             _active_lbl = _current_job["label"]
-        items.append((f"▶ {_active_lbl}", "current", -1))
+        items.append((f"▶ {_active_lbl}", "current", -1, None))
     reorg_map = {}
     with _reorg_queue_lock:
         for i, args in enumerate(_reorg_queue):
@@ -14148,29 +14649,29 @@ def _get_queue_items():
                 lbl = f"Re-Organize {ch_name}"
             else:
                 lbl = f"Un-Organize {ch_name}"
-            reorg_map[key] = (lbl, "reorg", i)
+            reorg_map[key] = (lbl, "reorg", i, key)
     transcribe_map = {}
     with _transcribe_queue_lock:
         for i, args in enumerate(_transcribe_queue):
-            transcribe_map[args[1]] = (f"Transcribe {args[0]}", "transcribe", i)
+            transcribe_map[args[1]] = (f"Transcribe {args[0]}", "transcribe", i, args[1])
     mt_map = {}
     with _mt_queue_lock:
         for i, fpath in enumerate(_mt_queue):
             mt_fname = os.path.splitext(os.path.basename(fpath))[0]
-            mt_map[fpath] = (f"M.T. {mt_fname}", "mt", i)
+            mt_map[fpath] = (f"M.T. {mt_fname}", "mt", i, fpath)
     video_item = None
     with _video_dl_queue_lock:
         n_vids = len(_video_dl_queue)
         if n_vids == 1:
-            video_item = ("Download 1 video", "video", 0)
+            video_item = ("Download 1 video", "video", 0, "batch")
         elif n_vids > 1:
-            video_item = (f"Download {n_vids} videos", "video", 0)
+            video_item = (f"Download {n_vids} videos", "video", 0, "batch")
     redownload_map = {}
     with _redownload_queue_lock:
         for i, item in enumerate(_redownload_queue):
             _rr_res = item.get("resolution", "")
             _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
-            redownload_map[item["ch_url"]] = (f"Redownload {item['ch_name']} ({_rr_disp})", "redownload", i)
+            redownload_map[item["ch_url"]] = (f"Redownload {item['ch_name']} ({_rr_disp})", "redownload", i, item["ch_url"])
 
     # Emit items in _queue_order (insertion order)
     seen = set()
@@ -14210,34 +14711,49 @@ def _get_queue_items():
     return items
 
 
-def _remove_queue_item(source, idx):
-    """Remove an item from a specific queue by source and index."""
+def _remove_queue_item(source, idx, expected_key=None):
+    """Remove an item from a specific queue by source and index.
+    If expected_key is provided, verify the item at idx matches before removing;
+    fall back to searching by key if the index has shifted."""
     global _queue_items_removed
     removed = None
     removed_key = None
     if source == "sync":
         with _sync_queue_lock:
-            if 0 <= idx < len(_sync_queue):
-                popped = _sync_queue.pop(idx)
+            # Try by index first, verify by URL; fall back to search by URL
+            _target = idx
+            if expected_key and 0 <= idx < len(_sync_queue) and _sync_queue[idx].get("url") != expected_key:
+                _target = next((i for i, ch in enumerate(_sync_queue) if ch.get("url") == expected_key), -1)
+            if 0 <= _target < len(_sync_queue):
+                popped = _sync_queue.pop(_target)
                 removed = popped.get("name", "?")
                 removed_key = popped.get("url")
                 _queue_items_removed = True
     elif source == "reorg":
         with _reorg_queue_lock:
-            if 0 <= idx < len(_reorg_queue):
-                popped = _reorg_queue.pop(idx)
+            _target = idx
+            if expected_key and 0 <= idx < len(_reorg_queue) and (_reorg_queue[idx][4] or _reorg_queue[idx][0]) != expected_key:
+                _target = next((i for i, a in enumerate(_reorg_queue) if (a[4] or a[0]) == expected_key), -1)
+            if 0 <= _target < len(_reorg_queue):
+                popped = _reorg_queue.pop(_target)
                 removed = popped[0]
                 removed_key = popped[4] or popped[0]  # ch_url or ch_name
     elif source == "transcribe":
         with _transcribe_queue_lock:
-            if 0 <= idx < len(_transcribe_queue):
-                popped = _transcribe_queue.pop(idx)
+            _target = idx
+            if expected_key and 0 <= idx < len(_transcribe_queue) and _transcribe_queue[idx][1] != expected_key:
+                _target = next((i for i, a in enumerate(_transcribe_queue) if a[1] == expected_key), -1)
+            if 0 <= _target < len(_transcribe_queue):
+                popped = _transcribe_queue.pop(_target)
                 removed = popped[0]
                 removed_key = popped[1]  # ch_url
     elif source == "mt":
         with _mt_queue_lock:
-            if 0 <= idx < len(_mt_queue):
-                popped = _mt_queue.pop(idx)
+            _target = idx
+            if expected_key and 0 <= idx < len(_mt_queue) and _mt_queue[idx] != expected_key:
+                _target = next((i for i, fp in enumerate(_mt_queue) if fp == expected_key), -1)
+            if 0 <= _target < len(_mt_queue):
+                popped = _mt_queue.pop(_target)
                 removed = os.path.splitext(os.path.basename(popped))[0]
                 removed_key = popped
     elif source == "video":
@@ -14248,8 +14764,11 @@ def _remove_queue_item(source, idx):
                 removed_key = "batch"
     elif source == "redownload":
         with _redownload_queue_lock:
-            if 0 <= idx < len(_redownload_queue):
-                popped = _redownload_queue.pop(idx)
+            _target = idx
+            if expected_key and 0 <= idx < len(_redownload_queue) and _redownload_queue[idx].get("ch_url") != expected_key:
+                _target = next((i for i, r in enumerate(_redownload_queue) if r.get("ch_url") == expected_key), -1)
+            if 0 <= _target < len(_redownload_queue):
+                popped = _redownload_queue.pop(_target)
                 removed = popped.get("ch_name", "?")
                 removed_key = popped.get("ch_url")
     elif source == "sync_batch":
@@ -14274,9 +14793,9 @@ def _remove_queue_item(source, idx):
     _update_queue_btn()
 
 
-def _confirm_remove(source, idx, label):
+def _confirm_remove(source, idx, label, expected_key=None):
     if messagebox.askyesno("Remove from Queue", f"Remove \"{label}\" from the Sync List?"):
-        _remove_queue_item(source, idx)
+        _remove_queue_item(source, idx, expected_key=expected_key)
 
 
 def _show_queue_menu(event=None):
@@ -14307,7 +14826,7 @@ def _show_queue_menu(event=None):
             if s.endswith(" (Paused)"):
                 s = s[:-9]
             return s
-        snapshot = [(_snap_label(lbl), src, idx) for lbl, src, idx in items]
+        snapshot = [(_snap_label(lbl), src, idx) for lbl, src, idx, _k in items]
         if _state["last_snapshot"] == snapshot:
             # Just update the dot animation on the active item's label widget
             _albl = _state.get("active_lbl")
@@ -14374,7 +14893,7 @@ def _show_queue_menu(event=None):
             inner = tk.Frame(canvas, bg="#2d2d2d")
             canvas.create_window((0, 0), window=inner, anchor="nw")
 
-            for i, (label, source, idx) in enumerate(items):
+            for i, (label, source, idx, item_key) in enumerate(items):
                 row = tk.Frame(inner, bg="#2d2d2d")
                 row.pack(fill="x")
 
@@ -14420,9 +14939,9 @@ def _show_queue_menu(event=None):
                         w.bind("<Leave>", _leave)
 
                     # Right-click to remove any non-current item
-                    def _remove(e, s=source, qi=idx, lb=label):
+                    def _remove(e, s=source, qi=idx, lb=label, ik=item_key):
                         popup.destroy()
-                        _confirm_remove(s, qi, lb)
+                        _confirm_remove(s, qi, lb, ik)
                     for w in ([row, lbl] + ([handle] if handle else [])):
                         w.bind("<Button-3>", _remove)
 
@@ -14493,18 +15012,21 @@ def _show_queue_menu(event=None):
                             src_wi = _drag["src_widget_idx"]
                             if target_widget_idx is not None and target_widget_idx != src_wi:
                                 # Reorder _queue_order based on widget positions
-                                # Widget list mirrors _queue_order but offset by 1 if "current" is at [0]
-                                has_current = (_state["widgets"][0]["source"] == "current") if _state["widgets"] else False
-                                src_qo = (src_wi - 1) if has_current else src_wi
-                                dst_qo = (target_widget_idx - 1) if has_current else target_widget_idx
+                                # Map widget indices to _queue_order indices by counting
+                                # non-queue ("current") widgets before each position.
+                                _cur_before_src = sum(1 for wi in _state["widgets"][:src_wi] if wi["source"] == "current")
+                                _cur_before_dst = sum(1 for wi in _state["widgets"][:target_widget_idx] if wi["source"] == "current")
+                                src_qo = src_wi - _cur_before_src
+                                dst_qo = target_widget_idx - _cur_before_dst
                                 with _queue_order_lock:
                                     if 0 <= src_qo < len(_queue_order) and 0 <= dst_qo < len(_queue_order):
                                         moved = _queue_order.pop(src_qo)
                                         _queue_order.insert(dst_qo, moved)
+                                _save_queue_state()
                                 # Update labels in-place
                                 new_items = _get_queue_items()
-                                _state["last_snapshot"] = [(lb, s2, ix) for lb, s2, ix in new_items]
-                                for j, (new_label, new_source, new_idx) in enumerate(new_items):
+                                _state["last_snapshot"] = [(_snap_label(lb), s2, ix) for lb, s2, ix, _k in new_items]
+                                for j, (new_label, new_source, new_idx, _new_key) in enumerate(new_items):
                                     if j < len(_state["widgets"]):
                                         wi = _state["widgets"][j]
                                         prefix = "  " if new_source == "current" else " "
@@ -14531,7 +15053,7 @@ def _show_queue_menu(event=None):
             _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
 
             # Footer hint
-            has_queued = any(s != "current" for _, s, _ in items)
+            has_queued = any(s != "current" for _, s, _, _k in items)
             hint_text = "  Drag to reorder · Right-click to remove" if has_queued else ""
             hint = tk.Label(wrapper, text=hint_text, bg="#2d2d2d", fg="#4a4f5a",
                             font=("Segoe UI", 8), anchor="w")
@@ -14813,7 +15335,7 @@ def _update_queue_btn():
             _update_sync_badge()
 
             # Manage sync blink animation
-            _is_running = _sync_running or _reorg_running or _redownload_running
+            _is_running = _sync_running or _reorg_running or _redownload_running or _transcribe_running
             if _is_running and not _sync_blink["active"]:
                 _sync_blink_start()
             elif not _is_running and _sync_blink["active"]:
@@ -15040,6 +15562,8 @@ def _show_gpu_menu(event=None):
         _start_manual_transcription()
 
     def _confirm_gpu_remove(idx, label):
+        # Capture item reference by identity (not index) to guard against list
+        # shifts while the confirmation messagebox is open.
         with _gpu_queue_lock:
             _item = _gpu_queue[idx] if idx < len(_gpu_queue) else None
         if _item and _item.get("type") == "encode":
@@ -15049,7 +15573,16 @@ def _show_gpu_menu(event=None):
             msg = f"Remove '{label}' from the GPU Tasks?"
             title = "Remove from GPU Tasks"
         if messagebox.askyesno(title, msg, parent=popup):
-            _remove_gpu_queue_item(idx)
+            # Re-find the item by identity after the messagebox (index may have shifted)
+            if _item is not None:
+                with _gpu_queue_lock:
+                    try:
+                        real_idx = next(i for i, q in enumerate(_gpu_queue) if q is _item)
+                    except StopIteration:
+                        return  # item was already removed
+                _remove_gpu_queue_item(real_idx)
+            else:
+                return  # item was None and index may be stale; don't use it
 
     def _do_gpu_start():
         """Start GPU processing — closes popup first, then shows model dialog."""
@@ -15270,7 +15803,7 @@ def _show_gpu_menu(event=None):
                                         _gpu_queue.insert(dst_qo, moved)
                                 # Update labels in-place
                                 new_items = _get_gpu_queue_items()
-                                _state["last_snapshot"] = [(lb.rstrip("."), ix) for lb, ix in new_items] + [("__btn__", "__unchanged__")]
+                                _state["last_snapshot"] = [(lb.rstrip("."), ix) for lb, ix in new_items]
                                 for j, (new_label, new_idx) in enumerate(new_items):
                                     if j < len(_state["widgets"]):
                                         wi = _state["widgets"][j]
@@ -15473,7 +16006,13 @@ def _show_gpu_menu(event=None):
 
     # Close on Escape
     popup.bind("<Escape>", lambda e: popup.destroy())
-    _state["esc_bind_id"] = root.bind("<Escape>", lambda e: (popup.destroy() if popup.winfo_exists() else None), add="+")
+    def _gpu_esc_close(e):
+        try:
+            if popup.winfo_exists():
+                popup.destroy()
+        except Exception:
+            pass
+    _state["esc_bind_id"] = root.bind("<Escape>", _gpu_esc_close, add="+")
 
     # Close when clicking outside the popup
     _state["popup_alive"] = True
@@ -15570,147 +16109,145 @@ def _gpu_start():
     with _gpu_queue_lock:
         _has_transcribe_tasks = any(q["type"] in ("transcribe", "mt") for q in _gpu_queue)
 
+    def _gpu_worker():
+        global _gpu_running, _gpu_current_item, _gpu_truly_paused
+        _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
+        try:
+            while True:
+                # Pause check
+                if _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                    _tray_stop_spin(force=True)  # stop blinking while paused
+                    _clear_whisper_progress()
+                    log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                    _gpu_truly_paused = True
+                    while _gpu_pause.is_set() and not _gpu_cancel.is_set():
+                        time.sleep(0.25)
+                    _gpu_truly_paused = False
+                    clear_pause_status()
+                    if not _gpu_cancel.is_set():
+                        _tray_start_spin(red=True)  # resume blinking
+                        log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
+
+                if _gpu_cancel.is_set():
+                    if _skip_current_gpu.is_set():
+                        _skip_current_gpu.clear()
+                        _gpu_cancel.clear()
+                    else:
+                        log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
+                        break
+
+                # Pop next item
+                with _gpu_queue_lock:
+                    if not _gpu_queue:
+                        break
+                    item = _gpu_queue.pop(0)
+                _gpu_current_item = item
+                _save_queue_state()
+
+                if item["type"] == "mt":
+                    if item.get("folder_path"):
+                        _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
+                        _gpu_current["ch_url"] = None
+                        _update_gpu_btn()
+                        _run_manual_transcription_folder(
+                            item["folder_path"], item["folder_name"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            _sync_mode=True
+                        )
+                    else:
+                        fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                        _gpu_current["label"] = f"M.T. {fname}"
+                        _gpu_current["ch_url"] = None
+                        _update_gpu_btn()
+                        _run_manual_transcription(
+                            item["file_path"],
+                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                            skip_model_dialog=True, _sync_mode=True
+                        )
+                elif item["type"] == "transcribe":
+                    _gpu_current["label"] = f"Transcribe {item['ch_name']}"
+                    _gpu_current["ch_url"] = item.get("ch_url")
+                    _update_gpu_btn()
+                    _ui_queue.append(refresh_channel_dropdowns)
+                    _start_transcription(
+                        item["ch_name"], item["ch_url"], item["folder"],
+                        item["split_years"], item["split_months"], item["combined"],
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        skip_model_dialog=True, _sync_mode=True
+                    )
+                elif item["type"] == "encode":
+                    _ebn = item.get("batch_num")
+                    _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
+                    _gpu_current["ch_url"] = item.get("ch_url")
+                    _update_gpu_btn()
+                    if _is_simple_mode:
+                        _update_encode_progress("Encode loading\n")
+                    _compress_channel(
+                        item["ch_name"], item["ch_url"], item["folder"],
+                        item["bitrate_mbhr"],
+                        item["split_years"], item["split_months"],
+                        output_res=item.get("output_res", ""),
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        _sync_mode=True,
+                        target_paths=item.get("target_paths"),
+                        batch_num=item.get("batch_num"),
+                    )
+                elif item["type"] == "backlog_encode":
+                    _gpu_current["label"] = f"Backlog {item['ch_name']}"
+                    _gpu_current["ch_url"] = item.get("ch_url")
+                    _update_gpu_btn()
+                    if _is_simple_mode:
+                        _update_encode_progress("Encode loading\n")
+                    _backlog_compress_channel(
+                        item["ch_name"], item["ch_url"], item["folder"],
+                        item["resolution"], item["bitrate_mbhr"],
+                        item.get("output_res", ""),
+                        item["split_years"], item["split_months"],
+                        batch_size=item.get("batch_size", 20),
+                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
+                        _sync_mode=True
+                    )
+
+                _clear_whisper_progress()  # Remove stale progress line before next iteration / pause check
+                _gpu_current["label"] = None
+                _gpu_current["ch_url"] = None
+                _gpu_current_item = None
+                _update_gpu_btn()
+
+            if not _gpu_cancel.is_set():
+                log(f"\n  ✓ All GPU Tasks completed.\n", "simpleline_green")
+        except Exception as e:
+            log(f"\n  ⚠ GPU Tasks error: {e}\n", "red")
+        finally:
+            _gpu_running = False
+            _gpu_current["label"] = None
+            _gpu_current["ch_url"] = None
+            _gpu_current_item = None
+            try:
+                _stop_whisper_process()
+            except Exception:
+                pass
+            try:
+                _stop_punct_process()
+            except Exception:
+                pass
+            try:
+                _stop_ffmpeg_process()
+            except Exception:
+                pass
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
+            _update_gpu_btn()
+            _save_queue_state()
+            # Safety: ensure main cancel/pause buttons are hidden after GPU work
+            _ui_queue.append(_sync_task_finished)
+
     if not _has_transcribe_tasks:
         # No transcription tasks — skip model dialog and start immediately
         _gpu_running = True
         _gpu_cancel.clear()
         _gpu_pause.clear()
         _update_gpu_btn()
-
-        def _gpu_worker():
-            global _gpu_running, _gpu_current_item, _gpu_truly_paused
-            _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
-            try:
-                while True:
-                    if _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                        _tray_stop_spin(force=True)  # stop blinking while paused
-                        _clear_whisper_progress()
-                        log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
-                        _gpu_truly_paused = True
-                        while _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                            time.sleep(0.25)
-                        _gpu_truly_paused = False
-                        clear_pause_status()
-                        if not _gpu_cancel.is_set():
-                            _tray_start_spin(red=True)  # resume blinking
-                            log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
-
-                    if _gpu_cancel.is_set():
-                        if _skip_current_gpu.is_set():
-                            # Skip current task — clear cancel and continue to next item
-                            _skip_current_gpu.clear()
-                            _gpu_cancel.clear()
-                        else:
-                            log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
-                            break
-
-                    with _gpu_queue_lock:
-                        if not _gpu_queue:
-                            break
-                        item = _gpu_queue.pop(0)
-                    _gpu_current_item = item
-                    _save_queue_state()
-
-                    if item["type"] == "encode":
-                        _ebn = item.get("batch_num")
-                        _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
-                        _gpu_current["ch_url"] = item.get("ch_url")
-                        _update_gpu_btn()
-                        if _is_simple_mode:
-                            _update_encode_progress("Encode loading\n")
-                        _compress_channel(
-                            item["ch_name"], item["ch_url"], item["folder"],
-                            item["bitrate_mbhr"],
-                            item["split_years"], item["split_months"],
-                            output_res=item.get("output_res", ""),
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            _sync_mode=True,
-                            target_paths=item.get("target_paths"),
-                            batch_num=item.get("batch_num"),
-                        )
-                    elif item["type"] == "backlog_encode":
-                        _gpu_current["label"] = f"Backlog {item['ch_name']}"
-                        _gpu_current["ch_url"] = item.get("ch_url")
-                        _update_gpu_btn()
-                        if _is_simple_mode:
-                            _update_encode_progress("Encode loading\n")
-                        _backlog_compress_channel(
-                            item["ch_name"], item["ch_url"], item["folder"],
-                            item["resolution"], item["bitrate_mbhr"],
-                            item.get("output_res", ""),
-                            item["split_years"], item["split_months"],
-                            batch_size=item.get("batch_size", 20),
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            _sync_mode=True
-                        )
-                    elif item["type"] == "mt":
-                        if item.get("folder_path"):
-                            _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
-                            _gpu_current["ch_url"] = None
-                            _update_gpu_btn()
-                            _run_manual_transcription_folder(
-                                item["folder_path"], item["folder_name"],
-                                cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                                _sync_mode=True
-                            )
-                        else:
-                            fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-                            _gpu_current["label"] = f"M.T. {fname}"
-                            _gpu_current["ch_url"] = None
-                            _update_gpu_btn()
-                            _run_manual_transcription(
-                                item["file_path"],
-                                cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                                skip_model_dialog=True, _sync_mode=True
-                            )
-                    elif item["type"] == "transcribe":
-                        _gpu_current["label"] = f"Transcribe {item['ch_name']}"
-                        _gpu_current["ch_url"] = item.get("ch_url")
-                        _update_gpu_btn()
-                        _ui_queue.append(refresh_channel_dropdowns)
-                        _start_transcription(
-                            item["ch_name"], item["ch_url"], item["folder"],
-                            item["split_years"], item["split_months"], item["combined"],
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            skip_model_dialog=True, _sync_mode=True
-                        )
-
-                    _clear_whisper_progress()  # Remove stale progress line before next iteration / pause check
-                    _gpu_current["label"] = None
-                    _gpu_current["ch_url"] = None
-                    _gpu_current_item = None
-                    _update_gpu_btn()
-
-                if not _gpu_cancel.is_set():
-                    log(f"\n  ✓ All GPU Tasks completed.\n", "simpleline_green")
-            except Exception as e:
-                log(f"\n  ⚠ GPU Tasks error: {e}\n", "red")
-            finally:
-                _gpu_running = False
-                _gpu_current["label"] = None
-                _gpu_current["ch_url"] = None
-                _gpu_current_item = None
-                try:
-                    _stop_whisper_process()
-                except Exception:
-                    pass
-                try:
-                    _stop_punct_process()
-                except Exception:
-                    pass
-                try:
-                    _stop_ffmpeg_process()
-                except Exception:
-                    pass
-                _tray_stop_spin()
-                _update_tray_tooltip("YT Archiver — Idle")
-                _update_gpu_btn()
-                _save_queue_state()
-                try:
-                    _ui_queue.append(_sync_task_finished)
-                except Exception:
-                    pass
-
         threading.Thread(target=_gpu_worker, daemon=True).start()
         return
 
@@ -15816,126 +16353,6 @@ def _gpu_start():
     _gpu_cancel.clear()
     _gpu_pause.clear()
     _update_gpu_btn()
-
-    def _gpu_worker():
-        global _gpu_running, _gpu_current_item, _gpu_truly_paused
-        _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
-        try:
-            while True:
-                # Pause check
-                if _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                    _tray_stop_spin(force=True)  # stop blinking while paused
-                    _clear_whisper_progress()
-                    log(f"  ⏸ GPU Tasks paused at {_fmt_time()} — click Resume.\n", "pausestatus")
-                    _gpu_truly_paused = True
-                    while _gpu_pause.is_set() and not _gpu_cancel.is_set():
-                        time.sleep(0.25)
-                    _gpu_truly_paused = False
-                    clear_pause_status()
-                    if not _gpu_cancel.is_set():
-                        _tray_start_spin(red=True)  # resume blinking
-                        log(f"  ▶ GPU Tasks resumed at {_fmt_time()}...\n", "pauselog")
-
-                if _gpu_cancel.is_set():
-                    if _skip_current_gpu.is_set():
-                        _skip_current_gpu.clear()
-                        _gpu_cancel.clear()
-                    else:
-                        log(f"\n  ⛔ GPU Tasks cancelled by user.\n", "red")
-                        break
-
-                # Pop next item
-                with _gpu_queue_lock:
-                    if not _gpu_queue:
-                        break
-                    item = _gpu_queue.pop(0)
-                _gpu_current_item = item
-                _save_queue_state()
-
-                if item["type"] == "mt":
-                    if item.get("folder_path"):
-                        _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
-                        _gpu_current["ch_url"] = None
-                        _update_gpu_btn()
-                        _run_manual_transcription_folder(
-                            item["folder_path"], item["folder_name"],
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            _sync_mode=True
-                        )
-                    else:
-                        fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
-                        _gpu_current["label"] = f"M.T. {fname}"
-                        _gpu_current["ch_url"] = None
-                        _update_gpu_btn()
-                        _run_manual_transcription(
-                            item["file_path"],
-                            cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                            skip_model_dialog=True, _sync_mode=True
-                        )
-                elif item["type"] == "transcribe":
-                    _gpu_current["label"] = f"Transcribe {item['ch_name']}"
-                    _gpu_current["ch_url"] = item.get("ch_url")
-                    _update_gpu_btn()
-                    _start_transcription(
-                        item["ch_name"], item["ch_url"], item["folder"],
-                        item["split_years"], item["split_months"], item["combined"],
-                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                        skip_model_dialog=True, _sync_mode=True
-                    )
-                elif item["type"] == "encode":
-                    _ebn = item.get("batch_num")
-                    _gpu_current["label"] = f"Compress {item['ch_name']}, Batch {_ebn}" if _ebn is not None else f"Compress {item['ch_name']}"
-                    _gpu_current["ch_url"] = item.get("ch_url")
-                    _update_gpu_btn()
-                    _compress_channel(
-                        item["ch_name"], item["ch_url"], item["folder"],
-                        item["bitrate_mbhr"],
-                        item["split_years"], item["split_months"],
-                        output_res=item.get("output_res", ""),
-                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                        _sync_mode=True,
-                        target_paths=item.get("target_paths"),
-                        batch_num=item.get("batch_num"),
-                    )
-                elif item["type"] == "backlog_encode":
-                    _gpu_current["label"] = f"Backlog {item['ch_name']}"
-                    _gpu_current["ch_url"] = item.get("ch_url")
-                    _update_gpu_btn()
-                    _backlog_compress_channel(
-                        item["ch_name"], item["ch_url"], item["folder"],
-                        item["resolution"], item["bitrate_mbhr"],
-                        item.get("output_res", ""),
-                        item["split_years"], item["split_months"],
-                        batch_size=item.get("batch_size", 20),
-                        cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
-                        _sync_mode=True
-                    )
-
-                _clear_whisper_progress()  # Remove stale progress line before next iteration / pause check
-                _gpu_current["label"] = None
-                _gpu_current["ch_url"] = None
-                _gpu_current_item = None
-                _update_gpu_btn()
-
-            if not _gpu_cancel.is_set():
-                log(f"\n  ✓ All GPU Tasks completed.\n", "simpleline_green")
-        except Exception as e:
-            log(f"\n  ⚠ GPU Tasks error: {e}\n", "red")
-        finally:
-            _gpu_running = False
-            _gpu_current["label"] = None
-            _gpu_current["ch_url"] = None
-            _gpu_current_item = None
-            _stop_whisper_process()
-            _stop_punct_process()
-            _stop_ffmpeg_process()
-            _tray_stop_spin()
-            _update_tray_tooltip("YT Archiver — Idle")
-            _update_gpu_btn()
-            _save_queue_state()
-            # Safety: ensure main cancel/pause buttons are hidden after GPU work
-            _ui_queue.append(_sync_task_finished)
-
     threading.Thread(target=_gpu_worker, daemon=True).start()
 
 
@@ -16268,9 +16685,11 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
         _ui_queue.append(_refresh_autorun_history)
 
 
+_redownload_hist_marker = None   # unique marker string to find the placeholder at finish time
+
 def _record_redownload_start(ch_name, res_label, total_count):
     """Insert an in-progress placeholder for a redownload job into the activity log."""
-    global _redownload_hist_idx
+    global _redownload_hist_idx, _redownload_hist_marker
     ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
         "%I:%M%p").lower().lstrip("0")
     date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
@@ -16278,6 +16697,7 @@ def _record_redownload_start(ch_name, res_label, total_count):
     ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
     ch_part = f"  {ch_display:^22s}  —" if ch_name else " " * 27
     line = f"[ReDwnl] {ts_date} —{ch_part}  {total_count:>4} total        · ▶ running..."
+    _redownload_hist_marker = line  # store the exact line for later lookup
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -16292,7 +16712,7 @@ def _record_redownload_start(ch_name, res_label, total_count):
 
 def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, skipped=0):
     """Replace the in-progress placeholder with the completed redownload stats."""
-    global _redownload_hist_idx
+    global _redownload_hist_idx, _redownload_hist_marker
     ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
         "%I:%M%p").lower().lstrip("0")
     date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
@@ -16312,13 +16732,24 @@ def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, sk
     line = f"[ReDwnl] {ts_date} —{ch_part}  {done:>4} {'replaced':<11} · {skipped:>4} skipped ·  {errors} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
-        if _redownload_hist_idx is not None and 0 <= _redownload_hist_idx < len(hist):
+        # Find the placeholder by stored marker string (immune to index drift)
+        _found = False
+        if _redownload_hist_marker:
+            for _hi, _hline in enumerate(hist):
+                if _hline == _redownload_hist_marker:
+                    hist[_hi] = line
+                    _found = True
+                    break
+        # Fallback to index if marker search fails
+        if not _found and _redownload_hist_idx is not None and 0 <= _redownload_hist_idx < len(hist):
             hist[_redownload_hist_idx] = line
-        else:
+            _found = True
+        if not _found:
             hist.append(line)
             if len(hist) > AUTORUN_HISTORY_MAX:
                 config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
         _redownload_hist_idx = None
+        _redownload_hist_marker = None
     save_config(config)
     if _root_alive:
         _ui_queue.append(_refresh_autorun_history)
@@ -16372,6 +16803,10 @@ def _run_autorun():
 
     if _sync_pipeline_busy():
         _autorun_job["id"] = root.after(60_000, _run_autorun)
+        # Keep countdown visible — push next-sync time forward so _tick_countdown
+        # shows "Waiting for queue..." rather than stale "Syncing now..."
+        from datetime import timedelta as _td_busy
+        _autorun_next["ts"] = datetime.now() + _td_busy(seconds=60)
         return
     interval_mins = AUTORUN_OPTIONS.get(autorun_interval_var.get(), 0)
     if not interval_mins:
@@ -16387,8 +16822,9 @@ def _run_autorun():
     _autorun_next["ts"] = None
     autorun_countdown_var.set("Syncing now...")
 
-    for key in session_totals:
-        session_totals[key] = 0
+    with _session_totals_lock:
+        for key in session_totals:
+            session_totals[key] = 0
     cancel_event.clear()
 
     if root.winfo_exists():
@@ -16418,6 +16854,11 @@ def _run_autorun():
                 return
 
             deferred_streams = []
+            ch_total = 0
+            url = ""
+            _batch_pstart = 0
+            _batch_cache_ids = None
+            _batch_start_idx = 0
 
             # Populate sync queue so channels are visible in Sync Tasks popup
             with _sync_queue_lock:
@@ -16625,7 +17066,8 @@ def _run_autorun():
                                     log(f"  Found {len(_new_ids)} new video(s), updating cache.\n", "green")
                                     _new_set = set(_new_ids)
                                     _batch_cache_ids = _new_ids + [x for x in _batch_cache_ids if x not in _new_set]
-                                    _batch_start_idx += len(_new_ids)
+                                    if _batch_start_idx > 0:
+                                        _batch_start_idx += len(_new_ids)
                                     try:
                                         with open(_get_batch_cache_path(url), "w", encoding="utf-8") as _cf:
                                             _cf.write("\n".join(_batch_cache_ids) + "\n")
@@ -16713,6 +17155,7 @@ def _run_autorun():
                             if _ask_start_gpu_tasks(count):
                                 _ui_queue.append(_gpu_start)
 
+                c_dl = 0
                 c_dur = 0
                 if not cancel_event.is_set() and not _all_cached_done:
                     c_dl = internal_run_cmd_blocking(cmd, channel_total=ch_total if not cancel_event.is_set() else 0,
@@ -16806,6 +17249,7 @@ def _run_autorun():
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
+                    save_config(config)
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
@@ -16823,6 +17267,14 @@ def _run_autorun():
                         skip_model_dialog=True, _sync_mode=True, captions_only=True
                     )
 
+            # Capture last channel's batch state before deferred streams may clobber loop variables
+            _last_batch_url = url
+            _last_batch_pstart = _batch_pstart
+            _last_batch_start_idx = _batch_start_idx
+            _last_batch_cache_ids = _batch_cache_ids
+            _last_batch_ch_total = ch_total
+            _last_batch_run_counts = _last_run_counts
+
             if deferred_streams and not cancel_event.is_set():
                 log(f"\n\n" + "█" * 55 + "\n", "livestream")
                 log(f"  ⚠  DOWNLOADING {len(deferred_streams)} DEFERRED LIVESTREAM(S)  ⚠\n", "livestream")
@@ -16838,11 +17290,11 @@ def _run_autorun():
                         _ds_ch.get("resolution", "720")
                     )
                     c_dl = internal_run_cmd_blocking(_ds_cmd)
-                    # Archive the stream ID after attempt so it won't reappear every sync
-                    with io_lock:
-                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                            _af.write(f"youtube {_ds_id}\n")
+                    # Only archive the stream ID on successful download so failed ones retry next sync
                     if c_dl:
+                        with io_lock:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                _af.write(f"youtube {_ds_id}\n")
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl
 
@@ -16851,15 +17303,15 @@ def _run_autorun():
                 clear_transient_lines()
                 log("\nSync cancelled.\n", "red")
                 _cleanup_partial_files(out_dir)
-                # Save batch resume if large channel and enough progress was made
-                if ch_total > 200:
-                    _cancel_total = _last_run_counts["dl"] + _last_run_counts["skip"] + _last_run_counts["dur"] + _last_run_counts["err"]
+                # Save batch resume using captured state (not stale loop vars)
+                if _last_batch_ch_total > 200:
+                    _cancel_total = _last_batch_run_counts["dl"] + _last_batch_run_counts["skip"] + _last_batch_run_counts["dur"] + _last_batch_run_counts["err"]
                     if _cancel_total > 50:
-                        if _batch_cache_ids:
-                            _save_batch_resume(url, _batch_pstart, _last_run_counts,
-                                               cache_resume_index=_batch_start_idx)
+                        if _last_batch_cache_ids:
+                            _save_batch_resume(_last_batch_url, _last_batch_pstart, _last_batch_run_counts,
+                                               cache_resume_index=_last_batch_start_idx)
                         else:
-                            _save_batch_resume(url, _batch_pstart, _last_run_counts)
+                            _save_batch_resume(_last_batch_url, _last_batch_pstart, _last_batch_run_counts)
                         log(f"  Batch progress saved — will resume from here next sync.\n", "dim")
             else:
                 zero_dl = sum(1 for count in ch_dl_map.values() if count == 0)
@@ -17022,7 +17474,7 @@ def _tp_open_db(path):
         start_time REAL,
         text       TEXT,
         note       TEXT DEFAULT '',
-        created    REAL DEFAULT (strftime('%%s','now')),
+        created    REAL DEFAULT (strftime('%s','now')),
         FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_channel ON segments(channel)")
@@ -17090,7 +17542,11 @@ def _tp_index_file(conn, jsonl_path, archive_roots):
     old = conn.execute("SELECT id FROM segments WHERE jsonl_path=?", (jsonl_path,)).fetchall()
     if old:
         ids = [r[0] for r in old]
-        conn.execute(f"DELETE FROM segments_fts WHERE rowid IN ({','.join('?'*len(ids))})", ids)
+        # Batch deletes to stay within SQLite's 999-variable limit
+        _BATCH = 999
+        for _i in range(0, len(ids), _BATCH):
+            _chunk = ids[_i:_i + _BATCH]
+            conn.execute(f"DELETE FROM segments_fts WHERE rowid IN ({','.join('?'*len(_chunk))})", _chunk)
         conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jsonl_path,))
     count = 0
     try:
@@ -17125,6 +17581,7 @@ def _tp_index_file(conn, jsonl_path, archive_roots):
     conn.execute(
         "INSERT OR REPLACE INTO indexed_files(path,mtime,segment_count) VALUES (?,?,?)",
         (jsonl_path, mtime, count))
+    conn.commit()
     return count
 
 
@@ -17171,6 +17628,7 @@ class _TranscriptionPanel(ttk.Frame):
         self.configure(style="TFrame")
         self._loaded          = False
         self._conn            = None
+        self._db_lock         = threading.Lock()
         self._result_meta     = {}
         self._sort_col        = "date"
         self._sort_asc        = False
@@ -17189,7 +17647,18 @@ class _TranscriptionPanel(ttk.Frame):
         self._search_running  = False
         self._bookmarks_data  = []
         self._browse_seg_map  = []  # [(char_start, char_end, seg_tuple), ...] built at load time
+        self._player_active   = False
         self._build_placeholder()
+
+    def _db_execute(self, *args, **kwargs):
+        """Thread-safe wrapper around self._conn.execute()."""
+        with self._db_lock:
+            return self._conn.execute(*args, **kwargs)
+
+    def _db_commit(self):
+        """Thread-safe wrapper around self._conn.commit()."""
+        with self._db_lock:
+            self._conn.commit()
 
     def _build_placeholder(self):
         self._placeholder = tk.Frame(self, bg=self._TP_BG)
@@ -17214,8 +17683,11 @@ class _TranscriptionPanel(ttk.Frame):
             conn = _tp_open_db(_TP_DB_PATH)
             self._conn = conn
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror(
-                "DB Error", f"Could not open transcription index:\n{e}"))
+            def _on_db_error(err=e):
+                self._loaded = False  # allow retry on next tab switch
+                messagebox.showerror(
+                    "DB Error", f"Could not open transcription index:\n{err}")
+            self.after(0, _on_db_error)
             return
         self.after(0, self._finish_load)
 
@@ -17253,13 +17725,75 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _maybe_offer_reindex(self, channel_name):
         name_str = f" for \"{channel_name}\"" if channel_name else ""
-        ans = messagebox.askyesno(
-            "Update Transcription Index",
-            f"Transcription{name_str} is complete.\n\n"
-            "Update the transcription search index now?",
-            parent=self.winfo_toplevel()
-        )
-        if ans:
+        # Custom dialog with 60-second auto-dismiss (defaults to "No")
+        _result = {"ans": False}
+        dlg = tk.Toplevel(self.winfo_toplevel())
+        dlg.title("Update Transcription Index")
+        dlg.configure(bg="#2d2d2d")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        _auto_job = [None]
+        _countdown = [60]
+
+        msg = tk.Label(dlg,
+                       text=f"Transcription{name_str} is complete.\n\n"
+                            "Update the transcription search index now?",
+                       bg="#2d2d2d", fg="#cccccc", font=("Segoe UI", 10),
+                       wraplength=320, justify="left", padx=16, pady=16)
+        msg.pack()
+
+        countdown_lbl = tk.Label(dlg, text="Auto-declining in 60s",
+                                 bg="#2d2d2d", fg="#888888",
+                                 font=("Segoe UI", 8))
+        countdown_lbl.pack(pady=(0, 4))
+
+        btn_frame = tk.Frame(dlg, bg="#2d2d2d")
+        btn_frame.pack(pady=(0, 12))
+
+        def _yes():
+            _result["ans"] = True
+            if _auto_job[0]:
+                dlg.after_cancel(_auto_job[0])
+            dlg.grab_release()
+            dlg.destroy()
+
+        def _no():
+            _result["ans"] = False
+            if _auto_job[0]:
+                dlg.after_cancel(_auto_job[0])
+            dlg.grab_release()
+            dlg.destroy()
+
+        def _tick():
+            _countdown[0] -= 1
+            if _countdown[0] <= 0:
+                _no()
+                return
+            try:
+                countdown_lbl.config(text=f"Auto-declining in {_countdown[0]}s")
+            except Exception:
+                pass
+            _auto_job[0] = dlg.after(1000, _tick)
+
+        tk.Button(btn_frame, text="Yes", command=_yes, width=8,
+                  bg="#3a6a3a", fg="white", activebackground="#4a8a4a",
+                  relief="flat", font=("Segoe UI", 9)).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="No", command=_no, width=8,
+                  bg="#555555", fg="white", activebackground="#666666",
+                  relief="flat", font=("Segoe UI", 9)).pack(side="left", padx=6)
+
+        dlg.protocol("WM_DELETE_WINDOW", _no)
+        _auto_job[0] = dlg.after(1000, _tick)
+
+        # Center on parent
+        dlg.update_idletasks()
+        pw = self.winfo_toplevel()
+        x = pw.winfo_x() + (pw.winfo_width() - dlg.winfo_width()) // 2
+        y = pw.winfo_y() + (pw.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+        self.wait_window(dlg)
+        if _result["ans"]:
             self._show_section("index")
             self.after(150, self._start_index)
 
@@ -17350,9 +17884,9 @@ class _TranscriptionPanel(ttk.Frame):
             return
         def _query():
             try:
-                segs = self._conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-                vids = self._conn.execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
-                chs  = self._conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                segs = self._db_execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                vids = self._db_execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+                chs  = self._db_execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
                 text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
                 self.after(0, lambda: self._stats_label.config(text=text))
             except Exception:
@@ -17444,7 +17978,7 @@ class _TranscriptionPanel(ttk.Frame):
         tree.delete(*tree.get_children())
         self._browse_items.clear()
         try:
-            channels = self._conn.execute(
+            channels = self._db_execute(
                 "SELECT DISTINCT channel FROM segments ORDER BY channel"
             ).fetchall()
         except Exception:
@@ -17474,7 +18008,7 @@ class _TranscriptionPanel(ttk.Frame):
         if meta["type"] == "channel":
             ch = meta["channel"]
             try:
-                years = self._conn.execute(
+                years = self._db_execute(
                     "SELECT DISTINCT year FROM segments WHERE channel=? AND year IS NOT NULL "
                     "ORDER BY year", (ch,)).fetchall()
             except Exception:
@@ -17489,7 +18023,7 @@ class _TranscriptionPanel(ttk.Frame):
         elif meta["type"] == "year":
             ch, yr = meta["channel"], meta["year"]
             try:
-                months = self._conn.execute(
+                months = self._db_execute(
                     "SELECT DISTINCT month FROM segments WHERE channel=? AND year=? "
                     "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
             except Exception:
@@ -17518,7 +18052,7 @@ class _TranscriptionPanel(ttk.Frame):
                 sql += " AND month=?"
                 params.append(month)
             sql += " ORDER BY title"
-            titles = self._conn.execute(sql, params).fetchall()
+            titles = self._db_execute(sql, params).fetchall()
         except Exception:
             return
         for title, jsonl_path in titles:
@@ -17547,7 +18081,7 @@ class _TranscriptionPanel(ttk.Frame):
         db_rows = []
         if self._conn:
             try:
-                db_rows = self._conn.execute(
+                db_rows = self._db_execute(
                     "SELECT video_id, start_time, end_time, text, words "
                     "FROM segments WHERE title=? ORDER BY start_time",
                     (title,)).fetchall()
@@ -17647,7 +18181,7 @@ class _TranscriptionPanel(ttk.Frame):
         video_id = None
         if self._conn and title:
             try:
-                _db_rows = self._conn.execute(
+                _db_rows = self._db_execute(
                     "SELECT video_id, start_time, end_time, text, words "
                     "FROM segments WHERE title=? ORDER BY start_time",
                     (title,)).fetchall()
@@ -17701,7 +18235,10 @@ class _TranscriptionPanel(ttk.Frame):
             return
 
         # Resolve click → char offset → segment via the position map built at load time
-        char_offset = int(self._browse_viewer.count("1.0", click_idx, "chars")[0])
+        raw_count = self._browse_viewer.count("1.0", click_idx, "chars")
+        if not raw_count:
+            return
+        char_offset = int(raw_count[0])
         seg_entry = self._browse_seg_lookup(char_offset)
         if seg_entry is None:
             return
@@ -17724,7 +18261,6 @@ class _TranscriptionPanel(ttk.Frame):
     def _browse_seg_lookup(self, char_offset):
         """Binary search _browse_seg_map for the segment at char_offset.
         Returns (video_id, start, end, text, words_json) or None."""
-        import bisect
         if not self._browse_seg_map:
             return None
         starts = [s[0] for s in self._browse_seg_map]
@@ -17739,8 +18275,7 @@ class _TranscriptionPanel(ttk.Frame):
         _TS_LEAD = 1.5  # seconds to seek before the matched word
         if words_json:
             try:
-                import json as _j
-                word_list = _j.loads(words_json)
+                word_list = json.loads(words_json)
                 clean = word.lower().strip(".,!?;:\"'()-")
                 for w in word_list:
                     if w.get("w", "").lower().strip(".,!?;:\"'()-") == clean:
@@ -17762,7 +18297,7 @@ class _TranscriptionPanel(ttk.Frame):
         _browse_db_rows = None
         if self._conn and title:
             try:
-                _browse_db_rows = self._conn.execute(
+                _browse_db_rows = self._db_execute(
                     "SELECT video_id, start_time, end_time, text, words "
                     "FROM segments WHERE title=? ORDER BY start_time",
                     (title,)).fetchall()
@@ -17871,7 +18406,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._bm_tree.delete(*self._bm_tree.get_children())
         self._bookmarks_data = []
         try:
-            rows = self._conn.execute(
+            rows = self._db_execute(
                 "SELECT id, segment_id, video_id, title, channel, start_time, text, note, created "
                 "FROM bookmarks ORDER BY created DESC").fetchall()
         except Exception:
@@ -17972,14 +18507,17 @@ class _TranscriptionPanel(ttk.Frame):
             return
         note = note_var.get().strip()
         try:
-            self._conn.execute(
+            self._db_execute(
                 "INSERT INTO bookmarks (segment_id, video_id, title, channel, start_time, text, note) "
                 "VALUES (?,?,?,?,?,?,?)",
                 (segment_id, video_id, title, channel, start, text, note))
-            self._conn.commit()
+            self._db_commit()
             self._refresh_bookmarks()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                messagebox.showerror("Bookmark Error", f"Failed to save bookmark:\n{e}")
+            except Exception:
+                pass
 
     def _edit_bookmark_note(self, bm):
         """Edit the note on an existing bookmark."""
@@ -17999,12 +18537,12 @@ class _TranscriptionPanel(ttk.Frame):
         note_entry.focus_set()
         def _save():
             try:
-                self._conn.execute(
+                self._db_execute(
                     "UPDATE bookmarks SET note=? WHERE id=?",
                     (note_var.get().strip(), bm["bm_id"]))
-                self._conn.commit()
+                self._db_commit()
             except Exception:
-                pass
+                traceback.print_exc()
             dlg.destroy()
             self._refresh_bookmarks()
         note_entry.bind("<Return>", lambda _: _save())
@@ -18023,10 +18561,10 @@ class _TranscriptionPanel(ttk.Frame):
         if not self._conn:
             return
         try:
-            self._conn.execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
-            self._conn.commit()
+            self._db_execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
+            self._db_commit()
         except Exception:
-            pass
+            traceback.print_exc()
         self._refresh_bookmarks()
 
     def _copy_to_clipboard(self, text):
@@ -18174,7 +18712,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not self._conn:
             return
         try:
-            rows = self._conn.execute(
+            rows = self._db_execute(
                 "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
             self._s_channel_cb["values"] = ["All"] + [r[0] for r in rows]
         except Exception:
@@ -18220,13 +18758,20 @@ class _TranscriptionPanel(ttk.Frame):
         sort_asc  = self._sort_asc
 
         def _run_query():
+          try:
             if sort_col == "date":
                 order_clause = (
                     "COALESCE(s.year,9999) ASC, COALESCE(s.month,99) ASC, s.start_time ASC"
                     if sort_asc else
                     "COALESCE(s.year,0) DESC, COALESCE(s.month,0) DESC, s.start_time DESC")
             else:
-                order_clause = self._SORT_EXPRS.get(sort_col)
+                _base_expr = self._SORT_EXPRS.get(sort_col)
+                if _base_expr:
+                    _dir = "ASC" if sort_asc else "DESC"
+                    order_clause = ", ".join(
+                        f"{col.strip()} {_dir}" for col in _base_expr.split(","))
+                else:
+                    order_clause = None
 
             SEL = ("SELECT s.id, s.video_id, s.title, s.channel, s.year, s.month, "
                    "s.start_time, s.end_time, s.text, s.jsonl_path FROM segments s ")
@@ -18247,7 +18792,7 @@ class _TranscriptionPanel(ttk.Frame):
                         sql += " AND s.year <= ?"
                         params.append(int(yr_to))
                     sql  += f" ORDER BY {order_clause} LIMIT 500"
-                    rows  = self._conn.execute(sql, params).fetchall()
+                    rows  = self._db_execute(sql, params).fetchall()
                 except Exception:
                     rows = None
             if rows is None:
@@ -18268,7 +18813,7 @@ class _TranscriptionPanel(ttk.Frame):
                         sql += " AND s.year <= ?"
                         params.append(int(yr_to))
                     sql  += " ORDER BY rank LIMIT 500"
-                    rows  = self._conn.execute(sql, params).fetchall()
+                    rows  = self._db_execute(sql, params).fetchall()
                 except Exception:
                     sql    = ("SELECT id, video_id, title, channel, year, month, "
                               "start_time, end_time, text, jsonl_path "
@@ -18288,13 +18833,20 @@ class _TranscriptionPanel(ttk.Frame):
                         _like_order = order_clause.replace("s.", "")
                         sql += f" ORDER BY {_like_order}"
                     sql  += " LIMIT 500"
-                    rows  = self._conn.execute(sql, params).fetchall()
+                    rows  = self._db_execute(sql, params).fetchall()
             self.after(0, lambda: _populate(rows or []))
+          except Exception:
+            # Ensure _search_running is reset even if query fails
+            try:
+                self.after(0, lambda: _populate([]))
+            except Exception:
+                self._search_running = False
 
         def _populate(rows):
             self._search_running = False
             self._tree.delete(*self._tree.get_children())
             self._result_meta.clear()
+            _deferred_iids = []
             for row in rows:
                 rid, video_id, title, ch, year, month, start_time, end_time, text, jsonl_path = row
                 date_str = (f"{year}-{month:02d}" if year and month
@@ -18307,7 +18859,6 @@ class _TranscriptionPanel(ttk.Frame):
                 else:
                     snippet = text[:160].replace("\n", " ")
                 txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
-                video_path = self._find_video_file(title, txt_path) if txt_path else None
                 iid = self._tree.insert("", "end", values=(ch, date_str, title, snippet))
                 self._result_meta[iid] = {
                     "video_id":   video_id,
@@ -18319,9 +18870,28 @@ class _TranscriptionPanel(ttk.Frame):
                     "date":       date_str,
                     "jsonl_path": jsonl_path,
                     "txt_path":   txt_path,
-                    "video_path": video_path,
+                    "video_path": None,
                     "segment_id": rid,
                 }
+                if txt_path:
+                    _deferred_iids.append((iid, title, txt_path))
+
+            # Resolve video file paths on background thread to avoid blocking UI
+            if _deferred_iids:
+                def _resolve_video_paths():
+                    resolved = []
+                    for _d_iid, _d_title, _d_txt in _deferred_iids:
+                        vp = self._find_video_file(_d_title, _d_txt)
+                        if vp:
+                            resolved.append((_d_iid, vp))
+                    def _apply():
+                        for _d_iid, vp in resolved:
+                            meta = self._result_meta.get(_d_iid)
+                            if meta:
+                                meta["video_path"] = vp
+                    self.after(0, _apply)
+                threading.Thread(target=_resolve_video_paths, daemon=True).start()
+
             n         = len(rows)
             sort_note = (f", sorted by {sort_col} "
                          f"{'↑' if sort_asc else '↓'}") if sort_col else ""
@@ -18370,7 +18940,6 @@ class _TranscriptionPanel(ttk.Frame):
             command=self._do_search)
 
     def _export_csv(self):
-        import csv
         rows = self._tree.get_children()
         if not rows:
             messagebox.showinfo("Export CSV", "No results to export.")
@@ -18412,7 +18981,11 @@ class _TranscriptionPanel(ttk.Frame):
     def _get_txt_path(self, jsonl_path):
         d  = os.path.dirname(jsonl_path)
         fn = os.path.basename(jsonl_path).lstrip('.')
-        fn = fn[:-5] + 'txt'
+        if fn.endswith('.jsonl'):
+            fn = fn[:-6] + '.txt'
+        else:
+            base, _ = os.path.splitext(fn)
+            fn = base + '.txt'
         return os.path.join(d, fn)
 
     def _find_video_file(self, title, txt_path):
@@ -18487,7 +19060,7 @@ class _TranscriptionPanel(ttk.Frame):
                   activebackground="#3a8e3a", activeforeground="white",
                   font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=4,
                   command=lambda: (webbrowser.open("https://www.videolan.org/vlc/"), dlg.destroy())).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="Close", bg=C_ENTRY_BG, fg=C_TEXT,
+        tk.Button(btn_frame, text="Close", bg=C_BORDER, fg=C_TEXT,
                   activebackground=C_BORDER, activeforeground=C_TEXT,
                   font=("Segoe UI", 9), relief="flat", padx=12, pady=4,
                   command=dlg.destroy).pack(side="left", padx=8)
@@ -18673,7 +19246,7 @@ class _TranscriptionPanel(ttk.Frame):
         _search_title = meta.get("title", "")
         if self._conn and _search_title:
             try:
-                _search_db_rows = self._conn.execute(
+                _search_db_rows = self._db_execute(
                     "SELECT video_id, start_time, end_time, text, words "
                     "FROM segments WHERE title=? ORDER BY start_time",
                     (_search_title,)).fetchall()
@@ -18827,7 +19400,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not self._conn:
             return
         try:
-            rows = self._conn.execute(
+            rows = self._db_execute(
                 "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
             channels = [r[0] for r in rows]
         except Exception:
@@ -18921,6 +19494,14 @@ class _TranscriptionPanel(ttk.Frame):
         use_bar   = chart_type == "Bar"
         normalize = self._freq_normalize_var.get()
 
+        def _bg_query():
+            """Run DB queries in background thread, then update chart on main thread."""
+            self._do_frequency_query(words, channels, by_month, use_bar, normalize)
+
+        threading.Thread(target=_bg_query, daemon=True).start()
+
+    def _do_frequency_query(self, words, channels, by_month, use_bar, normalize):
+        """Background: run DB queries for frequency chart, then schedule chart update on main thread."""
         all_keys = set()
         for word in words:
             fts_q = '"' + word.replace('"', '""') + '"'
@@ -18936,7 +19517,7 @@ class _TranscriptionPanel(ttk.Frame):
             params = [fts_q]
             sql = self._append_channel_filter(sql, params, channels)
             try:
-                for r in self._conn.execute(sql, params):
+                for r in self._db_execute(sql, params):
                     all_keys.add(r[0])
             except Exception:
                 pass
@@ -18956,7 +19537,7 @@ class _TranscriptionPanel(ttk.Frame):
                 params = [fts_q]
                 sql = self._append_channel_filter(sql, params, channels)
                 try:
-                    for r in self._conn.execute(sql, params):
+                    for r in self._db_execute(sql, params):
                         all_keys.add(r[0])
                 except Exception:
                     pass
@@ -18965,7 +19546,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not all_keys:
             fts_q = '"' + words[0].replace('"', '""') + '"'
             try:
-                chk = self._conn.execute(
+                chk = self._db_execute(
                     "SELECT COUNT(*) FROM segments_fts "
                     "WHERE segments_fts MATCH ?", [fts_q]).fetchone()[0]
                 msg = (f"'{words[0]}': {chk:,} match(es) but none have year data."
@@ -18973,18 +19554,15 @@ class _TranscriptionPanel(ttk.Frame):
                        f"No data found for: {', '.join(words)}")
             except Exception:
                 msg = "No data found."
-            self._freq_status.config(text=msg)
-            self._ax.clear()
-            self._style_freq_ax()
-            self._freq_canvas.draw()
+            def _show_empty(m=msg):
+                self._freq_status.config(text=m)
+                self._ax.clear()
+                self._style_freq_ax()
+                self._freq_canvas.draw()
+            self.after(0, _show_empty)
             return
 
-        self._freq_status.config(
-            text="  (no month data — grouped by year)" if month_fallback else "")
-
-        tick_labels = ([f"{k // 100}-{k % 100:02d}" for k in all_keys]
-                       if by_month else [str(k) for k in all_keys])
-
+        # Gather normalization totals (DB query)
         if normalize:
             tot_sql = (("SELECT year*100+month, COUNT(*) FROM segments "
                         "WHERE year IS NOT NULL AND month IS NOT NULL")
@@ -18993,19 +19571,13 @@ class _TranscriptionPanel(ttk.Frame):
             tot_params = []
             tot_sql = self._append_channel_filter(tot_sql, tot_params, channels, col="channel")
             tot_sql += " GROUP BY year, month" if by_month else " GROUP BY year"
-            totals = {r[0]: r[1] for r in self._conn.execute(tot_sql, tot_params)}
+            totals = {r[0]: r[1] for r in self._db_execute(tot_sql, tot_params)}
         else:
             totals = {}
 
-        self._ax.clear()
-        self._style_freq_ax()
-
-        palette   = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea", "#89ddff"]
-        n_words   = len(words)
-        bar_width = 0.8 / max(n_words, 1)
-        xs        = list(range(len(all_keys)))
-
-        for i, word in enumerate(words):
+        # Gather per-word counts (DB queries)
+        word_data = []  # list of (word, ys)
+        for word in words:
             fts_q = '"' + word.replace('"', '""') + '"'
             sql   = (("SELECT s.year*100+s.month, COUNT(*) FROM segments s "
                       "WHERE s.id IN (SELECT rowid FROM segments_fts "
@@ -19020,60 +19592,82 @@ class _TranscriptionPanel(ttk.Frame):
             sql = self._append_channel_filter(sql, params, channels)
             sql += " GROUP BY s.year, s.month" if by_month else " GROUP BY s.year"
             try:
-                counts = {r[0]: r[1] for r in self._conn.execute(sql, params)}
+                counts = {r[0]: r[1] for r in self._db_execute(sql, params)}
             except Exception:
                 counts = {}
             ys = [counts.get(k, 0) for k in all_keys]
             if normalize:
                 ys = [1000 * c / max(1, totals.get(k, 1))
                       for c, k in zip(ys, all_keys)]
-            color = palette[i % len(palette)]
-            if use_bar:
-                offset = (i - (n_words - 1) / 2) * bar_width
-                self._ax.bar([x + offset for x in xs], ys,
-                             width=bar_width, color=color,
-                             label=word, alpha=0.85)
-            else:
-                self._ax.plot(xs, ys, marker="o", markersize=4,
-                              linewidth=2, color=color, label=word)
+            word_data.append((word, ys))
 
-        n = len(tick_labels)
-        try:
-            canvas_w = self._freq_canvas.get_tk_widget().winfo_width()
-        except Exception:
-            canvas_w = 900
-        max_labels = max(4, canvas_w // 55)
-        if n > max_labels:
-            step    = (n + max_labels - 1) // max_labels
-            visible = list(range(0, n, step))
-        else:
-            visible = list(range(n))
-        self._ax.set_xticks(visible)
-        self._ax.set_xticklabels([tick_labels[i] for i in visible],
-                                  rotation=45, ha="right", fontsize=8)
-        ylabel = ("Mentions per 1,000 segments" if normalize
-                  else "Segment mentions")
-        self._ax.set_ylabel(ylabel, color="#888", fontsize=9)
-        if channels:
-            ch_label = ", ".join(channels) if len(channels) <= 2 else f"{len(channels)} channels"
-        else:
-            ch_label = "all channels"
-        self._ax.set_title(f"Word frequency — {ch_label}", fontsize=11)
-        if len(words) > 1:
-            self._ax.legend(facecolor=self._TP_BG2, edgecolor="#444",
-                            labelcolor=self._TP_FG, fontsize=9)
-        self._fig.tight_layout()
-        self._freq_canvas.draw()
-
-        self._freq_all_keys = all_keys
+        # Cache data for CSV export (reused by _export_frequency_csv to avoid re-querying)
+        self._freq_all_keys = list(all_keys)
         self._freq_words    = words
         self._freq_by_month = by_month
+        self._freq_word_data = word_data  # list of (word, ys) for CSV export
 
-        # Switch Plot button to Clear mode
-        self._freq_plotted_text = self._freq_words_var.get()
-        self._freq_plot_btn.config(
-            text="Clear", bg=self._TP_RED,
-            command=self._clear_frequency)
+        # Schedule chart rendering on main thread
+        def _render():
+            self._freq_status.config(
+                text="  (no month data — grouped by year)" if month_fallback else "")
+
+            tick_labels = ([f"{k // 100}-{k % 100:02d}" for k in all_keys]
+                           if by_month else [str(k) for k in all_keys])
+
+            self._ax.clear()
+            self._style_freq_ax()
+
+            palette   = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea", "#89ddff"]
+            n_words   = len(words)
+            bar_width = 0.8 / max(n_words, 1)
+            xs        = list(range(len(all_keys)))
+
+            for i, (word, ys) in enumerate(word_data):
+                color = palette[i % len(palette)]
+                if use_bar:
+                    offset = (i - (n_words - 1) / 2) * bar_width
+                    self._ax.bar([x + offset for x in xs], ys,
+                                 width=bar_width, color=color,
+                                 label=word, alpha=0.85)
+                else:
+                    self._ax.plot(xs, ys, marker="o", markersize=4,
+                                  linewidth=2, color=color, label=word)
+
+            n = len(tick_labels)
+            try:
+                canvas_w = self._freq_canvas.get_tk_widget().winfo_width()
+            except Exception:
+                canvas_w = 900
+            max_labels = max(4, canvas_w // 55)
+            if n > max_labels:
+                step    = (n + max_labels - 1) // max_labels
+                visible = list(range(0, n, step))
+            else:
+                visible = list(range(n))
+            self._ax.set_xticks(visible)
+            self._ax.set_xticklabels([tick_labels[i] for i in visible],
+                                      rotation=45, ha="right", fontsize=8)
+            ylabel = ("Mentions per 1,000 segments" if normalize
+                      else "Segment mentions")
+            self._ax.set_ylabel(ylabel, color="#888", fontsize=9)
+            if channels:
+                ch_label = ", ".join(channels) if len(channels) <= 2 else f"{len(channels)} channels"
+            else:
+                ch_label = "all channels"
+            self._ax.set_title(f"Word frequency — {ch_label}", fontsize=11)
+            if len(words) > 1:
+                self._ax.legend(facecolor=self._TP_BG2, edgecolor="#444",
+                                labelcolor=self._TP_FG, fontsize=9)
+            self._fig.tight_layout()
+            self._freq_canvas.draw()
+
+            # Switch Plot button to Clear mode
+            self._freq_plotted_text = self._freq_words_var.get()
+            self._freq_plot_btn.config(
+                text="Clear", bg=self._TP_RED,
+                command=self._clear_frequency)
+        self.after(0, _render)
 
     def _clear_frequency(self):
         """Reset the frequency section — clear chart, words, and restore Plot button."""
@@ -19099,6 +19693,12 @@ class _TranscriptionPanel(ttk.Frame):
         Clicking a word in the cloud re-seeds the cloud with that word (explore connections)."""
         if not _HAS_MPL or not self._conn or not self._freq_canvas:
             return
+        def _bg():
+            self._do_word_cloud_bg(seed_words, channels)
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _do_word_cloud_bg(self, seed_words, channels):
+        """Background thread: gather word cloud data, then schedule rendering on main thread."""
         import random as _rng
         # Find segments containing the seed words and extract surrounding vocabulary
         word_counts = {}
@@ -19155,7 +19755,7 @@ class _TranscriptionPanel(ttk.Frame):
                 params = [fts_q]
                 sql = self._append_channel_filter(sql, params, channels)
                 try:
-                    rows = self._conn.execute(sql, params).fetchall()
+                    rows = self._db_execute(sql, params).fetchall()
                 except Exception:
                     continue
                 for (text,) in rows:
@@ -19168,7 +19768,7 @@ class _TranscriptionPanel(ttk.Frame):
                 fts_q = '"' + sw.replace('"', '""') + '"'
                 sql = ("SELECT COUNT(*) FROM segments_fts WHERE segments_fts MATCH ?")
                 try:
-                    cnt = self._conn.execute(sql, (fts_q,)).fetchone()[0]
+                    cnt = self._db_execute(sql, (fts_q,)).fetchone()[0]
                 except Exception:
                     cnt = 50
                 word_counts[sw.lower()] = max(word_counts.get(sw.lower(), 0), cnt)
@@ -19179,7 +19779,7 @@ class _TranscriptionPanel(ttk.Frame):
             sql = self._append_channel_filter(sql, params, channels)
             sql += " ORDER BY RANDOM() LIMIT 5000"
             try:
-                rows = self._conn.execute(sql, params).fetchall()
+                rows = self._db_execute(sql, params).fetchall()
             except Exception:
                 rows = []
             for (text,) in rows:
@@ -19189,73 +19789,75 @@ class _TranscriptionPanel(ttk.Frame):
                         word_counts[w] = word_counts.get(w, 0) + 1
 
         if not word_counts:
-            self._freq_status.config(text="No data for word cloud.")
+            self.after(0, lambda: self._freq_status.config(text="No data for word cloud."))
             return
 
         # Get top 150 words
         top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:150]
         max_count = top[0][1] if top else 1
 
-        # Render word cloud using matplotlib text
-        self._ax.clear()
-        self._ax.set_facecolor(self._TP_BG2)
-        self._ax.set_xlim(0, 1)
-        self._ax.set_ylim(0, 1)
-        self._ax.axis("off")
-        palette = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea",
-                   "#89ddff", "#f78c6c", "#82aaff", "#c3e88d", "#ffcb6b",
-                   "#e06c75", "#56b6c2", "#d19a66", "#98c379"]
-        _rng.seed(42)  # deterministic layout so the cloud doesn't jump on re-plot
-        _WC_CENTER = 0.5
-        _WC_MIN_R  = 0.10
-        _WC_R_SCALE = 0.38
-        self._wc_texts = []  # store text artists for click detection
-        for i, (word, count) in enumerate(top):
-            # Size: 6-28pt based on count proportion
-            size = 6 + 22 * (count / max_count)
-            color = palette[i % len(palette)]
-            # Highlight seed words
-            if word in seed_lower:
-                color = "#ffffff"
-                size = min(size * 1.3, 32)
-            # Place words using a spiral-ish layout
-            angle = i * 137.508  # golden angle in degrees
-            r = _WC_MIN_R + _WC_R_SCALE * (i / max(len(top), 1))
-            x = _WC_CENTER + r * _rng.uniform(-1, 1)
-            y = _WC_CENTER + r * _rng.uniform(-1, 1)
-            x = max(0.03, min(0.97, x))
-            y = max(0.03, min(0.97, y))
-            txt = self._ax.text(x, y, word, fontsize=size, color=color,
-                          ha="center", va="center",
-                          fontweight="bold" if count > max_count * 0.5 else "normal",
-                          alpha=0.6 + 0.4 * (count / max_count),
-                          picker=True)
-            self._wc_texts.append(txt)
-        ch_label = (", ".join(channels[:2]) if channels else "all channels")
-        title_parts = ["Word Cloud"]
-        if seed_words:
-            title_parts.append(f"seeded: {', '.join(seed_words[:3])}")
-        title_parts.append(ch_label)
-        self._ax.set_title(" — ".join(title_parts), fontsize=11,
-                          color=self._TP_FG)
-        hint = "Click a word to explore its connections"
-        self._ax.text(0.5, 0.01, hint, fontsize=7, color="#666",
-                      ha="center", va="bottom", transform=self._ax.transAxes)
-        self._fig.tight_layout()
-        self._freq_canvas.draw()
-        self._freq_status.config(text=f"{len(top)} words plotted  ·  click a word to explore")
-        self._freq_all_keys = []
-        self._freq_words    = seed_words
-        self._freq_by_month = False
-        self._freq_plotted_text = self._freq_words_var.get()
-        self._wc_channels = channels  # remember channels for click-to-explore
-        self._freq_plot_btn.config(
-            text="Clear", bg=self._TP_RED,
-            command=self._clear_frequency)
+        # Schedule rendering on main thread
+        def _render_wc():
+            import random as _rng2
+            self._ax.clear()
+            self._ax.set_facecolor(self._TP_BG2)
+            self._ax.set_xlim(0, 1)
+            self._ax.set_ylim(0, 1)
+            self._ax.axis("off")
+            palette = ["#4a9eff", "#ff6b6b", "#4caf50", "#ffd700", "#c792ea",
+                       "#89ddff", "#f78c6c", "#82aaff", "#c3e88d", "#ffcb6b",
+                       "#e06c75", "#56b6c2", "#d19a66", "#98c379"]
+            _rng2.seed(42)  # deterministic layout so the cloud doesn't jump on re-plot
+            _WC_CENTER = 0.5
+            _WC_MIN_R  = 0.10
+            _WC_R_SCALE = 0.38
+            self._wc_texts = []  # store text artists for click detection
+            for i, (word, count) in enumerate(top):
+                # Size: 6-28pt based on count proportion
+                size = 6 + 22 * (count / max_count)
+                color = palette[i % len(palette)]
+                # Highlight seed words
+                if word in seed_lower:
+                    color = "#ffffff"
+                    size = min(size * 1.3, 32)
+                # Place words using a spiral-ish layout
+                angle = i * 137.508  # golden angle in degrees
+                r = _WC_MIN_R + _WC_R_SCALE * (i / max(len(top), 1))
+                x = _WC_CENTER + r * _rng2.uniform(-1, 1)
+                y = _WC_CENTER + r * _rng2.uniform(-1, 1)
+                x = max(0.03, min(0.97, x))
+                y = max(0.03, min(0.97, y))
+                txt = self._ax.text(x, y, word, fontsize=size, color=color,
+                              ha="center", va="center",
+                              fontweight="bold" if count > max_count * 0.5 else "normal",
+                              alpha=0.6 + 0.4 * (count / max_count),
+                              picker=True)
+                self._wc_texts.append(txt)
+            ch_label = (", ".join(channels[:2]) if channels else "all channels")
+            title_parts = ["Word Cloud"]
+            if seed_words:
+                title_parts.append(f"seeded: {', '.join(seed_words[:3])}")
+            title_parts.append(ch_label)
+            self._ax.set_title(" — ".join(title_parts), fontsize=11,
+                              color=self._TP_FG)
+            hint = "Click a word to explore its connections"
+            self._ax.text(0.5, 0.01, hint, fontsize=7, color="#666",
+                          ha="center", va="bottom", transform=self._ax.transAxes)
+            self._fig.tight_layout()
+            self._freq_canvas.draw()
+            self._freq_status.config(text=f"{len(top)} words plotted  ·  click a word to explore")
+            self._freq_all_keys = []
+            self._freq_words    = seed_words
+            self._freq_by_month = False
+            self._freq_plotted_text = self._freq_words_var.get()
+            self._wc_channels = channels  # remember channels for click-to-explore
+            self._freq_plot_btn.config(
+                text="Clear", bg=self._TP_RED,
+                command=self._clear_frequency)
+        self.after(0, _render_wc)
 
     def _export_frequency_csv(self):
         """Export the current frequency chart data to a CSV file."""
-        import csv as _csv
         if not self._freq_all_keys or not self._freq_words:
             messagebox.showinfo("Export", "No frequency data to export. Plot something first.")
             return
@@ -19266,30 +19868,40 @@ class _TranscriptionPanel(ttk.Frame):
             return
         try:
             by_month = self._freq_by_month
-            channels = self._get_freq_selected_channels()
+            # Use cached word_data from _do_frequency_query if available (avoids re-querying DB on main thread)
+            _cached = getattr(self, '_freq_word_data', None)
+            _word_ys = {}
+            if _cached and len(_cached) == len(self._freq_words):
+                for _w, _ys in _cached:
+                    _word_ys[_w] = _ys
             with open(path, "w", newline="", encoding="utf-8") as fh:
-                w = _csv.writer(fh)
+                w = csv.writer(fh)
                 w.writerow(["Period"] + self._freq_words)
-                for key in self._freq_all_keys:
+                for ki, key in enumerate(self._freq_all_keys):
                     label = (f"{key // 100}-{key % 100:02d}" if by_month else str(key))
                     row_data = [label]
                     for word in self._freq_words:
-                        fts_q = '"' + word.replace('"', '""') + '"'
-                        sql = (("SELECT COUNT(*) FROM segments s "
-                                "WHERE s.id IN (SELECT rowid FROM segments_fts "
-                                "WHERE segments_fts MATCH ?) "
-                                "AND s.year*100+s.month=?")
-                               if by_month else
-                               ("SELECT COUNT(*) FROM segments s "
-                                "WHERE s.id IN (SELECT rowid FROM segments_fts "
-                                "WHERE segments_fts MATCH ?) "
-                                "AND s.year=?"))
-                        params = [fts_q, key]
-                        sql = self._append_channel_filter(sql, params, channels)
-                        try:
-                            cnt = self._conn.execute(sql, params).fetchone()[0]
-                        except Exception:
-                            cnt = 0
+                        if word in _word_ys and ki < len(_word_ys[word]):
+                            cnt = _word_ys[word][ki]
+                        else:
+                            # Fallback: query DB (should not normally happen)
+                            channels = self._get_freq_selected_channels()
+                            fts_q = '"' + word.replace('"', '""') + '"'
+                            sql = (("SELECT COUNT(*) FROM segments s "
+                                    "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                                    "WHERE segments_fts MATCH ?) "
+                                    "AND s.year*100+s.month=?")
+                                   if by_month else
+                                   ("SELECT COUNT(*) FROM segments s "
+                                    "WHERE s.id IN (SELECT rowid FROM segments_fts "
+                                    "WHERE segments_fts MATCH ?) "
+                                    "AND s.year=?"))
+                            params = [fts_q, key]
+                            sql = self._append_channel_filter(sql, params, channels)
+                            try:
+                                cnt = self._db_execute(sql, params).fetchone()[0]
+                            except Exception:
+                                cnt = 0
                         row_data.append(cnt)
                     w.writerow(row_data)
             messagebox.showinfo("Export", f"Saved {len(self._freq_all_keys)} rows.")
@@ -19513,7 +20125,7 @@ class _TranscriptionPanel(ttk.Frame):
                             all_words.append((
                                 w.get("s", start),
                                 w.get("e", end),
-                                w["w"]
+                                w.get("w", "")
                             ))
                     except Exception:
                         pass
@@ -19776,7 +20388,7 @@ class _TranscriptionPanel(ttk.Frame):
         except Exception:
             pass
 
-        self._player_poll_id = self.after(30, self._player_poll)
+        self._player_poll_id = self.after(100, self._player_poll)
 
     def _player_highlight_word(self, cur_sec):
         """Highlight the word currently being spoken — single word, no skipping.
@@ -19798,18 +20410,21 @@ class _TranscriptionPanel(ttk.Frame):
 
         prev = self._player_last_word_idx
 
-        if target <= prev:
-            # If seeking backward, jump directly
-            if target < prev and target >= 0:
-                pass  # fall through to update below
-            else:
-                return  # no change or still on same word
-
-        # Step forward one word at a time (never skip)
-        if prev >= 0 and target > prev + 1:
-            new_idx = prev + 1  # advance by exactly one
-        else:
+        if target < prev:
+            # Seeking backward - jump directly to target (or clear if -1)
             new_idx = target
+        elif target == prev:
+            return  # still on same word - no change
+        else:
+            # Step forward one word at a time for smooth playback,
+            # but jump directly if the gap is large (indicates a user seek)
+            if prev >= 0 and target > prev + 1:
+                if target - prev > 5:
+                    new_idx = target  # large gap = user seeked forward
+                else:
+                    new_idx = prev + 1  # small gap = normal playback, advance by one
+            else:
+                new_idx = target
 
         if new_idx == prev:
             return
@@ -19985,17 +20600,22 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _confirm_delete_all_transcriptions(self, folder):
         """Delete all .txt and .jsonl transcript files in a directory tree."""
-        # Count files first
-        txt_files = []
-        jsonl_files = []
-        for dirpath, _dirs, files in os.walk(folder):
-            for f in files:
-                fp = os.path.join(dirpath, f)
-                if f.endswith("Transcript.txt") and not f.startswith("."):
-                    txt_files.append(fp)
-                elif f.endswith("Transcript.jsonl") and f.startswith("."):
-                    jsonl_files.append(fp)
+        # Count files in background thread to avoid blocking main thread on large trees
+        def _count_files():
+            txt_files = []
+            jsonl_files = []
+            for dirpath, _dirs, files in os.walk(folder):
+                for f in files:
+                    fp = os.path.join(dirpath, f)
+                    if f.endswith("Transcript.txt") and not f.startswith("."):
+                        txt_files.append(fp)
+                    elif f.endswith("Transcript.jsonl") and f.startswith("."):
+                        jsonl_files.append(fp)
+            self.after(0, lambda: self._confirm_delete_all_transcriptions_ui(folder, txt_files, jsonl_files))
+        threading.Thread(target=_count_files, daemon=True).start()
 
+    def _confirm_delete_all_transcriptions_ui(self, folder, txt_files, jsonl_files):
+        """Show confirmation dialog after background counting completes."""
         total = len(txt_files) + len(jsonl_files)
         if total == 0:
             messagebox.showinfo("No Transcriptions",
@@ -20009,16 +20629,14 @@ class _TranscriptionPanel(ttk.Frame):
                f"Total: {total} file(s)\n\n"
                f"This cannot be undone. Are you sure?")
 
-        if not messagebox.askyesno("Delete All Transcriptions", msg,
-                                   icon="warning"):
+        if not _dark_askquestion("Delete All Transcriptions", msg):
             return
 
         # Second confirmation
-        if not messagebox.askyesno(
+        if not _dark_askquestion(
                 "Final Confirmation",
                 f"Are you absolutely sure?\n\n"
-                f"All {total} transcript file(s) will be permanently deleted.",
-                icon="warning"):
+                f"All {total} transcript file(s) will be permanently deleted."):
             return
 
         deleted = 0
@@ -20028,7 +20646,6 @@ class _TranscriptionPanel(ttk.Frame):
                 # Un-hide before deleting (Windows hidden files)
                 if os.name == "nt":
                     try:
-                        import ctypes
                         ctypes.windll.kernel32.SetFileAttributesW(fp, 0x80)  # FILE_ATTRIBUTE_NORMAL
                     except Exception:
                         pass
@@ -20077,15 +20694,15 @@ class _TranscriptionPanel(ttk.Frame):
             return
         def _query():
             try:
-                segs  = self._conn.execute(
+                segs  = self._db_execute(
                     "SELECT COUNT(*) FROM segments").fetchone()[0]
-                vids  = self._conn.execute(
+                vids  = self._db_execute(
                     "SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
-                chs   = self._conn.execute(
+                chs   = self._db_execute(
                     "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
-                files = self._conn.execute(
+                files = self._db_execute(
                     "SELECT COUNT(*) FROM indexed_files").fetchone()[0]
-                yr    = self._conn.execute(
+                yr    = self._db_execute(
                     "SELECT MIN(year), MAX(year) FROM segments "
                     "WHERE year IS NOT NULL").fetchone()
                 yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] else "N/A"
@@ -20143,56 +20760,64 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _run_index(self, roots, rebuild):
         self._index_running = True
-        self.after(0, lambda: self._idx_progress_var.set("Scanning..."))
-        self._tp_log("─── Index build started ───")
+        try:
+            self.after(0, lambda: self._idx_progress_var.set("Scanning..."))
+            self._tp_log("─── Index build started ───")
 
-        if rebuild:
-            try:
-                self._conn.execute("DELETE FROM segments")
-                self._conn.execute("DELETE FROM segments_fts")
-                self._conn.execute("DELETE FROM indexed_files")
-                self._conn.commit()
-                self._tp_log("Cleared existing index.")
-            except Exception as e:
-                self._tp_log(f"Error clearing index: {e}")
-                self._index_running = False
-                return
+            if rebuild:
+                try:
+                    self._db_execute("DELETE FROM segments")
+                    self._db_execute("DELETE FROM segments_fts")
+                    self._db_execute("DELETE FROM indexed_files")
+                    self._db_commit()
+                    self._tp_log("Cleared existing index.")
+                except Exception as e:
+                    self._tp_log(f"Error clearing index: {e}")
+                    return
 
-        files = _tp_find_jsonl_files(roots)
-        self._tp_log(
-            f"Found {len(files)} JSONL file(s) in {len(roots)} root(s).")
+            files = _tp_find_jsonl_files(roots)
+            self._tp_log(
+                f"Found {len(files)} JSONL file(s) in {len(roots)} root(s).")
 
-        new_files = skip_files = total_segs = 0
-        for i, fpath in enumerate(files):
-            prog = f"{i + 1}/{len(files)}"
-            self.after(0, lambda p=prog: self._idx_progress_var.set(p))
-            if not _tp_file_needs_update(self._conn, fpath):
-                skip_files += 1
-                continue
-            try:
-                n = _tp_index_file(self._conn, fpath, roots)
-                self._conn.commit()
-                total_segs += n
-                new_files  += 1
-                self._tp_log(
-                    f"  [{prog}] {os.path.basename(fpath)}  ({n:,} segments)")
-            except Exception as e:
-                self._tp_log(
-                    f"  [{prog}] ERROR {os.path.basename(fpath)}: {e}")
+            new_files = skip_files = total_segs = 0
+            for i, fpath in enumerate(files):
+                prog = f"{i + 1}/{len(files)}"
+                self.after(0, lambda p=prog: self._idx_progress_var.set(p))
+                with self._db_lock:
+                    if not _tp_file_needs_update(self._conn, fpath):
+                        skip_files += 1
+                        continue
+                try:
+                    with self._db_lock:
+                        n = _tp_index_file(self._conn, fpath, roots)
+                    self._db_commit()
+                    total_segs += n
+                    new_files  += 1
+                    self._tp_log(
+                        f"  [{prog}] {os.path.basename(fpath)}  ({n:,} segments)")
+                except Exception as e:
+                    with self._db_lock:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                    self._tp_log(
+                        f"  [{prog}] ERROR {os.path.basename(fpath)}: {e}")
 
-        self._tp_log(
-            f"\nDone. {new_files} indexed, {skip_files} up-to-date. "
-            f"{total_segs:,} new segments added.")
-        self.after(0, lambda: self._idx_progress_var.set("Done"))
-        self.after(0, self._refresh_index_stats)
-        self.after(0, self._update_search_channels)
-        self.after(0, self._update_freq_channels)
-        self._index_running = False
+            self._tp_log(
+                f"\nDone. {new_files} indexed, {skip_files} up-to-date. "
+                f"{total_segs:,} new segments added.")
+            self.after(0, lambda: self._idx_progress_var.set("Done"))
+            self.after(0, self._refresh_index_stats)
+            self.after(0, self._update_search_channels)
+            self.after(0, self._update_freq_channels)
+        finally:
+            self._index_running = False
 
     def on_destroy(self):
         if self._conn:
             try:
-                self._conn.commit()
+                self._db_commit()
                 self._conn.close()
             except Exception:
                 pass
@@ -20355,21 +20980,27 @@ def _sort_recent_tree(col, reverse):
 
     if col == "size":
         def parse_sz(s):
-            if not s: return 0
-            s = s.strip()
-            if s.endswith("GB"): return float(s[:-2]) * 1073741824
-            if s.endswith("MB"): return float(s[:-2]) * 1048576
-            if s.endswith("KB"): return float(s[:-2]) * 1024
-            if s.endswith("B"): return float(s[:-1])
+            try:
+                if not s: return 0
+                s = s.strip()
+                if s.endswith("GB"): return float(s[:-2]) * 1073741824
+                if s.endswith("MB"): return float(s[:-2]) * 1048576
+                if s.endswith("KB"): return float(s[:-2]) * 1024
+                if s.endswith("B"): return float(s[:-1])
+            except (ValueError, TypeError):
+                pass
             return 0
 
         l.sort(key=lambda t: parse_sz(t[0]), reverse=reverse)
     elif col == "duration":
         def parse_dur(s):
-            if not s: return 0
-            parts = s.split(':')
-            if len(parts) == 3: return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            if len(parts) == 2: return int(parts[0]) * 60 + int(parts[1])
+            try:
+                if not s: return 0
+                parts = s.split(':')
+                if len(parts) == 3: return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                if len(parts) == 2: return int(parts[0]) * 60 + int(parts[1])
+            except (ValueError, TypeError):
+                pass
             return 0
 
         l.sort(key=lambda t: parse_dur(t[0]), reverse=reverse)
@@ -20741,14 +21372,32 @@ def _delete_selected_files():
             icon="warning"):
         return
 
-    indices = sorted([_get_recent_orig_idx(iid) for iid in sel], reverse=True)
+    # Build fingerprints from the tree's displayed values to match entries
+    # by identity (title + channel + download_ts), avoiding stale-index races
+    # with concurrent updates to the recent list.
+    fingerprints = set()
+    for iid in sel:
+        title = recent_tree.set(iid, "title")
+        channel = recent_tree.set(iid, "channel")
+        orig_idx = _get_recent_orig_idx(iid)
+        # Look up the download_ts from config for a stable fingerprint
+        with config_lock:
+            _recent_snap = config.get("recent_downloads", [])
+            _dl_ts = _recent_snap[orig_idx].get("download_ts", 0) if orig_idx < len(_recent_snap) else 0
+        fingerprints.add((title, channel, _dl_ts))
+
     with config_lock:
         recent = config.get("recent_downloads", [])
-        for idx in indices:
-            if 0 <= idx < len(recent):
-                fp = recent[idx].get("filepath", "")
+        to_remove = []
+        for i, entry in enumerate(recent):
+            raw_title = str(entry.get("title", "?")).replace("\n", " ").strip().replace("\ufffd", "")
+            raw_channel = str(entry.get("channel", "?")).replace("\n", " ").strip()
+            _entry_ts = entry.get("download_ts", 0)
+            # Match by title+channel+download_ts for stable identity
+            if (raw_title, raw_channel, _entry_ts) in fingerprints:
+                fp = entry.get("filepath", "")
                 if not fp:
-                    log(f"  ⚠ No filepath stored for '{recent[idx].get('title', '?')}' — remove from list only.\n",
+                    log(f"  ⚠ No filepath stored for '{entry.get('title', '?')}' — remove from list only.\n",
                         "red")
                 elif not os.path.exists(fp):
                     log(f"  ⚠ File not found on disk, removing from list:\n    {fp}\n", "red")
@@ -20760,7 +21409,9 @@ def _delete_selected_files():
                         log(f"  🗑 Deleted: {fp}{size_str}\n", "green")
                     except OSError as e:
                         log(f"ERROR: Could not delete {fp}: {e}\n", "red")
-                recent.pop(idx)
+                to_remove.append(i)
+        for i in sorted(to_remove, reverse=True):
+            recent.pop(i)
         config["recent_downloads"] = recent
     save_config(config)
     refresh_recent_list()
@@ -20896,9 +21547,17 @@ def _play_video():
     sel = recent_tree.selection()
     if len(sel) != 1: return
     idx = _get_recent_orig_idx(sel[0])
+    _sel_title = recent_tree.set(sel[0], "title")
+    _sel_channel = recent_tree.set(sel[0], "channel")
     with config_lock:
         recent = config.get("recent_downloads", [])
+        # Prefer index if it still matches, otherwise search by title+channel
         entry = recent[idx] if idx < len(recent) else {}
+        if entry and (str(entry.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") != _sel_title
+                      or str(entry.get("channel", "")).replace("\n", " ").strip() != _sel_channel):
+            entry = next((e for e in recent if
+                          str(e.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") == _sel_title
+                          and str(e.get("channel", "")).replace("\n", " ").strip() == _sel_channel), entry)
         fp = entry.get("filepath", "")
 
     if not fp or not os.path.exists(fp):
@@ -20912,7 +21571,14 @@ def _play_video():
             fp = found
             with config_lock:
                 recent = config.get("recent_downloads", [])
-                if idx < len(recent):
+                _written = False
+                for _re in recent:
+                    if (str(_re.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") == _sel_title
+                            and str(_re.get("channel", "")).replace("\n", " ").strip() == _sel_channel):
+                        _re["filepath"] = fp
+                        _written = True
+                        break
+                if not _written and idx < len(recent):
                     recent[idx]["filepath"] = fp
             save_config(config)
         else:
@@ -20934,9 +21600,17 @@ def _show_in_explorer():
     sel = recent_tree.selection()
     if len(sel) != 1: return
     idx = _get_recent_orig_idx(sel[0])
+    _sel_title = recent_tree.set(sel[0], "title")
+    _sel_channel = recent_tree.set(sel[0], "channel")
     with config_lock:
         recent = config.get("recent_downloads", [])
+        # Prefer index if it still matches, otherwise search by title+channel
         entry = recent[idx] if idx < len(recent) else {}
+        if entry and (str(entry.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") != _sel_title
+                      or str(entry.get("channel", "")).replace("\n", " ").strip() != _sel_channel):
+            entry = next((e for e in recent if
+                          str(e.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") == _sel_title
+                          and str(e.get("channel", "")).replace("\n", " ").strip() == _sel_channel), entry)
         fp = entry.get("filepath", "")
 
     if not fp or not os.path.exists(fp):
@@ -20965,7 +21639,14 @@ def _show_in_explorer():
             fp = found
             with config_lock:
                 recent = config.get("recent_downloads", [])
-                if idx < len(recent):
+                _written = False
+                for _re in recent:
+                    if (str(_re.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") == _sel_title
+                            and str(_re.get("channel", "")).replace("\n", " ").strip() == _sel_channel):
+                        _re["filepath"] = fp
+                        _written = True
+                        break
+                if not _written and idx < len(recent):
                     recent[idx]["filepath"] = fp
             save_config(config)
         else:
@@ -21001,9 +21682,17 @@ def _open_video_on_yt():
     sel = recent_tree.selection()
     if len(sel) != 1: return
     idx = _get_recent_orig_idx(sel[0])
+    _sel_title = recent_tree.set(sel[0], "title")
+    _sel_channel = recent_tree.set(sel[0], "channel")
     with config_lock:
         recent = config.get("recent_downloads", [])
-        video_url = recent[idx].get("video_url", "") if idx < len(recent) else ""
+        entry = recent[idx] if idx < len(recent) else {}
+        if entry and (str(entry.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") != _sel_title
+                      or str(entry.get("channel", "")).replace("\n", " ").strip() != _sel_channel):
+            entry = next((e for e in recent if
+                          str(e.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") == _sel_title
+                          and str(e.get("channel", "")).replace("\n", " ").strip() == _sel_channel), entry)
+        video_url = entry.get("video_url", "")
 
     if not video_url:
         log("  ⚠ No YouTube URL stored for this entry.\n", "red")
@@ -21153,7 +21842,11 @@ root.after(100, check_dependencies)
 
 def _check_channel_folders():
     """Check that each subscribed channel's directory still exists on disk.
-    If a folder is missing, prompt the user to remove the channel or locate the folder."""
+    If a folder is missing, prompt the user to remove the channel or locate the folder.
+
+    Note: This intentionally blocks the startup thread (up to 300s via the dialog
+    timeout) because the user must resolve missing folders before sync can proceed
+    safely. This is by design — not a performance bug."""
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
         channels = list(config.get("channels", []))
@@ -21226,13 +21919,12 @@ def _check_app_update():
     """Check GitHub releases for a newer version of YTArchiver and log a notice if found."""
     try:
         import urllib.request as _ur
-        import json as _json
         req = _ur.Request(
             "https://api.github.com/repos/skurbee/YTArchiver/releases/latest",
             headers={"User-Agent": "YTArchiver"}
         )
         with _ur.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read())
+            data = json.loads(resp.read())
         latest_tag = data.get("tag_name", "").strip()       # e.g. "v23.8"
         release_url = data.get("html_url", "https://github.com/skurbee/YTArchiver/releases/latest")
         if not latest_tag:
@@ -21260,7 +21952,16 @@ def run_startup_updates():
         yt_name = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
         dl_url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{yt_name}"
         import urllib.request
-        urllib.request.urlretrieve(dl_url, target_path)
+        tmp_path = target_path + ".tmp"
+        try:
+            urllib.request.urlretrieve(dl_url, tmp_path)
+            os.replace(tmp_path, target_path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _get_yt_dlp_version():
         """Get the current yt-dlp version string."""
@@ -21611,39 +22312,48 @@ def on_closing():
         except Exception:
             pass
         _INSTANCE_MUTEX = None
-    # Save window position and size before closing
-    try:
-        geo = root.geometry()  # e.g. "900x800+100+200"
-        _wh, _pos = geo.split("+", 1)
-        _w, _h = _wh.split("x")
-        _px, _py = _pos.split("+")
-        config["window_w"] = int(_w)
-        config["window_h"] = int(_h)
-        config["window_x"] = int(_px)
-        config["window_y"] = int(_py)
-        save_config(config)
-    except Exception:
-        pass
+    # Save window position, size, and column widths before closing
+    with config_lock:
+        try:
+            geo = root.geometry()  # e.g. "900x800+100+200"
+            _wh, _pos = geo.split("+", 1)
+            _w, _h = _wh.split("x")
+            _px, _py = _pos.split("+")
+            config["window_w"] = int(_w)
+            config["window_h"] = int(_h)
+            config["window_x"] = int(_px)
+            config["window_y"] = int(_py)
+        except Exception:
+            pass
 
-    # Save column widths for both treeviews
-    try:
-        _chan_widths = {}
-        for _col in ("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "num_vids", "size_on_disk"):
-            try:
-                _chan_widths[_col] = settings_chan_tree.column(_col, "width")
-            except Exception:
-                pass
-        config["chan_col_widths"] = _chan_widths
-        _recent_widths = {}
-        for _col in ("title", "channel", "time", "duration", "size"):
-            try:
-                _recent_widths[_col] = recent_tree.column(_col, "width")
-            except Exception:
-                pass
-        config["recent_col_widths"] = _recent_widths
-        save_config(config)
-    except Exception:
-        pass
+        # Collect column widths for both treeviews
+        try:
+            _chan_widths = {}
+            for _col in ("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "num_vids", "size_on_disk"):
+                try:
+                    _chan_widths[_col] = settings_chan_tree.column(_col, "width")
+                except Exception:
+                    pass
+            config["chan_col_widths"] = _chan_widths
+            _recent_widths = {}
+            for _col in ("title", "channel", "time", "duration", "size"):
+                try:
+                    _recent_widths[_col] = recent_tree.column(_col, "width")
+                except Exception:
+                    pass
+            config["recent_col_widths"] = _recent_widths
+        except Exception:
+            pass
+
+        # Single synchronous save to ensure both window geometry and column widths are persisted
+        try:
+            _cfg_snap = copy.deepcopy(config)
+            temp_file = CONFIG_FILE + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(_cfg_snap, f, indent=2)
+            os.replace(temp_file, CONFIG_FILE)
+        except Exception:
+            pass
 
     _root_alive = False  # Tell worker threads to stop touching Tkinter immediately
 
@@ -21689,6 +22399,12 @@ def on_closing():
     except Exception:
         pass
 
+    # Close transcription DB connection
+    try:
+        _tp_panel.on_destroy()
+    except Exception:
+        pass
+
     # Stop the system tray icon
     global _tray_spin_active
     _tray_spin_active = False
@@ -21709,20 +22425,22 @@ def on_closing():
     cancel_event.set()
 
     with proc_lock:
-        procs = list(active_processes)
+        procs = [p for p in active_processes if p is not None]
     for p in procs:
-        if p.poll() is None:
-            if os.name == 'nt':
-                subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 startupinfo=startupinfo)
-            else:
-                p.kill()
+        try:
+            if p.poll() is None:
+                if os.name == 'nt':
+                    subprocess.Popen(['taskkill', '/F', '/T', '/PID', str(p.pid)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     startupinfo=startupinfo)
+                else:
+                    p.kill()
+        except Exception:
+            pass
 
     # Give worker threads a moment to notice cancel_event and save state
     # (they're daemon threads — root.destroy() will kill them)
-    time.sleep(1.0)
-    root.destroy()
+    root.after(1000, root.destroy)
 
 
 root.protocol("WM_DELETE_WINDOW", on_closing)

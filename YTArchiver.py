@@ -568,7 +568,7 @@ def log(text, tag=None):
                     if _base_tag in ("simpleline", "simpleline_green", "simpleline_blue",
                                      "header"):
                         if any(kw in _txt for kw in ("SYNCING:", "Downloaded:", "▶",
-                                                      "no new videos")):
+                                                      "no new videos", "Filtered")):
                             _bk_tag = "sync_bracket"
                         elif any(kw in _txt for kw in ("Fetching captions:", "Re-transcribing",
                                                         "Transcribing", "fetching captions",
@@ -3060,7 +3060,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 8:16pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 9:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13069,7 +13069,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         log("  ↳ Try updating yt-dlp:  yt-dlp -U\n", "dim")
                     # In simple mode, silently count the error (shown in summary)
                 else:
-                    log(line, "red")
+                    if not is_simple_mode:
+                        log(line, "red")
+                    # In simple mode, silently count the error (shown in summary)
                 continue
             elif "WARNING:" in line:
                 log(line, "dim")

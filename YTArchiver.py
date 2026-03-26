@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 6:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 6:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -17485,6 +17485,7 @@ def _tp_open_db(path):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_channel ON segments(channel)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr ON segments(channel, year)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr_mo ON segments(channel, year, month)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_title ON segments(title)")
     # Migration: add words column for word-level timestamps (added later; safe to ignore if exists)
     try:
         conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
@@ -17956,7 +17957,7 @@ class _TranscriptionPanel(ttk.Frame):
             vh, text="Re-transcribe", bg="#3a3a3a", fg=self._TP_FG,
             activebackground="#555555", activeforeground=self._TP_FG,
             relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
-            width=28, anchor="center",
+            padx=8, anchor="center",
             state="disabled", command=self._on_retranscribe)
         self._browse_retranscribe_btn.pack(side="right", padx=(0, 10))
         # Current browse selection state for re-transcribe
@@ -18107,9 +18108,19 @@ class _TranscriptionPanel(ttk.Frame):
             "txt_path": txt_path, "jsonl_path": meta.get("jsonl_path"),
             "video_id": _vid_id,
         }
-        # Enable re-transcribe if we have a video file locally OR a video_id to download from
-        _has_video = bool(self._find_video_file(title, txt_path)) or bool(_vid_id)
-        self._browse_retranscribe_btn.config(state="normal" if _has_video else "disabled")
+        # Enable re-transcribe — check video_id immediately (fast DB lookup),
+        # defer the slow filesystem check to a background thread so the UI
+        # doesn't stall on Z:\ network drives.
+        if _vid_id:
+            self._browse_retranscribe_btn.config(state="normal")
+        else:
+            self._browse_retranscribe_btn.config(state="disabled")
+            _check_title, _check_txt = title, txt_path
+            def _check_video():
+                found = bool(self._find_video_file(_check_title, _check_txt))
+                if found:
+                    self.after(0, lambda: self._browse_retranscribe_btn.config(state="normal"))
+            threading.Thread(target=_check_video, daemon=True).start()
 
         # Fetch segments from DB for the position map (double-click seeking).
         # The viewer itself always shows the .txt body (punctuation-restored).

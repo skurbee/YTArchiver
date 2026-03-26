@@ -562,13 +562,15 @@ def log(text, tag=None):
                 # at insertion time — no post-hoc tag manipulation needed.
                 _bk_tag = None
                 _bk_m = None
-                if use_tag in ("simpleline", "simpleline_green", "header",
-                               "transcribe_using"):
+                if use_tag in ("simpleline", "simpleline_green", "simpleline_blue",
+                               "header", "transcribe_using"):
                     import re as _re_bk
-                    if any(kw in text for kw in ("SYNCING:", "Downloaded:", "▶")):
+                    if any(kw in text for kw in ("SYNCING:", "Downloaded:", "▶",
+                                                  "no new videos")):
                         _bk_tag = "sync_bracket"
                     elif any(kw in text for kw in ("Fetching captions:", "Re-transcribing",
-                                                    "Transcribing", "fetching captions")):
+                                                    "Transcribing", "fetching captions",
+                                                    "done (")):
                         _bk_tag = "trans_bracket"
                     if _bk_tag:
                         _bk_m = _re_bk.search(r'\[(\d+/\d+)\]', text)
@@ -3029,7 +3031,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 6:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.25.26 7:14pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3423,9 +3425,11 @@ log_box.tag_raise("simplestatus_white", "simplestatus")
 # Bracket overlays must override base line tags
 log_box.tag_raise("sync_bracket", "simpleline")
 log_box.tag_raise("sync_bracket", "simpleline_green")
+log_box.tag_raise("sync_bracket", "simpleline_blue")
 log_box.tag_raise("sync_bracket", "header")
 log_box.tag_raise("trans_bracket", "simpleline")
 log_box.tag_raise("trans_bracket", "simpleline_green")
+log_box.tag_raise("trans_bracket", "simpleline_blue")
 log_box.tag_raise("trans_bracket", "header")
 log_box.tag_raise("trans_bracket", "transcribe_using")
 
@@ -16382,9 +16386,30 @@ def _run_autorun():
 
             deferred_streams = []
 
+            # Populate sync queue so channels are visible in Sync Tasks popup
+            with _sync_queue_lock:
+                for ch in channels:
+                    if not any(q["url"] == ch["url"] for q in _sync_queue):
+                        _ch_copy = copy.deepcopy(ch)
+                        _ch_copy["_batch"] = True
+                        _sync_queue.append(_ch_copy)
+                        with _queue_order_lock:
+                            _queue_order.append(("sync", ch["url"]))
+            _update_queue_btn()
+
             for i, ch in enumerate(channels, 1):
                 if cancel_event.is_set():
                     break
+
+                # Pop this channel from the sync queue (mirrors _sync_worker)
+                with _sync_queue_lock:
+                    _sync_queue[:] = [q for q in _sync_queue if q["url"] != ch["url"]]
+                with _queue_order_lock:
+                    try:
+                        _queue_order.remove(("sync", ch["url"]))
+                    except ValueError:
+                        pass
+                _update_queue_btn()
 
                 if pause_event.is_set():
                     clear_transient_lines()
@@ -16413,6 +16438,7 @@ def _run_autorun():
                         continue
 
                 log(f"\n--- [{i}/{len(channels)}] SYNCING: {ch_name} ---\n", "header")
+                log(f"  Checking channel...\n", "dim")
                 _update_tray_tooltip(f"YT Archiver — [{i}/{len(channels)}] {ch_name}")
 
                 max_dur_ch = ch.get("max_duration", 0)
@@ -16806,7 +16832,7 @@ def _run_autorun():
                 zero_dl = sum(1 for count in ch_dl_map.values() if count == 0)
 
                 log("\n" + "=" * 45 + "\n", "summary")
-                log(f"TOTAL SESSION SUMMARY:\n", "summary")
+                log(f"TOTAL SYNC SUMMARY:\n", "summary")
                 _sum_parts = [f"Downloaded: {session_totals['dl']}", f"Channels without new videos: {zero_dl}"]
                 if session_totals['dur'] > 0:
                     _sum_parts.append(f"Filtered: {session_totals['dur']}")
@@ -16814,7 +16840,14 @@ def _run_autorun():
                     _sum_parts.append(f"Errors: {session_totals['err']}")
                 log(f"{', '.join(_sum_parts)}\n", "summary")
                 log("=" * 45 + "\n", "summary")
-                log("\n=== AUTO-SYNC COMPLETE ===\n", "header")
+                log("\n=== ALL CHANNELS SYNCED ===\n", "header")
+
+                _dl = session_totals["dl"]
+                _plural = "s" if _dl != 1 else ""
+                show_notification(
+                    "YT Archiver — Sync complete",
+                    f"Downloaded {_dl} video{_plural}. Errors: {session_totals['err']}"
+                )
 
         finally:
             _autorun_active = False

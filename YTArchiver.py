@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.5"
+APP_VERSION = "v25.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2581,8 +2581,11 @@ def _tray_start_spin(red=False):
     with _tray_spin_lock:
         if not _tray_spin_starting and (_tray_spin_thread is None or not _tray_spin_thread.is_alive()):
             _tray_spin_starting = True
-            _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
-            _tray_spin_thread.start()
+            try:
+                _tray_spin_thread = threading.Thread(target=_tray_spin_loop, daemon=True)
+                _tray_spin_thread.start()
+            except Exception:
+                _tray_spin_starting = False  # unblock future attempts
 
 
 def _tray_stop_spin(force=False):
@@ -3161,7 +3164,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:43pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 8:08pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4937,8 +4940,8 @@ def add_channel():
             })
 
     _clear_edit_mode()
-    refresh_channel_dropdowns()
     save_config(config)
+    refresh_channel_dropdowns()
 
     # Don't auto-add newly subscribed channels to the sync queue —
     # initialization should only happen on manual sync or full sync-subbed run.
@@ -5587,7 +5590,37 @@ def sync_single_channel():
     # Don't switch to Download tab — mini-logs on every tab show progress,
     # and the user may want to stay on the Subs tab to queue more channels.
     t_start_single = datetime.now()
-    threading.Thread(target=_single_worker, daemon=True).start()
+
+    def _safe_single_worker():
+        """Wrapper that guarantees _sync_running is cleared even on unhandled exceptions."""
+        global _sync_running, _current_sync_ch
+        try:
+            _single_worker()
+        except Exception as _unhandled:
+            log(f"\n  ⚠ Unexpected sync error: {_unhandled}\n", "red")
+            try:
+                log(f"  {traceback.format_exc()}\n", "red")
+            except Exception:
+                pass
+        finally:
+            # Safety net: if _single_worker didn't clear these, do it here
+            if _sync_running and _job_generation == _my_gen:
+                _sync_running = False
+                _current_sync_ch = None
+                _current_job["label"] = None
+                _current_job["url"] = None
+                _tray_stop_spin()
+                if _root_alive:
+                    def _reset_ui():
+                        try:
+                            sync_btn.config(state="normal")
+                            sync_single_btn.config(state="normal", text="▶ Sync this channel")
+                            _validate_download_btn()
+                            _sync_task_finished()
+                        except Exception:
+                            pass
+                    _ui_queue.append(_reset_ui)
+    threading.Thread(target=_safe_single_worker, daemon=True).start()
 
 
 def _process_sync_queue():
@@ -6933,7 +6966,32 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
                 entry["words"] = _generate_distributed_words(
                     seg["text"], seg["start"], seg["end"])
             new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-        # Single write — reduces risk of partial entries on disk errors
+        # Single write — reduces risk of partial entries on disk errors.
+        # First, repair any truncated last line left by a previous crash:
+        # if the file exists and its last line isn't valid JSON, remove it.
+        if os.path.isfile(jsonl_path):
+            try:
+                with open(jsonl_path, "rb") as _chk:
+                    _chk.seek(0, 2)
+                    _fsize = _chk.tell()
+                    if _fsize > 0:
+                        # Read last 8KB to find the final newline
+                        _read_back = min(_fsize, 8192)
+                        _chk.seek(_fsize - _read_back)
+                        _tail = _chk.read().decode("utf-8", errors="replace")
+                        _last_nl = _tail.rfind("\n", 0, len(_tail) - 1)
+                        _last_line = _tail[_last_nl + 1:].strip() if _last_nl >= 0 else _tail.strip()
+                        if _last_line:
+                            try:
+                                json.loads(_last_line)
+                            except (json.JSONDecodeError, ValueError):
+                                # Truncated line — remove it by truncating the file
+                                _trunc_pos = (_fsize - _read_back + _last_nl + 1) if _last_nl >= 0 else 0
+                                with open(jsonl_path, "r+b") as _fix:
+                                    _fix.seek(_trunc_pos)
+                                    _fix.truncate()
+            except Exception:
+                pass  # best-effort repair; don't block the write
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.writelines(new_lines)
         _hide_file_win(jsonl_path)
@@ -8530,9 +8588,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         """Persist completed video IDs so a cancelled redownload can resume."""
         try:
             os.makedirs(folder, exist_ok=True)
-            with open(_PROGRESS_FILE, "w", encoding="utf-8") as f:
+            _tmp = _PROGRESS_FILE + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 json.dump({"ch_url": ch_url, "resolution": new_res,
                            "done_ids": list(done_ids)}, f)
+            os.replace(_tmp, _PROGRESS_FILE)
         except Exception:
             pass
 
@@ -8986,13 +9046,23 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             except queue.Empty:
                 log(
                     f"  ⚠ Whisper stalled (no output for {_WHISPER_STALL_TIMEOUT // 60} min). "
-                    f"Restarting process...\n",
+                    f"Restarting process and retrying...\n",
                     "red",
                 )
                 with _ffmpeg_lock:
                     _gpu_actively_encoding = False
+                _stop_whisper_process()  # will be restarted by retry
+                # Retry once — stalls are usually transient (model loaded bad state)
+                if not hasattr(_whisper_transcribe, '_retrying') or not _whisper_transcribe._retrying:
+                    _whisper_transcribe._retrying = True
+                    try:
+                        _retry_result = _whisper_transcribe(
+                            audio_path, duration=duration, title=title,
+                            cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
+                        return _retry_result
+                    finally:
+                        _whisper_transcribe._retrying = False
                 _whisper_last_failed = True
-                _stop_whisper_process()  # will be restarted on next call
                 return None, []
 
             if response_line is None:
@@ -13132,20 +13202,24 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 if _out_base and os.path.isdir(_out_base):
                                     try:
                                         # Cache the walk result per output base; invalidate after 60s
+                                        # or when the file count in the directory changes (new download).
                                         if not hasattr(internal_run_cmd_blocking, '_walk_cache'):
                                             internal_run_cmd_blocking._walk_cache = {}
                                         _wc = internal_run_cmd_blocking._walk_cache
                                         _wc_key = _out_base
                                         _wc_entry = _wc.get(_wc_key)
                                         _now = time.time()
-                                        if not _wc_entry or (_now - _wc_entry[1]) > 60:
+                                        # Quick file count check to detect new downloads without a full walk
+                                        _dir_count = sum(1 for _ in os.scandir(_out_base) if _.is_file()) if os.path.isdir(_out_base) else 0
+                                        _cached_count = _wc_entry[2] if _wc_entry and len(_wc_entry) >= 3 else -1
+                                        if not _wc_entry or (_now - _wc_entry[1]) > 60 or _dir_count != _cached_count:
                                             _walk_files = []
                                             for _dp, _dns, _fns in os.walk(_out_base):
                                                 for _fn in _fns:
                                                     _fb, _fe = os.path.splitext(_fn)
                                                     if _fe.lower() in ('.mp4', '.mkv', '.webm'):
                                                         _walk_files.append((_dp, _fn, _fb, _fe))
-                                            _wc[_wc_key] = (_walk_files, _now)
+                                            _wc[_wc_key] = (_walk_files, _now, _dir_count)
                                         else:
                                             _walk_files = _wc_entry[0]
                                         for _dp, _fn, _fb, _fe in _walk_files:
@@ -16223,6 +16297,10 @@ def _gpu_start():
                 log(f"\n  ✓ All GPU Tasks completed.\n", "simpleline_green")
         except Exception as e:
             log(f"\n  ⚠ GPU Tasks error: {e}\n", "red")
+            try:
+                log(f"  {traceback.format_exc()}\n", "red")
+            except Exception:
+                pass
         finally:
             _gpu_running = False
             _gpu_current["label"] = None
@@ -18517,8 +18595,12 @@ class _TranscriptionPanel(ttk.Frame):
         new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
         new_content += new_entry
 
-        with open(txt_path, "w", encoding="utf-8") as f:
+        # Atomic write: write to temp file then replace, so a crash mid-write
+        # can't leave the transcript empty or corrupt.
+        _tmp = txt_path + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
             f.write(new_content)
+        os.replace(_tmp, txt_path)
 
     def _replace_jsonl_entry(self, jsonl_path, title, video_id, new_segments):
         """Replace a single video's segments in the .jsonl file."""
@@ -19245,10 +19327,10 @@ class _TranscriptionPanel(ttk.Frame):
             sort_note = (f", sorted by {sort_col} "
                          f"{'↑' if sort_asc else '↓'}") if sort_col else ""
             self._search_count.config(
-                text=f"{n} result{'s' if n != 1 else ''}{sort_note}")
+                text=f"{'500+' if n == 500 else n} result{'s' if n != 1 else ''}{sort_note}")
             if n == 500:
                 self._search_status.config(
-                    text="Showing 500 results — add filters to narrow down.",
+                    text="Results capped at 500 — there may be more. Add filters to narrow down.",
                     fg="#f0a020")
             else:
                 self._search_status.config(

@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.0"
+APP_VERSION = "v25.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 6:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:01pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6967,7 +6967,7 @@ def _scan_existing_jsonl(folder_path, ch_name):
                                         existing.add(title)
                                 except (json.JSONDecodeError, ValueError):
                                     _corrupt_lines += 1
-                    if _corrupt_lines:
+                    if _corrupt_lines and not _is_simple_mode:
                         try:
                             log(f"  ⚠ {_corrupt_lines} corrupt line(s) in {f} — skipped.\n", "red")
                         except Exception:

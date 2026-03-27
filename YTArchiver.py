@@ -480,6 +480,12 @@ def log(text, tag=None):
                                             log_box.tag_add("whisper_bracket",
                                                             log_box.index(f"{_wp_start}+{_close_b}c"),
                                                             log_box.index(f"{_wp_start}+{_close_b+1}c"))
+                                            # Color the / separator blue too
+                                            _slash_b = _before.find("/", 1)
+                                            if 0 < _slash_b < _close_b:
+                                                log_box.tag_add("whisper_bracket",
+                                                                log_box.index(f"{_wp_start}+{_slash_b}c"),
+                                                                log_box.index(f"{_wp_start}+{_slash_b+1}c"))
                                 _ttl_s = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
                                 _ttl_e = log_box.index(f"{_wp_start}+{len(_before)}c")
                                 if log_box.compare(_ttl_s, "<", _ttl_e):
@@ -866,6 +872,12 @@ def _reapply_whisper_overlays():
                 log_box.tag_add("whisper_bracket",
                                 log_box.index(f"{_wp_start}+{_close_b}c"),
                                 log_box.index(f"{_wp_start}+{_close_b+1}c"))
+                # Color the / separator blue too
+                _slash_b = _wp_text.find("/", 1)
+                if 0 < _slash_b < _close_b:
+                    log_box.tag_add("whisper_bracket",
+                                    log_box.index(f"{_wp_start}+{_slash_b}c"),
+                                    log_box.index(f"{_wp_start}+{_slash_b+1}c"))
     _ttl_start = log_box.index(f"{_wp_start}+{_trans_i + 12}c")
     _ttl_end = _wp_r[1]  # end of the first (prefix+title) range
     if log_box.compare(_ttl_start, "<", _ttl_end):
@@ -3165,7 +3177,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 11:53pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:06am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -22843,7 +22855,6 @@ def _load_queue_state():
                     if isinstance(entry, (list, tuple)) and len(entry) == 2:
                         _queue_order.append(tuple(entry))
         if restored:
-            log(f"Restored {restored} job(s) from previous session.\n", "simpleline_green")
             if gpu_restored:
                 _pause_str = " (paused)" if _gpu_pause.is_set() else ""
                 log(f"  💻 {gpu_restored} GPU task(s) restored{_pause_str}.\n", "simpleline_green")

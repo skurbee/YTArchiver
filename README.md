@@ -60,3 +60,4 @@ EXE in releases has icon bundled. If you run the .py seperately, download the .i
 
 
 Line by line, it's roughly 50% Claude-Code, 30% Copilot, 20% me :)
+

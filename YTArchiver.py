@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.4"
+APP_VERSION = "v25.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:21pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:43pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20956,9 +20956,10 @@ class _TranscriptionPanel(ttk.Frame):
             for dirpath, _dirs, files in os.walk(folder):
                 for f in files:
                     fp = os.path.join(dirpath, f)
-                    if f.endswith("Transcript.txt") and not f.startswith("."):
+                    fl = f.lower()
+                    if (fl.endswith("transcript.txt") or fl.endswith("transcription.txt")) and not f.startswith("."):
                         txt_files.append(fp)
-                    elif f.endswith("Transcript.jsonl") and f.startswith("."):
+                    elif fl.endswith(".jsonl") and f.startswith("."):
                         jsonl_files.append(fp)
             self.after(0, lambda: self._confirm_delete_all_transcriptions_ui(folder, txt_files, jsonl_files))
         threading.Thread(target=_count_files, daemon=True).start()
@@ -21127,6 +21128,31 @@ class _TranscriptionPanel(ttk.Frame):
             files = _tp_find_jsonl_files(roots)
             self._tp_log(
                 f"Found {len(files)} JSONL file(s) in {len(roots)} root(s).")
+
+            # Warn about .txt transcript files that have no .jsonl counterpart
+            _orphan_dirs = set()
+            for root_dir in roots:
+                if not os.path.isdir(root_dir):
+                    continue
+                for dirpath, _, filenames in os.walk(root_dir):
+                    fl_lower = [f.lower() for f in filenames]
+                    has_jsonl = any(f.endswith(".jsonl") for f in fl_lower)
+                    if not has_jsonl:
+                        has_txt = any(
+                            ("transcript" in f or "transcription" in f)
+                            and f.endswith(".txt")
+                            for f in fl_lower)
+                        if has_txt:
+                            _orphan_dirs.add(dirpath)
+            if _orphan_dirs:
+                self._tp_log(
+                    f"\n⚠ {len(_orphan_dirs)} folder(s) have transcript .txt "
+                    f"files but no .jsonl timestamp data:")
+                for od in sorted(_orphan_dirs):
+                    self._tp_log(f"    {od}")
+                self._tp_log(
+                    "  Re-transcribe these folders to generate .jsonl files "
+                    "and enable full indexing.\n")
 
             new_files = skip_files = total_segs = 0
             for i, fpath in enumerate(files):

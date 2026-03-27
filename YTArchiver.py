@@ -3165,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:09pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:16pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16674,55 +16674,80 @@ def _insert_hist_line(tw, entry, row_tags):
     tw.insert(tk.END, "\n", row_tags)
 
 
-def _fit_hist_line(entry, max_chars):
-    """Truncate the channel name in an activity-log line to fit within max_chars."""
-    # Total displayed width includes a 2-char indent added by _insert_hist_line
-    if len(entry) + 2 <= max_chars:
-        return entry
-    # Find the first " —" which ends the [Kind] + timestamp prefix
+def _parse_hist_entry(entry):
+    """Split an activity-log entry into (prefix, channel_name, stats) or None."""
     dash1 = entry.find(" —")
     if dash1 < 0:
-        return entry
+        return None
     rest = entry[dash1 + 2:]
-    # Look for the channel pattern: "  <centered name>  —" then stats
     dash2 = rest.find("  —")
     if dash2 < 4:
-        return entry  # no channel portion or too short
+        return None
     prefix = entry[:dash1 + 2]
-    ch_section = rest[:dash2]      # "  ChannelName         "
-    stats = rest[dash2 + 3:]       # everything after "  —"
-    ch_name = ch_section.strip()
+    ch_name = rest[:dash2].strip()
+    stats = rest[dash2 + 3:]
     if not ch_name:
-        return entry
-    # Calculate available chars for channel display
-    fixed = 2 + len(prefix) + 2 + 3 + len(stats)  # indent + prefix + "  " + "  —" + stats
-    avail = max(4, max_chars - fixed)
-    if len(ch_name) <= avail:
-        ch_disp = ch_name.center(avail)
+        return None
+    return prefix, ch_name, stats
+
+
+def _rebuild_hist_line(prefix, ch_name, stats, col_width):
+    """Reassemble an activity-log entry with a uniform channel column width."""
+    if len(ch_name) > col_width:
+        ch_disp = ch_name[:col_width - 1] + "\u2026"
     else:
-        ch_disp = (ch_name[:avail - 1] + "\u2026").center(avail)
-    return f"{prefix}  {ch_disp}  —{stats}"
+        ch_disp = ch_name
+    return f"{prefix}  {ch_disp:<{col_width}s}  —{stats}"
 
 
 def _refresh_autorun_history():
     autorun_history_text.config(state="normal")
     autorun_history_text.delete("1.0", tk.END)
-    # Calculate available character width for fitting lines
+    # Calculate available character width
     try:
         tw_width = autorun_history_text.winfo_width()
         if tw_width > 1:
             _font = tkfont.Font(font=autorun_history_text.cget("font"))
             char_w = _font.measure("M")
-            _hist_max_chars = max(40, tw_width // char_w) if char_w > 0 else 120
+            max_chars = max(40, tw_width // char_w) if char_w > 0 else 120
         else:
-            _hist_max_chars = 120
+            max_chars = 120
     except Exception:
-        _hist_max_chars = 120
+        max_chars = 120
     with config_lock:
         history = list(config.get("autorun_history", []))
+
+    # Parse all entries to find channel names and determine uniform column width
+    parsed = []
+    longest_ch = 0
+    for entry in history:
+        p = _parse_hist_entry(entry)
+        parsed.append(p)
+        if p:
+            longest_ch = max(longest_ch, len(p[1]))
+
+    if longest_ch > 0:
+        # Use the longest stats section to ensure all lines fit
+        max_fixed = 0
+        for p in parsed:
+            if p:
+                # 2 (indent) + len(prefix) + 2 ("  ") + ch_col + 3 ("  —") + len(stats)
+                fixed = 2 + len(p[0]) + 2 + 3 + len(p[2])
+                max_fixed = max(max_fixed, fixed)
+        avail_for_ch = max(4, max_chars - max_fixed)
+        # Column width: fit available space, but never wider than the longest name
+        col_width = max(4, min(longest_ch, avail_for_ch))
+    else:
+        col_width = 22  # fallback
+
     for idx, entry in enumerate(history):
         row_tags = ("hist_row_alt",) if idx % 2 == 0 else ()
-        _insert_hist_line(autorun_history_text, _fit_hist_line(entry, _hist_max_chars), row_tags)
+        p = parsed[idx]
+        if p:
+            fitted = _rebuild_hist_line(p[0], p[1], p[2], col_width)
+        else:
+            fitted = entry
+        _insert_hist_line(autorun_history_text, fitted, row_tags)
     autorun_history_text.config(state="disabled")
     # Scroll to bottom so newest entry is visible
     autorun_history_text.see(tk.END)

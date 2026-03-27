@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.3"
+APP_VERSION = "v25.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:21pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18418,6 +18418,7 @@ class _TranscriptionPanel(ttk.Frame):
                     return
 
                 # Apply punctuation fixup
+                self._browse_retranscribe_status("Restoring punctuation...")
                 text = _whisper_punct_fixup(text)
 
                 # --- Replace old entry in .txt ---
@@ -18430,9 +18431,19 @@ class _TranscriptionPanel(ttk.Frame):
                         jsonl_path, title, video_id or "", segments)
 
                     # --- Re-index this JSONL file in the DB ---
+                    self._browse_retranscribe_status("Re-indexing...")
                     roots = self._get_archive_roots()
-                    with self._db_lock:
-                        _tp_index_file(self._conn, jsonl_path, roots)
+                    # Acquire lock with retry — background indexer may hold it
+                    _got_lock = False
+                    for _ in range(120):  # up to 60s
+                        _got_lock = self._db_lock.acquire(timeout=0.5)
+                        if _got_lock:
+                            break
+                    if _got_lock:
+                        try:
+                            _tp_index_file(self._conn, jsonl_path, roots)
+                        finally:
+                            self._db_lock.release()
 
                 self._browse_retranscribe_done(True)
 

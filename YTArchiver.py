@@ -3165,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 10:38pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 11:53pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4565,7 +4565,8 @@ def _queue_pending_transcriptions():
     """Queue all channels with ✓ -X (new unprocessed videos) for GPU transcription."""
     with config_lock:
         out_dir = config.get("output_dir", "")
-        channels = list(config.get("channels", []))
+        channels = sorted(config.get("channels", []),
+                          key=lambda c: c.get("name", "").lower())
     added = 0
     for ch in channels:
         if ch.get("transcription_complete", False) and ch.get("transcription_pending", 0) > 0:
@@ -4589,7 +4590,8 @@ def _queue_pending_transcriptions():
 def _queue_all_transcriptions():
     """Queue ALL channels for GPU transcription (right-click action)."""
     with config_lock:
-        channels = list(config.get("channels", []))
+        channels = sorted(config.get("channels", []),
+                          key=lambda c: c.get("name", "").lower())
     n = len(channels)
     if n == 0:
         log(f"  No channels found.\n", "dim")
@@ -16618,11 +16620,11 @@ AUTORUN_HISTORY_MAX = 100
 def _insert_hist_line(tw, entry, row_tags):
     """Insert one activity-log entry into the history Text widget with inline colours."""
     line = f"  {entry}"
-    m = re.match(r'^(\s*\[(\w+)\])(.*)', line)
+    m = re.match(r'^(\s*\[\s*(\w+)\s*\])(.*)', line)
     if not m:
         tw.insert(tk.END, line + "\n", row_tags)
         return
-    prefix, kind, rest = m.group(1), m.group(2), m.group(3)
+    prefix, kind, rest = m.group(1), m.group(2).strip(), m.group(3)
 
     # Colour for the [Kind] tag
     if kind == "Trnscr":
@@ -16783,7 +16785,7 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
     else:
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
-    kind_tag = f"[{kind}]".ljust(8)
+    kind_tag = f"[{kind.center(6)}]" if len(kind) < 6 else f"[{kind}]"
     ch_part = f"  {channel_name}  —" if channel_name else " " * 7
     line = f"{kind_tag} {ts_date} —{ch_part}  {dl:>4} {'downloaded':<11} · {skipped:>4} skipped · {err:>1} errors · {dur}"
     with config_lock:

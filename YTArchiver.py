@@ -236,6 +236,44 @@ _whisper_lock = threading.Lock()  # protects _whisper_proc and _whisper_line_que
 _tray_spin_lock = threading.Lock()  # protects _tray_spin_starting flag
 _session_totals_lock = threading.Lock()  # protects session_totals reset
 
+# ---------------------------------------------------------------------------
+# TuneShine sync progress IPC — writes a JSON file for TuneShine Control to read
+# ---------------------------------------------------------------------------
+
+_SYNC_PROGRESS_DIR = os.path.join(os.environ.get("APPDATA", ""), "YTArchiver")
+_SYNC_PROGRESS_PATH = os.path.join(_SYNC_PROGRESS_DIR, "sync_progress.json")
+
+
+def _write_sync_progress():
+    """Write current sync state to a JSON file for TuneShine Control to display."""
+    try:
+        os.makedirs(_SYNC_PROGRESS_DIR, exist_ok=True)
+        data = {
+            "running": True,
+            "channel": (_current_sync_ch or {}).get("name", ""),
+            "idx": _queue_batch_idx if _queue_batch_total > 0 else 1,
+            "total": _queue_batch_total if _queue_batch_total > 0 else 1,
+            "dl": session_totals["dl"],
+            "skip": session_totals["skip"] + session_totals["dur"],
+            "err": session_totals["err"],
+        }
+        tmp = _SYNC_PROGRESS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _SYNC_PROGRESS_PATH)
+    except Exception:
+        pass
+
+
+def _clear_sync_progress():
+    """Remove the sync progress file when sync ends."""
+    try:
+        if os.path.exists(_SYNC_PROGRESS_PATH):
+            os.remove(_SYNC_PROGRESS_PATH)
+    except Exception:
+        pass
+
+
 # Disk error auto-pause — detects write errors (e.g. disconnected drive) and
 # pauses all tasks, retrying every 5 minutes until the disk is writable again.
 _disk_error_active = False
@@ -3193,7 +3231,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:19pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:01pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5139,6 +5177,7 @@ def sync_single_channel():
     _current_job["url"] = ch["url"]
     global _current_sync_ch
     _current_sync_ch = copy.deepcopy(ch)
+    _write_sync_progress()
     _tray_start_spin()
     _update_tray_tooltip(f"YT Archiver — Syncing {ch['name']}")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
@@ -5617,6 +5656,7 @@ def sync_single_channel():
                     _queue_batch_t_start = None
                     _sync_running = False
                     _current_sync_ch = None
+                    _clear_sync_progress()
                     if _root_alive:
                         def _on_single_sync_done(_fdl=_final_dl):
                             _validate_download_btn()
@@ -5659,6 +5699,7 @@ def sync_single_channel():
             if _sync_running and _job_generation == _my_gen:
                 _sync_running = False
                 _current_sync_ch = None
+                _clear_sync_progress()
                 _current_job["label"] = None
                 _current_job["url"] = None
                 _tray_stop_spin()
@@ -5697,6 +5738,7 @@ def _process_sync_queue():
         _queue_batch_t_start = datetime.now()
     _queue_batch_idx += 1
     _queue_batch_total = _queue_batch_idx + remaining
+    _write_sync_progress()
 
     if next_ch.get("initialized", False):
         _current_job["label"] = f"Sync {next_ch['name']}"
@@ -5729,6 +5771,7 @@ def _process_sync_queue():
             with _sync_queue_lock:
                 _sync_running = False
             _current_sync_ch = None
+            _clear_sync_progress()
             _current_job["label"] = None
             _current_job["url"] = None
             _tray_stop_spin()
@@ -13697,6 +13740,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     videos_processed.add(dedup_key)
                     dl_count += 1
                     session_totals["dl"] += 1
+                    _write_sync_progress()
 
                     if is_simple_mode:
                         _update_simple_dl(dl_count, 0, batch_size=compress_batch_size if on_batch_ready else 0)
@@ -13878,6 +13922,7 @@ def start_sync_all():
 
     _sync_running = True
     _current_job["label"] = "Sync Subs"
+    _write_sync_progress()
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Syncing...")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
@@ -13973,6 +14018,7 @@ def start_sync_all():
                 _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
+                _write_sync_progress()
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
                 log(f"  Checking channel...\n", "dim")
@@ -14428,6 +14474,7 @@ def start_sync_all():
 
                 _sync_running = False
                 _current_sync_ch = None
+                _clear_sync_progress()
                 _current_job["label"] = None
                 _current_job["url"] = None
                 _update_queue_btn()
@@ -17035,6 +17082,7 @@ def _run_autorun():
     _my_gen = _job_generation
 
     _sync_running = True
+    _write_sync_progress()
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Auto-syncing...")
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
@@ -17099,6 +17147,7 @@ def _run_autorun():
                 _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
+                _write_sync_progress()
 
                 # GPU batch limit: skip channel if too many unprocessed encode batches
                 _c_level_bl = ch.get("compress_level", "")
@@ -17550,6 +17599,7 @@ def _run_autorun():
             if _job_generation == _my_gen:
                 _sync_running = False
                 _current_sync_ch = None
+                _clear_sync_progress()
                 _current_job["label"] = None
                 _current_job["url"] = None
 

@@ -80,7 +80,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.2"
+APP_VERSION = "v25.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3161,7 +3161,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:01pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 7:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18511,11 +18511,18 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _replace_jsonl_entry(self, jsonl_path, title, video_id, new_segments):
         """Replace a single video's segments in the .jsonl file."""
-        # Clear hidden attribute so we can write (re-set by _write_jsonl_entry)
+        # Clear hidden + read-only attributes so we can write (re-set by _write_jsonl_entry)
         if os.name == "nt":
             try:
+                _norm = os.path.normpath(jsonl_path)
                 ctypes.windll.kernel32.SetFileAttributesW(
-                    jsonl_path, 0x80)  # FILE_ATTRIBUTE_NORMAL
+                    _norm, 0x80)  # FILE_ATTRIBUTE_NORMAL
+            except Exception:
+                pass
+            # Belt-and-suspenders: also try via os.chmod
+            try:
+                import stat
+                os.chmod(jsonl_path, stat.S_IWRITE | stat.S_IREAD)
             except Exception:
                 pass
 

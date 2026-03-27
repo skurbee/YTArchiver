@@ -3165,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 10:38pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10513,8 +10513,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         log(f"  [{idx}/{total}] {fname} — no captions, queuing for Whisper.\n", "dim")
                         unmatched.append((fname, fpath))
                         _whisper_queued += 1
-                        # Don't increment total when re-queuing for Phase B — these files
-                        # are already counted in the total; bumping double-counts them.
+                        # Bump total: this file already incremented idx in Phase A, and will
+                        # increment idx again in Phase B, so total needs +1 to stay in sync.
+                        total += 1
                         # Update cache immediately so a restart skips this file in Phase A
                         try:
                             with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
@@ -15436,7 +15437,7 @@ def _update_queue_btn():
             _update_sync_badge()
 
             # Manage sync blink animation
-            _is_running = _sync_running or _reorg_running or _redownload_running or _transcribe_running
+            _is_running = _sync_running or _reorg_running or _redownload_running or (_transcribe_running and _transcribe_sync_controlled)
             if _is_running and not _sync_blink["active"]:
                 _sync_blink_start()
             elif not _is_running and _sync_blink["active"]:

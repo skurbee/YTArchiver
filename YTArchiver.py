@@ -242,6 +242,8 @@ _session_totals_lock = threading.Lock()  # protects session_totals reset
 
 _SYNC_PROGRESS_DIR = os.path.join(os.environ.get("APPDATA", ""), "YTArchiver")
 _SYNC_PROGRESS_PATH = os.path.join(_SYNC_PROGRESS_DIR, "sync_progress.json")
+_sync_ch_idx = 0    # current channel index across all sync flows
+_sync_ch_total = 0  # total channels across all sync flows
 
 
 def _write_sync_progress():
@@ -251,8 +253,8 @@ def _write_sync_progress():
         data = {
             "running": True,
             "channel": (_current_sync_ch or {}).get("name", ""),
-            "idx": _queue_batch_idx if _queue_batch_total > 0 else 1,
-            "total": _queue_batch_total if _queue_batch_total > 0 else 1,
+            "idx": _sync_ch_idx if _sync_ch_total > 0 else (_queue_batch_idx if _queue_batch_total > 0 else 1),
+            "total": _sync_ch_total if _sync_ch_total > 0 else (_queue_batch_total if _queue_batch_total > 0 else 1),
             "dl": session_totals["dl"],
             "skip": session_totals["skip"] + session_totals["dur"],
             "err": session_totals["err"],
@@ -267,6 +269,9 @@ def _write_sync_progress():
 
 def _clear_sync_progress():
     """Remove the sync progress file when sync ends."""
+    global _sync_ch_idx, _sync_ch_total
+    _sync_ch_idx = 0
+    _sync_ch_total = 0
     try:
         if os.path.exists(_SYNC_PROGRESS_PATH):
             os.remove(_SYNC_PROGRESS_PATH)
@@ -3231,7 +3236,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:01pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:37pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13930,7 +13935,7 @@ def start_sync_all():
     t_start_manual = datetime.now()
 
     def _sync_worker():
-        global _sync_running, _current_sync_ch
+        global _sync_running, _current_sync_ch, _sync_ch_idx, _sync_ch_total
         try:
             out_dir = _captured_outdir
             if not check_directory_writable(out_dir):
@@ -14018,6 +14023,8 @@ def start_sync_all():
                 _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
+                _sync_ch_idx = i
+                _sync_ch_total = current_total
                 _write_sync_progress()
 
                 log(f"\n--- [{i}/{current_total}] SYNCING: {ch_name} ---\n", "header")
@@ -17088,7 +17095,7 @@ def _run_autorun():
     _captured_outdir = outdir_var.get().strip() or BASE_DIR
 
     def _auto_worker():
-        global _autorun_active, _sync_running, _current_sync_ch
+        global _autorun_active, _sync_running, _current_sync_ch, _sync_ch_idx, _sync_ch_total
         _autorun_active = True
         _current_job["label"] = "Sync Subs"
         ch_dl_map = {}
@@ -17147,6 +17154,8 @@ def _run_autorun():
                 _current_job["label"] = f"Sync {ch_name}"
                 _current_job["url"] = ch.get("url")
                 _current_sync_ch = copy.deepcopy(ch)
+                _sync_ch_idx = i
+                _sync_ch_total = len(channels)
                 _write_sync_progress()
 
                 # GPU batch limit: skip channel if too many unprocessed encode batches

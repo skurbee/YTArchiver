@@ -3165,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:26pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16783,8 +16783,7 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
     kind_tag = f"[{kind}]".ljust(8)
-    ch_display = (channel_name[:21] + "…") if len(channel_name) > 22 else channel_name
-    ch_part = f"  {ch_display:^22s}  —" if channel_name else " " * 27
+    ch_part = f"  {channel_name}  —" if channel_name else " " * 7
     line = f"{kind_tag} {ts_date} —{ch_part}  {dl:>4} {'downloaded':<11} · {skipped:>4} skipped · {err:>1} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
@@ -16814,8 +16813,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
     else:
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
-    ch_display = (channel_name[:21] + "…") if len(channel_name) > 22 else channel_name
-    ch_part = f"  {ch_display:^22s}  —" if channel_name else " " * 27
+    ch_part = f"  {channel_name}  —" if channel_name else " " * 7
     line = f"[Trnscr] {ts_date} —{ch_part}  {done_count:>4} {'transcribed':<11} · {skipped:>4} skipped · {err_count:>1} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
@@ -16843,9 +16841,8 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
     batch_part = f" Batch {batch_num} —" if batch_num is not None else ""
-    ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
-    ch_part = f"{ch_display:^22s}"
-    line = f"[Cmprss] {ts_date} —  {ch_part}{batch_part}  {done_count:>4} {'compressed':<11} · {err_count:>1} errors · {dur}"
+    ch_part = f"  {ch_name}  —" if ch_name else " " * 7
+    line = f"[Cmprss] {ts_date} —{ch_part}{batch_part}  {done_count:>4} {'compressed':<11} · {err_count:>1} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -16865,8 +16862,7 @@ def _record_redownload_start(ch_name, res_label, total_count):
         "%I:%M%p").lower().lstrip("0")
     date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
     ts_date = f"{ts}, {date}".ljust(16)
-    ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
-    ch_part = f"  {ch_display:^22s}  —" if ch_name else " " * 27
+    ch_part = f"  {ch_name}  —" if ch_name else " " * 7
     line = f"[ReDwnl] {ts_date} —{ch_part}  {total_count:>4} total        · ▶ running..."
     _redownload_hist_marker = line  # store the exact line for later lookup
     with config_lock:
@@ -16898,8 +16894,7 @@ def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, sk
     else:
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
-    ch_display = (ch_name[:21] + "…") if len(ch_name) > 22 else ch_name
-    ch_part = f"  {ch_display:^22s}  —" if ch_name else " " * 27
+    ch_part = f"  {ch_name}  —" if ch_name else " " * 7
     line = f"[ReDwnl] {ts_date} —{ch_part}  {done:>4} {'replaced':<11} · {skipped:>4} skipped ·  {errors} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])

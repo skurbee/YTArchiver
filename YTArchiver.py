@@ -3165,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:16pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:26pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16697,7 +16697,7 @@ def _rebuild_hist_line(prefix, ch_name, stats, col_width):
         ch_disp = ch_name[:col_width - 1] + "\u2026"
     else:
         ch_disp = ch_name
-    return f"{prefix}  {ch_disp:<{col_width}s}  —{stats}"
+    return f"{prefix}  {ch_disp:^{col_width}s}  —{stats}"
 
 
 def _refresh_autorun_history():

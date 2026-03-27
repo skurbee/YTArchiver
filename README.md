@@ -3,7 +3,6 @@
 
 Download, organize, transcribe, search, and compress entire channels — then keep them in sync as new videos are published.
 
-(Pictures in the Wiki)
 
 ## Features
 

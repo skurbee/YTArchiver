@@ -631,10 +631,20 @@ def log(text, tag=None):
                     log_box.insert(_p, "[", _bk_tag)
                     _p = log_box.index(f"{_p}+1c")
                     # N/M numbers — white for transcription done lines, base tag otherwise
+                    # Split into N, /, M so the slash gets bracket color
                     _nums = _txt[_bk_m.start() + 1:_bk_m.end() - 1]
                     _nums_tag = "dl_white" if _do_white else _base_tag
-                    log_box.insert(_p, _nums, _nums_tag)
-                    _p = log_box.index(f"{_p}+{len(_nums)}c")
+                    _sl_pos = _nums.find("/")
+                    if _sl_pos >= 0:
+                        log_box.insert(_p, _nums[:_sl_pos], _nums_tag)
+                        _p = log_box.index(f"{_p}+{_sl_pos}c")
+                        log_box.insert(_p, "/", _bk_tag)
+                        _p = log_box.index(f"{_p}+1c")
+                        log_box.insert(_p, _nums[_sl_pos + 1:], _nums_tag)
+                        _p = log_box.index(f"{_p}+{len(_nums) - _sl_pos - 1}c")
+                    else:
+                        log_box.insert(_p, _nums, _nums_tag)
+                        _p = log_box.index(f"{_p}+{len(_nums)}c")
                     # ] bracket in green/blue
                     log_box.insert(_p, "]", _bk_tag)
                     _p = log_box.index(f"{_p}+1c")
@@ -685,7 +695,7 @@ def log(text, tag=None):
                     if _tu_ranges:
                         _tu_start = _tu_ranges[-2]
                         _tu_text = log_box.get(_tu_ranges[-2], _tu_ranges[-1])
-                        # Blue brackets on [idx/total]
+                        # Blue brackets and slash on [idx/total]
                         _tu_bk = re.search(r'\[(\d+/\d+)\]', _tu_text)
                         if _tu_bk:
                             log_box.tag_add("trans_bracket",
@@ -694,6 +704,12 @@ def log(text, tag=None):
                             log_box.tag_add("trans_bracket",
                                             log_box.index(f"{_tu_start}+{_tu_bk.end() - 1}c"),
                                             log_box.index(f"{_tu_start}+{_tu_bk.end()}c"))
+                            # Color the / separator blue too
+                            _tu_slash = _tu_text.find("/", _tu_bk.start() + 1)
+                            if _tu_bk.start() < _tu_slash < _tu_bk.end():
+                                log_box.tag_add("trans_bracket",
+                                                log_box.index(f"{_tu_start}+{_tu_slash}c"),
+                                                log_box.index(f"{_tu_start}+{_tu_slash + 1}c"))
                         _tu_trans_i = _tu_text.find("Transcribing")
                         if _tu_trans_i > 0:
                             # White: [idx/total] prefix before "Transcribing"
@@ -3177,7 +3193,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:06am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

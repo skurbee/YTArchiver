@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
+import tkinter.font as tkfont
 import threading
 import queue
 import subprocess
@@ -3164,7 +3165,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 8:08pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.26.26 9:09pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3460,6 +3461,27 @@ autorun_history_text.tag_configure("hist_row_alt", background="#101520")
 # Prevent interaction (visual-only)
 autorun_history_text.bind("<Button-1>",  lambda e: "break")
 autorun_history_text.bind("<B1-Motion>", lambda e: "break")
+
+# Re-fit activity log lines when the widget is resized
+_hist_resize_job = {"id": None}
+
+def _on_hist_configure(event=None):
+    if _hist_resize_job["id"]:
+        try:
+            root.after_cancel(_hist_resize_job["id"])
+        except Exception:
+            pass
+    _hist_resize_job["id"] = root.after(150, _do_hist_refit)
+
+def _do_hist_refit():
+    _hist_resize_job["id"] = None
+    try:
+        if _root_alive:
+            _refresh_autorun_history()
+    except Exception:
+        pass
+
+autorun_history_text.bind("<Configure>", _on_hist_configure)
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
 
@@ -16652,14 +16674,55 @@ def _insert_hist_line(tw, entry, row_tags):
     tw.insert(tk.END, "\n", row_tags)
 
 
+def _fit_hist_line(entry, max_chars):
+    """Truncate the channel name in an activity-log line to fit within max_chars."""
+    # Total displayed width includes a 2-char indent added by _insert_hist_line
+    if len(entry) + 2 <= max_chars:
+        return entry
+    # Find the first " —" which ends the [Kind] + timestamp prefix
+    dash1 = entry.find(" —")
+    if dash1 < 0:
+        return entry
+    rest = entry[dash1 + 2:]
+    # Look for the channel pattern: "  <centered name>  —" then stats
+    dash2 = rest.find("  —")
+    if dash2 < 4:
+        return entry  # no channel portion or too short
+    prefix = entry[:dash1 + 2]
+    ch_section = rest[:dash2]      # "  ChannelName         "
+    stats = rest[dash2 + 3:]       # everything after "  —"
+    ch_name = ch_section.strip()
+    if not ch_name:
+        return entry
+    # Calculate available chars for channel display
+    fixed = 2 + len(prefix) + 2 + 3 + len(stats)  # indent + prefix + "  " + "  —" + stats
+    avail = max(4, max_chars - fixed)
+    if len(ch_name) <= avail:
+        ch_disp = ch_name.center(avail)
+    else:
+        ch_disp = (ch_name[:avail - 1] + "\u2026").center(avail)
+    return f"{prefix}  {ch_disp}  —{stats}"
+
+
 def _refresh_autorun_history():
     autorun_history_text.config(state="normal")
     autorun_history_text.delete("1.0", tk.END)
+    # Calculate available character width for fitting lines
+    try:
+        tw_width = autorun_history_text.winfo_width()
+        if tw_width > 1:
+            _font = tkfont.Font(font=autorun_history_text.cget("font"))
+            char_w = _font.measure("M")
+            _hist_max_chars = max(40, tw_width // char_w) if char_w > 0 else 120
+        else:
+            _hist_max_chars = 120
+    except Exception:
+        _hist_max_chars = 120
     with config_lock:
         history = list(config.get("autorun_history", []))
     for idx, entry in enumerate(history):
         row_tags = ("hist_row_alt",) if idx % 2 == 0 else ()
-        _insert_hist_line(autorun_history_text, entry, row_tags)
+        _insert_hist_line(autorun_history_text, _fit_hist_line(entry, _hist_max_chars), row_tags)
     autorun_history_text.config(state="disabled")
     # Scroll to bottom so newest entry is visible
     autorun_history_text.see(tk.END)
@@ -18700,22 +18763,22 @@ class _TranscriptionPanel(ttk.Frame):
             return self._browse_seg_map[i][2]
         return None
 
+    _TS_LEAD_BROWSE = 1.5  # seconds of lead for external VLC / YouTube seeks
+
     def _word_ts_lookup(self, words_json, word, seg_start, seg_end):
-        """Return the best seek timestamp for word within a segment.
-        Uses per-word timestamps when available; falls back to interpolation."""
-        _TS_LEAD = 1.5  # seconds to seek before the matched word
+        """Return the exact seek timestamp for word within a segment.
+        Uses per-word timestamps when available; falls back to segment start.
+        Lead offset is applied separately by the caller based on player type."""
         if words_json:
             try:
                 word_list = json.loads(words_json)
                 clean = word.lower().strip(".,!?;:\"'()-")
                 for w in word_list:
                     if w.get("w", "").lower().strip(".,!?;:\"'()-") == clean:
-                        return max(0.0, w["s"] - _TS_LEAD)
+                        return max(0.0, w["s"])
             except Exception:
                 pass
-        # Fallback: use segment start with a small lead so the user still
-        # lands very close to the right spot even without word timestamps.
-        return max(0.0, seg_start - _TS_LEAD)
+        return max(0.0, seg_start)
 
     def _show_browse_open_menu(self, x, y, video_id, video_path, ts,
                                 word, seg_text, title, channel, start_time):
@@ -18745,7 +18808,8 @@ class _TranscriptionPanel(ttk.Frame):
                              state="disabled")
 
         if video_id:
-            url = f"https://www.youtube.com/watch?v={video_id}&t={int(ts)}s"
+            _yt_t = max(0, int(ts - self._TS_LEAD_BROWSE))
+            url = f"https://www.youtube.com/watch?v={video_id}&t={_yt_t}s"
             menu.add_command(label="  Open Video — YouTube",
                              command=lambda u=url: _webbrowser.open(u))
         else:
@@ -19396,18 +19460,18 @@ class _TranscriptionPanel(ttk.Frame):
 
     # ── Viewer ────────────────────────────────────────────────────────────────
 
-    _TS_LEAD_SECONDS = 5.0  # seconds to seek before the matched word
+    _TS_LEAD_SECONDS = 5.0  # seconds of lead for external VLC / YouTube seeks
 
     @staticmethod
     def _interpolate_ts(start, end, seg_text, query):
-        lead = _TranscriptionPanel._TS_LEAD_SECONDS
+        """Return exact interpolated timestamp. Lead is applied by caller."""
         if not query or not seg_text or end <= start:
-            return max(0.0, start - lead)
+            return max(0.0, start)
         idx = seg_text.lower().find(query.lower())
         if idx < 0:
-            return max(0.0, start - lead)
+            return max(0.0, start)
         ts = start + (idx / max(1, len(seg_text))) * (end - start)
-        return max(0.0, ts - lead)
+        return max(0.0, ts)
 
     def _get_txt_path(self, jsonl_path):
         d  = os.path.dirname(jsonl_path)
@@ -19455,13 +19519,14 @@ class _TranscriptionPanel(ttk.Frame):
         return None
 
     def _open_vlc(self, video_path, start_time=0, title="", db_rows=None):
-        """Open video — embedded player if VLC lib available, else external."""
+        """Open video — embedded player uses exact timestamp, external VLC
+        applies a small lead offset so the user lands just before the target."""
         if _HAS_VLC:
             self._open_embedded_player(video_path, start_time, title=title,
                                        db_rows=db_rows)
             return True
-        # Fallback: external VLC
-        seek = max(0.0, float(start_time))
+        # Fallback: external VLC — apply lead so user lands 1-2s early
+        seek = max(0.0, float(start_time) - 1.5)
         for vlc in self._VLC_PATHS:
             try:
                 subprocess.Popen([vlc, os.path.normpath(video_path),
@@ -19695,8 +19760,9 @@ class _TranscriptionPanel(ttk.Frame):
                              state="disabled")
 
         if meta.get("video_id"):
+            _yt_t = max(0, int(ts - self._TS_LEAD_SECONDS))
             url = (f"https://www.youtube.com/watch?v={meta['video_id']}"
-                   f"&t={int(ts)}s")
+                   f"&t={_yt_t}s")
             menu.add_command(label="  Open Video — YouTube",
                              command=lambda u=url: _webbrowser.open(u))
         else:
@@ -20714,10 +20780,20 @@ class _TranscriptionPanel(ttk.Frame):
             self._player_play_btn.config(text="⏸")
 
     def _player_seek(self, time_sec):
-        """Seek to a specific time in seconds."""
+        """Seek to a specific time in seconds.
+        Pauses briefly before seeking to work around VLC's set_time()
+        becoming unresponsive after rapid successive calls during playback."""
         if not self._vlc_player:
             return
-        self._vlc_player.set_time(int(time_sec * 1000))
+        ms = int(time_sec * 1000)
+        was_playing = self._vlc_player.is_playing()
+        if was_playing:
+            self._vlc_player.pause()
+        self._vlc_player.set_time(ms)
+        # Reset word highlight tracking so it jumps to the new position
+        self._player_last_word_idx = -1
+        if was_playing:
+            self._vlc_player.play()
 
     def _player_on_slider_release(self, event):
         if not self._vlc_player:
@@ -20755,7 +20831,7 @@ class _TranscriptionPanel(ttk.Frame):
                 try:
                     widx = int(t[1:])
                     if 0 <= widx < len(self._player_words):
-                        seek_time = max(0, self._player_words[widx]["s"] - 0.5)
+                        seek_time = max(0, self._player_words[widx]["s"])
                         self._player_seek(seek_time)
                         # Auto-play if paused
                         if not self._vlc_player.is_playing():
@@ -21489,7 +21565,7 @@ recent_tree.heading("time", text="Downloaded", anchor="w", command=lambda: _sort
 recent_tree.heading("duration", text="Length", anchor="e", command=lambda: _sort_recent_tree("duration", False))
 recent_tree.heading("size", text="Size", anchor="e", command=lambda: _sort_recent_tree("size", False))
 
-recent_tree.column("title", stretch=False, minwidth=120, width=400, anchor="w")
+recent_tree.column("title", stretch=True, minwidth=120, width=400, anchor="w")
 recent_tree.column("channel", stretch=False, minwidth=60, width=140, anchor="w")
 recent_tree.column("time", stretch=False, minwidth=50, width=100, anchor="w")
 recent_tree.column("duration", stretch=False, minwidth=40, width=62, anchor="e")

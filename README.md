@@ -28,7 +28,7 @@ Download, organize, transcribe, search, and compress entire channels — then ke
 - **Transcript output** — clean `.txt` files with an option to follow the channel's folder org or combine into a single file per channel
 - **Hidden JSONL sidecars** — per-word timestamps and video IDs stored alongside readable transcripts
 
-### Transcriptions Tab
+### Browse Tab
 - **Searchable transcript database** — full-text search across all transcribed channels
 - **Embedded video player** — plays video inline with a synced, scrolling transcript (requires VLC)
 - **Click-to-seek** — click any word in the transcript to jump the video to that moment

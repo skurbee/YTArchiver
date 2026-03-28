@@ -237,6 +237,13 @@ _tray_spin_lock = threading.Lock()  # protects _tray_spin_starting flag
 _session_totals_lock = threading.Lock()  # protects session_totals reset
 
 # ---------------------------------------------------------------------------
+# Background internet monitor — pings every 5s, pauses all ops on outage
+# ---------------------------------------------------------------------------
+_internet_down = threading.Event()           # SET when internet is confirmed down (2 consecutive failures)
+_internet_monitor_running = False            # prevents duplicate monitor threads
+_internet_went_down_during = threading.Event()  # "dirty flag" — set on any outage, cleared before ops that need a clean run (e.g. playlist fetches)
+
+# ---------------------------------------------------------------------------
 # TuneShine sync progress IPC — writes a JSON file for TuneShine Control to read
 # ---------------------------------------------------------------------------
 
@@ -1772,6 +1779,9 @@ def _fetch_video_title(vid_id):
 
 
 def spawn_yt_dlp(cmd):
+    # Block if internet is down — don't spawn yt-dlp into a dead connection
+    if _internet_down.is_set():
+        _block_if_no_internet()
     try:
         # Always use utf-8; yt-dlp outputs utf-8 and mbcs mangles apostrophes/special chars into '?'
         # Force unbuffered stdout so --flat-playlist --print id output isn't held in yt-dlp's buffer
@@ -3236,7 +3246,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 10:53pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 3:17pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5178,6 +5188,7 @@ def sync_single_channel():
     _my_gen = _job_generation
 
     _sync_running = True
+    _start_internet_monitor()
     _current_job["label"] = f"Sync {ch['name']}"
     _current_job["url"] = ch["url"]
     global _current_sync_ch
@@ -8766,25 +8777,41 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
 
         # ── Step 2: Fetch YouTube video list for ID matching ──
         # Try with cookies first; fall back to without cookies for public channels.
+        # Protected by internet monitor: if internet drops mid-fetch, wait and retry.
         log("  Fetching YouTube video list for ID matching...\n", "simpleline")
-        yt_title_to_id = _fetch_yt_list(use_cookies=True)
+        while not _ce.is_set():
+            _internet_went_down_during.clear()  # arm the dirty flag
+            if not _block_if_no_internet(cancel_ev=_ce):
+                break  # cancelled
+            yt_title_to_id = _fetch_yt_list(use_cookies=True)
+
+            if _ce.is_set():
+                break
+
+            if yt_title_to_id is None:
+                log("  ⚠ Could not start yt-dlp (not installed or not on PATH).\n", "red")
+                return
+
+            if not yt_title_to_id:
+                # Retry without cookies — useful for public channels where Firefox
+                # cookies are not configured or cause authentication errors.
+                log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+                yt_title_to_id = _fetch_yt_list(use_cookies=False) or {}
+                if _ce.is_set():
+                    break
+
+            # Check if internet dropped during the fetch — list may be incomplete
+            if _internet_went_down_during.is_set() and not _ce.is_set():
+                log("  ⚠ Internet dropped during playlist fetch — will re-fetch after restore.\n", "red")
+                if not _block_if_no_internet(cancel_ev=_ce):
+                    break  # cancelled
+                log("  Retrying YouTube video list fetch...\n", "simpleline")
+                continue  # retry from the top
+            break  # clean fetch — proceed
 
         if _ce.is_set():
             log("  Redownload cancelled during YouTube fetch.\n", "simpleline")
             return
-
-        if yt_title_to_id is None:
-            log("  ⚠ Could not start yt-dlp (not installed or not on PATH).\n", "red")
-            return
-
-        if not yt_title_to_id:
-            # Retry without cookies — useful for public channels where Firefox
-            # cookies are not configured or cause authentication errors.
-            log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
-            yt_title_to_id = _fetch_yt_list(use_cookies=False) or {}
-            if _ce.is_set():
-                log("  Redownload cancelled during YouTube fetch.\n", "simpleline")
-                return
 
         if not yt_title_to_id:
             log("  ⚠ Could not retrieve video list from YouTube. Check the channel URL and your internet connection.\n", "red")
@@ -9329,6 +9356,82 @@ def _wait_for_internet(cancel_ev, pause_ev, log_fn=None):
             return True
         time.sleep(3)
     return False
+
+
+# ─── Background Internet Monitor ─────────────────────────────────────────────
+
+def _start_internet_monitor():
+    """Start the background internet monitor if not already running.
+
+    Pings every 5 seconds.  After 2 consecutive failures, sets _internet_down
+    (pausing all internet-dependent operations) and _internet_went_down_during
+    (dirty flag so playlist fetches know to retry).  On restoration, clears
+    _internet_down and logs a green message.  The thread exits automatically
+    when no operations (_sync_running, _transcribe_running, _redownload_running)
+    are active.
+    """
+    global _internet_monitor_running
+    if _internet_monitor_running:
+        return  # already running
+    _internet_monitor_running = True  # set before thread start to close race window
+
+    def _monitor_loop():
+        global _internet_monitor_running
+        _consec_fails = 0
+        _was_down = False
+        try:
+            while True:
+                # Exit when nothing needs internet monitoring
+                if (not _sync_running and not _transcribe_running
+                        and not _redownload_running and not _gpu_running):
+                    break
+                # Also exit if everything has been cancelled
+                if cancel_event.is_set() and _gpu_cancel.is_set():
+                    break
+
+                if _check_internet(timeout=5):
+                    _consec_fails = 0
+                    if _was_down:
+                        # Internet just came back
+                        _internet_down.clear()
+                        _was_down = False
+                        log("  ✓ Internet restored — resuming operations.\n", "simpleline_green")
+                else:
+                    _consec_fails += 1
+                    if _consec_fails >= 2 and not _was_down:
+                        # Confirmed outage — pause everything
+                        _internet_down.set()
+                        _internet_went_down_during.set()
+                        _was_down = True
+                        log("  ⚠ Internet connection lost — all operations paused until restored.\n", "red")
+
+                time.sleep(5)
+        finally:
+            _internet_monitor_running = False
+            # Ensure we leave in a clean state if exiting while still flagged down
+            # (e.g. user cancelled everything while offline)
+            _internet_down.clear()
+
+    t = threading.Thread(target=_monitor_loop, daemon=True)
+    t.start()
+
+
+def _block_if_no_internet(cancel_ev=None, pause_ev=None):
+    """Block until internet is available.  Returns True if OK, False if cancelled.
+
+    Uses the background monitor's _internet_down event.  If internet is currently
+    down, blocks (polling every 1 s) until the monitor clears the flag or cancel
+    fires.  If internet is up, returns immediately.
+    """
+    _ce = cancel_ev or cancel_event
+    if not _internet_down.is_set():
+        return True  # fast path — internet is fine
+    # Internet is down — wait for the monitor to clear it
+    while _internet_down.is_set():
+        if _ce.is_set():
+            return False
+        time.sleep(1)
+    return True
 
 
 def _fetch_auto_captions(video_id, temp_dir):
@@ -9913,6 +10016,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
     # Set flag before starting thread to close the race window where a second
     # call could pass the check above before the thread sets it itself.
     _redownload_running = True
+    _start_internet_monitor()
 
     def _worker():
         global _redownload_running, _current_redownload_item
@@ -10015,6 +10119,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _start_internet_monitor()
         _transcribe_sync_controlled = (cancel_ev is None)  # True when sync pipeline, False when GPU-driven
         if not _sync_mode:
             _current_job["label"] = f"Transcribe {ch_name}"
@@ -10169,10 +10274,26 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"  ⚠ Could not fetch YouTube list: {_e}\n", "red")
                     return {}
 
-            yt_title_to_id = _fetch_yt_title_map(use_cookies=True)
-            if not yt_title_to_id and not _ce.is_set():
-                log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
-                yt_title_to_id = _fetch_yt_title_map(use_cookies=False)
+            # Fetch with internet-outage protection: if internet dropped during the
+            # playlist fetch, the result is likely incomplete — wait for restore and
+            # re-fetch from scratch rather than proceeding with a partial list.
+            while not _ce.is_set():
+                _internet_went_down_during.clear()  # arm the dirty flag
+                if not _block_if_no_internet(cancel_ev=_ce):
+                    break  # cancelled
+                yt_title_to_id = _fetch_yt_title_map(use_cookies=True)
+                if not yt_title_to_id and not _ce.is_set():
+                    log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+                    yt_title_to_id = _fetch_yt_title_map(use_cookies=False)
+                # Check if internet dropped during the fetch — if so, the list may be
+                # incomplete.  Wait for restore and retry the whole fetch.
+                if _internet_went_down_during.is_set() and not _ce.is_set():
+                    log("  ⚠ Internet dropped during playlist fetch — will re-fetch after restore.\n", "red")
+                    if not _block_if_no_internet(cancel_ev=_ce):
+                        break  # cancelled
+                    log("  Retrying YouTube video list fetch...\n", "simpleline")
+                    continue  # retry from the top
+                break  # clean fetch — proceed
             if not yt_title_to_id:
                 log("  ⚠ Could not retrieve video list — all files will use Whisper.\n", "red")
             else:
@@ -10247,10 +10368,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         log(f"  [{_bf_idx}/{_bf_total}] Fetching captions: {_bf_display}\n", "simpleline")
                         _bf_segs = []
-                        # Pre-check internet before the 120s yt-dlp timeout can hang us
-                        if not _check_internet(timeout=5):
-                            if not _wait_for_internet(_ce, _pe, log_fn=log):
-                                break  # cancelled
+                        # Block if internet is down (background monitor handles detection)
+                        if not _block_if_no_internet(cancel_ev=_ce):
+                            break  # cancelled
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
                         except Exception:
@@ -10575,18 +10695,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
-                # Pre-check internet before the 120s yt-dlp timeout can hang us
-                if not _check_internet(timeout=5):
-                    if not _wait_for_internet(_ce, _pe, log_fn=log):
-                        break  # cancelled
+                # Block if internet is down (background monitor handles detection)
+                if not _block_if_no_internet(cancel_ev=_ce):
+                    break  # cancelled
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
                 source = "auto-captions"
 
                 if not text:
-                    # Check if failure is due to internet outage before queuing for Whisper
-                    if not _check_internet(timeout=5):
-                        if _wait_for_internet(_ce, _pe, log_fn=log):
+                    # Check if failure is due to internet outage before queuing for Whisper.
+                    # Use the background monitor's flag — if internet dropped during the
+                    # fetch, wait for restore and retry instead of blindly queuing.
+                    if _internet_down.is_set():
+                        if _block_if_no_internet(cancel_ev=_ce):
                             # Internet restored — retry this file
                             text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
                         else:
@@ -11301,6 +11422,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _start_internet_monitor()
         _transcribe_sync_controlled = False  # Manual transcription never blocks sync-pipeline jobs
         if not _sync_mode:
             _current_job["label"] = f"M.T. {fname}"
@@ -11483,6 +11605,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _start_internet_monitor()
         _transcribe_sync_controlled = False  # Manual folder transcription never blocks sync-pipeline jobs
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {folder_name}")
@@ -13172,6 +13295,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
             if cancel_event.is_set():
                 break
 
+            # Internet outage check — block until restored (monitor handles detection)
+            if _internet_down.is_set():
+                clear_transient_lines()
+                if not _block_if_no_internet(cancel_ev=cancel_event):
+                    break  # cancelled while waiting for internet
+
             try:
                 line = _line_q.get(timeout=2.0)
             except _queue_mod.Empty:
@@ -13935,6 +14064,7 @@ def start_sync_all():
     _my_gen = _job_generation
 
     _sync_running = True
+    _start_internet_monitor()
     _current_job["label"] = "Sync Subs"
     _write_sync_progress()
     _tray_start_spin()
@@ -16444,6 +16574,7 @@ def _gpu_start():
     if not _has_transcribe_tasks:
         # No transcription tasks — skip model dialog and start immediately
         _gpu_running = True
+        _start_internet_monitor()
         _gpu_cancel.clear()
         _gpu_pause.clear()
         _update_gpu_btn()
@@ -16549,6 +16680,7 @@ def _gpu_start():
         log(f"\n  GPU Tasks: using {_whisper_model_choice} model\n", "simpleline")
 
     _gpu_running = True
+    _start_internet_monitor()
     _gpu_cancel.clear()
     _gpu_pause.clear()
     _update_gpu_btn()
@@ -17098,6 +17230,7 @@ def _run_autorun():
     _my_gen = _job_generation
 
     _sync_running = True
+    _start_internet_monitor()
     _write_sync_progress()
     _tray_start_spin()
     _update_tray_tooltip("YT Archiver — Auto-syncing...")

@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.6"
+APP_VERSION = "v25.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2315,31 +2315,82 @@ def _scan_channel_disk_info(ch):
     """Walk a channel's folder and return (num_vids, total_bytes, has_transcripts).
 
     Only counts files with recognised video/audio extensions that are not
-    partial downloads or temporary encode outputs.
+    partial downloads or temporary encode outputs.  Also registers every video
+    file into the browse panel's videos table (piggybacked to avoid a second walk).
     """
     _base_dir = config.get("output_dir", "").strip() or BASE_DIR
     _folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
     _ch_folder = os.path.join(_base_dir, _folder_name)
+    _ch_name = ch.get("name", "")
     _num_vids = 0
     _ch_bytes = 0
     _has_transcripts = False
+    _dirs_with_tx = set()  # directories containing transcript files
+    _video_files = []      # (filepath, title, size, dirpath) for browse registration
     try:
         if os.path.isdir(_ch_folder):
             for _dp, _dns, _fns in os.walk(_ch_folder):
+                _dir_has_tx = False
                 for _fn in _fns:
                     _fn_lower = _fn.lower()
                     if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
                             and ".temp." not in _fn_lower
                             and ".part" not in _fn_lower):
                         _num_vids += 1
+                        _fp = os.path.join(_dp, _fn)
                         try:
-                            _ch_bytes += os.path.getsize(os.path.join(_dp, _fn))
+                            _sz = os.path.getsize(_fp)
+                            _ch_bytes += _sz
                         except Exception:
-                            pass
-                    elif _fn_lower.endswith("transcript.txt"):
+                            _sz = 0
+                        _video_files.append((_fp, os.path.splitext(_fn)[0], _sz, _dp))
+                    elif _fn_lower.endswith("transcript.txt") or _fn_lower.endswith(".jsonl"):
                         _has_transcripts = True
+                        _dir_has_tx = True
+                if _dir_has_tx:
+                    _dirs_with_tx.add(_dp)
     except Exception:
         pass
+
+    # Register videos in the browse panel's videos table
+    tp = _tp_panel_ref[0]
+    if tp and _video_files:
+        # Ensure DB connection exists (panel may not have been opened yet)
+        if not tp._conn:
+            try:
+                tp._conn = _tp_open_db(_TP_DB_PATH)
+            except Exception:
+                pass
+    if tp and tp._conn and _video_files:
+        _roots = [_base_dir]
+        for _fp, _title, _sz, _dp in _video_files:
+            _, _yr, _mo = _tp_parse_path_meta(_fp, _roots)
+            # Check if transcript exists in this dir or parents
+            _tx = False
+            _chk = _dp
+            for _ in range(3):
+                if _chk in _dirs_with_tx:
+                    _tx = True
+                    break
+                _p = os.path.dirname(_chk)
+                if _p == _chk:
+                    break
+                _chk = _p
+            _status = "transcribed" if _tx else "pending"
+            try:
+                tp._db_execute(
+                    "INSERT OR IGNORE INTO videos "
+                    "(title, channel, year, month, filepath, tx_status, "
+                    " size_bytes, added_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (_title, _ch_name, _yr, _mo, _fp, _status, _sz, time.time()))
+            except Exception:
+                pass
+        try:
+            tp._db_commit()
+        except Exception:
+            pass
+
     return _num_vids, _ch_bytes, _has_transcripts
 
 
@@ -2438,21 +2489,44 @@ def _run_startup_disk_scan():
     already have a cache entry are skipped — only genuinely missing entries
     are computed.  The Subs tab is refreshed once all missing entries have
     been filled.
+
+    Also populates the browse panel's videos table (piggybacked onto the walk).
     """
     with config_lock:
         _channels = list(config.get("channels", []))
         _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
     with _disk_cache_lock:
         _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
-    _need_scan = bool(_missing) or bool(_stale)
+
+    # Also check if the browse videos table needs populating
+    _need_browse = False
+    tp = _tp_panel_ref[0]
+    if tp:
+        if not tp._conn:
+            try:
+                tp._conn = _tp_open_db(_TP_DB_PATH)
+            except Exception:
+                pass
+        if tp._conn:
+            try:
+                row = tp._db_execute(
+                    "SELECT COUNT(*) FROM videos WHERE channel != '__ver__'"
+                ).fetchone()
+                _need_browse = (row[0] if row else 0) == 0
+            except Exception:
+                _need_browse = True
+
+    _need_scan = bool(_missing) or bool(_stale) or _need_browse
 
     if not _need_scan:
         return
 
     log("--- Scanning disk info... ---\n", "dim")
 
-    if _missing:
-        for _ch in _missing:
+    # If browse table needs populating, scan ALL channels (not just missing)
+    _to_scan = _channels if _need_browse else _missing
+    if _to_scan:
+        for _ch in _to_scan:
             if not _root_alive:
                 break
             _update_disk_cache_for_channel(_ch)
@@ -2483,6 +2557,10 @@ def _run_startup_disk_scan():
                 _ui_queue.append(refresh_channel_dropdowns)
 
     log("== Disk scan complete. ==\n", "simpleline_green")
+    # Refresh browse tree now that videos have been registered
+    tp = _tp_panel_ref[0]
+    if tp and tp._loaded and _root_alive:
+        _ui_queue.append(tp._refresh_browse)
 
 
 config = load_config()
@@ -3246,7 +3324,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 3:17pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 4:49pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -17884,6 +17962,25 @@ def _tp_open_db(path):
         conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
     except Exception:
         pass
+    # Videos table — tracks ALL videos regardless of transcription status.
+    # tx_status: 'pending' | 'transcribed' | 'no_captions' | 'error'
+    conn.execute("""CREATE TABLE IF NOT EXISTS videos (
+        id         INTEGER PRIMARY KEY,
+        title      TEXT NOT NULL,
+        channel    TEXT NOT NULL,
+        year       INTEGER,
+        month      INTEGER,
+        filepath   TEXT UNIQUE,
+        video_id   TEXT,
+        video_url  TEXT,
+        duration_s REAL,
+        size_bytes INTEGER,
+        tx_status  TEXT DEFAULT 'pending',
+        added_ts   REAL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_channel ON videos(channel)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_ch_yr ON videos(channel, year)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_ch_yr_mo ON videos(channel, year, month)")
     conn.commit()
     return conn
 
@@ -18095,6 +18192,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._tp_extra_roots = list(config.get("tp_archive_roots", []))
         self._build_ui()
         self._refresh_stats_label()
+        # Auto-scan archive if videos table is empty (first-time migration)
+        self._ensure_videos_populated()
         if self._pending_reindex is not None:
             self.after(300, lambda: self._maybe_offer_reindex(self._pending_reindex))
             self._pending_reindex = None
@@ -18111,15 +18210,288 @@ class _TranscriptionPanel(ttk.Frame):
                 roots.append(r)
         return roots
 
+    # ── Video registry (videos table) ────────────────────────────────────────
+
+    def register_video(self, title, channel, year=None, month=None, filepath=None,
+                       video_id=None, video_url=None, duration_s=None, size_bytes=None):
+        """Insert a single video into the videos table (idempotent via filepath UNIQUE)."""
+        if not self._conn:
+            return
+        try:
+            self._db_execute(
+                "INSERT OR IGNORE INTO videos "
+                "(title, channel, year, month, filepath, video_id, video_url, "
+                " duration_s, size_bytes, tx_status, added_ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (title, channel, year, month, filepath, video_id, video_url,
+                 duration_s, size_bytes, "pending", time.time()))
+            self._db_commit()
+        except Exception:
+            pass
+
+    def _scan_archive(self, auto=False):
+        """Walk known channel folders and register every video file in the videos table."""
+        if not self._conn:
+            return
+        roots = self._get_archive_roots()
+        if not roots:
+            return
+
+        # Build list of channel folders to scan (from config only)
+        with config_lock:
+            channels_cfg = list(config.get("channels", []))
+        channel_dirs = []
+        for ch in channels_cfg:
+            ch_name = ch.get("name", "")
+            folder = ch.get("folder_override", "").strip() or ch_name
+            folder = sanitize_folder(folder)
+            if not folder:
+                continue
+            for root_dir in roots:
+                ch_path = os.path.join(root_dir, folder)
+                if os.path.isdir(ch_path):
+                    channel_dirs.append((ch_name, ch_path, root_dir))
+
+        if not channel_dirs:
+            return
+
+        # UI feedback
+        def _set_scanning():
+            try:
+                self._browse_scan_btn.config(state="disabled")
+                self._browse_scan_status.config(text="Scanning...")
+            except Exception:
+                pass
+        self.after(0, _set_scanning)
+
+        def _worker():
+            count = 0
+            # Pre-scan: collect directories that have transcript files on disk
+            # (covers channels transcribed but not yet indexed in the DB)
+            dirs_with_transcripts = set()
+            for ch_name, ch_path, root_dir in channel_dirs:
+                for dirpath, _, filenames in os.walk(ch_path):
+                    for fn in filenames:
+                        fn_lower = fn.lower()
+                        if fn_lower.endswith('.txt') and 'transcript' in fn_lower:
+                            dirs_with_transcripts.add(dirpath)
+                            break
+                        if fn_lower.endswith('.jsonl'):
+                            dirs_with_transcripts.add(dirpath)
+                            break
+
+            for ch_name, ch_path, root_dir in channel_dirs:
+                for dirpath, _, filenames in os.walk(ch_path):
+                    for fn in filenames:
+                        fn_lower = fn.lower()
+                        if not any(fn_lower.endswith(ext) for ext in self._VIDEO_EXTS):
+                            continue
+                        if ".temp." in fn_lower or fn_lower.endswith(".part"):
+                            continue
+                        fp = os.path.join(dirpath, fn)
+                        # Derive year / month from path structure
+                        _, year, month = _tp_parse_path_meta(fp, [root_dir])
+                        title = os.path.splitext(fn)[0]
+                        try:
+                            sz = os.path.getsize(fp)
+                        except OSError:
+                            sz = None
+                        # Check if transcript files exist on disk in this dir
+                        # or any parent dir (handles split_years/split_months)
+                        has_tx = False
+                        _chk = dirpath
+                        for _ in range(3):
+                            if _chk in dirs_with_transcripts:
+                                has_tx = True
+                                break
+                            _p = os.path.dirname(_chk)
+                            if _p == _chk:
+                                break
+                            _chk = _p
+                        status = "transcribed" if has_tx else "pending"
+                        try:
+                            self._db_execute(
+                                "INSERT OR IGNORE INTO videos "
+                                "(title, channel, year, month, filepath, tx_status, "
+                                " size_bytes, added_ts) "
+                                "VALUES (?,?,?,?,?,?,?,?)",
+                                (title, ch_name, year, month, fp, status, sz,
+                                 time.time()))
+                            count += 1
+                        except Exception:
+                            continue
+            self._db_commit()
+            # Reconcile: update any existing 'pending' videos that actually
+            # have transcript files on disk (covers re-scans after transcription)
+            try:
+                pending = self._db_execute(
+                    "SELECT id, filepath FROM videos "
+                    "WHERE tx_status='pending' AND filepath IS NOT NULL"
+                ).fetchall()
+                for vid_id, fp in pending:
+                    _chk = os.path.dirname(fp)
+                    for _ in range(3):
+                        if _chk in dirs_with_transcripts:
+                            self._db_execute(
+                                "UPDATE videos SET tx_status='transcribed' WHERE id=?",
+                                (vid_id,))
+                            break
+                        _p = os.path.dirname(_chk)
+                        if _p == _chk:
+                            break
+                        _chk = _p
+                self._db_commit()
+            except Exception:
+                pass
+            _total = 0
+            try:
+                row = self._db_execute("SELECT COUNT(*) FROM videos").fetchone()
+                _total = row[0] if row else 0
+            except Exception:
+                pass
+            def _done(n=count, t=_total):
+                self._refresh_browse()
+                try:
+                    self._browse_scan_btn.config(state="normal")
+                    self._browse_scan_status.config(text=f"Found {t:,} videos")
+                    # Clear status after 5 seconds
+                    self.after(5000, lambda: self._browse_scan_status.config(text=""))
+                except Exception:
+                    pass
+            self.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _VIDEOS_SCHEMA_VER = 3  # bump to force clear after piggybacking onto disk scan
+
+    def _ensure_videos_populated(self):
+        """Clear stale data if schema version changed.
+
+        The actual population happens in _scan_channel_disk_info() which runs
+        at startup as part of the normal disk scan — no separate walk needed.
+        """
+        if not self._conn:
+            return
+        try:
+            ver = 0
+            try:
+                row = self._db_execute(
+                    "SELECT tx_status FROM videos WHERE filepath='__schema_ver__' LIMIT 1"
+                ).fetchone()
+                ver = int(row[0]) if row else 0
+            except Exception:
+                pass
+            if ver < self._VIDEOS_SCHEMA_VER:
+                # Schema changed — clear old data; startup disk scan will repopulate
+                self._db_execute("DELETE FROM videos")
+                self._db_execute(
+                    "INSERT OR REPLACE INTO videos (title,channel,filepath,tx_status) "
+                    "VALUES ('__ver__','__ver__','__schema_ver__',?)",
+                    (str(self._VIDEOS_SCHEMA_VER),))
+                self._db_commit()
+        except Exception:
+            pass
+
+    def navigate_to_video(self, title, channel, filepath=""):
+        """Navigate the browse tree to a specific video, expanding parents as needed."""
+        if not self._loaded or not self._conn:
+            return
+        self._show_section("browse")
+
+        # Ensure video is in the DB; insert if missing
+        if filepath:
+            self.register_video(title, channel, filepath=filepath)
+
+        # Refresh the tree so the video appears
+        self._refresh_browse()
+
+        tree = self._browse_tree
+        # Find the channel node
+        ch_iid = None
+        for iid in tree.get_children():
+            meta = self._browse_items.get(iid)
+            if meta and meta.get("channel") == channel:
+                ch_iid = iid
+                break
+        if not ch_iid:
+            return
+
+        # Expand the channel to load year nodes
+        tree.focus(ch_iid)
+        tree.item(ch_iid, open=True)
+        self._on_browse_open()
+
+        # Search through all descendant nodes for the title
+        def _find_title(parent):
+            for child in tree.get_children(parent):
+                meta = self._browse_items.get(child)
+                if not meta:
+                    continue
+                if meta["type"] == "title" and meta.get("title") == title:
+                    return child
+                if meta["type"] in ("year", "month"):
+                    tree.focus(child)
+                    tree.item(child, open=True)
+                    self._on_browse_open()
+                    found = _find_title(child)
+                    if found:
+                        return found
+            return None
+
+        target = _find_title(ch_iid)
+        if target:
+            tree.selection_set(target)
+            tree.see(target)
+            tree.focus(target)
+            self._on_browse_select()
+
     # ── Cross-communication ───────────────────────────────────────────────────
 
     def prompt_reindex(self, channel_name=""):
         """Called (from worker thread) when a transcription job finishes."""
+        # Update tx_status for transcribed videos in this channel.
+        # Check both the segments DB AND transcript files on disk (covers
+        # channels that have been transcribed but not yet indexed).
+        if self._conn and channel_name:
+            try:
+                pending = self._db_execute(
+                    "SELECT id, filepath FROM videos "
+                    "WHERE channel=? AND tx_status='pending' AND filepath IS NOT NULL",
+                    (channel_name,)).fetchall()
+                for vid_id, fp in pending:
+                    vid_dir = os.path.dirname(fp)
+                    # Check disk for transcript files in video's dir tree
+                    found = False
+                    _chk = vid_dir
+                    for _ in range(3):
+                        try:
+                            for fn in os.listdir(_chk):
+                                fn_l = fn.lower()
+                                if (fn_l.endswith('.jsonl') or
+                                        (fn_l.endswith('.txt') and 'transcript' in fn_l)):
+                                    found = True
+                                    break
+                        except OSError:
+                            pass
+                        if found:
+                            break
+                        _p = os.path.dirname(_chk)
+                        if _p == _chk:
+                            break
+                        _chk = _p
+                    if found:
+                        self._db_execute(
+                            "UPDATE videos SET tx_status='transcribed' WHERE id=?",
+                            (vid_id,))
+                self._db_commit()
+            except Exception:
+                pass
         def _on_main():
             if not self._loaded:
                 self._pending_reindex = channel_name
                 return
             self._maybe_offer_reindex(channel_name)
+            self._refresh_browse()
         self.after(0, _on_main)
 
     def _maybe_offer_reindex(self, channel_name):
@@ -18208,7 +18580,7 @@ class _TranscriptionPanel(ttk.Frame):
         sb.grid_propagate(False)
         self._sidebar = sb
 
-        tk.Label(sb, text="TRANSCRIPTIONS", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
+        tk.Label(sb, text="BROWSE", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
                  font=("Segoe UI", 7, "bold")).pack(pady=(16, 6), padx=10)
 
         self._nav_btns = {}
@@ -18267,6 +18639,10 @@ class _TranscriptionPanel(ttk.Frame):
         if key != "player" and self._player_active:
             self._player_stop_vlc()
 
+        # Show un-indexed video warnings for search/frequency sections
+        if key in ("search", "frequency"):
+            self._update_index_warning(key)
+
         # Auto-populate frequency words from a recent search and plot automatically
         if key == "frequency":
             query = self._search_var.get().strip()
@@ -18277,6 +18653,39 @@ class _TranscriptionPanel(ttk.Frame):
             self._refresh_bookmarks()
         elif key == "browse":
             self._refresh_browse()
+
+    def _update_index_warning(self, section_key):
+        """Show/hide warning about un-indexed videos in search/frequency sections."""
+        def _check():
+            if not self._conn:
+                return
+            try:
+                vid_total = self._db_execute(
+                    "SELECT COUNT(*) FROM videos WHERE filepath != '__schema_ver__'"
+                ).fetchone()[0]
+                seg_vids = self._db_execute(
+                    "SELECT COUNT(DISTINCT title) FROM segments"
+                ).fetchone()[0]
+                unindexed = max(0, vid_total - seg_vids)
+            except Exception:
+                unindexed = 0
+            def _update(n=unindexed):
+                warn_lbl = (self._search_index_warn if section_key == "search"
+                            else self._freq_index_warn)
+                if n > 0:
+                    warn_lbl.config(
+                        text=f"  \u26a0  {n:,} videos on disk are not yet indexed "
+                             f"\u2014 rebuild the index (Index tab) to include "
+                             f"them in search results")
+                    warn_lbl.pack(fill="x", side="top")
+                    # Move to top of parent
+                    siblings = warn_lbl.master.pack_slaves()
+                    if siblings and siblings[0] != warn_lbl:
+                        warn_lbl.pack_configure(before=siblings[0])
+                else:
+                    warn_lbl.pack_forget()
+            self.after(0, _update)
+        threading.Thread(target=_check, daemon=True).start()
 
     def _refresh_stats_label(self):
         if not self._conn:
@@ -18302,11 +18711,21 @@ class _TranscriptionPanel(ttk.Frame):
         # Header bar
         hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
         hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(hdr, text="Browse Transcriptions", bg=self._TP_BG3, fg=self._TP_FG,
+        tk.Label(hdr, text="Browse", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 11, "bold")).pack(side="left")
         self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                            font=("Segoe UI", 9))
         self._browse_path_label.pack(side="right", padx=8)
+        self._browse_scan_status = tk.Label(hdr, text="", bg=self._TP_BG3,
+                                            fg=self._TP_ACCENT,
+                                            font=("Segoe UI", 8))
+        self._browse_scan_status.pack(side="right", padx=(0, 4))
+        self._browse_scan_btn = tk.Button(hdr, text="Scan Archive", bg="#3a3a3a",
+                  fg=self._TP_FG, activebackground="#555555",
+                  activeforeground=self._TP_FG, relief="flat", bd=0,
+                  font=("Segoe UI", 8), cursor="hand2",
+                  padx=8, command=self._scan_archive)
+        self._browse_scan_btn.pack(side="right", padx=(0, 6))
 
         # Content pane with nav on left, viewer on right
         pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
@@ -18345,6 +18764,14 @@ class _TranscriptionPanel(ttk.Frame):
         bf_entry.bind("<Return>", lambda _: self._browse_find())
         tk.Label(vh, text="Find:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="right", padx=(8, 4))
+        # Play Video button — opens the embedded VLC player for the current video
+        self._browse_play_btn = tk.Button(
+            vh, text="▶  Play Video", bg="#2d5a1e", fg=self._TP_FG,
+            activebackground="#3a7a28", activeforeground=self._TP_FG,
+            relief="flat", bd=0, font=("Segoe UI", 8, "bold"), cursor="hand2",
+            padx=10, anchor="center",
+            state="disabled", command=self._on_browse_play_video)
+        self._browse_play_btn.pack(side="right", padx=(0, 10))
         # Re-transcribe button — lets user re-transcribe a bad YT caption via Whisper
         self._browse_retranscribe_btn = tk.Button(
             vh, text="Re-transcribe", bg="#3a3a3a", fg=self._TP_FG,
@@ -18353,6 +18780,23 @@ class _TranscriptionPanel(ttk.Frame):
             padx=8, anchor="center",
             state="disabled", command=self._on_retranscribe)
         self._browse_retranscribe_btn.pack(side="right", padx=(0, 10))
+        # Responsive: collapse button text when panel is narrow
+        self._browse_btn_compact = False
+        def _on_viewer_header_resize(event):
+            compact = event.width < 620
+            if compact != self._browse_btn_compact:
+                self._browse_btn_compact = compact
+                if compact:
+                    self._browse_play_btn.config(text="▶", padx=6)
+                    self._browse_retranscribe_btn.config(
+                        text="T" if self._browse_retranscribe_btn._tx_label == "Transcribe"
+                        else "RT", padx=6)
+                else:
+                    self._browse_play_btn.config(text="▶  Play Video", padx=10)
+                    self._browse_retranscribe_btn.config(
+                        text=self._browse_retranscribe_btn._tx_label, padx=8)
+        vh.bind("<Configure>", _on_viewer_header_resize)
+        self._browse_retranscribe_btn._tx_label = "Re-transcribe"
         # Current browse selection state for re-transcribe
         self._browse_current_meta = None
         vf = tk.Frame(right, bg=self._TP_BG)
@@ -18388,10 +18832,16 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_items.clear()
         try:
             channels = self._db_execute(
-                "SELECT DISTINCT channel FROM segments ORDER BY channel"
+                "SELECT DISTINCT channel FROM videos WHERE channel != '__ver__' ORDER BY channel"
             ).fetchall()
         except Exception:
-            return
+            # Fall back to segments table if videos table is empty/missing
+            try:
+                channels = self._db_execute(
+                    "SELECT DISTINCT channel FROM segments ORDER BY channel"
+                ).fetchall()
+            except Exception:
+                return
         for (ch,) in channels:
             ch_iid = tree.insert("", "end", text=f"📁  {ch}", open=False)
             self._browse_items[ch_iid] = {"type": "channel", "channel": ch}
@@ -18418,7 +18868,7 @@ class _TranscriptionPanel(ttk.Frame):
             ch = meta["channel"]
             try:
                 years = self._db_execute(
-                    "SELECT DISTINCT year FROM segments WHERE channel=? AND year IS NOT NULL "
+                    "SELECT DISTINCT year FROM videos WHERE channel=? AND year IS NOT NULL "
                     "ORDER BY year", (ch,)).fetchall()
             except Exception:
                 return
@@ -18433,7 +18883,7 @@ class _TranscriptionPanel(ttk.Frame):
             ch, yr = meta["channel"], meta["year"]
             try:
                 months = self._db_execute(
-                    "SELECT DISTINCT month FROM segments WHERE channel=? AND year=? "
+                    "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "
                     "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
             except Exception:
                 return
@@ -18452,7 +18902,8 @@ class _TranscriptionPanel(ttk.Frame):
     def _populate_browse_titles(self, parent_iid, channel, year, month):
         """Insert individual video title nodes under a parent browse node."""
         try:
-            sql = "SELECT DISTINCT title, jsonl_path FROM segments WHERE channel=?"
+            sql = ("SELECT DISTINCT title, filepath, video_id, tx_status "
+                   "FROM videos WHERE channel=?")
             params = [channel]
             if year is not None:
                 sql += " AND year=?"
@@ -18461,15 +18912,36 @@ class _TranscriptionPanel(ttk.Frame):
                 sql += " AND month=?"
                 params.append(month)
             sql += " ORDER BY title"
-            titles = self._db_execute(sql, params).fetchall()
+            rows = self._db_execute(sql, params).fetchall()
         except Exception:
             return
-        for title, jsonl_path in titles:
+        for title, filepath, video_id, tx_status in rows:
             disp = title if len(title) <= 60 else title[:57] + "..."
-            t_iid = self._browse_tree.insert(parent_iid, "end", text=f"  {disp}")
+            # Visual status indicators
+            if tx_status == "pending":
+                disp = f"  {disp}  (not processed)"
+            elif tx_status == "no_captions":
+                disp = f"  {disp}  (no captions)"
+            elif tx_status == "error":
+                disp = f"  {disp}  (error)"
+            else:
+                disp = f"  {disp}"
+            t_iid = self._browse_tree.insert(parent_iid, "end", text=disp)
+            # Try to find a matching jsonl_path from segments for backward compat
+            _jsonl = None
+            if tx_status == "transcribed":
+                try:
+                    _row = self._db_execute(
+                        "SELECT jsonl_path FROM segments WHERE title=? AND channel=? LIMIT 1",
+                        (title, channel)).fetchone()
+                    if _row:
+                        _jsonl = _row[0]
+                except Exception:
+                    pass
             self._browse_items[t_iid] = {
                 "type": "title", "channel": channel, "title": title,
-                "jsonl_path": jsonl_path}
+                "jsonl_path": _jsonl, "filepath": filepath,
+                "video_id": video_id, "tx_status": tx_status or "pending"}
 
     def _on_browse_select(self, event=None):
         """When a title node is selected in the browse tree, show its transcription."""
@@ -18479,15 +18951,34 @@ class _TranscriptionPanel(ttk.Frame):
         meta = self._browse_items.get(sel[0])
         if not meta or meta["type"] != "title":
             return
-        title    = meta["title"]
-        txt_path = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
+        title      = meta["title"]
+        tx_status  = meta.get("tx_status", "pending")
+        filepath   = meta.get("filepath")
+        txt_path   = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
+        # Fallback: if no jsonl_path, search for .txt transcript files near the video
+        if not txt_path and filepath:
+            _search_dir = os.path.dirname(filepath)
+            for _ in range(3):  # check dir + 2 parents
+                try:
+                    for fn in os.listdir(_search_dir):
+                        if fn.lower().endswith('.txt') and 'transcript' in fn.lower():
+                            txt_path = os.path.join(_search_dir, fn)
+                            break
+                except OSError:
+                    pass
+                if txt_path:
+                    break
+                _p = os.path.dirname(_search_dir)
+                if _p == _search_dir:
+                    break
+                _search_dir = _p
         self._browse_viewer_title.config(text=title)
         self._browse_path_label.config(
-            text=f"{meta.get('channel', '')}  •  {txt_path or ''}")
+            text=f"{meta.get('channel', '')}  •  {txt_path or filepath or ''}")
 
         # Look up video_id for re-transcribe
-        _vid_id = None
-        if self._conn and title:
+        _vid_id = meta.get("video_id")
+        if not _vid_id and self._conn and title:
             try:
                 _row = self._db_execute(
                     "SELECT video_id FROM segments WHERE title=? AND video_id!='' LIMIT 1",
@@ -18499,14 +18990,31 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_current_meta = {
             "title": title, "channel": meta.get("channel", ""),
             "txt_path": txt_path, "jsonl_path": meta.get("jsonl_path"),
-            "video_id": _vid_id,
+            "video_id": _vid_id, "filepath": filepath,
+            "tx_status": tx_status,
         }
-        # Enable re-transcribe — check video_id immediately (fast DB lookup),
-        # defer the slow filesystem check to a background thread so the UI
-        # doesn't stall on Z:\ network drives.
-        if _vid_id:
-            self._browse_retranscribe_btn.config(state="normal")
+        # Set transcribe/re-transcribe button label and state based on tx_status
+        if tx_status in ("pending", "no_captions", "error"):
+            # Not yet transcribed — show "Transcribe"
+            _lbl = "Transcribe"
+            _compact_lbl = "T"
+            self._browse_retranscribe_btn._tx_label = _lbl
+            if self._browse_btn_compact:
+                self._browse_retranscribe_btn.config(text=_compact_lbl, state="normal")
+            else:
+                self._browse_retranscribe_btn.config(text=_lbl, state="normal")
+        elif _vid_id:
+            # Transcribed and has video_id — show "Re-transcribe"
+            _lbl = "Re-transcribe"
+            _compact_lbl = "RT"
+            self._browse_retranscribe_btn._tx_label = _lbl
+            if self._browse_btn_compact:
+                self._browse_retranscribe_btn.config(text=_compact_lbl, state="normal")
+            else:
+                self._browse_retranscribe_btn.config(text=_lbl, state="normal")
         else:
+            _lbl = "Re-transcribe"
+            self._browse_retranscribe_btn._tx_label = _lbl
             self._browse_retranscribe_btn.config(state="disabled")
             _check_title, _check_txt = title, txt_path
             def _check_video():
@@ -18514,6 +19022,51 @@ class _TranscriptionPanel(ttk.Frame):
                 if found:
                     self.after(0, lambda: self._browse_retranscribe_btn.config(state="normal"))
             threading.Thread(target=_check_video, daemon=True).start()
+
+        # Enable play button — check for video file in background
+        self._browse_play_btn.config(state="disabled")
+        _play_title, _play_txt, _play_fp = title, txt_path, filepath
+        def _check_play():
+            vp = None
+            if _play_fp and os.path.isfile(_play_fp):
+                vp = _play_fp
+            else:
+                vp = self._find_video_file(_play_title, _play_txt)
+            if vp:
+                def _enable(p=vp):
+                    if self._browse_current_meta and self._browse_current_meta.get("title") == _play_title:
+                        self._browse_current_meta["_video_path"] = p
+                        self._browse_play_btn.config(state="normal")
+                self.after(0, _enable)
+        threading.Thread(target=_check_play, daemon=True).start()
+
+        # For untranscribed videos, show a status message instead of transcript
+        if tx_status in ("pending", "no_captions", "error"):
+            self._browse_viewer.config(state="normal")
+            self._browse_viewer.delete("1.0", "end")
+            self._browse_seg_map = []
+            if tx_status == "pending":
+                self._browse_viewer.insert("end",
+                    "Transcription not yet processed\n\n", "header")
+                self._browse_viewer.insert("end",
+                    "This video has not been transcribed yet. Use the Transcribe "
+                    "button above, or right-click the channel or folder in the "
+                    "tree to transcribe multiple videos at once.")
+            elif tx_status == "no_captions":
+                self._browse_viewer.insert("end",
+                    "No captions available\n\n", "header")
+                self._browse_viewer.insert("end",
+                    "This video has no detectable speech or captions. "
+                    "It may be a music-only video or have no spoken content.")
+            elif tx_status == "error":
+                self._browse_viewer.insert("end",
+                    "Transcription error\n\n", "header")
+                self._browse_viewer.insert("end",
+                    "An error occurred during transcription. "
+                    "Try re-transcribing the video.")
+            self._browse_viewer.config(state="disabled")
+            self._browse_viewer.yview_moveto(0)
+            return
 
         # Fetch segments from DB for the position map (double-click seeking).
         # The viewer itself always shows the .txt body (punctuation-restored).
@@ -18579,6 +19132,29 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_viewer.config(state="disabled")
         self._browse_viewer.yview_moveto(0)
 
+    def _on_browse_play_video(self):
+        """Play Video button — open the current video in the embedded VLC player."""
+        meta = self._browse_current_meta
+        if not meta:
+            return
+        video_path = meta.get("_video_path")
+        if not video_path:
+            return
+        title = meta.get("title", "")
+        tx_status = meta.get("tx_status")
+        # Fetch DB rows for transcript sync
+        db_rows = None
+        if self._conn and title:
+            try:
+                db_rows = self._db_execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (title,)).fetchall()
+            except Exception:
+                db_rows = None
+        self._open_vlc(video_path, 0, title=title, db_rows=db_rows,
+                       tx_status=tx_status)
+
     def _browse_find(self):
         """Highlight all occurrences of the find term in the browse viewer."""
         query = self._browse_find_var.get().strip()
@@ -18600,82 +19176,169 @@ class _TranscriptionPanel(ttk.Frame):
             self._browse_viewer.see(first)
 
     def _on_browse_tree_rightclick(self, event):
-        """Right-click on a video title in the browse tree → context menu."""
+        """Right-click on browse tree → context menu for titles or folders."""
         item = self._browse_tree.identify_row(event.y)
         if not item:
             return
         self._browse_tree.selection_set(item)
         meta = self._browse_items.get(item)
-        if not meta or meta["type"] != "title":
+        if not meta:
             return
-
-        title      = meta["title"]
-        channel    = meta.get("channel", "")
-        jsonl_path = meta.get("jsonl_path")
-        txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
-        video_path = self._find_video_file(title, txt_path)
-
-        # Fetch DB rows and find video_id
-        _db_rows = None
-        video_id = None
-        if self._conn and title:
-            try:
-                _db_rows = self._db_execute(
-                    "SELECT video_id, start_time, end_time, text, words "
-                    "FROM segments WHERE title=? ORDER BY start_time",
-                    (title,)).fetchall()
-                if _db_rows:
-                    video_id = _db_rows[0][0]
-            except Exception:
-                pass
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
                        disabledforeground=self._TP_DIM, relief="flat", bd=1)
 
-        if video_path:
-            menu.add_command(label="  ▶  Play from beginning",
-                             command=lambda: self._open_vlc(
-                                 video_path, 0, title=title,
-                                 db_rows=_db_rows))
-        else:
-            menu.add_command(label="  ▶  Play from beginning  (file not found)",
-                             state="disabled")
+        if meta["type"] == "title":
+            # Title-level context menu
+            title      = meta["title"]
+            channel    = meta.get("channel", "")
+            jsonl_path = meta.get("jsonl_path")
+            filepath   = meta.get("filepath")
+            txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
+            video_path = None
+            if filepath and os.path.isfile(filepath):
+                video_path = filepath
+            else:
+                video_path = self._find_video_file(title, txt_path)
 
-        if video_id:
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            menu.add_command(label="  Open Video — YouTube",
-                             command=lambda u=url: _webbrowser.open(u))
-        else:
-            menu.add_command(label="  Open Video — YouTube  (no ID)",
-                             state="disabled")
+            _db_rows = None
+            video_id = meta.get("video_id")
+            if self._conn and title:
+                try:
+                    _db_rows = self._db_execute(
+                        "SELECT video_id, start_time, end_time, text, words "
+                        "FROM segments WHERE title=? ORDER BY start_time",
+                        (title,)).fetchall()
+                    if _db_rows and not video_id:
+                        video_id = _db_rows[0][0]
+                except Exception:
+                    pass
+
+            if video_path:
+                menu.add_command(label="  ▶  Play Video",
+                                 command=lambda: self._open_vlc(
+                                     video_path, 0, title=title,
+                                     db_rows=_db_rows))
+            else:
+                menu.add_command(label="  ▶  Play Video  (file not found)",
+                                 state="disabled")
+
+            if video_id:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                menu.add_command(label="  Open Video — YouTube",
+                                 command=lambda u=url: _webbrowser.open(u))
+            else:
+                menu.add_command(label="  Open Video — YouTube  (no ID)",
+                                 state="disabled")
+
+        elif meta["type"] in ("channel", "year", "month"):
+            # Folder-level context menu — Transcribe / Re-transcribe options
+            channel = meta["channel"]
+            year    = meta.get("year")
+            month   = meta.get("month")
+
+            # Count pending videos in scope
+            _pending = 0
+            try:
+                sql = "SELECT COUNT(*) FROM videos WHERE channel=? AND tx_status='pending'"
+                params = [channel]
+                if year is not None:
+                    sql += " AND year=?"
+                    params.append(year)
+                if month is not None:
+                    sql += " AND month=?"
+                    params.append(month)
+                row = self._db_execute(sql, params).fetchone()
+                _pending = row[0] if row else 0
+            except Exception:
+                pass
+
+            scope_label = channel
+            if year is not None:
+                scope_label += f" / {year}"
+            if month is not None and 1 <= (month or 0) <= 12:
+                scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
+
+            if _pending > 0:
+                menu.add_command(
+                    label=f"  Transcribe untranscribed ({_pending})",
+                    command=lambda: self._browse_transcribe_folder(
+                        channel, year, month, retranscribe=False))
+            else:
+                menu.add_command(
+                    label="  Transcribe untranscribed (0)",
+                    state="disabled")
+            menu.add_command(
+                label="  Re-transcribe all",
+                command=lambda: self._browse_transcribe_folder(
+                    channel, year, month, retranscribe=True))
 
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _browse_transcribe_folder(self, channel, year=None, month=None,
+                                  retranscribe=False):
+        """Queue a transcription job for a channel/year/month folder from the browse tree."""
+        # Find the channel in config to get url and folder info
+        ch_cfg = None
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name", "") == channel:
+                    ch_cfg = ch
+                    break
+        if not ch_cfg:
+            messagebox.showwarning("Channel not found",
+                f"Could not find channel \"{channel}\" in your saved channels.\n"
+                "You may need to add it in Settings first.")
+            return
+
+        ch_name = ch_cfg["name"]
+        ch_url  = ch_cfg.get("url", "")
+        folder  = ch_cfg.get("folder_override") or sanitize_folder(ch_name)
+        with config_lock:
+            base = config.get("output_dir", "")
+        folder_path = os.path.join(base, folder) if base else folder
+        sy = ch_cfg.get("split_years", False)
+        sm = ch_cfg.get("split_months", False)
+
+        _add_to_gpu_queue({
+            "type": "transcribe",
+            "ch_name": ch_name,
+            "ch_url": ch_url,
+            "folder": folder_path,
+            "split_years": sy,
+            "split_months": sm,
+            "combined": not sy,
+        })
+
     def _on_retranscribe(self):
-        """Re-transcribe the currently viewed video using Whisper."""
+        """Transcribe or re-transcribe the currently viewed video using Whisper."""
         meta = self._browse_current_meta
         if not meta:
             return
         title      = meta["title"]
-        txt_path   = meta["txt_path"]
-        jsonl_path = meta["jsonl_path"]
-        video_id   = meta["video_id"]
-        channel    = meta["channel"]
+        txt_path   = meta.get("txt_path")
+        jsonl_path = meta.get("jsonl_path")
+        video_id   = meta.get("video_id")
+        channel    = meta.get("channel", "")
+        filepath   = meta.get("filepath")
 
-        if not txt_path:
-            messagebox.showerror("Error", "No transcript file path found.")
-            return
+        # Find local video file — try stored filepath first, then search
+        video_path = None
+        if filepath and os.path.isfile(filepath):
+            video_path = filepath
+        if not video_path and txt_path:
+            video_path = self._find_video_file(title, txt_path)
+        if not video_path and filepath:
+            video_path = self._find_video_file(title, filepath)
 
-        # Find local video file first
-        video_path = self._find_video_file(title, txt_path)
         if not video_path and not video_id:
             messagebox.showerror("Error",
                 "No local video file found and no YouTube video ID available.\n"
-                "Cannot re-transcribe.")
+                "Cannot transcribe.")
             return
 
         # Ask for Whisper model — show dialog directly on the main thread.
@@ -19327,6 +19990,12 @@ class _TranscriptionPanel(ttk.Frame):
     def _build_search_section(self, parent):
         f = tk.Frame(parent, bg=self._TP_BG)
 
+        # Warning banner for un-indexed videos
+        self._search_index_warn = tk.Label(f, text="", bg="#2a2000", fg="#e0b000",
+                                            font=("Segoe UI", 9), anchor="w",
+                                            padx=10, pady=4)
+        # Packed dynamically in _show_section when needed
+
         bar = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=6)
         bar.pack(fill="x")
 
@@ -19770,12 +20439,13 @@ class _TranscriptionPanel(ttk.Frame):
                 return content[m.start():end].strip()
         return None
 
-    def _open_vlc(self, video_path, start_time=0, title="", db_rows=None):
+    def _open_vlc(self, video_path, start_time=0, title="", db_rows=None,
+                  tx_status=None):
         """Open video — embedded player uses exact timestamp, external VLC
         applies a small lead offset so the user lands just before the target."""
         if _HAS_VLC:
             self._open_embedded_player(video_path, start_time, title=title,
-                                       db_rows=db_rows)
+                                       db_rows=db_rows, tx_status=tx_status)
             return True
         # Fallback: external VLC — apply lead so user lands 1-2s early
         seek = max(0.0, float(start_time) - 1.5)
@@ -20039,6 +20709,12 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _build_frequency_section(self, parent):
         f = tk.Frame(parent, bg=self._TP_BG)
+
+        # Warning banner for un-indexed videos
+        self._freq_index_warn = tk.Label(f, text="", bg="#2a2000", fg="#e0b000",
+                                          font=("Segoe UI", 9), anchor="w",
+                                          padx=10, pady=4)
+        # Packed dynamically in _show_section when needed
 
         bar = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
         bar.pack(fill="x")
@@ -20796,7 +21472,7 @@ class _TranscriptionPanel(ttk.Frame):
         return f
 
     def _open_embedded_player(self, video_path, start_time=0, title="",
-                              db_rows=None):
+                              db_rows=None, tx_status=None):
         """Open a video in the embedded player with synced transcript."""
         if not _HAS_VLC:
             return self._open_vlc(video_path, start_time)
@@ -20857,10 +21533,28 @@ class _TranscriptionPanel(ttk.Frame):
             body = " ".join(parts)
 
         if body:
+            # Show notice if transcript text exists but no word timing data
+            if not db_rows:
+                self._player_transcript.tag_configure(
+                    "db_notice", foreground="#888888",
+                    font=("Segoe UI", 9, "italic"))
+                self._player_transcript.insert("end",
+                    "Word-by-word highlight unavailable — rebuild the index "
+                    "(Browse → Index → Build / Update) to enable.\n\n", "db_notice")
             self._player_transcript.insert("end", body + "\n")
         else:
-            self._player_transcript.insert("end",
-                "(No transcript data available for this video.)\n")
+            if tx_status == "no_captions":
+                self._player_transcript.insert("end",
+                    "No captions available — video contains no detectable speech.\n")
+            elif tx_status == "error":
+                self._player_transcript.insert("end",
+                    "Transcription error — try re-transcribing this video.\n")
+            elif tx_status == "pending":
+                self._player_transcript.insert("end",
+                    "Transcription not yet processed.\n")
+            else:
+                self._player_transcript.insert("end",
+                    "(No transcript data available for this video.)\n")
 
         # ── Build word timing map ─────────────────────────────────────
         # Collect all words with timestamps from DB, deduplicate, sort.
@@ -21615,7 +22309,7 @@ tab_recent.rowconfigure(1, weight=1)
 
 # Transcriptions tab — lazy-loaded
 tab_transcriptions = ttk.Frame(notebook)
-notebook.add(tab_transcriptions, text="   Transcriptions  ")
+notebook.add(tab_transcriptions, text="   Browse  ")
 tab_transcriptions.columnconfigure(0, weight=1)
 tab_transcriptions.rowconfigure(0, weight=1)
 _tp_panel = _TranscriptionPanel(tab_transcriptions)
@@ -21643,7 +22337,7 @@ def _make_tab_btn(parent, text, tab, side="left"):
 _make_tab_btn(_tab_bar, "  Download  ", tab_download)
 _make_tab_btn(_tab_bar, "  Subs  ", tab_settings)
 _make_tab_btn(_tab_bar, "  Recent  ", tab_recent)
-_make_tab_btn(_tab_bar, "   Transcriptions  ", tab_transcriptions, side="right")
+_make_tab_btn(_tab_bar, "   Browse  ", tab_transcriptions, side="right")
 
 def _refresh_tab_btns(selected_str=None):
     if selected_str is None:
@@ -22489,12 +23183,31 @@ def _open_video_on_yt():
         log(f"ERROR: Could not open browser: {e}\n", "red")
 
 
+def _show_in_browse():
+    """Switch to Browse tab and navigate to the selected video."""
+    sel = recent_tree.selection()
+    if len(sel) != 1:
+        return
+    _sel_title = recent_tree.set(sel[0], "title")
+    _sel_channel = recent_tree.set(sel[0], "channel")
+    idx = _get_recent_orig_idx(sel[0])
+    with config_lock:
+        recent = config.get("recent_downloads", [])
+        entry = recent[idx] if idx < len(recent) else {}
+        fp = entry.get("filepath", "")
+    tp = _tp_panel_ref[0]
+    if tp:
+        notebook.select(tab_transcriptions)
+        tp.after(100, lambda: tp.navigate_to_video(_sel_title, _sel_channel, fp))
+
+
 _recent_ctx_menu = tk.Menu(root, tearoff=0, bg=C_RAISED, fg=C_TEXT,
                            activebackground=C_BTN_HVR, activeforeground=C_TEXT,
                            bd=0, relief="flat")
 _recent_ctx_menu.add_command(label="Play video", command=_play_video)
 _recent_ctx_menu.add_command(label="Show in Explorer", command=_show_in_explorer)
 _recent_ctx_menu.add_command(label="Open video on YouTube", command=_open_video_on_yt)
+_recent_ctx_menu.add_command(label="Show in Browse", command=_show_in_browse)
 _recent_ctx_menu.add_separator()
 _recent_ctx_menu.add_command(label="Delete File", command=_delete_selected_files)
 
@@ -22509,6 +23222,7 @@ def _recent_ctx_show(event):
         _recent_ctx_menu.entryconfig("Play video", state="normal" if single else "disabled")
         _recent_ctx_menu.entryconfig("Show in Explorer", state="normal" if single else "disabled")
         _recent_ctx_menu.entryconfig("Open video on YouTube", state="normal" if single else "disabled")
+        _recent_ctx_menu.entryconfig("Show in Browse", state="normal" if single else "disabled")
         try:
             _recent_ctx_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -22565,6 +23279,31 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                 if len(recent) > RECENT_MAX: config["recent_downloads"] = recent[:RECENT_MAX]
             save_config(config)
             refresh_recent_list()
+
+            # Register in browse videos table for immediate visibility
+            tp = _tp_panel_ref[0]
+            if tp and tp._conn:
+                _yr, _mo = None, None
+                try:
+                    # date is "YYYYMMDD" from yt-dlp
+                    if date and len(date) >= 6:
+                        _yr = int(date[:4])
+                        _mo = int(date[4:6])
+                except (ValueError, TypeError):
+                    pass
+                # Extract video_id from URL if available
+                _vid = None
+                if video_url:
+                    for _pat in ("v=", "youtu.be/", "/shorts/"):
+                        _idx = video_url.find(_pat)
+                        if _idx >= 0:
+                            _vid = video_url[_idx + len(_pat):][:11]
+                            break
+                tp.register_video(title, channel, year=_yr, month=_mo,
+                                  filepath=filepath, video_id=_vid,
+                                  video_url=video_url,
+                                  duration_s=float(duration_s) if duration_s else None,
+                                  size_bytes=int(final_size) if final_size else None)
 
             if notebook.select() != str(tab_recent):
                 new_download_count += 1

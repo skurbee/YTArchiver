@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.9"
+APP_VERSION = "v26.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2365,6 +2365,13 @@ def _scan_channel_disk_info(ch):
         _roots = [_base_dir]
         for _fp, _title, _sz, _dp in _video_files:
             _, _yr, _mo = _tp_parse_path_meta(_fp, _roots)
+            # Extract video ID from yt-dlp filename pattern: "Title [VIDEO_ID].ext"
+            _vid_id = None
+            _bracket = _title.rfind(" [")
+            if _bracket >= 0 and _title.endswith("]"):
+                _candidate = _title[_bracket + 2:-1]
+                if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
+                    _vid_id = _candidate
             # Check if transcript exists in this dir or parents
             _tx = False
             _chk = _dp
@@ -2380,10 +2387,15 @@ def _scan_channel_disk_info(ch):
             try:
                 tp._db_execute(
                     "INSERT OR IGNORE INTO videos "
-                    "(title, channel, year, month, filepath, tx_status, "
+                    "(title, channel, year, month, filepath, video_id, tx_status, "
                     " size_bytes, added_ts) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (_title, _ch_name, _yr, _mo, _fp, _status, _sz, time.time()))
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (_title, _ch_name, _yr, _mo, _fp, _vid_id, _status, _sz, time.time()))
+                if _vid_id:
+                    tp._db_execute(
+                        "UPDATE videos SET video_id=? "
+                        "WHERE filepath=? AND video_id IS NULL",
+                        (_vid_id, _fp))
             except Exception:
                 pass
         try:
@@ -2556,9 +2568,42 @@ def _run_startup_disk_scan():
             if _root_alive:
                 _ui_queue.append(refresh_channel_dropdowns)
 
+    # Reconcile channel names: fix rows where yt-dlp metadata channel name
+    # doesn't match the config name (e.g. "David Pakman Show" vs "David Pakman")
+    tp = _tp_panel_ref[0]
+    if tp:
+        if not tp._conn:
+            try:
+                tp._conn = _tp_open_db(_TP_DB_PATH)
+            except Exception:
+                pass
+        if tp._conn:
+            try:
+                _cfg_map = {}
+                with config_lock:
+                    for _ch_cfg in config.get("channels", []):
+                        _f = _ch_cfg.get("folder_override", "").strip() or sanitize_folder(_ch_cfg.get("name", ""))
+                        if _f:
+                            _cfg_map[_f] = _ch_cfg["name"]
+                _all_rows = tp._db_execute(
+                    "SELECT id, channel, filepath FROM videos WHERE filepath IS NOT NULL"
+                ).fetchall()
+                _fixed = 0
+                for _rid, _rch, _rfp in _all_rows:
+                    for _folder, _cfg_name in _cfg_map.items():
+                        if _rch != _cfg_name and os.sep + _folder + os.sep in _rfp.replace("/", os.sep):
+                            tp._db_execute(
+                                "UPDATE videos SET channel=? WHERE id=?",
+                                (_cfg_name, _rid))
+                            _fixed += 1
+                            break
+                if _fixed:
+                    tp._db_commit()
+            except Exception:
+                pass
+
     log("== Disk scan complete. ==\n", "simpleline_green")
     # Refresh browse tree now that videos have been registered
-    tp = _tp_panel_ref[0]
     if tp and tp._loaded and _root_alive:
         _ui_queue.append(tp._refresh_browse)
 
@@ -3324,7 +3369,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 5:23pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 6:44pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4852,7 +4897,7 @@ def _chan_ctx_transcribe():
     dlg.bind("<Escape>", lambda e: dlg.destroy())
 
 
-_chan_ctx_menu.add_command(label="Transcribe channel", command=_chan_ctx_transcribe)
+_chan_ctx_menu.add_command(label="Transcribe Channel", command=_chan_ctx_transcribe)
 
 _chan_ctx_menu.add_separator()
 
@@ -4940,7 +4985,7 @@ def _chan_ctx_show(event):
             _already_in_gpu = any(q.get("ch_url") == _ch_url_t for q in _gpu_queue)
             _gpu_has_items = bool(_gpu_queue)
         if not _has_videos:
-            _chan_ctx_menu.entryconfig(11, label="Transcribe Channel  (sync first)",
+            _chan_ctx_menu.entryconfig(11, label="Transcribe Channel (Sync Now)",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
             try:
@@ -4948,7 +4993,7 @@ def _chan_ctx_show(event):
             except Exception:
                 pass
         elif _is_active_gpu:
-            _chan_ctx_menu.entryconfig(11, label="Transcription in progress",
+            _chan_ctx_menu.entryconfig(11, label="Channel Transcribing...",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
             try:
@@ -4956,7 +5001,7 @@ def _chan_ctx_show(event):
             except Exception:
                 pass
         elif _already_in_gpu:
-            _chan_ctx_menu.entryconfig(11, label="Already in GPU Tasks",
+            _chan_ctx_menu.entryconfig(11, label="Already queued",
                                       state="normal", foreground=C_DIM,
                                       command=lambda: None)
             try:
@@ -7263,7 +7308,31 @@ def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
 
 
 # Path to Python 3.11 with CUDA PyTorch + Whisper installed
-_WHISPER_PYTHON = r"C:\Users\Scott\AppData\Local\Programs\Python\Python311\python.exe"
+# Auto-detect: check common install locations, fall back to PATH
+def _find_python311():
+    # Check standard Windows install locations
+    import glob as _glob_mod
+    _candidates = []
+    for _base in [os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python"),
+                  r"C:\Python311", r"C:\Python31",
+                  os.path.expandvars(r"%PROGRAMFILES%\Python311"),
+                  os.path.expandvars(r"%PROGRAMFILES(X86)%\Python311")]:
+        _candidates.extend(_glob_mod.glob(os.path.join(_base, "Python311*", "python.exe")))
+        _p = os.path.join(_base, "python.exe")
+        if os.path.isfile(_p):
+            _candidates.append(_p)
+    if _candidates:
+        return _candidates[0]
+    # Try PATH
+    import shutil as _shutil_mod
+    for _name in ("python3.11", "python"):
+        _found = _shutil_mod.which(_name)
+        if _found:
+            return _found
+    # Ultimate fallback — common location
+    return os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe")
+
+_WHISPER_PYTHON = _find_python311()
 _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
 _whisper_line_queue = None  # queue.Queue for subprocess stdout lines (module-level to avoid race)
 _whisper_last_failed = False  # True when last whisper call was a stall/crash (not "no speech")
@@ -18225,6 +18294,20 @@ class _TranscriptionPanel(ttk.Frame):
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (title, channel, year, month, filepath, video_id, video_url,
                  duration_s, size_bytes, "pending", time.time()))
+            # Backfill video_id/video_url on existing rows if they were missing
+            if filepath and (video_id or video_url):
+                sets, vals = [], []
+                if video_id:
+                    sets.append("video_id=?")
+                    vals.append(video_id)
+                if video_url:
+                    sets.append("video_url=?")
+                    vals.append(video_url)
+                vals.append(filepath)
+                self._db_execute(
+                    f"UPDATE videos SET {', '.join(sets)} "
+                    "WHERE filepath=? AND video_id IS NULL",
+                    vals)
             self._db_commit()
         except Exception:
             pass
@@ -18292,6 +18375,13 @@ class _TranscriptionPanel(ttk.Frame):
                         # Derive year / month from path structure
                         _, year, month = _tp_parse_path_meta(fp, [root_dir])
                         title = os.path.splitext(fn)[0]
+                        # Extract video ID from yt-dlp filename pattern: "Title [VIDEO_ID].ext"
+                        _vid_id = None
+                        _bracket = title.rfind(" [")
+                        if _bracket >= 0 and title.endswith("]"):
+                            _candidate = title[_bracket + 2:-1]
+                            if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
+                                _vid_id = _candidate
                         try:
                             sz = os.path.getsize(fp)
                         except OSError:
@@ -18312,11 +18402,17 @@ class _TranscriptionPanel(ttk.Frame):
                         try:
                             self._db_execute(
                                 "INSERT OR IGNORE INTO videos "
-                                "(title, channel, year, month, filepath, tx_status, "
+                                "(title, channel, year, month, filepath, video_id, tx_status, "
                                 " size_bytes, added_ts) "
-                                "VALUES (?,?,?,?,?,?,?,?)",
-                                (title, ch_name, year, month, fp, status, sz,
+                                "VALUES (?,?,?,?,?,?,?,?,?)",
+                                (title, ch_name, year, month, fp, _vid_id, status, sz,
                                  time.time()))
+                            # Backfill video_id for existing rows that are missing it
+                            if _vid_id:
+                                self._db_execute(
+                                    "UPDATE videos SET video_id=? "
+                                    "WHERE filepath=? AND video_id IS NULL",
+                                    (_vid_id, fp))
                             count += 1
                         except Exception:
                             continue
@@ -18340,6 +18436,28 @@ class _TranscriptionPanel(ttk.Frame):
                         if _p == _chk:
                             break
                         _chk = _p
+                self._db_commit()
+            except Exception:
+                pass
+            # Reconcile channel names: fix rows where the channel name from
+            # yt-dlp metadata doesn't match the config name (e.g. "David
+            # Pakman Show" vs "David Pakman") by matching filepath to channel folder
+            try:
+                _cfg_map = {}  # folder_name -> config channel name
+                for _ch_cfg in channels_cfg:
+                    _f = _ch_cfg.get("folder_override", "").strip() or sanitize_folder(_ch_cfg.get("name", ""))
+                    if _f:
+                        _cfg_map[_f] = _ch_cfg["name"]
+                _all_rows = self._db_execute(
+                    "SELECT id, channel, filepath FROM videos WHERE filepath IS NOT NULL"
+                ).fetchall()
+                for _rid, _rch, _rfp in _all_rows:
+                    for _folder, _cfg_name in _cfg_map.items():
+                        if _rch != _cfg_name and os.sep + _folder + os.sep in _rfp.replace("/", os.sep):
+                            self._db_execute(
+                                "UPDATE videos SET channel=? WHERE id=?",
+                                (_cfg_name, _rid))
+                            break
                 self._db_commit()
             except Exception:
                 pass
@@ -18392,10 +18510,10 @@ class _TranscriptionPanel(ttk.Frame):
         except Exception:
             pass
 
-    def navigate_to_video(self, title, channel, filepath=""):
+    def navigate_to_video(self, title, channel, filepath="", auto_play=False):
         """Navigate the browse tree to a specific video, expanding parents as needed."""
         if not self._loaded or not self._conn:
-            return
+            return False
         self._show_section("browse")
 
         # Ensure video is in the DB; insert if missing
@@ -18404,6 +18522,9 @@ class _TranscriptionPanel(ttk.Frame):
 
         # Refresh the tree so the video appears
         self._refresh_browse()
+
+        # Normalise filepath for comparison
+        norm_fp = os.path.normpath(filepath).lower() if filepath else ""
 
         tree = self._browse_tree
         # Find the channel node
@@ -18414,36 +18535,45 @@ class _TranscriptionPanel(ttk.Frame):
                 ch_iid = iid
                 break
         if not ch_iid:
-            return
+            return False
 
         # Expand the channel to load year nodes
         tree.focus(ch_iid)
         tree.item(ch_iid, open=True)
         self._on_browse_open()
 
-        # Search through all descendant nodes for the title
-        def _find_title(parent):
+        # Search through all descendant nodes — match by filepath first, then title
+        def _find_video(parent):
             for child in tree.get_children(parent):
                 meta = self._browse_items.get(child)
                 if not meta:
                     continue
-                if meta["type"] == "title" and meta.get("title") == title:
-                    return child
+                if meta["type"] == "title":
+                    # Prefer filepath match (reliable) over title match (can differ)
+                    if norm_fp and meta.get("filepath"):
+                        if os.path.normpath(meta["filepath"]).lower() == norm_fp:
+                            return child
+                    if meta.get("title") == title:
+                        return child
                 if meta["type"] in ("year", "month"):
                     tree.focus(child)
                     tree.item(child, open=True)
                     self._on_browse_open()
-                    found = _find_title(child)
+                    found = _find_video(child)
                     if found:
                         return found
             return None
 
-        target = _find_title(ch_iid)
+        target = _find_video(ch_iid)
         if target:
             tree.selection_set(target)
             tree.see(target)
             tree.focus(target)
             self._on_browse_select()
+            if auto_play:
+                self.after(150, self._on_browse_play_video)
+            return True
+        return False
 
     # ── Cross-communication ───────────────────────────────────────────────────
 
@@ -18763,19 +18893,21 @@ class _TranscriptionPanel(ttk.Frame):
         hdr.grid(row=0, column=0, sticky="ew")
         tk.Label(hdr, text="All Videos", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 11, "bold")).pack(side="left")
-        self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
-                                           font=("Segoe UI", 9))
-        self._browse_path_label.pack(side="right", padx=8)
-        self._browse_scan_status = tk.Label(hdr, text="", bg=self._TP_BG3,
-                                            fg=self._TP_ACCENT,
-                                            font=("Segoe UI", 8))
-        self._browse_scan_status.pack(side="right", padx=(0, 4))
+        # Pack scan button and status FIRST so they always have space
         self._browse_scan_btn = tk.Button(hdr, text="Scan Archive", bg="#3a3a3a",
                   fg=self._TP_FG, activebackground="#555555",
                   activeforeground=self._TP_FG, relief="flat", bd=0,
                   font=("Segoe UI", 8), cursor="hand2",
                   padx=8, command=self._scan_archive)
         self._browse_scan_btn.pack(side="right", padx=(0, 6))
+        self._browse_scan_status = tk.Label(hdr, text="", bg=self._TP_BG3,
+                                            fg=self._TP_ACCENT,
+                                            font=("Segoe UI", 8))
+        self._browse_scan_status.pack(side="right", padx=(0, 4))
+        # Path label gets remaining space — truncates instead of pushing buttons out
+        self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+                                           font=("Segoe UI", 9), anchor="e")
+        self._browse_path_label.pack(side="right", padx=8, fill="x", expand=True)
 
         # Content pane with nav on left, viewer on right
         pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
@@ -19225,6 +19357,34 @@ class _TranscriptionPanel(ttk.Frame):
         if first:
             self._browse_viewer.see(first)
 
+    def _browse_delete_file(self, video_path, title, channel):
+        """Delete a video file from the Browse tab context menu."""
+        if not messagebox.askyesno(
+                "Confirm Delete",
+                f"Permanently delete this file from disk?\n\n"
+                f"{os.path.basename(video_path)}\n\nThis cannot be undone.",
+                icon="warning"):
+            return
+        try:
+            fsize = _fmt_size(str(os.path.getsize(video_path)))
+            size_str = f"  ({fsize})" if fsize else ""
+            os.remove(video_path)
+            log(f"  🗑 Deleted: {video_path}{size_str}\n", "green")
+        except OSError as e:
+            log(f"ERROR: Could not delete {video_path}: {e}\n", "red")
+            return
+        # Also remove from recent_downloads if present
+        with config_lock:
+            recent = config.get("recent_downloads", [])
+            for i, entry in enumerate(recent):
+                if entry.get("filepath", "") == video_path:
+                    recent.pop(i)
+                    break
+            config["recent_downloads"] = recent
+        save_config(config)
+        refresh_recent_list()
+        self._refresh_browse()
+
     def _on_browse_tree_rightclick(self, event):
         """Right-click on browse tree → context menu for titles or folders."""
         item = self._browse_tree.identify_row(event.y)
@@ -19281,6 +19441,24 @@ class _TranscriptionPanel(ttk.Frame):
             else:
                 menu.add_command(label="  Open Video — YouTube  (no ID)",
                                  state="disabled")
+
+            if video_path:
+                def _show_explorer(vp=video_path):
+                    try:
+                        if os.name == "nt":
+                            subprocess.Popen(f'explorer /select,"{os.path.normpath(vp)}"')
+                        elif sys.platform == "darwin":
+                            subprocess.Popen(["open", "-R", vp])
+                        else:
+                            subprocess.Popen(["xdg-open", os.path.dirname(vp)])
+                    except Exception as e:
+                        log(f"ERROR: Could not open explorer: {e}\n", "red")
+                menu.add_command(label="  Show in Explorer",
+                                 command=_show_explorer)
+                menu.add_separator()
+                menu.add_command(label="  Delete File",
+                                 command=lambda vp=video_path, t=title, ch=channel:
+                                     self._browse_delete_file(vp, t, ch))
 
         elif meta["type"] in ("channel", "year", "month"):
             # Folder-level context menu — Transcribe / Re-transcribe options
@@ -23096,6 +23274,7 @@ def _try_locate_moved_file(entry, original_fp):
 
 
 def _play_video():
+    """Navigate to the video in Browse tab and play it in the embedded player."""
     sel = recent_tree.selection()
     if len(sel) != 1: return
     idx = _get_recent_orig_idx(sel[0])
@@ -23103,7 +23282,6 @@ def _play_video():
     _sel_channel = recent_tree.set(sel[0], "channel")
     with config_lock:
         recent = config.get("recent_downloads", [])
-        # Prefer index if it still matches, otherwise search by title+channel
         entry = recent[idx] if idx < len(recent) else {}
         if entry and (str(entry.get("title", "")).replace("\n", " ").strip().replace("\ufffd", "") != _sel_title
                       or str(entry.get("channel", "")).replace("\n", " ").strip() != _sel_channel):
@@ -23113,7 +23291,6 @@ def _play_video():
         fp = entry.get("filepath", "")
 
     if not fp or not os.path.exists(fp):
-        # Try to find the file by title if filepath is missing or invalid
         found = None
         if fp:
             found = _try_locate_moved_file(entry, fp)
@@ -23137,15 +23314,11 @@ def _play_video():
             log("  ⚠ Could not locate this video file.\n", "red")
             return
 
-    try:
-        if os.name == "nt":
-            os.startfile(fp)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", fp])
-        else:
-            subprocess.Popen(["xdg-open", fp])
-    except Exception as e:
-        log(f"ERROR: Could not play video: {e}\n", "red")
+    tp = _tp_panel_ref[0]
+    if tp:
+        notebook.select(tab_transcriptions)
+        tp.after(100, lambda: tp.navigate_to_video(
+            _sel_title, _sel_channel, fp, auto_play=True))
 
 
 def _show_in_explorer():
@@ -23280,7 +23453,6 @@ _recent_ctx_menu = tk.Menu(root, tearoff=0, bg=C_RAISED, fg=C_TEXT,
 _recent_ctx_menu.add_command(label="Play video", command=_play_video)
 _recent_ctx_menu.add_command(label="Show in Explorer", command=_show_in_explorer)
 _recent_ctx_menu.add_command(label="Open video on YouTube", command=_open_video_on_yt)
-_recent_ctx_menu.add_command(label="Show in Browse", command=_show_in_browse)
 _recent_ctx_menu.add_separator()
 _recent_ctx_menu.add_command(label="Delete File", command=_delete_selected_files)
 
@@ -23295,7 +23467,6 @@ def _recent_ctx_show(event):
         _recent_ctx_menu.entryconfig("Play video", state="normal" if single else "disabled")
         _recent_ctx_menu.entryconfig("Show in Explorer", state="normal" if single else "disabled")
         _recent_ctx_menu.entryconfig("Open video on YouTube", state="normal" if single else "disabled")
-        _recent_ctx_menu.entryconfig("Show in Browse", state="normal" if single else "disabled")
         try:
             _recent_ctx_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -23372,7 +23543,20 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                         if _idx >= 0:
                             _vid = video_url[_idx + len(_pat):][:11]
                             break
-                tp.register_video(title, channel, year=_yr, month=_mo,
+                # Resolve yt-dlp channel name to config channel name so the
+                # browse tree doesn't show duplicates (e.g. "David Pakman Show"
+                # vs "David Pakman" when the config name differs from YT name)
+                _db_channel = channel
+                if filepath:
+                    with config_lock:
+                        _cfg_channels = config.get("channels", [])
+                        _out_dir = config.get("output_dir", "").strip() or ""
+                    for _ch_cfg in _cfg_channels:
+                        _ch_folder = _ch_cfg.get("folder_override", "").strip() or sanitize_folder(_ch_cfg.get("name", ""))
+                        if _ch_folder and os.sep + _ch_folder + os.sep in filepath.replace("/", os.sep):
+                            _db_channel = _ch_cfg["name"]
+                            break
+                tp.register_video(title, _db_channel, year=_yr, month=_mo,
                                   filepath=filepath, video_id=_vid,
                                   video_url=video_url,
                                   duration_s=float(duration_s) if duration_s else None,

@@ -3236,7 +3236,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 12:37pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.27.26 10:53pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10247,6 +10247,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         log(f"  [{_bf_idx}/{_bf_total}] Fetching captions: {_bf_display}\n", "simpleline")
                         _bf_segs = []
+                        # Pre-check internet before the 120s yt-dlp timeout can hang us
+                        if not _check_internet(timeout=5):
+                            if not _wait_for_internet(_ce, _pe, log_fn=log):
+                                break  # cancelled
                         try:
                             _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
                         except Exception:
@@ -10570,6 +10574,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _whisper_queued > 0 else ""
                 log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
+
+                # Pre-check internet before the 120s yt-dlp timeout can hang us
+                if not _check_internet(timeout=5):
+                    if not _wait_for_internet(_ce, _pe, log_fn=log):
+                        break  # cancelled
 
                 text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
                 source = "auto-captions"

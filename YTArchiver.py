@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v25.7"
+APP_VERSION = "v25.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3324,7 +3324,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 4:49pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 5:09pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18580,7 +18580,7 @@ class _TranscriptionPanel(ttk.Frame):
         sb.grid_propagate(False)
         self._sidebar = sb
 
-        tk.Label(sb, text="BROWSE", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
+        tk.Label(sb, text="LIBRARY", bg=self._TP_SIDEBAR, fg=self._TP_DIM,
                  font=("Segoe UI", 7, "bold")).pack(pady=(16, 6), padx=10)
 
         self._nav_btns = {}
@@ -18613,6 +18613,56 @@ class _TranscriptionPanel(ttk.Frame):
         self._bookmarks_frame = self._build_bookmarks_section(self._content)
         self._index_frame     = self._build_index_section(self._content)
         self._player_frame    = self._build_player_section(self._content)
+
+        # Mini log at bottom — mirrors the main log (same as Subs/Recent tabs)
+        _ml_frame = tk.Frame(self, bg=self._TP_BG)
+        _ml_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        _ml_frame.columnconfigure(0, weight=1)
+        self._mini_log = tk.Text(_ml_frame, state="disabled", height=4,
+                                  bg="#0c0d0f", fg=self._TP_FG,
+                                  font=("Consolas", 9), relief="flat", bd=0,
+                                  highlightthickness=1, highlightbackground="#2a2d33",
+                                  highlightcolor="#2a2d33", padx=8, pady=4, wrap="none")
+        self._mini_log.grid(row=0, column=0, sticky="ew")
+        # Configure all log tags (must match subs/recent mini logs)
+        for _tn, _tc in [("green", {"foreground": "#3dd68c"}),
+                          ("red", {"foreground": "#ff6b6b"}),
+                          ("header", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
+                          ("summary", {"foreground": "#999", "font": ("Consolas", 9, "italic")}),
+                          ("simpleline", {"foreground": self._TP_FG}),
+                          ("simpleline_green", {"foreground": "#3dd68c"}),
+                          ("simpleline_blue", {"foreground": "#7eb8da"}),
+                          ("simpledownload", {"foreground": "#3dd68c"}),
+                          ("simplestatus", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
+                          ("simplestatus_green", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
+                          ("simplestatus_white", {"foreground": self._TP_FG}),
+                          ("dlprogress_pct", {"foreground": "#3dd68c"}),
+                          ("pauselog", {"foreground": "#7eb8da"}),
+                          ("pausestatus", {"foreground": "#7eb8da"}),
+                          ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
+                          ("filterskip", {"foreground": "#999"}),
+                          ("filterskip_dim", {"foreground": "#4a5060"}),
+                          ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
+                          ("tx_head", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
+                          ("update_sep", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
+                          ("update_head", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
+                          ("whisper_prefix", {"foreground": self._TP_FG}),
+                          ("whisper_bracket", {"foreground": "#7eb8da"}),
+                          ("whisper_title", {"foreground": self._TP_FG}),
+                          ("whisper_progress", {"foreground": "#7eb8da"}),
+                          ("whisper_pct", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
+                          ("whisper_dots", {"foreground": "#7eb8da"}),
+                          ("encode_progress", {"foreground": "#7eb8da"}),
+                          ("encode_prefix", {"foreground": self._TP_FG}),
+                          ("encode_title", {"foreground": self._TP_FG}),
+                          ("encode_pct", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
+                          ("encode_dots", {"foreground": "#7eb8da"}),
+                          ("encode_suffix", {"foreground": "#7eb8da"}),
+                          ("transcribe_prefix", {"foreground": self._TP_FG}),
+                          ("transcribe_title", {"foreground": self._TP_FG}),
+                          ("transcribe_using", {"foreground": "#7eb8da"}),
+                          ("dim", {"foreground": "#666"})]:
+            self._mini_log.tag_configure(_tn, **_tc)
 
         self._show_section("browse")
 
@@ -18711,7 +18761,7 @@ class _TranscriptionPanel(ttk.Frame):
         # Header bar
         hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
         hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(hdr, text="Browse", bg=self._TP_BG3, fg=self._TP_FG,
+        tk.Label(hdr, text="All Videos", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 11, "bold")).pack(side="left")
         self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                            font=("Segoe UI", 9))
@@ -21417,6 +21467,8 @@ class _TranscriptionPanel(ttk.Frame):
                                        sliderlength=14, width=10,
                                        activebackground=self._TP_ACCENT)
         self._player_slider.grid(row=0, column=2, sticky="ew", padx=(0, 10))
+        self._player_slider.bind("<ButtonPress-1>", lambda e: setattr(self, '_player_seeking', True))
+        self._player_slider.bind("<B1-Motion>", self._player_on_slider_drag)
         self._player_slider.bind("<ButtonRelease-1>", self._player_on_slider_release)
         self._player_seeking = False
 
@@ -21741,13 +21793,26 @@ class _TranscriptionPanel(ttk.Frame):
         if was_playing:
             self._vlc_player.play()
 
+    def _player_on_slider_drag(self, event):
+        """Update the time label in real-time while the user drags the slider."""
+        if not self._vlc_player:
+            return
+        dur_ms = self._vlc_player.get_length()
+        if dur_ms > 0:
+            pos = self._player_slider.get() / 1000.0
+            preview_ms = int(pos * dur_ms)
+            self._player_time_lbl.config(
+                text=f"{self._fmt_player_time(preview_ms)} / {self._fmt_player_time(dur_ms)}")
+
     def _player_on_slider_release(self, event):
+        self._player_seeking = False
         if not self._vlc_player:
             return
         duration = self._vlc_player.get_length()
         if duration > 0:
             pos = self._player_slider.get() / 1000.0
             self._vlc_player.set_position(pos)
+            self._player_last_word_idx = -1  # reset word highlight
 
     def _player_on_volume(self, val):
         """Debounced volume change — only calls VLC after slider stops moving."""
@@ -21825,10 +21890,10 @@ class _TranscriptionPanel(ttk.Frame):
             else:
                 self._player_play_btn.config(text="▶")
 
-            # Update time and slider
+            # Update time and slider (skip slider update while user is dragging)
             cur_ms = self._vlc_player.get_time()
             dur_ms = self._vlc_player.get_length()
-            if dur_ms > 0:
+            if dur_ms > 0 and not self._player_seeking:
                 self._player_time_lbl.config(
                     text=f"{self._fmt_player_time(cur_ms)} / {self._fmt_player_time(dur_ms)}")
                 pos = self._vlc_player.get_position()
@@ -22641,7 +22706,11 @@ def _sync_mini_logs_from_main():
         total_lines = int(end_idx.split(".")[0])
         # Empty log check
         if total_lines <= 1 and not log_box.get("1.0", "end-1c").strip():
-            for ml in (subs_mini_log, recent_mini_log):
+            _browse_ml2 = _tp_panel_ref[0]._mini_log if (_tp_panel_ref[0] and hasattr(_tp_panel_ref[0], '_mini_log')) else None
+            _empty_logs = [subs_mini_log, recent_mini_log]
+            if _browse_ml2:
+                _empty_logs.append(_browse_ml2)
+            for ml in _empty_logs:
                 try:
                     ml.config(state="normal")
                     ml.delete("1.0", tk.END)
@@ -22689,8 +22758,12 @@ def _sync_mini_logs_from_main():
                         break
                 segments.append((line_text, line_tag))
 
-        # Write to both mini logs
-        for ml in (subs_mini_log, recent_mini_log):
+        # Write to all mini logs (subs, recent, browse)
+        _browse_ml = _tp_panel_ref[0]._mini_log if (_tp_panel_ref[0] and hasattr(_tp_panel_ref[0], '_mini_log')) else None
+        _all_logs = [subs_mini_log, recent_mini_log]
+        if _browse_ml:
+            _all_logs.append(_browse_ml)
+        for ml in _all_logs:
             try:
                 if not ml.winfo_exists():
                     continue

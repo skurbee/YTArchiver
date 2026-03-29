@@ -140,7 +140,8 @@ DEFAULT_CONFIG = {
     "log_mode": "Simple",
     "autorun_gpu": False,
     "chan_col_widths": {},
-    "recent_col_widths": {}
+    "recent_col_widths": {},
+    "deps_checked": False
 }
 
 GPU_BATCH_LIMIT = 5  # max unprocessed encode batches per channel before sync skips it
@@ -3370,7 +3371,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 4:52pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 5:09pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -24067,6 +24068,275 @@ refresh_channel_dropdowns()
 refresh_recent_list()
 
 
+def _first_launch_dep_check():
+    """Show a dependency-setup dialog on first launch, then proceed to normal startup."""
+    with config_lock:
+        already_done = config.get("deps_checked", False)
+    if already_done:
+        check_dependencies()
+        return
+
+    # ── Detect what's installed ──────────────────────────────────────
+    import importlib.util as _ilu
+
+    deps = []  # list of dicts: name, installed, auto, size, note, pip_name/action
+
+    # --- Auto-installable pip packages ---
+    _pystray_ok = _ilu.find_spec("pystray") is not None
+    _pillow_ok = _ilu.find_spec("PIL") is not None
+    _mpl_ok = _HAS_MPL
+
+    deps.append({"name": "pystray", "installed": _pystray_ok, "auto": True,
+                  "size": "~1 MB", "pip": "pystray",
+                  "note": "System tray icon"})
+    deps.append({"name": "Pillow", "installed": _pillow_ok, "auto": True,
+                  "size": "~5 MB", "pip": "Pillow",
+                  "note": "Image processing (tray icon)"})
+    deps.append({"name": "matplotlib", "installed": _mpl_ok, "auto": True,
+                  "size": "~50 MB", "pip": "matplotlib",
+                  "note": "Frequency analysis charts"})
+
+    # --- Auto-downloadable binaries ---
+    def _has_ytdlp():
+        if shutil.which("yt-dlp"):
+            return True
+        for p in [os.path.join(BASE_DIR, "yt-dlp.exe"),
+                  os.path.join(RESOURCE_PATH, "yt-dlp.exe")]:
+            if os.path.isfile(p):
+                return True
+        return False
+
+    def _has_ffmpeg():
+        try:
+            subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, startupinfo=startupinfo)
+            return True
+        except FileNotFoundError:
+            return False
+
+    _ytdlp_ok = _has_ytdlp()
+    _ffmpeg_ok = _has_ffmpeg()
+
+    deps.append({"name": "yt-dlp", "installed": _ytdlp_ok, "auto": True,
+                  "size": "~8 MB", "binary": "yt-dlp",
+                  "note": "Video downloader"})
+    deps.append({"name": "ffmpeg", "installed": _ffmpeg_ok, "auto": True,
+                  "size": "~80 MB", "binary": "ffmpeg",
+                  "note": "Audio/video processing"})
+
+    # --- External (info-only) ---
+    if not _HAS_VLC:
+        deps.append({"name": "VLC", "installed": False, "auto": False,
+                      "size": "~45 MB", "url": "https://www.videolan.org/vlc/",
+                      "note": "Embedded video player (optional)"})
+
+    _py311_ok = False
+    try:
+        r = subprocess.run([_WHISPER_PYTHON, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, encoding="utf-8",
+                           startupinfo=startupinfo, timeout=10)
+        if r.returncode == 0 and "3.11" in (r.stdout or ""):
+            _py311_ok = True
+    except Exception:
+        pass
+
+    if not _py311_ok:
+        deps.append({"name": "Python 3.11", "installed": False, "auto": False,
+                      "size": "~25 MB",
+                      "url": "https://www.python.org/downloads/release/python-3110/",
+                      "note": "Required for Whisper transcription"})
+
+    # --- Whisper (always info-only in this dialog) ---
+    deps.append({"name": "Whisper AI", "installed": False, "auto": False,
+                  "size": "~4 GB", "url": None,
+                  "note": "Transcription — install later from app (needs Python 3.11 + NVIDIA GPU)"})
+
+    # If everything auto-installable is already present, skip the dialog
+    missing_auto = [d for d in deps if d["auto"] and not d["installed"]]
+    missing_external = [d for d in deps if not d["auto"] and not d["installed"]
+                        and d["name"] != "Whisper AI"]
+    if not missing_auto and not missing_external:
+        with config_lock:
+            config["deps_checked"] = True
+            save_config(config)
+        check_dependencies()
+        return
+
+    # ── Build the dialog ─────────────────────────────────────────────
+    dlg = tk.Toplevel(root)
+    dlg.title("Setup — Install Dependencies")
+    dlg.configure(bg=C_BG)
+    dlg.resizable(False, False)
+    dlg.transient(root)
+    dlg.grab_set()
+    dlg.update_idletasks()
+    _apply_dark_title_bar(dlg)
+
+    tk.Label(dlg, text="Install Dependencies", bg=C_BG, fg=C_TEXT,
+             font=("Segoe UI", 14, "bold")).pack(padx=24, pady=(16, 2), anchor="w")
+    tk.Label(dlg, text="The following components are needed for full functionality:",
+             bg=C_BG, fg=C_ACCENT, font=("Segoe UI", 9)).pack(padx=24, pady=(0, 10), anchor="w")
+
+    # Scrollable area isn't needed — list is short. Just a frame.
+    list_frame = tk.Frame(dlg, bg=C_BG)
+    list_frame.pack(fill="x", padx=24)
+
+    status_labels = {}  # name -> Label widget (for updating during install)
+
+    for d in deps:
+        row = tk.Frame(list_frame, bg=C_BG)
+        row.pack(fill="x", pady=2)
+
+        if d["installed"]:
+            icon_text, icon_color = "\u2714", "#5cb85c"  # green check
+        elif d["auto"]:
+            icon_text, icon_color = "\u2716", "#d9534f"  # red X
+        else:
+            icon_text, icon_color = "\u2014", "#888888"  # dash for external
+
+        icon_lbl = tk.Label(row, text=icon_text, bg=C_BG, fg=icon_color,
+                            font=("Segoe UI", 11), width=2)
+        icon_lbl.pack(side="left")
+        status_labels[d["name"]] = icon_lbl
+
+        name_lbl = tk.Label(row, text=d["name"], bg=C_BG, fg=C_TEXT,
+                            font=("Segoe UI", 10, "bold"), width=14, anchor="w")
+        name_lbl.pack(side="left")
+
+        note_text = d["note"]
+        if d["installed"]:
+            note_text += "  (installed)"
+        elif d["auto"]:
+            note_text += f"  ({d['size']})"
+        else:
+            note_text += f"  ({d['size']})"
+
+        note_lbl = tk.Label(row, text=note_text, bg=C_BG, fg=C_ACCENT,
+                            font=("Segoe UI", 9), anchor="w")
+        note_lbl.pack(side="left", fill="x", expand=True)
+
+        # External link button
+        if not d["auto"] and not d["installed"] and d.get("url"):
+            link_btn = tk.Button(row, text="Download \u2197", bg=C_BTN, fg="#66aaff",
+                                 relief="flat", font=("Segoe UI", 8), cursor="hand2",
+                                 command=lambda u=d["url"]: _webbrowser.open(u))
+            link_btn.pack(side="right", padx=(4, 0))
+
+    # ── Buttons ──────────────────────────────────────────────────────
+    btn_frame = tk.Frame(dlg, bg=C_BG)
+    btn_frame.pack(padx=24, pady=(14, 16))
+
+    def _do_install():
+        install_btn.config(state="disabled", text="Installing...")
+        skip_btn.config(state="disabled")
+
+        def _worker():
+            for d in deps:
+                if d["installed"] or not d["auto"]:
+                    continue
+                name = d["name"]
+
+                # Update icon to spinner/working indicator
+                def _set_working(n=name):
+                    try:
+                        status_labels[n].config(text="\u25CB", fg="#f0ad4e")  # yellow circle
+                    except Exception:
+                        pass
+                _ui_queue.append(_set_working)
+
+                success = False
+                try:
+                    if d.get("pip"):
+                        r = subprocess.run(
+                            [sys.executable, "-m", "pip", "install", d["pip"]],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            encoding="utf-8", errors="replace",
+                            startupinfo=startupinfo, timeout=600
+                        )
+                        success = (r.returncode == 0)
+                    elif d.get("binary") == "yt-dlp":
+                        yt_name = "yt-dlp.exe" if os.name == 'nt' else "yt-dlp"
+                        dl_url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{yt_name}"
+                        target = os.path.join(BASE_DIR, yt_name)
+                        tmp = target + ".tmp"
+                        urllib.request.urlretrieve(dl_url, tmp)
+                        os.replace(tmp, target)
+                        success = True
+                    elif d.get("binary") == "ffmpeg":
+                        import zipfile
+                        dl_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+                        zip_path = os.path.join(BASE_DIR, "_ffmpeg_download.zip")
+                        try:
+                            urllib.request.urlretrieve(dl_url, zip_path)
+                            with zipfile.ZipFile(zip_path, 'r') as zf:
+                                for zn in zf.namelist():
+                                    bn = os.path.basename(zn)
+                                    if bn in ("ffmpeg.exe", "ffprobe.exe"):
+                                        with zf.open(zn) as src, open(os.path.join(BASE_DIR, bn), 'wb') as dst:
+                                            shutil.copyfileobj(src, dst)
+                            success = True
+                        finally:
+                            try:
+                                os.remove(zip_path)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                icon_t = "\u2714" if success else "\u2716"
+                icon_c = "#5cb85c" if success else "#d9534f"
+                def _set_done(n=name, t=icon_t, c=icon_c):
+                    try:
+                        status_labels[n].config(text=t, fg=c)
+                    except Exception:
+                        pass
+                _ui_queue.append(_set_done)
+
+            # All done — update button and save config
+            def _finish():
+                try:
+                    install_btn.config(text="Done", state="normal",
+                                       command=lambda: _close(True))
+                    skip_btn.pack_forget()
+                except Exception:
+                    pass
+            _ui_queue.append(_finish)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _close(save=True):
+        if save:
+            with config_lock:
+                config["deps_checked"] = True
+                save_config(config)
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        check_dependencies()
+
+    dlg.protocol("WM_DELETE_WINDOW", lambda: _close(True))
+
+    if missing_auto:
+        install_btn = tk.Button(btn_frame, text="Install All", bg="#3a6a3a", fg="#cccccc",
+                                relief="flat", font=("Segoe UI", 10, "bold"),
+                                cursor="hand2", command=_do_install, width=12)
+        install_btn.pack(side="left", padx=(0, 8))
+    else:
+        install_btn = None
+
+    skip_btn = tk.Button(btn_frame, text="Skip", bg=C_BTN, fg=C_TEXT,
+                         relief="flat", font=("Segoe UI", 10),
+                         cursor="hand2", command=lambda: _close(True), width=12)
+    skip_btn.pack(side="left")
+
+    # Center on main window
+    dlg.update_idletasks()
+    rx = root.winfo_rootx() + root.winfo_width() // 2
+    ry = root.winfo_rooty() + root.winfo_height() // 2
+    dlg.geometry(f"+{rx - dlg.winfo_reqwidth() // 2}+{ry - dlg.winfo_reqheight() // 2}")
+
+
 def check_dependencies():
     global HAS_TRAY
     # Auto-install tray icon dependencies if missing
@@ -24107,7 +24377,7 @@ def check_dependencies():
             threading.Thread(target=_install_tray, daemon=True).start()
 
 
-root.after(100, check_dependencies)
+root.after(100, _first_launch_dep_check)
 
 
 def _check_channel_folders():

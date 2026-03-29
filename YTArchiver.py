@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.5"
+APP_VERSION = "v26.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3370,7 +3370,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 4:35pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 4:52pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19172,92 +19172,124 @@ class _TranscriptionPanel(ttk.Frame):
     _BROWSE_MONTH_SEP = "__month_sep__"
 
     def _populate_browse_titles(self, parent_iid, channel, year, month):
-        """Insert individual video title nodes under a parent browse node."""
-        try:
-            sql = ("SELECT DISTINCT title, filepath, video_id, tx_status, month "
-                   "FROM videos WHERE channel=?")
-            params = [channel]
-            if year is not None:
-                sql += " AND year=?"
-                params.append(year)
-            if month is not None:
-                sql += " AND month=?"
-                params.append(month)
-            sql += " ORDER BY title"
-            rows = self._db_execute(sql, params).fetchall()
-        except Exception:
-            return
+        """Insert individual video title nodes under a parent browse node.
+        Heavy work (DB queries + file stat calls) runs in a background thread;
+        the resulting tree inserts are batched back onto the main thread."""
+        # Show a temporary "Loading..." node while the worker runs
+        _loading_iid = self._browse_tree.insert(
+            parent_iid, "end", text="  Loading...",
+            tags=(self._BROWSE_PLACEHOLDER,))
 
-        # Sort by file mtime (upload date) instead of alphabetically
-        # Also derive month from mtime for separator lines
-        import datetime as _dt
-        _rows_with_mtime = []
-        for row in rows:
-            fp = row[1]
-            _mtime = 0.0
-            _mtime_month = None
-            if fp:
+        def _worker():
+            """Background thread: DB + filesystem work."""
+            try:
+                sql = ("SELECT DISTINCT title, filepath, video_id, tx_status, month "
+                       "FROM videos WHERE channel=?")
+                params = [channel]
+                if year is not None:
+                    sql += " AND year=?"
+                    params.append(year)
+                if month is not None:
+                    sql += " AND month=?"
+                    params.append(month)
+                sql += " ORDER BY title"
+                rows = self._db_execute(sql, params).fetchall()
+            except Exception:
+                self.after(0, lambda: self._browse_tree.delete(_loading_iid))
+                return
+
+            # Sort by file mtime (upload date) instead of alphabetically
+            # Also derive month from mtime for separator lines
+            import datetime as _dt
+            _rows_with_mtime = []
+            for row in rows:
+                fp = row[1]
+                _mtime = 0.0
+                _mtime_month = None
+                if fp:
+                    try:
+                        _mtime = os.path.getmtime(fp)
+                        _mtime_month = _dt.datetime.fromtimestamp(_mtime).month
+                    except OSError:
+                        pass
+                _effective_month = row[4] if row[4] else _mtime_month
+                _rows_with_mtime.append((*row, _mtime, _effective_month))
+            _rows_with_mtime.sort(key=lambda r: r[5])  # sort by mtime
+
+            _show_month_seps = (year is not None and month is None
+                                and len(set(r[6] for r in _rows_with_mtime if r[6])) > 1)
+
+            # Pre-fetch jsonl paths for transcribed videos in one batch query
+            _transcribed_titles = [r[0] for r in _rows_with_mtime if r[3] == "transcribed"]
+            _jsonl_map = {}
+            if _transcribed_titles:
                 try:
-                    _mtime = os.path.getmtime(fp)
-                    _mtime_month = _dt.datetime.fromtimestamp(_mtime).month
-                except OSError:
+                    placeholders = ",".join("?" * len(_transcribed_titles))
+                    _jrows = self._db_execute(
+                        f"SELECT title, jsonl_path FROM segments "
+                        f"WHERE title IN ({placeholders}) AND channel=? "
+                        f"GROUP BY title",
+                        _transcribed_titles + [channel]).fetchall()
+                    _jsonl_map = {r[0]: r[1] for r in _jrows if r[1]}
+                except Exception:
                     pass
-            # Use DB month if available, otherwise derive from file mtime
-            _effective_month = row[4] if row[4] else _mtime_month
-            _rows_with_mtime.append((*row, _mtime, _effective_month))
-        _rows_with_mtime.sort(key=lambda r: r[5])  # sort by mtime
 
-        # Show month separators when viewing a year without month filter
-        _show_month_seps = (year is not None and month is None
-                            and len(set(r[6] for r in _rows_with_mtime if r[6])) > 1)
-        _last_month = None
+            # Build the list of items to insert (pure data, no UI calls)
+            items = []  # list of (type, text, meta_dict) or ("sep", text, None)
+            _last_month = None
+            for title, filepath, video_id, tx_status, _db_month, _mtime, _eff_month in _rows_with_mtime:
+                if _show_month_seps and _eff_month and _eff_month != _last_month:
+                    _mo_name = _TP_MONTH_NAMES[_eff_month - 1].capitalize() if 1 <= _eff_month <= 12 else ""
+                    if _mo_name:
+                        items.append(("sep", f"  ── {_mo_name} ──", None))
+                    _last_month = _eff_month
 
-        # Configure separator tag (dim, non-selectable)
+                disp = title if len(title) <= 60 else title[:57] + "..."
+                if tx_status == "pending":
+                    disp = f"  {disp}  (not processed)"
+                elif tx_status == "no_captions":
+                    disp = f"  {disp}  (no captions)"
+                elif tx_status == "error":
+                    disp = f"  {disp}  (error)"
+                else:
+                    disp = f"  {disp}"
+
+                _jsonl = _jsonl_map.get(title)
+                items.append(("title", disp, {
+                    "type": "title", "channel": channel, "title": title,
+                    "jsonl_path": _jsonl, "filepath": filepath,
+                    "video_id": video_id, "tx_status": tx_status or "pending"}))
+
+            # Schedule the tree inserts on the main thread as one batch
+            self.after(0, lambda: self._browse_insert_batch(parent_iid, _loading_iid, items))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _browse_insert_batch(self, parent_iid, loading_iid, items):
+        """Insert pre-computed browse items into the tree (runs on main thread)."""
+        try:
+            self._browse_tree.delete(loading_iid)
+        except Exception:
+            pass
+
+        # Configure separator tag
         self._browse_tree.tag_configure(
             self._BROWSE_MONTH_SEP,
             foreground="#555555", font=("Segoe UI", 8))
 
-        for title, filepath, video_id, tx_status, _db_month, _mtime, _eff_month in _rows_with_mtime:
-            # Insert month separator if month changed
-            if _show_month_seps and _eff_month and _eff_month != _last_month:
-                _mo_name = _TP_MONTH_NAMES[_eff_month - 1].capitalize() if 1 <= _eff_month <= 12 else ""
-                if _mo_name:
-                    sep_iid = self._browse_tree.insert(
-                        parent_iid, "end",
-                        text=f"  ── {_mo_name} ──",
-                        tags=(self._BROWSE_MONTH_SEP,))
-                    self._browse_items[sep_iid] = {"type": "separator"}
-                _last_month = _eff_month
-
-            disp = title if len(title) <= 60 else title[:57] + "..."
-            # Visual status indicators
-            if tx_status == "pending":
-                disp = f"  {disp}  (not processed)"
-            elif tx_status == "no_captions":
-                disp = f"  {disp}  (no captions)"
-            elif tx_status == "error":
-                disp = f"  {disp}  (error)"
+        for kind, text, meta_dict in items:
+            if kind == "sep":
+                sep_iid = self._browse_tree.insert(
+                    parent_iid, "end", text=text,
+                    tags=(self._BROWSE_MONTH_SEP,))
+                self._browse_items[sep_iid] = {"type": "separator"}
             else:
-                disp = f"  {disp}"
-            t_iid = self._browse_tree.insert(parent_iid, "end", text=disp)
-            # Try to find a matching jsonl_path from segments for backward compat
-            _jsonl = None
-            if tx_status == "transcribed":
-                try:
-                    _row = self._db_execute(
-                        "SELECT jsonl_path FROM segments WHERE title=? AND channel=? LIMIT 1",
-                        (title, channel)).fetchone()
-                    if _row:
-                        _jsonl = _row[0]
-                except Exception:
-                    pass
-            self._browse_items[t_iid] = {
-                "type": "title", "channel": channel, "title": title,
-                "jsonl_path": _jsonl, "filepath": filepath,
-                "video_id": video_id, "tx_status": tx_status or "pending"}
+                t_iid = self._browse_tree.insert(parent_iid, "end", text=text)
+                self._browse_items[t_iid] = meta_dict
 
     def _on_browse_select(self, event=None):
-        """When a title node is selected in the browse tree, show its transcription."""
+        """When a title node is selected in the browse tree, show its transcription.
+        Heavy I/O (file search, file read, DB queries) runs in a background thread."""
         sel = self._browse_tree.selection()
         if not sel:
             return
@@ -19268,54 +19300,35 @@ class _TranscriptionPanel(ttk.Frame):
         tx_status  = meta.get("tx_status", "pending")
         filepath   = meta.get("filepath")
         txt_path   = self._get_txt_path(meta["jsonl_path"]) if meta.get("jsonl_path") else None
-        # Fallback: if no jsonl_path, search for .txt transcript files near the video
-        if not txt_path and filepath:
-            _search_dir = os.path.dirname(filepath)
-            for _ in range(3):  # check dir + 2 parents
-                try:
-                    for fn in os.listdir(_search_dir):
-                        if fn.lower().endswith('.txt') and 'transcript' in fn.lower():
-                            txt_path = os.path.join(_search_dir, fn)
-                            break
-                except OSError:
-                    pass
-                if txt_path:
-                    break
-                _p = os.path.dirname(_search_dir)
-                if _p == _search_dir:
-                    break
-                _search_dir = _p
+        channel    = meta.get("channel", "")
+
+        # Stamp a generation counter so stale threads don't clobber a newer selection
+        if not hasattr(self, '_browse_select_gen'):
+            self._browse_select_gen = 0
+        self._browse_select_gen += 1
+        _gen = self._browse_select_gen
+
+        # Immediate lightweight UI updates (no I/O)
         self._browse_viewer_title.config(text=title)
         self._browse_path_label.config(
-            text=f"{meta.get('channel', '')}  •  {txt_path or filepath or ''}")
+            text=f"{channel}  •  {txt_path or filepath or ''}")
 
-        # Look up video_id for re-transcribe
+        # Set initial metadata (txt_path may be updated by the worker thread)
         _vid_id = meta.get("video_id")
-        if not _vid_id and self._conn and title:
-            try:
-                _row = self._db_execute(
-                    "SELECT video_id FROM segments WHERE title=? AND video_id!='' LIMIT 1",
-                    (title,)).fetchone()
-                if _row:
-                    _vid_id = _row[0]
-            except Exception:
-                pass
         self._browse_current_meta = {
-            "title": title, "channel": meta.get("channel", ""),
+            "title": title, "channel": channel,
             "txt_path": txt_path, "jsonl_path": meta.get("jsonl_path"),
             "video_id": _vid_id, "filepath": filepath,
             "tx_status": tx_status,
         }
+
         # Set actions dropdown menu labels and state based on tx_status
         _transcribe_lbl = "  Re-transcribe"
-        _has_redownload = bool(_vid_id)
         if tx_status in ("pending", "no_captions", "error"):
             _transcribe_lbl = "  Transcribe"
         self._browse_actions_menu.entryconfig(0, label=_transcribe_lbl)
-        # Enable the dropdown button — always enabled when a video is selected
         _enable_actions = True
         if not _vid_id and tx_status not in ("pending", "no_captions", "error"):
-            # No video_id and already transcribed — check for video file before enabling
             _enable_actions = False
             _check_title, _check_txt = title, txt_path
             def _check_video():
@@ -19329,10 +19342,8 @@ class _TranscriptionPanel(ttk.Frame):
         # immediately; verify + probe resolution in background thread.
         self._browse_play_btn.config(state="disabled")
         _play_title, _play_txt, _play_fp = title, txt_path, filepath
-        _play_channel = meta.get("channel", "")
-        _play_path_display = txt_path or filepath or ""
+        _play_channel = channel
         if _play_fp:
-            # Trust the DB filepath — enable play button right away
             self._browse_current_meta["_video_path"] = _play_fp
             self._browse_play_btn.config(state="normal")
         def _check_play():
@@ -19342,7 +19353,6 @@ class _TranscriptionPanel(ttk.Frame):
             if not vp:
                 vp = self._find_video_file(_play_title, _play_txt)
             if vp:
-                # Probe resolution
                 _res_h = _ffprobe_height(vp)
                 _res_str = f"{_res_h}p" if _res_h else None
                 def _update(p=vp, rs=_res_str):
@@ -19355,14 +19365,13 @@ class _TranscriptionPanel(ttk.Frame):
                                 text=f"{_play_title}  ({rs})")
                 self.after(0, _update)
             elif _play_fp:
-                # DB filepath didn't exist — disable play button again
                 def _disable():
                     if self._browse_current_meta and self._browse_current_meta.get("title") == _play_title:
                         self._browse_play_btn.config(state="disabled")
                 self.after(0, _disable)
         threading.Thread(target=_check_play, daemon=True).start()
 
-        # For untranscribed videos, show a status message instead of transcript
+        # For untranscribed videos, show a status message instead of transcript (no I/O needed)
         if tx_status in ("pending", "no_captions", "error"):
             self._browse_viewer.config(state="normal")
             self._browse_viewer.delete("1.0", "end")
@@ -19390,23 +19399,125 @@ class _TranscriptionPanel(ttk.Frame):
             self._browse_viewer.yview_moveto(0)
             return
 
-        # Fetch segments from DB for the position map (double-click seeking).
-        # The viewer itself always shows the .txt body (punctuation-restored).
-        db_rows = []
-        if self._conn:
-            try:
-                db_rows = self._db_execute(
-                    "SELECT video_id, start_time, end_time, text, words "
-                    "FROM segments WHERE title=? ORDER BY start_time",
-                    (title,)).fetchall()
-            except Exception:
-                db_rows = []
+        # Show "Loading..." in the viewer while the worker fetches data
+        self._browse_viewer.config(state="normal")
+        self._browse_viewer.delete("1.0", "end")
+        self._browse_seg_map = []
+        self._browse_viewer.insert("end", "Loading...", "header")
+        self._browse_viewer.config(state="disabled")
+
+        # Heavy I/O runs in background: txt_path fallback search, DB query, file read
+        def _load_transcript():
+            nonlocal txt_path
+            # Fallback: if no jsonl_path, search for .txt transcript files near the video
+            if not txt_path and filepath:
+                _search_dir = os.path.dirname(filepath)
+                for _ in range(3):
+                    try:
+                        for fn in os.listdir(_search_dir):
+                            if fn.lower().endswith('.txt') and 'transcript' in fn.lower():
+                                txt_path = os.path.join(_search_dir, fn)
+                                break
+                    except OSError:
+                        pass
+                    if txt_path:
+                        break
+                    _p = os.path.dirname(_search_dir)
+                    if _p == _search_dir:
+                        break
+                    _search_dir = _p
+
+            # Look up video_id if not already known
+            found_vid_id = _vid_id
+            if not found_vid_id and self._conn and title:
+                try:
+                    _row = self._db_execute(
+                        "SELECT video_id FROM segments WHERE title=? AND video_id!='' LIMIT 1",
+                        (title,)).fetchone()
+                    if _row:
+                        found_vid_id = _row[0]
+                except Exception:
+                    pass
+
+            # Fetch segments from DB for the position map
+            db_rows = []
+            if self._conn:
+                try:
+                    db_rows = self._db_execute(
+                        "SELECT video_id, start_time, end_time, text, words "
+                        "FROM segments WHERE title=? ORDER BY start_time",
+                        (title,)).fetchall()
+                except Exception:
+                    db_rows = []
+
+            # Read the .txt file (can be 100KB+)
+            section = self._get_txt_section(txt_path, title) if txt_path else None
+
+            # Build the segment position map (CPU work, fine in thread)
+            body = ""
+            header_line = ""
+            header_char_len = 0
+            seg_map = []
+            if section:
+                lines = section.split('\n', 1)
+                header_line = lines[0]
+                body = lines[1].strip() if len(lines) > 1 else ""
+                header_char_len = len(header_line) + 2
+            elif db_rows:
+                body = " ".join(row[3] for row in db_rows)
+
+            if db_rows and body:
+                total_seg_chars = sum(len(row[3]) for row in db_rows)
+                if total_seg_chars > 0:
+                    _off = header_char_len
+                    body_chars = len(body)
+                    pending = []
+                    for video_id, start, end, seg_text, words_json in db_rows:
+                        proportion = len(seg_text) / total_seg_chars
+                        cs = _off
+                        _off += int(proportion * body_chars)
+                        pending.append((cs, (video_id, start, end, seg_text, words_json or "")))
+                    for i, (cs, data) in enumerate(pending):
+                        ce = (pending[i + 1][0] if i + 1 < len(pending)
+                              else header_char_len + body_chars)
+                        seg_map.append((cs, ce, data))
+
+            # Schedule UI update on main thread
+            self.after(0, lambda: self._browse_apply_transcript(
+                _gen, title, channel, txt_path, found_vid_id, filepath, tx_status,
+                meta.get("jsonl_path"), section, header_line, body, db_rows, seg_map))
+
+        threading.Thread(target=_load_transcript, daemon=True).start()
+
+    def _browse_apply_transcript(self, gen, title, channel, txt_path, vid_id,
+                                  filepath, tx_status, jsonl_path,
+                                  section, header_line, body, db_rows, seg_map):
+        """Apply loaded transcript data to the viewer (runs on main thread).
+        Skips if a newer selection has been made (stale generation)."""
+        if gen != self._browse_select_gen:
+            return  # a newer selection superseded this one
+
+        # Update metadata with resolved values from the worker thread,
+        # preserving any _video_path already set by the _check_play thread
+        _existing_vp = (self._browse_current_meta or {}).get("_video_path")
+        _existing_res = (self._browse_current_meta or {}).get("resolution")
+        self._browse_current_meta = {
+            "title": title, "channel": channel,
+            "txt_path": txt_path, "jsonl_path": jsonl_path,
+            "video_id": vid_id, "filepath": filepath,
+            "tx_status": tx_status,
+        }
+        if _existing_vp:
+            self._browse_current_meta["_video_path"] = _existing_vp
+        if _existing_res:
+            self._browse_current_meta["resolution"] = _existing_res
+        self._browse_path_label.config(
+            text=f"{channel}  •  {txt_path or filepath or ''}")
 
         self._browse_viewer.config(state="normal")
         self._browse_viewer.delete("1.0", "end")
         self._browse_seg_map = []
 
-        section = self._get_txt_section(txt_path, title) if txt_path else None
         if not section and not db_rows:
             self._browse_viewer.insert("end",
                 "(No .txt file found for this transcription.)\n\n", "header")
@@ -19416,40 +19527,13 @@ class _TranscriptionPanel(ttk.Frame):
             self._browse_viewer.yview_moveto(0)
             return
 
-        # Display the .txt content exactly as before (header + punctuated body)
-        body = ""
-        header_char_len = 0
         if section:
-            lines = section.split('\n', 1)
-            header_line = lines[0]
-            body = lines[1].strip() if len(lines) > 1 else ""
             self._browse_viewer.insert("end", header_line + "\n\n", "header")
-            header_char_len = len(header_line) + 2
             self._browse_viewer.insert("end", body)
         else:
-            # No .txt yet — show raw segment text as fallback
-            body = " ".join(row[3] for row in db_rows)
             self._browse_viewer.insert("end", body)
 
-        # Build the segment position map by proportionally dividing the body
-        # text among DB segments based on each segment's text length.  This is
-        # robust against overlapping VTT segments and punctuation changes.
-        if db_rows and body:
-            total_seg_chars = sum(len(row[3]) for row in db_rows)
-            if total_seg_chars > 0:
-                offset = header_char_len
-                body_chars = len(body)
-                pending = []
-                for video_id, start, end, seg_text, words_json in db_rows:
-                    proportion = len(seg_text) / total_seg_chars
-                    cs = offset
-                    offset += int(proportion * body_chars)
-                    pending.append((cs, (video_id, start, end, seg_text, words_json or "")))
-
-                for i, (cs, data) in enumerate(pending):
-                    ce = (pending[i + 1][0] if i + 1 < len(pending)
-                          else header_char_len + body_chars)
-                    self._browse_seg_map.append((cs, ce, data))
+        self._browse_seg_map = seg_map
 
         self._browse_viewer.config(state="disabled")
         self._browse_viewer.yview_moveto(0)

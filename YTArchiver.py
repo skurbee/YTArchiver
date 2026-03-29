@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.2"
+APP_VERSION = "v26.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3369,7 +3369,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 10:48pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 3:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18539,13 +18539,28 @@ class _TranscriptionPanel(ttk.Frame):
         norm_fp = os.path.normpath(filepath).lower() if filepath else ""
 
         tree = self._browse_tree
-        # Find the channel node
+        # Find the channel node — if direct match fails, look up the DB-stored
+        # channel name by filepath (yt-dlp names can differ from config names)
         ch_iid = None
         for iid in tree.get_children():
             meta = self._browse_items.get(iid)
             if meta and meta.get("channel") == channel:
                 ch_iid = iid
                 break
+        if not ch_iid and filepath:
+            try:
+                row = self._db_execute(
+                    "SELECT channel FROM videos WHERE filepath=?",
+                    (filepath,)).fetchone()
+                if row and row[0] != channel:
+                    channel = row[0]
+                    for iid in tree.get_children():
+                        meta = self._browse_items.get(iid)
+                        if meta and meta.get("channel") == channel:
+                            ch_iid = iid
+                            break
+            except Exception:
+                pass
         if not ch_iid:
             return False
 
@@ -23892,6 +23907,7 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                                   video_url=video_url,
                                   duration_s=float(duration_s) if duration_s else None,
                                   size_bytes=int(final_size) if final_size else None)
+                tp._refresh_browse()
 
             if notebook.select() != str(tab_recent):
                 new_download_count += 1

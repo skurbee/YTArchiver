@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import tkinter.font as tkfont
 import threading
+import concurrent.futures
 import queue
 import subprocess
 import json
@@ -81,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.3"
+APP_VERSION = "v26.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3369,7 +3370,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 3:19pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 4:28pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9581,15 +9582,17 @@ def _block_if_no_internet(cancel_ev=None, pause_ev=None):
     return True
 
 
-def _fetch_auto_captions(video_id, temp_dir):
+def _fetch_auto_captions(video_id, temp_dir, cookies_forced=False):
     """Fetch YouTube captions (manual or auto-generated) for a video.
 
-    Returns (text, segments) where text is str or None, and segments is a list of
-    {"start": float, "end": float, "text": str} dicts (empty list on failure).
+    Returns (text, segments, needed_cookies) where text is str or None, segments
+    is a list of {"start": float, "end": float, "text": str} dicts (empty list
+    on failure), and needed_cookies is True if the cookieless attempt failed but
+    the cookies attempt succeeded (used for adaptive cookie forcing).
 
-    Tries with Firefox cookies first; if no usable .vtt is produced, retries
-    without cookies (handles locked/expired browser cookie DB after pause or
-    session restore) with --force-overwrites so a stale partial file is replaced.
+    By default tries WITHOUT cookies first (faster — skips Firefox DB read),
+    then falls back to WITH cookies.  If cookies_forced=True, goes straight to
+    cookies (skips the cookieless attempt).
     """
     temp_base = os.path.join(temp_dir, f"_transcript_{video_id}")
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -9647,18 +9650,24 @@ def _fetch_auto_captions(video_id, temp_dir):
         segments = _parse_vtt_to_segments(vtt_path)
         return text, segments, vtt_files
 
-    # First attempt: with cookies + force-overwrites to avoid stale files
-    _run_fetch(use_cookies=True, force_overwrites=True)
-    text, segments, vtt_files = _try_parse_vtt()
+    _needed_cookies = False
 
-    # Fallback: retry without cookies if first attempt produced no usable text.
-    # Covers locked/expired browser cookie DB after pause/resume, session
-    # restore, or stale cookies that cause yt-dlp to download empty subtitle
-    # tracks.  Always cleans up temp files first so yt-dlp starts fresh.
-    if not text:
-        _cleanup_temp_files()
+    if cookies_forced:
+        # Adaptive mode: previous failures indicate cookies are required
+        _run_fetch(use_cookies=True, force_overwrites=True)
+        text, segments, vtt_files = _try_parse_vtt()
+    else:
+        # First attempt: WITHOUT cookies (faster — skips Firefox DB read)
         _run_fetch(use_cookies=False, force_overwrites=True)
         text, segments, vtt_files = _try_parse_vtt()
+
+        # Fallback: retry WITH cookies if cookieless attempt produced no usable text
+        if not text:
+            _cleanup_temp_files()
+            _run_fetch(use_cookies=True, force_overwrites=True)
+            text, segments, vtt_files = _try_parse_vtt()
+            if text:
+                _needed_cookies = True  # signal to caller for adaptive tracking
 
     # Log yt-dlp's error output when both attempts fail (aids diagnostics)
     if not text and _last_stderr[0]:
@@ -9674,7 +9683,7 @@ def _fetch_auto_captions(video_id, temp_dir):
             os.remove(vf)
         except Exception:
             pass
-    return (text if text else None), segments
+    return (text if text else None), segments, _needed_cookies
 
 
 def _format_upload_date(date_str):
@@ -10519,7 +10528,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if not _block_if_no_internet(cancel_ev=_ce):
                             break  # cancelled
                         try:
-                            _, _bf_segs = _fetch_auto_captions(_bf_vid, _bf_temp)
+                            _, _bf_segs, _ = _fetch_auto_captions(_bf_vid, _bf_temp)
                         except Exception:
                             pass
 
@@ -10803,7 +10812,17 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Phase A: Process matched files (auto-captions first) ────
             _consec_caption_fails = 0  # track consecutive caption failures for backoff/retry
             _caption_successes = 0     # total successes so far (to detect regression)
-            for fname, fpath, vid_id in matched:
+            _cookies_forced = False    # adaptive: force cookies after repeated cookieless failures
+            _consec_needed_cookies = 0 # track how many times cookieless failed but cookies worked
+            _COOKIES_FORCE_THRESHOLD = 5  # switch to cookies-first after this many
+
+            # Pipeline prefetch: overlap next video's yt-dlp fetch with current
+            # video's punctuation + write.  Single-threaded executor ensures only
+            # one yt-dlp process runs at a time — no extra YouTube load.
+            _prefetch_future = None
+            _prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+            for _mi, (fname, fpath, vid_id) in enumerate(matched):
                 idx += 1
                 _check_idx += 1
                 _fname_trunc_src = unicodedata.normalize('NFKC', fname)
@@ -10812,6 +10831,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Pause check
                 _pl = "GPU Tasks" if _sync_mode else "Sync"
                 if _pe.is_set() and not _ce.is_set():
+                    # Cancel any in-flight prefetch — temp dir will be wiped
+                    if _prefetch_future and not _prefetch_future.done():
+                        _prefetch_future.cancel()
+                    _prefetch_future = None
                     log(f"  ⏸ {_pl} paused at {_fmt_time()} — click Resume.\n", "pausestatus")
                     while _pe.is_set() and not _ce.is_set():
                         time.sleep(0.25)
@@ -10827,6 +10850,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     except Exception:
                         pass
                     _consec_caption_fails = 0
+                    _consec_needed_cookies = 0
+                    _cookies_forced = False
                 if _ce.is_set():
                     log(f"\n  ⛔ Transcription cancelled ({done_count}/{total} completed).\n", "red")
                     break
@@ -10846,7 +10871,15 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if not _block_if_no_internet(cancel_ev=_ce):
                     break  # cancelled
 
-                text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
+                # Use prefetched result if available, otherwise fetch now
+                if _prefetch_future is not None:
+                    try:
+                        text, _vtt_segments, _needed_cookies = _prefetch_future.result(timeout=120)
+                    except Exception:
+                        text, _vtt_segments, _needed_cookies = None, [], False
+                    _prefetch_future = None
+                else:
+                    text, _vtt_segments, _needed_cookies = _fetch_auto_captions(vid_id, temp_dir, cookies_forced=_cookies_forced)
                 source = "auto-captions"
 
                 if not text:
@@ -10856,7 +10889,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     if _internet_down.is_set():
                         if _block_if_no_internet(cancel_ev=_ce):
                             # Internet restored — retry this file
-                            text, _vtt_segments = _fetch_auto_captions(vid_id, temp_dir)
+                            text, _vtt_segments, _needed_cookies = _fetch_auto_captions(vid_id, temp_dir, cookies_forced=_cookies_forced)
                         else:
                             break  # cancelled
                     if not text:
@@ -10878,6 +10911,28 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         except Exception:
                             pass
                         continue
+
+                # Adaptive cookie forcing: if cookieless keeps failing but cookies
+                # work, stop wasting time on the cookieless attempt
+                if _needed_cookies:
+                    _consec_needed_cookies += 1
+                    if _consec_needed_cookies >= _COOKIES_FORCE_THRESHOLD and not _cookies_forced:
+                        _cookies_forced = True
+                        log(f"    ℹ Switching to cookies-first (cookieless failed {_consec_needed_cookies}x in a row).\n", "dim")
+                else:
+                    _consec_needed_cookies = 0  # reset on cookieless success
+
+                # Kick off prefetch for the NEXT video before punctuation/write.
+                # This overlaps the yt-dlp network fetch with GPU punctuation work.
+                _next_i = _mi + 1
+                if (_next_i < len(matched) and not _ce.is_set()
+                        and not _pe.is_set() and _consec_caption_fails < 3):
+                    _next_vid_id = matched[_next_i][2]
+                    _prefetch_future = _prefetch_executor.submit(
+                        _fetch_auto_captions, _next_vid_id, temp_dir,
+                        cookies_forced=_cookies_forced)
+                else:
+                    _prefetch_future = None
 
                 # Restore punctuation to YouTube captions
                 _consec_caption_fails = 0  # reset on success
@@ -10944,6 +10999,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
                     log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
+
+            # Cleanup prefetch executor
+            _prefetch_executor.shutdown(wait=False)
 
             # ── captions_only mode: finish up and optionally queue GPU task for Whisper ──
             if captions_only:

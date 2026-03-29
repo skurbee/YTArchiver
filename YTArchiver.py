@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.1"
+APP_VERSION = "v26.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3369,7 +3369,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 7:03pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 10:48pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18966,14 +18966,23 @@ class _TranscriptionPanel(ttk.Frame):
             padx=10, anchor="center",
             state="disabled", command=self._on_browse_play_video)
         self._browse_play_btn.pack(side="right", padx=(0, 10))
-        # Re-transcribe button — lets user re-transcribe a bad YT caption via Whisper
-        self._browse_retranscribe_btn = tk.Button(
-            vh, text="Re-transcribe", bg="#3a3a3a", fg=self._TP_FG,
+        # Actions dropdown — Re-transcribe / Redownload
+        self._browse_actions_menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                                            activebackground=self._TP_ACCENT, activeforeground="white",
+                                            disabledforeground=self._TP_DIM, relief="flat", bd=1)
+        self._browse_actions_menu.add_command(label="  Re-transcribe", command=self._on_retranscribe)
+        self._browse_actions_menu.add_command(label="  Re-download...", command=self._on_browse_redownload)
+        def _show_actions_menu():
+            btn = self._browse_actions_btn
+            self._browse_actions_menu.tk_popup(
+                btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+        self._browse_actions_btn = tk.Button(
+            vh, text="▾", bg="#3a3a3a", fg=self._TP_FG,
             activebackground="#555555", activeforeground=self._TP_FG,
-            relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
-            padx=8, anchor="center",
-            state="disabled", command=self._on_retranscribe)
-        self._browse_retranscribe_btn.pack(side="right", padx=(0, 10))
+            disabledforeground="#555555",
+            relief="flat", bd=0, font=("Segoe UI", 10, "bold"), cursor="hand2",
+            padx=6, state="disabled", command=_show_actions_menu)
+        self._browse_actions_btn.pack(side="right", padx=(0, 10))
         # Responsive: collapse button text when panel is narrow
         self._browse_btn_compact = False
         def _on_viewer_header_resize(event):
@@ -18982,16 +18991,10 @@ class _TranscriptionPanel(ttk.Frame):
                 self._browse_btn_compact = compact
                 if compact:
                     self._browse_play_btn.config(text="▶", padx=6)
-                    self._browse_retranscribe_btn.config(
-                        text="T" if self._browse_retranscribe_btn._tx_label == "Transcribe"
-                        else "RT", padx=6)
                 else:
                     self._browse_play_btn.config(text="▶  Play Video", padx=10)
-                    self._browse_retranscribe_btn.config(
-                        text=self._browse_retranscribe_btn._tx_label, padx=8)
         vh.bind("<Configure>", _on_viewer_header_resize)
-        self._browse_retranscribe_btn._tx_label = "Re-transcribe"
-        # Current browse selection state for re-transcribe
+        # Current browse selection state
         self._browse_current_meta = None
         vf = tk.Frame(right, bg=self._TP_BG)
         vf.pack(fill="both", expand=True)
@@ -19230,51 +19233,60 @@ class _TranscriptionPanel(ttk.Frame):
             "video_id": _vid_id, "filepath": filepath,
             "tx_status": tx_status,
         }
-        # Set transcribe/re-transcribe button label and state based on tx_status
+        # Set actions dropdown menu labels and state based on tx_status
+        _transcribe_lbl = "  Re-transcribe"
+        _has_redownload = bool(_vid_id)
         if tx_status in ("pending", "no_captions", "error"):
-            # Not yet transcribed — show "Transcribe"
-            _lbl = "Transcribe"
-            _compact_lbl = "T"
-            self._browse_retranscribe_btn._tx_label = _lbl
-            if self._browse_btn_compact:
-                self._browse_retranscribe_btn.config(text=_compact_lbl, state="normal")
-            else:
-                self._browse_retranscribe_btn.config(text=_lbl, state="normal")
-        elif _vid_id:
-            # Transcribed and has video_id — show "Re-transcribe"
-            _lbl = "Re-transcribe"
-            _compact_lbl = "RT"
-            self._browse_retranscribe_btn._tx_label = _lbl
-            if self._browse_btn_compact:
-                self._browse_retranscribe_btn.config(text=_compact_lbl, state="normal")
-            else:
-                self._browse_retranscribe_btn.config(text=_lbl, state="normal")
-        else:
-            _lbl = "Re-transcribe"
-            self._browse_retranscribe_btn._tx_label = _lbl
-            self._browse_retranscribe_btn.config(state="disabled")
+            _transcribe_lbl = "  Transcribe"
+        self._browse_actions_menu.entryconfig(0, label=_transcribe_lbl)
+        # Enable the dropdown button — always enabled when a video is selected
+        _enable_actions = True
+        if not _vid_id and tx_status not in ("pending", "no_captions", "error"):
+            # No video_id and already transcribed — check for video file before enabling
+            _enable_actions = False
             _check_title, _check_txt = title, txt_path
             def _check_video():
                 found = bool(self._find_video_file(_check_title, _check_txt))
                 if found:
-                    self.after(0, lambda: self._browse_retranscribe_btn.config(state="normal"))
+                    self.after(0, lambda: self._browse_actions_btn.config(state="normal"))
             threading.Thread(target=_check_video, daemon=True).start()
+        self._browse_actions_btn.config(state="normal" if _enable_actions else "disabled")
 
-        # Enable play button — check for video file in background
+        # Enable play button — if we have a filepath from DB, trust it and enable
+        # immediately; verify + probe resolution in background thread.
         self._browse_play_btn.config(state="disabled")
         _play_title, _play_txt, _play_fp = title, txt_path, filepath
+        _play_channel = meta.get("channel", "")
+        _play_path_display = txt_path or filepath or ""
+        if _play_fp:
+            # Trust the DB filepath — enable play button right away
+            self._browse_current_meta["_video_path"] = _play_fp
+            self._browse_play_btn.config(state="normal")
         def _check_play():
             vp = None
-            if _play_fp and os.path.isfile(_play_fp):
-                vp = _play_fp
-            else:
+            if _play_fp:
+                vp = _play_fp if os.path.isfile(_play_fp) else None
+            if not vp:
                 vp = self._find_video_file(_play_title, _play_txt)
             if vp:
-                def _enable(p=vp):
+                # Probe resolution
+                _res_h = _ffprobe_height(vp)
+                _res_str = f"{_res_h}p" if _res_h else None
+                def _update(p=vp, rs=_res_str):
                     if self._browse_current_meta and self._browse_current_meta.get("title") == _play_title:
                         self._browse_current_meta["_video_path"] = p
                         self._browse_play_btn.config(state="normal")
-                self.after(0, _enable)
+                        if rs:
+                            self._browse_current_meta["resolution"] = rs
+                            self._browse_viewer_title.config(
+                                text=f"{_play_title}  ({rs})")
+                self.after(0, _update)
+            elif _play_fp:
+                # DB filepath didn't exist — disable play button again
+                def _disable():
+                    if self._browse_current_meta and self._browse_current_meta.get("title") == _play_title:
+                        self._browse_play_btn.config(state="disabled")
+                self.after(0, _disable)
         threading.Thread(target=_check_play, daemon=True).start()
 
         # For untranscribed videos, show a status message instead of transcript
@@ -19497,6 +19509,13 @@ class _TranscriptionPanel(ttk.Frame):
                 menu.add_command(label="  Open Video — YouTube  (no ID)",
                                  state="disabled")
 
+            if video_id:
+                menu.add_command(label="  Redownload...",
+                                 command=lambda vi=video_id, t=title, vp=video_path, ch=channel:
+                                     self._on_browse_redownload(vi, t, vp, ch))
+            else:
+                menu.add_command(label="  Redownload...  (no ID)", state="disabled")
+
             if video_path:
                 def _show_explorer(vp=video_path):
                     try:
@@ -19557,6 +19576,12 @@ class _TranscriptionPanel(ttk.Frame):
                 command=lambda: self._browse_transcribe_folder(
                     channel, year, month, retranscribe=True))
 
+            menu.add_separator()
+            menu.add_command(
+                label="  Redownload at...",
+                command=lambda ch=channel, y=year, m=month:
+                    self._browse_redownload_folder(ch, y, m))
+
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -19596,6 +19621,45 @@ class _TranscriptionPanel(ttk.Frame):
             "split_months": sm,
             "combined": not sy,
         })
+
+    def _browse_redownload_folder(self, channel, year=None, month=None):
+        """Right-click → Redownload at... for a channel/year/month folder."""
+        ch_cfg = None
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name", "") == channel:
+                    ch_cfg = ch
+                    break
+        if not ch_cfg:
+            messagebox.showwarning("Channel not found",
+                f"Could not find channel \"{channel}\" in your saved channels.\n"
+                "You may need to add it in Settings first.")
+            return
+
+        ch_name = ch_cfg["name"]
+        ch_url  = ch_cfg.get("url", "")
+        folder  = ch_cfg.get("folder_override") or sanitize_folder(ch_name)
+        with config_lock:
+            base = config.get("output_dir", "")
+        folder_path = os.path.join(base, folder) if base else folder
+
+        # For year/month scoped redownloads, point to the subfolder
+        if year is not None:
+            folder_path = os.path.join(folder_path, str(year))
+        if month is not None and 1 <= (month or 0) <= 12:
+            folder_path = os.path.join(folder_path, f"{month:02d}")
+
+        scope_label = ch_name
+        if year is not None:
+            scope_label += f" / {year}"
+        if month is not None and 1 <= (month or 0) <= 12:
+            scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
+
+        resolution = self._show_resolution_dialog(f"Redownload: {scope_label}")
+        if not resolution:
+            return
+
+        _add_to_redownload_queue(ch_name, ch_url, folder_path, resolution)
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""
@@ -19683,7 +19747,7 @@ class _TranscriptionPanel(ttk.Frame):
             return  # User cancelled
 
         chosen_model = _model_result[0]
-        self._browse_retranscribe_btn.config(state="disabled", text="Working...")
+        self._browse_actions_btn.config(state="disabled")
 
         def _retranscribe_worker():
             global _whisper_model_choice
@@ -19800,14 +19864,13 @@ class _TranscriptionPanel(ttk.Frame):
         threading.Thread(target=_retranscribe_worker, daemon=True).start()
 
     def _browse_retranscribe_status(self, msg):
-        """Update the re-transcribe button text from a worker thread."""
-        self.after(0, lambda: self._browse_retranscribe_btn.config(text=msg))
+        """Update status from a worker thread (no-op now — actions button has no text label)."""
+        pass
 
     def _browse_retranscribe_done(self, success, error_msg=None):
         """Called when re-transcription finishes (from worker thread)."""
         def _finish():
-            self._browse_retranscribe_btn.config(
-                state="normal", text="Re-transcribe")
+            self._browse_actions_btn.config(state="normal")
             if success:
                 messagebox.showinfo("Re-transcribe",
                     "Transcription replaced successfully.\n"
@@ -19818,6 +19881,214 @@ class _TranscriptionPanel(ttk.Frame):
                 messagebox.showerror("Re-transcribe Failed",
                     error_msg or "Unknown error occurred.")
         self.after(0, _finish)
+
+    def _show_resolution_dialog(self, title_text):
+        """Show a modal resolution picker dialog. Returns chosen resolution string or None."""
+        _result = [None]
+        _dlg = tk.Toplevel(root)
+        _dlg.title("Select Resolution")
+        _dlg.configure(bg=C_BG)
+        _dlg.resizable(False, False)
+        _dlg.transient(root)
+        _dlg.grab_set()
+        _dlg.update_idletasks()
+        _apply_dark_title_bar(_dlg)
+        _rx = root.winfo_rootx() + root.winfo_width() // 2
+        _ry = root.winfo_rooty() + root.winfo_height() // 2
+        _dlg.geometry(f"+{_rx - 140}+{_ry - 200}")
+
+        tk.Label(_dlg, text=title_text[:80],
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
+                 pady=10, padx=20).pack(fill="x")
+        tk.Label(_dlg, text="Select download resolution",
+                 bg=C_BG, fg=C_DIM, font=("Segoe UI", 9),
+                 padx=20).pack(fill="x")
+
+        _btn_frame = tk.Frame(_dlg, bg=C_BG, pady=10)
+        _btn_frame.pack(fill="x", padx=20)
+
+        _options = [
+            ("best",  "Highest available"),
+            ("2160",  "4K  (2160p)"),
+            ("1440",  "QHD  (1440p)"),
+            ("1080",  "Full HD  (1080p)"),
+            ("720",   "HD  (720p)"),
+            ("480",   "SD  (480p)"),
+            ("360",   "Low  (360p)"),
+            ("audio", "Audio only"),
+        ]
+
+        def _pick(r):
+            _result[0] = r
+            try:
+                _dlg.destroy()
+            except Exception:
+                pass
+
+        for res_val, desc in _options:
+            _row = tk.Frame(_btn_frame, bg=C_BG)
+            _row.pack(fill="x", pady=2)
+            _b = tk.Button(_row, text=res_val, width=8,
+                           bg="#3a3a3a", fg=C_TEXT, activebackground="#555555",
+                           activeforeground=C_TEXT, relief="flat", bd=0,
+                           font=("Segoe UI", 9, "bold"), cursor="hand2",
+                           command=lambda r=res_val: _pick(r))
+            _b.pack(side="left", padx=(0, 8))
+            tk.Label(_row, text=desc, bg=C_BG, fg=C_DIM,
+                     font=("Segoe UI", 9)).pack(side="left")
+
+        _dlg.protocol("WM_DELETE_WINDOW", lambda: _pick(None))
+        _dlg.wait_window(_dlg)
+        return _result[0]
+
+    def _on_browse_redownload(self, video_id=None, title=None, video_path=None, channel=None):
+        """Redownload a single video at a user-chosen resolution."""
+        # If called from the actions dropdown (no args), use current meta
+        if video_id is None:
+            meta = self._browse_current_meta
+            if not meta:
+                return
+            video_id = meta.get("video_id")
+            title = meta.get("title", "")
+            video_path = meta.get("_video_path") or meta.get("filepath")
+            channel = meta.get("channel", "")
+
+        if not video_id:
+            messagebox.showerror("Redownload", "No YouTube video ID available for this video.")
+            return
+
+        resolution = self._show_resolution_dialog(f"Redownload: {title[:60]}")
+        if not resolution:
+            return
+
+        self._browse_actions_btn.config(state="disabled")
+        _res_label = "Best" if resolution == "best" else f"{resolution}p"
+
+        def _redownload_worker():
+            try:
+                fmt = build_format_string(resolution)
+                vid_url = f"https://www.youtube.com/watch?v={video_id}"
+
+                # Determine output directory and filename
+                if video_path and os.path.isfile(video_path):
+                    out_dir = os.path.dirname(video_path)
+                    orig_name = os.path.basename(video_path)
+                else:
+                    # No existing file — try to find channel folder
+                    out_dir = None
+                    with config_lock:
+                        for ch in config.get("channels", []):
+                            if ch.get("name", "") == channel:
+                                out_dir = ch.get("folder", "")
+                                break
+                    if not out_dir:
+                        self.after(0, lambda: messagebox.showerror("Redownload",
+                            "Could not determine output folder."))
+                        return
+                    orig_name = None
+
+                temp_dir = os.path.join(out_dir, "_REDOWNLOAD_TEMP")
+                os.makedirs(temp_dir, exist_ok=True)
+                dl_path = os.path.join(temp_dir, f"{video_id}.mp4")
+
+                dl_cmd = [
+                    "yt-dlp", "--newline", "--no-quiet",
+                    "--trim-filenames", "200",
+                    "--format", fmt, "--merge-output-format", "mp4",
+                    "--ppa", "Merger:-c copy",
+                    "--output", dl_path,
+                    "--cookies-from-browser", "firefox",
+                    "--no-download-archive",
+                    vid_url,
+                ]
+
+                dl_proc = spawn_yt_dlp(dl_cmd)
+                if dl_proc is None:
+                    self.after(0, lambda: messagebox.showerror("Redownload",
+                        "Could not start yt-dlp."))
+                    return
+
+                for line in dl_proc.stdout:
+                    pass  # consume output
+                dl_proc.wait()
+                with proc_lock:
+                    if dl_proc in active_processes:
+                        active_processes.remove(dl_proc)
+
+                # yt-dlp may produce a file with a different name
+                if not os.path.exists(dl_path):
+                    found_dl = None
+                    try:
+                        for f_temp in os.listdir(temp_dir):
+                            if f_temp.startswith(video_id):
+                                found_dl = os.path.join(temp_dir, f_temp)
+                                break
+                    except OSError:
+                        pass
+                    if found_dl:
+                        dl_path = found_dl
+                    else:
+                        self.after(0, lambda: messagebox.showerror("Redownload",
+                            "Download failed — no output file produced."))
+                        return
+
+                new_size = os.path.getsize(dl_path)
+                if new_size < 10240:
+                    try:
+                        os.remove(dl_path)
+                    except Exception:
+                        pass
+                    self.after(0, lambda: messagebox.showerror("Redownload",
+                        "Downloaded file is too small — likely a download error."))
+                    return
+
+                # Replace existing file or place new file
+                if orig_name and video_path and os.path.isfile(video_path):
+                    os.replace(dl_path, video_path)
+                    final_path = video_path
+                else:
+                    # Move from temp to output dir with title as filename
+                    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:200]
+                    final_path = os.path.join(out_dir, safe_title + ".mp4")
+                    os.replace(dl_path, final_path)
+
+                # Clean up temp dir
+                try:
+                    os.rmdir(temp_dir)
+                except Exception:
+                    pass
+
+                # Probe new resolution for display
+                _new_h = _ffprobe_height(final_path)
+                _new_res = f"{_new_h}p" if _new_h else _res_label
+
+                def _done():
+                    self._browse_actions_btn.config(state="normal")
+                    if self._browse_current_meta and self._browse_current_meta.get("title") == title:
+                        self._browse_current_meta["resolution"] = _new_res
+                        self._browse_current_meta["_video_path"] = final_path
+                        _ch = self._browse_current_meta.get("channel", "")
+                        _pp = self._browse_current_meta.get("txt_path") or final_path
+                        self._browse_path_label.config(
+                            text=f"{_ch}  •  {_new_res}  •  {_pp}")
+                    messagebox.showinfo("Redownload",
+                        f"Video redownloaded at {_new_res}.")
+                self.after(0, _done)
+
+            except Exception as e:
+                def _err(msg=str(e)):
+                    self._browse_actions_btn.config(state="normal")
+                    messagebox.showerror("Redownload Failed", msg)
+                self.after(0, _err)
+            finally:
+                try:
+                    if os.path.isdir(temp_dir):
+                        import shutil
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_redownload_worker, daemon=True).start()
 
     def _replace_txt_entry(self, txt_path, title, new_text, model_name):
         """Replace a single video's entry in the transcript .txt file."""
@@ -21763,8 +22034,13 @@ class _TranscriptionPanel(ttk.Frame):
             return self._open_vlc(video_path, start_time)
 
         self._player_video_path = video_path
-        self._player_title_lbl.config(
-            text=title if title else os.path.basename(video_path))
+        _player_display_title = title if title else os.path.basename(video_path)
+        # Append resolution if known from browse meta
+        if (self._browse_current_meta and
+                self._browse_current_meta.get("title") == title and
+                self._browse_current_meta.get("resolution")):
+            _player_display_title += f"  ({self._browse_current_meta['resolution']})"
+        self._player_title_lbl.config(text=_player_display_title)
 
         # ── Build transcript ──────────────────────────────────────────
         self._player_words = []

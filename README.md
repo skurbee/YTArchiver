@@ -1,7 +1,9 @@
 # YTArchiver
 
 
-Download, organize, transcribe, search, and compress entire channels — then keep them in sync as new videos are published.
+Download, organize, transcribe, search, and compress entire channels
+
+Parse and graph transcriptions
 
 
 ## Features

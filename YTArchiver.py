@@ -81,7 +81,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.0"
+APP_VERSION = "v26.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3369,7 +3369,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 6:44pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.28.26 7:03pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18080,7 +18080,19 @@ def _tp_parse_path_meta(jsonl_path, archive_roots):
                 try:
                     month = int(parts[2])
                 except ValueError:
-                    pass
+                    # Handle "01 January", "02 February" etc. folder names
+                    _folder_lower = parts[2].lower()
+                    for i, mn in enumerate(_TP_MONTH_NAMES):
+                        if mn in _folder_lower:
+                            month = i + 1
+                            break
+                    if month is None:
+                        # Try extracting leading digits: "03 March" → 3
+                        _m = re.match(r'^(\d{1,2})\b', parts[2])
+                        if _m:
+                            _mv = int(_m.group(1))
+                            if 1 <= _mv <= 12:
+                                month = _mv
             if month is None:
                 stem = p.stem.lower().lstrip(".")
                 for i, mn in enumerate(_TP_MONTH_NAMES):
@@ -18480,7 +18492,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    _VIDEOS_SCHEMA_VER = 3  # bump to force clear after piggybacking onto disk scan
+    _VIDEOS_SCHEMA_VER = 4  # bump to force clear — fix month parsing for "01 January" folders
 
     def _ensure_videos_populated(self):
         """Clear stale data if schema version changed.
@@ -19081,10 +19093,12 @@ class _TranscriptionPanel(ttk.Frame):
         elif meta["type"] == "month":
             self._populate_browse_titles(iid, meta["channel"], meta["year"], meta["month"])
 
+    _BROWSE_MONTH_SEP = "__month_sep__"
+
     def _populate_browse_titles(self, parent_iid, channel, year, month):
         """Insert individual video title nodes under a parent browse node."""
         try:
-            sql = ("SELECT DISTINCT title, filepath, video_id, tx_status "
+            sql = ("SELECT DISTINCT title, filepath, video_id, tx_status, month "
                    "FROM videos WHERE channel=?")
             params = [channel]
             if year is not None:
@@ -19097,7 +19111,48 @@ class _TranscriptionPanel(ttk.Frame):
             rows = self._db_execute(sql, params).fetchall()
         except Exception:
             return
-        for title, filepath, video_id, tx_status in rows:
+
+        # Sort by file mtime (upload date) instead of alphabetically
+        # Also derive month from mtime for separator lines
+        import datetime as _dt
+        _rows_with_mtime = []
+        for row in rows:
+            fp = row[1]
+            _mtime = 0.0
+            _mtime_month = None
+            if fp:
+                try:
+                    _mtime = os.path.getmtime(fp)
+                    _mtime_month = _dt.datetime.fromtimestamp(_mtime).month
+                except OSError:
+                    pass
+            # Use DB month if available, otherwise derive from file mtime
+            _effective_month = row[4] if row[4] else _mtime_month
+            _rows_with_mtime.append((*row, _mtime, _effective_month))
+        _rows_with_mtime.sort(key=lambda r: r[5])  # sort by mtime
+
+        # Show month separators when viewing a year without month filter
+        _show_month_seps = (year is not None and month is None
+                            and len(set(r[6] for r in _rows_with_mtime if r[6])) > 1)
+        _last_month = None
+
+        # Configure separator tag (dim, non-selectable)
+        self._browse_tree.tag_configure(
+            self._BROWSE_MONTH_SEP,
+            foreground="#555555", font=("Segoe UI", 8))
+
+        for title, filepath, video_id, tx_status, _db_month, _mtime, _eff_month in _rows_with_mtime:
+            # Insert month separator if month changed
+            if _show_month_seps and _eff_month and _eff_month != _last_month:
+                _mo_name = _TP_MONTH_NAMES[_eff_month - 1].capitalize() if 1 <= _eff_month <= 12 else ""
+                if _mo_name:
+                    sep_iid = self._browse_tree.insert(
+                        parent_iid, "end",
+                        text=f"  ── {_mo_name} ──",
+                        tags=(self._BROWSE_MONTH_SEP,))
+                    self._browse_items[sep_iid] = {"type": "separator"}
+                _last_month = _eff_month
+
             disp = title if len(title) <= 60 else title[:57] + "..."
             # Visual status indicators
             if tx_status == "pending":

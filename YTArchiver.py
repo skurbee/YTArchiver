@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.8"
+APP_VERSION = "v26.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -388,7 +388,7 @@ _WHISPER_MAX_DURATION = 21600  # 6 hours
 
 # Maximum characters shown for a video title/filename in progress status lines.
 # Titles longer than this are truncated with "..." to keep lines from becoming too wide.
-_MAX_TITLE_DISPLAY = 40
+_MAX_TITLE_DISPLAY = 55
 
 
 def _flush_ui_queue():
@@ -3377,7 +3377,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 9:21pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 9:32pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11155,12 +11155,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 upload_date = mtime.strftime("%Y%m%d")
 
                 dur_str = ""
+                _dur_secs = 0
                 try:
                     probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
                                  "format=duration", "-of", "csv=p=0", fpath]
                     probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
-                    secs = float(probe_result.stdout.strip())
-                    hrs, remainder = divmod(int(secs), 3600)
+                    _dur_secs = float(probe_result.stdout.strip())
+                    hrs, remainder = divmod(int(_dur_secs), 3600)
                     mins, sec = divmod(remainder, 60)
                     dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
                 except Exception:
@@ -11198,15 +11199,22 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _ve_m, _ve_s = divmod(int(_vid_elapsed), 60)
                 _ve_str = f"took {_ve_m}min {_ve_s:02d}sec" if _ve_m else f"took {_ve_s}sec"
                 _src_part = f"{source},"
+                # Duration string e.g. ", (6m 02s)"
+                _vid_dur_str = ""
+                if _dur_secs > 0:
+                    _vd_m, _vd_s = divmod(int(_dur_secs), 60)
+                    _vid_dur_str = f", ({_vd_m}m {_vd_s:02d}s)"
+                # Realtime ratio e.g. ", 3.0x realtime"
+                _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                 if _is_simple_mode:
                     _prefix = f"[{idx}/{total}] "
-                    _suffix = f"done ({_src_part} {_ve_str})"
-                    _name_trunc_src = unicodedata.normalize('NFKC', fname)
-                    _name_trunc = _name_trunc_src if len(_name_trunc_src) <= _MAX_TITLE_DISPLAY else _name_trunc_src[:_MAX_TITLE_DISPLAY - 3] + "..."
+                    _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
+                    _name_body = f"{unicodedata.normalize('NFKC', fname)}{_vid_dur_str}"
+                    _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."
                     _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
-                    log(f"  [{idx}/{total}] {fname} — done ({_src_part} {_ve_str})\n", "simpleline_blue")
+                    log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
 
             # Cleanup prefetch executor
             _prefetch_executor.shutdown(wait=False)

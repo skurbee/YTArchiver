@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.8"
+APP_VERSION = "v27.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3413,7 +3413,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:56am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:37pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15390,7 +15390,7 @@ def _update_sync_badge():
     """Update the green badge count on the Sync Tasks button."""
     # Fast count — just check queue lengths instead of building full item lists
     n = 0
-    if _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+    if _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running):
         n += 1  # currently running item
     with _sync_queue_lock:
         n += len(_sync_queue)
@@ -18690,6 +18690,21 @@ class _TranscriptionPanel(ttk.Frame):
             pass  # on_shown() will retry if needed
         finally:
             self._db_loading = False
+        # DB ready — eagerly build UI on the main thread so the Browse tab
+        # is instant when the user eventually clicks it.
+        if self._conn is not None and not self._loaded:
+            self.after(0, self._eager_finish_load)
+
+    def _eager_finish_load(self):
+        """Build the Browse tab UI eagerly after DB preload, before user clicks."""
+        if self._loaded:
+            return  # on_shown() already ran
+        self._loaded = True
+        self._placeholder.place_forget()
+        self._tp_extra_roots = list(config.get("tp_archive_roots", []))
+        self._build_ui()
+        self._refresh_stats_label()
+        self._ensure_videos_populated()
 
     def on_shown(self):
         """Called the first time the Transcriptions tab is selected."""

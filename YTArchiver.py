@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.5"
+APP_VERSION = "v27.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3381,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:31am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:38am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11270,10 +11270,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                     _fname_norm = unicodedata.normalize('NFKC', fname)
                     # Reserve space for duration so it's never truncated
-                    _dur_display = f" ({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
+                    _dur_display = f"({_vd_m}m {_vd_s:02d}s) — " if _dur_secs > 0 else "— "
                     _fname_trunc = _fname_norm if len(_fname_norm) <= _MAX_TITLE_DISPLAY else _fname_norm[:_MAX_TITLE_DISPLAY - 3] + "..."
-                    _name_padded = f"{_fname_trunc + ',':<{_MAX_TITLE_DISPLAY}}"
-                    _name_dash = f"{_name_padded}{_dur_display} — "
+                    _name_padded = f"{_fname_trunc:<{_MAX_TITLE_DISPLAY}}"
+                    _name_dash = f"{_name_padded} — {_dur_display}"
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
                     log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
@@ -11652,10 +11652,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                             _fname_norm = unicodedata.normalize('NFKC', fname)
                             # Reserve space for duration so it's never truncated
-                            _dur_display = f" ({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
+                            _dur_display = f"({_vd_m}m {_vd_s:02d}s) — " if _dur_secs > 0 else "— "
                             _fname_trunc = _fname_norm if len(_fname_norm) <= _MAX_TITLE_DISPLAY else _fname_norm[:_MAX_TITLE_DISPLAY - 3] + "..."
-                            _name_padded = f"{_fname_trunc + ',':<{_MAX_TITLE_DISPLAY}}"
-                            _name_dash = f"{_name_padded}{_dur_display} — "
+                            _name_padded = f"{_fname_trunc:<{_MAX_TITLE_DISPLAY}}"
+                            _name_dash = f"{_name_padded} — {_dur_display}"
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:
                             log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")

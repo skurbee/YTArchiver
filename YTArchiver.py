@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.7"
+APP_VERSION = "v26.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3377,7 +3377,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 8:49pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 9:21pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9302,14 +9302,30 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
 
     _hrs = total_duration / 3600
     _n_chunks = max(1, int(total_duration / _CHUNK_LEN) + (1 if total_duration % _CHUNK_LEN > 60 else 0))
-    log(f"  Audio is {_hrs:.1f}h — splitting into {_n_chunks} chunks for transcription...\n", "simpleline")
+
+    # Log the main [X/X] line for this video, then sections will appear indented below it
+    _title_disp = title
+    if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
+        _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
+    _title_part = f' "{_title_disp}"' if _title_disp else ""
+    _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+    log(f"{_wp}Transcribing{_title_part} — {_hrs:.1f}h, {_n_chunks} sections\n", "simpleline")
 
     all_text_parts = []
     all_segments = []
     _chunk_tmp_dir = _tf.mkdtemp(prefix="yt_whisper_chunk_")
 
+    _pe = pause_ev or pause_event
+
     try:
         for ci in range(_n_chunks):
+            if _ce.is_set():
+                break
+
+            # Respect pause between chunks — wait here until resumed
+            while _pe.is_set() and not _ce.is_set():
+                time.sleep(0.5)
+
             if _ce.is_set():
                 break
 
@@ -9323,7 +9339,6 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
                 break
 
             _chunk_path = os.path.join(_chunk_tmp_dir, f"chunk_{ci:03d}.wav")
-            _chunk_title = f"{title} [chunk {ci+1}/{_n_chunks}]" if title else f"chunk {ci+1}/{_n_chunks}"
 
             # Extract chunk with ffmpeg (WAV 16kHz mono — what Whisper expects)
             _ff_cmd = [
@@ -9335,7 +9350,8 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
                 _chunk_path,
             ]
             try:
-                subprocess.run(_ff_cmd, check=True, capture_output=True, timeout=120)
+                subprocess.run(_ff_cmd, check=True, capture_output=True, timeout=600,
+                               startupinfo=startupinfo)
             except Exception as e:
                 log(f"  ⚠ Failed to extract chunk {ci+1}: {e}\n", "red")
                 continue
@@ -9350,9 +9366,25 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
                         progress_cb(overall)
                     except Exception:
                         pass
+            _section_prefix = f"      Section {ci+1}/{_n_chunks},"
+            _t_chunk_start = time.time()
             _text, _segs = _whisper_transcribe(
-                _chunk_path, duration=_chunk_dur, title=_chunk_title,
-                cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=_chunk_progress)
+                _chunk_path, duration=_chunk_dur, title="",
+                cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=_chunk_progress,
+                _log_prefix=_section_prefix)
+            _t_chunk_elapsed = time.time() - _t_chunk_start
+
+            # Log per-section summary (indented, stays in log)
+            _ce_m, _ce_s = divmod(int(_t_chunk_elapsed), 60)
+            _ce_str = f"{_ce_m}min {_ce_s:02d}sec" if _ce_m else f"{_ce_s}sec"
+            _cd_m, _cd_s = divmod(int(_chunk_dur), 60)
+            _cd_str = f"{_cd_m}m{_cd_s:02d}s"
+            _rt = f"{_chunk_dur / _t_chunk_elapsed:.1f}x realtime" if _t_chunk_elapsed > 0 else ""
+            if _text:
+                log(f"      Section {ci+1}/{_n_chunks} done ({_cd_str}, {_ce_str}, {_rt})\n", "simpleline_blue")
+            else:
+                _reason = "failed" if _whisper_last_failed else "no speech"
+                log(f"      Section {ci+1}/{_n_chunks} — {_reason} ({_cd_str}, {_ce_str})\n", "simpleline")
 
             # Clean up chunk file immediately to save disk space
             try:
@@ -9398,7 +9430,7 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
             pass
 
 
-def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None):
+def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None, _log_prefix=None):
     """Transcribe a file using the persistent Whisper subprocess.
 
     Returns (text, segments) where text is str or None, and segments is a list of
@@ -9406,6 +9438,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
     If duration (seconds) is provided, progress percentage is logged in real time.
     title is shown in the progress line so the user knows which video is being processed.
     cancel_ev/pause_ev default to the global cancel_event/pause_event if not provided.
+    _log_prefix overrides the default [idx/total] prefix (used by chunked transcription).
 
     On process stalls or crashes, sets _whisper_last_failed = True so callers can
     distinguish a process failure from a legitimate "no speech" result.
@@ -9437,8 +9470,14 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
             _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
         _title_part = f' "{_title_disp}"' if _title_disp else ""
-        # In simple mode, prefix with [idx/total] instead of spaces
-        _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+        # In simple mode, prefix with [idx/total] instead of spaces.
+        # _log_prefix overrides this (used by chunked transcription for indented section lines).
+        if _log_prefix is not None:
+            _wp = _log_prefix
+        elif _is_simple_mode and _whisper_counter['total']:
+            _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] "
+        else:
+            _wp = "    "
         with _ffmpeg_lock:
             _gpu_actively_encoding = True
         log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
@@ -22316,6 +22355,16 @@ class _TranscriptionPanel(ttk.Frame):
         self._player_vol.grid(row=0, column=4)
         self._player_vol_debounce_id = None  # for debouncing volume changes
 
+        # Follow highlight checkbox — auto-scrolls transcript to keep the active word visible
+        self._player_follow_var = tk.BooleanVar(value=False)
+        self._player_follow_cb = tk.Checkbutton(
+            ctrl, text="Follow", variable=self._player_follow_var,
+            bg=self._TP_BG2, fg=self._TP_DIM, selectcolor=self._TP_BG,
+            activebackground=self._TP_BG2, activeforeground=self._TP_FG,
+            font=("Segoe UI", 9), bd=0, highlightthickness=0,
+            command=self._player_on_follow_toggle)
+        self._player_follow_cb.grid(row=0, column=5, padx=(12, 0))
+
         # Synced transcript viewer
         tf = tk.Frame(f, bg=self._TP_BG)
         tf.grid(row=3, column=0, sticky="nsew", padx=8, pady=(4, 8))
@@ -22649,6 +22698,16 @@ class _TranscriptionPanel(ttk.Frame):
             self._vlc_player.set_position(pos)
             self._player_last_word_idx = -1  # reset word highlight
 
+    def _player_on_follow_toggle(self):
+        """When Follow is turned on, immediately scroll to the current word."""
+        if self._player_follow_var.get() and self._player_last_word_idx >= 0:
+            idx = self._player_last_word_idx
+            if 0 <= idx < len(self._player_words):
+                tag = self._player_words[idx]["tag"]
+                ranges = self._player_transcript.tag_ranges(tag)
+                if ranges:
+                    self._player_transcript.yview_pickplace(ranges[0])
+
     def _player_on_volume(self, val):
         """Debounced volume change — only calls VLC after slider stops moving."""
         if self._player_vol_debounce_id is not None:
@@ -22803,9 +22862,23 @@ class _TranscriptionPanel(ttk.Frame):
             if ranges:
                 self._player_transcript.tag_add("active_word",
                                                  ranges[0], ranges[1])
-                # Scroll only every ~5 word changes to avoid jitter
-                if abs(new_idx - (prev if prev >= 0 else 0)) >= 3:
-                    self._player_transcript.see(ranges[0])
+                if self._player_follow_var.get():
+                    # Follow mode: once the highlight passes the middle of the
+                    # visible area, scroll it back up near the top.
+                    try:
+                        bbox = self._player_transcript.bbox(ranges[0])
+                        if bbox:
+                            _wid_h = self._player_transcript.winfo_height()
+                            _word_y = bbox[1]
+                            if _word_y > _wid_h * 0.5:
+                                # Scroll so this word is ~20% from the top
+                                self._player_transcript.yview_pickplace(ranges[0])
+                    except Exception:
+                        self._player_transcript.see(ranges[0])
+                else:
+                    # Default: just ensure visible every ~5 words
+                    if abs(new_idx - (prev if prev >= 0 else 0)) >= 3:
+                        self._player_transcript.see(ranges[0])
             self._player_prev_tag = word_tag
         else:
             self._player_prev_tag = None

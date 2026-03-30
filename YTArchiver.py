@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.2"
+APP_VERSION = "v27.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3381,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:06am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 1:03am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9512,13 +9512,17 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
 
     # Guard: if audio exceeds _WHISPER_MAX_DURATION, split into chunks and transcribe
     # each one separately to avoid loading the entire waveform into RAM at once.
-    _check_dur = duration
-    if not _check_dur and audio_path:
-        _check_dur = _ffprobe_duration(audio_path)
-    if _check_dur and _check_dur > _WHISPER_MAX_DURATION:
-        return _whisper_transcribe_chunked(
-            audio_path, _check_dur, title=title,
-            cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
+    # Skip this guard when already called from _whisper_transcribe_chunked (indicated
+    # by _log_prefix being set) — chunk durations can slightly exceed the limit due
+    # to overlap padding, and re-entering the chunker would cause recursive splitting.
+    if _log_prefix is None:
+        _check_dur = duration
+        if not _check_dur and audio_path:
+            _check_dur = _ffprobe_duration(audio_path)
+        if _check_dur and _check_dur > _WHISPER_MAX_DURATION:
+            return _whisper_transcribe_chunked(
+                audio_path, _check_dur, title=title,
+                cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
 
     try:
         _title_disp = title

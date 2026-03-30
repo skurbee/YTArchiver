@@ -3381,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 1:03am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 1:51am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11268,9 +11268,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _is_simple_mode:
                     _prefix = f"[{idx}/{total}] "
                     _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
-                    _name_body = f"{unicodedata.normalize('NFKC', fname)}{_vid_dur_str}"
-                    _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."
-                    _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
+                    _fname_norm = unicodedata.normalize('NFKC', fname)
+                    # Reserve space for duration so it's never truncated
+                    _dur_display = f", ({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
+                    _title_max = _MAX_TITLE_DISPLAY - len(_dur_display)
+                    _fname_trunc = _fname_norm if len(_fname_norm) <= _title_max else _fname_norm[:_title_max - 3] + "..."
+                    _name_combined = f"{_fname_trunc}{_dur_display}"
+                    _name_dash = f"{_name_combined:<{_MAX_TITLE_DISPLAY}} — "
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
                     log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
@@ -11647,9 +11651,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if _is_simple_mode:
                             _prefix = f"[{idx}/{total}] "
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
-                            _name_body = f"{unicodedata.normalize('NFKC', fname)}{_vid_dur_str}"
-                            _name_trunc = _name_body if len(_name_body) <= _MAX_TITLE_DISPLAY else _name_body[:_MAX_TITLE_DISPLAY - 3] + "..."
-                            _name_dash = f"{_name_trunc:<{_MAX_TITLE_DISPLAY}} — "
+                            _fname_norm = unicodedata.normalize('NFKC', fname)
+                            # Reserve space for duration so it's never truncated
+                            _dur_display = f", ({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
+                            _title_max = _MAX_TITLE_DISPLAY - len(_dur_display)
+                            _fname_trunc = _fname_norm if len(_fname_norm) <= _title_max else _fname_norm[:_title_max - 3] + "..."
+                            _name_combined = f"{_fname_trunc}{_dur_display}"
+                            _name_dash = f"{_name_combined:<{_MAX_TITLE_DISPLAY}} — "
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:
                             log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")

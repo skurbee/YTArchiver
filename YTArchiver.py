@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.3"
+APP_VERSION = "v27.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3381,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 1:51am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 3:03am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15865,16 +15865,9 @@ def _show_queue_menu(event=None):
                                         moved = _queue_order.pop(src_qo)
                                         _queue_order.insert(dst_qo, moved)
                                 _save_queue_state()
-                                # Update labels in-place
-                                new_items = _get_queue_items()
-                                _state["last_snapshot"] = [(_snap_label(lb), s2, ix) for lb, s2, ix, _k in new_items]
-                                for j, (new_label, new_source, new_idx, _new_key) in enumerate(new_items):
-                                    if j < len(_state["widgets"]):
-                                        wi = _state["widgets"][j]
-                                        prefix = "  " if new_source == "current" else " "
-                                        wi["lbl"].config(text=f"{prefix}{j + 1}. {new_label}")
-                                        wi["source"] = new_source
-                                        wi["idx"] = new_idx
+                                # Force full rebuild so closures get fresh indices
+                                _state["last_snapshot"] = None
+                                _build_content()
 
                         for w in [h, l, r]:
                             w.bind("<ButtonPress-1>", _on_press)
@@ -16676,16 +16669,10 @@ def _show_gpu_menu(event=None):
                                     if 0 <= src_qo < len(_gpu_queue) and 0 <= dst_qo < len(_gpu_queue):
                                         moved = _gpu_queue.pop(src_qo)
                                         _gpu_queue.insert(dst_qo, moved)
-                                # Update labels in-place
-                                new_items = _get_gpu_queue_items()
-                                _state["last_snapshot"] = [(lb.rstrip("."), ix) for lb, ix in new_items]
-                                for j, (new_label, new_idx) in enumerate(new_items):
-                                    if j < len(_state["widgets"]):
-                                        wi = _state["widgets"][j]
-                                        prefix = "  " if new_idx == -1 else " "
-                                        wi["lbl"].config(text=f"{prefix}{j + 1}. {new_label}")
-                                        wi["idx"] = new_idx
                                 _save_queue_state()
+                                # Force full rebuild so closures get fresh indices
+                                _state["last_snapshot"] = None
+                                _build_content()
 
                         for w in [h, l, r]:
                             w.bind("<ButtonPress-1>", _on_press)

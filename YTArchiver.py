@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.0"
+APP_VERSION = "v27.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -222,7 +222,7 @@ _gpu_queue_lock = threading.Lock()
 _gpu_running = False
 _gpu_cancel = threading.Event()
 _gpu_pause = threading.Event()
-_gpu_popup = {"win": None}
+_gpu_popup = {"win": None, "visible": False}
 _gpu_actively_encoding = False  # True while ffmpeg/whisper is processing a file (for blink vs solid)
 _gpu_truly_paused = False      # True only while the GPU worker is in its pause-wait loop (encode/transcription completed, waiting for resume)
 _gpu_current = {"label": None, "ch_url": None}  # currently processing GPU task
@@ -408,21 +408,25 @@ def _flush_ui_queue():
             if _fname not in ('<lambda>', '<listcomp>', '_write') and _fname:
                 break
             _ui_queue.popleft()
-        deadline = time.monotonic() + 0.012  # 12ms budget per tick
-        while time.monotonic() < deadline:
-            try:
-                fn = _ui_queue.popleft()
-            except IndexError:
-                break
-            try:
-                fn()
-            except Exception:
-                pass  # isolate per-callback — one failure must not break others
+        if not _ui_queue:
+            # Queue empty — skip processing, just reschedule
+            pass
+        else:
+            deadline = time.monotonic() + 0.012  # 12ms budget per tick
+            while time.monotonic() < deadline:
+                try:
+                    fn = _ui_queue.popleft()
+                except IndexError:
+                    break
+                try:
+                    fn()
+                except Exception:
+                    pass  # isolate per-callback — one failure must not break others
     except Exception:
         pass
     try:
         if root.winfo_exists():
-            root.after(50, _flush_ui_queue)
+            root.after(100, _flush_ui_queue)
     except Exception:
         pass
 
@@ -2648,7 +2652,7 @@ root = tk.Tk()
 root.title("YT Archiver")
 
 # Start the UI queue flush timer — processes log callbacks from worker threads
-root.after(50, _flush_ui_queue)
+root.after(100, _flush_ui_queue)
 # Start the mini-log sync timer — mirrors main log to Subs/Recent tab mini-logs
 root.after(250, _sync_mini_logs_timer)
 
@@ -3377,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 10:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 11:48pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3697,15 +3701,31 @@ autorun_history_text.bind("<Configure>", _on_hist_configure)
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
 
+_auto_scrollbar_job = {"id": None}
+
+
 def _auto_scrollbar(scrollbar, first, last):
     if _log_scroll_freeze:
         scrollbar.set(first, last)
         return
-    if float(first) <= 0.0 and float(last) >= 1.0:
-        scrollbar.grid_remove()
-    else:
-        scrollbar.grid()
     scrollbar.set(first, last)
+    # Debounce the show/hide toggle to avoid thrashing during rapid log output
+    if _auto_scrollbar_job["id"] is not None:
+        try:
+            root.after_cancel(_auto_scrollbar_job["id"])
+        except Exception:
+            pass
+    def _apply():
+        _auto_scrollbar_job["id"] = None
+        try:
+            f, l = scrollbar.get()
+            if f <= 0.0 and l >= 1.0:
+                scrollbar.grid_remove()
+            else:
+                scrollbar.grid()
+        except Exception:
+            pass
+    _auto_scrollbar_job["id"] = root.after(150, _apply)
 
 # Main log frame added SECOND (bottom) — weight=1 keeps it compact initially
 log_frame = ttk.Frame(log_paned)
@@ -4302,13 +4322,26 @@ def _toggle_date_entry():
         _date_day_entry.event_generate("<FocusOut>")
 
 
+_chan_tree_dirty = False  # Flag: tree needs refresh next time Subs tab is shown
+
+
 def refresh_channel_dropdowns():
+    global _chan_tree_dirty
     with config_lock:
         sorted_channels = sorted(config.get("channels", []), key=lambda c: c.get("name", "").lower())
         names = [c.get("name", "") for c in sorted_channels]
         chan_dropdown["values"] = names
 
-        settings_chan_tree.delete(*settings_chan_tree.get_children())
+        # If the Subs tab isn't visible and tree is already populated,
+        # just mark dirty and skip the heavy tree update
+        try:
+            if settings_chan_tree.get_children('') and notebook.select() != str(tab_settings):
+                _chan_tree_dirty = True
+                return
+        except Exception:
+            pass
+
+        _chan_tree_dirty = False
         _grand_total_bytes = 0
 
         # Batch lock acquisitions outside the per-channel loop to avoid O(N) lock overhead
@@ -4319,6 +4352,8 @@ def refresh_channel_dropdowns():
         with _disk_cache_lock:
             _disk_cache_snap = dict(_disk_cache)
 
+        # Build new row data
+        new_rows = []
         for i, c in enumerate(sorted_channels):
             res = c.get("resolution", CHANNEL_DEFAULTS["resolution"])
             display_res = f"{res}p" if res.isdigit() else ("Audio" if res == "audio" else res)
@@ -4406,9 +4441,28 @@ def refresh_channel_dropdowns():
             else:
                 size_str = "—"
 
+            new_rows.append((name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, num_vids_str, size_str, c['url']))
+
+        # Incremental update: reuse existing tree items instead of delete-all + reinsert
+        existing_iids = settings_chan_tree.get_children('')
+        n_existing = len(existing_iids)
+        n_new = len(new_rows)
+
+        # Update rows that exist in both old and new
+        for i in range(min(n_existing, n_new)):
             tag = "odd" if i % 2 else "even"
-            settings_chan_tree.insert("", tk.END, values=(name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, num_vids_str, size_str, c['url']),
-                                      tags=(tag,))
+            settings_chan_tree.item(existing_iids[i], values=new_rows[i], tags=(tag,))
+
+        # If we have more new rows than existing, insert the extras
+        if n_new > n_existing:
+            for i in range(n_existing, n_new):
+                tag = "odd" if i % 2 else "even"
+                settings_chan_tree.insert("", tk.END, values=new_rows[i], tags=(tag,))
+
+        # If we have fewer new rows than existing, delete the extras
+        elif n_existing > n_new:
+            for iid in existing_iids[n_new:]:
+                settings_chan_tree.delete(iid)
 
         # Update total size on disk label
         if _grand_total_bytes >= 1024 ** 4:
@@ -15280,7 +15334,7 @@ def _sync_task_finished():
 
 
 # --- Sync Tasks Button ---
-_queue_popup = {"win": None}  # Track the popup window
+_queue_popup = {"win": None, "visible": False}  # Track the popup window
 
 queue_btn = ttk.Button(btn_frame, text="📋", width=3, style="SyncQ.TButton", takefocus=False)
 # Packed later after _last_sync_spacer is created
@@ -15294,8 +15348,20 @@ _sync_badge_count = {"n": -1}  # track last displayed count to avoid redundant u
 
 def _update_sync_badge():
     """Update the green badge count on the Sync Tasks button."""
-    items = _get_queue_items()
-    n = len(items)
+    # Fast count — just check queue lengths instead of building full item lists
+    n = 0
+    if _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+        n += 1  # currently running item
+    with _sync_queue_lock:
+        n += len(_sync_queue)
+    with _reorg_queue_lock:
+        n += len(_reorg_queue)
+    with _transcribe_queue_lock:
+        n += len(_transcribe_queue)
+    with _mt_queue_lock:
+        n += len(_mt_queue)
+    with _redownload_queue_lock:
+        n += len(_redownload_queue)
     if n == _sync_badge_count["n"]:
         return  # no change
     _sync_badge_count["n"] = n
@@ -15546,17 +15612,34 @@ def _confirm_remove(source, idx, label, expected_key=None):
 
 
 def _show_queue_menu(event=None):
-    # Close existing popup if open
+    # Toggle: hide if visible, re-show if hidden
     if _queue_popup["win"] and _queue_popup["win"].winfo_exists():
-        _queue_popup["win"].destroy()
-        _queue_popup["win"] = None
-        return
+        if _queue_popup.get("visible"):
+            _queue_popup["win"].withdraw()
+            _queue_popup["visible"] = False
+            return
+        else:
+            # Re-show the cached popup — update content and reposition
+            popup = _queue_popup["win"]
+            _queue_popup["visible"] = True
+            # Let snapshot comparison decide if a rebuild is needed
+            _queue_popup.get("_build_fn", lambda: None)()
+            # Reposition below the button
+            try:
+                x = queue_btn.winfo_rootx()
+                y = queue_btn.winfo_rooty() + queue_btn.winfo_height()
+                popup.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+            popup.deiconify()
+            return
 
     popup = tk.Toplevel(root)
     popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _queue_popup["win"] = popup
+    _queue_popup["visible"] = True
 
     # Shared state for drag-to-reorder and live refresh
     _drag = {"active": False, "src_sync_idx": -1, "src_widget": None}
@@ -15953,6 +16036,8 @@ def _show_queue_menu(event=None):
         _state["widgets"] = _widgets
 
     _build_content()
+    _queue_popup["_build_fn"] = _build_content  # Store ref for re-show path
+    _queue_popup["_state"] = _state  # Store ref for snapshot reset on re-show
 
     # Position below the button
     def _reposition_queue_popup(*_args):
@@ -15973,24 +16058,31 @@ def _show_queue_menu(event=None):
     # --- Live refresh (updates queue while open) ---
     def _refresh():
         try:
-            if popup.winfo_exists() and not _drag["active"]:
+            if not popup.winfo_exists():
+                return
+            if _queue_popup.get("visible") and not _drag["active"]:
                 _build_content()
-            if popup.winfo_exists():
+            if _queue_popup.get("visible"):
                 _reposition_queue_popup()
-                _state["refresh_job"] = popup.after(300, _refresh)
+            _state["refresh_job"] = popup.after(1000, _refresh)
         except Exception:
             pass
-    _state["refresh_job"] = popup.after(300, _refresh)
+    _state["refresh_job"] = popup.after(1000, _refresh)
 
-    # --- Close popup: toggle via queue button, or press Escape ---
-    popup.bind("<Escape>", lambda e: popup.destroy())
-    # Also bind Escape on root so it works even without popup focus
-    def _esc_close(e):
+    # Helper to hide (withdraw) instead of destroy
+    def _hide_queue_popup():
         try:
             if popup.winfo_exists():
-                popup.destroy()
+                popup.withdraw()
+                _queue_popup["visible"] = False
         except Exception:
             pass
+
+    # --- Close popup: toggle via queue button, or press Escape ---
+    popup.bind("<Escape>", lambda e: _hide_queue_popup())
+    # Also bind Escape on root so it works even without popup focus
+    def _esc_close(e):
+        _hide_queue_popup()
     _state["esc_bind_id"] = root.bind("<Escape>", _esc_close, add="+")
 
     # Close when clicking outside the popup
@@ -16014,7 +16106,7 @@ def _show_queue_menu(event=None):
             pw, ph = popup.winfo_width(), popup.winfo_height()
             if px <= e.x_root <= px + pw and py <= e.y_root <= py + ph:
                 return  # Click inside popup — ignore
-            popup.destroy()
+            _hide_queue_popup()
         except Exception:
             pass
     # Delay binding by one event cycle so the button-press that opened
@@ -16055,6 +16147,7 @@ def _show_queue_menu(event=None):
         except Exception:
             pass
         _queue_popup["win"] = None
+        _queue_popup["visible"] = False
     popup.bind("<Destroy>", _on_popup_destroy)
 
 
@@ -16289,16 +16382,39 @@ def _remove_gpu_queue_item(idx):
 
 def _show_gpu_menu(event=None):
     """Show the GPU Tasks popup menu — styled to match the Sync Tasks popup."""
+    # Toggle: hide if visible, re-show if hidden
     if _gpu_popup["win"] and _gpu_popup["win"].winfo_exists():
-        _gpu_popup["win"].destroy()
-        _gpu_popup["win"] = None
-        return
+        if _gpu_popup.get("visible"):
+            _gpu_popup["win"].withdraw()
+            _gpu_popup["visible"] = False
+            return
+        else:
+            # Re-show the cached popup — update content and reposition
+            popup = _gpu_popup["win"]
+            _gpu_popup["visible"] = True
+            # Let snapshot comparison decide if a rebuild is needed
+            _gpu_popup.get("_build_fn", lambda: None)()
+            # Reposition below the button
+            try:
+                popup.update_idletasks()
+                x = gpu_btn.winfo_rootx()
+                y = gpu_btn.winfo_rooty() + gpu_btn.winfo_height()
+                pw = popup.winfo_width()
+                sw = popup.winfo_screenwidth()
+                if x + pw > sw:
+                    x = max(0, sw - pw - 2)
+                popup.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+            popup.deiconify()
+            return
 
     popup = tk.Toplevel(root)
     popup.withdraw()  # Hide until positioned to avoid flash on open
     popup.overrideredirect(True)
     popup.configure(bg="#2d2d2d", highlightbackground="#555555", highlightthickness=1)
     _gpu_popup["win"] = popup
+    _gpu_popup["visible"] = True
 
     _state = {"refresh_job": None, "last_snapshot": None, "wrapper": None, "mw_bind_id": None, "active_lbl": None, "widgets": [], "pause_resume_btn": None}
     _drag = {"active": False, "src_widget_idx": -1, "src_widget": None}
@@ -16717,6 +16833,8 @@ def _show_gpu_menu(event=None):
         _state["wrapper"] = wrapper
 
     _build_content()
+    _gpu_popup["_build_fn"] = _build_content  # Store ref for re-show path
+    _gpu_popup["_state"] = _state  # Store ref for snapshot reset on re-show
 
     # Position below the button
     def _reposition_gpu_popup(*_args):
@@ -16742,23 +16860,30 @@ def _show_gpu_menu(event=None):
     # --- Live refresh (double-buffered — no flicker) ---
     def _refresh():
         try:
-            if popup.winfo_exists() and not _drag["active"]:
+            if not popup.winfo_exists():
+                return
+            if _gpu_popup.get("visible") and not _drag["active"]:
                 _build_content()
-            if popup.winfo_exists():
+            if _gpu_popup.get("visible"):
                 _reposition_gpu_popup()
-                _state["refresh_job"] = popup.after(300, _refresh)
+            _state["refresh_job"] = popup.after(1000, _refresh)
         except Exception:
             pass
     _state["refresh_job"] = popup.after(1000, _refresh)
 
-    # Close on Escape
-    popup.bind("<Escape>", lambda e: popup.destroy())
-    def _gpu_esc_close(e):
+    # Helper to hide (withdraw) instead of destroy
+    def _hide_gpu_popup():
         try:
             if popup.winfo_exists():
-                popup.destroy()
+                popup.withdraw()
+                _gpu_popup["visible"] = False
         except Exception:
             pass
+
+    # Close on Escape
+    popup.bind("<Escape>", lambda e: _hide_gpu_popup())
+    def _gpu_esc_close(e):
+        _hide_gpu_popup()
     _state["esc_bind_id"] = root.bind("<Escape>", _gpu_esc_close, add="+")
 
     # Close when clicking outside the popup
@@ -16782,7 +16907,7 @@ def _show_gpu_menu(event=None):
             pw, ph = popup.winfo_width(), popup.winfo_height()
             if px <= e.x_root <= px + pw and py <= e.y_root <= py + ph:
                 return  # Click inside popup — ignore
-            popup.destroy()
+            _hide_gpu_popup()
         except Exception:
             pass
     # Delay binding by one event cycle so the button-press that opened
@@ -16823,6 +16948,7 @@ def _show_gpu_menu(event=None):
         except Exception:
             pass
         _gpu_popup["win"] = None
+        _gpu_popup["visible"] = False
     popup.bind("<Destroy>", _on_popup_destroy)
 
 
@@ -18480,6 +18606,7 @@ class _TranscriptionPanel(ttk.Frame):
         self.configure(style="TFrame")
         self._loaded          = False
         self._conn            = None
+        self._db_loading      = False
         self._db_lock         = threading.Lock()
         self._result_meta     = {}
         self._sort_col        = "date"
@@ -18519,6 +18646,24 @@ class _TranscriptionPanel(ttk.Frame):
                  bg=self._TP_BG, fg=self._TP_DIM,
                  font=("Segoe UI", 12)).place(relx=0.5, rely=0.5, anchor="center")
 
+    def preload_db(self):
+        """Pre-load the DB connection in the background at startup.
+        The UI is NOT built here — that happens in on_shown() / _finish_load().
+        This just warms up the DB so it's ready when the user clicks Browse."""
+        if self._conn is not None or self._loaded or self._db_loading:
+            return  # already loaded or in progress
+        self._db_loading = True
+        threading.Thread(target=self._preload_db_async, daemon=True).start()
+
+    def _preload_db_async(self):
+        try:
+            conn = _tp_open_db(_TP_DB_PATH)
+            self._conn = conn
+        except Exception:
+            pass  # on_shown() will retry if needed
+        finally:
+            self._db_loading = False
+
     def on_shown(self):
         """Called the first time the Transcriptions tab is selected."""
         if self._loaded:
@@ -18527,8 +18672,28 @@ class _TranscriptionPanel(ttk.Frame):
                 self._pending_reindex = None
             return
         self._loaded = True
+        # If DB was pre-loaded at startup, skip the async load — just build UI
+        if self._conn is not None:
+            self.update_idletasks()  # render placeholder before UI build
+            self.after(1, self._finish_load)  # defer so placeholder is visible
+            return
+        # If preload is still running, wait for it instead of opening a second connection
+        if self._db_loading:
+            self._wait_for_preload()
+            return
         self.update_idletasks()  # render placeholder before thread starts
         threading.Thread(target=self._load_db_async, daemon=True).start()
+
+    def _wait_for_preload(self):
+        """Poll until the background preload finishes, then finish loading."""
+        if self._db_loading:
+            self.after(50, self._wait_for_preload)
+            return
+        if self._conn is not None:
+            self.after(1, self._finish_load)
+        else:
+            # Preload failed — fall back to normal async load
+            threading.Thread(target=self._load_db_async, daemon=True).start()
 
     def _load_db_async(self):
         try:
@@ -19314,23 +19479,28 @@ class _TranscriptionPanel(ttk.Frame):
         """Populate the browse tree — lazy: only top-level channels at first."""
         if not self._conn:
             return
+        def _query():
+            try:
+                channels = self._db_execute(
+                    "SELECT DISTINCT channel FROM videos WHERE channel != '__ver__' ORDER BY channel"
+                ).fetchall()
+            except Exception:
+                try:
+                    channels = self._db_execute(
+                        "SELECT DISTINCT channel FROM segments ORDER BY channel"
+                    ).fetchall()
+                except Exception:
+                    return
+            self.after(0, lambda: self._apply_browse_channels(channels))
+        threading.Thread(target=_query, daemon=True).start()
+
+    def _apply_browse_channels(self, channels):
+        """Apply channel list to browse tree (must run on main thread)."""
         tree = self._browse_tree
         tree.delete(*tree.get_children())
         self._browse_items.clear()
-        try:
-            channels = self._db_execute(
-                "SELECT DISTINCT channel FROM videos WHERE channel != '__ver__' ORDER BY channel"
-            ).fetchall()
-        except Exception:
-            # Fall back to segments table if videos table is empty/missing
-            try:
-                channels = self._db_execute(
-                    "SELECT DISTINCT channel FROM segments ORDER BY channel"
-                ).fetchall()
-            except Exception:
-                return
         for (ch,) in channels:
-            ch_iid = tree.insert("", "end", text=f"📁  {ch}", open=False)
+            ch_iid = tree.insert("", "end", text=f"\U0001F4C1  {ch}", open=False)
             self._browse_items[ch_iid] = {"type": "channel", "channel": ch}
             # Dummy child so the expand arrow appears
             tree.insert(ch_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
@@ -23242,6 +23412,8 @@ class _TranscriptionPanel(ttk.Frame):
                     "and enable full indexing.\n")
 
             new_files = skip_files = total_segs = 0
+            _uncommitted = 0
+            _COMMIT_BATCH = 10  # commit every N files to reduce disk fsync overhead
             for i, fpath in enumerate(files):
                 prog = f"{i + 1}/{len(files)}"
                 self.after(0, lambda p=prog: self._idx_progress_var.set(p))
@@ -23252,9 +23424,13 @@ class _TranscriptionPanel(ttk.Frame):
                 try:
                     with self._db_lock:
                         n = _tp_index_file(self._conn, fpath, roots)
-                    self._db_commit()
+                    _uncommitted += 1
                     total_segs += n
                     new_files  += 1
+                    # Batch commits for better throughput
+                    if _uncommitted >= _COMMIT_BATCH:
+                        self._db_commit()
+                        _uncommitted = 0
                     self._tp_log(
                         f"  [{prog}] {os.path.basename(fpath)}  ({n:,} segments)")
                 except Exception as e:
@@ -23263,8 +23439,12 @@ class _TranscriptionPanel(ttk.Frame):
                             self._conn.rollback()
                         except Exception:
                             pass
+                    _uncommitted = 0
                     self._tp_log(
                         f"  [{prog}] ERROR {os.path.basename(fpath)}: {e}")
+            # Flush any remaining uncommitted files
+            if _uncommitted > 0:
+                self._db_commit()
 
             self._tp_log(
                 f"\nDone. {new_files} indexed, {skip_files} up-to-date. "
@@ -23298,6 +23478,10 @@ tab_transcriptions.rowconfigure(0, weight=1)
 _tp_panel = _TranscriptionPanel(tab_transcriptions)
 _tp_panel.grid(row=0, column=0, sticky="nsew")
 _tp_panel_ref[0] = _tp_panel
+
+# Pre-load Browse tab DB in background so it's ready when user clicks Browse
+# (deferred slightly so it doesn't compete with initial UI rendering)
+root.after(500, lambda: _tp_panel.preload_db())
 
 # ── Custom tab bar (replaces hidden built-in ttk.Notebook strip) ──────────────
 _tab_bar = tk.Frame(root, bg=C_BG)
@@ -23356,7 +23540,14 @@ def on_tab_changed(event):
         # (they can lose pack state when switching tabs during long operations)
         if _sync_running or _reorg_running or _redownload_running:
             _update_queue_btn()
+    elif selected == str(tab_settings):
+        # Refresh channel tree if it was dirtied while on another tab
+        if _chan_tree_dirty:
+            root.after(1, refresh_channel_dropdowns)
     elif selected == str(tab_recent):
+        # Refresh recent tree if it was dirtied while on another tab
+        if _recent_tree_dirty:
+            root.after(1, refresh_recent_list)
         if new_download_count > 0:
             new_download_count = 0
             notebook.tab(tab_recent, text="  Recent  ")
@@ -23730,7 +23921,21 @@ def _fmt_dur(raw):
         return ""
 
 
+_recent_tree_dirty = False  # Flag: tree needs refresh next time Recent tab is shown
+
+
 def refresh_recent_list():
+    global _recent_tree_dirty
+    # If the Recent tab isn't visible and tree is already populated,
+    # just mark dirty and skip the heavy tree update
+    try:
+        if recent_tree.get_children('') and notebook.select() != str(tab_recent):
+            _recent_tree_dirty = True
+            return
+    except Exception:
+        pass
+
+    _recent_tree_dirty = False
     sel_fingerprints = set()
     try:
         # Capture fingerprints directly from the tree's displayed values
@@ -23755,11 +23960,11 @@ def refresh_recent_list():
         except Exception:
             pass
 
-    recent_tree.delete(*recent_tree.get_children())
     with config_lock:
         recent_data = list(config.get("recent_downloads", []))
 
-    new_sel = []
+    # Build new row data
+    new_rows = []
     for i, e in enumerate(recent_data):
         raw_title = e.get('title', '?')
         title = str(raw_title).replace('\n', ' ').strip()
@@ -23772,13 +23977,35 @@ def refresh_recent_list():
         time_ago = _fmt_time_ago(dl_ts) if dl_ts else ""
         size = _fmt_size(e.get("size", ""))
         duration = _fmt_dur(e.get("duration", ""))
+        new_rows.append((title, channel, time_ago, duration, size, i))
+
+    # Incremental update: reuse existing tree items instead of delete-all + reinsert
+    existing_iids = recent_tree.get_children('')
+    n_existing = len(existing_iids)
+    n_new = len(new_rows)
+
+    new_sel = []
+    # Update rows that exist in both old and new
+    for i in range(min(n_existing, n_new)):
         tag = "odd" if i % 2 else "even"
-
-        item = recent_tree.insert("", tk.END, values=(title, channel, time_ago, duration, size, i), tags=(tag,))
-
-        # Reselect based on fingerprint (title + channel from the tree's displayed values)
+        recent_tree.item(existing_iids[i], values=new_rows[i], tags=(tag,))
+        title, channel = new_rows[i][0], new_rows[i][1]
         if (title, channel) in sel_fingerprints:
-            new_sel.append(item)
+            new_sel.append(existing_iids[i])
+
+    # If we have more new rows than existing, insert the extras
+    if n_new > n_existing:
+        for i in range(n_existing, n_new):
+            tag = "odd" if i % 2 else "even"
+            item = recent_tree.insert("", tk.END, values=new_rows[i], tags=(tag,))
+            title, channel = new_rows[i][0], new_rows[i][1]
+            if (title, channel) in sel_fingerprints:
+                new_sel.append(item)
+
+    # If we have fewer new rows than existing, delete the extras
+    elif n_existing > n_new:
+        for iid in existing_iids[n_new:]:
+            recent_tree.delete(iid)
 
     if new_sel:
         recent_tree.selection_set(new_sel)
@@ -24960,8 +25187,22 @@ root.after(200, run_startup_updates)
 root.after(50, _start_startup_loading)
 
 
+_save_queue_state_pending = {"job": None}
+
+
 def _save_queue_state():
-    """Save current queue state to disk for restoration on next launch."""
+    """Debounced save — batches rapid queue changes into one write every 2 seconds."""
+    if _save_queue_state_pending["job"] is not None:
+        return  # already scheduled
+    try:
+        _save_queue_state_pending["job"] = root.after(2000, _save_queue_state_now)
+    except Exception:
+        _save_queue_state_now()  # fallback: save immediately if root is gone
+
+
+def _save_queue_state_now():
+    """Actually save current queue state to disk."""
+    _save_queue_state_pending["job"] = None
     queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "redownload": [], "order": [], "gpu": []}
     # Include the currently-running sync channel so it survives crashes
     if _current_sync_ch is not None and _sync_running:
@@ -25180,7 +25421,7 @@ def on_closing():
         has_queue = True
 
     if has_queue:
-        _save_queue_state()
+        _save_queue_state_now()  # bypass debounce on exit
 
     # Stop embedded VLC player if active
     try:

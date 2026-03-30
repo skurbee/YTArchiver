@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v26.6"
+APP_VERSION = "v26.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -379,6 +379,12 @@ _whisper_counter = {"idx": 0, "total": 0}
 # Seconds of silence from the Whisper subprocess before treating it as stalled and restarting.
 # VAD pre-processing on very long audio can legitimately take several minutes, so this is generous.
 _WHISPER_STALL_TIMEOUT = 900  # 15 minutes
+
+# Maximum audio duration (seconds) for single-pass Whisper transcription.  Files longer
+# than this are automatically split into 2-hour chunks and transcribed piece-by-piece to
+# avoid loading the entire waveform into RAM at once (which can consume 8+ GB on long
+# livestream VODs and stall or OOM the system).
+_WHISPER_MAX_DURATION = 21600  # 6 hours
 
 # Maximum characters shown for a video title/filename in progress status lines.
 # Titles longer than this are truncated with "..." to keep lines from becoming too wide.
@@ -3371,7 +3377,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 5:09pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 8:49pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7808,24 +7814,52 @@ def _start_whisper_process():
         return False
 
 
-def _stop_whisper_process():
-    """Stop the persistent Whisper subprocess."""
+def _stop_whisper_process(force=False):
+    """Stop the persistent Whisper subprocess.
+
+    If force=True (used after stalls), skip terminate() and go straight to kill(),
+    and also kill the entire process tree to ensure CUDA memory is freed.
+    """
     global _whisper_proc, _whisper_line_queue
     with _whisper_lock:
         _proc = _whisper_proc
         _whisper_proc = None
         _whisper_line_queue = None
     if _proc is not None:
+        _pid = _proc.pid
         try:
             _proc.stdin.close()
-            _proc.terminate()
-            _proc.wait(timeout=10)
         except Exception:
+            pass
+        if force:
+            # Kill the entire process tree (CTranslate2 may spawn child processes)
             try:
-                _proc.kill()
+                import psutil
+                _parent = psutil.Process(_pid)
+                for _child in _parent.children(recursive=True):
+                    try:
+                        _child.kill()
+                    except Exception:
+                        pass
+                _parent.kill()
+                _parent.wait(timeout=10)
+            except Exception:
+                # psutil not available or process already gone — fall back to direct kill
+                try:
+                    _proc.kill()
+                    _proc.wait(timeout=10)
+                except Exception:
+                    pass
+        else:
+            try:
+                _proc.terminate()
                 _proc.wait(timeout=10)
             except Exception:
-                pass
+                try:
+                    _proc.kill()
+                    _proc.wait(timeout=10)
+                except Exception:
+                    pass
 
 
 def _stop_ffmpeg_process():
@@ -9251,6 +9285,119 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         threading.Thread(target=_worker, daemon=True).start()
 
 
+def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=None, pause_ev=None, progress_cb=None):
+    """Transcribe a long audio file by splitting it into chunks with ffmpeg.
+
+    Each chunk is extracted as a temporary WAV file, transcribed individually,
+    then timestamps are offset so the final result is seamless.  This avoids
+    loading the entire waveform into RAM at once.
+
+    Chunks overlap by 30 seconds so Whisper's VAD doesn't cut off speech at
+    boundaries.  Duplicate segments in the overlap zone are removed when merging.
+    """
+    import tempfile as _tf
+    _ce = cancel_ev or cancel_event
+    _CHUNK_LEN = 7200  # 2 hours per chunk
+    _OVERLAP = 30      # seconds of overlap between chunks
+
+    _hrs = total_duration / 3600
+    _n_chunks = max(1, int(total_duration / _CHUNK_LEN) + (1 if total_duration % _CHUNK_LEN > 60 else 0))
+    log(f"  Audio is {_hrs:.1f}h — splitting into {_n_chunks} chunks for transcription...\n", "simpleline")
+
+    all_text_parts = []
+    all_segments = []
+    _chunk_tmp_dir = _tf.mkdtemp(prefix="yt_whisper_chunk_")
+
+    try:
+        for ci in range(_n_chunks):
+            if _ce.is_set():
+                break
+
+            _start_sec = ci * _CHUNK_LEN
+            # Include overlap from previous chunk's end so we don't miss speech at boundaries
+            if ci > 0:
+                _start_sec -= _OVERLAP
+            _end_sec = min(_start_sec + _CHUNK_LEN + (_OVERLAP if ci > 0 else 0), total_duration)
+            _chunk_dur = _end_sec - _start_sec
+            if _chunk_dur <= 0:
+                break
+
+            _chunk_path = os.path.join(_chunk_tmp_dir, f"chunk_{ci:03d}.wav")
+            _chunk_title = f"{title} [chunk {ci+1}/{_n_chunks}]" if title else f"chunk {ci+1}/{_n_chunks}"
+
+            # Extract chunk with ffmpeg (WAV 16kHz mono — what Whisper expects)
+            _ff_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", str(_start_sec),
+                "-t", str(_chunk_dur),
+                "-i", audio_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+                _chunk_path,
+            ]
+            try:
+                subprocess.run(_ff_cmd, check=True, capture_output=True, timeout=120)
+            except Exception as e:
+                log(f"  ⚠ Failed to extract chunk {ci+1}: {e}\n", "red")
+                continue
+
+            # Transcribe the chunk (duration fits within the normal limit)
+            def _chunk_progress(pct, _ss=_start_sec, _cd=_chunk_dur):
+                # Scale chunk progress to overall progress
+                overall = int((_ss / total_duration + pct / 100 * _cd / total_duration) * 100)
+                overall = min(99, overall)
+                if progress_cb:
+                    try:
+                        progress_cb(overall)
+                    except Exception:
+                        pass
+            _text, _segs = _whisper_transcribe(
+                _chunk_path, duration=_chunk_dur, title=_chunk_title,
+                cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=_chunk_progress)
+
+            # Clean up chunk file immediately to save disk space
+            try:
+                os.remove(_chunk_path)
+            except Exception:
+                pass
+
+            if _text:
+                all_text_parts.append(_text)
+
+            if _segs:
+                # Offset all segment timestamps by the chunk's start position.
+                # _whisper_transcribe returns {"start", "end", "text", "words"} dicts
+                # where words have {"w", "s", "e"} sub-dicts.
+                _offset = _start_sec
+                for seg in _segs:
+                    seg["start"] = round(seg["start"] + _offset, 2)
+                    seg["end"] = round(seg["end"] + _offset, 2)
+                    for w in seg.get("words", []):
+                        w["s"] = round(w["s"] + _offset, 3)
+                        w["e"] = round(w["e"] + _offset, 3)
+
+                if ci > 0 and all_segments and _segs:
+                    # Remove duplicate segments from the overlap zone
+                    _overlap_start = _start_sec + _OVERLAP
+                    # Drop segments from this chunk that start before the overlap boundary
+                    _segs = [s for s in _segs if s["start"] >= _overlap_start - 2]
+
+                all_segments.extend(_segs)
+
+        if _whisper_last_failed and not all_text_parts:
+            return None, []
+
+        _full_text = " ".join(all_text_parts) if all_text_parts else None
+        return _full_text, all_segments
+
+    finally:
+        # Clean up temp directory
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(_chunk_tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None):
     """Transcribe a file using the persistent Whisper subprocess.
 
@@ -9274,6 +9421,17 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         if not _start_whisper_process():
             _whisper_last_failed = True
             return None, []
+
+    # Guard: if audio exceeds _WHISPER_MAX_DURATION, split into chunks and transcribe
+    # each one separately to avoid loading the entire waveform into RAM at once.
+    _check_dur = duration
+    if not _check_dur and audio_path:
+        _check_dur = _ffprobe_duration(audio_path)
+    if _check_dur and _check_dur > _WHISPER_MAX_DURATION:
+        return _whisper_transcribe_chunked(
+            audio_path, _check_dur, title=title,
+            cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
+
     try:
         _title_disp = title
         if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
@@ -9320,26 +9478,36 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             try:
                 response_line = _whisper_line_queue.get(timeout=_WHISPER_STALL_TIMEOUT)
             except queue.Empty:
+                with _ffmpeg_lock:
+                    _gpu_actively_encoding = False
+                _is_retry = getattr(_whisper_transcribe, '_retrying', False)
+                if _is_retry:
+                    # Second stall on same video — skip it instead of looping forever
+                    log(
+                        f"  ⚠ Whisper stalled again on retry (no output for "
+                        f"{_WHISPER_STALL_TIMEOUT // 60} min). Skipping this file.\n",
+                        "red",
+                    )
+                    _stop_whisper_process(force=True)
+                    time.sleep(3)  # let OS reclaim memory before next file
+                    _whisper_last_failed = True
+                    return None, []
                 log(
                     f"  ⚠ Whisper stalled (no output for {_WHISPER_STALL_TIMEOUT // 60} min). "
                     f"Restarting process and retrying...\n",
                     "red",
                 )
-                with _ffmpeg_lock:
-                    _gpu_actively_encoding = False
-                _stop_whisper_process()  # will be restarted by retry
+                _stop_whisper_process(force=True)  # aggressive kill to free RAM/VRAM
+                time.sleep(3)  # let OS reclaim memory from killed process before respawning
                 # Retry once — stalls are usually transient (model loaded bad state)
-                if not hasattr(_whisper_transcribe, '_retrying') or not _whisper_transcribe._retrying:
-                    _whisper_transcribe._retrying = True
-                    try:
-                        _retry_result = _whisper_transcribe(
-                            audio_path, duration=duration, title=title,
-                            cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
-                        return _retry_result
-                    finally:
-                        _whisper_transcribe._retrying = False
-                _whisper_last_failed = True
-                return None, []
+                _whisper_transcribe._retrying = True
+                try:
+                    _retry_result = _whisper_transcribe(
+                        audio_path, duration=duration, title=title,
+                        cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
+                    return _retry_result
+                finally:
+                    _whisper_transcribe._retrying = False
 
             if response_line is None:
                 # Subprocess closed stdout unexpectedly

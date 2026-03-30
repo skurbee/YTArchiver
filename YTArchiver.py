@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.9"
+APP_VERSION = "v28.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3413,7 +3413,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:37pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19560,11 +19560,24 @@ class _TranscriptionPanel(ttk.Frame):
             self._browse_tree.delete(children[0])
             self._populate_browse_children(iid, meta)
 
+    def _get_channel_org(self, ch_name):
+        """Return (split_years, split_months) for a channel from config."""
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name") == ch_name:
+                    return ch.get("split_years", False), ch.get("split_months", False)
+        return False, False
+
     def _populate_browse_children(self, iid, meta):
         """Load the next level of children for a browse tree node."""
         tree = self._browse_tree
         if meta["type"] == "channel":
             ch = meta["channel"]
+            split_years, split_months = self._get_channel_org(ch)
+            if not split_years:
+                # No folder org — show flat list of all titles
+                self._populate_browse_titles(iid, ch, None, None)
+                return
             try:
                 years = self._db_execute(
                     "SELECT DISTINCT year FROM videos WHERE channel=? AND year IS NOT NULL "
@@ -19576,10 +19589,15 @@ class _TranscriptionPanel(ttk.Frame):
                 return
             for (yr,) in years:
                 yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
-                self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr}
+                self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr,
+                                               "split_months": split_months}
                 tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
         elif meta["type"] == "year":
             ch, yr = meta["channel"], meta["year"]
+            if not meta.get("split_months", False):
+                # Year folders only, no month subfolders — show titles directly
+                self._populate_browse_titles(iid, ch, yr, None)
+                return
             try:
                 months = self._db_execute(
                     "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "

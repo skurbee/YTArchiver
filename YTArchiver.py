@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v27.1"
+APP_VERSION = "v27.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -384,7 +384,7 @@ _WHISPER_STALL_TIMEOUT = 900  # 15 minutes
 # than this are automatically split into 2-hour chunks and transcribed piece-by-piece to
 # avoid loading the entire waveform into RAM at once (which can consume 8+ GB on long
 # livestream VODs and stall or OOM the system).
-_WHISPER_MAX_DURATION = 21600  # 6 hours
+_WHISPER_MAX_DURATION = 7200  # 2 hours — chunk anything longer to avoid loading huge waveforms into RAM
 
 # Maximum characters shown for a video title/filename in progress status lines.
 # Titles longer than this are truncated with "..." to keep lines from becoming too wide.
@@ -3381,7 +3381,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.29.26 11:48pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:06am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.3"
+APP_VERSION = "v29.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3431,7 +3431,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 8:23am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 10:35am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16120,15 +16120,19 @@ def _show_queue_menu(event=None):
             return s
         snapshot = [(_snap_label(lbl), src, idx) for lbl, src, idx, _k in items]
         if _state["last_snapshot"] == snapshot:
-            # Just update the dot animation on the active item's label widget
-            _albl = _state.get("active_lbl")
-            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
+            # Just update the dot animation on the active item in the Text widget
+            _tw = _state.get("text_widget")
+            _al = _state.get("active_line")
+            if _tw and _al and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
                 try:
                     if pause_event.is_set():
                         _fresh = f"▶ {_current_job['label']} (Paused)"
                     else:
                         _fresh = f"▶ {_active_label(_current_job['label'], with_dots=True)}"
-                    _albl.config(text=f"  1. {_fresh}")
+                    _tw.configure(state="normal")
+                    _tw.delete(f"{_al}.0", f"{_al}.end")
+                    _tw.insert(f"{_al}.0", f"  {_al}. {_fresh}", "active")
+                    _tw.configure(state="disabled")
                 except Exception:
                     pass
             # Update pause/resume button text in-place to avoid full rebuild flicker
@@ -16144,15 +16148,7 @@ def _show_queue_menu(event=None):
             return  # No structural change
         _state["last_snapshot"] = snapshot
 
-        # Unbind old mousewheel before rebuilding
-        if _state["mw_bind_id"]:
-            try:
-                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
-            except Exception:
-                pass
-            _state["mw_bind_id"] = None
-
-        # Build new content into a fresh wrapper (double-buffer to avoid flash)
+        # Build new content into a fresh wrapper
         wrapper = tk.Frame(popup, bg="#2d2d2d")
         _widgets = []
 
@@ -16166,176 +16162,154 @@ def _show_queue_menu(event=None):
         if items:
             max_visible = 10
             show_count = min(len(items), max_visible)
-            item_height = 26
-            list_height = show_count * item_height
 
-            canvas_frame = tk.Frame(wrapper, bg="#2d2d2d")
-            canvas_frame.pack(fill="both", expand=True, padx=2)
+            # Use a single Text widget instead of N individual frame/label widgets.
+            # This renders instantly regardless of item count (1 widget vs 140+).
+            text_frame = tk.Frame(wrapper, bg="#2d2d2d")
+            text_frame.pack(fill="both", expand=True, padx=2)
 
-            canvas = tk.Canvas(canvas_frame, bg="#2d2d2d", highlightthickness=0,
-                               height=list_height, width=310, yscrollincrement=item_height)
+            text_w = tk.Text(text_frame, bg="#2d2d2d", fg="#cccccc",
+                             font=("Segoe UI", 9), height=show_count,
+                             wrap="none", cursor="arrow",
+                             highlightthickness=0, borderwidth=0,
+                             padx=4, pady=2,
+                             selectbackground="#2d2d2d", selectforeground="#cccccc",
+                             insertwidth=0, width=42, takefocus=False)
 
             if len(items) > max_visible:
-                scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+                scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text_w.yview)
                 scrollbar.pack(side="right", fill="y")
-                canvas.configure(yscrollcommand=scrollbar.set)
+                text_w.configure(yscrollcommand=scrollbar.set)
 
-            canvas.pack(side="left", fill="both", expand=True)
+            text_w.pack(side="left", fill="both", expand=True)
 
-            inner = tk.Frame(canvas, bg="#2d2d2d")
-            canvas.create_window((0, 0), window=inner, anchor="nw")
+            # Tags for styling
+            text_w.tag_configure("active", foreground="#6abf6a", font=("Segoe UI", 9, "bold"))
+            text_w.tag_configure("normal", foreground="#cccccc", font=("Segoe UI", 9))
+            text_w.tag_configure("handle", foreground="#666666", font=("Segoe UI", 10))
+            text_w.tag_configure("hover", background="#444444")
+            text_w.tag_configure("drag_src", background="#555555")
+            text_w.tag_configure("drag_target", background="#3a5a3a")
 
+            # Store item data for event handling: [(source, idx, label, item_key), ...]
+            _item_data = []
             for i, (label, source, idx, item_key) in enumerate(items):
-                row = tk.Frame(inner, bg="#2d2d2d")
-                row.pack(fill="x")
-
+                _item_data.append((source, idx, label, item_key))
+                if i > 0:
+                    text_w.insert("end", "\n")
                 if source == "current":
-                    lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#6abf6a",
-                                   font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
-                    lbl.pack(side="left", fill="x", expand=True)
-                    _widgets.append({"row": row, "lbl": lbl, "source": source, "idx": idx})
-                    _state["active_lbl"] = lbl  # track for dot-only updates
-
-                    # Right-click on current (running) item to skip it and move to next
-                    def _skip_current_click(e):
-                        popup.destroy()
-                        if messagebox.askyesno("Skip Current", "Cancel the current job and move to the next one in queue?"):
-                            _skip_current_job()
-                    for w in [row, lbl]:
-                        w.bind("<Button-3>", _skip_current_click)
+                    text_w.insert("end", f"  {i + 1}. {label}", "active")
+                    _state["active_line"] = i + 1  # 1-indexed line number
                 else:
-                    handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
-                                      font=("Segoe UI", 10), cursor="fleur", pady=2)
-                    handle.pack(side="left")
+                    text_w.insert("end", " \u2261 ", "handle")
+                    text_w.insert("end", f"{i + 1}. {label}", "normal")
 
-                    lbl = tk.Label(row, text=f" {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
-                                   font=("Segoe UI", 9), anchor="w", padx=4, pady=2)
-                    lbl.pack(side="left", fill="x", expand=True)
+            text_w.configure(state="disabled")
+            _state["text_widget"] = text_w
+            _state["_item_data"] = _item_data
+            _state["active_lbl"] = None  # not used with Text widget — see active_line
 
-                    info = {"row": row, "lbl": lbl, "handle": handle, "source": source, "idx": idx}
-                    _widgets.append(info)
+            # --- Hover highlight ---
+            _hover_line = [0]
 
-                    # Hover highlight
-                    def _enter(e, r=row, l=lbl, h=handle):
-                        if not _drag["active"]:
-                            r.config(bg="#444444")
-                            l.config(bg="#444444")
-                            if h: h.config(bg="#444444")
-                    def _leave(e, r=row, l=lbl, h=handle):
-                        if not _drag["active"]:
-                            r.config(bg="#2d2d2d")
-                            l.config(bg="#2d2d2d")
-                            if h: h.config(bg="#2d2d2d")
-                    for w in ([row, lbl] + ([handle] if handle else [])):
-                        w.bind("<Enter>", _enter)
-                        w.bind("<Leave>", _leave)
+            def _on_text_motion(e):
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                if line == _hover_line[0]:
+                    return
+                # Remove old hover
+                if _hover_line[0] > 0:
+                    text_w.tag_remove("hover", f"{_hover_line[0]}.0", f"{_hover_line[0]}.end")
+                _hover_line[0] = line
+                if 1 <= line <= len(_item_data) and _item_data[line - 1][0] != "current":
+                    if not _drag["active"]:
+                        text_w.tag_add("hover", f"{line}.0", f"{line}.end")
 
-                    # Right-click to remove any non-current item
-                    def _remove(e, s=source, qi=idx, lb=label, ik=item_key):
-                        popup.destroy()
-                        _confirm_remove(s, qi, lb, ik)
-                    for w in ([row, lbl] + ([handle] if handle else [])):
-                        w.bind("<Button-3>", _remove)
+            def _on_text_leave(e):
+                if _hover_line[0] > 0:
+                    text_w.tag_remove("hover", f"{_hover_line[0]}.0", f"{_hover_line[0]}.end")
+                    _hover_line[0] = 0
 
-                    # Drag-to-reorder for all non-current items
-                    def _make_drag_bindings(r, l, h, s=source):
-                        def _find_my_widget_index():
-                            """Look up this row's position in _state['widgets']."""
-                            for wi_idx, wi in enumerate(_state["widgets"]):
-                                if wi["row"] is r:
-                                    return wi_idx
-                            return -1
+            text_w.bind("<Motion>", _on_text_motion)
+            text_w.bind("<Leave>", _on_text_leave)
 
-                        def _on_press(e):
-                            _drag["active"] = True
-                            _drag["src_widget_idx"] = _find_my_widget_index()
-                            _drag["src_widget"] = r
-                            r.config(bg="#555555")
-                            l.config(bg="#555555")
-                            if h: h.config(bg="#555555")
+            # --- Right-click to remove / skip ---
+            def _on_text_right_click(e):
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                if line < 1 or line > len(_item_data):
+                    return
+                source, idx, label, item_key = _item_data[line - 1]
+                if source == "current":
+                    popup.destroy()
+                    if messagebox.askyesno("Skip Current", "Cancel the current job and move to the next one in queue?"):
+                        _skip_current_job()
+                else:
+                    popup.destroy()
+                    _confirm_remove(source, idx, label, item_key)
 
-                        def _on_motion(e):
-                            if not _drag["active"]:
-                                return
-                            y = e.y_root
-                            for wi in _state["widgets"]:
-                                if wi["source"] == "current" or wi["row"] == _drag["src_widget"]:
-                                    continue
-                                try:
-                                    wy = wi["row"].winfo_rooty()
-                                    wh2 = wi["row"].winfo_height()
-                                    if wy <= y <= wy + wh2:
-                                        wi["row"].config(bg="#3a5a3a")
-                                        wi["lbl"].config(bg="#3a5a3a")
-                                        if wi.get("handle"): wi["handle"].config(bg="#3a5a3a")
-                                    else:
-                                        wi["row"].config(bg="#2d2d2d")
-                                        wi["lbl"].config(bg="#2d2d2d")
-                                        if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                except Exception:
-                                    pass
+            text_w.bind("<Button-3>", _on_text_right_click)
 
-                        def _on_release(e):
-                            if not _drag["active"]:
-                                return
-                            _drag["active"] = False
-                            # Reset all backgrounds
-                            for wi in _state["widgets"]:
-                                try:
-                                    wi["row"].config(bg="#2d2d2d")
-                                    wi["lbl"].config(bg="#2d2d2d")
-                                    if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                except Exception:
-                                    pass
-                            # Find drop target (any non-current row)
-                            y = e.y_root
-                            target_widget_idx = None
-                            for wi_idx, wi in enumerate(_state["widgets"]):
-                                if wi["source"] == "current":
-                                    continue
-                                try:
-                                    wy = wi["row"].winfo_rooty()
-                                    wh2 = wi["row"].winfo_height()
-                                    if wy <= y <= wy + wh2:
-                                        target_widget_idx = wi_idx
-                                        break
-                                except Exception:
-                                    pass
-                            src_wi = _drag["src_widget_idx"]
-                            if target_widget_idx is not None and target_widget_idx != src_wi:
-                                # Reorder _queue_order based on widget positions
-                                # Map widget indices to _queue_order indices by counting
-                                # non-queue ("current") widgets before each position.
-                                _cur_before_src = sum(1 for wi in _state["widgets"][:src_wi] if wi["source"] == "current")
-                                _cur_before_dst = sum(1 for wi in _state["widgets"][:target_widget_idx] if wi["source"] == "current")
-                                src_qo = src_wi - _cur_before_src
-                                dst_qo = target_widget_idx - _cur_before_dst
-                                with _queue_order_lock:
-                                    if 0 <= src_qo < len(_queue_order) and 0 <= dst_qo < len(_queue_order):
-                                        moved = _queue_order.pop(src_qo)
-                                        _queue_order.insert(dst_qo, moved)
-                                _save_queue_state()
-                                # Force full rebuild so closures get fresh indices
-                                _state["last_snapshot"] = None
-                                _build_content()
+            # --- Drag to reorder ---
+            def _on_text_drag_press(e):
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                if 1 <= line <= len(_item_data) and _item_data[line - 1][0] != "current":
+                    _drag["active"] = True
+                    _drag["src_line"] = line
+                    text_w.tag_add("drag_src", f"{line}.0", f"{line}.end")
 
-                        for w in [h, l, r]:
-                            w.bind("<ButtonPress-1>", _on_press)
-                            w.bind("<B1-Motion>", _on_motion)
-                            w.bind("<ButtonRelease-1>", _on_release)
+            def _on_text_drag_motion(e):
+                if not _drag["active"]:
+                    return
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                # Clear all drag highlights except source
+                text_w.tag_remove("hover", "1.0", "end")
+                text_w.tag_remove("drag_target", "1.0", "end")
+                if (1 <= line <= len(_item_data) and _item_data[line - 1][0] != "current"
+                        and line != _drag.get("src_line")):
+                    text_w.tag_add("drag_target", f"{line}.0", f"{line}.end")
 
-                    _make_drag_bindings(row, lbl, handle)
+            def _on_text_drag_release(e):
+                if not _drag["active"]:
+                    return
+                _drag["active"] = False
+                text_w.tag_remove("drag_src", "1.0", "end")
+                text_w.tag_remove("drag_target", "1.0", "end")
+                text_w.tag_remove("hover", "1.0", "end")
+                try:
+                    target_line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                src_line = _drag.get("src_line", 0)
+                if (target_line == src_line or target_line < 1
+                        or target_line > len(_item_data)):
+                    return
+                if _item_data[target_line - 1][0] == "current":
+                    return
+                # Map line numbers to _queue_order indices (skip "current" items)
+                src_qo = src_line - 1 - sum(1 for d in _item_data[:src_line - 1] if d[0] == "current")
+                dst_qo = target_line - 1 - sum(1 for d in _item_data[:target_line - 1] if d[0] == "current")
+                with _queue_order_lock:
+                    if 0 <= src_qo < len(_queue_order) and 0 <= dst_qo < len(_queue_order):
+                        moved = _queue_order.pop(src_qo)
+                        _queue_order.insert(dst_qo, moved)
+                _save_queue_state()
+                _state["last_snapshot"] = None
+                _build_content()
 
-            inner.after(1, lambda: canvas.configure(scrollregion=canvas.bbox("all")))
-
-            # Mouse wheel scrolling — only when there are enough items to scroll
-            if len(items) > max_visible:
-                def _on_mousewheel(e):
-                    try:
-                        canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-                    except Exception:
-                        pass
-                _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
+            text_w.bind("<ButtonPress-1>", _on_text_drag_press)
+            text_w.bind("<B1-Motion>", _on_text_drag_motion)
+            text_w.bind("<ButtonRelease-1>", _on_text_drag_release)
 
             # Footer hint
             has_queued = any(s != "current" for _, s, _, _k in items)
@@ -16481,11 +16455,12 @@ def _show_queue_menu(event=None):
                              font=("Segoe UI", 9), anchor="w")
             empty.pack(fill="x", padx=4, pady=(0, 6))
 
-        # Swap: pack new wrapper, then destroy old (double-buffer avoids flash)
+        # Swap wrappers: pack new first so content is visible before old is removed
         wrapper.pack(fill="both", expand=True)
         old_wrapper = _state["wrapper"]
         if old_wrapper:
             try:
+                old_wrapper.pack_forget()
                 old_wrapper.destroy()
             except Exception:
                 pass
@@ -16515,7 +16490,7 @@ def _show_queue_menu(event=None):
     # --- Live refresh (updates queue while open) ---
     def _refresh():
         try:
-            if not popup.winfo_exists():
+            if not _root_alive or not popup.winfo_exists():
                 return
             if _queue_popup.get("visible") and not _drag["active"]:
                 _build_content()
@@ -16589,11 +16564,8 @@ def _show_queue_menu(event=None):
                 popup.after_cancel(_state["refresh_job"])
         except Exception:
             pass
-        try:
-            if _state.get("mw_bind_id"):
-                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
-        except Exception:
-            pass
+        # Mousewheel bindings on child widgets get destroyed with popup
+        _state["mw_bind_id"] = None
         try:
             if _state.get("esc_bind_id"):
                 root.unbind("<Escape>", _state["esc_bind_id"])
@@ -16622,13 +16594,19 @@ def _queue_btn_click(e=None):
     return "break"
 
 queue_btn.bind("<Button-1>", _queue_btn_click, add="+")
+# Badge sits on top of button — forward clicks through so the popup still toggles
+_sync_badge.bind("<Button-1>", _queue_btn_click, add="+")
 _ToolTip(queue_btn, "Sync Tasks")
 
 
 def _update_queue_btn():
     """Update sync tasks button state (badge, blink, popup refresh). Button is always visible."""
+    if not _root_alive:
+        return
     def _do():
         try:
+            if not _root_alive:
+                return
             items = _get_queue_items()
             # Close the popup when queue becomes empty (e.g. after cancel)
             if not items:
@@ -16702,7 +16680,7 @@ def _blink_tick():
     """Unified blink clock — toggles both Sync and GPU buttons in phase.
     Running = blink, Paused = solid color, Idle = default bg."""
     try:
-        if not root.winfo_exists():
+        if not _root_alive or not root.winfo_exists():
             _blink_clock["job"] = None
             return
         _blink_clock["on"] = not _blink_clock["on"]
@@ -16789,8 +16767,12 @@ def _gpu_blink_stop():
 
 def _update_gpu_btn():
     """Update GPU Tasks button state (badge, blink). Button is always visible."""
+    if not _root_alive:
+        return
     def _do():
         try:
+            if not _root_alive:
+                return
             # Update badge count
             _update_gpu_badge()
 
@@ -16929,12 +16911,16 @@ def _show_gpu_menu(event=None):
         # Exclude button state (pause/resume) from snapshot — update button in-place instead.
         snapshot = [(lbl.rstrip("."), idx) for lbl, idx in items]
         if _state["last_snapshot"] == snapshot:
-            # Just update the dot animation on the active item's label widget
-            _albl = _state.get("active_lbl")
-            if _albl and _gpu_running and _gpu_current.get("label"):
+            # Just update the dot animation on the active item in the Text widget
+            _tw = _state.get("text_widget")
+            _al = _state.get("active_line")
+            if _tw and _al and _gpu_running and _gpu_current.get("label"):
                 try:
                     _fresh = f"▶ {_active_label(_gpu_current['label'], with_dots=True)}"
-                    _albl.config(text=f"  1. {_fresh}")
+                    _tw.configure(state="normal")
+                    _tw.delete(f"{_al}.0", f"{_al}.end")
+                    _tw.insert(f"{_al}.0", f"  {_al}. {_fresh}", "active")
+                    _tw.configure(state="disabled")
                 except Exception:
                     pass
             # Update pause/resume button text in-place to avoid full rebuild flicker
@@ -16949,14 +16935,6 @@ def _show_gpu_menu(event=None):
                     pass
             return  # No structural change
         _state["last_snapshot"] = snapshot
-
-        # Unbind old mousewheel before rebuilding
-        if _state["mw_bind_id"]:
-            try:
-                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
-            except Exception:
-                pass
-            _state["mw_bind_id"] = None
 
         wrapper = tk.Frame(popup, bg="#2d2d2d")
 
@@ -16993,165 +16971,142 @@ def _show_gpu_menu(event=None):
         if items:
             max_visible = 10
             show_count = min(len(items), max_visible)
-            item_height = 26
-            list_height = show_count * item_height
 
-            canvas_frame = tk.Frame(wrapper, bg="#2d2d2d")
-            canvas_frame.pack(fill="both", expand=True, padx=2)
+            # Single Text widget — renders instantly regardless of item count
+            text_frame = tk.Frame(wrapper, bg="#2d2d2d")
+            text_frame.pack(fill="both", expand=True, padx=2)
 
-            canvas = tk.Canvas(canvas_frame, bg="#2d2d2d", highlightthickness=0,
-                               height=list_height, width=310, yscrollincrement=item_height)
+            text_w = tk.Text(text_frame, bg="#2d2d2d", fg="#cccccc",
+                             font=("Segoe UI", 9), height=show_count,
+                             wrap="none", cursor="arrow",
+                             highlightthickness=0, borderwidth=0,
+                             padx=4, pady=2,
+                             selectbackground="#2d2d2d", selectforeground="#cccccc",
+                             insertwidth=0, width=42, takefocus=False)
 
             if len(items) > max_visible:
-                scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+                scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text_w.yview)
                 scrollbar.pack(side="right", fill="y")
-                canvas.configure(yscrollcommand=scrollbar.set)
+                text_w.configure(yscrollcommand=scrollbar.set)
 
-            canvas.pack(side="left", fill="both", expand=True)
+            text_w.pack(side="left", fill="both", expand=True)
 
-            inner = tk.Frame(canvas, bg="#2d2d2d")
-            canvas.create_window((0, 0), window=inner, anchor="nw")
+            text_w.tag_configure("active", foreground="#6abf6a", font=("Segoe UI", 9, "bold"))
+            text_w.tag_configure("normal", foreground="#cccccc", font=("Segoe UI", 9))
+            text_w.tag_configure("handle", foreground="#666666", font=("Segoe UI", 10))
+            text_w.tag_configure("hover", background="#444444")
+            text_w.tag_configure("drag_src", background="#555555")
+            text_w.tag_configure("drag_target", background="#3a5a3a")
 
-            _widgets = []
+            _item_data = []  # [(label, idx), ...]
             for i, (label, idx) in enumerate(items):
-                row = tk.Frame(inner, bg="#2d2d2d")
-                row.pack(fill="x")
-
+                _item_data.append((label, idx))
+                if i > 0:
+                    text_w.insert("end", "\n")
                 if idx == -1:
-                    # Currently processing — green, bold
-                    lbl = tk.Label(row, text=f"  {i + 1}. {label}", bg="#2d2d2d", fg="#6abf6a",
-                                   font=("Segoe UI", 9, "bold"), anchor="w", padx=4, pady=2)
-                    lbl.pack(side="left", fill="x", expand=True)
-                    _state["active_lbl"] = lbl  # track for dot-only updates
-                    _widgets.append({"row": row, "lbl": lbl, "handle": None, "source": "current", "idx": idx})
-
-                    # Right-click on current (running) GPU item to skip it and move to next
-                    def _skip_gpu_click(e):
-                        popup.destroy()
-                        _gpu_popup["win"] = None
-                        if messagebox.askyesno("Skip Current", "Cancel the current GPU task and move to the next one?"):
-                            _skip_current_gpu_job()
-                    for w in [row, lbl]:
-                        w.bind("<Button-3>", _skip_gpu_click)
+                    text_w.insert("end", f"  {i + 1}. {label}", "active")
+                    _state["active_line"] = i + 1
                 else:
-                    handle = tk.Label(row, text=" ≡", bg="#2d2d2d", fg="#666666",
-                                      font=("Segoe UI", 10), cursor="fleur", pady=2)
-                    handle.pack(side="left")
+                    text_w.insert("end", " \u2261 ", "handle")
+                    text_w.insert("end", f"{i + 1}. {label}", "normal")
 
-                    lbl = tk.Label(row, text=f" {i + 1}. {label}", bg="#2d2d2d", fg="#cccccc",
-                                   font=("Segoe UI", 9), anchor="w", padx=4, pady=2)
-                    lbl.pack(side="left", fill="x", expand=True)
+            text_w.configure(state="disabled")
+            _state["text_widget"] = text_w
+            _state["_item_data"] = _item_data
+            _state["active_lbl"] = None
 
-                    _widgets.append({"row": row, "lbl": lbl, "handle": handle, "source": "gpu", "idx": idx})
-
-                    # Hover highlight
-                    def _enter(e, r=row, l=lbl, h=handle):
-                        if not _drag["active"]:
-                            r.config(bg="#444444"); l.config(bg="#444444")
-                            if h: h.config(bg="#444444")
-                    def _leave(e, r=row, l=lbl, h=handle):
-                        if not _drag["active"]:
-                            r.config(bg="#2d2d2d"); l.config(bg="#2d2d2d")
-                            if h: h.config(bg="#2d2d2d")
-                    for w in ([row, lbl] + ([handle] if handle else [])):
-                        w.bind("<Enter>", _enter)
-                        w.bind("<Leave>", _leave)
-
-                    # Right-click to remove
-                    def _remove(e, qi=idx, lb=label):
-                        _confirm_gpu_remove(qi, lb)
-                    for w in ([row, lbl] + ([handle] if handle else [])):
-                        w.bind("<Button-3>", _remove)
-
-                    # Drag-to-reorder
-                    def _make_drag_bindings(r, l, h):
-                        def _find_my_widget_index():
-                            for wi_idx, wi in enumerate(_state["widgets"]):
-                                if wi["row"] is r:
-                                    return wi_idx
-                            return -1
-
-                        def _on_press(e):
-                            _drag["active"] = True
-                            _drag["src_widget_idx"] = _find_my_widget_index()
-                            _drag["src_widget"] = r
-                            r.config(bg="#555555"); l.config(bg="#555555")
-                            if h: h.config(bg="#555555")
-
-                        def _on_motion(e):
-                            if not _drag["active"]:
-                                return
-                            y = e.y_root
-                            for wi in _state["widgets"]:
-                                if wi["source"] == "current" or wi["row"] == _drag["src_widget"]:
-                                    continue
-                                try:
-                                    wy = wi["row"].winfo_rooty()
-                                    wh2 = wi["row"].winfo_height()
-                                    if wy <= y <= wy + wh2:
-                                        wi["row"].config(bg="#3a5a3a"); wi["lbl"].config(bg="#3a5a3a")
-                                        if wi.get("handle"): wi["handle"].config(bg="#3a5a3a")
-                                    else:
-                                        wi["row"].config(bg="#2d2d2d"); wi["lbl"].config(bg="#2d2d2d")
-                                        if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                except Exception:
-                                    pass
-
-                        def _on_release(e):
-                            if not _drag["active"]:
-                                return
-                            _drag["active"] = False
-                            for wi in _state["widgets"]:
-                                try:
-                                    wi["row"].config(bg="#2d2d2d"); wi["lbl"].config(bg="#2d2d2d")
-                                    if wi.get("handle"): wi["handle"].config(bg="#2d2d2d")
-                                except Exception:
-                                    pass
-                            y = e.y_root
-                            target_widget_idx = None
-                            for wi_idx, wi in enumerate(_state["widgets"]):
-                                if wi["source"] == "current":
-                                    continue
-                                try:
-                                    wy = wi["row"].winfo_rooty()
-                                    wh2 = wi["row"].winfo_height()
-                                    if wy <= y <= wy + wh2:
-                                        target_widget_idx = wi_idx
-                                        break
-                                except Exception:
-                                    pass
-                            src_wi = _drag["src_widget_idx"]
-                            if target_widget_idx is not None and target_widget_idx != src_wi:
-                                has_current = (_state["widgets"][0]["source"] == "current") if _state["widgets"] else False
-                                src_qo = (src_wi - 1) if has_current else src_wi
-                                dst_qo = (target_widget_idx - 1) if has_current else target_widget_idx
-                                with _gpu_queue_lock:
-                                    if 0 <= src_qo < len(_gpu_queue) and 0 <= dst_qo < len(_gpu_queue):
-                                        moved = _gpu_queue.pop(src_qo)
-                                        _gpu_queue.insert(dst_qo, moved)
-                                _save_queue_state()
-                                # Force full rebuild so closures get fresh indices
-                                _state["last_snapshot"] = None
-                                _build_content()
-
-                        for w in [h, l, r]:
-                            w.bind("<ButtonPress-1>", _on_press)
-                            w.bind("<B1-Motion>", _on_motion)
-                            w.bind("<ButtonRelease-1>", _on_release)
-
-                    _make_drag_bindings(row, lbl, handle)
-
-            _state["widgets"] = _widgets
-
-            inner.after(1, lambda: canvas.configure(scrollregion=canvas.bbox("all")))
-
-            # Use popup-level binding instead of bind_all to avoid global event interference
-            def _on_mousewheel(e):
+            # Hover
+            _hover_line = [0]
+            def _on_text_motion(e):
                 try:
-                    canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
                 except Exception:
-                    pass
-            _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
+                    return
+                if line == _hover_line[0]:
+                    return
+                if _hover_line[0] > 0:
+                    text_w.tag_remove("hover", f"{_hover_line[0]}.0", f"{_hover_line[0]}.end")
+                _hover_line[0] = line
+                if 1 <= line <= len(_item_data) and _item_data[line - 1][1] != -1:
+                    if not _drag["active"]:
+                        text_w.tag_add("hover", f"{line}.0", f"{line}.end")
+            def _on_text_leave(e):
+                if _hover_line[0] > 0:
+                    text_w.tag_remove("hover", f"{_hover_line[0]}.0", f"{_hover_line[0]}.end")
+                    _hover_line[0] = 0
+            text_w.bind("<Motion>", _on_text_motion)
+            text_w.bind("<Leave>", _on_text_leave)
+
+            # Right-click
+            def _on_text_right_click(e):
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                if line < 1 or line > len(_item_data):
+                    return
+                label, idx = _item_data[line - 1]
+                if idx == -1:
+                    popup.destroy()
+                    _gpu_popup["win"] = None
+                    if messagebox.askyesno("Skip Current", "Cancel the current GPU task and move to the next one?"):
+                        _skip_current_gpu_job()
+                else:
+                    _confirm_gpu_remove(idx, label)
+            text_w.bind("<Button-3>", _on_text_right_click)
+
+            # Drag to reorder
+            def _on_text_drag_press(e):
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                if 1 <= line <= len(_item_data) and _item_data[line - 1][1] != -1:
+                    _drag["active"] = True
+                    _drag["src_line"] = line
+                    text_w.tag_add("drag_src", f"{line}.0", f"{line}.end")
+            def _on_text_drag_motion(e):
+                if not _drag["active"]:
+                    return
+                try:
+                    line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                text_w.tag_remove("hover", "1.0", "end")
+                text_w.tag_remove("drag_target", "1.0", "end")
+                if (1 <= line <= len(_item_data) and _item_data[line - 1][1] != -1
+                        and line != _drag.get("src_line")):
+                    text_w.tag_add("drag_target", f"{line}.0", f"{line}.end")
+            def _on_text_drag_release(e):
+                if not _drag["active"]:
+                    return
+                _drag["active"] = False
+                text_w.tag_remove("drag_src", "1.0", "end")
+                text_w.tag_remove("drag_target", "1.0", "end")
+                text_w.tag_remove("hover", "1.0", "end")
+                try:
+                    target_line = int(text_w.index(f"@{e.x},{e.y}").split(".")[0])
+                except Exception:
+                    return
+                src_line = _drag.get("src_line", 0)
+                if (target_line == src_line or target_line < 1
+                        or target_line > len(_item_data)):
+                    return
+                if _item_data[target_line - 1][1] == -1:
+                    return
+                has_current = (_item_data[0][1] == -1) if _item_data else False
+                src_qo = (src_line - 2) if has_current else (src_line - 1)
+                dst_qo = (target_line - 2) if has_current else (target_line - 1)
+                with _gpu_queue_lock:
+                    if 0 <= src_qo < len(_gpu_queue) and 0 <= dst_qo < len(_gpu_queue):
+                        moved = _gpu_queue.pop(src_qo)
+                        _gpu_queue.insert(dst_qo, moved)
+                _save_queue_state()
+                _state["last_snapshot"] = None
+                _build_content()
+            text_w.bind("<ButtonPress-1>", _on_text_drag_press)
+            text_w.bind("<B1-Motion>", _on_text_drag_motion)
+            text_w.bind("<ButtonRelease-1>", _on_text_drag_release)
 
             # Footer hint
             has_queued = any(idx != -1 for _, idx in items)
@@ -17280,11 +17235,12 @@ def _show_gpu_menu(event=None):
                              font=("Segoe UI", 9), anchor="w")
             empty.pack(fill="x", padx=4, pady=(0, 6))
 
-        # Swap: pack new wrapper, then destroy old (double-buffer avoids flash)
+        # Swap wrappers: pack new first so content is visible before old is removed
         wrapper.pack(fill="both", expand=True)
         old_wrapper = _state["wrapper"]
         if old_wrapper:
             try:
+                old_wrapper.pack_forget()
                 old_wrapper.destroy()
             except Exception:
                 pass
@@ -17318,7 +17274,7 @@ def _show_gpu_menu(event=None):
     # --- Live refresh (double-buffered — no flicker) ---
     def _refresh():
         try:
-            if not popup.winfo_exists():
+            if not _root_alive or not popup.winfo_exists():
                 return
             if _gpu_popup.get("visible") and not _drag["active"]:
                 _build_content()
@@ -17383,11 +17339,8 @@ def _show_gpu_menu(event=None):
                 popup.after_cancel(_state["refresh_job"])
         except Exception:
             pass
-        try:
-            if _state.get("mw_bind_id"):
-                popup.unbind("<MouseWheel>", _state["mw_bind_id"])
-        except Exception:
-            pass
+        # Mousewheel bindings on child widgets get destroyed with popup
+        _state["mw_bind_id"] = None
         try:
             if _state.get("esc_bind_id"):
                 root.unbind("<Escape>", _state["esc_bind_id"])
@@ -17416,6 +17369,7 @@ def _gpu_btn_click(e=None):
     return "break"
 
 gpu_btn.bind("<Button-1>", _gpu_btn_click, add="+")
+_gpu_badge.bind("<Button-1>", _gpu_btn_click, add="+")
 _ToolTip(gpu_btn, "GPU Tasks")
 
 
@@ -27518,6 +27472,27 @@ def on_closing():
                     p.kill()
         except Exception:
             pass
+
+    # Destroy popup windows and stop recurring timers immediately so their after()
+    # callbacks stop firing (prevents "ButtonProc called on an invalid HWND" during shutdown)
+    for _popup_dict in [_queue_popup, _gpu_popup]:
+        try:
+            _pw = _popup_dict.get("win")
+            if _pw and _pw.winfo_exists():
+                _pw.destroy()
+            _popup_dict["win"] = None
+            _popup_dict["visible"] = False
+        except Exception:
+            pass
+    # Stop blink timer
+    _sync_blink["active"] = False
+    _gpu_blink["active"] = False
+    if _blink_clock.get("job"):
+        try:
+            root.after_cancel(_blink_clock["job"])
+        except Exception:
+            pass
+        _blink_clock["job"] = None
 
     # Give worker threads a moment to notice cancel_event and save state
     # (they're daemon threads — root.destroy() will kill them)

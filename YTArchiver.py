@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.4"
+APP_VERSION = "v29.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3431,7 +3431,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 10:35am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 11:01am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20456,6 +20456,8 @@ class _TranscriptionPanel(ttk.Frame):
         """Clear the browse tree selection and reset the viewer to its initial state."""
         self._browse_tree.selection_set([])
         self._hide_grid()
+        self._hide_browse_thumbnail()
+        self._clear_browse_drawer()
         self._browse_viewer_title.config(text="Select a transcription to read")
         self._browse_viewer.config(state="normal")
         self._browse_viewer.delete("1.0", "end")
@@ -21446,6 +21448,10 @@ class _TranscriptionPanel(ttk.Frame):
 
         if not entry:
             self.after(0, self._clear_browse_drawer)
+            # Still attempt to show thumbnail even without metadata
+            self._show_browse_thumbnail(
+                video_id, title, channel, folder_path,
+                split_years, split_months, year, month)
             return
 
         # Store the current metadata entry for player drawer access

@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.6"
+APP_VERSION = "v29.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3345,6 +3345,15 @@ style.map("Cancel.TButton", background=[("active", "#7a2020"), ("disabled", C_BO
 style.configure("Pause.TButton", background="#2a4a6b", foreground="#ffffff", padding=_bp, relief="flat",
                 font=("Segoe UI Emoji", 9))
 style.map("Pause.TButton", background=[("active", "#3a5e84"), ("disabled", C_BORDER)])
+style.layout("GpbPlay.TButton", [("Button.padding", {"children": [("Button.label", {"sticky": "nswe"})], "sticky": "nswe"})])
+style.configure("GpbPlay.TButton", background=C_SYNC, foreground="#ffffff", padding=_bp, relief="flat",
+                font=("Segoe UI Symbol", 9))
+style.map("GpbPlay.TButton", background=[("active", C_SYNC_H), ("disabled", C_BORDER)])
+style.layout("GpbPause.TButton", [("Button.padding", {"children": [("Button.label", {"sticky": "nswe"})], "sticky": "nswe"})])
+style.configure("GpbPause.TButton", background="#2a4a6b", foreground="#ffffff", padding=_bp, relief="flat",
+                font=("Segoe UI Symbol", 9))
+style.map("GpbPause.TButton", background=[("active", "#3a5e84"), ("disabled", C_BORDER)],
+          foreground=[("disabled", C_DIM)])
 style.configure("Warn.TButton", background=C_WARN, foreground="#ffffff", padding=_bp, relief="flat",
                 font=("Segoe UI", 9))
 style.map("Warn.TButton", background=[("active", "#7a4412"), ("disabled", C_BORDER)])
@@ -3435,7 +3444,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 11:23am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 12:16pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15683,6 +15692,112 @@ sync_btn = ttk.Button(btn_frame, text="🔄 Sync Subbed", command=start_sync_all
 sync_btn.pack(side="left", padx=(0, 6))
 _ToolTip(sync_btn, "Sync and download every channel in your Sub list")
 
+# ── Global Pause / Resume / Start button ────────────────────────────
+_gpb_btn = ttk.Button(btn_frame, text="\u25B6", state="disabled", width=2, style="GpbPlay.TButton", takefocus=False)
+_gpb_btn.pack(side="left", padx=(0, 0))
+_gpb_tooltip = _ToolTip(_gpb_btn, "No tasks")
+_gpb_mode = {"current": "disabled", "ready": False}   # "disabled" | "start" | "pause" | "resume"
+
+
+def _gpb_has_sync_queued():
+    """Check if any sync-pipeline queue has pending items and pipeline is idle."""
+    if _sync_running or _reorg_running or _redownload_running or _metadata_running or (_transcribe_running and _transcribe_sync_controlled):
+        return False
+    with _sync_queue_lock:
+        if _sync_queue:
+            return True
+    with _reorg_queue_lock:
+        if _reorg_queue:
+            return True
+    with _transcribe_queue_lock:
+        if _transcribe_queue:
+            return True
+    with _mt_queue_lock:
+        if _mt_queue:
+            return True
+    with _redownload_queue_lock:
+        if _redownload_queue:
+            return True
+    with _metadata_queue_lock:
+        if _metadata_queue:
+            return True
+    return False
+
+
+def _global_start_all():
+    """Start both sync queue and GPU queue if they have pending items."""
+    if _gpb_has_sync_queued():
+        cancel_event.clear()
+        _process_next_queued()
+    with _gpu_queue_lock:
+        _has_gpu = bool(_gpu_queue)
+    if _has_gpu and not _gpu_running:
+        _gpu_start()
+
+
+def _global_toggle_pause():
+    """Toggle pause on both Sync Tasks and GPU Tasks simultaneously."""
+    _all_paused = pause_event.is_set() and _gpu_pause.is_set()
+    if _all_paused:
+        pause_event.clear()
+        _gpu_pause.clear()
+    else:
+        pause_event.set()
+        _gpu_pause.set()
+    _update_global_pause_btn_sync()
+
+
+def _update_global_pause_btn_sync():
+    """Update global pause button appearance based on current state. Called reactively."""
+    if not _root_alive or not _gpb_mode["ready"]:
+        return
+    def _do():
+        try:
+            if not _root_alive:
+                return
+            _is_running = (_sync_running or _reorg_running or _redownload_running
+                           or _metadata_running
+                           or (_transcribe_running and _transcribe_sync_controlled)
+                           or _gpu_running)
+            _any_paused = pause_event.is_set() or _gpu_pause.is_set()
+
+            # Check for queued-but-not-started items
+            _has_sync_queued = _gpb_has_sync_queued()
+            with _gpu_queue_lock:
+                _has_gpu_queued = bool(_gpu_queue) and not _gpu_running
+
+            if _is_running:
+                if _any_paused:
+                    if _gpb_mode["current"] != "resume":
+                        _gpb_btn.config(text="\u25B6", command=_global_toggle_pause,
+                                        state="normal", style="GpbPlay.TButton")
+                        _gpb_tooltip.text = "Resume all tasks"
+                        _gpb_mode["current"] = "resume"
+                else:
+                    if _gpb_mode["current"] != "pause":
+                        _gpb_btn.config(text="\u23F8", command=_global_toggle_pause,
+                                        state="normal", style="GpbPause.TButton")
+                        _gpb_tooltip.text = "Pause all tasks"
+                        _gpb_mode["current"] = "pause"
+            elif _has_sync_queued or _has_gpu_queued:
+                if _gpb_mode["current"] != "start":
+                    _gpb_btn.config(text="\u25B6", command=_global_start_all,
+                                    state="normal", style="GpbPlay.TButton")
+                    _gpb_tooltip.text = "Start all tasks"
+                    _gpb_mode["current"] = "start"
+            else:
+                if _gpb_mode["current"] != "disabled":
+                    _gpb_btn.config(text="\u23F8", state="disabled", style="GpbPause.TButton")
+                    _gpb_tooltip.text = "No tasks"
+                    _gpb_mode["current"] = "disabled"
+        except Exception:
+            pass
+    try:
+        _ui_queue.append(_do)
+    except Exception:
+        pass
+
+
 def _clear_all_logs():
     global _log_at_bottom, _log_user_scrolled
     log_box.config(state="normal")
@@ -15728,7 +15843,7 @@ def _show_clear_log_if_needed():
             return
         content = log_box.get("1.0", "end-1c").strip()
         if content and not clear_log_btn.winfo_ismapped():
-            clear_log_btn.pack(side="left", padx=(6, 0), after=sync_btn)
+            clear_log_btn.pack(side="left", padx=(6, 0), after=_gpb_btn)
         elif not content and clear_log_btn.winfo_ismapped():
             clear_log_btn.pack_forget()
     except Exception:
@@ -16462,6 +16577,7 @@ def _show_queue_menu(event=None):
                                               activebackground="#3a5e84")
                         except Exception:
                             pass
+                        _update_global_pause_btn_sync()
                     if pause_event.is_set():
                         _sync_pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
@@ -16725,6 +16841,7 @@ def _update_queue_btn():
                 _sync_blink_start()
             elif not _is_running and _sync_blink["active"]:
                 _sync_blink_stop()
+            _update_global_pause_btn_sync()
         except Exception:
             pass
     try:
@@ -16883,6 +17000,7 @@ def _update_gpu_btn():
                 _gpu_blink_start()
             elif not _gpu_running and _gpu_blink["active"]:
                 _gpu_blink_stop()
+            _update_global_pause_btn_sync()
         except Exception:
             pass
     try:
@@ -17251,6 +17369,7 @@ def _show_gpu_menu(event=None):
                                               activebackground="#3a5e84")
                         except Exception:
                             pass
+                        _update_global_pause_btn_sync()
                     if _gpu_pause.is_set():
                         _pr_btn = tk.Button(btn_row, text="\u25B6 Resume", bg="#3a6a3a", fg="#cccccc",
                                   activebackground="#4a8a4a", activeforeground="#cccccc",
@@ -27266,7 +27385,11 @@ def run_startup_updates():
 
         # Enable sync button now that startup is complete
         if _root_alive:
-            _ui_queue.append(lambda: sync_btn.config(state="normal"))
+            def _enable_sync_btns():
+                sync_btn.config(state="normal")
+                _gpb_mode["ready"] = True
+                _update_global_pause_btn_sync()
+            _ui_queue.append(_enable_sync_btns)
 
         # Auto-resume any redownload jobs that were restored from the previous session
         with _redownload_queue_lock:

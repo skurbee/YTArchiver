@@ -3418,7 +3418,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:21pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:28pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19888,8 +19888,12 @@ class _TranscriptionPanel(ttk.Frame):
         vf = tk.Frame(right, bg=self._TP_BG)
         vf.pack(fill="both", expand=True)
 
+        # Container for transcript-related widgets (swapped with grid frame)
+        self._transcript_container = tk.Frame(vf, bg=self._TP_BG)
+        self._transcript_container.pack(fill="both", expand=True)
+
         # Thumbnail area — hidden by default, shown when metadata exists
-        self._browse_thumb_frame = tk.Frame(vf, bg="#0e0f11", height=0)
+        self._browse_thumb_frame = tk.Frame(self._transcript_container, bg="#0e0f11", height=0)
         self._browse_thumb_frame.pack(fill="x")
         self._browse_thumb_frame.pack_propagate(False)
         self._browse_thumb_label = tk.Label(self._browse_thumb_frame, bg="#0e0f11",
@@ -19900,11 +19904,11 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_thumb_visible = False
 
         # Transcript viewer
-        self._browse_viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG,
+        self._browse_viewer = tk.Text(self._transcript_container, bg="#1a1c1f", fg=self._TP_FG,
                                        font=("Segoe UI", 10), wrap="word",
                                        relief="flat", padx=12, pady=10,
                                        state="disabled", cursor="arrow")
-        bvsb = ttk.Scrollbar(vf, orient="vertical", command=self._browse_viewer.yview)
+        bvsb = ttk.Scrollbar(self._transcript_container, orient="vertical", command=self._browse_viewer.yview)
         self._browse_viewer.configure(yscrollcommand=bvsb.set)
         self._browse_viewer.tag_configure("header", foreground=self._TP_ACCENT,
                                           font=("Segoe UI", 10, "bold"))
@@ -19918,7 +19922,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._current_metadata_entry = None  # currently loaded metadata dict
 
         # Pull-up metadata drawer — overlays transcript from bottom
-        self._browse_drawer_frame = tk.Frame(vf, bg="#141618", relief="flat")
+        self._browse_drawer_frame = tk.Frame(self._transcript_container, bg="#141618", relief="flat")
         self._browse_drawer_visible = False
         self._browse_drawer_height = 0  # current height in px
         # Drawer handle bar (clickable to toggle)
@@ -21356,16 +21360,13 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _show_grid(self, channel, year=None, month=None):
         """Show the video grid for a folder scope. Hides the transcript viewer."""
-        self._grid_scope = (channel, year, month)
-        # Hide transcript-related widgets
-        self._browse_thumb_frame.pack_forget()
-        self._browse_viewer.pack_forget()
-        # Find and hide the scrollbar (it's packed in vf)
-        for w in self._vf.winfo_children():
-            if isinstance(w, ttk.Scrollbar) and w != self._grid_scrollbar:
-                w.pack_forget()
-        self._browse_drawer_frame.place_forget()
-        # Show grid
+        _new_scope = (channel, year, month)
+        # Skip reload if already showing this exact scope
+        if self._grid_visible and self._grid_scope == _new_scope and self._grid_videos:
+            return
+        self._grid_scope = _new_scope
+        # Swap: hide transcript container, show grid
+        self._transcript_container.pack_forget()
         if not self._grid_visible:
             self._grid_frame.pack(fill="both", expand=True)
             self._grid_visible = True
@@ -21391,14 +21392,8 @@ class _TranscriptionPanel(ttk.Frame):
             return
         self._grid_frame.pack_forget()
         self._grid_visible = False
-        # Restore transcript widgets
-        self._browse_thumb_frame.pack(fill="x", before=self._browse_viewer)
-        # Re-pack scrollbar and viewer
-        for w in self._vf.winfo_children():
-            if isinstance(w, ttk.Scrollbar) and w != self._grid_scrollbar:
-                w.pack(side="right", fill="y")
-                break
-        self._browse_viewer.pack(fill="both", expand=True)
+        # Restore transcript container
+        self._transcript_container.pack(fill="both", expand=True)
 
     def _grid_load_videos(self, channel, year, month):
         """Background: query videos and metadata for the grid."""

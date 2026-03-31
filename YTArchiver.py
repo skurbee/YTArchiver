@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.5"
+APP_VERSION = "v29.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2373,7 +2373,7 @@ def _save_disk_cache():
 
 
 def _scan_channel_disk_info(ch):
-    """Walk a channel's folder and return (num_vids, total_bytes, has_transcripts).
+    """Walk a channel's folder and return (num_vids, total_bytes, has_transcripts, has_metadata).
 
     Only counts files with recognised video/audio extensions that are not
     partial downloads or temporary encode outputs.  Also registers every video
@@ -2386,6 +2386,7 @@ def _scan_channel_disk_info(ch):
     _num_vids = 0
     _ch_bytes = 0
     _has_transcripts = False
+    _has_metadata = False
     _dirs_with_tx = set()  # directories containing transcript files
     _video_files = []      # (filepath, title, size, dirpath) for browse registration
     try:
@@ -2408,6 +2409,8 @@ def _scan_channel_disk_info(ch):
                     elif _fn_lower.endswith("transcript.txt") or _fn_lower.endswith(".jsonl"):
                         _has_transcripts = True
                         _dir_has_tx = True
+                    if not _has_metadata and _fn_lower.endswith("metadata.jsonl") and _fn.startswith("."):
+                        _has_metadata = True
                 if _dir_has_tx:
                     _dirs_with_tx.add(_dp)
     except Exception:
@@ -2464,7 +2467,7 @@ def _scan_channel_disk_info(ch):
         except Exception:
             pass
 
-    return _num_vids, _ch_bytes, _has_transcripts
+    return _num_vids, _ch_bytes, _has_transcripts, _has_metadata
 
 
 def _channel_has_transcripts(ch):
@@ -2492,7 +2495,7 @@ def _update_disk_cache_for_channel(ch):
     _url = ch.get("url", "")
     if not _url:
         return
-    _nv, _nb, _has_tx = _scan_channel_disk_info(ch)
+    _nv, _nb, _has_tx, _has_meta = _scan_channel_disk_info(ch)
     # Canonical lock order: config_lock first, then _disk_cache_lock
     with config_lock:
         _tx_complete_snap = ch.get("transcription_complete", False)
@@ -2500,6 +2503,7 @@ def _update_disk_cache_for_channel(ch):
             _disk_cache[_url] = {
                 "num_vids": _nv,
                 "size_bytes": _nb,
+                "has_metadata": _has_meta,
                 "last_updated": time.time(),
             }
     _save_disk_cache()
@@ -3431,7 +3435,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 11:01am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 11:23am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3958,7 +3962,7 @@ chan_scrollbar = ttk.Scrollbar(chan_list_frame, orient="vertical")
 chan_scrollbar.grid(row=0, column=1, sticky="ns")
 
 settings_chan_tree = ttk.Treeview(chan_list_frame, style="Recent.Treeview",
-                                  columns=("folder", "res", "min", "max", "compress", "transcribed", "last_sync", "num_vids", "size_on_disk", "url"),
+                                  columns=("folder", "res", "min", "max", "compress", "transcribed", "metadata", "last_sync", "num_vids", "size_on_disk", "url"),
                                   show="headings", selectmode="browse",
                                   yscrollcommand=chan_scrollbar.set)
 settings_chan_tree.grid(row=0, column=0, sticky="nsew")
@@ -3970,6 +3974,7 @@ _CHAN_COL_LABELS = {
     "min": "Min",
     "max": "Max",
     "transcribed": "Transcribed",
+    "metadata": "Metadata",
     "last_sync": "Last Sync",
     "num_vids": "# Vids",
     "size_on_disk": "Size",
@@ -4062,6 +4067,8 @@ settings_chan_tree.heading("max", text="Max", anchor="w", command=lambda: _sort_
 settings_chan_tree.heading("compress", text="Compress", anchor="center")
 settings_chan_tree.heading("transcribed", text="Transcribed", anchor="w",
                            command=lambda: _sort_chan_tree("transcribed", False))
+settings_chan_tree.heading("metadata", text="Metadata", anchor="w",
+                           command=lambda: _sort_chan_tree("metadata", False))
 settings_chan_tree.heading("last_sync", text="Last Sync", anchor="w",
                            command=lambda: _sort_chan_tree("last_sync", False))
 settings_chan_tree.heading("num_vids", text="# Vids", anchor="e",
@@ -4076,6 +4083,7 @@ settings_chan_tree.column("min", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("max", stretch=False, width=45, anchor="w")
 settings_chan_tree.column("compress", stretch=False, width=65, anchor="center")
 settings_chan_tree.column("transcribed", stretch=False, width=85, anchor="w")
+settings_chan_tree.column("metadata", stretch=False, width=75, anchor="w")
 settings_chan_tree.column("last_sync", stretch=False, width=100, anchor="w")
 settings_chan_tree.column("num_vids", stretch=False, width=55, anchor="e")
 settings_chan_tree.column("size_on_disk", stretch=False, width=82, anchor="e")
@@ -4401,6 +4409,8 @@ def refresh_channel_dropdowns():
             _tq_urls = {q[1] for q in _transcribe_queue}
         with _disk_cache_lock:
             _disk_cache_snap = dict(_disk_cache)
+        with _metadata_queue_lock:
+            _mq_ch_names = {q["ch_name"] for q in _metadata_queue}
 
         # Build new row data
         new_rows = []
@@ -4467,6 +4477,23 @@ def refresh_channel_dropdowns():
             else:
                 trans_str = "—"
 
+            # Metadata status column
+            _ch_name_m = c.get("name", "")
+            auto_m = c.get("auto_metadata", False)
+            _is_running_m = _metadata_running and _current_job.get("_metadata_key", "").startswith(f"metadata:{_ch_name_m}:")
+            _is_queued_m = _ch_name_m in _mq_ch_names
+            _has_meta = _disk_cache_snap.get(ch_url_t, {}).get("has_metadata", False) if ch_url_t else False
+            if _is_running_m:
+                meta_str = "Running"
+            elif _is_queued_m:
+                meta_str = "Queued"
+            elif _has_meta:
+                meta_str = "✓ Done" if auto_m else "✓"
+            elif auto_m:
+                meta_str = "✓ Auto"
+            else:
+                meta_str = "—"
+
             # Look up # of vids and size on disk from the cache (populated by
             # background scan after startup, or by per-channel rescan after actions).
             # Shows "—" when no entry exists yet (scan still pending).
@@ -4491,7 +4518,7 @@ def refresh_channel_dropdowns():
             else:
                 size_str = "—"
 
-            new_rows.append((name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, ls_str, num_vids_str, size_str, c['url']))
+            new_rows.append((name_col, display_res, dur_str, maxdur_str, compress_str, trans_str, meta_str, ls_str, num_vids_str, size_str, c['url']))
 
         # Incremental update: reuse existing tree items instead of delete-all + reinsert
         existing_iids = settings_chan_tree.get_children('')
@@ -4643,7 +4670,7 @@ def on_channel_double_click(event):
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][9]
+    target_url = item['values'][10]
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -4741,7 +4768,7 @@ def _chan_ctx_sync_now():
         return
     # Match the channel in the treeview to visually select it before syncing
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][9] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][10] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -5013,6 +5040,24 @@ def _chan_ctx_transcribe():
 
 _chan_ctx_menu.add_command(label="Transcribe Channel", command=_chan_ctx_transcribe)
 
+
+def _chan_ctx_download_metadata():
+    """Right-click → Download Metadata for the selected channel."""
+    ch = _ctx_channel["ch"]
+    if not ch:
+        return
+    folder = _chan_ctx_get_folder()
+    if not folder:
+        return
+    ch_name = ch["name"]
+    ch_url = ch["url"]
+    sy = ch.get("split_years", False)
+    sm = ch.get("split_months", False)
+    _add_to_metadata_queue(ch_name, ch_url, folder, sy, sm, None, None, ch_name)
+
+
+_chan_ctx_menu.add_command(label="Download Metadata", command=_chan_ctx_download_metadata)
+
 _chan_ctx_menu.add_separator()
 
 
@@ -5025,7 +5070,7 @@ def _chan_ctx_remove():
         return
     # Select the channel in the tree so remove_channel() can find it
     for item in settings_chan_tree.get_children():
-        if settings_chan_tree.item(item)['values'][9] == ch["url"]:
+        if settings_chan_tree.item(item)['values'][10] == ch["url"]:
             settings_chan_tree.selection_set(item)
             on_chan_list_select(None)
             break
@@ -5040,7 +5085,7 @@ def _chan_ctx_show(event):
     if row:
         settings_chan_tree.selection_set(row)
         on_chan_list_select(None)
-        target_url = settings_chan_tree.item(row)['values'][9]
+        target_url = settings_chan_tree.item(row)['values'][10]
         with config_lock:
             for c in config.get("channels", []):
                 if c["url"] == target_url:
@@ -5056,7 +5101,7 @@ def _chan_ctx_show(event):
 
         # Menu indices: 0=Sync, 1=Edit, 2=Open folder, 3=Open URL, 4=separator,
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
-        #               10=separator, 11=Transcribe, 12=separator, 13=Remove
+        #               10=separator, 11=Transcribe, 12=Download Metadata, 13=separator, 14=Remove
         # Dynamic label: show "Add to Sync List" when a sync/reorg is running
         if _sync_running or _reorg_running or _redownload_running:
             # Check if this channel is already queued or actively syncing
@@ -5129,6 +5174,36 @@ def _chan_ctx_show(event):
                                       command=_chan_ctx_transcribe)
             try:
                 _chan_ctx_menu.entryconfig(11, activeforeground=C_TEXT)
+            except Exception:
+                pass
+
+        # Download Metadata menu item (index 12)
+        _ch_name_m = ch.get("name", "")
+        _is_running_meta = _metadata_running and _current_job.get("_metadata_key", "").startswith(f"metadata:{_ch_name_m}:")
+        with _metadata_queue_lock:
+            _already_queued_meta = any(q["ch_name"] == _ch_name_m for q in _metadata_queue)
+        if _is_running_meta:
+            _chan_ctx_menu.entryconfig(12, label="Downloading Metadata...",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
+            try:
+                _chan_ctx_menu.entryconfig(12, activeforeground=C_DIM)
+            except Exception:
+                pass
+        elif _already_queued_meta:
+            _chan_ctx_menu.entryconfig(12, label="Already queued",
+                                      state="normal", foreground=C_DIM,
+                                      command=lambda: None)
+            try:
+                _chan_ctx_menu.entryconfig(12, activeforeground=C_DIM)
+            except Exception:
+                pass
+        else:
+            _chan_ctx_menu.entryconfig(12, label="Download Metadata",
+                                      state="normal", foreground=C_TEXT,
+                                      command=_chan_ctx_download_metadata)
+            try:
+                _chan_ctx_menu.entryconfig(12, activeforeground=C_TEXT)
             except Exception:
                 pass
 
@@ -5389,7 +5464,7 @@ def sync_single_channel():
     if not sel:
         return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][9]
+    target_url = item['values'][10]
 
     with config_lock:
         ch = None
@@ -6015,7 +6090,7 @@ def _process_sync_queue():
         try:
             _found = False
             for item in settings_chan_tree.get_children():
-                if settings_chan_tree.item(item)['values'][9] == next_ch["url"]:
+                if settings_chan_tree.item(item)['values'][10] == next_ch["url"]:
                     settings_chan_tree.selection_set(item)
                     on_chan_list_select(None)
                     _found = True
@@ -6146,7 +6221,7 @@ def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
     item = settings_chan_tree.item(sel[0])
-    target_url = item['values'][9]
+    target_url = item['values'][10]
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -6946,6 +7021,33 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                                                    trust_mtime=recheck_dates)
             if success and ch_url:
                 _chan_ctx_update_split(ch_url, target_years, target_months)
+                # Update browse DB: delete stale rows for this channel, then rescan
+                # so filepaths reflect the new directory structure.
+                tp = _tp_panel_ref[0]
+                if tp:
+                    if not tp._conn:
+                        try:
+                            tp._conn = _tp_open_db(_TP_DB_PATH)
+                        except Exception:
+                            pass
+                    if tp._conn:
+                        try:
+                            tp._db_execute("DELETE FROM videos WHERE channel=?", (channel_name,))
+                            tp._db_commit()
+                        except Exception:
+                            pass
+                # Rescan disk — re-registers videos at their new paths
+                with config_lock:
+                    _ch_cfg = None
+                    for _c in config.get("channels", []):
+                        if _c.get("url") == ch_url:
+                            _ch_cfg = _c
+                            break
+                if _ch_cfg:
+                    _update_disk_cache_for_channel(_ch_cfg)
+                # Refresh browse tree on the UI thread
+                if tp:
+                    _ui_queue.append(lambda: tp._refresh_browse())
         finally:
             with _reorg_queue_lock:
                 _reorg_running = False

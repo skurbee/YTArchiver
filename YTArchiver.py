@@ -3418,7 +3418,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:28pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:56pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19970,9 +19970,9 @@ class _TranscriptionPanel(ttk.Frame):
         # Sort dropdown
         tk.Label(self._grid_header, text="Sort:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 8)).pack(side="right", padx=(8, 4))
-        self._grid_sort_var = tk.StringVar(value="Date")
+        self._grid_sort_var = tk.StringVar(value="Newest")
         self._grid_sort_menu = tk.OptionMenu(
-            self._grid_header, self._grid_sort_var, "Date", "Views",
+            self._grid_header, self._grid_sort_var, "Newest", "Oldest", "Most Viewed",
             command=lambda _: self._grid_resort())
         self._grid_sort_menu.config(bg="#3a3a3a", fg=self._TP_FG, activebackground="#555",
                                      activeforeground=self._TP_FG, relief="flat", bd=0,
@@ -20019,6 +20019,9 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_cards = []        # card widget refs
         self._grid_scope = None      # (channel, year, month) for current grid
         self._grid_last_width = 0
+        self._grid_loaded_count = 0
+        self._grid_cols = 0
+        self._grid_cache = {}        # scope -> {"videos": [...], "photos": {...}, "has_metadata": bool}
         self._vf = vf                # reference to the viewer frame
 
         pane.add(right, minsize=300)
@@ -20097,50 +20100,76 @@ class _TranscriptionPanel(ttk.Frame):
         return False, False
 
     def _populate_browse_children(self, iid, meta):
-        """Load the next level of children for a browse tree node."""
+        """Load the next level of children for a browse tree node.
+        DB queries run in a background thread to avoid freezing the UI."""
         tree = self._browse_tree
         if meta["type"] == "channel":
             ch = meta["channel"]
             split_years, split_months = self._get_channel_org(ch)
             if not split_years:
-                # No folder org — show flat list of all titles
                 self._populate_browse_titles(iid, ch, None, None)
                 return
-            try:
-                years = self._db_execute(
-                    "SELECT DISTINCT year FROM videos WHERE channel=? AND year IS NOT NULL "
-                    "ORDER BY year", (ch,)).fetchall()
-            except Exception:
-                return
-            if not years:
-                self._populate_browse_titles(iid, ch, None, None)
-                return
-            for (yr,) in years:
-                yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
-                self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr,
-                                               "split_months": split_months}
-                tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+            # Show placeholder while loading
+            _load_iid = tree.insert(iid, "end", text="  Loading...",
+                                     tags=(self._BROWSE_PLACEHOLDER,))
+            def _query_years():
+                try:
+                    years = self._db_execute(
+                        "SELECT DISTINCT year FROM videos WHERE channel=? AND year IS NOT NULL "
+                        "ORDER BY year", (ch,)).fetchall()
+                except Exception:
+                    years = []
+                def _apply():
+                    if not tree.exists(iid):
+                        return
+                    try:
+                        tree.delete(_load_iid)
+                    except Exception:
+                        pass
+                    if not years:
+                        self._populate_browse_titles(iid, ch, None, None)
+                        return
+                    for (yr,) in years:
+                        yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
+                        self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr,
+                                                       "split_months": split_months}
+                        tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                self.after(0, _apply)
+            threading.Thread(target=_query_years, daemon=True).start()
+
         elif meta["type"] == "year":
             ch, yr = meta["channel"], meta["year"]
             if not meta.get("split_months", False):
-                # Year folders only, no month subfolders — show titles directly
                 self._populate_browse_titles(iid, ch, yr, None)
                 return
-            try:
-                months = self._db_execute(
-                    "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "
-                    "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
-            except Exception:
-                return
-            if months and len(months) > 1:
-                for (mo,) in months:
-                    mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
-                    mo_iid = tree.insert(iid, "end", text=f"📄  {mo_name}", open=False)
-                    self._browse_items[mo_iid] = {
-                        "type": "month", "channel": ch, "year": yr, "month": mo}
-                    tree.insert(mo_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
-            else:
-                self._populate_browse_titles(iid, ch, yr, None)
+            _load_iid = tree.insert(iid, "end", text="  Loading...",
+                                     tags=(self._BROWSE_PLACEHOLDER,))
+            def _query_months():
+                try:
+                    months = self._db_execute(
+                        "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "
+                        "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
+                except Exception:
+                    months = []
+                def _apply():
+                    if not tree.exists(iid):
+                        return
+                    try:
+                        tree.delete(_load_iid)
+                    except Exception:
+                        pass
+                    if months and len(months) > 1:
+                        for (mo,) in months:
+                            mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
+                            mo_iid = tree.insert(iid, "end", text=f"📄  {mo_name}", open=False)
+                            self._browse_items[mo_iid] = {
+                                "type": "month", "channel": ch, "year": yr, "month": mo}
+                            tree.insert(mo_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                    else:
+                        self._populate_browse_titles(iid, ch, yr, None)
+                self.after(0, _apply)
+            threading.Thread(target=_query_months, daemon=True).start()
+
         elif meta["type"] == "month":
             self._populate_browse_titles(iid, meta["channel"], meta["year"], meta["month"])
 
@@ -20621,8 +20650,6 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_seg_map = seg_map
 
         self._browse_viewer.config(state="disabled")
-        # Force a single geometry pass then scroll — prevents resize recalc lag
-        self._browse_viewer.update_idletasks()
         self._browse_viewer.yview_moveto(0)
 
         # Load metadata (thumbnail + drawer) in background if available
@@ -21154,14 +21181,12 @@ class _TranscriptionPanel(ttk.Frame):
         except ImportError:
             return  # Pillow not available
 
-        def _load_and_show():
+        def _load_bg():
             try:
                 img = Image.open(thumb_path)
-                # Scale to fit width of viewer, max height 280px
                 vf_width = self._browse_viewer.winfo_width()
                 if vf_width < 100:
                     vf_width = 600
-                # Maintain aspect ratio
                 aspect = img.width / img.height
                 target_w = min(vf_width - 24, img.width)
                 target_h = int(target_w / aspect)
@@ -21170,15 +21195,19 @@ class _TranscriptionPanel(ttk.Frame):
                     target_w = int(target_h * aspect)
                 img = img.resize((target_w, target_h), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
-                self._browse_thumb_photo = photo
-                self._browse_thumb_label.config(image=photo)
-                self._browse_thumb_frame.config(height=target_h + 12)
-                self._browse_thumb_visible = True
+                def _apply():
+                    try:
+                        self._browse_thumb_photo = photo
+                        self._browse_thumb_label.config(image=photo)
+                        self._browse_thumb_frame.config(height=target_h + 12)
+                        self._browse_thumb_visible = True
+                    except Exception:
+                        pass
+                self.after(0, _apply)
             except Exception:
-                self._hide_browse_thumbnail()
+                pass
 
-        # Run on main thread
-        self.after(0, _load_and_show)
+        threading.Thread(target=_load_bg, daemon=True).start()
 
     def _hide_browse_thumbnail(self):
         """Hide the thumbnail display."""
@@ -21364,7 +21393,15 @@ class _TranscriptionPanel(ttk.Frame):
         # Skip reload if already showing this exact scope
         if self._grid_visible and self._grid_scope == _new_scope and self._grid_videos:
             return
+        # Save current grid's photos to cache before switching
+        if self._grid_scope and self._grid_videos and self._grid_scope in self._grid_cache:
+            self._grid_cache[self._grid_scope]["photos"].update(self._grid_photos)
         self._grid_scope = _new_scope
+        # Bump generation counter to discard stale background results
+        if not hasattr(self, '_grid_gen'):
+            self._grid_gen = 0
+        self._grid_gen += 1
+        _gen = self._grid_gen
         # Swap: hide transcript container, show grid
         self._transcript_container.pack_forget()
         if not self._grid_visible:
@@ -21379,12 +21416,35 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_title_lbl.config(text=f"{scope}")
         self._browse_viewer_title.config(text=scope)
         self._browse_path_label.config(text="")
-        # Disable play/actions buttons (no single video selected)
         self._browse_play_btn.config(state="disabled")
         self._browse_actions_btn.config(state="disabled")
+        # Check cache — instant restore if we've loaded this scope before
+        cached = self._grid_cache.get(_new_scope)
+        if cached:
+            self._grid_videos = cached["videos"]
+            self._grid_photos = dict(cached["photos"])  # copy so we don't mutate cache
+            for w in self._grid_inner.winfo_children():
+                w.destroy()
+            self._grid_cards.clear()
+            has_meta = cached.get("has_metadata", False)
+            if not has_meta:
+                self._grid_meta_banner.pack(fill="x", after=self._grid_header)
+            else:
+                self._grid_meta_banner.pack_forget()
+            self._grid_build_cards()
+            return
+        # No cache — show loading state immediately, clear old cards
+        for w in self._grid_inner.winfo_children():
+            w.destroy()
+        self._grid_cards.clear()
+        self._grid_photos.clear()
+        self._grid_videos = []
+        self._grid_meta_banner.pack_forget()
+        tk.Label(self._grid_inner, text="Loading...", bg=self._TP_BG,
+                 fg=self._TP_DIM, font=("Segoe UI", 11)).pack(pady=40)
         # Load videos in background
         threading.Thread(target=self._grid_load_videos,
-                         args=(channel, year, month), daemon=True).start()
+                         args=(channel, year, month, _gen), daemon=True).start()
 
     def _hide_grid(self):
         """Hide the video grid and restore the transcript viewer."""
@@ -21395,10 +21455,12 @@ class _TranscriptionPanel(ttk.Frame):
         # Restore transcript container
         self._transcript_container.pack(fill="both", expand=True)
 
-    def _grid_load_videos(self, channel, year, month):
+    def _grid_load_videos(self, channel, year, month, gen=0):
         """Background: query videos and metadata for the grid."""
         if not self._conn:
             return
+        if gen != self._grid_gen:
+            return  # stale request
         sql = "SELECT title, filepath, video_id, tx_status FROM videos WHERE channel=?"
         params = [channel]
         if year is not None:
@@ -21411,22 +21473,17 @@ class _TranscriptionPanel(ttk.Frame):
             rows = self._db_execute(sql, params).fetchall()
         except Exception:
             return
+        if gen != self._grid_gen:
+            return
 
-        # Get file mtimes for date sorting
+        # Build video dicts — defer mtime lookups to keep this fast
         import datetime as _dt
         videos = []
         for title, filepath, video_id, tx_status in rows:
-            mtime = 0.0
-            if filepath:
-                try:
-                    mtime = os.path.getmtime(filepath)
-                except OSError:
-                    pass
             videos.append({
                 "title": title, "filepath": filepath,
                 "video_id": video_id, "tx_status": tx_status,
-                "mtime": mtime,
-                "date_str": _dt.datetime.fromtimestamp(mtime).strftime("%b %d, %Y") if mtime else "",
+                "mtime": 0.0, "date_str": "",
             })
 
         # Load metadata if available
@@ -21454,6 +21511,9 @@ class _TranscriptionPanel(ttk.Frame):
             if not os.path.isdir(thumb_dir):
                 thumb_dir = None
 
+        if gen != self._grid_gen:
+            return
+
         # Enrich videos with metadata
         for v in videos:
             m = metadata.get(v["video_id"]) if v["video_id"] else None
@@ -21461,31 +21521,57 @@ class _TranscriptionPanel(ttk.Frame):
             v["like_count"] = m.get("like_count", 0) if m else 0
             v["duration"] = m.get("duration", 0) if m else 0
             v["upload_date"] = m.get("upload_date", "") if m else ""
-            if m and m.get("upload_date") and not v["date_str"]:
+            if m and m.get("upload_date"):
                 try:
                     _ud = m["upload_date"]
-                    v["date_str"] = f"{_ud[4:6]}/{_ud[6:8]}/{_ud[:4]}"
+                    v["date_str"] = f"{_TP_MONTH_NAMES[int(_ud[4:6]) - 1].split(' ', 1)[1].capitalize()} {int(_ud[6:8]):02d}, {_ud[:4]}" if len(_ud) == 8 else ""
                 except Exception:
+                    v["date_str"] = ""
+
+        # Fetch mtimes only for the first page (fast enough for 30 files)
+        _page_size = self._GRID_PAGE_SIZE
+        for v in videos[:_page_size]:
+            if not v["date_str"] and v["filepath"]:
+                try:
+                    mt = os.path.getmtime(v["filepath"])
+                    v["mtime"] = mt
+                    v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
+                except OSError:
                     pass
 
-        # Sort by date (newest first) by default
-        videos.sort(key=lambda x: x["mtime"], reverse=True)
+        # Sort: prefer metadata upload_date, fall back to mtime
+        def _sort_key(v):
+            if v["upload_date"]:
+                return v["upload_date"]
+            if v["mtime"]:
+                return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
+            return "00000000"
+        videos.sort(key=_sort_key, reverse=True)
 
-        # Find thumbnail paths
+        # Find thumbnail paths — listdir once, build lookup
+        _thumb_files = {}
+        if thumb_dir and os.path.isdir(thumb_dir):
+            try:
+                for fn in os.listdir(thumb_dir):
+                    _b = fn.rfind("[")
+                    _e = fn.rfind("]")
+                    if _b >= 0 and _e > _b:
+                        _thumb_files[fn[_b + 1:_e]] = os.path.join(thumb_dir, fn)
+            except OSError:
+                pass
+        if gen != self._grid_gen:
+            return
         for v in videos:
-            v["thumb_path"] = None
-            if thumb_dir and v["video_id"]:
-                for fn in os.listdir(thumb_dir) if os.path.isdir(thumb_dir) else []:
-                    if f"[{v['video_id']}]" in fn:
-                        v["thumb_path"] = os.path.join(thumb_dir, fn)
-                        break
+            v["thumb_path"] = _thumb_files.get(v["video_id"]) if v["video_id"] else None
 
         self._grid_videos = videos
-        self.after(0, lambda: self._grid_render(has_metadata, channel, year, month))
+        self.after(0, lambda: self._grid_render(has_metadata, channel, year, month, gen))
 
-    def _grid_render(self, has_metadata, channel, year, month):
+    def _grid_render(self, has_metadata, channel, year, month, gen=0):
         """Render the video grid on the main thread."""
         # Check scope hasn't changed while loading
+        if gen and gen != self._grid_gen:
+            return
         if self._grid_scope != (channel, year, month):
             return
 
@@ -21507,15 +21593,27 @@ class _TranscriptionPanel(ttk.Frame):
                      font=("Segoe UI", 11)).pack(pady=40)
             return
 
+        # Cache this scope's data for instant restore later
+        _scope = (channel, year, month)
+        self._grid_cache[_scope] = {
+            "videos": self._grid_videos,
+            "photos": {},  # will be populated as thumbnails load
+            "has_metadata": has_metadata,
+        }
         self._grid_build_cards()
 
-    def _grid_build_cards(self):
-        """Build video cards in the grid inner frame using grid layout."""
-        # Clear existing
-        for w in self._grid_inner.winfo_children():
-            w.destroy()
-        self._grid_cards.clear()
-        self._grid_photos.clear()
+    _GRID_PAGE_SIZE = 30  # videos per page
+
+    def _grid_build_cards(self, reset=True):
+        """Build video cards in the grid inner frame using grid layout.
+        If reset=True, clears and starts from the beginning.
+        If reset=False, appends the next page of cards."""
+        if reset:
+            for w in self._grid_inner.winfo_children():
+                w.destroy()
+            self._grid_cards.clear()
+            self._grid_photos.clear()
+            self._grid_loaded_count = 0
 
         canvas_w = self._grid_canvas.winfo_width()
         if canvas_w < 50:
@@ -21529,8 +21627,8 @@ class _TranscriptionPanel(ttk.Frame):
         if card_w < 150:
             card_w = 150
         thumb_h = int(card_w * 9 / 16)
+        self._grid_cols = cols
 
-        # Configure grid columns with equal weight
         for c in range(cols):
             self._grid_inner.columnconfigure(c, weight=1, uniform="card")
 
@@ -21540,33 +21638,50 @@ class _TranscriptionPanel(ttk.Frame):
         except ImportError:
             _has_pil = False
 
-        # Pre-generate a 1x1 transparent image for pixel-sized labels
-        if _has_pil:
+        if "__pixel__" not in self._grid_photos and _has_pil:
             _pixel = ImageTk.PhotoImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
             self._grid_photos["__pixel__"] = _pixel
-        else:
-            _pixel = None
+        _pixel = self._grid_photos.get("__pixel__")
 
         def _mw(e):
             self._grid_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            self._grid_check_scroll_bottom()
 
-        for i, v in enumerate(self._grid_videos):
+        start = self._grid_loaded_count
+        end = min(start + self._GRID_PAGE_SIZE, len(self._grid_videos))
+        if start >= end:
+            return  # nothing more to load
+
+        # Lazy-fill mtimes/date_str for this batch if missing
+        import datetime as _dt
+        for v in self._grid_videos[start:end]:
+            if not v["date_str"] and v["filepath"]:
+                try:
+                    mt = os.path.getmtime(v["filepath"])
+                    v["mtime"] = mt
+                    v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
+                except OSError:
+                    pass
+
+        for i in range(start, end):
+            v = self._grid_videos[i]
             row = i // cols
             col = i % cols
 
             card = tk.Frame(self._grid_inner, bg=self._TP_BG2, cursor="hand2")
             card.grid(row=row, column=col, padx=pad // 2, pady=(pad, 0), sticky="new")
 
-            # Thumbnail — use a pixel image to force pixel sizing on the Label
+            # Thumbnail — always start with placeholder, bg thread replaces with real image
             if _pixel:
                 thumb_label = tk.Label(card, bg="#0a0b0d", image=_pixel,
-                                        width=card_w, height=thumb_h, compound="center")
+                                        text="🎬", compound="center",
+                                        fg="#333", font=("Segoe UI", 20),
+                                        width=card_w, height=thumb_h)
             else:
                 thumb_label = tk.Label(card, bg="#0a0b0d", text="🎬",
                                         font=("Segoe UI", 20), fg="#333")
             thumb_label.pack(fill="x")
 
-            # Duration overlay
             if v["duration"]:
                 _dur_m, _dur_s = divmod(int(v["duration"]), 60)
                 _dur_h, _dur_m = divmod(_dur_m, 60)
@@ -21576,7 +21691,6 @@ class _TranscriptionPanel(ttk.Frame):
                 dur_lbl.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-4)
                 dur_lbl.bind("<MouseWheel>", _mw)
 
-            # Info area
             info = tk.Frame(card, bg=self._TP_BG2, padx=6, pady=4)
             info.pack(fill="x")
 
@@ -21606,7 +21720,6 @@ class _TranscriptionPanel(ttk.Frame):
                                       font=("Segoe UI", 7), anchor="w")
                 stats_lbl.pack(fill="x")
 
-            # Click → navigate to video
             _title = v["title"]
             def _click(e, t=_title):
                 self._grid_navigate_to_video(t)
@@ -21617,7 +21730,6 @@ class _TranscriptionPanel(ttk.Frame):
                 w.bind("<Button-1>", _click)
                 w.bind("<MouseWheel>", _mw)
 
-            # Hover
             def _enter(e, c=card, il=info, tl=title_lbl, sl=stats_lbl):
                 _hc = "#252830"
                 c.config(bg=_hc); il.config(bg=_hc); tl.config(bg=_hc)
@@ -21632,59 +21744,91 @@ class _TranscriptionPanel(ttk.Frame):
 
             self._grid_cards.append(card)
 
-            # Show placeholder icon if no thumbnail will be loaded
-            if not v["thumb_path"] or not _has_pil:
-                tk.Label(thumb_label, text="🎬", bg="#0a0b0d", fg="#333",
-                         font=("Segoe UI", 20)).place(relx=0.5, rely=0.5, anchor="center")
-
-            # Load thumbnail in background to avoid lag
             if v["thumb_path"] and _has_pil:
-                _tpath = v["thumb_path"]
-                _tlbl = thumb_label
-                _cw = card_w
-                _th = thumb_h
-                def _load_thumb(path=_tpath, lbl=_tlbl, w=_cw, h=_th, title_key=_title):
-                    try:
-                        img = Image.open(path)
-                        img = img.resize((w, h), Image.LANCZOS)
-                        photo = ImageTk.PhotoImage(img)
-                        def _apply(p=photo, l=lbl, tk=title_key):
-                            try:
-                                l.config(image=p)
-                                self._grid_photos[tk] = p
-                            except Exception:
-                                pass
-                        self.after(0, _apply)
-                    except Exception:
-                        pass
-                threading.Thread(target=_load_thumb, daemon=True).start()
+                # Check if we already have a cached photo for this video
+                _cached_photo = self._grid_photos.get(_title)
+                if _cached_photo:
+                    thumb_label.config(image=_cached_photo, text="")
+                else:
+                    _tpath = v["thumb_path"]
+                    _tlbl = thumb_label
+                    _cw = card_w
+                    _th = thumb_h
+                    def _load_thumb(path=_tpath, lbl=_tlbl, w=_cw, h=_th, title_key=_title):
+                        try:
+                            img = Image.open(path)
+                            img = img.resize((w, h), Image.LANCZOS)
+                            photo = ImageTk.PhotoImage(img)
+                            def _apply(p=photo, l=lbl, tk=title_key, sc=self._grid_scope):
+                                try:
+                                    l.config(image=p, text="")
+                                    self._grid_photos[tk] = p
+                                    if sc in self._grid_cache:
+                                        self._grid_cache[sc]["photos"][tk] = p
+                                except Exception:
+                                    pass
+                            self.after(0, _apply)
+                        except Exception:
+                            pass
+                    threading.Thread(target=_load_thumb, daemon=True).start()
 
-        # Update scroll region
-        self._grid_inner.update_idletasks()
-        self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all"))
-        self._grid_canvas.yview_moveto(0)
+        self._grid_loaded_count = end
+
+        # Update scroll region after layout settles (avoid sync update_idletasks)
+        def _update_scroll():
+            try:
+                bbox = self._grid_canvas.bbox("all")
+                if bbox:
+                    self._grid_canvas.configure(scrollregion=bbox)
+            except Exception:
+                pass
+        self.after(10, _update_scroll)
+        if reset:
+            self._grid_canvas.yview_moveto(0)
+
+    def _grid_check_scroll_bottom(self):
+        """Check if the user scrolled near the bottom and load more cards."""
+        if not self._grid_visible or not self._grid_videos:
+            return
+        if self._grid_loaded_count >= len(self._grid_videos):
+            return  # all loaded
+        # Check scroll position — load more when within 85% of the bottom
+        try:
+            _, y_end = self._grid_canvas.yview()
+            if y_end > 0.85:
+                self._grid_build_cards(reset=False)
+        except Exception:
+            pass
 
     def _on_grid_canvas_resize(self, event):
         """Responsive: rebuild grid when canvas width changes significantly."""
         self._grid_canvas.itemconfig(self._grid_canvas_window, width=event.width)
         if not self._grid_visible or not self._grid_videos:
             return
-        # Only rebuild if column count would change
-        card_w = 220
-        pad = 10
-        new_cols = max(1, (event.width - pad) // (card_w + pad))
-        old_cols = max(1, (self._grid_last_width - pad) // (card_w + pad))
+        pad = 8
+        min_card = 200
+        new_cols = max(1, (event.width - pad) // (min_card + pad))
+        old_cols = getattr(self, '_grid_cols', 0)
         if new_cols != old_cols:
             self._grid_last_width = event.width
             self._grid_build_cards()
 
     def _grid_resort(self):
         """Re-sort the grid based on the current sort selection."""
+        import datetime as _dt
         sort = self._grid_sort_var.get()
-        if sort == "Views":
+        def _date_key(v):
+            if v["upload_date"]:
+                return v["upload_date"]
+            if v["mtime"]:
+                return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
+            return "00000000"
+        if sort == "Most Viewed":
             self._grid_videos.sort(key=lambda x: x["view_count"], reverse=True)
-        else:
-            self._grid_videos.sort(key=lambda x: x["mtime"], reverse=True)
+        elif sort == "Oldest":
+            self._grid_videos.sort(key=_date_key)
+        else:  # Newest
+            self._grid_videos.sort(key=_date_key, reverse=True)
         if self._grid_visible:
             self._grid_build_cards()
 
@@ -25397,6 +25541,8 @@ _ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simp
                  "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using")
 
 
+_mini_log_last_end = [None]  # track last log_box end index to skip if unchanged
+
 def _sync_mini_logs_from_main():
     """Mirror the last 4 lines from the main log_box to both mini logs.
 
@@ -25411,6 +25557,10 @@ def _sync_mini_logs_from_main():
 
         # Get total line count in main log
         end_idx = log_box.index("end-1c")
+        # Fast path: skip if nothing changed since last sync
+        if end_idx == _mini_log_last_end[0]:
+            return
+        _mini_log_last_end[0] = end_idx
         total_lines = int(end_idx.split(".")[0])
         # Empty log check
         if total_lines <= 1 and not log_box.get("1.0", "end-1c").strip():

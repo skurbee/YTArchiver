@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.0"
+APP_VERSION = "v29.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -429,7 +429,12 @@ def _trunc_pad_title(s, width):
 
 
 def _flush_ui_queue():
-    """Process pending UI callbacks on the main thread with a time budget."""
+    """Process pending UI callbacks on the main thread with a time budget.
+
+    Adaptive scheduling: 4ms when draining work (near-instant response),
+    250ms when idle (low overhead).  Old behaviour was a fixed 100ms tick.
+    """
+    _had_work = False
     try:
         # Drop oldest entries if queue grows too large (prevents unbounded memory growth).
         # Preserve callbacks tagged as important (e.g. refresh_recent_list, refresh_channel_dropdowns)
@@ -445,10 +450,8 @@ def _flush_ui_queue():
             if _fname not in ('<lambda>', '<listcomp>', '_write') and _fname:
                 break
             _ui_queue.popleft()
-        if not _ui_queue:
-            # Queue empty — skip processing, just reschedule
-            pass
-        else:
+        if _ui_queue:
+            _had_work = True
             deadline = time.monotonic() + 0.012  # 12ms budget per tick
             while time.monotonic() < deadline:
                 try:
@@ -463,20 +466,29 @@ def _flush_ui_queue():
         pass
     try:
         if root.winfo_exists():
-            root.after(100, _flush_ui_queue)
+            # Adaptive: fast drain when busy (4ms), idle when quiet (250ms)
+            root.after(4 if _had_work or _ui_queue else 250, _flush_ui_queue)
     except Exception:
         pass
 
 
 def _sync_mini_logs_timer():
-    """Sync mini logs on a slow timer instead of per-log-line."""
+    """Sync mini logs on a slow timer instead of per-log-line.
+
+    Adaptive: 250ms when log content changed, 1000ms when idle.
+    """
+    _changed = False
     try:
+        # Peek at log index before syncing to detect if content changed
+        if 'log_box' in globals() and log_box.winfo_exists():
+            _cur = log_box.index("end-1c")
+            _changed = (_cur != _mini_log_last_end[0])
         _sync_mini_logs_from_main()
     except Exception:
         pass
     try:
         if root.winfo_exists():
-            root.after(250, _sync_mini_logs_timer)
+            root.after(250 if _changed else 1000, _sync_mini_logs_timer)
     except Exception:
         pass
 
@@ -3419,7 +3431,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:07pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 11:49pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12822,7 +12834,6 @@ def _continue_redownload():
     """Triggered by the Continue Redownload button in edit mode."""
     # Immediately disable and show feedback so user knows click registered
     continue_redownload_btn.config(state="disabled", text="↻ Queuing…")
-    root.update_idletasks()
 
     ch_url = _editing_channel.get("url") or new_url_var.get().strip()
     ch_name = _editing_channel.get("name") or new_name_var.get().strip()
@@ -16281,8 +16292,7 @@ def _show_queue_menu(event=None):
 
                     _make_drag_bindings(row, lbl, handle)
 
-            inner.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            inner.after(1, lambda: canvas.configure(scrollregion=canvas.bbox("all")))
 
             # Mouse wheel scrolling — popup-level binding to avoid global event interference
             def _on_mousewheel(e):
@@ -17096,8 +17106,7 @@ def _show_gpu_menu(event=None):
 
             _state["widgets"] = _widgets
 
-            inner.update_idletasks()
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            inner.after(1, lambda: canvas.configure(scrollregion=canvas.bbox("all")))
 
             # Use popup-level binding instead of bind_all to avoid global event interference
             def _on_mousewheel(e):
@@ -20059,7 +20068,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_last_width = 0
         self._grid_loaded_count = 0
         self._grid_cols = 0
-        self._grid_cache = {}        # scope -> {"videos": [...], "photos": {...}, "has_metadata": bool}
+        self._grid_cache = collections.OrderedDict()  # scope -> {"videos": [...], "photos": {...}, "has_metadata": bool}  (LRU, max 20 scopes)
+        self._GRID_CACHE_MAX = 20
         self._vf = vf                # reference to the viewer frame
 
         pane.add(right, minsize=300)
@@ -21482,6 +21492,7 @@ class _TranscriptionPanel(ttk.Frame):
         # Check cache — instant restore if we've loaded this scope before
         cached = self._grid_cache.get(_new_scope)
         if cached:
+            self._grid_cache.move_to_end(_new_scope)  # LRU: mark as recently used
             self._grid_videos = cached["videos"]
             self._grid_photos = dict(cached["photos"])  # copy so we don't mutate cache
             for w in self._grid_inner.winfo_children():
@@ -21648,13 +21659,16 @@ class _TranscriptionPanel(ttk.Frame):
                      font=("Segoe UI", 11)).pack(pady=40)
             return
 
-        # Cache this scope's data for instant restore later
+        # Cache this scope's data for instant restore later (LRU eviction at max size)
         _scope = (channel, year, month)
         self._grid_cache[_scope] = {
             "videos": self._grid_videos,
             "photos": {},  # will be populated as thumbnails load
             "has_metadata": has_metadata,
         }
+        # Evict oldest cached scopes when over limit (frees PhotoImage memory)
+        while len(self._grid_cache) > self._GRID_CACHE_MAX:
+            self._grid_cache.popitem(last=False)
         self._grid_build_cards()
 
     _GRID_PAGE_SIZE = 30  # videos per page

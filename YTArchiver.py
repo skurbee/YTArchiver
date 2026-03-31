@@ -3419,7 +3419,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 9:07pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:02pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19661,6 +19661,9 @@ class _TranscriptionPanel(ttk.Frame):
                                      font=("Segoe UI", 7), wraplength=110, justify="left")
         self._stats_label.pack(side="bottom", padx=8, pady=10)
 
+        # Click dead space on sidebar → deselect browse tree
+        sb.bind("<Button-1>", lambda e: self._deselect_browse_tree())
+
         # Content area
         self._content = tk.Frame(self, bg=self._TP_BG)
         self._content.grid(row=0, column=1, sticky="nsew")
@@ -19841,6 +19844,9 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_path_label = tk.Label(hdr, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                            font=("Segoe UI", 9), anchor="e")
         self._browse_path_label.pack(side="right", padx=8, fill="x", expand=True)
+
+        # Click header dead space → deselect browse tree
+        hdr.bind("<Button-1>", lambda e: self._deselect_browse_tree())
 
         # Content pane with nav on left, viewer on right
         pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
@@ -20082,12 +20088,12 @@ class _TranscriptionPanel(ttk.Frame):
         def _query():
             try:
                 channels = self._db_execute(
-                    "SELECT DISTINCT channel FROM videos WHERE channel != '__ver__' ORDER BY channel"
+                    "SELECT DISTINCT channel FROM videos WHERE channel != '__ver__' ORDER BY channel COLLATE NOCASE"
                 ).fetchall()
             except Exception:
                 try:
                     channels = self._db_execute(
-                        "SELECT DISTINCT channel FROM segments ORDER BY channel"
+                        "SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE"
                     ).fetchall()
                 except Exception:
                     return
@@ -20397,6 +20403,18 @@ class _TranscriptionPanel(ttk.Frame):
             else:
                 t_iid = self._browse_tree.insert(parent_iid, "end", text=text)
                 self._browse_items[t_iid] = meta_dict
+
+    def _deselect_browse_tree(self):
+        """Clear the browse tree selection and reset the viewer to its initial state."""
+        self._browse_tree.selection_set([])
+        self._hide_grid()
+        self._browse_viewer_title.config(text="Select a transcription to read")
+        self._browse_viewer.config(state="normal")
+        self._browse_viewer.delete("1.0", "end")
+        self._browse_viewer.config(state="disabled")
+        self._browse_path_label.config(text="")
+        self._browse_play_btn.config(state="disabled")
+        self._browse_actions_btn.config(state="disabled")
 
     def _on_browse_select(self, event=None):
         """When a title node is selected in the browse tree, show its transcription.
@@ -21470,10 +21488,7 @@ class _TranscriptionPanel(ttk.Frame):
                 w.destroy()
             self._grid_cards.clear()
             has_meta = cached.get("has_metadata", False)
-            if not has_meta:
-                self._grid_meta_banner.pack(fill="x", after=self._grid_header)
-            else:
-                self._grid_meta_banner.pack_forget()
+            self._update_meta_banner(has_meta, channel, year, month)
             self._grid_build_cards()
             return
         # No cache — show loading state immediately, clear old cards
@@ -21619,10 +21634,7 @@ class _TranscriptionPanel(ttk.Frame):
             return
 
         # Show/hide metadata banner
-        if not has_metadata:
-            self._grid_meta_banner.pack(fill="x", after=self._grid_header)
-        else:
-            self._grid_meta_banner.pack_forget()
+        self._update_meta_banner(has_metadata, channel, year, month)
 
         # Clear old cards
         for w in self._grid_inner.winfo_children():
@@ -21915,12 +21927,40 @@ class _TranscriptionPanel(ttk.Frame):
                 self._browse_tree.event_generate("<<TreeviewSelect>>")
                 return
 
+    def _is_metadata_queued_or_running(self, channel, year=None, month=None):
+        """Check if a metadata download is queued or running for the given scope."""
+        _key = f"metadata:{channel}:{year}:{month}"
+        with _metadata_queue_lock:
+            if any(q["_key"] == _key for q in _metadata_queue):
+                return True
+        if _metadata_running and _current_job.get("_metadata_key") == _key:
+            return True
+        return False
+
+    def _update_meta_banner(self, has_metadata, channel, year, month):
+        """Show/hide/update the metadata banner based on queue state."""
+        if has_metadata:
+            self._grid_meta_banner.pack_forget()
+            return
+        queued = self._is_metadata_queued_or_running(channel, year, month)
+        if queued:
+            self._grid_meta_banner_lbl.config(
+                text="  Metadata download in queue",
+                cursor="arrow")
+        else:
+            self._grid_meta_banner_lbl.config(
+                text="  Download metadata for thumbnails, view counts, and more",
+                cursor="hand2")
+        self._grid_meta_banner.pack(fill="x", after=self._grid_header)
+
     def _grid_download_metadata(self):
         """Trigger metadata download for the current grid scope."""
         if not self._grid_scope:
             return
         channel, year, month = self._grid_scope
         self._browse_download_metadata(channel, year, month)
+        # Update banner to reflect queued state
+        self._update_meta_banner(False, channel, year, month)
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""
@@ -22945,7 +22985,7 @@ class _TranscriptionPanel(ttk.Frame):
             return
         try:
             rows = self._db_execute(
-                "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
+                "SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE").fetchall()
             self._s_channel_cb["values"] = ["All"] + [r[0] for r in rows]
         except Exception:
             self._s_channel_cb["values"] = ["All"]
@@ -23642,7 +23682,7 @@ class _TranscriptionPanel(ttk.Frame):
             return
         try:
             rows = self._db_execute(
-                "SELECT DISTINCT channel FROM segments ORDER BY channel").fetchall()
+                "SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE").fetchall()
             channels = [r[0] for r in rows]
         except Exception:
             channels = []
@@ -25304,6 +25344,16 @@ def _refresh_tab_btns(selected_str=None):
                        highlightbackground=C_BORDER_LT)
 
 _refresh_tab_btns()
+
+# Click dead space on header or tab bar → deselect browse tree (Browse tab only)
+def _header_deselect_browse(event):
+    try:
+        if str(notebook.select()) == str(tab_transcriptions) and _tp_panel_ref[0]:
+            _tp_panel_ref[0]._deselect_browse_tree()
+    except Exception:
+        pass
+header_strip.bind("<Button-1>", _header_deselect_browse)
+_tab_bar.bind("<Button-1>", _header_deselect_browse)
 
 
 def on_tab_changed(event):

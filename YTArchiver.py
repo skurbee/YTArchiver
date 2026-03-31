@@ -149,6 +149,7 @@ GPU_BATCH_LIMIT = 5  # max unprocessed encode batches per channel before sync sk
 RECENT_MAX = 1000
 CHANNEL_DEFAULTS = {"resolution": "720", "mode": "full", "min_duration": 0, "max_duration": 0,
                     "split_years": False, "split_months": False, "auto_transcribe": False,
+                    "auto_metadata": False,
                     "compress_enabled": False, "compress_level": "", "compress_output_res": ""}
 
 # Compression presets: resolution → quality tier → MB per hour of video
@@ -3418,7 +3419,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:56pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 9:07pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4554,6 +4555,7 @@ def _set_edit_mode(ch):
     else:
         new_folder_org_var.set("None")
     new_auto_transcribe_var.set(ch.get("auto_transcribe", False))
+    new_auto_metadata_var.set(ch.get("auto_metadata", False))
     new_compress_var.set(ch.get("compress_enabled", False))
     _cr = ch.get("compress_output_res", "")
     new_compress_res_var.set(f"{_cr}p" if _cr else "Original")  # set Res first → triggers quality combo enable
@@ -4601,6 +4603,7 @@ def _clear_edit_mode():
     _toggle_date_entry()
     new_folder_org_var.set("None")
     new_auto_transcribe_var.set(False)
+    new_auto_metadata_var.set(False)
     new_compress_var.set(False)
     new_compress_level_var.set("")
     new_compress_res_var.set("")
@@ -5230,6 +5233,7 @@ def add_channel():
                     ch["split_years"] = new_years
                     ch["split_months"] = new_months
                     ch["auto_transcribe"] = new_auto_transcribe_var.get()
+                    ch["auto_metadata"] = new_auto_metadata_var.get()
                     _old_compress = ch.get("compress_enabled", False)
                     _old_c_level = ch.get("compress_level", "")
                     _old_c_res = ch.get("compress_output_res", "")
@@ -5260,6 +5264,7 @@ def add_channel():
                 "split_years": new_years,
                 "split_months": new_months,
                 "auto_transcribe": new_auto_transcribe_var.get(),
+                "auto_metadata": new_auto_metadata_var.get(),
                 "compress_enabled": new_compress_var.get(),
                 "compress_level": new_compress_level_var.get(),
                 "compress_output_res": (lambda v: v.replace("p", "") if v != "Original" else "")(new_compress_res_var.get()),
@@ -5810,6 +5815,14 @@ def sync_single_channel():
                         skip_model_dialog=True, _sync_mode=True, captions_only=True
                     )
 
+                # Auto-metadata: queue metadata download for this channel after sync
+                if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
+                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                    _am_sy = ch.get("split_years", False)
+                    _am_sm = ch.get("split_months", False)
+                    _add_to_metadata_queue(ch["name"], url, _am_folder, _am_sy, _am_sm,
+                                           None, None, ch["name"])
+
                 if _queue_batch_total > 1:
                     # Queue batch mode: accumulate totals; defer summary/notification to end
                     _queue_batch_dl += session_totals["dl"]
@@ -6290,6 +6303,7 @@ split_row.grid(row=4, column=0, columnspan=9, sticky="w", padx=(4, 8), pady=(2, 
 
 new_folder_org_var = tk.StringVar(value="None")
 new_auto_transcribe_var = tk.BooleanVar(value=False)
+new_auto_metadata_var = tk.BooleanVar(value=False)
 
 # Computed BooleanVars kept in sync with the dropdown so all existing code that
 # reads new_split_years_var / new_split_months_var continues to work unchanged.
@@ -6309,7 +6323,10 @@ folder_org_combo = _combo(split_row, textvariable=new_folder_org_var,
                           state="readonly", width=13)
 folder_org_combo.pack(side="left", padx=(0, 16))
 
-auto_transcribe_cb = ttk.Checkbutton(split_row, text="Auto-transcribe new videos",
+auto_metadata_cb = ttk.Checkbutton(split_row, text="Auto-download metadata",
+                                    variable=new_auto_metadata_var)
+auto_metadata_cb.pack(side="right", padx=(8, 4))
+auto_transcribe_cb = ttk.Checkbutton(split_row, text="Auto-transcribe",
                                       variable=new_auto_transcribe_var)
 auto_transcribe_cb.pack(side="right", padx=(16, 4))
 
@@ -15382,6 +15399,13 @@ def start_sync_all():
                         skip_model_dialog=True, _sync_mode=True, captions_only=True
                     )
 
+                if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
+                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _am_sy = ch.get("split_years", False)
+                    _am_sm = ch.get("split_months", False)
+                    _add_to_metadata_queue(ch_name, url, _am_folder, _am_sy, _am_sm,
+                                           None, None, ch_name)
+
             _in_deferred_streams = False
             if deferred_streams and not cancel_event.is_set():
                 _in_deferred_streams = True
@@ -18600,6 +18624,14 @@ def _run_autorun():
                         skip_model_dialog=True, _sync_mode=True, captions_only=True
                     )
 
+                if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
+                    _am_name = ch.get("name", "")
+                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or _am_name))
+                    _am_sy = ch.get("split_years", False)
+                    _am_sm = ch.get("split_months", False)
+                    _add_to_metadata_queue(_am_name, url, _am_folder, _am_sy, _am_sm,
+                                           None, None, _am_name)
+
             # Capture last channel's batch state before deferred streams may clobber loop variables
             _last_batch_url = url
             _last_batch_pstart = _batch_pstart
@@ -21075,6 +21107,17 @@ class _TranscriptionPanel(ttk.Frame):
             scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
 
         _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, year, month, scope_label)
+
+        # For full-channel downloads, offer to enable auto-metadata for future syncs
+        if year is None and month is None and not ch_cfg.get("auto_metadata", False):
+            if messagebox.askyesno("Auto-download metadata",
+                    f"Automatically download metadata for new {ch_name} videos in the future?"):
+                with config_lock:
+                    for ch in config.get("channels", []):
+                        if ch.get("name", "") == ch_name:
+                            ch["auto_metadata"] = True
+                            break
+                    save_config(config)
 
     def _fetch_video_metadata(self, video_id, title):
         """Fetch metadata for a single video via yt-dlp --dump-json.

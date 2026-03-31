@@ -3419,7 +3419,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:02pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 10:07pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16306,7 +16306,7 @@ def _show_queue_menu(event=None):
             if _sync_pipeline_active:
                 _show_sync_btns = True
             else:
-                _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue) or bool(_redownload_queue)
+                _has_queued = bool(_sync_queue) or bool(_reorg_queue) or bool(_transcribe_queue) or bool(_mt_queue) or bool(_redownload_queue) or bool(_metadata_queue)
                 if _has_queued:
                     _show_sync_btns = True
 

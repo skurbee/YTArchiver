@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.1"
+APP_VERSION = "v29.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3431,7 +3431,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 11:49pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 12:09am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10563,7 +10563,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
         _redownload_running = False
 
 
-def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label):
+def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label, refresh=False):
     """Add a metadata download task to the Sync-Tasks queue."""
     _key = f"metadata:{ch_name}:{year}:{month}"
     with _metadata_queue_lock:
@@ -10582,6 +10582,7 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
             "year": year,
             "month": month,
             "scope_label": scope_label,
+            "refresh": refresh,
             "_key": _key,
         })
     with _queue_order_lock:
@@ -10678,6 +10679,7 @@ def _run_metadata_download(item):
     year = item["year"]
     month = item["month"]
     scope_label = item["scope_label"]
+    refresh = item.get("refresh", False)
 
     # Get the TP instance (Browse tab) for DB access and metadata helpers
     tp = _tp_panel_ref[0]
@@ -10827,11 +10829,13 @@ def _run_metadata_download(item):
     skipped = 0
     errors = 0
 
-    log(f"Metadata: {scope_label} — {total} videos to process.\n", "simpleline")
+    refreshed = 0
+    _mode_label = "Refreshing" if refresh else "Metadata"
+    log(f"{_mode_label}: {scope_label} — {total} videos to process.\n", "simpleline")
 
     for meta_path, group in folder_groups.items():
         if cancel_event.is_set():
-            log("Metadata: cancelled.\n", "simpleline")
+            log(f"{_mode_label}: cancelled.\n", "simpleline")
             return
         subfolder = group["subfolder"]
         existing = tp._read_metadata_jsonl(meta_path)
@@ -10848,7 +10852,7 @@ def _run_metadata_download(item):
         changed = False
         for vid_id, title, v_year, v_month, filepath in group["videos"]:
             if cancel_event.is_set():
-                log("Metadata: cancelled.\n", "simpleline")
+                log(f"{_mode_label}: cancelled.\n", "simpleline")
                 if changed:
                     tp._write_metadata_jsonl(meta_path, existing)
                 return
@@ -10856,17 +10860,32 @@ def _run_metadata_download(item):
             while pause_event.is_set() and not cancel_event.is_set():
                 time.sleep(0.5)
 
-            if vid_id in existing:
+            if vid_id in existing and not refresh:
                 skipped += 1
                 done += 1
                 continue
 
             _trunc = title[:55] + "..." if len(title) > 55 else title
-            log(f"  Metadata [{done + 1}/{total}] {_trunc}\n", "simpleline")
+            _is_refresh = vid_id in existing and refresh
+            _prefix = "Refresh" if _is_refresh else "Metadata"
+            log(f"  {_prefix} [{done + 1}/{total}] {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:
-                existing[vid_id] = entry
+                if _is_refresh:
+                    # Merge: update counts and comments but keep original static fields
+                    old = existing[vid_id]
+                    old["view_count"] = entry.get("view_count", old.get("view_count", 0))
+                    old["like_count"] = entry.get("like_count", old.get("like_count", 0))
+                    old["comment_count"] = entry.get("comment_count", old.get("comment_count", 0))
+                    old["comments"] = entry.get("comments", old.get("comments", []))
+                    old["fetched_at"] = entry.get("fetched_at", "")
+                    # Update thumbnail if it changed
+                    if entry.get("thumbnail_url"):
+                        old["thumbnail_url"] = entry["thumbnail_url"]
+                    refreshed += 1
+                else:
+                    existing[vid_id] = entry
                 changed = True
                 thumb_url = entry.get("thumbnail_url", "")
                 if thumb_url:
@@ -10880,6 +10899,8 @@ def _run_metadata_download(item):
             tp._write_metadata_jsonl(meta_path, existing)
 
     _parts = [f"{done} processed"]
+    if refreshed:
+        _parts.append(f"{refreshed} refreshed")
     if skipped:
         _parts.append(f"{skipped} already had metadata")
     if errors:
@@ -15632,6 +15653,8 @@ def stop_downloads():
         _mt_queue.clear()
     with _redownload_queue_lock:
         _redownload_queue.clear()
+    with _metadata_queue_lock:
+        _metadata_queue.clear()
     with _queue_order_lock:
         _queue_order.clear()
 
@@ -16377,6 +16400,8 @@ def _show_queue_menu(event=None):
                         _total += len(_transcribe_queue)
                     with _mt_queue_lock:
                         _total += len(_mt_queue)
+                    with _metadata_queue_lock:
+                        _total += len(_metadata_queue)
                     if _total >= 2:
                         _choice = [None]
                         _cdlg = tk.Toplevel(root)
@@ -19836,8 +19861,10 @@ class _TranscriptionPanel(ttk.Frame):
         # Header bar
         hdr = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
         hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(hdr, text="All Videos", bg=self._TP_BG3, fg=self._TP_FG,
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._all_videos_lbl = tk.Label(hdr, text="All Videos", bg=self._TP_BG3, fg=self._TP_FG,
+                 font=("Segoe UI", 11, "bold"))
+        self._all_videos_lbl.pack(side="left")
+        self._all_videos_lbl.bind("<Button-3>", lambda e: self._secret_download_all_metadata())
         # Pack scan button and status FIRST so they always have space
         self._browse_scan_btn = tk.Button(hdr, text="Scan Archive", bg="#3a3a3a",
                   fg=self._TP_FG, activebackground="#555555",
@@ -21134,7 +21161,25 @@ class _TranscriptionPanel(ttk.Frame):
         if month is not None and 1 <= (month or 0) <= 12:
             scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
 
-        _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, year, month, scope_label)
+        # Check if metadata already exists for this scope
+        refresh = False
+        has_existing = False
+        try:
+            meta_path, _ = self._get_metadata_jsonl_path(
+                ch_name, folder_path, sy, sm, year=year, month=month)
+            existing = self._read_metadata_jsonl(meta_path)
+            has_existing = bool(existing)
+        except Exception:
+            pass
+
+        if has_existing:
+            # Show choice dialog: check for new, refresh counts, or cancel
+            choice = self._metadata_choice_dialog(scope_label)
+            if choice == "cancel":
+                return
+            refresh = (choice == "refresh")
+
+        _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, year, month, scope_label, refresh=refresh)
 
         # For full-channel downloads, offer to enable auto-metadata for future syncs
         if year is None and month is None and not ch_cfg.get("auto_metadata", False):
@@ -21146,6 +21191,56 @@ class _TranscriptionPanel(ttk.Frame):
                             ch["auto_metadata"] = True
                             break
                     save_config(config)
+
+    def _metadata_choice_dialog(self, scope_label):
+        """Show a 3-button dialog: Check for New / Refresh Counts / Cancel.
+        Returns 'new', 'refresh', or 'cancel'."""
+        _result = ["cancel"]
+
+        _dlg = tk.Toplevel(root)
+        _dlg.title("Metadata Already Downloaded")
+        _dlg.configure(bg=C_BG)
+        _dlg.resizable(False, False)
+        _dlg.transient(root)
+        _dlg.grab_set()
+        _dlg.update_idletasks()
+        _apply_dark_title_bar(_dlg)
+
+        def _dismiss(val):
+            _result[0] = val
+            try:
+                _dlg.destroy()
+            except Exception:
+                pass
+
+        _dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss("cancel"))
+
+        tk.Label(_dlg, text=f"{scope_label} already has metadata.\nWhat would you like to do?",
+                 bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10), justify="left",
+                 wraplength=420).pack(fill="x", padx=20, pady=(14, 4))
+
+        btn_row = tk.Frame(_dlg, bg=C_BG)
+        btn_row.pack(padx=20, pady=(6, 14))
+        tk.Button(btn_row, text="Check for New", bg="#3a6a3a", fg="#cccccc",
+                  relief="flat", font=("Segoe UI", 9, "bold"),
+                  cursor="hand2", command=lambda: _dismiss("new"),
+                  width=14).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="Refresh Counts", bg="#4a5a6a", fg="#cccccc",
+                  relief="flat", font=("Segoe UI", 9, "bold"),
+                  cursor="hand2", command=lambda: _dismiss("refresh"),
+                  width=14).pack(side="left", padx=(0, 8))
+        tk.Button(btn_row, text="Cancel", bg=C_BTN, fg=C_TEXT,
+                  relief="flat", font=("Segoe UI", 9),
+                  cursor="hand2", command=lambda: _dismiss("cancel"),
+                  width=10).pack(side="left")
+
+        _dlg.update_idletasks()
+        _rx = root.winfo_rootx() + root.winfo_width() // 2
+        _ry = root.winfo_rooty() + root.winfo_height() // 2
+        _dlg.geometry(f"+{_rx - _dlg.winfo_reqwidth() // 2}+{_ry - _dlg.winfo_reqheight() // 2}")
+
+        root.wait_window(_dlg)
+        return _result[0]
 
     def _fetch_video_metadata(self, video_id, title):
         """Fetch metadata for a single video via yt-dlp --dump-json.
@@ -21975,6 +22070,35 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_download_metadata(channel, year, month)
         # Update banner to reflect queued state
         self._update_meta_banner(False, channel, year, month)
+
+    def _secret_download_all_metadata(self):
+        """Queue metadata download for ALL saved channels at once."""
+        if not _dark_askquestion("Download All Metadata",
+                "Download metadata for all channels?\n\n"
+                "This will queue a metadata download for every\n"
+                "saved channel. It may take a while.",
+                yes_text="Download All", no_text="Cancel"):
+            return
+        with config_lock:
+            channels = list(config.get("channels", []))
+        if not channels:
+            log("No channels configured.\n", "red")
+            return
+        queued = 0
+        for ch_cfg in channels:
+            ch_name = ch_cfg.get("name", "")
+            if not ch_name:
+                continue
+            ch_url = ch_cfg.get("url", "")
+            folder = ch_cfg.get("folder_override") or sanitize_folder(ch_name)
+            with config_lock:
+                base = config.get("output_dir", "")
+            folder_path = os.path.join(base, folder) if base else folder
+            sy = ch_cfg.get("split_years", False)
+            sm = ch_cfg.get("split_months", False)
+            _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, None, None, ch_name)
+            queued += 1
+        log(f"\n=== Queued metadata download for {queued} channel(s) ===\n", "header")
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""

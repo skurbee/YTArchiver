@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.2"
+APP_VERSION = "v29.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3431,7 +3431,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 12:09am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.31.26 8:23am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10825,6 +10825,7 @@ def _run_metadata_download(item):
     if total == 0:
         log(f"Metadata: {scope_label} — no videos with video IDs found.\n", "simpleline")
         return
+    _meta_t0 = time.time()
     done = 0
     skipped = 0
     errors = 0
@@ -10857,8 +10858,15 @@ def _run_metadata_download(item):
                     tp._write_metadata_jsonl(meta_path, existing)
                 return
             # Pause support
-            while pause_event.is_set() and not cancel_event.is_set():
-                time.sleep(0.5)
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  ⏸ Metadata paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                _tray_stop_spin(force=True)
+                while pause_event.is_set() and not cancel_event.is_set():
+                    time.sleep(0.5)
+                clear_pause_status()
+                if not cancel_event.is_set():
+                    _tray_start_spin()
+                    log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
 
             if vid_id in existing and not refresh:
                 skipped += 1
@@ -10906,6 +10914,9 @@ def _run_metadata_download(item):
     if errors:
         _parts.append(f"{errors} failed")
     log(f"\n=== Metadata Complete: {scope_label} — {', '.join(_parts)} ===\n", "green")
+    _meta_elapsed = time.time() - _meta_t0
+    _new_count = done - skipped - errors
+    _record_metadata(ch_name, _new_count, refreshed, skipped, errors, _meta_elapsed)
 
 
 def _has_pending_redownload(ch_url):
@@ -16317,13 +16328,14 @@ def _show_queue_menu(event=None):
 
             inner.after(1, lambda: canvas.configure(scrollregion=canvas.bbox("all")))
 
-            # Mouse wheel scrolling — popup-level binding to avoid global event interference
-            def _on_mousewheel(e):
-                try:
-                    canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-                except Exception:
-                    pass
-            _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
+            # Mouse wheel scrolling — only when there are enough items to scroll
+            if len(items) > max_visible:
+                def _on_mousewheel(e):
+                    try:
+                        canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                    except Exception:
+                        pass
+                _state["mw_bind_id"] = popup.bind("<MouseWheel>", _on_mousewheel, add="+")
 
             # Footer hint
             has_queued = any(s != "current" for _, s, _, _k in items)
@@ -17846,6 +17858,12 @@ def _insert_hist_line(tw, entry, row_tags):
     # Colour for the [Kind] tag
     if kind == "Trnscr":
         prefix_tags = ("hist_blue",) + row_tags
+    elif kind == "Metdta":
+        _fetched_m = re.search(r'\b(\d+) fetched\b', rest)
+        _refreshed_m = re.search(r'\b(\d+) refreshed\b', rest)
+        _has_work = ((_fetched_m and int(_fetched_m.group(1)) > 0) or
+                     (_refreshed_m and int(_refreshed_m.group(1)) > 0))
+        prefix_tags = ("hist_blue",) + row_tags if _has_work else row_tags
     elif kind in ("Manual", "Auto"):
         dl_m = re.search(r'\b(\d+) downloaded\b', rest)
         dl_count = int(dl_m.group(1)) if dl_m else 0
@@ -17863,6 +17881,9 @@ def _insert_hist_line(tw, entry, row_tags):
     patterns = []
     if kind == "Trnscr":
         patterns.append((r'\b\d+ transcribed\b', "hist_blue"))
+    elif kind == "Metdta":
+        patterns.append((r'\b[1-9]\d* fetched\b', "hist_blue"))
+        patterns.append((r'\b[1-9]\d* refreshed\b', "hist_blue"))
     elif kind in ("Manual", "Auto"):
         dl_m = re.search(r'\b(\d+) downloaded\b', rest)
         if dl_m and int(dl_m.group(1)) > 0:
@@ -18063,6 +18084,42 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
     batch_part = f" Batch {batch_num} —" if batch_num is not None else ""
     ch_part = f"  {ch_name}  —" if ch_name else " " * 7
     line = f"[Cmprss] {ts_date} —{ch_part}{batch_part}  {done_count:>4} {'compressed':<11} · {err_count:>1} errors · {dur}"
+    with config_lock:
+        hist = config.setdefault("autorun_history", [])
+        hist.append(line)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+    save_config(config)
+    if _root_alive:
+        _ui_queue.append(_refresh_autorun_history)
+
+
+def _record_metadata(ch_name, new_count, refreshed, skipped, errors, elapsed_secs):
+    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
+        "%I:%M%p").lower().lstrip("0")
+    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    mins = int(elapsed_secs // 60)
+    secs = int(elapsed_secs % 60)
+    if mins >= 60:
+        hrs = mins // 60
+        rem_mins = mins % 60
+        dur = f"took {hrs}h {rem_mins:02d}m"
+    elif mins:
+        dur = f"took {mins}m {secs:02d}s"
+    else:
+        dur = f"took {secs}s"
+    ts_date = f"{ts}, {date}".ljust(16)
+    ch_part = f"  {ch_name}  —" if ch_name else " " * 7
+    # Stats: new fetched, refreshed, skipped (already had), errors
+    _stat_parts = []
+    if new_count:
+        _stat_parts.append(f"{new_count} fetched")
+    if refreshed:
+        _stat_parts.append(f"{refreshed} refreshed")
+    _stat_parts.append(f"{skipped} skipped")
+    _stat_parts.append(f"{errors} errors")
+    stats = " · ".join(f"{p:>}" for p in _stat_parts)
+    line = f"[Metdta] {ts_date} —{ch_part}  {stats} · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)

@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v28.0"
+APP_VERSION = "v29.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -215,6 +215,10 @@ _redownload_queue_lock = threading.Lock()
 _redownload_running = False
 _current_redownload_item = None  # full dict of the currently-running redownload (for persistence on close)
 _redownload_hist_idx = None      # index of the in-progress placeholder in autorun_history
+
+_metadata_queue = []  # list of dicts: {"ch_name", "folder_path", "split_years", "split_months", "year", "month", "scope_label"}
+_metadata_queue_lock = threading.Lock()
+_metadata_running = False
 
 # GPU Tasks queue — independent from the main job queue
 _gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
@@ -2649,6 +2653,7 @@ def _run_startup_disk_scan():
     log("== Disk scan complete. ==\n", "simpleline_green")
     # Refresh browse tree now that videos have been registered
     if tp and tp._loaded and _root_alive:
+        tp._disk_scan_complete = True
         _ui_queue.append(tp._refresh_browse)
 
 
@@ -3413,7 +3418,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 12:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 03.30.26 8:21pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6048,8 +6053,13 @@ def _process_next_queued():
                 has_items = bool(_redownload_queue)
             if has_items:
                 return _process_redownload_queue()
+        elif source == "metadata":
+            with _metadata_queue_lock:
+                has_items = bool(_metadata_queue)
+            if has_items:
+                return _process_metadata_queue()
     # Fallback: try each queue in case _queue_order is out of sync
-    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue() or _process_redownload_queue()
+    return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue() or _process_redownload_queue() or _process_metadata_queue()
 
 
 def _process_video_dl_queue():
@@ -10522,6 +10532,330 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
         threading.Thread(target=_worker, daemon=True).start()
     except Exception:
         _redownload_running = False
+
+
+def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label):
+    """Add a metadata download task to the Sync-Tasks queue."""
+    _key = f"metadata:{ch_name}:{year}:{month}"
+    with _metadata_queue_lock:
+        if any(q["_key"] == _key for q in _metadata_queue):
+            log(f"  ⚠ {scope_label} metadata is already in the queue.\n", "simpleline")
+            return
+        if _metadata_running and _current_job.get("_metadata_key") == _key:
+            log(f"  ⚠ {scope_label} metadata is already running.\n", "simpleline")
+            return
+        _metadata_queue.append({
+            "ch_name": ch_name,
+            "ch_url": ch_url,
+            "folder_path": folder_path,
+            "split_years": split_years,
+            "split_months": split_months,
+            "year": year,
+            "month": month,
+            "scope_label": scope_label,
+            "_key": _key,
+        })
+    with _queue_order_lock:
+        _queue_order.append(("metadata", _key))
+    log(f"\n=== Added to Sync List: Download {scope_label} Metadata ===\n", "header")
+    _update_queue_btn()
+    _save_queue_state()
+
+    # If nothing else is running, start processing immediately
+    if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled) and not _redownload_running and not _metadata_running:
+        _process_metadata_queue()
+
+
+def _process_metadata_queue():
+    """Pop the next metadata task from the queue and start it."""
+    with _metadata_queue_lock:
+        if not _metadata_queue:
+            return False
+        item = _metadata_queue.pop(0)
+    with _queue_order_lock:
+        try:
+            _queue_order.remove(("metadata", item["_key"]))
+        except ValueError:
+            pass
+    _start_metadata_task(item)
+    return True
+
+
+def _start_metadata_task(item):
+    """Start a metadata download task as a sync-pipeline job."""
+    global _metadata_running
+
+    if _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled) or _redownload_running or _metadata_running:
+        with _metadata_queue_lock:
+            _metadata_queue.insert(0, item)
+        with _queue_order_lock:
+            _queue_order.insert(0, ("metadata", item["_key"]))
+        return
+
+    _metadata_running = True
+    _start_internet_monitor()
+
+    def _worker():
+        global _metadata_running
+        if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled):
+            cancel_event.clear()
+
+        _current_job["label"] = f"Download {item['scope_label']} Metadata"
+        _current_job["url"] = None
+        _current_job["_metadata_key"] = item["_key"]
+        _update_queue_btn()
+        _tray_start_spin()
+        _update_tray_tooltip(f"YT Archiver — Downloading {item['scope_label']} metadata")
+        try:
+            _run_metadata_download(item)
+        except Exception as e:
+            log(f"\n  ⚠ Metadata error: {e}\n", "red")
+        finally:
+            _metadata_running = False
+            _current_job["label"] = None
+            _current_job["url"] = None
+            _current_job.pop("_metadata_key", None)
+            _tray_stop_spin()
+            _update_tray_tooltip("YT Archiver — Idle")
+
+            _queue_started = False
+            if _skip_current.is_set():
+                _skip_current.clear()
+                cancel_event.clear()
+                _queue_started = _process_next_queued()
+            elif not cancel_event.is_set():
+                _queue_started = _process_next_queued()
+            if not _queue_started:
+                try:
+                    _ui_queue.append(_sync_task_finished)
+                except Exception:
+                    pass
+            _save_queue_state()
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        _metadata_running = False
+
+
+def _run_metadata_download(item):
+    """Worker: fetch metadata for all videos in the given scope.
+    Uses the TranscriptionParser instance methods via the global reference."""
+    ch_name = item["ch_name"]
+    ch_url = item.get("ch_url", "")
+    folder_path = item["folder_path"]
+    split_years = item["split_years"]
+    split_months = item["split_months"]
+    year = item["year"]
+    month = item["month"]
+    scope_label = item["scope_label"]
+
+    # Get the TP instance (Browse tab) for DB access and metadata helpers
+    tp = _tp_panel_ref[0]
+    if not tp or not tp._conn:
+        log("Metadata: no database connection.\n", "red")
+        return
+
+    # Try videos table first, fall back to scanning the filesystem
+    sql = "SELECT video_id, title, year, month, filepath FROM videos WHERE channel=?"
+    params = [ch_name]
+    if year is not None:
+        sql += " AND year=?"
+        params.append(year)
+    if month is not None:
+        sql += " AND month=?"
+        params.append(month)
+
+    rows = []
+    try:
+        rows = tp._db_execute(sql, params).fetchall()
+    except Exception:
+        pass
+
+    if not rows:
+        # Fallback: scan the filesystem for video files in the channel folder
+        log(f"  No videos in DB for {scope_label} — scanning folder...\n", "dim")
+        scan_path = folder_path
+        if year is not None:
+            scan_path = os.path.join(scan_path, str(year))
+        if month is not None and 1 <= (month or 0) <= 12:
+            scan_path = os.path.join(scan_path, MONTH_NAMES.get(month, f"{month:02d} Unknown"))
+        _VIDEO_EXTS = {'.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv'}
+        if os.path.isdir(scan_path):
+            for dirpath, _, filenames in os.walk(scan_path):
+                for fn in filenames:
+                    fn_lower = fn.lower()
+                    if not any(fn_lower.endswith(ext) for ext in _VIDEO_EXTS):
+                        continue
+                    if ".temp." in fn_lower or fn_lower.endswith(".part"):
+                        continue
+                    fp = os.path.join(dirpath, fn)
+                    title = os.path.splitext(fn)[0]
+                    _vid_id = None
+                    _bracket = title.rfind(" [")
+                    if _bracket >= 0 and title.endswith("]"):
+                        _candidate = title[_bracket + 2:-1]
+                        if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
+                            _vid_id = _candidate
+                    # Derive year/month from path
+                    _, v_year, v_month = _tp_parse_path_meta(fp, [folder_path])
+                    rows.append((_vid_id, title, v_year, v_month, fp))
+
+    if not rows:
+        log(f"Metadata: {scope_label} — no videos found.\n"
+            f"  Check that video files exist in the channel folder.\n", "red")
+        return
+
+    # Resolve missing video_ids from segments table or JSONL files on disk
+    _resolved_rows = []
+    _no_id_count = 0
+    _seg_id_map = {}
+    # Try segments table first
+    try:
+        for _st, _sv in tp._db_execute(
+                "SELECT DISTINCT title, video_id FROM segments "
+                "WHERE channel=? AND video_id != ''",
+                (ch_name,)).fetchall():
+            if _sv:
+                _seg_id_map[_st] = _sv
+    except Exception:
+        pass
+    # If segments had nothing, read JSONL files from the channel folder
+    if not _seg_id_map:
+        _search_dirs = set()
+        _search_dirs.add(folder_path)
+        for dirpath, _, _ in os.walk(folder_path):
+            _search_dirs.add(dirpath)
+        for _sd in _search_dirs:
+            try:
+                for _fn in os.listdir(_sd):
+                    if _fn.endswith('.jsonl') and _fn.startswith('.'):
+                        _jf = os.path.join(_sd, _fn)
+                        with open(_jf, 'r', encoding='utf-8', errors='replace') as _fh:
+                            for _jline in _fh:
+                                _jline = _jline.strip()
+                                if not _jline:
+                                    continue
+                                try:
+                                    _jd = json.loads(_jline)
+                                    _jvid = _jd.get("video_id", "")
+                                    _jtitle = _jd.get("title", "")
+                                    if _jvid and _jtitle and _jtitle not in _seg_id_map:
+                                        _seg_id_map[_jtitle] = _jvid
+                                except (json.JSONDecodeError, Exception):
+                                    continue
+            except (OSError, PermissionError):
+                continue
+
+    for vid_id, title, v_year, v_month, filepath in rows:
+        if not vid_id:
+            # Try segments table lookup
+            vid_id = _seg_id_map.get(title)
+        if not vid_id and filepath:
+            # Try filename pattern: "Title [VIDEO_ID].ext"
+            _base = os.path.splitext(os.path.basename(filepath))[0]
+            _bracket = _base.rfind(" [")
+            if _bracket >= 0 and _base.endswith("]"):
+                _candidate = _base[_bracket + 2:-1]
+                if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
+                    vid_id = _candidate
+        if vid_id:
+            # Backfill into videos table if it was missing
+            if filepath:
+                try:
+                    tp._db_execute(
+                        "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                        (vid_id, filepath))
+                except Exception:
+                    pass
+            _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
+        else:
+            _no_id_count += 1
+    if _resolved_rows:
+        try:
+            tp._db_commit()
+        except Exception:
+            pass
+    if _no_id_count:
+        log(f"  ({_no_id_count} video(s) skipped — no video ID found)\n", "dim")
+
+    # Group videos by their target folder
+    folder_groups = {}
+    for vid_id, title, v_year, v_month, filepath in _resolved_rows:
+        meta_path, subfolder = tp._get_metadata_jsonl_path(
+            ch_name, folder_path, split_years, split_months,
+            year=v_year, month=v_month)
+        if meta_path not in folder_groups:
+            folder_groups[meta_path] = {"subfolder": subfolder, "videos": []}
+        folder_groups[meta_path]["videos"].append(
+            (vid_id, title, v_year, v_month, filepath))
+
+    total = sum(len(g["videos"]) for g in folder_groups.values())
+    if total == 0:
+        log(f"Metadata: {scope_label} — no videos with video IDs found.\n", "simpleline")
+        return
+    done = 0
+    skipped = 0
+    errors = 0
+
+    log(f"Metadata: {scope_label} — {total} videos to process.\n", "simpleline")
+
+    for meta_path, group in folder_groups.items():
+        if cancel_event.is_set():
+            log("Metadata: cancelled.\n", "simpleline")
+            return
+        subfolder = group["subfolder"]
+        existing = tp._read_metadata_jsonl(meta_path)
+
+        thumb_dir = os.path.join(subfolder, ".Thumbnails")
+        os.makedirs(thumb_dir, exist_ok=True)
+        if os.name == "nt":
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(
+                    os.path.normpath(thumb_dir), 0x02)
+            except Exception:
+                pass
+
+        changed = False
+        for vid_id, title, v_year, v_month, filepath in group["videos"]:
+            if cancel_event.is_set():
+                log("Metadata: cancelled.\n", "simpleline")
+                if changed:
+                    tp._write_metadata_jsonl(meta_path, existing)
+                return
+            # Pause support
+            while pause_event.is_set() and not cancel_event.is_set():
+                time.sleep(0.5)
+
+            if vid_id in existing:
+                skipped += 1
+                done += 1
+                continue
+
+            _trunc = title[:55] + "..." if len(title) > 55 else title
+            log(f"  Metadata [{done + 1}/{total}] {_trunc}\n", "simpleline")
+
+            entry = tp._fetch_video_metadata(vid_id, title)
+            if entry:
+                existing[vid_id] = entry
+                changed = True
+                thumb_url = entry.get("thumbnail_url", "")
+                if thumb_url:
+                    tp._download_thumbnail(thumb_url, thumb_dir, title, vid_id)
+            else:
+                errors += 1
+
+            done += 1
+
+        if changed:
+            tp._write_metadata_jsonl(meta_path, existing)
+
+    _parts = [f"{done} processed"]
+    if skipped:
+        _parts.append(f"{skipped} already had metadata")
+    if errors:
+        _parts.append(f"{errors} failed")
+    log(f"\n=== Metadata Complete: {scope_label} — {', '.join(_parts)} ===\n", "green")
 
 
 def _has_pending_redownload(ch_url):
@@ -15365,8 +15699,8 @@ def toggle_pause():
 
 
 def _sync_task_finished():
-    """Called when sync/reorg/redownload finishes — resets job state and updates sync tasks button."""
-    if not _sync_running and not _reorg_running and not _redownload_running:
+    """Called when sync/reorg/redownload/metadata finishes — resets job state and updates sync tasks button."""
+    if not _sync_running and not _reorg_running and not _redownload_running and not _metadata_running:
         pause_event.clear()
         _current_job["label"] = None
         _current_job["url"] = None
@@ -15390,7 +15724,7 @@ def _update_sync_badge():
     """Update the green badge count on the Sync Tasks button."""
     # Fast count — just check queue lengths instead of building full item lists
     n = 0
-    if _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running):
+    if _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
         n += 1  # currently running item
     with _sync_queue_lock:
         n += len(_sync_queue)
@@ -15402,6 +15736,8 @@ def _update_sync_badge():
         n += len(_mt_queue)
     with _redownload_queue_lock:
         n += len(_redownload_queue)
+    with _metadata_queue_lock:
+        n += len(_metadata_queue)
     if n == _sync_badge_count["n"]:
         return  # no change
     _sync_badge_count["n"] = n
@@ -15484,9 +15820,9 @@ def _get_queue_items():
 
     # Show currently processing item first — but not during batch syncs (batch entry covers it)
     if _current_job["label"] and not (_has_batch and _sync_running):
-        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running) and pause_event.is_set():
+        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running) and pause_event.is_set():
             _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
-        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running:
+        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running:
             _active_lbl = _active_label(_current_job["label"], with_dots=True)
         else:
             _active_lbl = _current_job["label"]
@@ -15525,6 +15861,10 @@ def _get_queue_items():
             _rr_res = item.get("resolution", "")
             _rr_disp = "Best" if _rr_res == "best" else f"{_rr_res}p"
             redownload_map[item["ch_url"]] = (f"Redownload {item['ch_name']} ({_rr_disp})", "redownload", i, item["ch_url"])
+    metadata_map = {}
+    with _metadata_queue_lock:
+        for i, item in enumerate(_metadata_queue):
+            metadata_map[item["_key"]] = (f"Download {item['scope_label']} Metadata", "metadata", i, item["_key"])
 
     # Emit items in _queue_order (insertion order)
     seen = set()
@@ -15546,6 +15886,8 @@ def _get_queue_items():
                 video_item = None
             elif source == "redownload" and key in redownload_map:
                 items.append(redownload_map.pop(key))
+            elif source == "metadata" and key in metadata_map:
+                items.append(metadata_map.pop(key))
 
     # Append any orphaned items (added without _queue_order tracking, e.g. legacy/startup)
     for entry in sync_map.values():
@@ -15557,6 +15899,8 @@ def _get_queue_items():
     for entry in mt_map.values():
         items.append(entry)
     for entry in redownload_map.values():
+        items.append(entry)
+    for entry in metadata_map.values():
         items.append(entry)
     if video_item:
         items.append(video_item)
@@ -15624,6 +15968,15 @@ def _remove_queue_item(source, idx, expected_key=None):
                 popped = _redownload_queue.pop(_target)
                 removed = popped.get("ch_name", "?")
                 removed_key = popped.get("ch_url")
+    elif source == "metadata":
+        with _metadata_queue_lock:
+            _target = idx
+            if expected_key and 0 <= idx < len(_metadata_queue) and _metadata_queue[idx].get("_key") != expected_key:
+                _target = next((i for i, m in enumerate(_metadata_queue) if m.get("_key") == expected_key), -1)
+            if 0 <= _target < len(_metadata_queue):
+                popped = _metadata_queue.pop(_target)
+                removed = popped.get("scope_label", "?")
+                removed_key = popped.get("_key")
     elif source == "sync_batch":
         with _sync_queue_lock:
             batch_urls = [ch["url"] for ch in _sync_queue if ch.get("_batch")]
@@ -15700,7 +16053,7 @@ def _show_queue_menu(event=None):
         if _state["last_snapshot"] == snapshot:
             # Just update the dot animation on the active item's label widget
             _albl = _state.get("active_lbl")
-            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running):
+            if _albl and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
                 try:
                     if pause_event.is_set():
                         _fresh = f"▶ {_current_job['label']} (Paused)"
@@ -15924,7 +16277,7 @@ def _show_queue_menu(event=None):
 
             # Footer buttons — show when running (Pause/Cancel) or queued (Start/Cancel)
             # Only count transcription as "sync-running" if it's sync-controlled (not GPU-driven)
-            _sync_pipeline_active = _sync_running or _reorg_running or _redownload_running or (_transcribe_running and _transcribe_sync_controlled)
+            _sync_pipeline_active = _sync_running or _reorg_running or _redownload_running or _metadata_running or (_transcribe_running and _transcribe_sync_controlled)
             _show_sync_btns = False
             if _sync_pipeline_active:
                 _show_sync_btns = True
@@ -16127,11 +16480,19 @@ def _show_queue_menu(event=None):
                 return
             if not popup.winfo_exists():
                 return
-            # Check if the click is on the queue_btn itself (toggle behavior)
+            # Check if the click is on the queue_btn or its children (badge label)
             try:
                 w = e.widget
                 if w == queue_btn:
-                    return  # Let the button's own command handle toggle
+                    return
+                # Check parent chain — badge is a child of queue_btn
+                _p = w
+                for _ in range(5):
+                    _p = _p.master
+                    if _p == queue_btn:
+                        return
+                    if _p is None or _p == root:
+                        break
             except Exception:
                 pass
             # Check if click is inside the popup
@@ -16208,7 +16569,7 @@ def _update_queue_btn():
             _update_sync_badge()
 
             # Manage sync blink animation
-            _is_running = _sync_running or _reorg_running or _redownload_running or (_transcribe_running and _transcribe_sync_controlled)
+            _is_running = _sync_running or _reorg_running or _redownload_running or _metadata_running or (_transcribe_running and _transcribe_sync_controlled)
             if _is_running and not _sync_blink["active"]:
                 _sync_blink_start()
             elif not _is_running and _sync_blink["active"]:
@@ -18955,6 +19316,34 @@ class _TranscriptionPanel(ttk.Frame):
                 self._db_commit()
             except Exception:
                 pass
+            # Backfill missing video_ids from the segments table
+            # (segments/JSONL data almost always has the video_id even when
+            # the filename doesn't include [VIDEO_ID])
+            try:
+                _null_ids = self._db_execute(
+                    "SELECT v.id, v.title, v.channel FROM videos v "
+                    "WHERE v.video_id IS NULL"
+                ).fetchall()
+                if _null_ids:
+                    # Build title+channel → video_id lookup from segments
+                    _seg_map = {}
+                    for _st, _sv, _sc in self._db_execute(
+                            "SELECT DISTINCT title, video_id, channel "
+                            "FROM segments WHERE video_id != ''").fetchall():
+                        if _sv:
+                            _seg_map[(_st, _sc)] = _sv
+                    _backfilled = 0
+                    for _vid_row_id, _vtitle, _vch in _null_ids:
+                        _found_id = _seg_map.get((_vtitle, _vch))
+                        if _found_id:
+                            self._db_execute(
+                                "UPDATE videos SET video_id=? WHERE id=?",
+                                (_found_id, _vid_row_id))
+                            _backfilled += 1
+                    if _backfilled:
+                        self._db_commit()
+            except Exception:
+                pass
             _total = 0
             try:
                 row = self._db_execute("SELECT COUNT(*) FROM videos").fetchone()
@@ -19340,7 +19729,10 @@ class _TranscriptionPanel(ttk.Frame):
                 self.after(50, self._do_frequency)
         elif key == "bookmarks":
             self._refresh_bookmarks()
-        elif key == "browse":
+        elif key == "browse" and not self._browse_items:
+            # Only refresh if the tree is empty (first visit) — don't
+            # rebuild when returning from the player or other sections,
+            # as that destroys the user's expansion state.
             self._refresh_browse()
 
     def _update_index_warning(self, section_key):
@@ -19495,6 +19887,19 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_current_meta = None
         vf = tk.Frame(right, bg=self._TP_BG)
         vf.pack(fill="both", expand=True)
+
+        # Thumbnail area — hidden by default, shown when metadata exists
+        self._browse_thumb_frame = tk.Frame(vf, bg="#0e0f11", height=0)
+        self._browse_thumb_frame.pack(fill="x")
+        self._browse_thumb_frame.pack_propagate(False)
+        self._browse_thumb_label = tk.Label(self._browse_thumb_frame, bg="#0e0f11",
+                                            cursor="hand2", anchor="center")
+        self._browse_thumb_label.pack(fill="both", expand=True)
+        self._browse_thumb_label.bind("<Button-1>", lambda e: self._on_browse_play_video())
+        self._browse_thumb_photo = None  # keep reference to avoid GC
+        self._browse_thumb_visible = False
+
+        # Transcript viewer
         self._browse_viewer = tk.Text(vf, bg="#1a1c1f", fg=self._TP_FG,
                                        font=("Segoe UI", 10), wrap="word",
                                        relief="flat", padx=12, pady=10,
@@ -19509,10 +19914,124 @@ class _TranscriptionPanel(ttk.Frame):
         bvsb.pack(side="right", fill="y")
         self._browse_viewer.pack(fill="both", expand=True)
         self._browse_viewer.bind("<Double-Button-1>", self._on_browse_word_double_click)
+
+        self._current_metadata_entry = None  # currently loaded metadata dict
+
+        # Pull-up metadata drawer — overlays transcript from bottom
+        self._browse_drawer_frame = tk.Frame(vf, bg="#141618", relief="flat")
+        self._browse_drawer_visible = False
+        self._browse_drawer_height = 0  # current height in px
+        # Drawer handle bar (clickable to toggle)
+        self._browse_drawer_handle = tk.Frame(self._browse_drawer_frame, bg="#222426",
+                                              height=28, cursor="hand2")
+        self._browse_drawer_handle.pack(fill="x", side="top")
+        self._browse_drawer_handle.pack_propagate(False)
+        self._browse_drawer_toggle_lbl = tk.Label(
+            self._browse_drawer_handle, text="▲  Metadata", bg="#222426",
+            fg=self._TP_DIM, font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._browse_drawer_toggle_lbl.pack(side="left", padx=10)
+        def _drawer_click(e):
+            self._toggle_browse_drawer()
+            return "break"
+        self._browse_drawer_handle.bind("<Button-1>", _drawer_click)
+        self._browse_drawer_toggle_lbl.bind("<Button-1>", _drawer_click)
+        # Drawer content area — scrollable text
+        self._browse_drawer_text = tk.Text(
+            self._browse_drawer_frame, bg="#141618", fg=self._TP_FG,
+            font=("Segoe UI", 9), wrap="word", relief="flat",
+            padx=12, pady=8, state="disabled", cursor="arrow")
+        dsb = ttk.Scrollbar(self._browse_drawer_frame, orient="vertical",
+                            command=self._browse_drawer_text.yview)
+        self._browse_drawer_text.configure(yscrollcommand=dsb.set)
+        self._browse_drawer_text.tag_configure("meta_label",
+            foreground=self._TP_ACCENT, font=("Segoe UI", 9, "bold"))
+        self._browse_drawer_text.tag_configure("meta_dim",
+            foreground=self._TP_DIM, font=("Segoe UI", 8))
+        self._browse_drawer_text.tag_configure("comment_author",
+            foreground="#5a9fd4", font=("Segoe UI", 9, "bold"))
+        self._browse_drawer_text.tag_configure("comment_likes",
+            foreground=self._TP_DIM, font=("Segoe UI", 8))
+        dsb.pack(side="right", fill="y")
+        self._browse_drawer_text.pack(fill="both", expand=True)
+
+        # ── Video grid view (shown when a folder node is selected) ────────
+        self._grid_frame = tk.Frame(vf, bg=self._TP_BG)
+        # Grid header with sort controls
+        self._grid_header = tk.Frame(self._grid_frame, bg=self._TP_BG3, padx=10, pady=6)
+        self._grid_header.pack(fill="x")
+        self._grid_title_lbl = tk.Label(self._grid_header, text="", bg=self._TP_BG3,
+                                         fg=self._TP_FG, font=("Segoe UI", 10, "bold"),
+                                         anchor="w")
+        self._grid_title_lbl.pack(side="left", fill="x", expand=True)
+        # Sort dropdown
+        tk.Label(self._grid_header, text="Sort:", bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 8)).pack(side="right", padx=(8, 4))
+        self._grid_sort_var = tk.StringVar(value="Date")
+        self._grid_sort_menu = tk.OptionMenu(
+            self._grid_header, self._grid_sort_var, "Date", "Views",
+            command=lambda _: self._grid_resort())
+        self._grid_sort_menu.config(bg="#3a3a3a", fg=self._TP_FG, activebackground="#555",
+                                     activeforeground=self._TP_FG, relief="flat", bd=0,
+                                     font=("Segoe UI", 8), highlightthickness=0,
+                                     cursor="hand2")
+        self._grid_sort_menu["menu"].config(bg=self._TP_BG3, fg=self._TP_FG,
+                                             activebackground=self._TP_ACCENT,
+                                             activeforeground="white")
+        self._grid_sort_menu.pack(side="right")
+        # "Download metadata" banner (shown when no metadata available)
+        self._grid_meta_banner = tk.Frame(self._grid_frame, bg="#2a2518")
+        self._grid_meta_banner_lbl = tk.Label(
+            self._grid_meta_banner,
+            text="  Download metadata for thumbnails, view counts, and more",
+            bg="#2a2518", fg="#9a8a4a", font=("Segoe UI", 8, "italic"),
+            cursor="hand2", anchor="w", padx=8, pady=4)
+        self._grid_meta_banner_lbl.pack(fill="x")
+        self._grid_meta_banner_lbl.bind("<Button-1>", lambda e: self._grid_download_metadata())
+        # Scrollable canvas for video cards
+        self._grid_canvas_frame = tk.Frame(self._grid_frame, bg=self._TP_BG)
+        self._grid_canvas_frame.pack(fill="both", expand=True)
+        self._grid_canvas = tk.Canvas(self._grid_canvas_frame, bg=self._TP_BG,
+                                       highlightthickness=0)
+        self._grid_scrollbar = ttk.Scrollbar(self._grid_canvas_frame, orient="vertical",
+                                              command=self._grid_canvas.yview)
+        self._grid_canvas.configure(yscrollcommand=self._grid_scrollbar.set)
+        self._grid_scrollbar.pack(side="right", fill="y")
+        self._grid_canvas.pack(fill="both", expand=True)
+        self._grid_inner = tk.Frame(self._grid_canvas, bg=self._TP_BG)
+        self._grid_canvas_window = self._grid_canvas.create_window(
+            (0, 0), window=self._grid_inner, anchor="nw")
+        self._grid_inner.bind("<Configure>",
+            lambda e: self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all")))
+        self._grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
+        # Mousewheel scrolling
+        def _grid_mousewheel(e):
+            self._grid_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        self._grid_canvas.bind("<MouseWheel>", _grid_mousewheel)
+        self._grid_inner.bind("<MouseWheel>", _grid_mousewheel)
+        # Grid state
+        self._grid_visible = False
+        self._grid_videos = []       # current video data list
+        self._grid_photos = {}       # title -> PhotoImage (keep refs)
+        self._grid_cards = []        # card widget refs
+        self._grid_scope = None      # (channel, year, month) for current grid
+        self._grid_last_width = 0
+        self._vf = vf                # reference to the viewer frame
+
         pane.add(right, minsize=300)
 
         # Internal state for browse tree items
         self._browse_items = {}  # iid → {"type": "channel"/"year"/"month"/"file", ...}
+
+        # Loading overlay — shown until the startup disk scan completes
+        self._disk_scan_complete = False
+        self._browse_loading_overlay = tk.Frame(f, bg=self._TP_BG)
+        self._browse_loading_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._browse_loading_overlay.lift()
+        _ll = tk.Label(self._browse_loading_overlay, text="Loading archive...",
+                       bg=self._TP_BG, fg=self._TP_DIM,
+                       font=("Segoe UI", 12), anchor="center")
+        _ll.place(relx=0.5, rely=0.45, anchor="center")
+
         return f
 
     _BROWSE_PLACEHOLDER = "__placeholder__"
@@ -19538,6 +20057,11 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _apply_browse_channels(self, channels):
         """Apply channel list to browse tree (must run on main thread)."""
+        # Dismiss loading overlay only after the startup disk scan is done
+        if self._browse_loading_overlay and self._disk_scan_complete:
+            self._browse_loading_overlay.place_forget()
+            self._browse_loading_overlay.destroy()
+            self._browse_loading_overlay = None
         tree = self._browse_tree
         tree.delete(*tree.get_children())
         self._browse_items.clear()
@@ -19645,6 +20169,78 @@ class _TranscriptionPanel(ttk.Frame):
                 self.after(0, lambda: self._browse_tree.delete(_loading_iid))
                 return
 
+            # Backfill missing video_ids from segments table or JSONL files
+            _has_null_ids = any(r[2] is None for r in rows)
+            if _has_null_ids:
+                _id_map = {}  # title -> video_id
+                # Try segments table first
+                try:
+                    for _st, _sv in self._db_execute(
+                            "SELECT DISTINCT title, video_id FROM segments "
+                            "WHERE channel=? AND video_id != ''",
+                            (channel,)).fetchall():
+                        if _sv:
+                            _id_map[_st] = _sv
+                except Exception:
+                    pass
+                # If segments had nothing, read the JSONL files on disk
+                if not _id_map:
+                    try:
+                        # Find the channel folder from any filepath
+                        _sample_fp = next((r[1] for r in rows if r[1]), None)
+                        if _sample_fp:
+                            _search_dirs = set()
+                            _search_dirs.add(os.path.dirname(_sample_fp))
+                            # Also check parent dirs (handles year/month subfolders)
+                            _p = os.path.dirname(_sample_fp)
+                            for _ in range(3):
+                                _search_dirs.add(_p)
+                                _pp = os.path.dirname(_p)
+                                if _pp == _p:
+                                    break
+                                _p = _pp
+                            for _sd in _search_dirs:
+                                try:
+                                    for _fn in os.listdir(_sd):
+                                        if _fn.endswith('.jsonl') and _fn.startswith('.'):
+                                            _jf = os.path.join(_sd, _fn)
+                                            with open(_jf, 'r', encoding='utf-8', errors='replace') as _fh:
+                                                for _jline in _fh:
+                                                    _jline = _jline.strip()
+                                                    if not _jline:
+                                                        continue
+                                                    try:
+                                                        _jd = json.loads(_jline)
+                                                        _jvid = _jd.get("video_id", "")
+                                                        _jtitle = _jd.get("title", "")
+                                                        if _jvid and _jtitle and _jtitle not in _id_map:
+                                                            _id_map[_jtitle] = _jvid
+                                                    except (json.JSONDecodeError, Exception):
+                                                        continue
+                                except (OSError, PermissionError):
+                                    continue
+                    except Exception:
+                        pass
+                if _id_map:
+                    _new_rows = []
+                    for r in rows:
+                        if r[2] is None and r[0] in _id_map:
+                            _new_rows.append((r[0], r[1], _id_map[r[0]], r[3], r[4]))
+                            try:
+                                self._db_execute(
+                                    "UPDATE videos SET video_id=? "
+                                    "WHERE title=? AND channel=? AND video_id IS NULL",
+                                    (_id_map[r[0]], r[0], channel))
+                            except Exception:
+                                pass
+                        else:
+                            _new_rows.append(r)
+                    rows = _new_rows
+                    try:
+                        self._db_commit()
+                    except Exception:
+                        pass
+
             # Sort by file mtime (upload date) instead of alphabetically
             # Also derive month from mtime for separator lines
             import datetime as _dt
@@ -19714,6 +20310,9 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _browse_insert_batch(self, parent_iid, loading_iid, items):
         """Insert pre-computed browse items into the tree (runs on main thread)."""
+        # Guard: parent may have been deleted by a tree refresh while we were loading
+        if not self._browse_tree.exists(parent_iid):
+            return
         try:
             self._browse_tree.delete(loading_iid)
         except Exception:
@@ -19741,8 +20340,18 @@ class _TranscriptionPanel(ttk.Frame):
         if not sel:
             return
         meta = self._browse_items.get(sel[0])
-        if not meta or meta["type"] != "title":
+        if not meta:
             return
+        if meta["type"] in ("channel", "year", "month"):
+            channel = meta["channel"]
+            year = meta.get("year")
+            month = meta.get("month")
+            self._show_grid(channel, year, month)
+            return
+        if meta["type"] != "title":
+            return
+        # Switching from grid to title view
+        self._hide_grid()
         title      = meta["title"]
         tx_status  = meta.get("tx_status", "pending")
         filepath   = meta.get("filepath")
@@ -19897,6 +20506,31 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     db_rows = []
 
+            # Fallback: if segments DB is empty, read from JSONL files on disk
+            if not db_rows and txt_path:
+                try:
+                    _jsonl_path = _get_jsonl_path(txt_path)
+                    if os.path.isfile(_jsonl_path):
+                        with open(_jsonl_path, 'r', encoding='utf-8', errors='replace') as _jfh:
+                            for _jl in _jfh:
+                                _jl = _jl.strip()
+                                if not _jl:
+                                    continue
+                                try:
+                                    _jd = json.loads(_jl)
+                                    if _jd.get("title") == title:
+                                        db_rows.append((
+                                            _jd.get("video_id", ""),
+                                            _jd.get("start", 0.0),
+                                            _jd.get("end", 0.0),
+                                            _jd.get("text", ""),
+                                            json.dumps(_jd["words"]) if "words" in _jd else ""
+                                        ))
+                                except (json.JSONDecodeError, Exception):
+                                    continue
+                except Exception:
+                    pass
+
             # Read the .txt file (can be 100KB+)
             section = self._get_txt_section(txt_path, title) if txt_path else None
 
@@ -19983,7 +20617,50 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_seg_map = seg_map
 
         self._browse_viewer.config(state="disabled")
+        # Force a single geometry pass then scroll — prevents resize recalc lag
+        self._browse_viewer.update_idletasks()
         self._browse_viewer.yview_moveto(0)
+
+        # Load metadata (thumbnail + drawer) in background if available
+        self._hide_browse_thumbnail()
+        self._clear_browse_drawer()
+        if vid_id and channel:
+            threading.Thread(
+                target=self._try_load_metadata_for_video,
+                args=(vid_id, title, channel), daemon=True).start()
+
+    def _try_load_metadata_for_video(self, video_id, title, channel):
+        """Background: resolve channel config and load metadata for a video."""
+        ch_cfg = None
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name", "") == channel:
+                    ch_cfg = ch
+                    break
+        if not ch_cfg:
+            return
+        folder = ch_cfg.get("folder_override") or sanitize_folder(channel)
+        with config_lock:
+            base = config.get("output_dir", "")
+        folder_path = os.path.join(base, folder) if base else folder
+        sy = ch_cfg.get("split_years", False)
+        sm = ch_cfg.get("split_months", False)
+
+        # Determine year/month for this video from the DB
+        v_year, v_month = None, None
+        if self._conn:
+            try:
+                row = self._db_execute(
+                    "SELECT year, month FROM videos WHERE video_id=? LIMIT 1",
+                    (video_id,)).fetchone()
+                if row:
+                    v_year, v_month = row
+            except Exception:
+                pass
+
+        self._load_browse_metadata(
+            video_id, title, channel, folder_path,
+            sy, sm, v_year, v_month)
 
     def _on_browse_play_video(self):
         """Play Video button — open the current video in the embedded VLC player."""
@@ -20068,7 +20745,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
+                       disabledforeground="#666b75", relief="flat", bd=1)
 
         if meta["type"] == "title":
             # Title-level context menu
@@ -20102,7 +20779,7 @@ class _TranscriptionPanel(ttk.Frame):
                                      video_path, 0, title=title,
                                      db_rows=_db_rows))
             else:
-                menu.add_command(label="  ▶  Play Video  (file not found)",
+                menu.add_command(label="  ▶  Play Video",
                                  state="disabled")
 
             if video_id:
@@ -20110,7 +20787,7 @@ class _TranscriptionPanel(ttk.Frame):
                 menu.add_command(label="  Open Video — YouTube",
                                  command=lambda u=url: _webbrowser.open(u))
             else:
-                menu.add_command(label="  Open Video — YouTube  (no ID)",
+                menu.add_command(label="  Open Video — YouTube",
                                  state="disabled")
 
             if video_id:
@@ -20118,7 +20795,7 @@ class _TranscriptionPanel(ttk.Frame):
                                  command=lambda vi=video_id, t=title, vp=video_path, ch=channel:
                                      self._on_browse_redownload(vi, t, vp, ch))
             else:
-                menu.add_command(label="  Redownload...  (no ID)", state="disabled")
+                menu.add_command(label="  Redownload...", state="disabled")
 
             if video_path:
                 def _show_explorer(vp=video_path):
@@ -20185,6 +20862,11 @@ class _TranscriptionPanel(ttk.Frame):
                 label="  Redownload at...",
                 command=lambda ch=channel, y=year, m=month:
                     self._browse_redownload_folder(ch, y, m))
+            menu.add_separator()
+            menu.add_command(
+                label="  Download Metadata",
+                command=lambda ch=channel, y=year, m=month:
+                    self._browse_download_metadata(ch, y, m))
 
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -20264,6 +20946,799 @@ class _TranscriptionPanel(ttk.Frame):
             return
 
         _add_to_redownload_queue(ch_name, ch_url, folder_path, resolution)
+
+    # ── Metadata download ─────────────────────────────────────────────────
+
+    def _get_metadata_jsonl_path(self, ch_name, folder_path, split_years,
+                                  split_months, year=None, month=None):
+        """Build the hidden .Metadata.jsonl path matching transcript naming."""
+        if not split_years:
+            fname = f".{ch_name} Metadata.jsonl"
+            return os.path.join(folder_path, fname), folder_path
+        if split_years and split_months and year and month:
+            month_num = int(month) if isinstance(month, str) and month.isdigit() else month
+            month_name = MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown").split(" ", 1)[1]
+            yr_short = str(year)[-2:]
+            subfolder = os.path.join(folder_path, str(year),
+                                     MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown"))
+            fname = f".{ch_name} {month_name} {yr_short} Metadata.jsonl"
+            return os.path.join(subfolder, fname), subfolder
+        if split_years and year:
+            subfolder = os.path.join(folder_path, str(year))
+            fname = f".{ch_name} {year} Metadata.jsonl"
+            return os.path.join(subfolder, fname), subfolder
+        fname = f".{ch_name} Metadata.jsonl"
+        return os.path.join(folder_path, fname), folder_path
+
+    def _read_metadata_jsonl(self, jsonl_path):
+        """Read existing metadata JSONL, return dict of video_id -> data."""
+        existing = {}
+        if not os.path.isfile(jsonl_path):
+            return existing
+        try:
+            # Unhide to read (Windows)
+            if os.name == "nt":
+                try:
+                    ctypes.windll.kernel32.SetFileAttributesW(
+                        os.path.normpath(jsonl_path), 0x80)
+                except Exception:
+                    pass
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        vid = entry.get("video_id", "")
+                        if vid:
+                            existing[vid] = entry
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+        return existing
+
+    def _write_metadata_jsonl(self, jsonl_path, entries_dict):
+        """Write all metadata entries to a JSONL file and hide it."""
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        # Unhide first if exists
+        norm = os.path.normpath(jsonl_path)
+        if os.name == "nt" and os.path.isfile(norm):
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(norm, 0x80)
+            except Exception:
+                pass
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for vid, data in entries_dict.items():
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        _hide_file_win(jsonl_path)
+
+    def _browse_download_metadata(self, channel, year=None, month=None):
+        """Add a metadata download task to the Sync-Tasks queue."""
+        ch_cfg = None
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name", "") == channel:
+                    ch_cfg = ch
+                    break
+        if not ch_cfg:
+            messagebox.showwarning("Channel not found",
+                f"Could not find channel \"{channel}\" in your saved channels.\n"
+                "You may need to add it in Settings first.")
+            return
+
+        ch_name = ch_cfg["name"]
+        folder = ch_cfg.get("folder_override") or sanitize_folder(ch_name)
+        with config_lock:
+            base = config.get("output_dir", "")
+        folder_path = os.path.join(base, folder) if base else folder
+        sy = ch_cfg.get("split_years", False)
+        sm = ch_cfg.get("split_months", False)
+
+        ch_url = ch_cfg.get("url", "")
+        scope_label = ch_name
+        if year is not None:
+            scope_label += f" / {year}"
+        if month is not None and 1 <= (month or 0) <= 12:
+            scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
+
+        _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, year, month, scope_label)
+
+    def _fetch_video_metadata(self, video_id, title):
+        """Fetch metadata for a single video via yt-dlp --dump-json.
+        Returns a dict with video_id, description, view_count, comments, etc."""
+        cmd = [
+            "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
+            "--ignore-errors", "--skip-download",
+            "--cookies-from-browser", "firefox",
+            "--write-comments",
+            "--extractor-args", "youtube:comment_sort=top;max_comments=50,50,0,0",
+            f"https://www.youtube.com/watch?v={video_id}"
+        ]
+
+        try:
+            proc = spawn_yt_dlp(cmd)
+            if not proc:
+                return None
+            stdout, _ = proc.communicate(timeout=120)
+            cleanup_process(proc)
+
+            if proc.returncode != 0:
+                return None
+
+            data = json.loads(stdout)
+
+            # Extract top 50 comments (no replies)
+            comments = []
+            for c in (data.get("comments") or [])[:50]:
+                comments.append({
+                    "author": c.get("author", ""),
+                    "text": c.get("text", ""),
+                    "likes": c.get("like_count", 0),
+                    "time": c.get("timestamp") or c.get("time_text", ""),
+                })
+
+            return {
+                "video_id": video_id,
+                "title": data.get("title", title),
+                "description": data.get("description", ""),
+                "view_count": data.get("view_count", 0),
+                "like_count": data.get("like_count", 0),
+                "comment_count": data.get("comment_count", 0),
+                "upload_date": data.get("upload_date", ""),
+                "duration": data.get("duration", 0),
+                "thumbnail_url": data.get("thumbnail", ""),
+                "comments": comments,
+                "fetched_at": datetime.now().isoformat(),
+            }
+        except subprocess.TimeoutExpired:
+            if proc:
+                proc.kill()
+                cleanup_process(proc)
+            log(f"Metadata: timeout fetching {title[:40]}\n", "red")
+            return None
+        except (json.JSONDecodeError, Exception) as e:
+            if proc:
+                cleanup_process(proc)
+            return None
+
+    def _download_thumbnail(self, url, thumb_dir, title, video_id):
+        """Download a thumbnail image to the .Thumbnails folder."""
+        # Build filename from title + video_id (matching video file naming)
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:100]
+        fname = f"{safe_title} [{video_id}].jpg"
+        fpath = os.path.join(thumb_dir, fname)
+        if os.path.isfile(fpath):
+            return  # already downloaded
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                img_data = resp.read()
+            with open(fpath, "wb") as f:
+                f.write(img_data)
+        except Exception:
+            pass  # non-fatal — skip thumbnail on failure
+
+    # ── Thumbnail display ─────────────────────────────────────────────────
+
+    def _show_browse_thumbnail(self, video_id, title, channel, folder_path,
+                                split_years, split_months, year, month):
+        """Show the thumbnail for the selected video, if available."""
+        self._hide_browse_thumbnail()
+
+        # Find the .Thumbnails folder for this video's location
+        _, subfolder = self._get_metadata_jsonl_path(
+            channel, folder_path, split_years, split_months,
+            year=year, month=month)
+        thumb_dir = os.path.join(subfolder, ".Thumbnails")
+
+        # Look for thumbnail file matching this video ID
+        thumb_path = None
+        if os.path.isdir(thumb_dir):
+            for fn in os.listdir(thumb_dir):
+                if video_id and f"[{video_id}]" in fn and fn.lower().endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")):
+                    thumb_path = os.path.join(thumb_dir, fn)
+                    break
+
+        if not thumb_path or not os.path.isfile(thumb_path):
+            return
+
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return  # Pillow not available
+
+        def _load_and_show():
+            try:
+                img = Image.open(thumb_path)
+                # Scale to fit width of viewer, max height 280px
+                vf_width = self._browse_viewer.winfo_width()
+                if vf_width < 100:
+                    vf_width = 600
+                # Maintain aspect ratio
+                aspect = img.width / img.height
+                target_w = min(vf_width - 24, img.width)
+                target_h = int(target_w / aspect)
+                if target_h > 280:
+                    target_h = 280
+                    target_w = int(target_h * aspect)
+                img = img.resize((target_w, target_h), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._browse_thumb_photo = photo
+                self._browse_thumb_label.config(image=photo)
+                self._browse_thumb_frame.config(height=target_h + 12)
+                self._browse_thumb_visible = True
+            except Exception:
+                self._hide_browse_thumbnail()
+
+        # Run on main thread
+        self.after(0, _load_and_show)
+
+    def _hide_browse_thumbnail(self):
+        """Hide the thumbnail display."""
+        if self._browse_thumb_visible:
+            self._browse_thumb_frame.config(height=0)
+            self._browse_thumb_label.config(image="")
+            self._browse_thumb_photo = None
+            self._browse_thumb_visible = False
+
+    # ── Pull-up metadata drawer ───────────────────────────────────────────
+
+    def _toggle_browse_drawer(self):
+        """Toggle the metadata drawer open/closed."""
+        if self._browse_drawer_visible:
+            self._hide_browse_drawer()
+        else:
+            self._show_browse_drawer()
+
+    def _show_browse_drawer(self):
+        """Expand the metadata drawer overlay from the bottom."""
+        if self._browse_drawer_visible:
+            return
+        self._browse_drawer_visible = True
+        self._browse_drawer_toggle_lbl.config(text="▼  Metadata")
+        # Overlay bottom 60% of the viewer area
+        self._browse_drawer_frame.place_forget()
+        self._browse_drawer_frame.place(
+            relx=0, rely=1.0, relwidth=1.0, relheight=0.6,
+            anchor="sw")
+        self._browse_drawer_frame.lift()
+
+    def _hide_browse_drawer(self):
+        """Collapse the metadata drawer back to just the handle bar."""
+        if not self._browse_drawer_visible:
+            return
+        self._browse_drawer_visible = False
+        self._browse_drawer_toggle_lbl.config(text="▲  Metadata")
+        # Collapse to just the handle bar — place_forget first to clear relheight
+        self._browse_drawer_frame.place_forget()
+        self._browse_drawer_frame.place(
+            relx=0, rely=1.0, relwidth=1.0, height=28,
+            anchor="sw")
+        self._browse_drawer_frame.lift()
+
+    def _load_browse_metadata(self, video_id, title, channel, folder_path,
+                               split_years, split_months, year, month):
+        """Load metadata for the selected video into the drawer (if available).
+        Also triggers thumbnail display. Runs from background thread context."""
+        if not video_id:
+            self.after(0, self._clear_browse_drawer)
+            return
+
+        meta_path, subfolder = self._get_metadata_jsonl_path(
+            channel, folder_path, split_years, split_months,
+            year=year, month=month)
+
+        existing = self._read_metadata_jsonl(meta_path)
+        entry = existing.get(video_id)
+
+        if not entry:
+            self.after(0, self._clear_browse_drawer)
+            return
+
+        # Store the current metadata entry for player drawer access
+        self._current_metadata_entry = entry
+
+        def _apply():
+            # Populate browse drawer
+            self._populate_drawer_text(self._browse_drawer_text, entry)
+            self._browse_drawer_toggle_lbl.config(
+                text="▲  Metadata" if not self._browse_drawer_visible
+                else "▼  Metadata")
+
+            # Show the drawer handle at the bottom (collapsed)
+            if not self._browse_drawer_visible:
+                self._browse_drawer_frame.place_forget()
+                self._browse_drawer_frame.place(
+                    relx=0, rely=1.0, relwidth=1.0, height=28,
+                    anchor="sw")
+                self._browse_drawer_frame.lift()
+
+            # Also populate player drawer so it's ready when the user plays
+            self._populate_drawer_text(self._player_drawer_text, entry)
+            self._player_drawer_toggle_lbl.config(
+                text="▲  Metadata" if not self._player_drawer_visible
+                else "▼  Metadata")
+            # Show collapsed handle in player too
+            if not self._player_drawer_visible:
+                self._player_drawer_frame.place_forget()
+                self._player_drawer_frame.place(
+                    relx=0, rely=1.0, relwidth=1.0, height=28,
+                    anchor="sw")
+                self._player_drawer_frame.lift()
+
+        self.after(0, _apply)
+
+        # Show thumbnail
+        self._show_browse_thumbnail(
+            video_id, title, channel, folder_path,
+            split_years, split_months, year, month)
+
+    def _clear_browse_drawer(self):
+        """Clear and hide the drawer when no metadata is available."""
+        self._current_metadata_entry = None
+        self._browse_drawer_frame.place_forget()
+        self._browse_drawer_visible = False
+        self._browse_drawer_text.config(state="normal")
+        self._browse_drawer_text.delete("1.0", "end")
+        self._browse_drawer_text.config(state="disabled")
+        self._hide_browse_thumbnail()
+        # Also clear player drawer
+        self._player_drawer_frame.place_forget()
+        self._player_drawer_visible = False
+        self._player_drawer_text.config(state="normal")
+        self._player_drawer_text.delete("1.0", "end")
+        self._player_drawer_text.config(state="disabled")
+
+    # ── Player metadata drawer ────────────────────────────────────────────
+
+    def _toggle_player_drawer(self):
+        if self._player_drawer_visible:
+            self._hide_player_drawer()
+        else:
+            self._show_player_drawer()
+
+    def _show_player_drawer(self):
+        if self._player_drawer_visible:
+            return
+        self._player_drawer_visible = True
+        self._player_drawer_toggle_lbl.config(text="▼  Metadata")
+        self._player_drawer_frame.place_forget()
+        self._player_drawer_frame.place(
+            relx=0, rely=1.0, relwidth=1.0, relheight=0.6,
+            anchor="sw")
+        self._player_drawer_frame.lift()
+
+    def _hide_player_drawer(self):
+        if not self._player_drawer_visible:
+            return
+        self._player_drawer_visible = False
+        self._player_drawer_toggle_lbl.config(text="▲  Metadata")
+        self._player_drawer_frame.place_forget()
+        self._player_drawer_frame.place(
+            relx=0, rely=1.0, relwidth=1.0, height=28,
+            anchor="sw")
+        self._player_drawer_frame.lift()
+
+    def _populate_drawer_text(self, text_widget, entry):
+        """Fill a drawer text widget with metadata content."""
+        text_widget.config(state="normal")
+        text_widget.delete("1.0", "end")
+        views = entry.get("view_count", 0)
+        likes = entry.get("like_count", 0)
+        views_str = f"{views:,}" if views else "N/A"
+        likes_str = f"{likes:,}" if likes else "N/A"
+        text_widget.insert("end", "Views: ", "meta_label")
+        text_widget.insert("end", f"{views_str}    ")
+        text_widget.insert("end", "Likes: ", "meta_label")
+        text_widget.insert("end", f"{likes_str}\n\n")
+        desc = entry.get("description", "").strip()
+        if desc:
+            text_widget.insert("end", "Description\n", "meta_label")
+            text_widget.insert("end", desc + "\n\n")
+        comments = entry.get("comments", [])
+        if comments:
+            text_widget.insert("end", f"Top Comments ({len(comments)})\n\n", "meta_label")
+            for c in comments:
+                author = c.get("author", "Unknown")
+                text_c = c.get("text", "")
+                clikes = c.get("likes", 0)
+                text_widget.insert("end", f"{author}", "comment_author")
+                if clikes:
+                    text_widget.insert("end", f"  ({clikes:,} likes)", "comment_likes")
+                text_widget.insert("end", f"\n{text_c}\n\n")
+        text_widget.config(state="disabled")
+        text_widget.yview_moveto(0)
+
+    # ── Video grid view ────────────────────────────────────────────────────
+
+    def _show_grid(self, channel, year=None, month=None):
+        """Show the video grid for a folder scope. Hides the transcript viewer."""
+        self._grid_scope = (channel, year, month)
+        # Hide transcript-related widgets
+        self._browse_thumb_frame.pack_forget()
+        self._browse_viewer.pack_forget()
+        # Find and hide the scrollbar (it's packed in vf)
+        for w in self._vf.winfo_children():
+            if isinstance(w, ttk.Scrollbar) and w != self._grid_scrollbar:
+                w.pack_forget()
+        self._browse_drawer_frame.place_forget()
+        # Show grid
+        if not self._grid_visible:
+            self._grid_frame.pack(fill="both", expand=True)
+            self._grid_visible = True
+        # Build scope label
+        scope = channel
+        if year is not None:
+            scope += f" / {year}"
+        if month is not None and 1 <= (month or 0) <= 12:
+            scope += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
+        self._grid_title_lbl.config(text=f"{scope}")
+        self._browse_viewer_title.config(text=scope)
+        self._browse_path_label.config(text="")
+        # Disable play/actions buttons (no single video selected)
+        self._browse_play_btn.config(state="disabled")
+        self._browse_actions_btn.config(state="disabled")
+        # Load videos in background
+        threading.Thread(target=self._grid_load_videos,
+                         args=(channel, year, month), daemon=True).start()
+
+    def _hide_grid(self):
+        """Hide the video grid and restore the transcript viewer."""
+        if not self._grid_visible:
+            return
+        self._grid_frame.pack_forget()
+        self._grid_visible = False
+        # Restore transcript widgets
+        self._browse_thumb_frame.pack(fill="x", before=self._browse_viewer)
+        # Re-pack scrollbar and viewer
+        for w in self._vf.winfo_children():
+            if isinstance(w, ttk.Scrollbar) and w != self._grid_scrollbar:
+                w.pack(side="right", fill="y")
+                break
+        self._browse_viewer.pack(fill="both", expand=True)
+
+    def _grid_load_videos(self, channel, year, month):
+        """Background: query videos and metadata for the grid."""
+        if not self._conn:
+            return
+        sql = "SELECT title, filepath, video_id, tx_status FROM videos WHERE channel=?"
+        params = [channel]
+        if year is not None:
+            sql += " AND year=?"
+            params.append(year)
+        if month is not None:
+            sql += " AND month=?"
+            params.append(month)
+        try:
+            rows = self._db_execute(sql, params).fetchall()
+        except Exception:
+            return
+
+        # Get file mtimes for date sorting
+        import datetime as _dt
+        videos = []
+        for title, filepath, video_id, tx_status in rows:
+            mtime = 0.0
+            if filepath:
+                try:
+                    mtime = os.path.getmtime(filepath)
+                except OSError:
+                    pass
+            videos.append({
+                "title": title, "filepath": filepath,
+                "video_id": video_id, "tx_status": tx_status,
+                "mtime": mtime,
+                "date_str": _dt.datetime.fromtimestamp(mtime).strftime("%b %d, %Y") if mtime else "",
+            })
+
+        # Load metadata if available
+        ch_cfg = None
+        with config_lock:
+            for ch in config.get("channels", []):
+                if ch.get("name", "") == channel:
+                    ch_cfg = ch
+                    break
+        metadata = {}
+        has_metadata = False
+        thumb_dir = None
+        if ch_cfg:
+            folder = ch_cfg.get("folder_override") or sanitize_folder(channel)
+            with config_lock:
+                base = config.get("output_dir", "")
+            folder_path = os.path.join(base, folder) if base else folder
+            sy = ch_cfg.get("split_years", False)
+            sm = ch_cfg.get("split_months", False)
+            meta_path, subfolder = self._get_metadata_jsonl_path(
+                channel, folder_path, sy, sm, year=year, month=month)
+            metadata = self._read_metadata_jsonl(meta_path)
+            has_metadata = bool(metadata)
+            thumb_dir = os.path.join(subfolder, ".Thumbnails")
+            if not os.path.isdir(thumb_dir):
+                thumb_dir = None
+
+        # Enrich videos with metadata
+        for v in videos:
+            m = metadata.get(v["video_id"]) if v["video_id"] else None
+            v["view_count"] = m.get("view_count", 0) if m else 0
+            v["like_count"] = m.get("like_count", 0) if m else 0
+            v["duration"] = m.get("duration", 0) if m else 0
+            v["upload_date"] = m.get("upload_date", "") if m else ""
+            if m and m.get("upload_date") and not v["date_str"]:
+                try:
+                    _ud = m["upload_date"]
+                    v["date_str"] = f"{_ud[4:6]}/{_ud[6:8]}/{_ud[:4]}"
+                except Exception:
+                    pass
+
+        # Sort by date (newest first) by default
+        videos.sort(key=lambda x: x["mtime"], reverse=True)
+
+        # Find thumbnail paths
+        for v in videos:
+            v["thumb_path"] = None
+            if thumb_dir and v["video_id"]:
+                for fn in os.listdir(thumb_dir) if os.path.isdir(thumb_dir) else []:
+                    if f"[{v['video_id']}]" in fn:
+                        v["thumb_path"] = os.path.join(thumb_dir, fn)
+                        break
+
+        self._grid_videos = videos
+        self.after(0, lambda: self._grid_render(has_metadata, channel, year, month))
+
+    def _grid_render(self, has_metadata, channel, year, month):
+        """Render the video grid on the main thread."""
+        # Check scope hasn't changed while loading
+        if self._grid_scope != (channel, year, month):
+            return
+
+        # Show/hide metadata banner
+        if not has_metadata:
+            self._grid_meta_banner.pack(fill="x", after=self._grid_header)
+        else:
+            self._grid_meta_banner.pack_forget()
+
+        # Clear old cards
+        for w in self._grid_inner.winfo_children():
+            w.destroy()
+        self._grid_cards.clear()
+        self._grid_photos.clear()
+
+        if not self._grid_videos:
+            tk.Label(self._grid_inner, text="No videos found",
+                     bg=self._TP_BG, fg=self._TP_DIM,
+                     font=("Segoe UI", 11)).pack(pady=40)
+            return
+
+        self._grid_build_cards()
+
+    def _grid_build_cards(self):
+        """Build video cards in the grid inner frame using grid layout."""
+        # Clear existing
+        for w in self._grid_inner.winfo_children():
+            w.destroy()
+        self._grid_cards.clear()
+        self._grid_photos.clear()
+
+        canvas_w = self._grid_canvas.winfo_width()
+        if canvas_w < 50:
+            canvas_w = 600
+        self._grid_last_width = canvas_w
+
+        pad = 8
+        min_card = 200
+        cols = max(1, (canvas_w - pad) // (min_card + pad))
+        card_w = (canvas_w - pad * (cols + 1)) // cols
+        if card_w < 150:
+            card_w = 150
+        thumb_h = int(card_w * 9 / 16)
+
+        # Configure grid columns with equal weight
+        for c in range(cols):
+            self._grid_inner.columnconfigure(c, weight=1, uniform="card")
+
+        try:
+            from PIL import Image, ImageTk
+            _has_pil = True
+        except ImportError:
+            _has_pil = False
+
+        # Pre-generate a 1x1 transparent image for pixel-sized labels
+        if _has_pil:
+            _pixel = ImageTk.PhotoImage(Image.new("RGBA", (1, 1), (0, 0, 0, 0)))
+            self._grid_photos["__pixel__"] = _pixel
+        else:
+            _pixel = None
+
+        def _mw(e):
+            self._grid_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        for i, v in enumerate(self._grid_videos):
+            row = i // cols
+            col = i % cols
+
+            card = tk.Frame(self._grid_inner, bg=self._TP_BG2, cursor="hand2")
+            card.grid(row=row, column=col, padx=pad // 2, pady=(pad, 0), sticky="new")
+
+            # Thumbnail — use a pixel image to force pixel sizing on the Label
+            if _pixel:
+                thumb_label = tk.Label(card, bg="#0a0b0d", image=_pixel,
+                                        width=card_w, height=thumb_h, compound="center")
+            else:
+                thumb_label = tk.Label(card, bg="#0a0b0d", text="🎬",
+                                        font=("Segoe UI", 20), fg="#333")
+            thumb_label.pack(fill="x")
+
+            # Duration overlay
+            if v["duration"]:
+                _dur_m, _dur_s = divmod(int(v["duration"]), 60)
+                _dur_h, _dur_m = divmod(_dur_m, 60)
+                _dur_str = f"{_dur_h}:{_dur_m:02d}:{_dur_s:02d}" if _dur_h else f"{_dur_m}:{_dur_s:02d}"
+                dur_lbl = tk.Label(thumb_label, text=f" {_dur_str} ", bg="#000000",
+                                    fg="#ffffff", font=("Segoe UI", 7, "bold"))
+                dur_lbl.place(relx=1.0, rely=1.0, anchor="se", x=-4, y=-4)
+                dur_lbl.bind("<MouseWheel>", _mw)
+
+            # Info area
+            info = tk.Frame(card, bg=self._TP_BG2, padx=6, pady=4)
+            info.pack(fill="x")
+
+            disp_title = v["title"]
+            if len(disp_title) > 55:
+                disp_title = disp_title[:52] + "..."
+            title_lbl = tk.Label(info, text=disp_title, bg=self._TP_BG2,
+                                  fg=self._TP_FG, font=("Segoe UI", 8, "bold"),
+                                  anchor="nw", justify="left", wraplength=card_w - 16)
+            title_lbl.pack(fill="x")
+
+            stats_parts = []
+            if v["view_count"]:
+                vc = v["view_count"]
+                if vc >= 1_000_000:
+                    stats_parts.append(f"{vc / 1_000_000:.1f}M views")
+                elif vc >= 1_000:
+                    stats_parts.append(f"{vc / 1_000:.1f}K views")
+                else:
+                    stats_parts.append(f"{vc:,} views")
+            if v["date_str"]:
+                stats_parts.append(v["date_str"])
+            stats_lbl = None
+            if stats_parts:
+                stats_lbl = tk.Label(info, text="  •  ".join(stats_parts),
+                                      bg=self._TP_BG2, fg=self._TP_DIM,
+                                      font=("Segoe UI", 7), anchor="w")
+                stats_lbl.pack(fill="x")
+
+            # Click → navigate to video
+            _title = v["title"]
+            def _click(e, t=_title):
+                self._grid_navigate_to_video(t)
+            _all_w = [card, thumb_label, info, title_lbl]
+            if stats_lbl:
+                _all_w.append(stats_lbl)
+            for w in _all_w:
+                w.bind("<Button-1>", _click)
+                w.bind("<MouseWheel>", _mw)
+
+            # Hover
+            def _enter(e, c=card, il=info, tl=title_lbl, sl=stats_lbl):
+                _hc = "#252830"
+                c.config(bg=_hc); il.config(bg=_hc); tl.config(bg=_hc)
+                if sl: sl.config(bg=_hc)
+            def _leave(e, c=card, il=info, tl=title_lbl, sl=stats_lbl):
+                _nc = self._TP_BG2
+                c.config(bg=_nc); il.config(bg=_nc); tl.config(bg=_nc)
+                if sl: sl.config(bg=_nc)
+            for w in _all_w:
+                w.bind("<Enter>", _enter)
+                w.bind("<Leave>", _leave)
+
+            self._grid_cards.append(card)
+
+            # Show placeholder icon if no thumbnail will be loaded
+            if not v["thumb_path"] or not _has_pil:
+                tk.Label(thumb_label, text="🎬", bg="#0a0b0d", fg="#333",
+                         font=("Segoe UI", 20)).place(relx=0.5, rely=0.5, anchor="center")
+
+            # Load thumbnail in background to avoid lag
+            if v["thumb_path"] and _has_pil:
+                _tpath = v["thumb_path"]
+                _tlbl = thumb_label
+                _cw = card_w
+                _th = thumb_h
+                def _load_thumb(path=_tpath, lbl=_tlbl, w=_cw, h=_th, title_key=_title):
+                    try:
+                        img = Image.open(path)
+                        img = img.resize((w, h), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        def _apply(p=photo, l=lbl, tk=title_key):
+                            try:
+                                l.config(image=p)
+                                self._grid_photos[tk] = p
+                            except Exception:
+                                pass
+                        self.after(0, _apply)
+                    except Exception:
+                        pass
+                threading.Thread(target=_load_thumb, daemon=True).start()
+
+        # Update scroll region
+        self._grid_inner.update_idletasks()
+        self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all"))
+        self._grid_canvas.yview_moveto(0)
+
+    def _on_grid_canvas_resize(self, event):
+        """Responsive: rebuild grid when canvas width changes significantly."""
+        self._grid_canvas.itemconfig(self._grid_canvas_window, width=event.width)
+        if not self._grid_visible or not self._grid_videos:
+            return
+        # Only rebuild if column count would change
+        card_w = 220
+        pad = 10
+        new_cols = max(1, (event.width - pad) // (card_w + pad))
+        old_cols = max(1, (self._grid_last_width - pad) // (card_w + pad))
+        if new_cols != old_cols:
+            self._grid_last_width = event.width
+            self._grid_build_cards()
+
+    def _grid_resort(self):
+        """Re-sort the grid based on the current sort selection."""
+        sort = self._grid_sort_var.get()
+        if sort == "Views":
+            self._grid_videos.sort(key=lambda x: x["view_count"], reverse=True)
+        else:
+            self._grid_videos.sort(key=lambda x: x["mtime"], reverse=True)
+        if self._grid_visible:
+            self._grid_build_cards()
+
+    def _grid_navigate_to_video(self, title):
+        """Find the title node in the tree and select it (triggers transcript view).
+        If the tree node isn't expanded yet, expand the parent first."""
+        for iid, meta in self._browse_items.items():
+            if meta.get("type") == "title" and meta.get("title") == title:
+                self._browse_tree.selection_set(iid)
+                self._browse_tree.see(iid)
+                self._browse_tree.event_generate("<<TreeviewSelect>>")
+                return
+        # Node not found — try expanding the folder in the tree, then retry
+        if self._grid_scope:
+            channel, year, month = self._grid_scope
+            # Find the folder node and expand it
+            for iid, meta in self._browse_items.items():
+                _match = False
+                if month and meta.get("type") == "month" and meta.get("channel") == channel \
+                        and meta.get("year") == year and meta.get("month") == month:
+                    _match = True
+                elif not month and year and meta.get("type") == "year" \
+                        and meta.get("channel") == channel and meta.get("year") == year:
+                    _match = True
+                elif not month and not year and meta.get("type") == "channel" \
+                        and meta.get("channel") == channel:
+                    _match = True
+                if _match:
+                    self._browse_tree.item(iid, open=True)
+                    self._browse_tree.event_generate("<<TreeviewOpen>>")
+                    # Retry after a short delay (tree population is async)
+                    self.after(500, lambda t=title: self._grid_navigate_to_video_retry(t))
+                    return
+
+    def _grid_navigate_to_video_retry(self, title):
+        """Retry finding a title node after tree expansion."""
+        for iid, meta in self._browse_items.items():
+            if meta.get("type") == "title" and meta.get("title") == title:
+                self._browse_tree.selection_set(iid)
+                self._browse_tree.see(iid)
+                self._browse_tree.event_generate("<<TreeviewSelect>>")
+                return
+
+    def _grid_download_metadata(self):
+        """Trigger metadata download for the current grid scope."""
+        if not self._grid_scope:
+            return
+        channel, year, month = self._grid_scope
+        self._browse_download_metadata(channel, year, month)
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""
@@ -22627,12 +24102,45 @@ class _TranscriptionPanel(ttk.Frame):
                                               font=("Segoe UI", 10, "bold"))
         self._player_transcript.bind("<Button-1>", self._player_on_transcript_click)
 
+        # Metadata drawer overlay in the player transcript area
+        self._player_drawer_frame = tk.Frame(tf, bg="#141618", relief="flat")
+        self._player_drawer_visible = False
+        _pdh = tk.Frame(self._player_drawer_frame, bg="#222426", height=28, cursor="hand2")
+        _pdh.pack(fill="x", side="top")
+        _pdh.pack_propagate(False)
+        self._player_drawer_toggle_lbl = tk.Label(
+            _pdh, text="▲  Metadata", bg="#222426",
+            fg=self._TP_DIM, font=("Segoe UI", 8, "bold"), cursor="hand2")
+        self._player_drawer_toggle_lbl.pack(side="left", padx=10)
+        def _player_drawer_click(e):
+            self._toggle_player_drawer()
+            return "break"
+        _pdh.bind("<Button-1>", _player_drawer_click)
+        self._player_drawer_toggle_lbl.bind("<Button-1>", _player_drawer_click)
+        self._player_drawer_text = tk.Text(
+            self._player_drawer_frame, bg="#141618", fg=self._TP_FG,
+            font=("Segoe UI", 9), wrap="word", relief="flat",
+            padx=12, pady=8, state="disabled", cursor="arrow")
+        _pdsb = ttk.Scrollbar(self._player_drawer_frame, orient="vertical",
+                              command=self._player_drawer_text.yview)
+        self._player_drawer_text.configure(yscrollcommand=_pdsb.set)
+        self._player_drawer_text.tag_configure("meta_label",
+            foreground=self._TP_ACCENT, font=("Segoe UI", 9, "bold"))
+        self._player_drawer_text.tag_configure("meta_dim",
+            foreground=self._TP_DIM, font=("Segoe UI", 8))
+        self._player_drawer_text.tag_configure("comment_author",
+            foreground="#5a9fd4", font=("Segoe UI", 9, "bold"))
+        self._player_drawer_text.tag_configure("comment_likes",
+            foreground=self._TP_DIM, font=("Segoe UI", 8))
+        _pdsb.pack(side="right", fill="y")
+        self._player_drawer_text.pack(fill="both", expand=True)
+
         # Internal player state
         self._vlc_instance  = None
         self._vlc_player    = None
         self._player_active = False
         self._player_poll_id = None
-        self._player_words  = []   # [{"w": str, "s": float, "e": float, "tag": str}, ...]
+        self._player_words  = []   # [{"w": str, "s": float, "e": float, "cs": int, "ce": int}, ...]
         self._player_segs   = []   # [(start, end, text, char_start, char_end), ...]
         self._player_video_path = None
         self._player_last_word_idx = -1
@@ -22678,6 +24186,7 @@ class _TranscriptionPanel(ttk.Frame):
                 p = os.path.dirname(search_dirs[-1])
                 if p != search_dirs[-1]:
                     search_dirs.append(p)
+            _tx_header = ""
             for sd in search_dirs:
                 try:
                     for fn in os.listdir(sd):
@@ -22686,6 +24195,7 @@ class _TranscriptionPanel(ttk.Frame):
                             section = self._get_txt_section(fpath, title)
                             if section:
                                 lines = section.split('\n', 1)
+                                _tx_header = lines[0]
                                 body = lines[1].strip() if len(lines) > 1 else ""
                                 if body:
                                     txt_body_found = True
@@ -22708,15 +24218,43 @@ class _TranscriptionPanel(ttk.Frame):
                 max_end = max(max_end, end)
             body = " ".join(parts)
 
+        _body_char_offset = 0  # chars before body in the text widget
         if body:
             # Show notice if transcript text exists but no word timing data
             if not db_rows:
+                _notice = ("Word-by-word highlight unavailable — rebuild the index "
+                           "(Browse → Index → Build / Update) to enable.\n\n")
                 self._player_transcript.tag_configure(
                     "db_notice", foreground="#888888",
                     font=("Segoe UI", 9, "italic"))
-                self._player_transcript.insert("end",
-                    "Word-by-word highlight unavailable — rebuild the index "
-                    "(Browse → Index → Build / Update) to enable.\n\n", "db_notice")
+                self._player_transcript.insert("end", _notice, "db_notice")
+                _body_char_offset += len(_notice)
+            # Show accuracy notice for YT-sourced transcripts (clickable)
+            _is_yt_source = txt_body_found and _tx_header and (
+                "YT+PUNCTUATION" in _tx_header or "YT CAPTIONS" in _tx_header)
+            if _is_yt_source and db_rows:
+                _yt_notice = "Highlight timing is approximate — "
+                _yt_link = "re-transcribe with Whisper"
+                _yt_suffix = " for word-accurate sync.\n\n"
+                self._player_transcript.tag_configure(
+                    "yt_notice", foreground="#7a6a3a",
+                    font=("Segoe UI", 8, "italic"))
+                self._player_transcript.tag_configure(
+                    "yt_retranscribe", foreground="#9a8a4a",
+                    font=("Segoe UI", 8, "italic underline"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Enter>",
+                    lambda e: self._player_transcript.config(cursor="hand2"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Leave>",
+                    lambda e: self._player_transcript.config(cursor="hand2"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Button-1>",
+                    lambda e: self._on_retranscribe())
+                self._player_transcript.insert("end", _yt_notice, "yt_notice")
+                self._player_transcript.insert("end", _yt_link, "yt_retranscribe")
+                self._player_transcript.insert("end", _yt_suffix, "yt_notice")
+                _body_char_offset += len(_yt_notice) + len(_yt_link) + len(_yt_suffix)
             self._player_transcript.insert("end", body + "\n")
         else:
             if tx_status == "no_captions":
@@ -22761,11 +24299,13 @@ class _TranscriptionPanel(ttk.Frame):
         # Uses sequential forward-matching: a cursor advances through the body
         # text so each word maps to a position AFTER the previous one.  This
         # guarantees monotonically increasing positions (no highlight jumping).
+        # Performance: instead of creating thousands of individual tk.Text tags
+        # (which degrades to near-quadratic), we store char offsets in a list
+        # and move a single "active_word" tag during playback.
         if all_words and body:
             body_lower = body.lower()
             body_len = len(body)
             cursor = 0       # current search position — only moves forward
-            word_idx = 0
 
             for s, e, w in all_words:
                 w_lower = w.lower().rstrip(".,!?;:'\"")
@@ -22794,15 +24334,13 @@ class _TranscriptionPanel(ttk.Frame):
                     wend = best_offset + len(w_lower)
                     while wend < body_len and body[wend] in ".,!?;:'\")-":
                         wend += 1
-                    tag_name = f"w{word_idx}"
-                    cs = f"1.0+{best_offset}c"
-                    ce = f"1.0+{wend}c"
-                    self._player_transcript.tag_add(tag_name, cs, ce)
+                    # Store char offsets adjusted for any prefix text (notices)
                     self._player_words.append({
-                        "w": w, "s": s, "e": e, "tag": tag_name
+                        "w": w, "s": s, "e": e,
+                        "cs": best_offset + _body_char_offset,
+                        "ce": wend + _body_char_offset
                     })
                     cursor = wend  # advance cursor past this word
-                    word_idx += 1
                 # If word not found, skip it — don't create a bad mapping
 
         self._player_transcript.config(state="disabled")
@@ -22943,10 +24481,8 @@ class _TranscriptionPanel(ttk.Frame):
         if self._player_follow_var.get() and self._player_last_word_idx >= 0:
             idx = self._player_last_word_idx
             if 0 <= idx < len(self._player_words):
-                tag = self._player_words[idx]["tag"]
-                ranges = self._player_transcript.tag_ranges(tag)
-                if ranges:
-                    self._player_transcript.yview_pickplace(ranges[0])
+                cs = f"1.0+{self._player_words[idx]['cs']}c"
+                self._player_transcript.yview_pickplace(cs)
 
     def _player_on_volume(self, val):
         """Debounced volume change — only calls VLC after slider stops moving."""
@@ -22965,26 +24501,48 @@ class _TranscriptionPanel(ttk.Frame):
                 pass
 
     def _player_on_transcript_click(self, event):
-        """Click a word in the transcript to seek to it."""
+        """Click a word in the transcript to seek to it.
+        Uses binary search on stored char offsets instead of per-word tags."""
         if not self._vlc_player or not self._player_words:
             return
         idx = self._player_transcript.index(f"@{event.x},{event.y}")
-        # Find which word tag covers this position
-        tags = self._player_transcript.tag_names(idx)
-        for t in tags:
-            if t.startswith("w"):
-                try:
-                    widx = int(t[1:])
-                    if 0 <= widx < len(self._player_words):
-                        seek_time = max(0, self._player_words[widx]["s"])
-                        self._player_seek(seek_time)
-                        # Auto-play if paused
-                        if not self._vlc_player.is_playing():
-                            self._vlc_player.play()
-                            self._player_play_btn.config(text="⏸")
-                        return
-                except ValueError:
-                    pass
+        # Convert text index to char offset from start
+        try:
+            char_offset = len(self._player_transcript.get("1.0", idx))
+        except Exception:
+            return
+        # Binary search for the word whose char range contains this offset
+        lo, hi = 0, len(self._player_words) - 1
+        found = -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            wd = self._player_words[mid]
+            if char_offset < wd["cs"]:
+                hi = mid - 1
+            elif char_offset >= wd["ce"]:
+                lo = mid + 1
+            else:
+                found = mid
+                break
+        # If click landed between words (on a space), use the nearest word
+        if found < 0 and self._player_words:
+            # lo is the insertion point — nearest word is lo or lo-1
+            if lo >= len(self._player_words):
+                found = len(self._player_words) - 1
+            elif lo == 0:
+                found = 0
+            else:
+                # Pick whichever word boundary is closer
+                dist_prev = char_offset - self._player_words[lo - 1]["ce"]
+                dist_next = self._player_words[lo]["cs"] - char_offset
+                found = lo - 1 if dist_prev <= dist_next else lo
+        if 0 <= found < len(self._player_words):
+            seek_time = max(0, self._player_words[found]["s"])
+            self._player_seek(seek_time)
+            if not self._vlc_player.is_playing():
+                self._vlc_player.play()
+                self._player_play_btn.config(text="⏸")
+            return
 
     def _fmt_player_time(self, ms):
         """Format milliseconds to M:SS or H:MM:SS."""
@@ -23045,7 +24603,9 @@ class _TranscriptionPanel(ttk.Frame):
     def _player_highlight_word(self, cur_sec):
         """Highlight the word currently being spoken — single word, no skipping.
         Instead of jumping to wherever VLC reports, we step forward one word
-        at a time so every word gets highlighted for at least one poll cycle."""
+        at a time so every word gets highlighted for at least one poll cycle.
+        Uses char offsets stored in _player_words instead of per-word tags
+        for O(1) highlight updates regardless of transcript length."""
         if not self._player_words:
             return
 
@@ -23083,45 +24643,29 @@ class _TranscriptionPanel(ttk.Frame):
 
         self._player_last_word_idx = new_idx
 
-        # Remove highlight from previous word
-        prev_tag = getattr(self, '_player_prev_tag', None)
-        if prev_tag:
-            try:
-                ranges = self._player_transcript.tag_ranges(prev_tag)
-                if ranges:
-                    self._player_transcript.tag_remove("active_word",
-                                                        ranges[0], ranges[1])
-            except Exception:
-                pass
+        # Remove previous highlight
+        self._player_transcript.tag_remove("active_word", "1.0", "end")
 
-        # Add highlight to new word
+        # Add highlight to new word using stored char offsets
         if 0 <= new_idx < len(self._player_words):
             word_data = self._player_words[new_idx]
-            word_tag = word_data["tag"]
-            ranges = self._player_transcript.tag_ranges(word_tag)
-            if ranges:
-                self._player_transcript.tag_add("active_word",
-                                                 ranges[0], ranges[1])
-                if self._player_follow_var.get():
-                    # Follow mode: once the highlight passes the middle of the
-                    # visible area, scroll it back up near the top.
-                    try:
-                        bbox = self._player_transcript.bbox(ranges[0])
-                        if bbox:
-                            _wid_h = self._player_transcript.winfo_height()
-                            _word_y = bbox[1]
-                            if _word_y > _wid_h * 0.5:
-                                # Scroll so this word is ~20% from the top
-                                self._player_transcript.yview_pickplace(ranges[0])
-                    except Exception:
-                        self._player_transcript.see(ranges[0])
-                else:
-                    # Default: just ensure visible every ~5 words
-                    if abs(new_idx - (prev if prev >= 0 else 0)) >= 3:
-                        self._player_transcript.see(ranges[0])
-            self._player_prev_tag = word_tag
-        else:
-            self._player_prev_tag = None
+            cs = f"1.0+{word_data['cs']}c"
+            ce = f"1.0+{word_data['ce']}c"
+            self._player_transcript.tag_add("active_word", cs, ce)
+            if self._player_follow_var.get():
+                try:
+                    bbox = self._player_transcript.bbox(cs)
+                    if bbox:
+                        _wid_h = self._player_transcript.winfo_height()
+                        _word_y = bbox[1]
+                        if _word_y > _wid_h * 0.5:
+                            self._player_transcript.yview_pickplace(cs)
+                except Exception:
+                    self._player_transcript.see(cs)
+            else:
+                # Default: just ensure visible every ~5 words
+                if abs(new_idx - (prev if prev >= 0 else 0)) >= 3:
+                    self._player_transcript.see(cs)
 
     # ── Index section ─────────────────────────────────────────────────────────
 
@@ -25263,7 +26807,7 @@ def _save_queue_state():
 def _save_queue_state_now():
     """Actually save current queue state to disk."""
     _save_queue_state_pending["job"] = None
-    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "redownload": [], "order": [], "gpu": []}
+    queue_data = {"sync": [], "reorg": [], "video": [], "transcribe": [], "redownload": [], "metadata": [], "order": [], "gpu": []}
     # Include the currently-running sync channel so it survives crashes
     if _current_sync_ch is not None and _sync_running:
         with _sync_queue_lock:
@@ -25286,6 +26830,9 @@ def _save_queue_state_now():
     with _redownload_queue_lock:
         for item in _redownload_queue:
             queue_data["redownload"].append(copy.deepcopy(item))
+    with _metadata_queue_lock:
+        for item in _metadata_queue:
+            queue_data["metadata"].append(copy.deepcopy(item))
     with _video_dl_queue_lock:
         # Video download commands contain subprocess args — skip them (not easily restorable)
         pass
@@ -25359,6 +26906,13 @@ def _load_queue_state():
                 for item in redownload_items:
                     if not any(q["ch_url"] == item["ch_url"] for q in _redownload_queue):
                         _redownload_queue.append(item)
+                        restored += 1
+        metadata_items = queue_data.get("metadata", [])
+        if metadata_items:
+            with _metadata_queue_lock:
+                for item in metadata_items:
+                    if not any(q["_key"] == item["_key"] for q in _metadata_queue):
+                        _metadata_queue.append(item)
                         restored += 1
         gpu_items = queue_data.get("gpu", [])
         gpu_restored = 0

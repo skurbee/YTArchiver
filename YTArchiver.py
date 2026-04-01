@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.6"
+APP_VERSION = "v30.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3584,7 +3584,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:55pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 2:21pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7317,7 +7317,7 @@ def _parse_vtt_to_text(vtt_path):
         with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except Exception:
-        traceback.print_exc()
+        log(f"  {traceback.format_exc()}\n", "dim")
         return ""
 
     lines = raw.split("\n")
@@ -7379,7 +7379,7 @@ def _parse_vtt_to_segments(vtt_path):
         with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except Exception:
-        traceback.print_exc()
+        log(f"  {traceback.format_exc()}\n", "dim")
         return []
 
     def _ts_to_secs(ts_str):
@@ -7770,7 +7770,7 @@ def _remove_jsonl_entries_for_title(jsonl_path, title):
         os.replace(tmp_path, jsonl_path)
         _hide_file_win(jsonl_path)
     except Exception:
-        traceback.print_exc()
+        log(f"  {traceback.format_exc()}\n", "dim")
 
 
 def _remove_jsonl_entries_for_title_all_files(folder_path, ch_name, title):
@@ -10370,7 +10370,7 @@ def _fetch_auto_captions(video_id, temp_dir, cookies_forced=False):
             for f in glob.glob(os.path.join(temp_dir, f"_transcript_{video_id}*")):
                 os.remove(f)
         except Exception:
-            traceback.print_exc()
+            log(f"  {traceback.format_exc()}\n", "dim")
 
     def _run_fetch(use_cookies, force_overwrites=False):
         cmd = [
@@ -10566,7 +10566,7 @@ def _sort_transcript_entries(txt_paths):
                     pass
                 raise
         except Exception:
-            traceback.print_exc()  # don't break transcription over a sort error
+            log(f"  {traceback.format_exc()}\n", "dim")  # don't break transcription over a sort error
 
 
 def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
@@ -11758,7 +11758,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 os.replace(_pftmp, _pfpath)
                                 _hide_file_win(_pfpath)
                         except Exception:
-                            traceback.print_exc()
+                            log(f"  {traceback.format_exc()}\n", "dim")
                 if _vid_id_patched:
                     log(f"  ✓ Linked YouTube IDs for {_vid_id_patched} Whisper segment(s).\n",
                         "simpleline_green")
@@ -19561,9 +19561,9 @@ def _tp_open_db(path):
     # Migration: add words column for word-level timestamps (added later; safe to ignore if exists)
     try:
         conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
-    except Exception as _e:
+    except sqlite3.OperationalError as _e:
         if "duplicate column" not in str(_e).lower():
-            traceback.print_exc()
+            log(f"  ALTER TABLE segments: {_e}\n", "dim")
     # Videos table — tracks ALL videos regardless of transcription status.
     # tx_status: 'pending' | 'transcribed' | 'no_captions' | 'error'
     conn.execute("""CREATE TABLE IF NOT EXISTS videos (
@@ -19728,7 +19728,7 @@ class _TranscriptionPanel(ttk.Frame):
     _TP_SIDEBAR = "#0d1117"
     _TP_SEL     = "#1a2535"
 
-    _VIDEO_EXTS = list(_VIDEO_EXTS) + ['.m4a']  # include audio for transcript matching
+    _VIDEO_EXTS = tuple(list(_VIDEO_EXTS) + ['.m4a'])  # include audio for transcript matching
     _thumb_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     _VLC_PATHS  = [
         r'C:\Program Files\VideoLAN\VLC\vlc.exe',
@@ -19987,73 +19987,68 @@ class _TranscriptionPanel(ttk.Frame):
 
         def _worker():
             count = 0
-            # Pre-scan: collect directories that have transcript files on disk
-            # (covers channels transcribed but not yet indexed in the DB)
+            # Single-pass scan: collect transcript dirs AND video files together
+            # to avoid walking the same directory tree twice (was NEW-3 audit item).
             dirs_with_transcripts = set()
+            pending_videos = []  # (ch_name, root_dir, dirpath, fn, fn_lower)
             for ch_name, ch_path, root_dir in channel_dirs:
                 for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
                     for fn in filenames:
                         fn_lower = fn.lower()
-                        if fn_lower.endswith('.txt') and 'transcript' in fn_lower:
+                        # Track dirs containing transcript/jsonl files
+                        if (fn_lower.endswith('.txt') and 'transcript' in fn_lower) or fn_lower.endswith('.jsonl'):
                             dirs_with_transcripts.add(dirpath)
-                            break
-                        if fn_lower.endswith('.jsonl'):
-                            dirs_with_transcripts.add(dirpath)
-                            break
+                        # Collect video files for DB insertion
+                        if fn_lower.endswith(self._VIDEO_EXTS) and ".temp." not in fn_lower and not fn_lower.endswith(".part"):
+                            pending_videos.append((ch_name, root_dir, dirpath, fn, fn_lower))
 
-            for ch_name, ch_path, root_dir in channel_dirs:
-                for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
-                    for fn in filenames:
-                        fn_lower = fn.lower()
-                        if not fn_lower.endswith(self._VIDEO_EXTS):
-                            continue
-                        if ".temp." in fn_lower or fn_lower.endswith(".part"):
-                            continue
-                        fp = os.path.join(dirpath, fn)
-                        # Derive year / month from path structure
-                        _, year, month = _tp_parse_path_meta(fp, [root_dir])
-                        title = os.path.splitext(fn)[0]
-                        # Extract video ID from yt-dlp filename pattern: "Title [VIDEO_ID].ext"
-                        _vid_id = None
-                        _bracket = title.rfind(" [")
-                        if _bracket >= 0 and title.endswith("]"):
-                            _candidate = title[_bracket + 2:-1]
-                            if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
-                                _vid_id = _candidate
-                        try:
-                            sz = os.path.getsize(fp)
-                        except OSError:
-                            sz = None
-                        # Check if transcript files exist on disk in this dir
-                        # or any parent dir (handles split_years/split_months)
-                        has_tx = False
-                        _chk = dirpath
-                        for _ in range(3):
-                            if _chk in dirs_with_transcripts:
-                                has_tx = True
-                                break
-                            _p = os.path.dirname(_chk)
-                            if _p == _chk:
-                                break
-                            _chk = _p
-                        status = "transcribed" if has_tx else "pending"
-                        try:
-                            self._db_execute(
-                                "INSERT OR IGNORE INTO videos "
-                                "(title, channel, year, month, filepath, video_id, tx_status, "
-                                " size_bytes, added_ts) "
-                                "VALUES (?,?,?,?,?,?,?,?,?)",
-                                (title, ch_name, year, month, fp, _vid_id, status, sz,
-                                 time.time()))
-                            # Backfill video_id for existing rows that are missing it
-                            if _vid_id:
-                                self._db_execute(
-                                    "UPDATE videos SET video_id=? "
-                                    "WHERE filepath=? AND video_id IS NULL",
-                                    (_vid_id, fp))
-                            count += 1
-                        except Exception:
-                            continue
+            # Now process all collected video files with transcript info available
+            for ch_name, root_dir, dirpath, fn, fn_lower in pending_videos:
+                fp = os.path.join(dirpath, fn)
+                # Derive year / month from path structure
+                _, year, month = _tp_parse_path_meta(fp, [root_dir])
+                title = os.path.splitext(fn)[0]
+                # Extract video ID from yt-dlp filename pattern: "Title [VIDEO_ID].ext"
+                _vid_id = None
+                _bracket = title.rfind(" [")
+                if _bracket >= 0 and title.endswith("]"):
+                    _candidate = title[_bracket + 2:-1]
+                    if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
+                        _vid_id = _candidate
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    sz = None
+                # Check if transcript files exist on disk in this dir
+                # or any parent dir (handles split_years/split_months)
+                has_tx = False
+                _chk = dirpath
+                for _ in range(3):
+                    if _chk in dirs_with_transcripts:
+                        has_tx = True
+                        break
+                    _p = os.path.dirname(_chk)
+                    if _p == _chk:
+                        break
+                    _chk = _p
+                status = "transcribed" if has_tx else "pending"
+                try:
+                    self._db_execute(
+                        "INSERT OR IGNORE INTO videos "
+                        "(title, channel, year, month, filepath, video_id, tx_status, "
+                        " size_bytes, added_ts) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (title, ch_name, year, month, fp, _vid_id, status, sz,
+                         time.time()))
+                    # Backfill video_id for existing rows that are missing it
+                    if _vid_id:
+                        self._db_execute(
+                            "UPDATE videos SET video_id=? "
+                            "WHERE filepath=? AND video_id IS NULL",
+                            (_vid_id, fp))
+                    count += 1
+                except Exception:
+                    continue
             self._db_commit()
             # Reconcile: update any existing 'pending' videos that actually
             # have transcript files on disk (covers re-scans after transcription)
@@ -23731,7 +23726,7 @@ class _TranscriptionPanel(ttk.Frame):
                     (note_var.get().strip(), bm["bm_id"]))
                 self._db_commit()
             except Exception:
-                traceback.print_exc()
+                log(f"  {traceback.format_exc()}\n", "dim")
             dlg.destroy()
             self._refresh_bookmarks()
         note_entry.bind("<Return>", lambda _: _save())
@@ -23755,7 +23750,7 @@ class _TranscriptionPanel(ttk.Frame):
             self._db_execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
             self._db_commit()
         except Exception:
-            traceback.print_exc()
+            log(f"  {traceback.format_exc()}\n", "dim")
         self._refresh_bookmarks()
 
     def _copy_to_clipboard(self, text):

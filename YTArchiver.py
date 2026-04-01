@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.7"
+APP_VERSION = "v30.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -764,6 +764,22 @@ def log(text, tag=None):
                             log_box.insert(_p, _meta_prefix_m.group(2), "meta_bracket")
                             _p = log_box.index(f"{_p}+{len(_meta_prefix_m.group(2))}c")
                             log_box.insert(_p, _meta_prefix_m.group(3), _base_tag)
+                        elif _base_tag in ("simpleline", "simpleline_green") and _txt.lstrip().startswith("\u2014") and "\u2014" in _txt:
+                            # Transcription scan lines: color only the — (em-dash) symbols blue
+                            _text_tag = _base_tag  # keep original color for non-dash text
+                            _p = _ins_pos
+                            _remaining = _txt
+                            while _remaining:
+                                _di = _remaining.find("\u2014")
+                                if _di < 0:
+                                    log_box.insert(_p, _remaining, _text_tag)
+                                    break
+                                if _di > 0:
+                                    log_box.insert(_p, _remaining[:_di], _text_tag)
+                                    _p = log_box.index(f"{_p}+{_di}c")
+                                log_box.insert(_p, "\u2014", "simpleline_blue")
+                                _p = log_box.index(f"{_p}+1c")
+                                _remaining = _remaining[_di + 1:]
                         else:
                             log_box.insert(_ins_pos, _txt, _base_tag)
                         return
@@ -822,16 +838,20 @@ def log(text, tag=None):
                             _title_part = _after[:_dash_idx]
                             _done_part = _after[_dash_idx:]
                             if _title_part:
-                                # Color trailing "..." blue to match transcription style
-                                if _title_part.rstrip().endswith("..."):
-                                    _stripped = _title_part.rstrip()
-                                    _pre_dots = _stripped[:-3]
-                                    _dots_and_pad = _title_part[len(_pre_dots):]
+                                # Color "..." blue — look for truncation ellipsis within the title portion
+                                _dots_pos = _title_part.find("...")
+                                if _dots_pos >= 0:
+                                    _pre_dots = _title_part[:_dots_pos]
+                                    _dots_str = "..."
+                                    _post_dots = _title_part[_dots_pos + 3:]
                                     if _pre_dots:
                                         log_box.insert(_p, _pre_dots, "dl_white")
                                         _p = log_box.index(f"{_p}+{len(_pre_dots)}c")
-                                    log_box.insert(_p, _dots_and_pad, "trans_dots")
-                                    _p = log_box.index(f"{_p}+{len(_dots_and_pad)}c")
+                                    log_box.insert(_p, _dots_str, "trans_dots")
+                                    _p = log_box.index(f"{_p}+{len(_dots_str)}c")
+                                    if _post_dots:
+                                        log_box.insert(_p, _post_dots, "dl_white")
+                                        _p = log_box.index(f"{_p}+{len(_post_dots)}c")
                                 else:
                                     log_box.insert(_p, _title_part, "dl_white")
                                     _p = log_box.index(f"{_p}+{len(_title_part)}c")
@@ -3584,7 +3604,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 2:21pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 4:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8265,7 +8285,7 @@ def _start_whisper_process():
                 _stop_whisper_process()
                 return False
             if info.get("status") == "ready":
-                log(f"  ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
+                log(f"  — ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
                 # Start a single reader thread for the lifetime of this subprocess.
                 # Previous code created a new reader thread per _whisper_transcribe()
                 # call — but old threads kept blocking on readline(), racing with new
@@ -11309,8 +11329,7 @@ def _run_metadata_download(item):
 
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
-            _meta_title_width = _MAX_TITLE_DISPLAY - len(_prefix) - 3  # " - " = 3 chars
-            _trunc = _trunc_pad_title(title, _meta_title_width)
+            _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY)
             log(f"[{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
@@ -11430,7 +11449,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log(f"{'='*60}\n\n", "tx_sep")
 
             # ── Step 1: Scan local video files ──────────────────────────
-            log("  — Scanning local video files...\n", "simpleline_blue")
+            log("  — Scanning local video files...\n", "simpleline")
             local_files = {}  # filename_no_ext -> full_path
             for dirpath, _, files in os.walk(folder):
                 for f in files:
@@ -11445,7 +11464,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log("  ⚠ No video files found in channel folder.\n", "red")
                 return
 
-            log(f"  — Found {len(local_files)} video file(s) on disk.\n", "simpleline_blue")
+            log(f"  — Found {len(local_files)} video file(s) on disk.\n", "simpleline")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -11461,7 +11480,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     files_to_process[fname] = fpath
 
             if already_done:
-                log(f"  — {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline_blue")
+                log(f"  — {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
 
             _jsonl_existing = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
@@ -11499,12 +11518,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if isinstance(e, dict) and e.get("fpath") and e["fpath"] in _fp_to_process
                     }
                     if _whisper_cache_set:
-                        log(f"  — Resuming: {len(_whisper_cache_set)} file(s) already identified for Whisper — skipping caption re-check.\n", "simpleline_blue")
+                        log(f"  — Resuming: {len(_whisper_cache_set)} file(s) already identified for Whisper — skipping caption re-check.\n", "simpleline")
             except Exception:
                 _whisper_cache_set = set()
 
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
-            log("  — Fetching YouTube video list for caption matching...\n", "simpleline_blue")
+            log("  — Fetching YouTube video list for caption matching...\n", "simpleline")
             yt_title_to_id = {}  # yt_title -> video_id
             def _fetch_yt_title_map(use_cookies):
                 """Fetch title→id map from YouTube playlist. Returns {} on failure.
@@ -11584,7 +11603,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             if not yt_title_to_id:
                 log("  ⚠ Could not retrieve video list — all files will use Whisper.\n", "red")
             else:
-                log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+                log(f"  — Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -11760,7 +11779,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         except Exception:
                             log(f"  {traceback.format_exc()}\n", "dim")
                 if _vid_id_patched:
-                    log(f"  ✓ Linked YouTube IDs for {_vid_id_patched} Whisper segment(s).\n",
+                    log(f"  — ✓ Linked YouTube IDs for {_vid_id_patched} Whisper segment(s).\n",
                         "simpleline_green")
 
             # ── Punctuation sweep for already-transcribed entries ──
@@ -11896,9 +11915,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             matched.sort(key=_safe_mtime, reverse=True)
             unmatched.sort(key=_safe_mtime, reverse=True)
 
-            log(f"  {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
+            log(f"  — {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
             if unmatched:
-                log(f"  {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
+                log(f"  — {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
             log("\n", "simpleline")
 
             # Write initial whisper cache with pre-scan unmatched files so that
@@ -12159,7 +12178,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     pass
                 if not _ce.is_set():
                     if unmatched:
-                        log(f"\n  {len(unmatched)} video(s) need Whisper — queuing GPU task...\n", "simpleline")
+                        log(f"\n  — {len(unmatched)} video(s) need Whisper — queuing GPU task...\n", "simpleline")
                         _add_to_gpu_queue({
                             "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
                             "folder": folder, "split_years": split_years, "split_months": split_months,
@@ -12207,12 +12226,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 unmatched.sort(key=_safe_mtime_u, reverse=True)
 
                 # ── Model selection ──
-                log(f"\n  {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
+                log(f"\n  — {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
 
                 if skip_model_dialog:
                     # GPU Tasks mode — model already chosen, skip dialog
                     _stop_whisper_process()
-                    log(f"  Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+                    log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
                     _model_result = [_whisper_model_choice]
                     _model_timed_out = [False]
                 else:
@@ -12329,9 +12348,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     # If model changed, stop old process so it relaunches with new model
                     _stop_whisper_process()
                     if _model_timed_out[0]:
-                        log(f"  No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
+                        log(f"  — No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
                     else:
-                        log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
+                        log(f"  — Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
                 # Check if Whisper is available (only once)
                 if not _ce.is_set() and _model_result[0] != "skip" and _whisper_available is None:
@@ -12805,7 +12824,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             if skip_model_dialog:
                 # GPU Tasks mode — model already chosen
                 _stop_whisper_process()
-                log(f"  Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+                log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
             else:
                 # Model selection dialog
                 model_choice, timed_out = _ask_whisper_model_dialog(
@@ -12821,9 +12840,9 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                 _stop_whisper_process()
 
                 if timed_out:
-                    log(f"  No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
+                    log(f"  — No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
                 else:
-                    log(f"  Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
+                    log(f"  — Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
             # Check CUDA availability
             if not _check_cuda_available():
@@ -13029,7 +13048,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     return
 
             _stop_whisper_process()
-            log(f"  Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
+            log(f"  — Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
 
             _t_start = time.time()
             _whisper_counter["idx"] = 0
@@ -18295,9 +18314,9 @@ def _gpu_start():
     _stop_whisper_process()
 
     if timed_out:
-        log(f"\n  GPU Tasks: auto-selected {_whisper_model_choice} model\n", "simpleline")
+        log(f"\n  — GPU Tasks: auto-selected {_whisper_model_choice} model\n", "simpleline")
     else:
-        log(f"\n  GPU Tasks: using {_whisper_model_choice} model\n", "simpleline")
+        log(f"\n  — GPU Tasks: using {_whisper_model_choice} model\n", "simpleline")
 
     _gpu_running = True
     _update_global_pause_btn_sync()
@@ -19921,31 +19940,75 @@ class _TranscriptionPanel(ttk.Frame):
 
     def register_video(self, title, channel, year=None, month=None, filepath=None,
                        video_id=None, video_url=None, duration_s=None, size_bytes=None):
-        """Insert a single video into the videos table (idempotent via filepath UNIQUE)."""
+        """Insert a single video into the videos table (idempotent).
+        Matches existing rows by normalized filepath first (case-insensitive on
+        Windows), then by title+channel.  Updates metadata on existing rows
+        rather than creating duplicates."""
         if not self._conn:
             return
+        # Normalize filepath for consistent matching (Windows is case-insensitive)
+        _norm_fp = os.path.normcase(os.path.normpath(filepath)) if filepath else None
         try:
-            self._db_execute(
-                "INSERT OR IGNORE INTO videos "
-                "(title, channel, year, month, filepath, video_id, video_url, "
-                " duration_s, size_bytes, tx_status, added_ts) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (title, channel, year, month, filepath, video_id, video_url,
-                 duration_s, size_bytes, "pending", time.time()))
-            # Backfill video_id/video_url on existing rows if they were missing
-            if filepath and (video_id or video_url):
-                sets, vals = [], []
+            _existing = None
+            # 1) Match by normalized filepath (most reliable — same file on disk)
+            if _norm_fp:
+                for _row in self._db_execute(
+                        "SELECT id, filepath, title FROM videos "
+                        "WHERE filepath IS NOT NULL AND channel=?",
+                        (channel,)).fetchall():
+                    if _row[1] and os.path.normcase(os.path.normpath(_row[1])) == _norm_fp:
+                        _existing = (_row[0], _row[1])
+                        break
+            # 2) Fall back to title+channel match
+            if not _existing:
+                _row = self._db_execute(
+                    "SELECT id, filepath FROM videos WHERE title=? AND channel=?",
+                    (title, channel)).fetchone()
+                if _row:
+                    _existing = (_row[0], _row[1])
+
+            if _existing:
+                _eid, _efp = _existing
+                _sets, _vals = [], []
+                # Always update filepath if the new one is valid and different
+                if filepath and (not _efp or os.path.normcase(os.path.normpath(_efp or "")) != _norm_fp):
+                    _sets.append("filepath=?")
+                    _vals.append(filepath)
+                # Update title if this is a filepath match with a different title
+                # (prefer YouTube title over filename-derived title)
+                if filepath and _norm_fp:
+                    _sets.append("title=?")
+                    _vals.append(title)
+                if year is not None:
+                    _sets.append("year=?")
+                    _vals.append(year)
+                if month is not None:
+                    _sets.append("month=?")
+                    _vals.append(month)
                 if video_id:
-                    sets.append("video_id=?")
-                    vals.append(video_id)
+                    _sets.append("video_id=COALESCE(video_id,?)")
+                    _vals.append(video_id)
                 if video_url:
-                    sets.append("video_url=?")
-                    vals.append(video_url)
-                vals.append(filepath)
+                    _sets.append("video_url=COALESCE(video_url,?)")
+                    _vals.append(video_url)
+                if duration_s is not None:
+                    _sets.append("duration_s=COALESCE(duration_s,?)")
+                    _vals.append(duration_s)
+                if size_bytes is not None:
+                    _sets.append("size_bytes=COALESCE(size_bytes,?)")
+                    _vals.append(size_bytes)
+                if _sets:
+                    _vals.append(_eid)
+                    self._db_execute(
+                        f"UPDATE videos SET {', '.join(_sets)} WHERE id=?", _vals)
+            else:
                 self._db_execute(
-                    f"UPDATE videos SET {', '.join(sets)} "
-                    "WHERE filepath=? AND video_id IS NULL",
-                    vals)
+                    "INSERT OR IGNORE INTO videos "
+                    "(title, channel, year, month, filepath, video_id, video_url, "
+                    " duration_s, size_bytes, tx_status, added_ts) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (title, channel, year, month, filepath, video_id, video_url,
+                     duration_s, size_bytes, "pending", time.time()))
             self._db_commit()
         except Exception:
             pass
@@ -20094,6 +20157,65 @@ class _TranscriptionPanel(ttk.Frame):
                 self._db_commit()
             except Exception:
                 pass
+            # ── Deduplicate: remove DB rows for the same video file ──
+            # Videos can end up with multiple rows when the disk scan uses the
+            # filename as title while the download callback uses the YouTube
+            # title (different punctuation/spacing).  Group by normalised
+            # filepath (case-insensitive) and keep the best row per group.
+            try:
+                _all_vids = self._db_execute(
+                    "SELECT id, title, channel, filepath, video_id FROM videos "
+                    "WHERE title != '__ver__'"
+                ).fetchall()
+                # Group by (channel, normalised filepath)
+                _fp_groups = {}  # (channel, norm_fp) -> [rows]
+                for _r in _all_vids:
+                    _rid, _rt, _rc, _rfp, _rvid = _r
+                    if _rfp:
+                        _nfp = os.path.normcase(os.path.normpath(_rfp))
+                        _gkey = (_rc, _nfp)
+                    else:
+                        _gkey = (_rc, f"__null_{_rid}")  # unique key for NULL fps
+                    _fp_groups.setdefault(_gkey, []).append(_r)
+                _deleted = 0
+                for _gkey, _group in _fp_groups.items():
+                    if len(_group) <= 1:
+                        continue
+                    # Score: existing file > has video_id > newest id
+                    def _score(r):
+                        return (1 if r[3] and os.path.isfile(r[3]) else 0,
+                                1 if r[4] else 0,
+                                r[0])
+                    _group.sort(key=_score, reverse=True)
+                    for _dr in _group[1:]:
+                        self._db_execute("DELETE FROM videos WHERE id=?", (_dr[0],))
+                        _deleted += 1
+                # Also deduplicate by fuzzy title within same channel
+                # (catches case where filepaths differ but it's the same video)
+                if not _deleted:
+                    _by_ch = {}
+                    for _r in _all_vids:
+                        _by_ch.setdefault(_r[2], []).append(_r)
+                    for _ch, _ch_rows in _by_ch.items():
+                        _by_ntitle = {}  # norm_title -> [rows]
+                        for _r in _ch_rows:
+                            _nt = re.sub(r'[^a-z0-9]', '', _r[1].lower())
+                            _by_ntitle.setdefault(_nt, []).append(_r)
+                        for _nt, _group in _by_ntitle.items():
+                            if len(_group) <= 1:
+                                continue
+                            def _score2(r):
+                                return (1 if r[3] and os.path.isfile(r[3]) else 0,
+                                        1 if r[4] else 0,
+                                        r[0])
+                            _group.sort(key=_score2, reverse=True)
+                            for _dr in _group[1:]:
+                                self._db_execute("DELETE FROM videos WHERE id=?", (_dr[0],))
+                                _deleted += 1
+                if _deleted:
+                    self._db_commit()
+            except Exception:
+                pass
             # Backfill missing video_ids from the segments table
             # (segments/JSONL data almost always has the video_id even when
             # the filename doesn't include [VIDEO_ID])
@@ -20181,9 +20303,16 @@ class _TranscriptionPanel(ttk.Frame):
         if filepath:
             self.register_video(title, channel, filepath=filepath)
 
-        # Refresh the tree so the video appears
+        # Refresh the tree so the video appears — this is async (background thread
+        # + self.after callback), so schedule the actual navigation after a delay
+        # to let the tree rebuild complete.
         self._refresh_browse()
+        self.after(300, lambda: self._navigate_to_video_find(
+            title, channel, filepath, auto_play, _attempt=0))
+        return True  # optimistic — actual navigation happens async
 
+    def _navigate_to_video_find(self, title, channel, filepath, auto_play, _attempt=0):
+        """Retry-aware helper for navigate_to_video — finds and selects the video in the tree."""
         # Normalise filepath for comparison
         norm_fp = os.path.normpath(filepath).lower() if filepath else ""
 
@@ -20211,7 +20340,11 @@ class _TranscriptionPanel(ttk.Frame):
             except Exception:
                 pass
         if not ch_iid:
-            return False
+            # Tree may not be rebuilt yet — retry
+            if _attempt < 5:
+                self.after(500, lambda: self._navigate_to_video_find(
+                    title, channel, filepath, auto_play, _attempt + 1))
+            return
 
         # Expand the channel to load year nodes
         tree.focus(ch_iid)
@@ -20250,8 +20383,10 @@ class _TranscriptionPanel(ttk.Frame):
             self._on_browse_select()
             if auto_play:
                 self.after(150, self._on_browse_play_video)
-            return True
-        return False
+        elif _attempt < 5:
+            # Video node may still be loading (async population) — retry
+            self.after(500, lambda: self._navigate_to_video_find(
+                title, channel, filepath, auto_play, _attempt + 1))
 
     # ── Cross-communication ───────────────────────────────────────────────────
 
@@ -20455,8 +20590,8 @@ class _TranscriptionPanel(ttk.Frame):
                           ("simplestatus_green", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
                           ("simplestatus_white", {"foreground": self._TP_FG}),
                           ("dlprogress_pct", {"foreground": "#3dd68c"}),
-                          ("pauselog", {"foreground": "#7eb8da"}),
-                          ("pausestatus", {"foreground": "#7eb8da"}),
+                          ("pauselog", {"foreground": "#a0aabb"}),
+                          ("pausestatus", {"foreground": "#a0aabb"}),
                           ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
                           ("filterskip", {"foreground": "#999"}),
                           ("filterskip_dim", {"foreground": "#4a5060"}),
@@ -20875,13 +21010,37 @@ class _TranscriptionPanel(ttk.Frame):
             self._browse_loading_overlay.destroy()
             self._browse_loading_overlay = None
         tree = self._browse_tree
+
+        # Save expansion state before clearing — keyed by (type, channel, year, month)
+        _open_keys = set()
+        for iid, meta in self._browse_items.items():
+            if tree.exists(iid) and tree.item(iid, "open"):
+                _key = (meta.get("type"), meta.get("channel"),
+                        meta.get("year"), meta.get("month"))
+                _open_keys.add(_key)
+
         tree.delete(*tree.get_children())
         self._browse_items.clear()
         for (ch,) in channels:
-            ch_iid = tree.insert("", "end", text=f"\U0001F4C1  {ch}", open=False)
+            _was_open = ("channel", ch, None, None) in _open_keys
+            ch_iid = tree.insert("", "end", text=f"\U0001F4C1  {ch}", open=_was_open)
             self._browse_items[ch_iid] = {"type": "channel", "channel": ch}
             # Dummy child so the expand arrow appears
             tree.insert(ch_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+            # If channel was previously expanded, re-populate its children
+            if _was_open:
+                self._on_browse_open_for_iid(ch_iid)
+
+    def _on_browse_open_for_iid(self, iid):
+        """Populate children for a specific iid (used during expansion state restore)."""
+        meta = self._browse_items.get(iid)
+        if not meta:
+            return
+        children = self._browse_tree.get_children(iid)
+        if (len(children) == 1
+                and self._BROWSE_PLACEHOLDER in self._browse_tree.item(children[0], "tags")):
+            self._browse_tree.delete(children[0])
+            self._populate_browse_children(iid, meta)
 
     def _on_browse_open(self, event=None):
         """Lazily populate children when a browse tree node is expanded."""
@@ -21081,6 +21240,51 @@ class _TranscriptionPanel(ttk.Frame):
                         except Exception:
                             pass
                     rows = _new_rows
+
+            # ── Deduplicate ──────────────────────────────────────────
+            # Multiple DB rows can exist for the same video: the disk scan
+            # uses the *filename* as title while the download callback uses
+            # the *YouTube title* (different punctuation/spacing).  Deduplicate
+            # by normalised filepath (most reliable) then by fuzzy title.
+            def _norm_fp(fp):
+                return os.path.normcase(os.path.normpath(fp)) if fp else None
+            def _norm_title(t):
+                """Strip punctuation/whitespace differences for fuzzy matching."""
+                return re.sub(r'[^a-z0-9]', '', t.lower()) if t else ""
+
+            _deduped = {}  # norm_key -> best row
+            for row in rows:
+                # Primary key: normalized filepath
+                _nfp = _norm_fp(row[1])
+                _key = _nfp or ("title:" + _norm_title(row[0]))
+                if _key not in _deduped:
+                    _deduped[_key] = row
+                else:
+                    prev = _deduped[_key]
+                    _prev_exists = prev[1] and os.path.isfile(prev[1])
+                    _cur_exists = row[1] and os.path.isfile(row[1])
+                    if _cur_exists and not _prev_exists:
+                        _deduped[_key] = row
+                    elif not _cur_exists and _prev_exists:
+                        pass
+                    elif row[2] and not prev[2]:
+                        _deduped[_key] = row
+            # Second pass: also catch fuzzy title dupes across different filepaths
+            _by_ntitle = {}
+            for _key, row in _deduped.items():
+                _nt = _norm_title(row[0])
+                if _nt in _by_ntitle:
+                    prev = _by_ntitle[_nt]
+                    _prev_exists = prev[1] and os.path.isfile(prev[1])
+                    _cur_exists = row[1] and os.path.isfile(row[1])
+                    if _cur_exists and not _prev_exists:
+                        _by_ntitle[_nt] = row
+                    elif row[2] and not prev[2]:
+                        _by_ntitle[_nt] = row
+                    # else keep prev
+                else:
+                    _by_ntitle[_nt] = row
+            rows = list(_by_ntitle.values())
 
             # Sort by file mtime (upload date) instead of alphabetically
             # Also derive month from mtime for separator lines
@@ -21603,7 +21807,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground="#666b75", relief="flat", bd=1)
+                       disabledforeground="#4a4f5a", relief="flat", bd=1)
 
         if meta["type"] == "title":
             # Title-level context menu
@@ -21617,6 +21821,9 @@ class _TranscriptionPanel(ttk.Frame):
                 video_path = filepath
             else:
                 video_path = self._find_video_file(title, txt_path)
+            # If still not found, search channel folder by fuzzy title match
+            if not video_path:
+                video_path = self._find_video_in_channel(title, channel)
 
             _db_rows = None
             video_id = meta.get("video_id")
@@ -21655,20 +21862,40 @@ class _TranscriptionPanel(ttk.Frame):
             else:
                 menu.add_command(label="  Redownload...", state="disabled")
 
-            if video_path:
-                def _show_explorer(vp=video_path):
-                    try:
+            # Always show "Show in Explorer" — falls back to channel folder
+            def _show_explorer(vp=video_path, t=title, ch=channel):
+                _target = vp
+                # Re-verify the path actually exists (it was checked at menu build time
+                # but the file could have moved since then)
+                if _target and not os.path.isfile(_target):
+                    # Try finding the file again by searching the channel folder
+                    _target = self._find_video_in_channel(t, ch)
+                try:
+                    if _target and os.path.isfile(_target):
                         if os.name == "nt":
-                            _npath = os.path.normpath(vp).replace('"', '')
-                            subprocess.Popen(["explorer", f"/select,{_npath}"])
+                            _npath = os.path.normpath(_target).replace('"', '')
+                            subprocess.Popen(f'explorer /select,"{_npath}"')
                         elif sys.platform == "darwin":
-                            subprocess.Popen(["open", "-R", vp])
+                            subprocess.Popen(["open", "-R", _target])
                         else:
-                            subprocess.Popen(["xdg-open", os.path.dirname(vp)])
-                    except Exception as e:
-                        log(f"ERROR: Could not open explorer: {e}\n", "red")
-                menu.add_command(label="  Show in Explorer",
-                                 command=_show_explorer)
+                            subprocess.Popen(["xdg-open", os.path.dirname(_target)])
+                    else:
+                        # Fallback: open channel directory
+                        _ch_dir = self._get_channel_dir(ch)
+                        if _ch_dir and os.path.isdir(_ch_dir):
+                            if os.name == "nt":
+                                subprocess.Popen(["explorer", os.path.normpath(_ch_dir)])
+                            elif sys.platform == "darwin":
+                                subprocess.Popen(["open", _ch_dir])
+                            else:
+                                subprocess.Popen(["xdg-open", _ch_dir])
+                        else:
+                            log("  ⚠ Could not locate video file or channel folder.\n", "red")
+                except Exception as e:
+                    log(f"ERROR: Could not open explorer: {e}\n", "red")
+            menu.add_command(label="  Show in Explorer",
+                             command=_show_explorer)
+            if video_path:
                 menu.add_separator()
                 menu.add_command(label="  Delete File",
                                  command=lambda vp=video_path, t=title, ch=channel:
@@ -22848,6 +23075,7 @@ class _TranscriptionPanel(ttk.Frame):
         if not channels:
             log("No channels configured.\n", "red")
             return
+        channels = sorted(channels, key=lambda c: c.get("name", "").lower())
         queued = 0
         for ch_cfg in channels:
             ch_name = ch_cfg.get("name", "")
@@ -24216,6 +24444,55 @@ class _TranscriptionPanel(ttk.Frame):
                 p = os.path.join(sd, title + ext)
                 if os.path.exists(p):
                     return p
+        return None
+
+    def _get_channel_dir(self, channel):
+        """Return the archive folder path for a channel, or None."""
+        if not channel:
+            return None
+        with config_lock:
+            _base = config.get("output_dir", "").strip() or ""
+            for _cc in config.get("channels", []):
+                if _cc.get("name") == channel:
+                    _f = _cc.get("folder_override", "").strip() or sanitize_folder(channel)
+                    _d = os.path.join(_base, _f) if _base else _f
+                    return _d if os.path.isdir(_d) else None
+        return None
+
+    def _find_video_in_channel(self, title, channel):
+        """Search the channel's archive folder for a video matching the title.
+        Handles sanitised filenames that differ from the YouTube title."""
+        if not title or not channel:
+            return None
+        # Locate the channel folder from config
+        with config_lock:
+            _base = config.get("output_dir", "").strip() or ""
+            _channels = config.get("channels", [])
+        _ch_folder = None
+        for _cc in _channels:
+            if _cc.get("name") == channel:
+                _f = _cc.get("folder_override", "").strip() or sanitize_folder(channel)
+                _ch_folder = os.path.join(_base, _f) if _base else _f
+                break
+        if not _ch_folder or not os.path.isdir(_ch_folder):
+            return None
+        # Normalise the title for fuzzy matching
+        _norm = re.sub(r'[^a-z0-9]', '', title.lower())
+        if len(_norm) < 4:
+            return None
+        try:
+            for dirpath, _, filenames in os.walk(_ch_folder):
+                for fn in filenames:
+                    if fn.lower().endswith(self._VIDEO_EXTS):
+                        _fn_stem = os.path.splitext(fn)[0]
+                        _fn_norm = re.sub(r'[^a-z0-9]', '', _fn_stem.lower())
+                        if _fn_norm == _norm or (
+                                len(_fn_norm) >= 10 and (
+                                    _norm.startswith(_fn_norm) or
+                                    _fn_norm.startswith(_norm))):
+                            return os.path.join(dirpath, fn)
+        except OSError:
+            pass
         return None
 
     def _get_txt_section(self, txt_path, title):
@@ -27124,7 +27401,7 @@ def _show_in_explorer():
     try:
         if os.name == "nt":
             _npath = os.path.normpath(fp).replace('"', '')
-            subprocess.Popen(["explorer", f"/select,{_npath}"])
+            subprocess.Popen(f'explorer /select,"{_npath}"')
         elif sys.platform == "darwin":
             subprocess.Popen(["open", "-R", fp])
         else:

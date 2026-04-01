@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.2"
+APP_VERSION = "v30.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -272,14 +272,16 @@ def _write_sync_progress():
     """Write current sync state to a JSON file for TuneShine Control to display."""
     try:
         os.makedirs(_SYNC_PROGRESS_DIR, exist_ok=True)
+        with _session_totals_lock:
+            _snap = dict(session_totals)
         data = {
             "running": True,
             "channel": (_current_sync_ch or {}).get("name", ""),
             "idx": _sync_ch_idx if _sync_ch_total > 0 else (_queue_batch_idx if _queue_batch_total > 0 else 1),
             "total": _sync_ch_total if _sync_ch_total > 0 else (_queue_batch_total if _queue_batch_total > 0 else 1),
-            "dl": session_totals["dl"],
-            "skip": session_totals["skip"] + session_totals["dur"],
-            "err": session_totals["err"],
+            "dl": _snap["dl"],
+            "skip": _snap["skip"] + _snap["dur"],
+            "err": _snap["err"],
         }
         tmp = _SYNC_PROGRESS_PATH + ".tmp"
         with open(tmp, "w") as f:
@@ -424,6 +426,8 @@ def _display_width(s):
 
 def _trunc_pad_title(s, width):
     """Truncate to *display* width and right-pad with spaces to exactly *width* columns."""
+    if width < 4:
+        return s[:width]
     # Normalise fancy punctuation so char-count ≈ display-width for Latin text
     s = s.translate(_UNICODE_WIDTH_MAP).replace('\u2026', '...')
     dw = _display_width(s)
@@ -506,6 +510,9 @@ def _sync_mini_logs_timer():
             root.after(250 if _changed else 1000, _sync_mini_logs_timer)
     except Exception:
         pass
+
+
+_log_write_count = 0
 
 
 def log(text, tag=None):
@@ -931,15 +938,18 @@ def log(text, tag=None):
 
                 # Cap verbose log at 20000 lines to prevent unbounded memory growth;
                 # when exceeded, trim to 15000 — enough headroom for large single syncs
-                try:
-                    line_count = int(log_box.index("end-1c").split(".")[0])
-                    if line_count > 20000:
-                        log_box.delete("1.0", f"{line_count - 15000}.0")
-                        # Re-apply active overlay tags whose anchors may have
-                        # been destroyed by the trim above.
-                        _reapply_whisper_overlays()
-                except Exception:
-                    pass
+                global _log_write_count
+                _log_write_count += 1
+                if _log_write_count % 200 == 0:
+                    try:
+                        line_count = int(log_box.index("end-1c").split(".")[0])
+                        if line_count > 20000:
+                            log_box.delete("1.0", f"{line_count - 15000}.0")
+                            # Re-apply active overlay tags whose anchors may have
+                            # been destroyed by the trim above.
+                            _reapply_whisper_overlays()
+                    except Exception:
+                        pass
 
                 # Unfreeze scrollbar layout now that batch ops are done
                 _log_scroll_freeze = False
@@ -2117,7 +2127,8 @@ def _disk_retry_check():
     path = _disk_error_path or (config.get("output_dir", "").strip() or BASE_DIR)
     if check_directory_writable(path):
         # Drive is back — clean up any errored recent entries, then resume
-        _disk_error_active = False
+        with _disk_error_lock:
+            _disk_error_active = False
         _disk_retry_job = None
 
         log("\n" + "█" * 65 + "\n", "simpleline_green")
@@ -3561,7 +3572,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:21am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 1:14am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4578,7 +4589,7 @@ def refresh_channel_dropdowns():
                     ls_str = f"{diff_mins}m ago"
                 elif diff_mins < 1440:
                     ls_str = f"{diff_mins // 60}hr ago"
-                elif diff_mins < 10080:
+                elif diff_mins < 43200:
                     ls_str = f"{diff_mins // 1440}d ago"
                 else:
                     ls_str = f"{diff_mins // 10080}wk ago"
@@ -6525,8 +6536,8 @@ def remove_channel():
     if os.path.isdir(_ch_folder_path):
         try:
             # Use cached disk size if available (avoid blocking UI with os.walk)
-            _cached = _disk_cache.get(removed_name, {})
-            _total_bytes = _cached.get("bytes", 0)
+            _cached = _disk_cache.get(removed_url, {})
+            _total_bytes = _cached.get("size_bytes", 0)
             if _total_bytes:
                 _size_disp = _fmt_size(str(_total_bytes))
             else:
@@ -11508,11 +11519,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 return
 
             # ── Step 3.5: Title normalization helper + punctuation sweep for already-done ─
+            _re_unsafe_chars = re.compile(r'[\\/:*?"<>|]')
+            _re_whitespace   = re.compile(r'\s+')
             def _normalize_title(title):
                 """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
                 s = unicodedata.normalize('NFKC', title)
-                s = re.sub(r'[\\/:*?"<>|]', '', s)
-                s = re.sub(r'\s+', ' ', s).strip()
+                s = _re_unsafe_chars.sub('', s)
+                s = _re_whitespace.sub(' ', s).strip()
                 return s.lower()
 
             # Build normalized YT title → video_id lookup (used by backfill and Pass 2)
@@ -15161,6 +15174,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     videos_processed.add(dedup_key)
                     dl_count += 1
                     session_totals["dl"] += 1
+                    if current_vid_id:
+                        _local_archived_set.add(current_vid_id)
                     _write_sync_progress()
 
                     if is_simple_mode:
@@ -15511,7 +15526,7 @@ def start_sync_all():
                         with config_lock:
                             for cfg_ch in config.get("channels", []):
                                 if cfg_ch["url"] == url: cfg_ch["initialized"] = True
-                        save_config(config)
+                            save_config(config)
                         log(f"Initialization complete.\n", "green")
                     else:
                         log(f"ERROR: Backlog archive failed for {ch_name}. Skipping download for this channel.\n",
@@ -15540,7 +15555,7 @@ def start_sync_all():
                         with config_lock:
                             for cfg_ch in config.get("channels", []):
                                 if cfg_ch["url"] == url: cfg_ch["initialized"] = True
-                        save_config(config)
+                            save_config(config)
                         log(f"Initialization complete. Downloading from {date_after[:4]}-{date_after[4:6]}-{date_after[6:]} onward...\n",
                             "green")
                     else:
@@ -15555,7 +15570,7 @@ def start_sync_all():
                     for cfg_ch in config.get("channels", []):
                         if cfg_ch["url"] == url:
                             cfg_ch["sync_complete"] = False
-                save_config(config)
+                    save_config(config)
 
                 cmd = build_channel_cmd(url, out_dir, min_dur, res, folder_ovr,
                                         break_on_existing=is_initialized and sync_complete,
@@ -17363,7 +17378,7 @@ def _show_gpu_menu(event=None):
         else:
             msg = f"Remove '{label}' from the GPU Tasks?"
             title = "Remove from GPU Tasks"
-        if messagebox.askyesno(title, msg, parent=popup):
+        if messagebox.askyesno(title, msg, parent=root):
             # Re-find the item by identity after the messagebox (index may have shifted)
             if _item is not None:
                 with _gpu_queue_lock:
@@ -18162,7 +18177,7 @@ def _format_last_sync(ts_str):
     try:
         dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
         now = datetime.now()
-        diff_mins = int((now - dt).total_seconds() // 60)
+        diff_mins = max(0, int((now - dt).total_seconds() // 60))
         time_part = dt.strftime("%I:%M%p").lstrip("0").lower()
         date_part = dt.strftime("%b %-d") if os.name != "nt" else dt.strftime("%b {d}").replace("{d}", str(dt.day))
         if diff_mins < 1:
@@ -18453,9 +18468,9 @@ def _refresh_autorun_history():
 
 
 def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0):
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     mins = int(elapsed_secs // 60)
     secs = int(elapsed_secs % 60)
     if mins >= 60:
@@ -18483,9 +18498,9 @@ def _record_sync(dl, err, elapsed_secs, kind="Auto", channel_name="", skipped=0)
 
 
 def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", skipped=0):
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     mins = int(elapsed_secs // 60)
     secs = int(elapsed_secs % 60)
     if mins >= 60:
@@ -18510,9 +18525,9 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
 
 
 def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=None):
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     mins = int(elapsed_secs // 60)
     secs = int(elapsed_secs % 60)
     if mins >= 60:
@@ -18538,9 +18553,9 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
 
 
 def _record_metadata(ch_name, new_count, refreshed, skipped, errors, elapsed_secs):
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     mins = int(elapsed_secs // 60)
     secs = int(elapsed_secs % 60)
     if mins >= 60:
@@ -18575,9 +18590,9 @@ _redownload_hist_idx = None      # index into history list for the placeholder l
 def _record_redownload_start(ch_name, res_label, total_count):
     """Insert an in-progress placeholder for a redownload job into the activity log."""
     global _redownload_hist_idx, _redownload_hist_marker
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     ts_date = f"{ts}, {date}".ljust(16)
     ch_part = f"  {ch_name}  —" if ch_name else " " * 7
     line = f"[ReDwnl] {ts_date} —{ch_part}  {total_count:>4} total        · ▶ running..."
@@ -18597,9 +18612,9 @@ def _record_redownload_start(ch_name, res_label, total_count):
 def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, skipped=0):
     """Replace the in-progress placeholder with the completed redownload stats."""
     global _redownload_hist_idx, _redownload_hist_marker
-    ts = datetime.now().strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else datetime.now().strftime(
-        "%I:%M%p").lower().lstrip("0")
-    date = datetime.now().strftime("%b {d}").replace("{d}", str(datetime.now().day))
+    _now = datetime.now()
+    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
+    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
     mins = int(elapsed_secs // 60)
     secs = int(elapsed_secs % 60)
     if mins >= 60:
@@ -19525,7 +19540,7 @@ def _tp_find_jsonl_files(roots):
     for root_dir in roots:
         if not os.path.isdir(root_dir):
             continue
-        for dirpath, _, filenames in os.walk(root_dir):
+        for dirpath, _, filenames in os.walk(root_dir, followlinks=False):
             for fn in filenames:
                 if fn.endswith(".jsonl"):
                     files.append(os.path.join(dirpath, fn))
@@ -19558,6 +19573,40 @@ class _TranscriptionPanel(ttk.Frame):
     ]
     _HEADER_RE    = re.compile(r'^===\((.+?)\),', re.MULTILINE)
     _VIEWER_WORDS = 300
+    _WC_STOP_WORDS = {
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "is", "it", "i", "you", "he", "she", "we", "they", "that",
+        "this", "was", "are", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may",
+        "might", "shall", "can", "not", "no", "so", "if", "then", "than",
+        "when", "what", "who", "how", "which", "where", "there", "here",
+        "all", "each", "every", "both", "few", "more", "most", "other",
+        "some", "such", "only", "own", "same", "just", "also", "very",
+        "with", "from", "about", "into", "through", "during", "before",
+        "after", "above", "below", "between", "out", "off", "over", "under",
+        "again", "further", "once", "my", "your", "his", "her", "its",
+        "our", "their", "me", "him", "us", "them", "up", "down", "as",
+        "by", "like", "know", "think", "go", "going", "get", "got", "make",
+        "say", "said", "see", "come", "way", "look", "thing", "things",
+        "well", "back", "right", "yeah", "okay", "oh", "uh", "um", "really",
+        "one", "two", "much", "even", "still", "because", "don't", "dont",
+        "it's", "its", "that's", "thats", "he's", "hes", "she's", "shes",
+        "i'm", "im", "they're", "theyre", "we're", "were", "you're", "youre",
+        "i've", "ive", "you've", "youve", "we've", "weve", "they've", "theyve",
+        "i'll", "ill", "you'll", "youll", "he'll", "hell", "she'll", "shell",
+        "we'll", "they'll", "theyll", "it'll", "itll",
+        "i'd", "id", "you'd", "youd", "he'd", "hed", "she'd", "shed",
+        "we'd", "wed", "they'd", "theyd",
+        "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't",
+        "werent", "hasn't", "hasnt", "haven't", "havent", "hadn't", "hadnt",
+        "doesn't", "doesnt", "didn't", "didnt", "won't", "wont", "wouldn't",
+        "wouldnt", "can't", "cant", "couldn't", "couldnt", "shouldn't",
+        "shouldnt", "mustn't", "mustnt", "let's", "lets",
+        "there's", "theres", "here's", "heres", "what's", "whats",
+        "who's", "whos", "where's", "wheres", "how's", "hows",
+        "ain't", "aint", "y'all", "yall", "ma'am", "maam",
+        "that'll", "thatll", "who'll", "wholl", "what'll", "whatll",
+    }
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -19778,7 +19827,7 @@ class _TranscriptionPanel(ttk.Frame):
             # (covers channels transcribed but not yet indexed in the DB)
             dirs_with_transcripts = set()
             for ch_name, ch_path, root_dir in channel_dirs:
-                for dirpath, _, filenames in os.walk(ch_path):
+                for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
                     for fn in filenames:
                         fn_lower = fn.lower()
                         if fn_lower.endswith('.txt') and 'transcript' in fn_lower:
@@ -19789,7 +19838,7 @@ class _TranscriptionPanel(ttk.Frame):
                             break
 
             for ch_name, ch_path, root_dir in channel_dirs:
-                for dirpath, _, filenames in os.walk(ch_path):
+                for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
                     for fn in filenames:
                         fn_lower = fn.lower()
                         if not any(fn_lower.endswith(ext) for ext in self._VIDEO_EXTS):
@@ -21873,12 +21922,12 @@ class _TranscriptionPanel(ttk.Frame):
         except ImportError:
             return  # Pillow not available
 
+        vf_width = self._browse_viewer.winfo_width()
+        if vf_width < 100:
+            vf_width = 600
         def _load_bg():
             try:
                 img = Image.open(thumb_path)
-                vf_width = self._browse_viewer.winfo_width()
-                if vf_width < 100:
-                    vf_width = 600
                 aspect = img.width / img.height
                 target_w = min(vf_width - 24, img.width)
                 target_h = int(target_w / aspect)
@@ -22451,7 +22500,7 @@ class _TranscriptionPanel(ttk.Frame):
                     def _load_thumb(path=_tpath, lbl=_tlbl, w=_cw, h=_th, title_key=_title):
                         try:
                             img = Image.open(path)
-                            img = img.resize((w, h), Image.LANCZOS)
+                            img = img.resize((w, h), Image.BICUBIC)
                             photo = ImageTk.PhotoImage(img)
                             def _apply(p=photo, l=lbl, tk=title_key, sc=self._grid_scope):
                                 try:
@@ -23719,6 +23768,9 @@ class _TranscriptionPanel(ttk.Frame):
         query = self._search_var.get().strip()
         if not query:
             return
+        # Strip FTS5 special operators to prevent query injection / unintended semantics
+        query = re.sub(r'\b(AND|OR|NOT|NEAR)\b', '', query, flags=re.IGNORECASE)
+        query = query.replace('*', '').replace('+', '').replace('^', '').strip()
         self._search_running = True
         self._search_btn.config(state="disabled", text="Searching…")
         self._search_count.config(text="")
@@ -24457,7 +24509,10 @@ class _TranscriptionPanel(ttk.Frame):
             return
         self._wc_texts = []  # clear word cloud state when switching chart types
         raw = self._freq_words_var.get().strip()
-        words     = [w.strip() for w in raw.split(",") if w.strip()][:6] if raw else []
+        def _sanitize_fts(w):
+            w = re.sub(r'\b(AND|OR|NOT|NEAR)\b', '', w, flags=re.IGNORECASE)
+            return w.replace('*', '').replace('+', '').replace('^', '').strip()
+        words     = [_sanitize_fts(w) for w in raw.split(",") if _sanitize_fts(w)][:6] if raw else []
         channels  = self._get_freq_selected_channels()
         chart_type = self._freq_chart_var.get()
 
@@ -24682,41 +24737,7 @@ class _TranscriptionPanel(ttk.Frame):
         import random as _rng
         # Find segments containing the seed words and extract surrounding vocabulary
         word_counts = {}
-        _stop = {
-            "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-            "of", "is", "it", "i", "you", "he", "she", "we", "they", "that",
-            "this", "was", "are", "be", "been", "being", "have", "has", "had",
-            "do", "does", "did", "will", "would", "could", "should", "may",
-            "might", "shall", "can", "not", "no", "so", "if", "then", "than",
-            "when", "what", "who", "how", "which", "where", "there", "here",
-            "all", "each", "every", "both", "few", "more", "most", "other",
-            "some", "such", "only", "own", "same", "just", "also", "very",
-            "with", "from", "about", "into", "through", "during", "before",
-            "after", "above", "below", "between", "out", "off", "over", "under",
-            "again", "further", "once", "my", "your", "his", "her", "its",
-            "our", "their", "me", "him", "us", "them", "up", "down", "as",
-            "by", "like", "know", "think", "go", "going", "get", "got", "make",
-            "say", "said", "see", "come", "way", "look", "thing", "things",
-            "well", "back", "right", "yeah", "okay", "oh", "uh", "um", "really",
-            "one", "two", "much", "even", "still", "because", "don't", "dont",
-            # Contractions
-            "it's", "its", "that's", "thats", "he's", "hes", "she's", "shes",
-            "i'm", "im", "they're", "theyre", "we're", "were", "you're", "youre",
-            "i've", "ive", "you've", "youve", "we've", "weve", "they've", "theyve",
-            "i'll", "ill", "you'll", "youll", "he'll", "hell", "she'll", "shell",
-            "we'll", "they'll", "theyll", "it'll", "itll",  # "well" already listed above
-            "i'd", "id", "you'd", "youd", "he'd", "hed", "she'd", "shed",
-            "we'd", "wed", "they'd", "theyd",
-            "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "weren't",
-            "werent", "hasn't", "hasnt", "haven't", "havent", "hadn't", "hadnt",
-            "doesn't", "doesnt", "didn't", "didnt", "won't", "wont", "wouldn't",
-            "wouldnt", "can't", "cant", "couldn't", "couldnt", "shouldn't",
-            "shouldnt", "mustn't", "mustnt", "let's", "lets",
-            "there's", "theres", "here's", "heres", "what's", "whats",
-            "who's", "whos", "where's", "wheres", "how's", "hows",
-            "ain't", "aint", "y'all", "yall", "ma'am", "maam",
-            "that'll", "thatll", "who'll", "wholl", "what'll", "whatll",
-        }
+        _stop = self._WC_STOP_WORDS
 
         def _clean_word(w):
             """Strip contraction suffixes and filter junk."""
@@ -24948,6 +24969,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._player_canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 0))
         # Bind click on canvas for play/pause (only works before VLC takes over hwnd)
         self._player_canvas.bind("<Button-1>", lambda e: self._player_toggle_pause())
+        # Spacebar play/pause binding on the player section frame
+        f.bind("<space>", lambda e: self._player_toggle_pause())
 
         # Controls bar — reset cursor on entry to prevent "stuck" cursor
         ctrl = tk.Frame(f, bg=self._TP_BG2, pady=6, padx=10, cursor="arrow")
@@ -27003,16 +27026,19 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
     def _delayed_record():
         final_size = size_bytes
         # Give ffmpeg a brief moment to finish writing the file to disk to fetch the exact final byte count
-        for _ in range(6):
-            if filepath and os.path.exists(filepath):
-                try:
-                    disk_size = os.path.getsize(filepath)
-                    if disk_size > 0:
-                        final_size = str(disk_size)
-                        break
-                except OSError:
-                    pass
-            time.sleep(0.5)
+        if filepath and not os.path.exists(filepath):
+            pass  # file never appeared (download failed) — skip polling
+        else:
+            for _ in range(6):
+                if filepath and os.path.exists(filepath):
+                    try:
+                        disk_size = os.path.getsize(filepath)
+                        if disk_size > 0:
+                            final_size = str(disk_size)
+                            break
+                    except OSError:
+                        pass
+                time.sleep(0.5)
 
         def _sync():
             global new_download_count
@@ -27933,14 +27959,13 @@ def on_closing():
     # Save window position, size, and column widths before closing
     with config_lock:
         try:
-            geo = root.geometry()  # e.g. "900x800+100+200"
-            _wh, _pos = geo.split("+", 1)
-            _w, _h = _wh.split("x")
-            _px, _py = _pos.split("+")
-            config["window_w"] = int(_w)
-            config["window_h"] = int(_h)
-            config["window_x"] = int(_px)
-            config["window_y"] = int(_py)
+            geo = root.geometry()  # e.g. "900x800+100+200" or "900x800+-500+200"
+            _m = re.match(r'(\d+)x(\d+)([+-]\d+)([+-]\d+)', geo)
+            if _m:
+                config["window_w"] = int(_m.group(1))
+                config["window_h"] = int(_m.group(2))
+                config["window_x"] = int(_m.group(3))
+                config["window_y"] = int(_m.group(4))
         except Exception:
             pass
 

@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.3"
+APP_VERSION = "v30.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -113,7 +113,8 @@ if os.name == 'nt':
                         ctypes.windll.user32.SetForegroundWindow(hwnd)
                         return False  # stop enumeration
             return True  # continue
-        ctypes.windll.user32.EnumWindows(_WNDENUMPROC(_find_yta_window), 0)
+        _cb = _WNDENUMPROC(_find_yta_window)  # prevent GC during EnumWindows
+        ctypes.windll.user32.EnumWindows(_cb, 0)
         sys.exit(0)
 
 # File extensions recognised as channel video/audio content (excludes temp/partial files)
@@ -189,6 +190,7 @@ _queue_batch_err = 0    # accumulated errors across batch
 _queue_batch_skip = 0   # accumulated skipped (duration-filtered) across batch
 _queue_batch_t_start = None  # datetime when the batch started (for elapsed time in combined record)
 new_download_count = 0
+_new_dl_count_lock = threading.Lock()
 cancel_event = threading.Event()
 pause_event = threading.Event()
 _autorun_active = False
@@ -245,7 +247,7 @@ _skip_current_gpu = threading.Event()  # same, for GPU Tasks
 _ffmpeg_lock = threading.Lock()  # protects _ffmpeg_proc and _gpu_actively_encoding
 _whisper_lock = threading.Lock()  # protects _whisper_proc and _whisper_line_queue
 _tray_spin_lock = threading.Lock()  # protects _tray_spin_starting flag
-_punct_lock = threading.Lock()  # protects _punct_proc start/stop/access
+_punct_lock = threading.RLock()  # protects _punct_proc start/stop/access (reentrant for nested calls)
 _session_totals_lock = threading.Lock()  # protects session_totals reset
 _mini_log_last_end = [None]
 def _sync_mini_logs_from_main(): pass  # stub until real definition later
@@ -284,7 +286,7 @@ def _write_sync_progress():
             "err": _snap["err"],
         }
         tmp = _SYNC_PROGRESS_PATH + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, _SYNC_PROGRESS_PATH)
     except Exception:
@@ -800,7 +802,7 @@ def log(text, tag=None):
                     _after = _txt[_bk_m.end():]
                     if _is_meta and _after:
                         # Color "Metadata -" or "Refresh -" pink, title white
-                        _meta_m = re.match(r'( (?:Metadata|Refresh) - )(.*?)(\.\.\.)?(\n?)$', _after, re.DOTALL)
+                        _meta_m = re.match(r'( (?:Metadata|Refresh) - )(.*?)(\.\.\.)?(\s*\n?)$', _after, re.DOTALL)
                         if _meta_m:
                             log_box.insert(_p, _meta_m.group(1), _bk_tag)
                             _p = log_box.index(f"{_p}+{len(_meta_m.group(1))}c")
@@ -819,7 +821,7 @@ def log(text, tag=None):
                             _title_part = _after[:_dash_idx]
                             _done_part = _after[_dash_idx:]
                             if _title_part:
-                                # Color trailing "..." pink to match metadata style
+                                # Color trailing "..." blue to match transcription style
                                 if _title_part.rstrip().endswith("..."):
                                     _stripped = _title_part.rstrip()
                                     _pre_dots = _stripped[:-3]
@@ -827,7 +829,7 @@ def log(text, tag=None):
                                     if _pre_dots:
                                         log_box.insert(_p, _pre_dots, "dl_white")
                                         _p = log_box.index(f"{_p}+{len(_pre_dots)}c")
-                                    log_box.insert(_p, _dots_and_pad, "meta_bracket")
+                                    log_box.insert(_p, _dots_and_pad, "trans_dots")
                                     _p = log_box.index(f"{_p}+{len(_dots_and_pad)}c")
                                 else:
                                     log_box.insert(_p, _title_part, "dl_white")
@@ -1902,7 +1904,9 @@ def _startup_cleanup_temps():
 def _fetch_video_title(vid_id):
     """Fetch video title from YouTube oEmbed API. Returns vid_id on failure."""
     try:
-        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid_id}&format=json"
+        import urllib.parse as _up
+        _safe_id = _up.quote(vid_id, safe='')
+        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={_safe_id}&format=json"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read())
@@ -1964,11 +1968,16 @@ if os.name == 'nt':
 def show_notification(title, message):
     if os.name == 'nt':
         try:
-            # Strip control characters (newlines, carriage returns, etc.) that break
-            # the PowerShell command string when embedded in single-quoted literals.
-            _ctrl_re = re.compile(r'[\x00-\x1f\x7f]')
-            title = _ctrl_re.sub(' ', title).strip()
-            message = _ctrl_re.sub(' ', message).strip()
+            # Strip control characters and non-printable Unicode (zero-width, RTL
+            # overrides, etc.) that could break or manipulate the PowerShell command.
+            import unicodedata as _ud
+            def _sanitize_notif(s):
+                return ''.join(
+                    c if _ud.category(c)[0] not in ('C',) else ' '
+                    for c in s
+                ).strip()
+            title = _sanitize_notif(title)
+            message = _sanitize_notif(message)
             safe_title = title.replace("'", "''").replace("`", "``").replace("$", "`$")
             safe_message = message.replace("'", "''").replace("`", "``").replace("$", "`$")
             # Windows Runtime toast shows "YT Archiver" as app name;
@@ -2992,8 +3001,10 @@ def _update_tray_badge():
     if _tray_spin_active:
         return  # don't overwrite spin frames
     try:
-        if new_download_count > 0:
-            _tray_icon.icon = _make_badge_icon(_tray_base_img, new_download_count)
+        with _new_dl_count_lock:
+            _badge_n = new_download_count
+        if _badge_n > 0:
+            _tray_icon.icon = _make_badge_icon(_tray_base_img, _badge_n)
         else:
             _tray_icon.icon = _tray_base_img
     except Exception:
@@ -3572,7 +3583,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 1:14am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:06pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4004,6 +4015,7 @@ log_box.tag_raise("transcribe_title", "transcribe_using")
 log_box.tag_configure("sync_bracket", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("trans_bracket", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("meta_bracket", foreground=C_LOG_PINK, font=("Consolas", 9))
+log_box.tag_configure("trans_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("dl_white", foreground="#ffffff", font=("Consolas", 9))
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
@@ -4538,7 +4550,8 @@ _chan_tree_dirty = False  # Flag: tree needs refresh next time Subs tab is shown
 def refresh_channel_dropdowns():
     global _chan_tree_dirty
     with config_lock:
-        sorted_channels = sorted(copy.deepcopy(config.get("channels", [])), key=lambda c: c.get("name", "").lower())
+        # Shallow dict copy is sufficient — channel values are all scalars (str/int/bool)
+        sorted_channels = sorted([dict(c) for c in config.get("channels", [])], key=lambda c: c.get("name", "").lower())
         names = [c.get("name", "") for c in sorted_channels]
     # config_lock released — all UI work below uses the snapshot
     chan_dropdown["values"] = names
@@ -4592,7 +4605,7 @@ def refresh_channel_dropdowns():
                 elif diff_mins < 43200:
                     ls_str = f"{diff_mins // 1440}d ago"
                 else:
-                    ls_str = f"{diff_mins // 10080}wk ago"
+                    ls_str = f"{diff_mins // 43200}mo ago"
             except Exception:
                 ls_str = ls_raw[:12]
 
@@ -4845,6 +4858,29 @@ def on_chan_list_select(event):
 
 
 settings_chan_tree.bind("<<TreeviewSelect>>", on_chan_list_select)
+
+
+def _on_chan_tree_return(event):
+    """Open edit UI when Enter is pressed on a selected channel."""
+    sel = settings_chan_tree.selection()
+    if not sel:
+        return
+    target_url = settings_chan_tree.set(sel[0], "url") if sel else ""
+    with config_lock:
+        for ch in config.get("channels", []):
+            if ch["url"] == target_url:
+                _set_edit_mode(copy.deepcopy(ch))
+                break
+
+
+def _on_chan_tree_escape(event):
+    """Cancel edit mode when Escape is pressed."""
+    if _editing_channel.get("url"):
+        _clear_edit_mode()
+
+
+settings_chan_tree.bind("<Return>", _on_chan_tree_return)
+settings_chan_tree.bind("<Escape>", _on_chan_tree_escape)
 
 _chan_ctx_menu = tk.Menu(root, tearoff=0, bg=C_RAISED, fg=C_TEXT,
                          activebackground=C_BTN_HVR, activeforeground=C_TEXT,
@@ -5424,7 +5460,7 @@ def add_channel():
         date_after = y + m + d
         url_error_var.set("")
 
-    editing = _editing_channel["name"]
+    editing_url = _editing_channel.get("url")
 
     # Capture old/new split settings before saving (for auto-reorganize on edit)
     old_split_years = False
@@ -5441,13 +5477,13 @@ def add_channel():
     with config_lock:
         channels = config.setdefault("channels", [])
 
-        if editing:
+        if editing_url:
             for ch in channels:
-                if ch["name"] == editing:
-                    if name != editing and any(c["name"] == name for c in channels):
+                if ch["url"] == editing_url:
+                    if name != ch["name"] and any(c["name"] == name for c in channels):
                         log(f"ERROR: A channel named '{name}' already exists.\n", "red")
                         return
-                    if url != ch.get("url", "") and any(c["url"] == url and c["name"] != editing for c in channels):
+                    if url != ch.get("url", "") and any(c["url"] == url and c["url"] != editing_url for c in channels):
                         log(f"ERROR: A channel with this URL already exists.\n", "red")
                         return
 
@@ -5532,7 +5568,7 @@ def add_channel():
     # initialization should only happen on manual sync or full sync-subbed run.
 
     # Auto-reorganize existing downloads if split settings changed during edit
-    if editing and (old_split_years != new_years or old_split_months != new_months):
+    if editing_url and (old_split_years != new_years or old_split_months != new_months):
         with config_lock:
             base = config.get("output_dir", "").strip() or BASE_DIR
         folder_path = os.path.join(base, sanitize_folder(name))
@@ -5540,7 +5576,7 @@ def add_channel():
 
     # Offer to re-download & compress existing videos if compress settings changed
     _compress_changed = False
-    if editing and _new_compress is not None:
+    if editing_url and _new_compress is not None:
         _compress_changed = (
             _new_compress and _new_c_level in _QUALITY_OPTIONS and
             (not _old_compress or _old_c_level != _new_c_level or _old_c_res != _new_c_res)
@@ -5624,7 +5660,7 @@ def add_channel():
                 threading.Thread(target=_count_and_ask_rd, daemon=True).start()
 
 
-def sync_single_channel():
+def sync_single_channel(_from_queue=False):
     global _sync_running
     sel = settings_chan_tree.selection()
     if not sel:
@@ -5640,7 +5676,8 @@ def sync_single_channel():
         if not ch: return
 
     # If something is already running, queue instead of starting immediately
-    if _sync_running or _reorg_running or _redownload_running:
+    # (_from_queue bypasses this check since the queue processor already owns the slot)
+    if not _from_queue and (_sync_running or _reorg_running or _redownload_running):
         with _sync_queue_lock:
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
@@ -5705,9 +5742,12 @@ def sync_single_channel():
                         log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
                         # Max-dur means these can never be downloaded — archive so they won't show up again
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                for _lid, _lurl in live_videos:
-                                    _af.write(f"youtube {_lid}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    for _lid, _lurl in live_videos:
+                                        _af.write(f"youtube {_lid}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                     else:
                         for _lid, _lurl in live_videos:
                             deferred_streams.append((ch, _lurl, _lid))
@@ -5979,8 +6019,11 @@ def sync_single_channel():
                     # Only archive the stream ID on successful download so failed ones retry next sync
                     if _ds_dl:
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                _af.write(f"youtube {_ds_id}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    _af.write(f"youtube {_ds_id}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
 
             _cleanup_batch_file()
 
@@ -6263,12 +6306,12 @@ def _process_sync_queue():
                     on_chan_list_select(None)
                     _found = True
                     break
-            # Must clear _sync_running before calling sync_single_channel(),
-            # otherwise it sees True and re-queues instead of starting.
+            # Keep _sync_running True to prevent races, pass _from_queue
+            # so sync_single_channel skips the "already running" check.
             with _sync_queue_lock:
                 _sync_running = False
             if _found:
-                sync_single_channel()
+                sync_single_channel(_from_queue=True)
             else:
                 log(f"  ⚠ Could not find {next_ch.get('name', '?')} in channel list — skipping.\n", "red")
                 # Try next queued item instead of getting stuck
@@ -6661,7 +6704,8 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
     # over mtime (which may reflect HTTP Last-Modified rather than actual upload date).
     all_files = []
 
-    # Scan root folder — no folder date info, fall back to mtime
+    # Single pass over root folder — collect video files AND year subdirectories
+    _year_dirs = []  # (path, year_int)
     try:
         for entry in os.scandir(folder_path):
             if entry.is_file() and os.path.splitext(entry.name)[1].lower() in VIDEO_EXTS:
@@ -6670,46 +6714,38 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
                     all_files.append((entry.path, mtime, None, None))
                 except OSError:
                     all_files.append((entry.path, None, None, None))
+            elif entry.is_dir() and _is_year_folder(entry.name):
+                _year_dirs.append((entry.path, int(entry.name)))
     except OSError as e:
         log(f"  ERROR scanning root: {e}\n", "red")
         return
 
     # Scan year subfolders — trust year from folder name
-    try:
-        for entry in os.scandir(folder_path):
-            if entry.is_dir() and _is_year_folder(entry.name):
-                f_year = int(entry.name)
-                # Scan files directly in year folder
-                try:
-                    for vid in os.scandir(entry.path):
-                        if vid.is_file() and os.path.splitext(vid.name)[1].lower() in VIDEO_EXTS:
-                            try:
-                                mtime = datetime.fromtimestamp(vid.stat().st_mtime)
-                                all_files.append((vid.path, mtime, f_year, None))
-                            except OSError:
-                                all_files.append((vid.path, None, f_year, None))
-                except OSError:
-                    pass
-
-                # Scan month subfolders within year folders — trust both year and month
-                try:
-                    for month_entry in os.scandir(entry.path):
-                        if month_entry.is_dir() and _is_month_folder(month_entry.name):
-                            f_month = _MONTH_FOLDER_LOOKUP[month_entry.name.lower()]
-                            try:
-                                for vid in os.scandir(month_entry.path):
-                                    if vid.is_file() and os.path.splitext(vid.name)[1].lower() in VIDEO_EXTS:
-                                        try:
-                                            mtime = datetime.fromtimestamp(vid.stat().st_mtime)
-                                            all_files.append((vid.path, mtime, f_year, f_month))
-                                        except OSError:
-                                            all_files.append((vid.path, None, f_year, f_month))
-                            except OSError:
-                                pass
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for _yd_path, f_year in _year_dirs:
+        # Scan files directly in year folder
+        try:
+            for vid in os.scandir(_yd_path):
+                if vid.is_file() and os.path.splitext(vid.name)[1].lower() in VIDEO_EXTS:
+                    try:
+                        mtime = datetime.fromtimestamp(vid.stat().st_mtime)
+                        all_files.append((vid.path, mtime, f_year, None))
+                    except OSError:
+                        all_files.append((vid.path, None, f_year, None))
+                elif vid.is_dir() and _is_month_folder(vid.name):
+                    # Scan month subfolders within year folders — trust both year and month
+                    f_month = _MONTH_FOLDER_LOOKUP[vid.name.lower()]
+                    try:
+                        for mv in os.scandir(vid.path):
+                            if mv.is_file() and os.path.splitext(mv.name)[1].lower() in VIDEO_EXTS:
+                                try:
+                                    mtime = datetime.fromtimestamp(mv.stat().st_mtime)
+                                    all_files.append((mv.path, mtime, f_year, f_month))
+                                except OSError:
+                                    all_files.append((mv.path, None, f_year, f_month))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     total = len(all_files)
     if total == 0:
@@ -7039,7 +7075,13 @@ def _fix_file_dates(channel_url, folder_path):
                 # Skip O(N) prefix scan for very large channels (>5000 videos) to avoid O(N*M) stall
                 if not upload_date and len(norm_fname) >= 15 and len(date_lookup) <= 5000:
                     for norm_title, date_val in date_lookup.items():
-                        if len(norm_title) >= 15 and (norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title)):
+                        if len(norm_title) < 15:
+                            continue
+                        _min_l = min(len(norm_title), len(norm_fname))
+                        _max_l = max(len(norm_title), len(norm_fname))
+                        if _min_l / _max_l < 0.8:
+                            continue
+                        if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title):
                             upload_date = date_val
                             break
 
@@ -7265,7 +7307,7 @@ def _parse_vtt_to_text(vtt_path):
     """Parse a .vtt subtitle file into clean plain text."""
     import html as _html_mod
     try:
-        with open(vtt_path, "r", encoding="utf-8") as f:
+        with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except Exception:
         traceback.print_exc()
@@ -7327,7 +7369,7 @@ def _parse_vtt_to_segments(vtt_path):
     """
     import html as _html_mod
     try:
-        with open(vtt_path, "r", encoding="utf-8") as f:
+        with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
     except Exception:
         traceback.print_exc()
@@ -7765,6 +7807,7 @@ _whisper_line_queue = None  # queue.Queue for subprocess stdout lines (module-le
 _whisper_starting = False  # guard against concurrent startup attempts
 _whisper_last_failed = False  # True when last whisper call was a stall/crash (not "no speech")
 _whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
+_whisper_model_lock = threading.Lock()  # protects _whisper_model_choice during re-transcription
 _ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
@@ -8819,7 +8862,13 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             # Prefix match for truncated filenames (--trim-filenames)
             if not match and len(norm_fname) >= 15:
                 for norm_title, val in norm_lookup.items():
-                    if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title[:len(norm_fname)]):
+                    if len(norm_title) < 15:
+                        continue
+                    _min_l = min(len(norm_title), len(norm_fname))
+                    _max_l = max(len(norm_title), len(norm_fname))
+                    if _min_l / _max_l < 0.8:
+                        continue
+                    if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title):
                         match = val
                         break
             if not match and len(norm_fname_ascii) >= 10:
@@ -9507,7 +9556,13 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             # Prefix matching for truncated filenames (--trim-filenames 200)
             if not match and len(norm_fname) >= 15:
                 for norm_title, val in norm_lookup.items():
-                    if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title[:len(norm_fname)]):
+                    if len(norm_title) < 15:
+                        continue
+                    _min_l = min(len(norm_title), len(norm_fname))
+                    _max_l = max(len(norm_title), len(norm_fname))
+                    if _min_l / _max_l < 0.8:
+                        continue
+                    if norm_title.startswith(norm_fname) or norm_fname.startswith(norm_title):
                         match = val
                         break
             if not match and len(norm_fname_ascii) >= 10:
@@ -9907,7 +9962,7 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
             pass
 
 
-def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None, _log_prefix=None):
+def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_ev=None, progress_cb=None, _log_prefix=None, _retrying=False):
     """Transcribe a file using the persistent Whisper subprocess.
 
     Returns (text, segments) where text is str or None, and segments is a list of
@@ -9963,8 +10018,9 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             _gpu_actively_encoding = True
         log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
         request = json.dumps({"path": audio_path, "duration": duration})
-        _whisper_proc.stdin.write(request + "\n")
-        _whisper_proc.stdin.flush()
+        with _whisper_lock:
+            _whisper_proc.stdin.write(request + "\n")
+            _whisper_proc.stdin.flush()
 
         # Use the module-level reader thread + queue (started in _start_whisper_process).
         # Previous code created a NEW reader thread per call — but old daemon threads
@@ -10000,7 +10056,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             except queue.Empty:
                 with _ffmpeg_lock:
                     _gpu_actively_encoding = False
-                _is_retry = getattr(_whisper_transcribe, '_retrying', False)
+                _is_retry = _retrying
                 if _is_retry:
                     # Second stall on same video — skip it instead of looping forever
                     log(
@@ -10020,14 +10076,11 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 _stop_whisper_process(force=True)  # aggressive kill to free RAM/VRAM
                 time.sleep(3)  # let OS reclaim memory from killed process before respawning
                 # Retry once — stalls are usually transient (model loaded bad state)
-                _whisper_transcribe._retrying = True
-                try:
-                    _retry_result = _whisper_transcribe(
-                        audio_path, duration=duration, title=title,
-                        cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
-                    return _retry_result
-                finally:
-                    _whisper_transcribe._retrying = False
+                _retry_result = _whisper_transcribe(
+                    audio_path, duration=duration, title=title,
+                    cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb,
+                    _retrying=True)
+                return _retry_result
 
             if response_line is None:
                 # Subprocess closed stdout unexpectedly
@@ -10111,49 +10164,50 @@ def _punctuate_text(text):
     """Restore punctuation and capitalization via the GPU subprocess.
 
     Returns original text if subprocess is unavailable or errors.
+    Serialized via _punct_lock to prevent concurrent stdin/stdout interleaving.
     """
     global _punct_proc
     with _punct_lock:
         if _punct_proc is None or _punct_proc.poll() is not None:
             return text
         _local_proc = _punct_proc  # capture local reference under lock
-    try:
-        request = json.dumps({"text": text})
-        _local_proc.stdin.write(request + "\n")
-        _local_proc.stdin.flush()
+        try:
+            request = json.dumps({"text": text})
+            _local_proc.stdin.write(request + "\n")
+            _local_proc.stdin.flush()
 
-        # Read response with a 60-second timeout to avoid blocking forever
-        # if the subprocess hangs.
-        _resp_q = queue.Queue()
-        def _read_response():
-            try:
-                _resp_q.put(_local_proc.stdout.readline())
-            except Exception as _e:
-                _resp_q.put(_e)
-        _t = threading.Thread(target=_read_response, daemon=True)
-        _t.start()
-        _t.join(timeout=60)
-        if _t.is_alive():
-            # Subprocess hung — kill it and report
-            log("    ⚠ Punctuation subprocess timed out (60 s), killing it.\n", "red")
-            _stop_punct_process()
-            return text
+            # Read response with a 60-second timeout to avoid blocking forever
+            # if the subprocess hangs.
+            _resp_q = queue.Queue()
+            def _read_response():
+                try:
+                    _resp_q.put(_local_proc.stdout.readline())
+                except Exception as _e:
+                    _resp_q.put(_e)
+            _t = threading.Thread(target=_read_response, daemon=True)
+            _t.start()
+            _t.join(timeout=60)
+            if _t.is_alive():
+                # Subprocess hung — kill it and report
+                log("    ⚠ Punctuation subprocess timed out (60 s), killing it.\n", "red")
+                _stop_punct_process()
+                return text
 
-        _raw = _resp_q.get_nowait()
-        if isinstance(_raw, Exception):
-            raise _raw
-        response_line = _raw.strip()
-        if not response_line:
+            _raw = _resp_q.get_nowait()
+            if isinstance(_raw, Exception):
+                raise _raw
+            response_line = _raw.strip()
+            if not response_line:
+                return text
+            result = json.loads(response_line)
+            if result.get("status") == "ok":
+                return result.get("text", text)
+            else:
+                log(f"    ⚠ Punctuation error: {result.get('text', 'unknown')}\n", "red")
+                return text
+        except Exception:
+            _stop_punct_process()  # Kill broken process
             return text
-        result = json.loads(response_line)
-        if result.get("status") == "ok":
-            return result.get("text", text)
-        else:
-            log(f"    ⚠ Punctuation error: {result.get('text', 'unknown')}\n", "red")
-            return text
-    except Exception:
-        _stop_punct_process()  # Kill broken process
-        return text
 
 
 def _whisper_punct_fixup(text):
@@ -11236,11 +11290,11 @@ def _run_metadata_download(item):
                 done += 1
                 continue
 
-            _meta_max = _MAX_TITLE_DISPLAY - 13  # account for "Metadata - " prefix width
-            _trunc = title[:_meta_max] + "..." if len(title) > _meta_max else title
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
-            log(f"  [{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
+            _meta_title_width = _MAX_TITLE_DISPLAY - len(_prefix) - 3  # " - " = 3 chars
+            _trunc = _trunc_pad_title(title, _meta_title_width)
+            log(f"[{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:
@@ -11358,7 +11412,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             log(f"{'='*60}\n\n", "tx_sep")
 
             # ── Step 1: Scan local video files ──────────────────────────
-            log("  Scanning local video files...\n", "simpleline")
+            log("  — Scanning local video files...\n", "simpleline_blue")
             local_files = {}  # filename_no_ext -> full_path
             for dirpath, _, files in os.walk(folder):
                 for f in files:
@@ -11373,7 +11427,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log("  ⚠ No video files found in channel folder.\n", "red")
                 return
 
-            log(f"  Found {len(local_files)} video file(s) on disk.\n", "simpleline")
+            log(f"  — Found {len(local_files)} video file(s) on disk.\n", "simpleline_blue")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -11389,7 +11443,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     files_to_process[fname] = fpath
 
             if already_done:
-                log(f"  {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
+                log(f"  — {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline_blue")
 
             _jsonl_existing = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
@@ -11427,12 +11481,12 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         if isinstance(e, dict) and e.get("fpath") and e["fpath"] in _fp_to_process
                     }
                     if _whisper_cache_set:
-                        log(f"  Resuming: {len(_whisper_cache_set)} file(s) already identified for Whisper — skipping caption re-check.\n", "simpleline")
+                        log(f"  — Resuming: {len(_whisper_cache_set)} file(s) already identified for Whisper — skipping caption re-check.\n", "simpleline_blue")
             except Exception:
                 _whisper_cache_set = set()
 
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
-            log("  Fetching YouTube video list for caption matching...\n", "simpleline")
+            log("  — Fetching YouTube video list for caption matching...\n", "simpleline_blue")
             yt_title_to_id = {}  # yt_title -> video_id
             def _fetch_yt_title_map(use_cookies):
                 """Fetch title→id map from YouTube playlist. Returns {} on failure.
@@ -12843,7 +12897,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             if not _sync_mode:
                 if _skip_current.is_set():
                     _skip_current.clear()
-                    cancel_event.clear()
+                    if _ce is cancel_event:
+                        cancel_event.clear()
                     _process_next_queued()
                 elif not _ce.is_set():
                     _process_next_queued()
@@ -13850,9 +13905,12 @@ def internal_run_subscribe_before_date(url, date_str):
                         if p: existing.add(p[-1])
             new_ids = [i for i in ids if i not in existing]
             if new_ids:
-                with open(ARCHIVE_FILE, "a", encoding="utf-8") as f_:
-                    for vid_id in new_ids:
-                        f_.write(f"youtube {vid_id}\n")
+                try:
+                    with open(ARCHIVE_FILE, "a", encoding="utf-8") as f_:
+                        for vid_id in new_ids:
+                            f_.write(f"youtube {vid_id}\n")
+                except OSError as _e:
+                    log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
 
         # Store the date-filtered IDs in channel config so they can be
         # removed from the archive if the date filter is later changed
@@ -14463,9 +14521,12 @@ def internal_run_subscribe_blocking(url):
 
             new_ids = [i for i in ids if i not in existing]
             if new_ids:
-                with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
-                    for vid_id in new_ids: f.write(f"youtube {vid_id}\n")
-                log(f"✓ Wrote {len(new_ids)} new IDs to archive.\n", "green")
+                try:
+                    with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                        for vid_id in new_ids: f.write(f"youtube {vid_id}\n")
+                    log(f"✓ Wrote {len(new_ids)} new IDs to archive.\n", "green")
+                except OSError as _e:
+                    log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
             else:
                 log(f"✓ All {len(ids)} IDs already in archive.\n", "green")
 
@@ -14546,6 +14607,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
     _tracked_paths = []  # file paths captured at DLTRACK time for per-batch compression
     _local_archived_set = _load_archived_ids()   # ID-based dedup (works when yt-dlp logs the ID)
     _seen_filter_titles = _load_seen_filter_titles()  # title-based dedup (works even when ID is not logged)
+    _seen_filter_batch = []  # batch buffer for seen-filter-title file writes
     try:
         proc = spawn_yt_dlp(cmd)
         if not proc: return 0
@@ -14994,7 +15056,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
             if "recorded in the archive" in line:
                 skip_count += 1
-                session_totals["skip"] += 1
+                with _session_totals_lock:
+                    session_totals["skip"] += 1
 
                 checked = skip_count + dl_count + dur_count
                 if checked == 1 or checked % 25 == 0:
@@ -15029,7 +15092,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                 # Only count genuinely new filter-rejected videos (after dedup).
                 dur_count += 1
-                session_totals["dur"] += 1
+                with _session_totals_lock:
+                    session_totals["dur"] += 1
 
                 # Determine filter reason by checking the whole yt-dlp line
                 # (works regardless of whether yt-dlp wraps the expression in parens)
@@ -15064,18 +15128,25 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
                 # Persist the title so future syncs suppress this entry silently.
                 _seen_filter_titles.add(_skip_title_raw)
-                with io_lock:
-                    try:
-                        with open(SEEN_FILTER_TITLES_FILE, "a", encoding="utf-8") as f:
-                            f.write(_skip_title_raw + "\n")
-                    except Exception:
-                        pass
+                _seen_filter_batch.append(_skip_title_raw)
+                # Flush batch every 50 entries to avoid unbounded memory use
+                if len(_seen_filter_batch) >= 50:
+                    with io_lock:
+                        try:
+                            with open(SEEN_FILTER_TITLES_FILE, "a", encoding="utf-8") as f:
+                                f.write("".join(t + "\n" for t in _seen_filter_batch))
+                        except Exception:
+                            pass
+                    _seen_filter_batch.clear()
 
                 # Also write to ID archive when the ID is available (duration-based filters).
                 if current_vid_id and current_vid_id not in live_ids:
                     with io_lock:
-                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
-                            f.write(f"youtube {current_vid_id}\n")
+                        try:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                                f.write(f"youtube {current_vid_id}\n")
+                        except OSError as _e:
+                            log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                     _local_archived_set.add(current_vid_id)
                     if not is_simple_mode:
                         log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
@@ -15085,7 +15156,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 # Members-only videos are not real errors — treat as skips
                 if "Join this channel to get access to members-only content" in line:
                     dur_count += 1
-                    session_totals["dur"] += 1
+                    with _session_totals_lock:
+                        session_totals["dur"] += 1
                     _vid = current_vid_id or "video"
                     _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
                     _skipped_dur_titles.append((_skip_title, "Members-only content."))
@@ -15099,8 +15171,11 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         log(line, "filterskip")
                     if current_vid_id and current_vid_id not in live_ids:
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
-                                f.write(f"youtube {current_vid_id}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                                    f.write(f"youtube {current_vid_id}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         if not is_simple_mode:
                             log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
@@ -15108,7 +15183,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 if current_vid_id and ("Video unavailable" in line or "This video is private" in line
                                        or "video is no longer available" in line.lower()):
                     dur_count += 1
-                    session_totals["dur"] += 1
+                    with _session_totals_lock:
+                        session_totals["dur"] += 1
                     _vid = current_vid_id
                     _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
                     _skipped_dur_titles.append((_skip_title, "Private/unavailable."))
@@ -15121,15 +15197,19 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     else:
                         log(line, "filterskip")
                     with io_lock:
-                        with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
-                            f.write(f"youtube {current_vid_id}\n")
+                        try:
+                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                                f.write(f"youtube {current_vid_id}\n")
+                        except OSError as _e:
+                            log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                     if not is_simple_mode:
                         log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 # Scheduled livestreams — not a real error, treat as filtered
                 if "This live event will begin in" in line or "Premieres in" in line:
                     dur_count += 1
-                    session_totals["dur"] += 1
+                    with _session_totals_lock:
+                        session_totals["dur"] += 1
                     _vid = current_vid_id or "video"
                     _skip_title = _fetch_video_title(_vid) if _vid != "video" else "video"
                     _skipped_dur_titles.append((_skip_title, "Scheduled/premiere."))
@@ -15143,13 +15223,17 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         log(line, "filterskip")
                     if current_vid_id and current_vid_id not in live_ids:
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
-                                f.write(f"youtube {current_vid_id}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+                                    f.write(f"youtube {current_vid_id}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         if not is_simple_mode:
                             log(f"  [Auto-Archived] Added {current_vid_id} to archive so it won't be checked again.\n", "dim")
                     continue
                 err_count += 1
-                session_totals["err"] += 1
+                with _session_totals_lock:
+                    session_totals["err"] += 1
                 if "Requested format is not available" in line:
                     if not is_simple_mode:
                         log(line, "red")
@@ -15173,7 +15257,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 if dedup_key not in videos_processed:
                     videos_processed.add(dedup_key)
                     dl_count += 1
-                    session_totals["dl"] += 1
+                    with _session_totals_lock:
+                        session_totals["dl"] += 1
                     if current_vid_id:
                         _local_archived_set.add(current_vid_id)
                     _write_sync_progress()
@@ -15195,6 +15280,16 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 proc.wait(timeout=5)
             except Exception:
                 pass
+
+        # Flush any remaining seen-filter-title batch entries
+        if _seen_filter_batch:
+            with io_lock:
+                try:
+                    with open(SEEN_FILTER_TITLES_FILE, "a", encoding="utf-8") as f:
+                        f.write("".join(t + "\n" for t in _seen_filter_batch))
+                except Exception:
+                    pass
+            _seen_filter_batch.clear()
 
         # Fire final-batch callback for any remaining tracked paths that didn't complete a full batch
         if on_batch_ready and compress_batch_size > 0 and _tracked_paths:
@@ -15475,9 +15570,12 @@ def start_sync_all():
                             log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
                             # Max-dur means these can never be downloaded — archive so they won't show up again
                             with io_lock:
-                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                    for _lid, _lurl in live_videos:
-                                        _af.write(f"youtube {_lid}\n")
+                                try:
+                                    with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                        for _lid, _lurl in live_videos:
+                                            _af.write(f"youtube {_lid}\n")
+                                except OSError as _e:
+                                    log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         else:
                             for _lid, _lurl in live_videos:
                                 deferred_streams.append((ch, _lurl, _lid))
@@ -15854,8 +15952,11 @@ def start_sync_all():
                     # Only archive the stream ID on successful download so failed ones retry next sync
                     if c_dl:
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                _af.write(f"youtube {_ds_id}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    _af.write(f"youtube {_ds_id}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl
 
@@ -17811,6 +17912,14 @@ def _show_gpu_menu(event=None):
                 w = e.widget
                 if w == gpu_btn:
                     return  # Let the button's own command handle toggle
+                # Check parent chain — badge is a child of gpu_btn
+                _p = w
+                for _ in range(5):
+                    _p = _p.master
+                    if _p == gpu_btn:
+                        return
+                    if _p is None or _p == root:
+                        break
             except Exception:
                 pass
             # Check if click is inside the popup
@@ -18831,9 +18940,12 @@ def _run_autorun():
                             log(f"  ⏭ {len(live_videos)} livestream(s) skipped (max-dur set).\n", "dim")
                             # Max-dur means these can never be downloaded — archive so they won't show up again
                             with io_lock:
-                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                    for _lid, _lurl in live_videos:
-                                        _af.write(f"youtube {_lid}\n")
+                                try:
+                                    with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                        for _lid, _lurl in live_videos:
+                                            _af.write(f"youtube {_lid}\n")
+                                except OSError as _e:
+                                    log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         else:
                             for _lid, _lurl in live_videos:
                                 deferred_streams.append((ch, _lurl, _lid))
@@ -19207,8 +19319,11 @@ def _run_autorun():
                     # Only archive the stream ID on successful download so failed ones retry next sync
                     if c_dl:
                         with io_lock:
-                            with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
-                                _af.write(f"youtube {_ds_id}\n")
+                            try:
+                                with open(ARCHIVE_FILE, "a", encoding="utf-8") as _af:
+                                    _af.write(f"youtube {_ds_id}\n")
+                            except OSError as _e:
+                                log(f"  WARNING: Could not write to archive file: {_e}\n", "red")
                         ch_name = _ds_ch.get("name", "")
                         ch_dl_map[ch_name] = ch_dl_map.get(ch_name, 0) + c_dl
 
@@ -19398,8 +19513,9 @@ def _tp_open_db(path):
     # Migration: add words column for word-level timestamps (added later; safe to ignore if exists)
     try:
         conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
-    except Exception:
-        pass
+    except Exception as _e:
+        if "duplicate column" not in str(_e).lower():
+            traceback.print_exc()
     # Videos table — tracks ALL videos regardless of transcription status.
     # tx_status: 'pending' | 'transcribed' | 'no_captions' | 'error'
     conn.execute("""CREATE TABLE IF NOT EXISTS videos (
@@ -19614,7 +19730,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._loaded          = False
         self._conn            = None
         self._db_loading      = False
-        self._db_lock         = threading.Lock()
+        self._db_lock         = threading.RLock()
         self._result_meta     = {}
         self._sort_col        = "date"
         self._sort_asc        = False
@@ -20079,6 +20195,8 @@ class _TranscriptionPanel(ttk.Frame):
                     found = _find_video(child)
                     if found:
                         return found
+                    # Collapse if video wasn't found under this node
+                    tree.item(child, open=False)
             return None
 
         target = _find_video(ch_iid)
@@ -20101,10 +20219,12 @@ class _TranscriptionPanel(ttk.Frame):
         # channels that have been transcribed but not yet indexed).
         if self._conn and channel_name:
             try:
-                pending = self._db_execute(
-                    "SELECT id, filepath FROM videos "
-                    "WHERE channel=? AND tx_status='pending' AND filepath IS NOT NULL",
-                    (channel_name,)).fetchall()
+                with self._db_lock:
+                    pending = self._db_execute(
+                        "SELECT id, filepath FROM videos "
+                        "WHERE channel=? AND tx_status='pending' AND filepath IS NOT NULL",
+                        (channel_name,)).fetchall()
+                _to_update = []
                 for vid_id, fp in pending:
                     vid_dir = os.path.dirname(fp)
                     # Check disk for transcript files in video's dir tree
@@ -20127,10 +20247,14 @@ class _TranscriptionPanel(ttk.Frame):
                             break
                         _chk = _p
                     if found:
-                        self._db_execute(
-                            "UPDATE videos SET tx_status='transcribed' WHERE id=?",
-                            (vid_id,))
-                self._db_commit()
+                        _to_update.append(vid_id)
+                if _to_update:
+                    with self._db_lock:
+                        for _uid in _to_update:
+                            self._db_execute(
+                                "UPDATE videos SET tx_status='transcribed' WHERE id=?",
+                                (_uid,))
+                        self._db_commit()
             except Exception:
                 pass
         def _on_main():
@@ -20365,12 +20489,13 @@ class _TranscriptionPanel(ttk.Frame):
             if not self._conn:
                 return
             try:
-                vid_total = self._db_execute(
-                    "SELECT COUNT(*) FROM videos WHERE filepath != '__schema_ver__'"
-                ).fetchone()[0]
-                seg_vids = self._db_execute(
-                    "SELECT COUNT(DISTINCT video_id) FROM segments WHERE video_id != ''"
-                ).fetchone()[0]
+                with self._db_lock:
+                    vid_total = self._db_execute(
+                        "SELECT COUNT(*) FROM videos WHERE filepath != '__schema_ver__'"
+                    ).fetchone()[0]
+                    seg_vids = self._db_execute(
+                        "SELECT COUNT(DISTINCT video_id) FROM segments WHERE video_id != ''"
+                    ).fetchone()[0]
                 unindexed = max(0, vid_total - seg_vids)
             except Exception:
                 unindexed = 0
@@ -20397,9 +20522,10 @@ class _TranscriptionPanel(ttk.Frame):
             return
         def _query():
             try:
-                segs = self._db_execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-                vids = self._db_execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
-                chs  = self._db_execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                with self._db_lock:
+                    segs = self._db_execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                    vids = self._db_execute("SELECT COUNT(DISTINCT video_id) FROM segments").fetchone()[0]
+                    chs  = self._db_execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
                 text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
                 self.after(0, lambda: self._stats_label.config(text=text))
             except Exception:
@@ -20833,7 +20959,8 @@ class _TranscriptionPanel(ttk.Frame):
                     sql += " AND month=?"
                     params.append(month)
                 sql += " ORDER BY title"
-                rows = self._db_execute(sql, params).fetchall()
+                with self._db_lock:
+                    rows = self._db_execute(sql, params).fetchall()
             except Exception:
                 self.after(0, lambda: self._browse_tree.delete(_loading_iid))
                 return
@@ -20844,12 +20971,13 @@ class _TranscriptionPanel(ttk.Frame):
                 _id_map = {}  # title -> video_id
                 # Try segments table first
                 try:
-                    for _st, _sv in self._db_execute(
-                            "SELECT DISTINCT title, video_id FROM segments "
-                            "WHERE channel=? AND video_id != ''",
-                            (channel,)).fetchall():
-                        if _sv:
-                            _id_map[_st] = _sv
+                    with self._db_lock:
+                        for _st, _sv in self._db_execute(
+                                "SELECT DISTINCT title, video_id FROM segments "
+                                "WHERE channel=? AND video_id != ''",
+                                (channel,)).fetchall():
+                            if _sv:
+                                _id_map[_st] = _sv
                 except Exception:
                     pass
                 # If segments had nothing, read the JSONL files on disk
@@ -20892,23 +21020,24 @@ class _TranscriptionPanel(ttk.Frame):
                         pass
                 if _id_map:
                     _new_rows = []
-                    for r in rows:
-                        if r[2] is None and r[0] in _id_map:
-                            _new_rows.append((r[0], r[1], _id_map[r[0]], r[3], r[4]))
-                            try:
-                                self._db_execute(
-                                    "UPDATE videos SET video_id=? "
-                                    "WHERE title=? AND channel=? AND video_id IS NULL",
-                                    (_id_map[r[0]], r[0], channel))
-                            except Exception:
-                                pass
-                        else:
-                            _new_rows.append(r)
+                    with self._db_lock:
+                        for r in rows:
+                            if r[2] is None and r[0] in _id_map:
+                                _new_rows.append((r[0], r[1], _id_map[r[0]], r[3], r[4]))
+                                try:
+                                    self._db_execute(
+                                        "UPDATE videos SET video_id=? "
+                                        "WHERE title=? AND channel=? AND video_id IS NULL",
+                                        (_id_map[r[0]], r[0], channel))
+                                except Exception:
+                                    pass
+                            else:
+                                _new_rows.append(r)
+                        try:
+                            self._db_commit()
+                        except Exception:
+                            pass
                     rows = _new_rows
-                    try:
-                        self._db_commit()
-                    except Exception:
-                        pass
 
             # Sort by file mtime (upload date) instead of alphabetically
             # Also derive month from mtime for separator lines
@@ -20938,15 +21067,16 @@ class _TranscriptionPanel(ttk.Frame):
                 try:
                     # Batch to stay within SQLite's 999-variable limit
                     _BATCH_SZ = 998  # reserve 1 slot for the channel param
-                    for _bi in range(0, len(_transcribed_titles), _BATCH_SZ):
-                        _batch = _transcribed_titles[_bi:_bi + _BATCH_SZ]
-                        placeholders = ",".join("?" * len(_batch))
-                        _jrows = self._db_execute(
-                            f"SELECT title, jsonl_path FROM segments "
-                            f"WHERE title IN ({placeholders}) AND channel=? "
-                            f"GROUP BY title",
-                            _batch + [channel]).fetchall()
-                        _jsonl_map.update({r[0]: r[1] for r in _jrows if r[1]})
+                    with self._db_lock:
+                        for _bi in range(0, len(_transcribed_titles), _BATCH_SZ):
+                            _batch = _transcribed_titles[_bi:_bi + _BATCH_SZ]
+                            placeholders = ",".join("?" * len(_batch))
+                            _jrows = self._db_execute(
+                                f"SELECT title, jsonl_path FROM segments "
+                                f"WHERE title IN ({placeholders}) AND channel=? "
+                                f"GROUP BY title",
+                                _batch + [channel]).fetchall()
+                            _jsonl_map.update({r[0]: r[1] for r in _jrows if r[1]})
                 except Exception:
                     pass
 
@@ -21486,7 +21616,8 @@ class _TranscriptionPanel(ttk.Frame):
                 def _show_explorer(vp=video_path):
                     try:
                         if os.name == "nt":
-                            subprocess.Popen(f'explorer /select,"{os.path.normpath(vp)}"')
+                            _npath = os.path.normpath(vp).replace('"', '')
+                            subprocess.Popen(["explorer", f"/select,{_npath}"])
                         elif sys.platform == "darwin":
                             subprocess.Popen(["open", "-R", vp])
                         else:
@@ -22213,7 +22344,8 @@ class _TranscriptionPanel(ttk.Frame):
             sql += " AND month=?"
             params.append(month)
         try:
-            rows = self._db_execute(sql, params).fetchall()
+            with self._db_lock:
+                rows = self._db_execute(sql, params).fetchall()
         except Exception:
             return
         if gen != self._grid_gen:
@@ -22612,14 +22744,18 @@ class _TranscriptionPanel(ttk.Frame):
                     self.after(500, lambda t=title: self._grid_navigate_to_video_retry(t))
                     return
 
-    def _grid_navigate_to_video_retry(self, title):
-        """Retry finding a title node after tree expansion."""
+    def _grid_navigate_to_video_retry(self, title, _attempt=0):
+        """Retry finding a title node after tree expansion (up to 3 attempts)."""
         for iid, meta in self._browse_items.items():
             if meta.get("type") == "title" and meta.get("title") == title:
                 self._browse_tree.selection_set(iid)
                 self._browse_tree.see(iid)
                 self._browse_tree.event_generate("<<TreeviewSelect>>")
                 return
+        # Not found yet — retry with increasing delays up to 3 attempts
+        if _attempt < 3:
+            _delay = [500, 1000, 2000][_attempt]
+            self.after(_delay, lambda t=title, a=_attempt: self._grid_navigate_to_video_retry(t, a + 1))
 
     def _is_metadata_queued_or_running(self, channel, year=None, month=None):
         """Check if a metadata download is queued or running for the given scope."""
@@ -22822,9 +22958,10 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     pass
 
-                # Set whisper model and transcribe
-                _prev_model = _whisper_model_choice
-                _whisper_model_choice = chosen_model
+                # Set whisper model and transcribe (locked to prevent race with other threads)
+                with _whisper_model_lock:
+                    _prev_model = _whisper_model_choice
+                    _whisper_model_choice = chosen_model
                 # Stop existing whisper process so it restarts with new model
                 _stop_whisper_process()
 
@@ -22838,7 +22975,8 @@ class _TranscriptionPanel(ttk.Frame):
                     _clear_whisper_progress()
                 finally:
                     # Restore previous model choice no matter what
-                    _whisper_model_choice = _prev_model
+                    with _whisper_model_lock:
+                        _whisper_model_choice = _prev_model
                     _stop_whisper_process()
 
                 if not text:
@@ -26114,8 +26252,10 @@ def on_tab_changed(event):
         # Refresh recent tree if it was dirtied while on another tab
         if _recent_tree_dirty:
             root.after(1, refresh_recent_list)
-        if new_download_count > 0:
+        with _new_dl_count_lock:
+            _had_new = new_download_count > 0
             new_download_count = 0
+        if _had_new:
             notebook.tab(tab_recent, text="  Recent  ")
             if _tab_btns.get(str(tab_recent)):
                 _tab_btns[str(tab_recent)].config(text="  Recent  ")
@@ -26936,7 +27076,8 @@ def _show_in_explorer():
 
     try:
         if os.name == "nt":
-            subprocess.Popen(f'explorer /select,"{os.path.normpath(fp)}"')
+            _npath = os.path.normpath(fp).replace('"', '')
+            subprocess.Popen(["explorer", f"/select,{_npath}"])
         elif sys.platform == "darwin":
             subprocess.Popen(["open", "-R", fp])
         else:
@@ -27092,10 +27233,12 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                 tp._refresh_browse()
 
             if notebook.select() != str(tab_recent):
-                new_download_count += 1
-                notebook.tab(tab_recent, text=f"  Recent ({new_download_count})  ")
+                with _new_dl_count_lock:
+                    new_download_count += 1
+                    _ct = new_download_count
+                notebook.tab(tab_recent, text=f"  Recent ({_ct})  ")
                 if _tab_btns.get(str(tab_recent)):
-                    _tab_btns[str(tab_recent)].config(text=f"  Recent ({new_download_count})  ")
+                    _tab_btns[str(tab_recent)].config(text=f"  Recent ({_ct})  ")
                 _update_tray_badge()
 
         if _root_alive: _ui_queue.append(_sync)

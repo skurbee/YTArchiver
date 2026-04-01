@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.8"
+APP_VERSION = "v30.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3604,7 +3604,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 4:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 5:21pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -3911,7 +3911,7 @@ def _on_hist_configure(event=None):
             root.after_cancel(_hist_resize_job["id"])
         except Exception:
             pass
-    _hist_resize_job["id"] = root.after(150, _do_hist_refit)
+    _hist_resize_job["id"] = root.after(300, _do_hist_refit)
 
 def _do_hist_refit():
     _hist_resize_job["id"] = None
@@ -4286,7 +4286,7 @@ def _on_chan_tree_configure(event=None):
             root.after_cancel(_chan_resize_job["id"])
         except Exception:
             pass
-    _chan_resize_job["id"] = root.after(50, _do_chan_resize)
+    _chan_resize_job["id"] = root.after(100, _do_chan_resize)
 
 def _do_chan_resize():
     _chan_resize_job["id"] = None
@@ -4902,6 +4902,18 @@ def _on_chan_tree_escape(event):
 
 settings_chan_tree.bind("<Return>", _on_chan_tree_return)
 settings_chan_tree.bind("<Escape>", _on_chan_tree_escape)
+
+def _global_escape_edit(event):
+    """Close edit channel UI from any widget on the Subs tab when Escape is pressed."""
+    if _editing_channel.get("name") or _editing_channel.get("url"):
+        # Only act if the Subs tab is currently active
+        try:
+            if notebook.select() == str(tab_settings):
+                _clear_edit_mode()
+                return "break"
+        except Exception:
+            pass
+root.bind("<Escape>", _global_escape_edit, add="+")
 
 _chan_ctx_menu = tk.Menu(root, tearoff=0, bg=C_RAISED, fg=C_TEXT,
                          activebackground=C_BTN_HVR, activeforeground=C_TEXT,
@@ -17117,7 +17129,8 @@ def _show_queue_menu(event=None):
     _queue_popup["_state"] = _state  # Store ref for snapshot reset on re-show
 
     # Position below the button
-    def _reposition_queue_popup(*_args):
+    _queue_repos_job = [None]
+    def _reposition_queue_popup_now():
         try:
             if popup.winfo_exists():
                 x = queue_btn.winfo_rootx()
@@ -17125,8 +17138,13 @@ def _show_queue_menu(event=None):
                 popup.geometry(f"+{x}+{y}")
         except Exception:
             pass
+    def _reposition_queue_popup(*_args):
+        if _queue_repos_job[0]:
+            try: root.after_cancel(_queue_repos_job[0])
+            except Exception: pass
+        _queue_repos_job[0] = root.after(16, _reposition_queue_popup_now)
 
-    _reposition_queue_popup()
+    _reposition_queue_popup_now()
     popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
@@ -17913,7 +17931,8 @@ def _show_gpu_menu(event=None):
     _gpu_popup["_state"] = _state  # Store ref for snapshot reset on re-show
 
     # Position below the button
-    def _reposition_gpu_popup(*_args):
+    _gpu_repos_job = [None]
+    def _reposition_gpu_popup_now():
         try:
             if popup.winfo_exists():
                 popup.update_idletasks()
@@ -17926,8 +17945,13 @@ def _show_gpu_menu(event=None):
                 popup.geometry(f"+{x}+{y}")
         except Exception:
             pass
+    def _reposition_gpu_popup(*_args):
+        if _gpu_repos_job[0]:
+            try: root.after_cancel(_gpu_repos_job[0])
+            except Exception: pass
+        _gpu_repos_job[0] = root.after(16, _reposition_gpu_popup_now)
 
-    _reposition_gpu_popup()
+    _reposition_gpu_popup_now()
     popup.deiconify()  # Show now that it's positioned
 
     # Follow main window when it moves
@@ -20943,8 +20967,14 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_inner = tk.Frame(self._grid_canvas, bg=self._TP_BG)
         self._grid_canvas_window = self._grid_canvas.create_window(
             (0, 0), window=self._grid_inner, anchor="nw")
-        self._grid_inner.bind("<Configure>",
-            lambda e: self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all")))
+        self._grid_scroll_job = None
+        def _grid_inner_configure(e):
+            if self._grid_scroll_job:
+                try: self.after_cancel(self._grid_scroll_job)
+                except Exception: pass
+            self._grid_scroll_job = self.after(50,
+                lambda: self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all")))
+        self._grid_inner.bind("<Configure>", _grid_inner_configure)
         self._grid_canvas.bind("<Configure>", self._on_grid_canvas_resize)
         # Mousewheel scrolling
         def _grid_mousewheel(e):
@@ -22749,15 +22779,17 @@ class _TranscriptionPanel(ttk.Frame):
 
     _GRID_PAGE_SIZE = 30  # videos per page
 
-    def _grid_build_cards(self, reset=True):
+    def _grid_build_cards(self, reset=True, _keep_photos=False):
         """Build video cards in the grid inner frame using grid layout.
         If reset=True, clears and starts from the beginning.
-        If reset=False, appends the next page of cards."""
+        If reset=False, appends the next page of cards.
+        If _keep_photos=True, reuse cached PhotoImages (for resize rebuilds)."""
         if reset:
             for w in self._grid_inner.winfo_children():
                 w.destroy()
             self._grid_cards.clear()
-            self._grid_photos.clear()
+            if not _keep_photos:
+                self._grid_photos.clear()
             self._grid_loaded_count = 0
 
         canvas_w = self._grid_canvas.winfo_width()
@@ -22946,7 +22978,7 @@ class _TranscriptionPanel(ttk.Frame):
             pass
 
     def _on_grid_canvas_resize(self, event):
-        """Responsive: rebuild grid when canvas width changes significantly."""
+        """Responsive: re-layout grid when canvas width changes column count."""
         self._grid_canvas.itemconfig(self._grid_canvas_window, width=event.width)
         if not self._grid_visible or not self._grid_videos:
             return
@@ -22955,14 +22987,84 @@ class _TranscriptionPanel(ttk.Frame):
         new_cols = max(1, (event.width - pad) // (min_card + pad))
         old_cols = getattr(self, '_grid_cols', 0)
         if new_cols != old_cols:
-            # Debounce rebuild to avoid thrashing during drag-resize
+            # Cancel any pending resize job
             if hasattr(self, '_grid_resize_job') and self._grid_resize_job:
                 try:
                     self.after_cancel(self._grid_resize_job)
                 except Exception:
                     pass
             self._grid_last_width = event.width
-            self._grid_resize_job = self.after(100, self._grid_build_cards)
+            # Fast path: just re-grid existing cards at new positions (no destroy/rebuild)
+            self._grid_regrid(event.width, new_cols, pad)
+            # Schedule a deferred full thumbnail resize for correct dimensions
+            self._grid_resize_job = self.after(400, lambda: self._grid_rethumbnail(event.width))
+
+    def _grid_regrid(self, canvas_w, cols, pad):
+        """Re-position existing cards into new column layout without destroying them.
+        This is nearly instant because it only changes grid row/col, not widget content."""
+        self._grid_cols = cols
+        card_w = (canvas_w - pad * (cols + 1)) // cols
+        if card_w < 150:
+            card_w = 150
+        for c in range(cols):
+            self._grid_inner.columnconfigure(c, weight=1, uniform="card")
+        # Re-grid each existing card at its new row/col position
+        for i, card in enumerate(self._grid_cards):
+            row = i // cols
+            col = i % cols
+            card.grid_configure(row=row, column=col)
+
+    def _grid_rethumbnail(self, canvas_w):
+        """Deferred pass: resize thumbnails to correct dimensions after drag ends."""
+        self._grid_resize_job = None
+        if not self._grid_visible or not self._grid_videos:
+            return
+        pad = 8
+        min_card = 200
+        cols = max(1, (canvas_w - pad) // (min_card + pad))
+        card_w = (canvas_w - pad * (cols + 1)) // cols
+        if card_w < 150:
+            card_w = 150
+        thumb_h = int(card_w * 9 / 16)
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return
+        # Update thumbnail sizes for loaded cards via background thread
+        for i, card in enumerate(self._grid_cards):
+            if i >= len(self._grid_videos):
+                break
+            v = self._grid_videos[i]
+            if not v.get("thumb_path"):
+                continue
+            # Find the thumbnail label (first child of card)
+            children = card.winfo_children()
+            if not children:
+                continue
+            thumb_label = children[0]
+            # Resize thumbnail label dimensions
+            thumb_label.config(width=card_w, height=thumb_h)
+            # Load new correctly-sized thumbnail in background
+            _tpath = v["thumb_path"]
+            _tlbl = thumb_label
+            _cw = card_w
+            _th = thumb_h
+            _title = v["title"]
+            def _load(path=_tpath, lbl=_tlbl, w=_cw, h=_th, tk_key=_title):
+                try:
+                    img = Image.open(path)
+                    img = img.resize((w, h), Image.BICUBIC)
+                    photo = ImageTk.PhotoImage(img)
+                    def _apply(p=photo, l=lbl, k=tk_key):
+                        try:
+                            l.config(image=p, text="")
+                            self._grid_photos[k] = p
+                        except Exception:
+                            pass
+                    self.after(0, _apply)
+                except Exception:
+                    pass
+            self._thumb_pool.submit(_load)
 
     def _grid_resort(self):
         """Re-sort the grid based on the current sort selection."""
@@ -26746,7 +26848,7 @@ def _on_recent_tree_configure(event=None):
             root.after_cancel(_recent_resize_job["id"])
         except Exception:
             pass
-    _recent_resize_job["id"] = root.after(50, _do_recent_resize)
+    _recent_resize_job["id"] = root.after(100, _do_recent_resize)
 
 
 def _do_recent_resize():

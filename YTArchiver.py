@@ -26,6 +26,7 @@ import traceback
 import math
 import bisect
 import csv
+import random
 import webbrowser as _webbrowser
 from pathlib import Path
 
@@ -82,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.4"
+APP_VERSION = "v30.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2019,7 +2020,7 @@ def check_directory_writable(path):
         os.makedirs(path, exist_ok=True)
         test_file = os.path.join(path, '.write_test')
         try:
-            with open(test_file, 'w') as f:
+            with open(test_file, 'w', encoding='utf-8') as f:
                 f.write('test')
         finally:
             try:
@@ -3583,7 +3584,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:06pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6475,7 +6476,11 @@ def remove_channel():
                     line = line.strip()
                     if re.fullmatch(r'[\w-]{11}', line):
                         channel_ids.add(line)
-                proc.wait()
+                try:
+                    proc.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
 
                 if not channel_ids:
                     log(f"  ⚠ No IDs found for \"{removed_name}\" — blocklist unchanged.\n", "red")
@@ -8995,7 +9000,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 break
                             if not _is_simple_mode:
                                 log(f"  {line.rstrip()}\n", "dim")
-                        dl_proc.wait()
+                        try:
+                            dl_proc.wait(timeout=300)
+                        except subprocess.TimeoutExpired:
+                            dl_proc.kill()
+                            dl_proc.wait()
                         with proc_lock:
                             if dl_proc in active_processes:
                                 active_processes.remove(dl_proc)
@@ -9444,7 +9453,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     if re.fullmatch(r'[\w-]{11}', vid_id):  # YouTube IDs are exactly 11 chars
                         result[yt_title] = vid_id
         finally:
-            proc.wait()
+            try:
+                proc.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             with proc_lock:
                 if proc in active_processes:
                     active_processes.remove(proc)
@@ -9705,7 +9718,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     if _ce.is_set():
                         dl_proc.terminate()
                         break
-                dl_proc.wait()
+                try:
+                    dl_proc.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    dl_proc.kill()
+                    dl_proc.wait()
                 with proc_lock:
                     if dl_proc in active_processes:
                         active_processes.remove(dl_proc)
@@ -11170,15 +11187,11 @@ def _run_metadata_download(item):
         pass
     # If segments had nothing, read JSONL files from the channel folder
     if not _seg_id_map:
-        _search_dirs = set()
-        _search_dirs.add(folder_path)
-        for dirpath, _, _ in os.walk(folder_path):
-            _search_dirs.add(dirpath)
-        for _sd in _search_dirs:
+        for dirpath, _, filenames in os.walk(folder_path):
             try:
-                for _fn in os.listdir(_sd):
+                for _fn in filenames:
                     if _fn.endswith('.jsonl') and _fn.startswith('.'):
-                        _jf = os.path.join(_sd, _fn)
+                        _jf = os.path.join(dirpath, _fn)
                         with open(_jf, 'r', encoding='utf-8', errors='replace') as _fh:
                             for _jline in _fh:
                                 _jline = _jline.strip()
@@ -11976,9 +11989,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Rate-limit backoff: if many consecutive captions failed, slow down
                 # to avoid hitting YouTube throttling after pause/resume or heavy use.
                 if _consec_caption_fails >= 5:
-                    time.sleep(2)
+                    time.sleep(random.uniform(1.5, 3.0))
                 elif _consec_caption_fails >= 3:
-                    time.sleep(1)
+                    time.sleep(random.uniform(0.5, 1.5))
 
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _whisper_queued > 0 else ""
                 log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
@@ -19957,7 +19970,7 @@ class _TranscriptionPanel(ttk.Frame):
                 for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
                     for fn in filenames:
                         fn_lower = fn.lower()
-                        if not any(fn_lower.endswith(ext) for ext in self._VIDEO_EXTS):
+                        if not fn_lower.endswith(self._VIDEO_EXTS):
                             continue
                         if ".temp." in fn_lower or fn_lower.endswith(".part"):
                             continue
@@ -23177,7 +23190,11 @@ class _TranscriptionPanel(ttk.Frame):
 
                 for line in dl_proc.stdout:
                     pass  # consume output
-                dl_proc.wait()
+                try:
+                    dl_proc.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    dl_proc.kill()
+                    dl_proc.wait()
                 with proc_lock:
                     if dl_proc in active_processes:
                         active_processes.remove(dl_proc)

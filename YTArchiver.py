@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.5"
+APP_VERSION = "v30.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3584,7 +3584,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 12:55pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5705,6 +5705,7 @@ def sync_single_channel(_from_queue=False):
     _my_gen = _job_generation
 
     _sync_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
     _current_job["label"] = f"Sync {ch['name']}"
     _current_job["url"] = ch["url"]
@@ -7241,6 +7242,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
         global _reorg_running
         with _reorg_queue_lock:
             _reorg_running = True
+        _update_global_pause_btn_sync()
         try:
             # If a cancel is already in-flight, respect it and bail out
             # instead of clearing it (which would erase user cancel intent).
@@ -10945,6 +10947,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
     # Set flag before starting thread to close the race window where a second
     # call could pass the check above before the thread sets it itself.
     _redownload_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
 
     def _worker():
@@ -11058,6 +11061,7 @@ def _start_metadata_task(item):
         return
 
     _metadata_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
 
     def _worker():
@@ -11400,6 +11404,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _update_global_pause_btn_sync()
         _start_internet_monitor()
         _transcribe_sync_controlled = (cancel_ev is None)  # True when sync pipeline, False when GPU-driven
         if not _sync_mode:
@@ -12765,6 +12770,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _update_global_pause_btn_sync()
         _start_internet_monitor()
         _transcribe_sync_controlled = False  # Manual transcription never blocks sync-pipeline jobs
         if not _sync_mode:
@@ -12940,6 +12946,7 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _transcribe_running = True
+        _update_global_pause_btn_sync()
         _start_internet_monitor()
         _transcribe_sync_controlled = False  # Manual folder transcription never blocks sync-pipeline jobs
         _tray_start_spin(red=True)
@@ -15467,6 +15474,7 @@ def start_sync_all():
     _my_gen = _job_generation
 
     _sync_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
     _current_job["label"] = "Sync Subs"
     _write_sync_progress()
@@ -17073,6 +17081,18 @@ def _show_queue_menu(event=None):
         _state["wrapper"] = wrapper
         _state["widgets"] = _widgets
 
+        # Force popup to resize to fit new content (overrideredirect windows
+        # don't auto-resize when inner content changes)
+        try:
+            popup.update_idletasks()
+            _rw = popup.winfo_reqwidth()
+            _rh = popup.winfo_reqheight()
+            x = queue_btn.winfo_rootx()
+            y = queue_btn.winfo_rooty() + queue_btn.winfo_height()
+            popup.geometry(f"{_rw}x{_rh}+{x}+{y}")
+        except Exception:
+            pass
+
     _build_content()
     _queue_popup["_build_fn"] = _build_content  # Store ref for re-show path
     _queue_popup["_state"] = _state  # Store ref for snapshot reset on re-show
@@ -17857,6 +17877,18 @@ def _show_gpu_menu(event=None):
                 pass
         _state["wrapper"] = wrapper
 
+        # Force popup to resize to fit new content (overrideredirect windows
+        # don't auto-resize when inner content changes)
+        try:
+            popup.update_idletasks()
+            _rw = popup.winfo_reqwidth()
+            _rh = popup.winfo_reqheight()
+            x = gpu_btn.winfo_rootx()
+            y = gpu_btn.winfo_rooty() + gpu_btn.winfo_height()
+            popup.geometry(f"{_rw}x{_rh}+{x}+{y}")
+        except Exception:
+            pass
+
     _build_content()
     _gpu_popup["_build_fn"] = _build_content  # Store ref for re-show path
     _gpu_popup["_state"] = _state  # Store ref for snapshot reset on re-show
@@ -18161,6 +18193,7 @@ def _gpu_start():
     if not _has_transcribe_tasks:
         # No transcription tasks — skip model dialog and start immediately
         _gpu_running = True
+        _update_global_pause_btn_sync()
         _start_internet_monitor()
         _gpu_cancel.clear()
         _gpu_pause.clear()
@@ -18267,6 +18300,7 @@ def _gpu_start():
         log(f"\n  GPU Tasks: using {_whisper_model_choice} model\n", "simpleline")
 
     _gpu_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
     _gpu_cancel.clear()
     _gpu_pause.clear()
@@ -18861,6 +18895,7 @@ def _run_autorun():
     _my_gen = _job_generation
 
     _sync_running = True
+    _update_global_pause_btn_sync()
     _start_internet_monitor()
     _write_sync_progress()
     _tray_start_spin()

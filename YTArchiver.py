@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v30.9"
+APP_VERSION = "v31.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3604,7 +3604,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 5:21pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 6:36pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8859,16 +8859,76 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             enum_cmd = [
                 "yt-dlp", "--flat-playlist",
                 "--print", "%(id)s|||%(title)s",
-                "--no-warnings",
+                "--no-warnings", "--verbose",
                 "--cookies-from-browser", "firefox",
                 ch_url
             ]
-            enum_proc = subprocess.run(enum_cmd, capture_output=True, text=True, timeout=600,
-                                       startupinfo=startupinfo)
-            for line in enum_proc.stdout.strip().split("\n"):
-                if "|||" in line:
-                    vid_id, yt_title = line.strip().split("|||", 1)
-                    yt_title_to_id[yt_title.strip()] = vid_id.strip()
+            _enum_proc = subprocess.Popen(
+                enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, startupinfo=startupinfo
+            )
+            # Read both streams via background threads — yt-dlp buffers all --print
+            # output until the entire playlist is enumerated, so stderr page progress
+            # is the only real-time signal.
+            _stdout_q = queue.Queue()
+            _stderr_q = queue.Queue()
+            _so_done = threading.Event()
+            _se_done = threading.Event()
+            def _rd_so():
+                try:
+                    for _ln in _enum_proc.stdout:
+                        _stdout_q.put(_ln)
+                except ValueError:
+                    pass
+                finally:
+                    _so_done.set()
+            def _rd_se():
+                try:
+                    for _ln in _enum_proc.stderr:
+                        _stderr_q.put(_ln)
+                except ValueError:
+                    pass
+                finally:
+                    _se_done.set()
+            threading.Thread(target=_rd_so, daemon=True).start()
+            threading.Thread(target=_rd_se, daemon=True).start()
+            _deadline = time.time() + 600
+            _last_page = 0
+            _page_re = re.compile(r'page (\d+)')
+            while True:
+                while not _stdout_q.empty():
+                    try:
+                        line = _stdout_q.get_nowait().strip()
+                        if "|||" in line:
+                            vid_id, yt_title = line.split("|||", 1)
+                            yt_title_to_id[yt_title.strip()] = vid_id.strip()
+                    except queue.Empty:
+                        break
+                while not _stderr_q.empty():
+                    try:
+                        _se = _stderr_q.get_nowait()
+                        _pm = _page_re.search(_se)
+                        if _pm:
+                            _pg = int(_pm.group(1))
+                            if _pg >= _last_page + 10:
+                                _last_page = _pg
+                                log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
+                    except queue.Empty:
+                        break
+                if _so_done.is_set() and _se_done.is_set() and _stdout_q.empty():
+                    break
+                if _ce.is_set():
+                    _enum_proc.terminate()
+                    break
+                if time.time() > _deadline:
+                    _enum_proc.terminate()
+                    log("  ⚠ YouTube list fetch timed out.\n", "red")
+                    break
+                time.sleep(0.5)
+            try:
+                _enum_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _enum_proc.kill()
             log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
         except Exception as e:
             log(f"  ⚠ Could not fetch YouTube list: {e}\n", "red")
@@ -9461,11 +9521,13 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             pass
 
     def _fetch_yt_list(use_cookies):
-        """Fetch YouTube video list (id→title) using spawn_yt_dlp with cancel support."""
+        """Fetch YouTube video list (id→title) using spawn_yt_dlp with cancel support.
+        Uses --verbose so stderr (merged into stdout) shows page progress — yt-dlp
+        buffers all --print output until the entire playlist is enumerated."""
         enum_cmd = [
             "yt-dlp", "--flat-playlist",
             "--print", "%(id)s|||%(title)s",
-            "--no-warnings",
+            "--no-warnings", "--verbose",
         ]
         if use_cookies:
             enum_cmd += ["--cookies-from-browser", "firefox"]
@@ -9474,6 +9536,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         if proc is None:
             return None
         result = {}
+        _last_page = 0
+        _page_re = re.compile(r'page (\d+)')
         try:
             for line in proc.stdout:
                 if (cancel_ev or cancel_event).is_set():
@@ -9486,6 +9550,14 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     yt_title = yt_title.strip()
                     if re.fullmatch(r'[\w-]{11}', vid_id):  # YouTube IDs are exactly 11 chars
                         result[yt_title] = vid_id
+                else:
+                    # Check for page progress from verbose stderr (merged into stdout)
+                    _pm = _page_re.search(line)
+                    if _pm:
+                        _pg = int(_pm.group(1))
+                        if _pg >= _last_page + 10:
+                            _last_page = _pg
+                            log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
         finally:
             try:
                 proc.wait(timeout=300)
@@ -11539,30 +11611,71 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             yt_title_to_id = {}  # yt_title -> video_id
             def _fetch_yt_title_map(use_cookies):
                 """Fetch title→id map from YouTube playlist. Returns {} on failure.
-                Cancel-aware: polls _ce every second so cancellation doesn't block 5 min."""
+                Cancel-aware: polls _ce every second so cancellation doesn't block 5 min.
+                Uses --verbose so stderr shows page progress (yt-dlp buffers all stdout
+                until the entire playlist is enumerated)."""
                 _cmd = [
                     "yt-dlp", "--flat-playlist",
                     "--print", "%(id)s|||%(title)s",
-                    "--no-warnings",
+                    "--no-warnings", "--verbose",
                 ]
                 if use_cookies:
                     _cmd += ["--cookies-from-browser", "firefox"]
                 _cmd.append(ch_url)
                 try:
                     _proc = subprocess.Popen(
-                        _cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        _cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, startupinfo=startupinfo
                     )
-                    # Read stdout line-by-line inside the poll loop to prevent
-                    # pipe buffer filling up and causing a deadlock.
-                    _deadline = time.time() + 300
+                    # Scale timeout with channel size: 5 min base + 30s per 1000 videos, up to 30 min
+                    _timeout_s = min(1800, 300 + (len(local_files) // 1000) * 30)
+                    _deadline = time.time() + _timeout_s
                     _result = {}
-                    _lines_buf = []
+                    _stdout_lines = []
+                    _stdout_queue = queue.Queue()
+                    _stderr_queue = queue.Queue()
+                    _stdout_done = threading.Event()
+                    _stderr_done = threading.Event()
+                    def _read_stdout():
+                        try:
+                            for _ln in _proc.stdout:
+                                _stdout_queue.put(_ln)
+                        except ValueError:
+                            pass
+                        finally:
+                            _stdout_done.set()
+                    def _read_stderr():
+                        try:
+                            for _ln in _proc.stderr:
+                                _stderr_queue.put(_ln)
+                        except ValueError:
+                            pass
+                        finally:
+                            _stderr_done.set()
+                    threading.Thread(target=_read_stdout, daemon=True).start()
+                    threading.Thread(target=_read_stderr, daemon=True).start()
+                    _last_page = 0
+                    _page_re = re.compile(r'page (\d+)')
                     while True:
-                        _line_raw = _proc.stdout.readline()
-                        if _line_raw:
-                            _lines_buf.append(_line_raw)
-                        elif _proc.poll() is not None:
+                        # Drain stdout
+                        while not _stdout_queue.empty():
+                            try:
+                                _stdout_lines.append(_stdout_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        # Drain stderr for page progress
+                        while not _stderr_queue.empty():
+                            try:
+                                _se = _stderr_queue.get_nowait()
+                                _pm = _page_re.search(_se)
+                                if _pm:
+                                    _pg = int(_pm.group(1))
+                                    if _pg >= _last_page + 10:
+                                        _last_page = _pg
+                                        log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
+                            except queue.Empty:
+                                break
+                        if _stdout_done.is_set() and _stderr_done.is_set() and _stdout_queue.empty():
                             break
                         if _ce.is_set():
                             _proc.terminate()
@@ -11579,7 +11692,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                 _proc.kill()
                             log("  ⚠ YouTube list fetch timed out.\n", "red")
                             return {}
-                    for _line in _lines_buf:
+                        time.sleep(0.5)
+                    for _line in _stdout_lines:
                         _line = _line.strip()
                         if "|||" in _line:
                             _vid_id, _yt_title = _line.split("|||", 1)
@@ -22804,8 +22918,12 @@ class _TranscriptionPanel(ttk.Frame):
         if card_w < 150:
             card_w = 150
         thumb_h = int(card_w * 9 / 16)
+        old_cols = getattr(self, '_grid_cols', 0)
         self._grid_cols = cols
 
+        # Zero out stale columns from a wider layout (prevents blank space on right)
+        for c in range(cols, max(old_cols, cols)):
+            self._grid_inner.columnconfigure(c, weight=0, minsize=0, uniform="")
         for c in range(cols):
             self._grid_inner.columnconfigure(c, weight=1, uniform="card")
 
@@ -22922,11 +23040,19 @@ class _TranscriptionPanel(ttk.Frame):
             self._grid_cards.append(card)
 
             if v["thumb_path"] and _has_pil:
-                # Check if we already have a cached photo for this video
+                # Show cached photo immediately (even if wrong size), then
+                # submit a resize job if dimensions don't match.
                 _cached_photo = self._grid_photos.get(_title)
+                _need_load = True
                 if _cached_photo:
                     thumb_label.config(image=_cached_photo, text="")
-                else:
+                    # Check if cached photo is already at the right size
+                    try:
+                        if _cached_photo.width() == card_w and _cached_photo.height() == thumb_h:
+                            _need_load = False
+                    except Exception:
+                        pass
+                if _need_load:
                     _tpath = v["thumb_path"]
                     _tlbl = thumb_label
                     _cw = card_w
@@ -22934,7 +23060,7 @@ class _TranscriptionPanel(ttk.Frame):
                     def _load_thumb(path=_tpath, lbl=_tlbl, w=_cw, h=_th, title_key=_title):
                         try:
                             img = Image.open(path)
-                            img = img.resize((w, h), Image.BICUBIC)
+                            img = img.resize((w, h), Image.BILINEAR)
                             photo = ImageTk.PhotoImage(img)
                             def _apply(p=photo, l=lbl, tk=title_key, sc=self._grid_scope):
                                 try:
@@ -22978,34 +23104,42 @@ class _TranscriptionPanel(ttk.Frame):
             pass
 
     def _on_grid_canvas_resize(self, event):
-        """Responsive: re-layout grid when canvas width changes column count."""
-        self._grid_canvas.itemconfig(self._grid_canvas_window, width=event.width)
+        """Responsive: hide the grid during drag, rebuild after user lets go.
+        Hiding the canvas window prevents tkinter from doing ANY layout work
+        on the card widgets while the drag is in progress."""
         if not self._grid_visible or not self._grid_videos:
+            self._grid_canvas.itemconfig(self._grid_canvas_window, width=event.width)
             return
-        pad = 8
-        min_card = 200
-        new_cols = max(1, (event.width - pad) // (min_card + pad))
-        old_cols = getattr(self, '_grid_cols', 0)
-        if new_cols != old_cols:
-            # Cancel any pending resize job
-            if hasattr(self, '_grid_resize_job') and self._grid_resize_job:
-                try:
-                    self.after_cancel(self._grid_resize_job)
-                except Exception:
-                    pass
-            self._grid_last_width = event.width
-            # Fast path: just re-grid existing cards at new positions (no destroy/rebuild)
-            self._grid_regrid(event.width, new_cols, pad)
-            # Schedule a deferred full thumbnail resize for correct dimensions
-            self._grid_resize_job = self.after(400, lambda: self._grid_rethumbnail(event.width))
+        # Cancel any pending deferred resize
+        _pending = getattr(self, '_grid_resize_job', None)
+        if _pending:
+            try:
+                self.after_cancel(_pending)
+            except Exception:
+                pass
+        # Hide the grid on first drag event — prevents all layout recalculation
+        if not getattr(self, '_grid_drag_hidden', False):
+            self._grid_drag_hidden = True
+            self._grid_canvas.itemconfig(self._grid_canvas_window, state='hidden')
+        _w = event.width
+        def _deferred_resize():
+            self._grid_resize_job = None
+            self._grid_drag_hidden = False
+            self._grid_canvas.itemconfig(self._grid_canvas_window, width=_w, state='normal')
+            self._grid_build_cards(reset=True, _keep_photos=True)
+        self._grid_resize_job = self.after(200, _deferred_resize)
 
     def _grid_regrid(self, canvas_w, cols, pad):
         """Re-position existing cards into new column layout without destroying them.
         This is nearly instant because it only changes grid row/col, not widget content."""
+        old_cols = getattr(self, '_grid_cols', 0)
         self._grid_cols = cols
         card_w = (canvas_w - pad * (cols + 1)) // cols
         if card_w < 150:
             card_w = 150
+        # Zero out old columns that are no longer used (prevents blank space on right)
+        for c in range(cols, max(old_cols, cols)):
+            self._grid_inner.columnconfigure(c, weight=0, minsize=0, uniform="")
         for c in range(cols):
             self._grid_inner.columnconfigure(c, weight=1, uniform="card")
         # Re-grid each existing card at its new row/col position
@@ -23015,7 +23149,9 @@ class _TranscriptionPanel(ttk.Frame):
             card.grid_configure(row=row, column=col)
 
     def _grid_rethumbnail(self, canvas_w):
-        """Deferred pass: resize thumbnails to correct dimensions after drag ends."""
+        """Deferred pass: resize thumbnails to correct dimensions after drag ends.
+        Only resizes thumbnails currently visible in the viewport, and uses a
+        generation counter so stale resize jobs from an earlier drag are discarded."""
         self._grid_resize_job = None
         if not self._grid_visible or not self._grid_videos:
             return
@@ -23030,32 +23166,51 @@ class _TranscriptionPanel(ttk.Frame):
             from PIL import Image, ImageTk
         except ImportError:
             return
-        # Update thumbnail sizes for loaded cards via background thread
+        # Bump generation so in-flight resize jobs from a previous drag are discarded
+        _gen = getattr(self, '_grid_resize_gen', 0) + 1
+        self._grid_resize_gen = _gen
+        # Determine which cards are visible in the viewport
+        try:
+            _cy = self._grid_canvas.canvasy(0)
+            _ch = self._grid_canvas.winfo_height()
+        except Exception:
+            _cy, _ch = 0, 9999
         for i, card in enumerate(self._grid_cards):
             if i >= len(self._grid_videos):
                 break
+            # Skip cards not in viewport
+            try:
+                _wy = card.winfo_y()
+                _wh = card.winfo_height()
+                if _wy + _wh < _cy or _wy > _cy + _ch:
+                    continue
+            except Exception:
+                pass
             v = self._grid_videos[i]
             if not v.get("thumb_path"):
                 continue
-            # Find the thumbnail label (first child of card)
             children = card.winfo_children()
             if not children:
                 continue
             thumb_label = children[0]
-            # Resize thumbnail label dimensions
             thumb_label.config(width=card_w, height=thumb_h)
-            # Load new correctly-sized thumbnail in background
             _tpath = v["thumb_path"]
             _tlbl = thumb_label
             _cw = card_w
             _th = thumb_h
             _title = v["title"]
-            def _load(path=_tpath, lbl=_tlbl, w=_cw, h=_th, tk_key=_title):
+            def _load(path=_tpath, lbl=_tlbl, w=_cw, h=_th, tk_key=_title, gen=_gen):
+                if getattr(self, '_grid_resize_gen', 0) != gen:
+                    return  # stale — a newer resize started
                 try:
                     img = Image.open(path)
-                    img = img.resize((w, h), Image.BICUBIC)
+                    img = img.resize((w, h), Image.BILINEAR)
                     photo = ImageTk.PhotoImage(img)
-                    def _apply(p=photo, l=lbl, k=tk_key):
+                    if getattr(self, '_grid_resize_gen', 0) != gen:
+                        return  # stale
+                    def _apply(p=photo, l=lbl, k=tk_key, g=gen):
+                        if getattr(self, '_grid_resize_gen', 0) != g:
+                            return
                         try:
                             l.config(image=p, text="")
                             self._grid_photos[k] = p

@@ -82,7 +82,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v29.8"
+APP_VERSION = "v29.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -724,7 +724,7 @@ def log(text, tag=None):
                             _bk_tag = "trans_bracket"
                             if _base_tag == "simpleline_blue" and "done (" in _txt:
                                 _do_white = True
-                        elif _base_tag == "simpleline_pink" and "Metadata" in _txt:
+                        elif "Metadata" in _txt or "Refresh" in _txt:
                             _bk_tag = "meta_bracket"
                     if not _bk_tag:
                         log_box.insert(_ins_pos, _txt, _base_tag)
@@ -733,19 +733,20 @@ def log(text, tag=None):
                     if not _bk_m:
                         log_box.insert(_ins_pos, _txt, _base_tag)
                         return
+                    _is_meta = (_bk_tag == "meta_bracket")
                     # Build segments: before, [, N/M, ], after
                     _p = _ins_pos
                     _before = _txt[:_bk_m.start()]
                     if _before:
                         log_box.insert(_p, _before, _base_tag)
                         _p = log_box.index(f"{_p}+{len(_before)}c")
-                    # [ bracket in green/blue
+                    # [ bracket in green/blue/pink
                     log_box.insert(_p, "[", _bk_tag)
                     _p = log_box.index(f"{_p}+1c")
-                    # N/M numbers — white for transcription done lines, base tag otherwise
+                    # N/M numbers — white for transcription done & metadata lines, base tag otherwise
                     # Split into N, /, M so the slash gets bracket color
                     _nums = _txt[_bk_m.start() + 1:_bk_m.end() - 1]
-                    _nums_tag = "dl_white" if _do_white else _base_tag
+                    _nums_tag = "dl_white" if (_do_white or _is_meta) else _base_tag
                     _sl_pos = _nums.find("/")
                     if _sl_pos >= 0:
                         log_box.insert(_p, _nums[:_sl_pos], _nums_tag)
@@ -757,12 +758,21 @@ def log(text, tag=None):
                     else:
                         log_box.insert(_p, _nums, _nums_tag)
                         _p = log_box.index(f"{_p}+{len(_nums)}c")
-                    # ] bracket in green/blue
+                    # ] bracket in green/blue/pink
                     log_box.insert(_p, "]", _bk_tag)
                     _p = log_box.index(f"{_p}+1c")
-                    # After the bracket: for transcription done lines, split at " — done ("
+                    # After the bracket
                     _after = _txt[_bk_m.end():]
-                    if _do_white and _after:
+                    if _is_meta and _after:
+                        # Color "Metadata -" or "Refresh -" pink, title white
+                        _meta_m = re.match(r'( (?:Metadata|Refresh) - )(.*)', _after)
+                        if _meta_m:
+                            log_box.insert(_p, _meta_m.group(1), _bk_tag)
+                            _p = log_box.index(f"{_p}+{len(_meta_m.group(1))}c")
+                            log_box.insert(_p, _meta_m.group(2), "dl_white")
+                        else:
+                            log_box.insert(_p, _after, _base_tag)
+                    elif _do_white and _after:
                         _dash_idx = _after.find(" — done (")
                         if _dash_idx >= 0:
                             _title_part = _after[:_dash_idx]
@@ -11030,7 +11040,7 @@ def _run_metadata_download(item):
             _trunc = title[:55] + "..." if len(title) > 55 else title
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
-            log(f"  [{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline_pink")
+            log(f"  [{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:

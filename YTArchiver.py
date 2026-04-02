@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.2"
+APP_VERSION = "v31.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3619,7 +3619,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:54pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -22893,15 +22893,39 @@ class _TranscriptionPanel(ttk.Frame):
             return "00000000"
         videos.sort(key=_sort_key, reverse=True)
 
-        # Find thumbnail paths — listdir once, build lookup
+        # Find thumbnail paths — scan .Thumbnails folders.
+        # For split_years channels viewed at root scope, thumbnails live in
+        # per-year (and per-month) subfolders, not in the root .Thumbnails.
+        # Collect from all .Thumbnails dirs under folder_path.
         _thumb_files = {}
-        if thumb_dir and os.path.isdir(thumb_dir):
+        def _scan_thumb_dir(td):
+            if td and os.path.isdir(td):
+                try:
+                    for fn in os.listdir(td):
+                        _b = fn.rfind("[")
+                        _e = fn.rfind("]")
+                        if _b >= 0 and _e > _b:
+                            _thumb_files[fn[_b + 1:_e]] = os.path.join(td, fn)
+                except OSError:
+                    pass
+        if thumb_dir:
+            _scan_thumb_dir(thumb_dir)
+        # If viewing at channel root with split_years, also scan year/month .Thumbnails
+        if ch_cfg and ch_cfg.get("split_years", False) and not year:
             try:
-                for fn in os.listdir(thumb_dir):
-                    _b = fn.rfind("[")
-                    _e = fn.rfind("]")
-                    if _b >= 0 and _e > _b:
-                        _thumb_files[fn[_b + 1:_e]] = os.path.join(thumb_dir, fn)
+                for _yd in os.listdir(folder_path):
+                    _yp = os.path.join(folder_path, _yd)
+                    if os.path.isdir(_yp) and _yd.isdigit():
+                        _scan_thumb_dir(os.path.join(_yp, ".Thumbnails"))
+                        # Also scan month subfolders
+                        if ch_cfg.get("split_months", False):
+                            try:
+                                for _md in os.listdir(_yp):
+                                    _mp = os.path.join(_yp, _md)
+                                    if os.path.isdir(_mp):
+                                        _scan_thumb_dir(os.path.join(_mp, ".Thumbnails"))
+                            except OSError:
+                                pass
             except OSError:
                 pass
         if gen != self._grid_gen:

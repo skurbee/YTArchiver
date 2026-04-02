@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.6"
+APP_VERSION = "v31.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3618,7 +3618,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 9:05pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 10:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11434,7 +11434,7 @@ def _run_metadata_download(item):
 
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
-            _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY)
+            _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY - len(_prefix) - 3)
             log(f"[{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)

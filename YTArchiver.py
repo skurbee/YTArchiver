@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.1"
+APP_VERSION = "v31.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -417,6 +417,9 @@ _WHISPER_MAX_DURATION = 7200  # 2 hours — chunk anything longer to avoid loadi
 # Maximum characters shown for a video title/filename in progress status lines.
 # Titles longer than this are truncated with "..." to keep lines from becoming too wide.
 _MAX_TITLE_DISPLAY = 55
+# Target total line width for progress lines.  Title truncation is computed as
+# _MAX_LINE_WIDTH minus the prefix width so the "..." always lands at the same column.
+_MAX_LINE_WIDTH = 78
 
 # Smart-quote / fancy-punctuation → ASCII map for consistent monospace width
 _UNICODE_WIDTH_MAP = str.maketrans({
@@ -3616,7 +3619,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:25pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:54pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9975,11 +9978,13 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
     _n_chunks = max(1, int(total_duration / _CHUNK_LEN) + (1 if total_duration % _CHUNK_LEN > 0 else 0))
 
     # Log the main [X/X] line for this video, then sections will appear indented below it
-    _title_disp = title
-    if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
-        _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
-    _title_part = f' "{_title_disp}"' if _title_disp else ""
     _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+    _title_disp = title
+    if _title_disp:
+        _chunk_fixed = len(f'{_wp}Transcribing "" — {_hrs:.1f}h, {_n_chunks} sections')
+        _tw = max(20, _MAX_LINE_WIDTH - _chunk_fixed)
+        _title_disp = _trunc_pad_title(_title_disp, _tw).rstrip()
+    _title_part = f' "{_title_disp}"' if _title_disp else ""
     log(f"{_wp}Transcribing{_title_part} — {_hrs:.1f}h, {_n_chunks} sections\n", "simpleline")
 
     all_text_parts = []
@@ -10142,10 +10147,6 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 cancel_ev=cancel_ev, pause_ev=pause_ev, progress_cb=progress_cb)
 
     try:
-        _title_disp = title
-        if _title_disp and len(_title_disp) > _MAX_TITLE_DISPLAY:
-            _title_disp = _title_disp[:_MAX_TITLE_DISPLAY - 3] + "..."
-        _title_part = f' "{_title_disp}"' if _title_disp else ""
         # In simple mode, prefix with [idx/total] instead of spaces.
         # _log_prefix overrides this (used by chunked transcription for indented section lines).
         if _log_prefix is not None:
@@ -10154,6 +10155,13 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] "
         else:
             _wp = "    "
+        # Truncate title to fit within _MAX_LINE_WIDTH accounting for prefix
+        _title_disp = title
+        if _title_disp:
+            _whisper_fixed = len(f'{_wp}Transcribing "", 100%...')
+            _tw = max(20, _MAX_LINE_WIDTH - _whisper_fixed)
+            _title_disp = _trunc_pad_title(_title_disp, _tw).rstrip()
+        _title_part = f' "{_title_disp}"' if _title_disp else ""
         with _ffmpeg_lock:
             _gpu_actively_encoding = True
         log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
@@ -11432,8 +11440,10 @@ def _run_metadata_download(item):
 
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
-            _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY)
-            log(f"[{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
+            _counter = f"[{done + 1}/{total}] {_prefix} - "
+            _title_width = max(20, _MAX_LINE_WIDTH - len(_counter))
+            _trunc = _trunc_pad_title(title, _title_width)
+            log(f"{_counter}{_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:
@@ -12125,7 +12135,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 idx += 1
                 _check_idx += 1
                 _fname_trunc_src = unicodedata.normalize('NFKC', fname)
-                _fname_trunc = _fname_trunc_src if len(_fname_trunc_src) <= _MAX_TITLE_DISPLAY else _fname_trunc_src[:_MAX_TITLE_DISPLAY - 3] + "..."
+                # Compute title width based on prefix so ... always lands at same column
+                _tx_counter = f"[{_check_idx}/{total}] Transcribing \""
+                _tx_title_w = max(20, _MAX_LINE_WIDTH - len(_tx_counter) - len("\" - fetching captions..."))
+                _fname_trunc = _trunc_pad_title(_fname_trunc_src, _tx_title_w).rstrip()
 
                 # Pause check
                 _pl = "GPU Tasks" if _sync_mode else "Sync"
@@ -12303,7 +12316,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _fname_norm = unicodedata.normalize('NFKC', fname)
                     _dur_raw = f"({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
                     _dur_display = f"{_dur_raw:>10} — " if _dur_raw else "— "
-                    _name_padded = _trunc_pad_title(_fname_norm, _MAX_TITLE_DISPLAY)
+                    _done_title_w = max(20, _MAX_LINE_WIDTH - len(_prefix) - len(" — ") - len(_dur_display))
+                    _name_padded = _trunc_pad_title(_fname_norm, _done_title_w)
                     _name_dash = f"{_name_padded} — {_dur_display}"
                     log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                 else:
@@ -12682,7 +12696,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _fname_norm = unicodedata.normalize('NFKC', fname)
                             _dur_raw = f"({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
                             _dur_display = f"{_dur_raw:>10} — " if _dur_raw else "— "
-                            _name_padded = _trunc_pad_title(_fname_norm, _MAX_TITLE_DISPLAY)
+                            _done_title_w = max(20, _MAX_LINE_WIDTH - len(_prefix) - len(" — ") - len(_dur_display))
+                            _name_padded = _trunc_pad_title(_fname_norm, _done_title_w)
                             _name_dash = f"{_name_padded} — {_dur_display}"
                             log(f"{_prefix}{_name_dash}{_suffix}\n", "simpleline_blue")
                         else:

@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.4"
+APP_VERSION = "v31.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3619,7 +3619,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 8:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 8:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11603,6 +11603,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
                 if _jsonl_needed:
                     log(f"  — {len(_jsonl_needed)} video(s) need searchable .jsonl — will generate next transcription run.\n", "dim")
+                # Record in activity log (0 transcribed — shows as uncolored/white tag)
+                _record_transcription(0, 0, 0, channel_name=ch_name, skipped=0)
                 # Mark channel as fully transcribed
                 with config_lock:
                     for _cfg_ch in config.get("channels", []):
@@ -18675,7 +18677,9 @@ def _insert_hist_line(tw, entry, row_tags):
 
     # Colour for the [Kind] tag
     if kind == "Trnscr":
-        prefix_tags = ("hist_blue",) + row_tags
+        _tr_m = re.search(r'\b(\d+) transcribed\b', rest)
+        _has_transcribed = _tr_m and int(_tr_m.group(1)) > 0
+        prefix_tags = ("hist_blue",) + row_tags if _has_transcribed else row_tags
     elif kind == "Metdta":
         _fetched_m = re.search(r'\b(\d+) fetched\b', rest)
         _refreshed_m = re.search(r'\b(\d+) refreshed\b', rest)
@@ -18698,7 +18702,7 @@ def _insert_hist_line(tw, entry, row_tags):
     # Inline highlight patterns for the rest of the line
     patterns = []
     if kind == "Trnscr":
-        patterns.append((r'\b\d+ transcribed\b', "hist_blue"))
+        patterns.append((r'\b[1-9]\d* transcribed\b', "hist_blue"))
     elif kind == "Metdta":
         patterns.append((r'\b[1-9]\d* fetched\b', "hist_pink"))
         patterns.append((r'\b[1-9]\d* refreshed\b', "hist_pink"))

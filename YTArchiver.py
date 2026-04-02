@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.0"
+APP_VERSION = "v31.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -355,6 +355,11 @@ class _ToolTip:
             return
         x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        # Clamp to screen edges so tooltip doesn't appear off-screen
+        screen_w = self.widget.winfo_screenwidth()
+        screen_h = self.widget.winfo_screenheight()
+        x = min(x, screen_w - 280)
+        y = min(y, screen_h - 40)
         self._tip = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.wm_geometry(f"+{x}+{y}")
@@ -483,9 +488,9 @@ def _flush_ui_queue():
                 try:
                     fn()
                 except Exception:
-                    import traceback; traceback.print_exc()  # isolate per-callback — log but don't break others
+                    traceback.print_exc()  # isolate per-callback — log but don't break others
     except Exception:
-        import traceback; traceback.print_exc()
+        traceback.print_exc()
     try:
         if root.winfo_exists():
             # Adaptive: fast drain when busy (4ms), idle when quiet (250ms)
@@ -1263,10 +1268,16 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
 
                 # Save encode/whisper progress so they stay above the sync line
                 # Collect all ranges sorted by position to preserve interleaved order
+                # Quick check: skip expensive save/restore if no progress tags exist
+                _has_any_progress = bool(
+                    log_box.tag_ranges("encode_progress") or
+                    log_box.tag_ranges("whisper_progress"))
                 _saved_parts = []
                 _all_ranges = []
                 for _tag in ("encode_progress", "encode_pct", "encode_dots", "encode_suffix",
                              "whisper_progress", "whisper_pct", "whisper_dots"):
+                    if not _has_any_progress:
+                        break
                     _r = log_box.tag_ranges(_tag)
                     for _ri in range(0, len(_r), 2):
                         _all_ranges.append((_r[_ri], _r[_ri + 1], _tag))
@@ -2402,9 +2413,19 @@ def save_config(cfg):
     cfg_snapshot = copy.deepcopy(cfg)
 
     def _write_snapshot(snapshot):
-        """Write a single snapshot to disk. Returns True on success."""
-        with config_lock:
+        """Write a single snapshot to disk. Returns True on success.
+        No config_lock needed — snapshot is already a deep copy."""
+        try:
+            temp_file = CONFIG_FILE + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, CONFIG_FILE)
+            return True
+        except (PermissionError, OSError):
             try:
+                time.sleep(0.5)
                 temp_file = CONFIG_FILE + ".tmp"
                 with open(temp_file, "w", encoding="utf-8") as f:
                     json.dump(snapshot, f, indent=2)
@@ -2412,23 +2433,13 @@ def save_config(cfg):
                     os.fsync(f.fileno())
                 os.replace(temp_file, CONFIG_FILE)
                 return True
-            except (PermissionError, OSError):
+            except (PermissionError, OSError) as e2:
                 try:
-                    time.sleep(0.5)
-                    temp_file = CONFIG_FILE + ".tmp"
-                    with open(temp_file, "w", encoding="utf-8") as f:
-                        json.dump(snapshot, f, indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(temp_file, CONFIG_FILE)
-                    return True
-                except (PermissionError, OSError) as e2:
-                    try:
-                        if sys.stdout:
-                            sys.stdout.write(f"ERROR: Could not save config: {e2}\n")
-                    except Exception:
-                        pass
-                    return False
+                    if sys.stdout:
+                        sys.stdout.write(f"ERROR: Could not save config: {e2}\n")
+                except Exception:
+                    pass
+                return False
 
     def _do_save():
         global _save_config_thread_running, _save_config_pending
@@ -3308,6 +3319,7 @@ def _dark_missing_channel_dialog(ch_name, expected_path):
             pass
 
     _dlg.protocol("WM_DELETE_WINDOW", lambda: _dismiss("skip"))
+    _dlg.bind("<Escape>", lambda e: _dismiss("skip"))
 
     tk.Label(_dlg, text=f"Cannot locate folder for \"{ch_name}\".",
              bg=C_BG, fg=C_TEXT, font=("Segoe UI", 10, "bold"),
@@ -3604,7 +3616,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 6:36pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:25pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4856,7 +4868,7 @@ def on_channel_double_click(event):
         return
     sel = settings_chan_tree.selection()
     if not sel: return
-    target_url = settings_chan_tree.set(sel[0], "url") if sel else ""
+    target_url = settings_chan_tree.set(sel[0], "url")
     with config_lock:
         channels = config.get("channels", [])
         for ch in channels:
@@ -4886,7 +4898,7 @@ def _on_chan_tree_return(event):
     sel = settings_chan_tree.selection()
     if not sel:
         return
-    target_url = settings_chan_tree.set(sel[0], "url") if sel else ""
+    target_url = settings_chan_tree.set(sel[0], "url")
     with config_lock:
         for ch in config.get("channels", []):
             if ch["url"] == target_url:
@@ -5590,7 +5602,7 @@ def add_channel():
                 "compress_enabled": new_compress_var.get(),
                 "compress_level": new_compress_level_var.get(),
                 "compress_output_res": (lambda v: v.replace("p", "") if v != "Original" else "")(new_compress_res_var.get()),
-                "compress_batch_size": max(1, int(new_compress_batch_var.get() or "20")) if new_compress_batch_var.get().strip().isdigit() else 20,
+                "compress_batch_size": (lambda _v: max(1, int(_v)) if _v.strip().isdigit() else 20)(new_compress_batch_var.get()),
             })
 
     _clear_edit_mode()
@@ -5698,7 +5710,7 @@ def sync_single_channel(_from_queue=False):
     sel = settings_chan_tree.selection()
     if not sel:
         return
-    target_url = settings_chan_tree.set(sel[0], "url") if sel else ""
+    target_url = settings_chan_tree.set(sel[0], "url")
 
     with config_lock:
         ch = None
@@ -6465,7 +6477,7 @@ def _process_video_dl_queue():
 def remove_channel():
     sel = settings_chan_tree.selection()
     if not sel: return
-    target_url = settings_chan_tree.set(sel[0], "url") if sel else ""
+    target_url = settings_chan_tree.set(sel[0], "url")
 
     with config_lock:
         channels = config.setdefault("channels", [])
@@ -6905,6 +6917,10 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
             try:
                 for _ce in os.scandir(_src_dir):
                     if _ce.is_file() and _ce.name.startswith(_base_no_ext) and _ce.name != filename:
+                        # Verify the character after the base name is a dot to avoid
+                        # matching "My Video Part 2.jpg" when base is "My Video"
+                        if len(_ce.name) > len(_base_no_ext) and _ce.name[len(_base_no_ext)] != '.':
+                            continue
                         _ce_ext_lower = _ce.name[len(_base_no_ext):].lower()
                         if _ce_ext_lower in _companion_exts:
                             _ce_target = os.path.join(target_dir, _ce.name)
@@ -7546,7 +7562,7 @@ def _parse_vtt_to_segments(vtt_path):
             seg_words = seg_text.split()
             new_words = _t.split()
             # Try overlap lengths from large to small
-            max_overlap = min(len(seg_words), len(new_words) - 1)
+            max_overlap = min(len(seg_words), len(new_words) - 1, 20)
             for ol in range(max_overlap, 0, -1):
                 if seg_words[-ol:] == new_words[:ol]:
                     extra = " ".join(new_words[ol:])
@@ -8331,7 +8347,8 @@ def _start_whisper_process():
         _stop_whisper_process()
         return False
     finally:
-        _whisper_starting = False
+        with _whisper_lock:
+            _whisper_starting = False
 
 
 def _check_cuda_available():
@@ -10652,11 +10669,11 @@ def _sort_transcript_entries(txt_paths):
             dated_entries.sort(key=lambda x: x[0], reverse=True)
 
             # Rewrite file atomically (temp + replace) to avoid corruption on disk-full
-            sorted_content = ""
+            _sorted_parts = []
             for _, entry in dated_entries:
                 # Ensure each entry ends with exactly triple-newline
-                entry = entry.rstrip("\n") + "\n\n\n"
-                sorted_content += entry
+                _sorted_parts.append(entry.rstrip("\n") + "\n\n\n")
+            sorted_content = "".join(_sorted_parts)
 
             _tmp_sort = txt_path + ".tmp_sort"
             try:
@@ -10735,6 +10752,8 @@ def _ask_whisper_model_dialog(prompt_text="Which Whisper model to use?",
         _timer_lbl.pack(fill="x", pady=(0, 4))
 
         def _tick():
+            if _model_result[0] is not None:
+                return  # user already picked — avoid double destroy race
             _countdown["secs"] -= 1
             if _countdown["secs"] <= 0:
                 _model_timed_out[0] = True
@@ -10882,7 +10901,7 @@ def _get_next_compress_batch(ch_url):
                 seq = ch.get("compress_batch_seq", 0) + 1
                 ch["compress_batch_seq"] = seq
                 break
-    save_config(config)
+        save_config(config)
     return seq
 
 
@@ -12419,6 +12438,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         _timer_lbl.pack(fill="x", pady=(0, 4))
 
                         def _tick():
+                            if _model_result[0] is not None:
+                                return  # user already picked — avoid double destroy race
                             _countdown["secs"] -= 1
                             if _countdown["secs"] <= 0:
                                 _model_timed_out[0] = True
@@ -13597,7 +13618,10 @@ debounce_id = None
 def on_url_change(*_):
     global debounce_id
     if debounce_id:
-        root.after_cancel(debounce_id)
+        try:
+            root.after_cancel(debounce_id)
+        except Exception:
+            pass
     debounce_id = root.after(350, process_url_update)
 
 
@@ -14218,6 +14242,11 @@ def _prefetch_total(url):
             if line.isdigit():
                 count = int(line)
                 break
+        # Drain remaining stdout to prevent pipe deadlock before wait()
+        try:
+            proc.stdout.read()
+        except Exception:
+            pass
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -17456,7 +17485,8 @@ style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), 
 
 def _blink_tick():
     """Unified blink clock — toggles both Sync and GPU buttons in phase.
-    Running = blink, Paused = solid color, Idle = default bg."""
+    Running = blink, Paused = solid color, Idle = default bg.
+    Tracks last visual state to skip no-op style.configure calls."""
     try:
         if not _root_alive or not root.winfo_exists():
             _blink_clock["job"] = None
@@ -17464,32 +17494,39 @@ def _blink_tick():
         _blink_clock["on"] = not _blink_clock["on"]
         is_on = _blink_clock["on"]
 
-        # Sync Tasks button
+        # Sync Tasks button — track state to avoid redundant style.configure every 700ms
         if _sync_blink["active"]:
             if pause_event.is_set():
-                # Paused → solid color
-                style.configure("SyncQ.TButton", background="#3a5a3a")
-                style.map("SyncQ.TButton", background=[("pressed", "#3a5a3a"), ("active", "#4a6a4a"), ("disabled", C_BORDER)])
+                _new_sync_state = "paused"
             elif is_on:
-                style.configure("SyncQ.TButton", background="#3a5a3a")
-                style.map("SyncQ.TButton", background=[("pressed", "#3a5a3a"), ("active", "#4a6a4a"), ("disabled", C_BORDER)])
+                _new_sync_state = "on"
             else:
-                style.configure("SyncQ.TButton", background=C_BTN)
-                style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
+                _new_sync_state = "off"
+            if _sync_blink.get("_last_vis") != _new_sync_state:
+                _sync_blink["_last_vis"] = _new_sync_state
+                if _new_sync_state in ("paused", "on"):
+                    style.configure("SyncQ.TButton", background="#3a5a3a")
+                    style.map("SyncQ.TButton", background=[("pressed", "#3a5a3a"), ("active", "#4a6a4a"), ("disabled", C_BORDER)])
+                else:
+                    style.configure("SyncQ.TButton", background=C_BTN)
+                    style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
         # GPU Tasks button — blink while actively encoding; go solid when paused between items
-        # (i.e. pause is set AND nothing is actively encoding/transcribing).
         if _gpu_blink["active"] and gpu_btn.winfo_ismapped():
             if _gpu_truly_paused or (_gpu_pause.is_set() and not _gpu_actively_encoding):
-                # Worker is waiting in the pause loop — hold solid red
-                style.configure("Gpu.TButton", background="#6b1a1a")
-                style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
+                _new_gpu_state = "paused"
             elif is_on:
-                style.configure("Gpu.TButton", background="#6b1a1a")
-                style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
+                _new_gpu_state = "on"
             else:
-                style.configure("Gpu.TButton", background=C_BTN)
-                style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
+                _new_gpu_state = "off"
+            if _gpu_blink.get("_last_vis") != _new_gpu_state:
+                _gpu_blink["_last_vis"] = _new_gpu_state
+                if _new_gpu_state in ("paused", "on"):
+                    style.configure("Gpu.TButton", background="#6b1a1a")
+                    style.map("Gpu.TButton", background=[("pressed", "#6b1a1a"), ("active", "#8a2a2a"), ("disabled", C_BORDER)])
+                else:
+                    style.configure("Gpu.TButton", background=C_BTN)
+                    style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
 
         if _sync_blink["active"] or _gpu_blink["active"]:
             _blink_clock["job"] = root.after(700, _blink_tick)
@@ -18411,6 +18448,8 @@ def _gpu_start():
     _timer_lbl.pack(fill="x", pady=(0, 4))
 
     def _tick():
+        if _model_result[0] is not None:
+            return  # user already picked — avoid double destroy race
         _countdown["secs"] -= 1
         if _countdown["secs"] <= 0:
             _model_timed_out[0] = True
@@ -19673,7 +19712,7 @@ _TP_MONTH_NAMES = ["january", "february", "march", "april", "may", "june",
 
 def _tp_open_db(path):
     conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""CREATE TABLE IF NOT EXISTS segments (
         id         INTEGER PRIMARY KEY,
@@ -20590,6 +20629,8 @@ class _TranscriptionPanel(ttk.Frame):
         dlg.configure(bg="#2d2d2d")
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.update_idletasks()
+        _apply_dark_title_bar(dlg)
         _auto_job = [None]
         _countdown = [60]
 
@@ -23528,12 +23569,8 @@ class _TranscriptionPanel(ttk.Frame):
                     # --- Re-index this JSONL file in the DB ---
                     self._browse_retranscribe_status("Re-indexing...")
                     roots = self._get_archive_roots()
-                    # Acquire lock with retry — background indexer may hold it
-                    _got_lock = False
-                    for _ in range(120):  # up to 60s
-                        _got_lock = self._db_lock.acquire(timeout=0.5)
-                        if _got_lock:
-                            break
+                    # Acquire lock — background indexer may hold it
+                    _got_lock = self._db_lock.acquire(timeout=60)
                     if _got_lock:
                         try:
                             _tp_index_file(self._conn, jsonl_path, roots)
@@ -24083,6 +24120,8 @@ class _TranscriptionPanel(ttk.Frame):
         from datetime import datetime as _dt
         for row in rows:
             bm_id, seg_id, vid_id, title, ch, start, text, note, created = row
+            title = title or ""
+            note = note or ""
             try:
                 date_str = _dt.fromtimestamp(created).strftime("%Y-%m-%d")
             except Exception:
@@ -24534,6 +24573,10 @@ class _TranscriptionPanel(ttk.Frame):
                 self.after(0, lambda: _populate([]))
             except Exception:
                 self._search_running = False
+                try:
+                    self._search_btn.config(state="normal", text="Search")
+                except Exception:
+                    pass
 
         def _populate(rows):
             self._search_running = False
@@ -26268,7 +26311,12 @@ class _TranscriptionPanel(ttk.Frame):
             except Exception:
                 pass
 
-        self._player_poll_id = self.after(100, self._player_poll)
+        # Poll faster when playing (smooth word highlighting), slower when paused
+        try:
+            _interval = 100 if self._vlc_player.is_playing() else 500
+        except Exception:
+            _interval = 100
+        self._player_poll_id = self.after(_interval, self._player_poll)
 
     def _player_highlight_word(self, cur_sec):
         """Highlight the word currently being spoken — single word, no skipping.
@@ -26313,8 +26361,13 @@ class _TranscriptionPanel(ttk.Frame):
 
         self._player_last_word_idx = new_idx
 
-        # Remove previous highlight
-        self._player_transcript.tag_remove("active_word", "1.0", "end")
+        # Remove previous highlight — use targeted removal if we know the previous word
+        if 0 <= prev < len(self._player_words):
+            _pd = self._player_words[prev]
+            self._player_transcript.tag_remove(
+                "active_word", f"1.0+{_pd['cs']}c", f"1.0+{_pd['ce']}c")
+        else:
+            self._player_transcript.tag_remove("active_word", "1.0", "end")
 
         # Add highlight to new word using stored char offsets
         if 0 <= new_idx < len(self._player_words):
@@ -28723,40 +28776,6 @@ def on_closing():
             pass
 
     _root_alive = False  # Tell worker threads to stop touching Tkinter immediately
-
-    # Check if there are queued jobs
-    has_queue = False
-    with _sync_queue_lock:
-        if _sync_queue:
-            has_queue = True
-    if not has_queue:
-        with _reorg_queue_lock:
-            if _reorg_queue:
-                has_queue = True
-    if not has_queue:
-        with _transcribe_queue_lock:
-            if _transcribe_queue:
-                has_queue = True
-    if not has_queue:
-        with _gpu_queue_lock:
-            if _gpu_queue:
-                has_queue = True
-    if not has_queue and _gpu_running:
-        has_queue = True
-    if not has_queue:
-        with _redownload_queue_lock:
-            if _redownload_queue:
-                has_queue = True
-    if not has_queue and _redownload_running:
-        has_queue = True
-
-    # Include currently-running items in has_queue check
-    if _current_sync_ch is not None and _sync_running:
-        has_queue = True
-    if _gpu_current_item is not None:
-        has_queue = True
-
-    # (Queue state already saved at top of on_closing — no second save needed here.)
 
     # Stop embedded VLC player if active
     try:

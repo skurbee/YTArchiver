@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.3"
+APP_VERSION = "v31.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3619,7 +3619,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 7:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.01.26 8:04pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11599,8 +11599,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
-            if not files_to_process and not _jsonl_needed:
+            if not files_to_process:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                if _jsonl_needed:
+                    log(f"  — {len(_jsonl_needed)} video(s) need searchable .jsonl — will generate next transcription run.\n", "dim")
                 # Mark channel as fully transcribed
                 with config_lock:
                     for _cfg_ch in config.get("channels", []):
@@ -12016,18 +12018,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _punct_fixes:
                     log(f"  ✓ Punctuation added to {_punct_fixes} existing transcript(s).\n", "simpleline_green")
 
-            # If all files were already transcribed, run any pending JSONL backfill and finish
-            if not files_to_process:
-                log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
-                _do_jsonl_backfill()
-                with config_lock:
-                    for _cfg_ch in config.get("channels", []):
-                        if _cfg_ch.get("url") == ch_url:
-                            _cfg_ch["transcription_complete"] = True
-                            _cfg_ch["transcription_pending"] = 0
-                            break
-                    save_config(config)
-                return
+            # (files_to_process is guaranteed non-empty here — the empty case
+            # returns early in Step 2 above, before the YouTube fetch.)
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")

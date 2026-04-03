@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.3"
+APP_VERSION = "v32.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -758,7 +758,7 @@ def log(text, tag=None):
                             _bk_tag = "trans_bracket"
                             if _base_tag == "simpleline_blue" and "done (" in _txt:
                                 _do_white = True
-                        elif _base_tag == "metadata_using" or re.search(r'\[\d+/\d+\] (?:Metadata|Refresh) - ', _txt):
+                        elif _base_tag == "metadata_using" or re.search(r'\[\d+/\d+\] (?:Metadata|Refresh|Searching)[: -]', _txt):
                             _bk_tag = "meta_bracket"
                     if not _bk_tag:
                         # Check for "Metadata:" or "Refreshing:" prefix without brackets
@@ -770,7 +770,20 @@ def log(text, tag=None):
                                 _p = log_box.index(f"{_p}+{len(_meta_prefix_m.group(1))}c")
                             log_box.insert(_p, _meta_prefix_m.group(2), "meta_bracket")
                             _p = log_box.index(f"{_p}+{len(_meta_prefix_m.group(2))}c")
-                            log_box.insert(_p, _meta_prefix_m.group(3), _base_tag)
+                            # Color any — in the rest pink
+                            _rest = _meta_prefix_m.group(3)
+                            _rem = _rest
+                            while _rem:
+                                _di = _rem.find("\u2014")
+                                if _di < 0:
+                                    log_box.insert(_p, _rem, _base_tag)
+                                    break
+                                if _di > 0:
+                                    log_box.insert(_p, _rem[:_di], _base_tag)
+                                    _p = log_box.index(f"{_p}+{_di}c")
+                                log_box.insert(_p, "\u2014", "simpleline_pink")
+                                _p = log_box.index(f"{_p}+1c")
+                                _rem = _rem[_di + 1:]
                         elif _base_tag in ("simpleline", "simpleline_green") and _txt.lstrip().startswith("\u2014") and "\u2014" in _txt:
                             # Transcription scan lines: color only the — (em-dash) symbols blue
                             _text_tag = _base_tag  # keep original color for non-dash text
@@ -825,8 +838,8 @@ def log(text, tag=None):
                     # After the bracket
                     _after = _txt[_bk_m.end():]
                     if _is_meta and _after:
-                        # Color "Metadata -" or "Refresh -" pink, title white
-                        _meta_m = re.match(r'( (?:Metadata|Refresh) - )(.*?)(\.\.\.)?(\s*\n?)$', _after, re.DOTALL)
+                        # Color "Metadata -" / "Refresh -" / "Searching:" pink, title white
+                        _meta_m = re.match(r'( (?:Metadata|Refresh) - | Searching: )(.*?)(\.\.\.)?(\s*\n?)$', _after, re.DOTALL)
                         if _meta_m:
                             log_box.insert(_p, _meta_m.group(1), _bk_tag)
                             _p = log_box.index(f"{_p}+{len(_meta_m.group(1))}c")
@@ -3682,7 +3695,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 1:12pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 1:27pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8228,7 +8241,7 @@ def _start_punct_process():
             return True  # Already running
 
         try:
-            log("  Loading punctuation model...\n", "simpleline")
+            log("  Loading punctuation model...\n", "simpleline_blue")
             _punct_proc = subprocess.Popen(
                 [_WHISPER_PYTHON, "-c", _PUNCT_SCRIPT],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -11492,7 +11505,7 @@ def _run_metadata_download(item):
                             _ch_match = _norm(_found_channel) == _norm(ch_name)
                         if _found_id and _ch_match:
                             if _found_id in _known_vids:
-                                log(f"    Skipped (ID already belongs to another video)\n", "simpleline")
+                                log(f"    Skipped (ID already belongs to another video)\n", "simpleline_pink")
                             else:
                                 _known_vids.add(_found_id)
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))

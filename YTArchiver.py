@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.7"
+APP_VERSION = "v32.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2909,6 +2909,8 @@ def _run_startup_disk_scan():
     if tp and tp._loaded and _root_alive:
         tp._disk_scan_complete = True
         _ui_queue.append(tp._refresh_browse)
+        # Check if disk has more files than the DB (shows warning icon if so)
+        _ui_queue.append(tp._check_index_freshness)
 
 
 config = load_config()
@@ -3723,7 +3725,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 3:54pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20695,6 +20697,8 @@ class _TranscriptionPanel(ttk.Frame):
                     self.after(5000, lambda: self._browse_scan_status.config(text=""))
                 except Exception:
                     pass
+                # Re-check index freshness (hides warning if now fully indexed)
+                self._check_index_freshness()
             self.after(0, _done)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -21167,6 +21171,32 @@ class _TranscriptionPanel(ttk.Frame):
                  font=("Segoe UI", 11, "bold"))
         self._all_videos_lbl.pack(side="left")
         self._all_videos_lbl.bind("<Button-3>", lambda e: self._secret_download_all_metadata())
+        # Title search bar — search video titles across all channels
+        self._browse_search_var = tk.StringVar()
+        _search_frame = tk.Frame(hdr, bg=self._TP_BG2, highlightthickness=1,
+                                  highlightbackground="#3a3d44", highlightcolor=self._TP_ACCENT)
+        _search_frame.pack(side="left", padx=(12, 0))
+        tk.Label(_search_frame, text="\U0001F50D", bg=self._TP_BG2, fg=self._TP_DIM,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+        self._browse_search_entry = tk.Entry(
+            _search_frame, textvariable=self._browse_search_var,
+            bg=self._TP_BG2, fg=self._TP_FG, insertbackground=self._TP_FG,
+            relief="flat", font=("Segoe UI", 9), width=22)
+        self._browse_search_entry.pack(side="left", padx=(2, 4), ipady=2)
+        self._browse_search_entry.bind("<Return>", lambda _: self._browse_title_search())
+        self._browse_search_entry.bind("<Escape>", lambda _: self._browse_clear_search())
+        # Index freshness warning icon (hidden by default)
+        self._browse_index_warn = tk.Label(
+            hdr, text="\u26A0", bg=self._TP_BG3, fg="#e8a838",
+            font=("Segoe UI", 11), cursor="hand2")
+        self._browse_index_warn.pack(side="left", padx=(6, 0))
+        self._browse_index_warn.pack_forget()  # hidden until check detects stale index
+        def _warn_click(_):
+            self._browse_index_warn.pack_forget()
+            self._scan_archive()
+        self._browse_index_warn.bind("<Button-1>", _warn_click)
+        _ToolTip(self._browse_index_warn,
+                 "Videos on disk aren\u2019t fully indexed \u2014 click to scan, then rebuild in Index tab")
         # Pack scan button and status FIRST so they always have space
         self._browse_scan_btn = tk.Button(hdr, text="Scan Archive", bg="#3a3a3a",
                   fg=self._TP_FG, activebackground="#555555",
@@ -22213,6 +22243,212 @@ class _TranscriptionPanel(ttk.Frame):
                 db_rows = None
         self._open_vlc(video_path, 0, title=title, db_rows=db_rows,
                        tx_status=tx_status)
+
+    def _browse_title_search(self):
+        """Search video titles across all channels and show results in the grid."""
+        query = self._browse_search_var.get().strip()
+        if not query:
+            self._browse_clear_search()
+            return
+        if not self._conn:
+            return
+        self._browse_search_active = True
+        # Show "Searching..." immediately in the grid area
+        self._grid_show_search_loading(query)
+
+        def _worker():
+            try:
+                # Split query into words — each must appear independently in the title
+                words = query.split()
+                if not words:
+                    return
+                clauses = " AND ".join(["title LIKE ? COLLATE NOCASE"] * len(words))
+                params = [f"%{w}%" for w in words]
+                sql = (f"SELECT title, filepath, video_id, channel, tx_status "
+                       f"FROM videos WHERE {clauses} "
+                       f"AND channel != '__ver__' ORDER BY title COLLATE NOCASE")
+                with self._db_lock:
+                    rows = self._db_execute(sql, params).fetchall()
+            except Exception:
+                return
+            import datetime as _dt
+            videos = []
+            seen = set()
+            for title, filepath, video_id, channel, tx_status in rows:
+                # Deduplicate by video_id or (title, channel)
+                _key = video_id if video_id else (title, channel)
+                if _key in seen:
+                    continue
+                seen.add(_key)
+                v = {
+                    "title": title, "filepath": filepath,
+                    "video_id": video_id, "channel": channel,
+                    "tx_status": tx_status,
+                    "mtime": 0.0, "date_str": "",
+                    "view_count": 0, "like_count": 0,
+                    "duration": 0, "upload_date": "",
+                    "thumb_path": None,
+                }
+                # Get file date if available
+                if filepath:
+                    try:
+                        mt = os.path.getmtime(filepath)
+                        v["mtime"] = mt
+                        v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
+                    except OSError:
+                        pass
+                videos.append(v)
+            self.after(0, lambda: self._grid_show_search_results(query, videos))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _browse_clear_search(self):
+        """Clear the title search and return to normal browse mode."""
+        self._browse_search_var.set("")
+        self._browse_search_entry.master.focus_set()  # unfocus the entry
+        if getattr(self, '_browse_search_active', False):
+            self._browse_search_active = False
+            # If grid is showing search results, hide it
+            if self._grid_visible and self._grid_scope and \
+               isinstance(self._grid_scope[0], str) and self._grid_scope[0] == "__search__":
+                self._hide_grid()
+
+    def _check_index_freshness(self):
+        """Background check: detect un-indexed videos.
+        Two checks:
+         1. Video files on disk not registered in the videos table
+         2. Videos registered but not transcript-indexed in segments table
+        Shows a warning icon next to the search bar if either is true."""
+        if not self._conn:
+            return
+        def _worker():
+            try:
+                # Check 1: disk files vs videos table
+                _disk_stale = False
+                roots = self._get_archive_roots()
+                if roots:
+                    with config_lock:
+                        channels_cfg = list(config.get("channels", []))
+                    disk_count = 0
+                    for ch in channels_cfg:
+                        folder = ch.get("folder_override", "").strip() or ch.get("name", "")
+                        folder = sanitize_folder(folder)
+                        if not folder:
+                            continue
+                        for root_dir in roots:
+                            ch_path = os.path.join(root_dir, folder)
+                            if not os.path.isdir(ch_path):
+                                continue
+                            for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
+                                for fn in filenames:
+                                    fn_lower = fn.lower()
+                                    if fn_lower.endswith(self._TP_VIDEO_EXTS) \
+                                       and ".temp." not in fn_lower \
+                                       and not fn_lower.endswith(".part"):
+                                        disk_count += 1
+                    db_count = 0
+                    try:
+                        with self._db_lock:
+                            row = self._db_execute(
+                                "SELECT COUNT(*) FROM videos WHERE channel != '__ver__'"
+                            ).fetchone()
+                            db_count = row[0] if row else 0
+                    except Exception:
+                        pass
+                    _disk_stale = disk_count > db_count
+                # Check 2: videos table vs segments table (transcript index)
+                _seg_stale = False
+                try:
+                    with self._db_lock:
+                        vid_total = self._db_execute(
+                            "SELECT COUNT(*) FROM videos "
+                            "WHERE filepath != '__schema_ver__' AND channel != '__ver__'"
+                        ).fetchone()[0]
+                        seg_vids = self._db_execute(
+                            "SELECT COUNT(DISTINCT video_id) FROM segments "
+                            "WHERE video_id != ''"
+                        ).fetchone()[0]
+                    _seg_stale = vid_total > seg_vids
+                except Exception:
+                    pass
+                self.after(0, lambda: self._update_index_warn(
+                    _disk_stale or _seg_stale))
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_index_warn(self, stale):
+        """Show or hide the index freshness warning icon."""
+        try:
+            if stale:
+                self._browse_index_warn.pack(side="left", padx=(6, 0),
+                                              after=self._browse_search_entry.master)
+            else:
+                self._browse_index_warn.pack_forget()
+        except Exception:
+            pass
+
+    def _grid_show_search_loading(self, query):
+        """Immediately show the grid with a 'Searching...' indicator."""
+        _scope = ("__search__", query, None)
+        if self._grid_scope and self._grid_videos and self._grid_scope in self._grid_cache:
+            self._grid_cache[self._grid_scope]["photos"].update(self._grid_photos)
+        self._grid_scope = _scope
+        if not hasattr(self, '_grid_gen'):
+            self._grid_gen = 0
+        self._grid_gen += 1
+        # Swap: hide transcript container + viewer header, show grid
+        self._transcript_container.pack_forget()
+        self._browse_viewer_header.pack_forget()
+        self._browse_back_btn.pack_forget()
+        if not self._grid_visible:
+            self._grid_frame.pack(fill="both", expand=True)
+            self._grid_visible = True
+        # Breadcrumb shows "Searching..."
+        for w in self._grid_breadcrumb_frame.winfo_children():
+            w.destroy()
+        tk.Label(self._grid_breadcrumb_frame,
+                 text=f'Searching: "{query}"...',
+                 bg=self._TP_BG3, fg=self._TP_DIM,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+        self._browse_path_label.config(text="")
+        self._browse_play_btn.config(state="disabled")
+        self._browse_actions_btn.config(state="disabled")
+        self._grid_meta_banner.pack_forget()
+        # Clear canvas and show loading
+        self._grid_canvas.delete("all")
+        self._grid_cards.clear()
+        self._grid_photos.clear()
+        self._grid_videos = []
+        self._grid_bg_rects.clear()
+        self._grid_thumb_items.clear()
+        self._grid_loaded_count = 0
+        if not self._grid_canvas_frame.winfo_ismapped():
+            self._grid_canvas_frame.pack(fill="both", expand=True)
+        self._grid_loading_lbl.config(text=f'Searching "{query}"...')
+        self._grid_loading_progress.config(text="Querying database...")
+        self._grid_loading_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._grid_loading_frame.lift()
+
+    def _grid_show_search_results(self, query, videos):
+        """Display title search results in the grid view."""
+        # Verify we're still showing results for this query
+        if not self._grid_scope or self._grid_scope[0] != "__search__":
+            return
+        # Set videos BEFORE building breadcrumb so count is correct
+        self._grid_videos = videos
+        self._grid_update_breadcrumb("__search__")
+        self._grid_loaded_count = 0
+        self._grid_loading_frame.place_forget()
+        if not videos:
+            self._grid_canvas.create_text(
+                self._grid_canvas.winfo_width() // 2, 60,
+                text=f'No videos matching "{query}"', fill=self._TP_DIM,
+                font=("Segoe UI", 11))
+            return
+        self._grid_suppress_resize = True
+        self.update_idletasks()
+        self._grid_build_cards()
+        self.after(500, self._grid_enable_resize)
 
     def _browse_find(self):
         """Highlight all occurrences of the find term in the browse viewer."""
@@ -23478,8 +23714,11 @@ class _TranscriptionPanel(ttk.Frame):
                 anchor="nw", width=card_w - 12,
                 tags=("card",))
 
-            # Stats text (views + date)
+            # Stats text (views + date, channel name in search mode)
             stats_parts = []
+            _is_search = self._grid_scope and self._grid_scope[0] == "__search__"
+            if _is_search and v.get("channel"):
+                stats_parts.append(v["channel"])
             if v["view_count"]:
                 vc = v["view_count"]
                 if vc >= 1_000_000:
@@ -23595,7 +23834,8 @@ class _TranscriptionPanel(ttk.Frame):
             return
         idx = self._grid_idx_from_event(event)
         if idx >= 0:
-            self._grid_navigate_to_video(self._grid_videos[idx]["title"])
+            v = self._grid_videos[idx]
+            self._grid_navigate_to_video(v["title"], channel=v.get("channel"))
 
     def _grid_on_leave(self, event):
         """Clear hover highlight when mouse leaves canvas."""
@@ -23639,6 +23879,14 @@ class _TranscriptionPanel(ttk.Frame):
         _font_link = ("Segoe UI", 10, "bold underline")
         _font_current = ("Segoe UI", 10, "bold")
         _font_sep = ("Segoe UI", 10)
+        # Search results breadcrumb
+        if channel == "__search__":
+            _query = self._grid_scope[1] if self._grid_scope else ""
+            _n = len(self._grid_videos) if self._grid_videos else 0
+            tk.Label(self._grid_breadcrumb_frame,
+                     text=f'Search: "{_query}"  ({_n} result{"" if _n == 1 else "s"})',
+                     bg=_bg, fg=_fg, font=_font_current).pack(side="left")
+            return
         # Channel segment — clickable if viewing a year/month
         if year is not None or month is not None:
             ch_lbl = tk.Label(self._grid_breadcrumb_frame, text=channel, bg=_bg,
@@ -23674,7 +23922,11 @@ class _TranscriptionPanel(ttk.Frame):
             return
         v = self._grid_videos[idx]
         title = v["title"]
-        channel = self._grid_scope[0] if self._grid_scope else ""
+        # In search mode, get channel from the video dict; otherwise from scope
+        if self._grid_scope and self._grid_scope[0] == "__search__":
+            channel = v.get("channel", "")
+        else:
+            channel = self._grid_scope[0] if self._grid_scope else ""
         filepath = v.get("filepath")
         video_id = v.get("video_id")
 
@@ -23798,12 +24050,19 @@ class _TranscriptionPanel(ttk.Frame):
         """Back button: return from transcript view to the grid for the last scope."""
         scope = getattr(self, '_grid_return_scope', None)
         if scope:
-            channel, year, month = scope
-            # Force re-show by clearing the scope match check
-            self._grid_scope = None
-            self._show_grid(channel, year, month)
+            if scope[0] == "__search__":
+                # Re-run the search to restore results
+                query = scope[1]
+                self._browse_search_var.set(query)
+                self._grid_scope = None
+                self._browse_title_search()
+            else:
+                channel, year, month = scope
+                # Force re-show by clearing the scope match check
+                self._grid_scope = None
+                self._show_grid(channel, year, month)
 
-    def _grid_navigate_to_video(self, title):
+    def _grid_navigate_to_video(self, title, channel=None):
         """Find the title node in the tree and select it (triggers transcript view).
         If the tree node isn't expanded yet, expand the parent hierarchy
         one level at a time, waiting for each level to populate."""
@@ -23816,7 +24075,9 @@ class _TranscriptionPanel(ttk.Frame):
                 return
         if not self._grid_scope:
             return
-        channel = self._grid_scope[0]
+        # For search results, use the explicitly passed channel; otherwise use scope
+        if channel is None:
+            channel = self._grid_scope[0]
         # Look up the video's year/month from the DB
         _v_year, _v_month = None, None
         if self._conn:
@@ -27700,7 +27961,12 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # simplestatus_green must precede simplestatus so the SYNCING status renders green;
 # dlprogress_pct must precede dlprogress so the progress bar percentage is green.
 # encode_prefix/encode_title must precede encode_progress so the white title overlay wins.
-_ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simpleline", "simpleline_green",
+# Bracket tags (trans_bracket, sync_bracket, meta_bracket) must precede the base tags
+# they overlay (simpleline*, transcribe_prefix, header, etc.) so brackets keep their
+# blue/green color in mini-log mirroring — mirrors the tag_raise() calls on the main log.
+_ALL_LOG_TAGS = ("green", "red",
+                 "meta_bracket", "trans_bracket", "sync_bracket",
+                 "header", "tx_sep", "tx_head", "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpleline_pink", "simpledownload",
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
@@ -27710,7 +27976,7 @@ _ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simp
                  "encode_progress", "encode_pct", "encode_dots",
                  "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using",
                  "metadata_using",
-                 "dl_white", "meta_bracket", "trans_bracket", "sync_bracket", "trans_dots")
+                 "dl_white", "trans_dots")
 
 
 _mini_log_last_end = [None]  # track last log_box end index to skip if unchanged

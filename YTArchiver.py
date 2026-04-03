@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.6"
+APP_VERSION = "v32.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3723,7 +3723,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:06pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11504,7 +11504,7 @@ def _run_metadata_download(item):
                     _tray_start_spin()
                     log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
             _search_i += 1
-            _trunc_s = _s_title[:50] + "..." if len(_s_title) > 50 else _s_title
+            _trunc_s = _trunc_pad_title(_s_title, _MAX_TITLE_DISPLAY - len("Searching") - 3).rstrip()
             log(f"  \u2014 [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
             try:
                 _search_cmd = [
@@ -11533,7 +11533,7 @@ def _run_metadata_download(item):
                             _ch_match = _norm(_found_channel) == _norm(ch_name)
                         if _found_id and _ch_match:
                             if _found_id in _known_vids:
-                                log(f"    Skipped (ID already belongs to another video) \u2014\n", "simpleline_pink")
+                                log(f"    \u2014 Skipped (ID already belongs to another video)\n", "simpleline_pink")
                             else:
                                 _known_vids.add(_found_id)
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))

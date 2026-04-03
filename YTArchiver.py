@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.4"
+APP_VERSION = "v32.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -784,6 +784,21 @@ def log(text, tag=None):
                                 log_box.insert(_p, "\u2014", "simpleline_pink")
                                 _p = log_box.index(f"{_p}+1c")
                                 _rem = _rem[_di + 1:]
+                        elif _base_tag == "simpleline_pink" and "\u2014" in _txt:
+                            # Pink lines: color only the — pink, rest in default simpleline
+                            _p = _ins_pos
+                            _remaining = _txt
+                            while _remaining:
+                                _di = _remaining.find("\u2014")
+                                if _di < 0:
+                                    log_box.insert(_p, _remaining, "simpleline")
+                                    break
+                                if _di > 0:
+                                    log_box.insert(_p, _remaining[:_di], "simpleline")
+                                    _p = log_box.index(f"{_p}+{_di}c")
+                                log_box.insert(_p, "\u2014", "simpleline_pink")
+                                _p = log_box.index(f"{_p}+1c")
+                                _remaining = _remaining[_di + 1:]
                         elif _base_tag in ("simpleline", "simpleline_green") and _txt.lstrip().startswith("\u2014") and "\u2014" in _txt:
                             # Transcription scan lines: color only the — (em-dash) symbols blue
                             _text_tag = _base_tag  # keep original color for non-dash text
@@ -812,8 +827,20 @@ def log(text, tag=None):
                     _p = _ins_pos
                     _before = _txt[:_bk_m.start()]
                     if _before:
-                        log_box.insert(_p, _before, _base_tag)
-                        _p = log_box.index(f"{_p}+{len(_before)}c")
+                        if "\u2014" in _before:
+                            _bi = _before.find("\u2014")
+                            if _bi > 0:
+                                log_box.insert(_p, _before[:_bi], _base_tag)
+                                _p = log_box.index(f"{_p}+{_bi}c")
+                            log_box.insert(_p, "\u2014", "simpleline_blue")
+                            _p = log_box.index(f"{_p}+1c")
+                            _rest_b = _before[_bi + 1:]
+                            if _rest_b:
+                                log_box.insert(_p, _rest_b, _base_tag)
+                                _p = log_box.index(f"{_p}+{len(_rest_b)}c")
+                        else:
+                            log_box.insert(_p, _before, _base_tag)
+                            _p = log_box.index(f"{_p}+{len(_before)}c")
                     # [ bracket in green/blue/pink
                     log_box.insert(_p, "[", _bk_tag)
                     _p = log_box.index(f"{_p}+1c")
@@ -3695,7 +3722,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 1:27pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:04pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8270,7 +8297,7 @@ def _start_punct_process():
                     _stop_punct_process()
                     return False
                 if info.get("status") == "ready":
-                    log(f"  ✓ Punctuation model loaded ({info.get('device', '?').upper()}).\n", "simpleline_green")
+                    log(f"  — ✓ Punctuation model loaded ({info.get('device', '?').upper()}).\n", "simpleline_green")
                     return True
                 elif info.get("status") == "error":
                     log(f"  ⚠ Punctuation model failed: {info.get('text', 'unknown')}\n", "red")
@@ -11477,7 +11504,7 @@ def _run_metadata_download(item):
                     log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
             _search_i += 1
             _trunc_s = _s_title[:50] + "..." if len(_s_title) > 50 else _s_title
-            log(f"  [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
+            log(f"  \u2014 [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
             try:
                 _search_cmd = [
                     "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
@@ -11505,7 +11532,7 @@ def _run_metadata_download(item):
                             _ch_match = _norm(_found_channel) == _norm(ch_name)
                         if _found_id and _ch_match:
                             if _found_id in _known_vids:
-                                log(f"    Skipped (ID already belongs to another video)\n", "simpleline_pink")
+                                log(f"    Skipped (ID already belongs to another video) \u2014\n", "simpleline_pink")
                             else:
                                 _known_vids.add(_found_id)
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))

@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.5"
+APP_VERSION = "v32.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -828,11 +828,12 @@ def log(text, tag=None):
                     _before = _txt[:_bk_m.start()]
                     if _before:
                         if "\u2014" in _before:
+                            _dash_color = "simpleline_pink" if _is_meta else "simpleline_blue"
                             _bi = _before.find("\u2014")
                             if _bi > 0:
                                 log_box.insert(_p, _before[:_bi], _base_tag)
                                 _p = log_box.index(f"{_p}+{_bi}c")
-                            log_box.insert(_p, "\u2014", "simpleline_blue")
+                            log_box.insert(_p, "\u2014", _dash_color)
                             _p = log_box.index(f"{_p}+1c")
                             _rest_b = _before[_bi + 1:]
                             if _rest_b:
@@ -3722,7 +3723,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:04pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 2:06pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

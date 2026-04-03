@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.2"
+APP_VERSION = "v32.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3682,7 +3682,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 10:26am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 1:12pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11452,9 +11452,19 @@ def _run_metadata_download(item):
         for _s_title, _s_year, _s_month, _s_filepath in _need_search:
             if cancel_event.is_set():
                 break
+            # Pause support during search phase
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  ⏸ Metadata paused at {_fmt_time()} — click Resume.\n", "pausestatus")
+                _tray_stop_spin(force=True)
+                while pause_event.is_set() and not cancel_event.is_set():
+                    time.sleep(0.5)
+                clear_pause_status()
+                if not cancel_event.is_set():
+                    _tray_start_spin()
+                    log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
             _search_i += 1
             _trunc_s = _s_title[:50] + "..." if len(_s_title) > 50 else _s_title
-            log(f"  [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "dim")
+            log(f"  [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
             try:
                 _search_cmd = [
                     "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
@@ -11482,7 +11492,7 @@ def _run_metadata_download(item):
                             _ch_match = _norm(_found_channel) == _norm(ch_name)
                         if _found_id and _ch_match:
                             if _found_id in _known_vids:
-                                log(f"    Skipped (ID already belongs to another video)\n", "dim")
+                                log(f"    Skipped (ID already belongs to another video)\n", "simpleline")
                             else:
                                 _known_vids.add(_found_id)
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))
@@ -11641,7 +11651,7 @@ def _run_metadata_download(item):
         _parts.append(f"{skipped} already had metadata")
     if errors:
         _parts.append(f"{errors} failed")
-    log(f"\n=== Metadata Complete: {scope_label} — {', '.join(_parts)} ===\n", "green")
+    log(f"=== Metadata Complete: {scope_label} — {', '.join(_parts)} ===\n", "green")
     _meta_elapsed = time.time() - _meta_t0
     _new_count = done - skipped - errors
     _record_metadata(ch_name, _new_count, refreshed, skipped, errors, _meta_elapsed)

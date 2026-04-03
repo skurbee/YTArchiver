@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v31.9"
+APP_VERSION = "v32.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3618,7 +3618,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.02.26 10:39pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.02.26 11:46pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13576,7 +13576,12 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("transcribe_prefix", {"foreground": C_TEXT}),
                              ("transcribe_title", {"foreground": C_TEXT}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE}),
-                             ("metadata_using", {"foreground": C_TEXT})]:
+                             ("metadata_using", {"foreground": C_TEXT}),
+                             ("dl_white", {"foreground": "#ffffff"}),
+                             ("meta_bracket", {"foreground": C_LOG_PINK}),
+                             ("trans_bracket", {"foreground": C_LOG_BLUE}),
+                             ("sync_bracket", {"foreground": C_LOG_GREEN}),
+                             ("trans_dots", {"foreground": C_LOG_BLUE})]:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -20795,7 +20800,12 @@ class _TranscriptionPanel(ttk.Frame):
                           ("transcribe_title", {"foreground": self._TP_FG}),
                           ("transcribe_using", {"foreground": "#7eb8da"}),
                           ("metadata_using", {"foreground": self._TP_FG}),
-                          ("dim", {"foreground": "#666"})]:
+                          ("dim", {"foreground": "#666"}),
+                          ("dl_white", {"foreground": "#ffffff"}),
+                          ("meta_bracket", {"foreground": "#e87aac"}),
+                          ("trans_bracket", {"foreground": "#7eb8da"}),
+                          ("sync_bracket", {"foreground": "#3dd68c"}),
+                          ("trans_dots", {"foreground": "#7eb8da"})]:
             self._mini_log.tag_configure(_tn, **_tc)
 
         self._show_section("browse")
@@ -23248,12 +23258,13 @@ class _TranscriptionPanel(ttk.Frame):
         if reset:
             self._grid_canvas.yview_moveto(0)
 
-        # Reveal grid — hide loading overlay
-        self._grid_loading_frame.place_forget()
-
-        # Load thumbnail images progressively via thread pool
+        # Reveal grid — hide loading overlay after a short delay so most
+        # thumbnails finish loading before the user sees the grid.
         if _thumb_jobs and _has_pil:
             self._grid_load_thumbnails_canvas(_thumb_jobs)
+            self.after(1800, lambda: self._grid_loading_frame.place_forget())
+        else:
+            self._grid_loading_frame.place_forget()
 
     def _grid_load_thumbnails_canvas(self, thumb_jobs):
         """Load thumbnail images via thread pool and replace canvas items."""
@@ -27424,7 +27435,12 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
                              ("transcribe_prefix", {"foreground": C_TEXT}),
                              ("transcribe_title", {"foreground": C_TEXT}),
                              ("transcribe_using", {"foreground": C_LOG_BLUE}),
-                             ("metadata_using", {"foreground": C_TEXT})]:
+                             ("metadata_using", {"foreground": C_TEXT}),
+                             ("dl_white", {"foreground": "#ffffff"}),
+                             ("meta_bracket", {"foreground": C_LOG_PINK}),
+                             ("trans_bracket", {"foreground": C_LOG_BLUE}),
+                             ("sync_bracket", {"foreground": C_LOG_GREEN}),
+                             ("trans_dots", {"foreground": C_LOG_BLUE})]:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
@@ -27440,7 +27456,8 @@ _ALL_LOG_TAGS = ("green", "red", "header", "tx_sep", "tx_head", "summary", "simp
                  "whisper_pct", "whisper_dots", "encode_prefix", "encode_title",
                  "encode_progress", "encode_pct", "encode_dots",
                  "encode_suffix", "transcribe_prefix", "transcribe_title", "transcribe_using",
-                 "metadata_using")
+                 "metadata_using",
+                 "dl_white", "meta_bracket", "trans_bracket", "sync_bracket", "trans_dots")
 
 
 _mini_log_last_end = [None]  # track last log_box end index to skip if unchanged

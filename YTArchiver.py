@@ -83,7 +83,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.1"
+APP_VERSION = "v32.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3682,7 +3682,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 9:26am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 10:26am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5333,7 +5333,36 @@ def _chan_ctx_download_metadata():
     ch_url = ch["url"]
     sy = ch.get("split_years", False)
     sm = ch.get("split_months", False)
-    _add_to_metadata_queue(ch_name, ch_url, folder, sy, sm, None, None, ch_name)
+
+    # Check if metadata already exists — show choice dialog if so
+    refresh = False
+    tp = _tp_panel_ref[0]
+    if tp:
+        try:
+            has_existing = False
+            if sy:
+                # Split channel — check if any per-year metadata exists
+                for _yd in os.listdir(folder):
+                    _yp = os.path.join(folder, _yd)
+                    if os.path.isdir(_yp) and _yd.isdigit():
+                        _mp, _ = tp._get_metadata_jsonl_path(
+                            ch_name, folder, sy, sm, year=int(_yd), month=None)
+                        if os.path.isfile(_mp):
+                            has_existing = True
+                            break
+            else:
+                meta_path, _ = tp._get_metadata_jsonl_path(
+                    ch_name, folder, sy, sm, year=None, month=None)
+                has_existing = bool(tp._read_metadata_jsonl(meta_path))
+            if has_existing:
+                choice = tp._metadata_choice_dialog(ch_name)
+                if choice == "cancel":
+                    return
+                refresh = (choice == "refresh")
+        except Exception:
+            pass
+
+    _add_to_metadata_queue(ch_name, ch_url, folder, sy, sm, None, None, ch_name, refresh=refresh)
 
 
 _chan_ctx_menu.add_command(label="Download Metadata", command=_chan_ctx_download_metadata)
@@ -11282,6 +11311,8 @@ def _run_metadata_download(item):
     scope_label = item["scope_label"]
     refresh = item.get("refresh", False)
 
+    log(f"Metadata: preparing {scope_label}...\n", "simpleline")
+
     # Get the TP instance (Browse tab) for DB access and metadata helpers
     tp = _tp_panel_ref[0]
     if not tp or not tp._conn:
@@ -11337,6 +11368,8 @@ def _run_metadata_download(item):
             f"  Check that video files exist in the channel folder.\n", "red")
         return
 
+    log(f"  Found {len(rows)} video(s) — resolving video IDs...\n", "dim")
+
     # Resolve missing video_ids from segments table or JSONL files on disk
     _resolved_rows = []
     _no_id_count = 0
@@ -11353,6 +11386,7 @@ def _run_metadata_download(item):
         pass
     # If segments had nothing, read JSONL files from the channel folder
     if not _seg_id_map:
+        log(f"  Scanning transcript files for video IDs...\n", "dim")
         for dirpath, _, filenames in os.walk(folder_path):
             try:
                 for _fn in filenames:
@@ -11374,6 +11408,7 @@ def _run_metadata_download(item):
             except (OSError, PermissionError):
                 continue
 
+    _need_search = []  # (index, title, v_year, v_month, filepath) for yt-dlp search
     for vid_id, title, v_year, v_month, filepath in rows:
         if not vid_id:
             # Try segments table lookup
@@ -11397,7 +11432,84 @@ def _run_metadata_download(item):
                     pass
             _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
         else:
+            _need_search.append((title, v_year, v_month, filepath))
             _no_id_count += 1
+
+    # For videos with no video_id, try searching YouTube by title + channel name
+    if _need_search and ch_url:
+        log(f"  Searching YouTube for {len(_need_search)} video(s) with no ID...\n", "dim")
+        _search_found = 0
+        _search_i = 0
+        # Track all known video_ids to avoid assigning the same ID to multiple videos
+        _known_vids = set(vid for vid, *_ in _resolved_rows)
+        try:
+            for _db_vid, in tp._db_execute(
+                    "SELECT DISTINCT video_id FROM videos WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
+                    (ch_name,)).fetchall():
+                _known_vids.add(_db_vid)
+        except Exception:
+            pass
+        for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+            if cancel_event.is_set():
+                break
+            _search_i += 1
+            _trunc_s = _s_title[:50] + "..." if len(_s_title) > 50 else _s_title
+            log(f"  [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "dim")
+            try:
+                _search_cmd = [
+                    "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
+                    "--skip-download", "--cookies-from-browser", "firefox",
+                    "--playlist-items", "1",
+                    f"ytsearch1:{_s_title} {ch_name}"
+                ]
+                _search_proc = spawn_yt_dlp(_search_cmd)
+                if _search_proc:
+                    _search_out, _ = _search_proc.communicate(timeout=30)
+                    cleanup_process(_search_proc)
+                    if _search_proc.returncode == 0 and _search_out.strip():
+                        _search_data = json.loads(_search_out)
+                        _found_id = _search_data.get("id", "")
+                        _found_channel = _search_data.get("channel", "") or _search_data.get("uploader", "")
+                        # Verify the result is from the same channel AND not already used
+                        _found_url = _search_data.get("uploader_url", "") or _search_data.get("channel_url", "")
+                        _norm = lambda s: re.sub(r'[\s\-_\.]+', '', s).lower()
+                        _ch_match = False
+                        if _found_url and ch_url:
+                            # Primary: compare channel URLs (handles renamed channels)
+                            _ch_match = _found_url.rstrip('/').lower() == ch_url.rstrip('/').lower()
+                        if not _ch_match and _found_channel:
+                            # Fallback: compare normalized channel names
+                            _ch_match = _norm(_found_channel) == _norm(ch_name)
+                        if _found_id and _ch_match:
+                            if _found_id in _known_vids:
+                                log(f"    Skipped (ID already belongs to another video)\n", "dim")
+                            else:
+                                _known_vids.add(_found_id)
+                                _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))
+                                _search_found += 1
+                                _no_id_count -= 1
+                                # Backfill into videos table
+                                if _s_filepath:
+                                    try:
+                                        tp._db_execute(
+                                            "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                            (_found_id, _s_filepath))
+                                    except Exception:
+                                        pass
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+                if '_search_proc' in dir() and _search_proc:
+                    try:
+                        _search_proc.kill()
+                        cleanup_process(_search_proc)
+                    except Exception:
+                        pass
+        if _search_found:
+            log(f"  Found {_search_found} video ID(s) via YouTube search.\n", "dim")
+            try:
+                tp._db_commit()
+            except Exception:
+                pass
+
     if _resolved_rows:
         try:
             tp._db_commit()
@@ -11422,20 +11534,41 @@ def _run_metadata_download(item):
         log(f"Metadata: {scope_label} — no videos with video IDs found.\n", "simpleline")
         return
     _meta_t0 = time.time()
-    done = 0
     skipped = 0
     errors = 0
 
     refreshed = 0
     _mode_label = "Refreshing" if refresh else "Metadata"
-    log(f"{_mode_label}: {scope_label} — {total} videos to process.\n", "simpleline")
+
+    # Pre-count how many actually need fetching so the [X/Y] counter is accurate
+    _to_fetch = []
+    for meta_path, group in folder_groups.items():
+        existing = tp._read_metadata_jsonl(meta_path)
+        group["_existing"] = existing  # cache for reuse below
+        for vid_id, title, v_year, v_month, filepath in group["videos"]:
+            if vid_id in existing and not refresh:
+                skipped += 1
+            else:
+                _to_fetch.append((meta_path, vid_id, title, v_year, v_month, filepath))
+
+    _fetch_total = len(_to_fetch)
+    if _fetch_total == 0 and skipped > 0:
+        log(f"{_mode_label}: {scope_label} — all {skipped} videos already have metadata.\n", "simpleline")
+        return
+    if skipped:
+        log(f"{_mode_label}: {scope_label} — {_fetch_total} to fetch ({skipped} already done).\n", "simpleline")
+    else:
+        log(f"{_mode_label}: {scope_label} — {_fetch_total} videos to process.\n", "simpleline")
+
+    _fetch_done = 0
+    _changed_paths = set()
 
     for meta_path, group in folder_groups.items():
         if cancel_event.is_set():
             log(f"{_mode_label}: cancelled.\n", "simpleline")
             return
         subfolder = group["subfolder"]
-        existing = tp._read_metadata_jsonl(meta_path)
+        existing = group["_existing"]
 
         thumb_dir = os.path.join(subfolder, ".Thumbnails")
         os.makedirs(thumb_dir, exist_ok=True)
@@ -11465,14 +11598,13 @@ def _run_metadata_download(item):
                     log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
 
             if vid_id in existing and not refresh:
-                skipped += 1
-                done += 1
                 continue
 
+            _fetch_done += 1
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
             _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY - len(_prefix) - 3)
-            log(f"[{done + 1}/{total}] {_prefix} - {_trunc}\n", "simpleline")
+            log(f"[{_fetch_done}/{_fetch_total}] {_prefix} - {_trunc}\n", "simpleline")
 
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:
@@ -11497,10 +11629,10 @@ def _run_metadata_download(item):
             else:
                 errors += 1
 
-            done += 1
-
         if changed:
             tp._write_metadata_jsonl(meta_path, existing)
+
+    done = _fetch_done + skipped
 
     _parts = [f"{done} processed"]
     if refreshed:
@@ -11513,6 +11645,21 @@ def _run_metadata_download(item):
     _meta_elapsed = time.time() - _meta_t0
     _new_count = done - skipped - errors
     _record_metadata(ch_name, _new_count, refreshed, skipped, errors, _meta_elapsed)
+
+    # Invalidate grid cache for this channel so thumbnails refresh on next view
+    if tp and (_new_count > 0 or refreshed > 0):
+        def _invalidate():
+            try:
+                _stale = [k for k in tp._grid_cache if k[0] == ch_name]
+                for k in _stale:
+                    del tp._grid_cache[k]
+                # If currently viewing this channel, force a reload
+                if tp._grid_visible and tp._grid_scope and tp._grid_scope[0] == ch_name:
+                    tp._grid_scope = None  # force _show_grid to reload
+                    tp._show_grid(ch_name, year, month)
+            except Exception:
+                pass
+        tp.after(0, _invalidate)
 
 
 def _has_pending_redownload(ch_url):
@@ -20819,7 +20966,7 @@ class _TranscriptionPanel(ttk.Frame):
         # Configure all log tags (must match subs/recent mini logs)
         for _tn, _tc in [("green", {"foreground": "#3dd68c"}),
                           ("red", {"foreground": "#ff6b6b"}),
-                          ("header", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
+                          ("header", {"foreground": "#a0aabb", "font": ("Consolas", 9, "bold")}),
                           ("summary", {"foreground": "#999", "font": ("Consolas", 9, "italic")}),
                           ("simpleline", {"foreground": self._TP_FG}),
                           ("simpleline_green", {"foreground": "#3dd68c"}),
@@ -22083,7 +22230,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground="#4a4f5a", relief="flat", bd=1)
+                       disabledforeground="#666b75", relief="flat", bd=1)
 
         if meta["type"] == "title":
             # Title-level context menu
@@ -22380,10 +22527,21 @@ class _TranscriptionPanel(ttk.Frame):
         refresh = False
         has_existing = False
         try:
-            meta_path, _ = self._get_metadata_jsonl_path(
-                ch_name, folder_path, sy, sm, year=year, month=month)
-            existing = self._read_metadata_jsonl(meta_path)
-            has_existing = bool(existing)
+            if sy and year is None:
+                # Split channel at root — check if any per-year metadata exists
+                for _yd in os.listdir(folder_path):
+                    _yp = os.path.join(folder_path, _yd)
+                    if os.path.isdir(_yp) and _yd.isdigit():
+                        _mp, _ = self._get_metadata_jsonl_path(
+                            ch_name, folder_path, sy, sm, year=int(_yd), month=None)
+                        if os.path.isfile(_mp):
+                            has_existing = True
+                            break
+            else:
+                meta_path, _ = self._get_metadata_jsonl_path(
+                    ch_name, folder_path, sy, sm, year=year, month=month)
+                existing = self._read_metadata_jsonl(meta_path)
+                has_existing = bool(existing)
         except Exception:
             pass
 
@@ -22951,6 +23109,26 @@ class _TranscriptionPanel(ttk.Frame):
             if not v["video_id"] and v["title"] in _meta_title_to_id:
                 v["video_id"] = _meta_title_to_id[v["title"]]
 
+        # Fallback: resolve remaining missing video_ids from segments table
+        # (handles renamed videos where metadata title no longer matches filename)
+        _missing_id = [v for v in videos if not v["video_id"]]
+        if _missing_id:
+            _seg_id_map = {}
+            try:
+                for _st, _sv in self._db_execute(
+                        "SELECT DISTINCT title, video_id FROM segments "
+                        "WHERE channel=? AND video_id != ''",
+                        (channel,)).fetchall():
+                    if _sv:
+                        _seg_id_map[_st] = _sv
+            except Exception:
+                pass
+            if _seg_id_map:
+                for v in _missing_id:
+                    _sid = _seg_id_map.get(v["title"])
+                    if _sid:
+                        v["video_id"] = _sid
+
         # Enrich videos with metadata
         for v in videos:
             m = metadata.get(v["video_id"]) if v["video_id"] else None
@@ -22974,6 +23152,18 @@ class _TranscriptionPanel(ttk.Frame):
                     v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
                 except OSError:
                     pass
+
+        # Deduplicate: if multiple videos share the same video_id, keep the first
+        _seen_vids = set()
+        _deduped = []
+        for v in videos:
+            vid = v["video_id"]
+            if vid:
+                if vid in _seen_vids:
+                    continue
+                _seen_vids.add(vid)
+            _deduped.append(v)
+        videos = _deduped
 
         self.after(0, lambda: self._grid_loading_progress.config(
             text=f"Scanning thumbnails..."))
@@ -23457,7 +23647,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground="#4a4f5a", relief="flat", bd=1)
+                       disabledforeground="#666b75", relief="flat", bd=1)
 
         if video_path:
             menu.add_command(label="  \u25b6  Play Video",

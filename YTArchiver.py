@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.0"
+APP_VERSION = "v33.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3773,7 +3773,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 11:25pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.04.26 12:16am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20623,6 +20623,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._scan_running = True
         roots = self._get_archive_roots()
         if not roots:
+            self._scan_running = False
             return
 
         # Build list of channel folders to scan (from config only)
@@ -20641,6 +20642,7 @@ class _TranscriptionPanel(ttk.Frame):
                     channel_dirs.append((ch_name, ch_path, root_dir))
 
         if not channel_dirs:
+            self._scan_running = False
             return
 
         # UI feedback
@@ -23096,7 +23098,13 @@ class _TranscriptionPanel(ttk.Frame):
             if proc.returncode != 0:
                 return None
 
-            data = json.loads(stdout)
+            # Extract only the JSON object from stdout — yt-dlp may emit
+            # non-JSON text (update notices, warnings) before the JSON dump.
+            _json_start = stdout.find('{')
+            _json_end = stdout.rfind('}')
+            if _json_start < 0 or _json_end <= _json_start:
+                return None
+            data = json.loads(stdout[_json_start:_json_end + 1])
 
             # Extract top 50 comments (no replies)
             comments = []
@@ -26702,7 +26710,7 @@ class _TranscriptionPanel(ttk.Frame):
         year = key // 100 if self._freq_by_month else key
         self._s_year_from_var.set(str(year))
         self._s_year_to_var.set(str(year))
-        self._search_var.set(", ".join(self._freq_words))
+        self._search_var.set(" ".join(self._freq_words))
         self._show_section("search")
         self._do_search()
 

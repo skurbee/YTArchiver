@@ -28,6 +28,7 @@ import bisect
 import csv
 import random
 import webbrowser as _webbrowser
+import atexit
 from pathlib import Path
 
 try:
@@ -83,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v32.8"
+APP_VERSION = "v32.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -171,6 +172,7 @@ _COMPRESS_PRESETS = {
 _QUALITY_OPTIONS = ["Generous", "Average", "Below Average"]
 _LEVEL_MIGRATION = {"Low": "Generous", "High": "Average", "Extreme": "Below Average"}
 _FFMPEG_TIME_RE = re.compile(r'time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})')
+_DOT_CHARS = (".", "..", "...")
 
 def _get_compress_bitrate(quality, output_res):
     """Get MB/hr for a quality level at a given output resolution."""
@@ -194,6 +196,9 @@ new_download_count = 0
 _new_dl_count_lock = threading.Lock()
 cancel_event = threading.Event()
 pause_event = threading.Event()
+# Note: these bare-bool flags (_sync_running, _reorg_running, _redownload_running, etc.)
+# are intentionally NOT protected by locks.  CPython's GIL guarantees that bool/int
+# assignment is atomic, making these safe for cross-thread read/write on CPython.
 _autorun_active = False
 _sync_running = False
 _last_sync_job = {"id": None}
@@ -212,7 +217,7 @@ _reorg_queue = []  # list of (channel_name, folder_path, target_years, target_mo
 _reorg_queue_lock = threading.Lock()
 _current_job = {"label": None, "url": None}  # currently processing job label + channel URL for queue display
 _current_sync_ch = None  # full channel dict of the currently syncing channel (for persistence on close)
-_last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts from last internal_run_cmd_blocking
+_last_run_counts = {"dl": 0, "skip": 0, "dur": 0, "err": 0}  # per-run counts — written at end of internal_run_cmd_blocking, read by same worker thread after return (sequential, not concurrent)
 _queue_items_removed = False  # tracks if user removed items from sync queue during a manual sync
 _transcribe_running = False
 _transcribe_sync_controlled = False  # True when current transcription responds to pause_event/cancel_event (not GPU-driven)
@@ -248,7 +253,7 @@ _skip_current_gpu = threading.Event()  # same, for GPU Tasks
 _ffmpeg_lock = threading.Lock()  # protects _ffmpeg_proc and _gpu_actively_encoding
 _whisper_lock = threading.Lock()  # protects _whisper_proc and _whisper_line_queue
 _tray_spin_lock = threading.Lock()  # protects _tray_spin_starting flag
-_punct_lock = threading.RLock()  # protects _punct_proc start/stop/access (reentrant for nested calls)
+_punct_lock = threading.RLock()  # MUST be RLock: _punctuate_text holds this lock and calls _stop_punct_process which also acquires it
 _session_totals_lock = threading.Lock()  # protects session_totals reset
 _mini_log_last_end = [None]
 def _sync_mini_logs_from_main(): pass  # stub until real definition later
@@ -259,6 +264,7 @@ _tp_panel_ref = [None]
 # ---------------------------------------------------------------------------
 _internet_down = threading.Event()           # SET when internet is confirmed down (2 consecutive failures)
 _internet_monitor_running = False            # prevents duplicate monitor threads
+_internet_monitor_lock = threading.Lock()   # protects _internet_monitor_running check-then-set
 _internet_went_down_during = threading.Event()  # "dirty flag" — set on any outage, cleared before ops that need a clean run (e.g. playlist fetches)
 
 # ---------------------------------------------------------------------------
@@ -454,7 +460,7 @@ def _trunc_pad_title(s, width):
         cols += cw
         cut = i + 1
     truncated = s[:cut] + '...'
-    return truncated + ' ' * (width - cols - 3)
+    return truncated + ' ' * max(0, width - cols - 3)
 
 
 def _flush_ui_queue():
@@ -643,7 +649,7 @@ def log(text, tag=None):
                             if _wp_ins != tk.END:
                                 _wp_ins = log_box.index(f"{_wp_ins} + {len(_suffix)}c")
                         # Animated dots
-                        _dot_chars = [".", "..", "..."]
+                        _dot_chars = _DOT_CHARS
                         _whisper_dots["base_before"] = _before
                         _whisper_dots["pct_str"] = _pct_str
                         _whisper_dots["suffix"] = _suffix
@@ -1070,7 +1076,7 @@ def _whisper_dot_tick():
     if not _whisper_dots["active"]:
         return
     _whisper_dots["idx"] = (_whisper_dots["idx"] + 1) % 3
-    _dot_chars = [".", "..", "..."]
+    _dot_chars = _DOT_CHARS
     try:
         if 'log_box' in globals() and log_box.winfo_exists():
             log_box.config(state="normal")
@@ -1515,7 +1521,7 @@ def _update_encode_progress(text):
                     _after_raw = text[_ep_match.end():]
                     # Strip trailing dots/newline — we animate those separately
                     _suffix = _after_raw.rstrip(".\n ").rstrip()
-                    _dot_chars = [".", "..", "..."]
+                    _dot_chars = _DOT_CHARS
                     _d = _dot_chars[_encode_dots["idx"] % 3]
                     # Insert the whole _before as ONE encode_progress range (blue),
                     # then overlay white tags for "[N/M] " (prefix) and ": title" (title).
@@ -1559,7 +1565,7 @@ def _update_encode_progress(text):
                     # No percentage (unknown duration or loading state) — show with animation.
                     # Insert as ONE encode_progress range; overlay white tags for prefix and title.
                     _stripped = text.rstrip(".\n ").rstrip()
-                    _dot_chars = [".", "..", "..."]
+                    _dot_chars = _DOT_CHARS
                     _d = _dot_chars[_encode_dots["idx"] % 3]
                     _ins = _enc_pos
                     _enc_i2 = _stripped.find("ENCODING")
@@ -1613,7 +1619,7 @@ def _encode_dot_tick():
     if not _encode_dots["active"]:
         return
     _encode_dots["idx"] = (_encode_dots["idx"] + 1) % 3
-    _dot_chars = [".", "..", "..."]
+    _dot_chars = _DOT_CHARS
     def _tick():
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
@@ -1888,7 +1894,7 @@ def _is_partial_file(name):
     if low.endswith('.part') or low.endswith('.temp') or low.endswith('.ytdl'):
         return True
     # Double-extension partials like .mp4.part, .webm.part
-    if '.part' in low:
+    if '.part.' in low or low.endswith('.part'):
         return True
     # Mid-download temp files like .temp.mp4, .temp.webm
     if '.temp.' in low:
@@ -2003,6 +2009,7 @@ def spawn_yt_dlp(cmd):
         _env = _YT_DLP_ENV
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8",
@@ -2202,39 +2209,49 @@ def _handle_disk_error():
 
 
 def _disk_retry_check():
-    """Periodic retry: test if the output directory is writable again."""
+    """Periodic retry: test if the output directory is writable again.
+    Runs the actual disk I/O on a background thread to avoid freezing the UI."""
     global _disk_error_active, _disk_retry_job
 
     if not _disk_error_active:
         return
 
     path = _disk_error_path or (config.get("output_dir", "").strip() or BASE_DIR)
-    if check_directory_writable(path):
-        # Drive is back — clean up any errored recent entries, then resume
-        with _disk_error_lock:
-            _disk_error_active = False
-        _disk_retry_job = None
 
-        log("\n" + "█" * 65 + "\n", "simpleline_green")
-        log("█  ✓ Disk is writable again — resuming all tasks.\n", "simpleline_green")
-        log("█" * 65 + "\n\n", "simpleline_green")
+    def _check_and_resume():
+        writable = check_directory_writable(path)
 
-        _cleanup_disk_error_entries()
+        def _apply_result():
+            global _disk_error_active, _disk_retry_job
+            if not _disk_error_active:
+                return
+            if writable:
+                with _disk_error_lock:
+                    _disk_error_active = False
+                _disk_retry_job = None
 
-        # Resume sync-pipeline tasks
-        if pause_event.is_set():
-            pause_event.clear()
-        # Resume GPU tasks
-        if _gpu_pause.is_set():
-            _gpu_pause.clear()
-    else:
-        # Still unwritable — log and schedule another retry
-        log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_MINUTES} minutes...\n", "red")
-        try:
-            if root.winfo_exists():
-                _disk_retry_job = root.after(_DISK_RETRY_MINUTES * 60_000, _disk_retry_check)
-        except Exception:
-            pass
+                log("\n" + "█" * 65 + "\n", "simpleline_green")
+                log("█  ✓ Disk is writable again — resuming all tasks.\n", "simpleline_green")
+                log("█" * 65 + "\n\n", "simpleline_green")
+
+                _cleanup_disk_error_entries()
+
+                if pause_event.is_set():
+                    pause_event.clear()
+                if _gpu_pause.is_set():
+                    _gpu_pause.clear()
+            else:
+                log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_MINUTES} minutes...\n", "red")
+                try:
+                    if _root_alive:
+                        _disk_retry_job = root.after(_DISK_RETRY_MINUTES * 60_000, _disk_retry_check)
+                except Exception:
+                    pass
+
+        if _root_alive:
+            _ui_queue.append(_apply_result)
+
+    threading.Thread(target=_check_and_resume, daemon=True).start()
 
 
 def _cleanup_disk_error_entries():
@@ -2304,7 +2321,7 @@ def _remove_ids_from_archive(ids_to_remove):
                     continue  # Skip this line (remove it)
                 new_lines.append(line)
             # Sanity check: if we'd remove more than half the archive, something is wrong
-            if lines and len(new_lines) < len(lines) * 0.5 and len(remove_set) < len(lines) * 0.5:
+            if lines and len(new_lines) < len(lines) * 0.5:
                 log(f"  ⚠ Archive sanity check failed: would remove {len(lines) - len(new_lines)}/{len(lines)} lines. Aborting.\n", "red")
                 return
             # Atomic write: write to temp file then replace, so a crash mid-write
@@ -2353,6 +2370,7 @@ def detect_url_type(url):
 
 
 def build_format_string(resolution):
+    resolution = str(resolution).lower().strip()
     # Audio-only mode: prefer m4a (AAC) then best audio, no video stream
     if resolution == "audio":
         return "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
@@ -2537,7 +2555,7 @@ def save_config(cfg):
                     pass
                 return False
 
-    def _do_save():
+    def _do_save(_retries=0):
         global _save_config_thread_running, _save_config_pending
         try:
             _write_snapshot(cfg_snapshot)
@@ -2549,14 +2567,20 @@ def save_config(cfg):
                 if pending is None:
                     break
                 _write_snapshot(pending)
+        except Exception:
+            if _retries < 5:
+                time.sleep(0.5 * (_retries + 1))  # backoff: 0.5s, 1s, 1.5s, 2s, 2.5s
+            else:
+                print("[CONFIG] save_config failed after 5 retries, giving up", file=sys.stderr)
+                traceback.print_exc()
         finally:
             with _save_config_lock:
                 _save_config_thread_running = False
                 # Check one final time in case a save arrived between the
                 # while-loop exit and the lock acquisition above.
-                if _save_config_pending is not None:
+                if _save_config_pending is not None and _retries < 5:
                     _save_config_thread_running = True
-                    threading.Thread(target=_do_save, daemon=True).start()
+                    threading.Thread(target=lambda: _do_save(_retries + 1), daemon=True).start()
 
     with _save_config_lock:
         if _save_config_thread_running:
@@ -2599,6 +2623,8 @@ def _save_disk_cache():
             _tmp = DISK_CACHE_FILE + ".tmp"
             with open(_tmp, "w", encoding="utf-8") as _f:
                 json.dump(_snapshot, _f, indent=2)
+                _f.flush()
+                os.fsync(_f.fileno())
             os.replace(_tmp, DISK_CACHE_FILE)
         except (OSError, PermissionError) as _e:
             try:
@@ -2765,9 +2791,11 @@ def _rescan_all_disk_sizes():
             channels = list(config.get("channels", []))
         with _disk_cache_lock:
             _disk_cache.clear()
-        _save_disk_cache()
+        # Don't persist the empty cache — if app crashes during rebuild, the
+        # next startup would have to do a full scan. Only save after rebuilding.
         for _ch in channels:
             _update_disk_cache_for_channel(_ch)
+        _save_disk_cache()  # persist the rebuilt cache
         if _root_alive:
             _ui_queue.append(refresh_channel_dropdowns)
     threading.Thread(target=_worker, daemon=True).start()
@@ -3221,9 +3249,10 @@ def _setup_tray_icon():
         # Load the base icon
         _ico_path = os.path.join(RESOURCE_PATH, "icon.ico")
         if os.path.exists(_ico_path):
-            _tray_base_img = Image.open(_ico_path)
+            _tray_img = Image.open(_ico_path)
+            _tray_img.load()  # force read into memory so the file handle is released
             # Ensure a reasonable size for tray (typically 64x64 works well)
-            _tray_base_img = _tray_base_img.resize((64, 64), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
+            _tray_base_img = _tray_img.resize((64, 64), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.BICUBIC)
         else:
             # Fallback: create a simple colored icon
             _tray_base_img = Image.new("RGBA", (64, 64), (30, 30, 35, 255))
@@ -3725,7 +3754,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 3:54pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.03.26 7:17pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4046,7 +4075,7 @@ autorun_history_text.bind("<Configure>", _on_hist_configure)
 
 # Auto-hide scrollbar helper: only show scrollbar when content overflows
 
-_auto_scrollbar_job = {"id": None}
+_auto_scrollbar_jobs = {}  # keyed by scrollbar widget id to avoid cross-widget interference
 
 
 def _auto_scrollbar(scrollbar, first, last):
@@ -4054,14 +4083,16 @@ def _auto_scrollbar(scrollbar, first, last):
         scrollbar.set(first, last)
         return
     scrollbar.set(first, last)
+    _sb_key = id(scrollbar)
     # Debounce the show/hide toggle to avoid thrashing during rapid log output
-    if _auto_scrollbar_job["id"] is not None:
+    _old_job = _auto_scrollbar_jobs.get(_sb_key)
+    if _old_job is not None:
         try:
-            root.after_cancel(_auto_scrollbar_job["id"])
+            root.after_cancel(_old_job)
         except Exception:
             pass
     def _apply():
-        _auto_scrollbar_job["id"] = None
+        _auto_scrollbar_jobs.pop(_sb_key, None)
         try:
             f, l = scrollbar.get()
             if f <= 0.0 and l >= 1.0:
@@ -4070,7 +4101,7 @@ def _auto_scrollbar(scrollbar, first, last):
                 scrollbar.grid()
         except Exception:
             pass
-    _auto_scrollbar_job["id"] = root.after(150, _apply)
+    _auto_scrollbar_jobs[_sb_key] = root.after(150, _apply)
 
 # Main log frame added SECOND (bottom) — weight=1 keeps it compact initially
 log_frame = ttk.Frame(log_paned)
@@ -4713,6 +4744,9 @@ def refresh_channel_dropdowns():
     # Batch lock acquisitions outside the per-channel loop to avoid O(N) lock overhead
     with _gpu_queue_lock:
         _gpu_queued_urls = {q.get("ch_url") for q in _gpu_queue if q["type"] in ("transcribe", "mt")}
+        _snap_gpu_running = _gpu_running
+        _snap_gpu_current = dict(_gpu_current)
+        _snap_gpu_current_item = _gpu_current_item
     with _transcribe_queue_lock:
         _tq_urls = {q[1] for q in _transcribe_queue}
     with _disk_cache_lock:
@@ -4761,8 +4795,8 @@ def refresh_channel_dropdowns():
         _is_queued_t = ch_url_t in _gpu_queued_urls
         _is_running_t = False
         # Check GPU Tasks queue (already batched above)
-        if _gpu_running and _gpu_current.get("ch_url") == ch_url_t:
-            _cur_item = _gpu_current_item
+        if _snap_gpu_running and _snap_gpu_current.get("ch_url") == ch_url_t:
+            _cur_item = _snap_gpu_current_item
             if _cur_item and _cur_item.get("type") in ("transcribe", "mt"):
                 _is_running_t = True
         # Check standalone transcription (non-GPU path) — skip during sync/reorg/redownload
@@ -5605,8 +5639,8 @@ def add_channel():
     url = _real_get(_new_url_entry).strip()
     if not name or not url: return
 
-    dur_val = _parse_duration(new_dur_var.get()) * 60
-    maxdur_val = _parse_duration(new_maxdur_var.get()) * 60
+    dur_val = (_parse_duration(new_dur_var.get()) or 0) * 60
+    maxdur_val = (_parse_duration(new_maxdur_var.get()) or 0) * 60
 
     mode = new_mode_var.get()
     date_after = ""
@@ -5752,11 +5786,15 @@ def add_channel():
             _bl_folder = os.path.join(_bl_base, sanitize_folder(name))
             if os.path.isdir(_bl_folder):
                 # Count videos in a background thread to avoid blocking the main thread
+                try:
+                    _batch_val = int(new_compress_batch_val or "20")
+                except (ValueError, TypeError):
+                    _batch_val = 20
                 _bl_snap = {
                     "folder": _bl_folder, "name": name, "url": url,
                     "res": _ch_resolution_snap, "c_level": _new_c_level,
                     "c_res": _new_c_res, "years": new_years, "months": new_months,
-                    "batch": int(new_compress_batch_val or "20"),
+                    "batch": _batch_val,
                 }
                 def _count_and_ask(_snap=_bl_snap):
                     _vid_exts = _VIDEO_EXTS
@@ -6637,7 +6675,7 @@ def remove_channel():
                 channel_ids = set()
                 for line in proc.stdout:
                     line = line.strip()
-                    if re.fullmatch(r'[\w-]{11}', line):
+                    if re.fullmatch(r'[A-Za-z0-9_-]{11}', line):
                         channel_ids.add(line)
                 try:
                     proc.wait(timeout=300)
@@ -6747,7 +6785,8 @@ def remove_channel():
     if os.path.isdir(_ch_folder_path):
         try:
             # Use cached disk size if available (avoid blocking UI with os.walk)
-            _cached = _disk_cache.get(removed_url, {})
+            with _disk_cache_lock:
+                _cached = _disk_cache.get(removed_url, {})
             _total_bytes = _cached.get("size_bytes", 0)
             if _total_bytes:
                 _size_disp = _fmt_size(str(_total_bytes))
@@ -6762,11 +6801,14 @@ def remove_channel():
             f"{_ch_folder_path}\n\n"
             f"({_size_disp})"
         ):
-            try:
-                shutil.rmtree(_ch_folder_path)
-                log(f"  ✓ Deleted folder: {_ch_folder_path}\n", "green")
-            except Exception as e:
-                log(f"ERROR: Could not delete folder: {e}\n", "red")
+            log(f"  Deleting folder: {_ch_folder_path}...\n", "dim")
+            def _bg_rmtree(_path=_ch_folder_path):
+                try:
+                    shutil.rmtree(_path)
+                    log(f"  ✓ Deleted folder: {_path}\n", "green")
+                except Exception as e:
+                    log(f"ERROR: Could not delete folder: {e}\n", "red")
+            threading.Thread(target=_bg_rmtree, daemon=True).start()
 
 
 split_row = ttk.Frame(add_outer, style="Raised.TFrame")
@@ -7876,8 +7918,8 @@ def _write_jsonl_entry(jsonl_path, video_id, title, segments):
                 pass  # best-effort repair; don't block the write
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.writelines(new_lines)
-            f.flush()
-            os.fsync(f.fileno())
+            # No per-video fsync: called thousands of times during batch transcription
+            # and decimates HDD performance. OS page cache flushes within seconds.
         _hide_file_win(jsonl_path)
     except Exception as _jsonl_err:
         try:
@@ -7993,6 +8035,18 @@ _whisper_last_failed = False  # True when last whisper call was a stall/crash (n
 _whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
 _whisper_model_lock = threading.Lock()  # protects _whisper_model_choice during re-transcription
 _ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
+
+
+def _atexit_kill_subprocesses():
+    """Kill GPU-bound subprocesses on crash/exit to prevent orphaned processes consuming GPU memory."""
+    for _p in (_whisper_proc, _punct_proc, _ffmpeg_proc):
+        if _p is not None:
+            try:
+                _p.kill()
+            except Exception:
+                pass
+
+atexit.register(_atexit_kill_subprocesses)
 
 # Whisper helper script — runs under Python 3.11 with CUDA, stays alive accepting JSON requests
 # Uses faster-whisper (CTranslate2 backend) for ~4x speedup + built-in VAD to prevent hallucination loops
@@ -9010,9 +9064,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                 ch_url
             ]
             _enum_proc = subprocess.Popen(
-                enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, startupinfo=startupinfo
+                enum_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, startupinfo=startupinfo
             )
+            with proc_lock:
+                active_processes.append(_enum_proc)
             # Read both streams via background threads — yt-dlp buffers all --print
             # output until the entire playlist is enumerated, so stderr page progress
             # is the only real-time signal.
@@ -9075,6 +9131,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                 _enum_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 _enum_proc.kill()
+            cleanup_process(_enum_proc)
             log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
         except Exception as e:
             log(f"  ⚠ Could not fetch YouTube list: {e}\n", "red")
@@ -9694,7 +9751,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     vid_id, yt_title = line.split("|||", 1)
                     vid_id = vid_id.strip()
                     yt_title = yt_title.strip()
-                    if re.fullmatch(r'[\w-]{11}', vid_id):  # YouTube IDs are exactly 11 chars
+                    if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid_id):  # YouTube IDs are exactly 11 chars
                         result[yt_title] = vid_id
                 else:
                     # Check for page progress from verbose stderr (merged into stdout)
@@ -10287,10 +10344,6 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
             _gpu_actively_encoding = True
         try:
             log(f"{_wp}Transcribing{_title_part}, 0%...\n", "whisper_progress")
-            request = json.dumps({"path": audio_path, "duration": duration})
-            with _whisper_lock:
-                _whisper_proc.stdin.write(request + "\n")
-                _whisper_proc.stdin.flush()
 
             # Use the module-level reader thread + queue (started in _start_whisper_process).
             if _whisper_line_queue is None:
@@ -10299,7 +10352,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 _stop_whisper_process()
                 return None, []
 
-            # Drain any stale data left over from a previous call
+            # Drain any stale data left over from a previous call BEFORE sending
+            # the new request — draining after send risks consuming the valid response
             _stale = 0
             while True:
                 try:
@@ -10309,6 +10363,11 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                     break
             if _stale:
                 log(f"  ⚠ Drained {_stale} stale message(s) from previous Whisper call.\n", "red")
+
+            request = json.dumps({"path": audio_path, "duration": duration})
+            with _whisper_lock:
+                _whisper_proc.stdin.write(request + "\n")
+                _whisper_proc.stdin.flush()
 
             # Read responses — may be progress updates before the final result
             while True:
@@ -10517,9 +10576,10 @@ def _start_internet_monitor():
     are active.
     """
     global _internet_monitor_running
-    if _internet_monitor_running:
-        return  # already running
-    _internet_monitor_running = True  # set before thread start to close race window
+    with _internet_monitor_lock:
+        if _internet_monitor_running:
+            return  # already running
+        _internet_monitor_running = True
 
     def _monitor_loop():
         global _internet_monitor_running
@@ -10553,7 +10613,8 @@ def _start_internet_monitor():
 
                 time.sleep(5)
         finally:
-            _internet_monitor_running = False
+            with _internet_monitor_lock:
+                _internet_monitor_running = False
             # Ensure we leave in a clean state if exiting while still flagged down
             # (e.g. user cancelled everything while offline)
             _internet_down.clear()
@@ -11446,7 +11507,7 @@ def _run_metadata_download(item):
                                     _jtitle = _jd.get("title", "")
                                     if _jvid and _jtitle and _jtitle not in _seg_id_map:
                                         _seg_id_map[_jtitle] = _jvid
-                                except (json.JSONDecodeError, Exception):
+                                except Exception:
                                     continue
             except (OSError, PermissionError):
                 continue
@@ -11961,7 +12022,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _vid_id, _yt_title = _line.split("|||", 1)
                             _vid_id = _vid_id.strip()
                             _yt_title = _yt_title.strip()
-                            if re.fullmatch(r'[\w-]{11}', _vid_id):
+                            if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
                                 _result[_yt_title] = _vid_id
                     return _result
                 except Exception as _e:
@@ -12069,8 +12130,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             break  # cancelled
                         try:
                             _, _bf_segs, _ = _fetch_auto_captions(_bf_vid, _bf_temp)
-                        except Exception:
-                            pass
+                        except Exception as _bf_err:
+                            log(f"    ⚠ Caption fetch error: {_bf_err}\n", "dim")
+
+                        # If internet dropped during the fetch, skip this video
+                        # rather than permanently marking it as "no captions"
+                        if _internet_down.is_set():
+                            log(f"    ⚠ Internet down — skipping (will retry next run)\n", "dim")
+                            continue
 
                         # Fallback: if no YouTube captions, Whisper the local file
                         if not _bf_segs:
@@ -12302,8 +12369,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # a restart mid-Phase A can skip re-checking files already identified.
             if unmatched:
                 try:
-                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                    _tmp_path = _whisper_cache_path + ".tmp"
+                    with open(_tmp_path, "w", encoding="utf-8") as _wf:
                         json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                    os.replace(_tmp_path, _whisper_cache_path)
                 except Exception:
                     pass
 
@@ -12439,8 +12508,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         total += 1
                         # Update cache immediately so a restart skips this file in Phase A
                         try:
-                            with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                            _tmp_path = _whisper_cache_path + ".tmp"
+                            with open(_tmp_path, "w", encoding="utf-8") as _wf:
                                 json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                            os.replace(_tmp_path, _whisper_cache_path)
                         except Exception:
                             pass
                         continue
@@ -12544,7 +12615,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     log(f"  [{idx}/{total}] {fname}{_vid_dur_str} — done ({_src_part} {_ve_str}{_rt_str})\n", "simpleline_blue")
 
             # Cleanup prefetch executor
-            _prefetch_executor.shutdown(wait=False)
+            _prefetch_executor.shutdown(wait=True)
 
             # ── captions_only mode: finish up and optionally queue GPU task for Whisper ──
             if captions_only:
@@ -12578,8 +12649,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Phase A caption re-check (cache is loaded at the top of this function).
                 if unmatched:
                     try:
-                        with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                        _tmp_path = _whisper_cache_path + ".tmp"
+                        with open(_tmp_path, "w", encoding="utf-8") as _wf:
                             json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                        os.replace(_tmp_path, _whisper_cache_path)
                     except Exception:
                         pass
                 return  # skip Phase B
@@ -12589,8 +12662,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # Phase B without repeating the entire Phase A caption scan.
             if unmatched:
                 try:
-                    with open(_whisper_cache_path, "w", encoding="utf-8") as _wf:
+                    _tmp_path = _whisper_cache_path + ".tmp"
+                    with open(_tmp_path, "w", encoding="utf-8") as _wf:
                         json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
+                    os.replace(_tmp_path, _whisper_cache_path)
                 except Exception:
                     pass
 
@@ -13949,7 +14024,7 @@ def _validate_add_btn():
                         cur_date = (y + mo + dy) if (y or mo or dy) else ""
                         parsed = _parse_date_input(cur_date) or ""
 
-                        dur_val = _parse_duration(new_dur_var.get()) * 60
+                        dur_val = (_parse_duration(new_dur_var.get()) or 0) * 60
 
                         mx_val = _parse_duration(new_maxdur_var.get())
                         mx_str = str(mx_val) if mx_val else ""
@@ -14304,7 +14379,7 @@ def internal_run_subscribe_before_date(url, date_str):
 
             line = line.strip()
             parts = line.split("|||", 2)
-            if len(parts) == 3 and re.fullmatch(r'[\w-]{11}', parts[0]):
+            if len(parts) == 3 and re.fullmatch(r'[A-Za-z0-9_-]{11}', parts[0]):
                 vid_id, upload_date, title = parts
                 first_result.set()
                 checked += 1
@@ -14612,7 +14687,7 @@ def _enumerate_all_video_ids(url):
             if not line:
                 continue
             # 11-char alphanumeric+dash = video ID
-            if re.fullmatch(r'[\w-]{11}', line):
+            if re.fullmatch(r'[A-Za-z0-9_-]{11}', line):
                 ids.append(line)
                 _enum_count += 1
                 # Update simple mode animation with actual count
@@ -14723,7 +14798,7 @@ def _check_new_videos(url, cached_ids, check_count=100):
             if not line:
                 continue
             # Only process 11-char video IDs, skip yt-dlp progress lines
-            if re.fullmatch(r'[\w-]{11}', line):
+            if re.fullmatch(r'[A-Za-z0-9_-]{11}', line):
                 if line in cached_set:
                     break  # Hit a known ID — everything after is already cached
                 new_ids.append(line)
@@ -14816,7 +14891,7 @@ def _quick_check_new_uploads(url, check_count=5):
             if not line:
                 break
             line = line.strip()
-            if re.fullmatch(r'[\w-]{11}', line):
+            if re.fullmatch(r'[A-Za-z0-9_-]{11}', line):
                 ids.append(line)
         try:
             proc.wait(timeout=30)
@@ -14928,7 +15003,7 @@ def internal_run_subscribe_blocking(url):
                 break
 
             line = line.strip()
-            if re.fullmatch(r'[\w-]{11}', line):
+            if re.fullmatch(r'[A-Za-z0-9_-]{11}', line):
                 ids.append(line)
         try:
             proc.wait(timeout=30)
@@ -16335,7 +16410,7 @@ def start_sync_all():
                                 cfg_ch["sync_complete"] = True
                                 cfg_ch["initialized"] = True
                             cfg_ch["last_sync"] = _ts
-                save_config(config)
+                    save_config(config)
                 if _root_alive:
                     _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
@@ -16348,7 +16423,7 @@ def start_sync_all():
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
-                    save_config(config)
+                        save_config(config)
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
@@ -19267,7 +19342,7 @@ def _sync_pipeline_busy():
 
 def _tick_countdown():
     try:
-        if not root.winfo_exists():
+        if not _root_alive:
             return
         nxt = _autorun_next.get("ts")
         if nxt:
@@ -19291,7 +19366,9 @@ def _tick_countdown():
                 autorun_countdown_var.set("Syncing now...")
         root.after(1_000, _tick_countdown)
     except Exception:
-        # Reschedule even on error to prevent countdown from dying
+        # Reschedule even on error to prevent countdown from dying — but not during shutdown
+        if not _root_alive:
+            return
         try:
             root.after(2_000, _tick_countdown)
         except Exception:
@@ -19489,7 +19566,7 @@ def _run_autorun():
                         with config_lock:
                             for c in config.get("channels", []):
                                 if c["url"] == url: c["initialized"] = True
-                        save_config(config)
+                            save_config(config)
                     else:
                         continue
                 elif mode == "date" and not is_init:
@@ -19501,7 +19578,7 @@ def _run_autorun():
                         with config_lock:
                             for c in config.get("channels", []):
                                 if c["url"] == url: c["initialized"] = True
-                        save_config(config)
+                            save_config(config)
                     else:
                         continue
 
@@ -19758,7 +19835,7 @@ def _run_autorun():
                                 cfg_ch["sync_complete"] = True
                                 cfg_ch["initialized"] = True
                             cfg_ch["last_sync"] = _ts
-                save_config(config)
+                    save_config(config)
                 if _root_alive:
                     _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
@@ -19770,7 +19847,7 @@ def _run_autorun():
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
                                 break
-                    save_config(config)
+                        save_config(config)
 
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
@@ -19876,7 +19953,7 @@ def _run_autorun():
                 _ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                 with config_lock:
                     config["last_sync"] = _ts
-                save_config(config)
+                    save_config(config)
                 if _root_alive:
                     _ui_queue.append(refresh_channel_dropdowns)
                     _ui_queue.append(lambda ts=_ts: _update_last_sync_display(ts))
@@ -21711,7 +21788,7 @@ class _TranscriptionPanel(ttk.Frame):
                                                         _jtitle = _jd.get("title", "")
                                                         if _jvid and _jtitle and _jtitle not in _id_map:
                                                             _id_map[_jtitle] = _jvid
-                                                    except (json.JSONDecodeError, Exception):
+                                                    except Exception:
                                                         continue
                                 except (OSError, PermissionError):
                                     continue
@@ -22087,7 +22164,7 @@ class _TranscriptionPanel(ttk.Frame):
                                             _jd.get("text", ""),
                                             json.dumps(_jd["words"]) if "words" in _jd else ""
                                         ))
-                                except (json.JSONDecodeError, Exception):
+                                except Exception:
                                     continue
                 except Exception:
                     pass
@@ -22956,7 +23033,7 @@ class _TranscriptionPanel(ttk.Frame):
                 cleanup_process(proc)
             log(f"Metadata: timeout fetching {title[:40]}\n", "red")
             return None
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             if proc:
                 cleanup_process(proc)
             return None
@@ -23096,10 +23173,10 @@ class _TranscriptionPanel(ttk.Frame):
 
         if not entry:
             self.after(0, self._clear_browse_drawer)
-            # Still attempt to show thumbnail even without metadata
-            self._show_browse_thumbnail(
+            # Dispatch thumbnail to main thread — this function runs on a bg thread
+            self.after(0, lambda: self._show_browse_thumbnail(
                 video_id, title, channel, folder_path,
-                split_years, split_months, year, month)
+                split_years, split_months, year, month))
             return
 
         # Store the current metadata entry for player drawer access
@@ -23135,10 +23212,10 @@ class _TranscriptionPanel(ttk.Frame):
 
         self.after(0, _apply)
 
-        # Show thumbnail
-        self._show_browse_thumbnail(
+        # Show thumbnail — dispatch to main thread (this runs on bg thread)
+        self.after(0, lambda: self._show_browse_thumbnail(
             video_id, title, channel, folder_path,
-            split_years, split_months, year, month)
+            split_years, split_months, year, month))
 
     def _clear_browse_drawer(self):
         """Clear and hide the drawer when no metadata is available."""
@@ -24313,8 +24390,8 @@ class _TranscriptionPanel(ttk.Frame):
                         f"https://www.youtube.com/watch?v={video_id}",
                     ]
                     _dl_result = subprocess.run(
-                        _dl_cmd, capture_output=True, text=True,
-                        timeout=300, startupinfo=startupinfo)
+                        _dl_cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                        text=True, timeout=300, startupinfo=startupinfo)
                     if _dl_result.returncode != 0 or not os.path.exists(_temp_audio):
                         # Retry without cookies
                         _dl_cmd2 = [
@@ -24323,8 +24400,8 @@ class _TranscriptionPanel(ttk.Frame):
                             f"https://www.youtube.com/watch?v={video_id}",
                         ]
                         _dl_result2 = subprocess.run(
-                            _dl_cmd2, capture_output=True, text=True,
-                            timeout=300, startupinfo=startupinfo)
+                            _dl_cmd2, stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, timeout=300, startupinfo=startupinfo)
                         if _dl_result2.returncode != 0 or not os.path.exists(_temp_audio):
                             self._browse_retranscribe_done(
                                 False, "Failed to download audio from YouTube.")

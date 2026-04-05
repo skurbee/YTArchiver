@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.3"
+APP_VERSION = "v33.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -1903,7 +1903,7 @@ def _update_simple_dl(dl_current, ch_total, batch_size=0):
     _simple_anim_state["batch_size"] = batch_size
 
 
-_PARTIAL_FRAG_RE = re.compile(r'\.f\d{1,4}(?:\.\w+)?$')
+_PARTIAL_FRAG_RE = re.compile(r'\.f\d{1,4}(?:-\d+)?(?:\.\w+)?$')
 _DL_PCT_RE = re.compile(r'\d+\.?\d*%')
 _DL_BAR_RE = re.compile(r'█+')
 
@@ -1926,7 +1926,7 @@ def _is_partial_file(name):
         return True
     # Intermediate fragment with media extension (e.g. video.f136.mp4)
     base, ext = os.path.splitext(name)
-    if ext.lower() in ('.webm', '.m4a', '.mp4') and re.search(r'\.f\d{1,4}$', base):
+    if ext.lower() in ('.webm', '.m4a', '.mp4') and re.search(r'\.f\d{1,4}(?:-\d+)?$', base):
         return True
     return False
 
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 11:52am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 12:03pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6516,13 +6516,20 @@ def sync_single_channel(_from_queue=False):
     threading.Thread(target=_safe_single_worker, daemon=True).start()
 
 
-def _process_sync_queue():
+def _process_sync_queue(_preferred_key=None):
     """Process next queued sync if any. Returns True if a sync was started."""
     global _queue_batch_idx, _queue_batch_total, _queue_batch_dl, _queue_batch_err, _queue_batch_skip, _queue_batch_t_start
     with _sync_queue_lock:
         if not _sync_queue:
             return False
-        next_ch = _sync_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _ch in enumerate(_sync_queue):
+                if _ch["url"] == _preferred_key:
+                    _pop_idx = _i
+                    break
+        next_ch = _sync_queue.pop(_pop_idx)
         remaining = len(_sync_queue)
     with _queue_order_lock:
         try:
@@ -6591,32 +6598,32 @@ def _process_next_queued():
             with _sync_queue_lock:
                 has_items = bool(_sync_queue)
             if has_items:
-                return _process_sync_queue()
+                return _process_sync_queue(_preferred_key=key)
         elif source == "reorg":
             with _reorg_queue_lock:
                 has_items = bool(_reorg_queue)
             if has_items:
-                return _process_reorg_queue()
+                return _process_reorg_queue(_preferred_key=key)
         elif source == "transcribe":
             with _transcribe_queue_lock:
                 has_items = bool(_transcribe_queue)
             if has_items:
-                return _process_transcribe_queue()
+                return _process_transcribe_queue(_preferred_key=key)
         elif source == "mt":
             with _mt_queue_lock:
                 has_items = bool(_mt_queue)
             if has_items:
-                return _process_mt_queue()
+                return _process_mt_queue(_preferred_key=key)
         elif source == "redownload":
             with _redownload_queue_lock:
                 has_items = bool(_redownload_queue)
             if has_items:
-                return _process_redownload_queue()
+                return _process_redownload_queue(_preferred_key=key)
         elif source == "metadata":
             with _metadata_queue_lock:
                 has_items = bool(_metadata_queue)
             if has_items:
-                return _process_metadata_queue()
+                return _process_metadata_queue(_preferred_key=key)
     # Fallback: try each queue in case _queue_order is out of sync
     return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue() or _process_redownload_queue() or _process_metadata_queue()
 
@@ -7451,12 +7458,19 @@ def _fix_file_dates(channel_url, folder_path):
             cleanup_process(proc)
 
 
-def _process_reorg_queue():
+def _process_reorg_queue(_preferred_key=None):
     """Process next queued reorganize if any. Returns True if one was started."""
     with _reorg_queue_lock:
         if not _reorg_queue:
             return False
-        args = _reorg_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _rq in enumerate(_reorg_queue):
+                if (_rq[4] or _rq[0]) == _preferred_key:  # ch_url or ch_name
+                    _pop_idx = _i
+                    break
+        args = _reorg_queue.pop(_pop_idx)
         remaining = len(_reorg_queue)
 
     ch_name, folder, t_years, t_months, ch_url, recheck = args
@@ -11239,12 +11253,19 @@ def _add_to_gpu_queue(item, _quiet=False):
         _ui_queue.append(_gpu_start)
 
 
-def _process_transcribe_queue():
+def _process_transcribe_queue(_preferred_key=None):
     """Process next queued transcription if any. Returns True if one was started."""
     with _transcribe_queue_lock:
         if not _transcribe_queue:
             return False
-        args = _transcribe_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _tq in enumerate(_transcribe_queue):
+                if _tq[1] == _preferred_key:  # ch_url
+                    _pop_idx = _i
+                    break
+        args = _transcribe_queue.pop(_pop_idx)
         remaining = len(_transcribe_queue)
 
     ch_name, ch_url, folder, sy, sm, combined = args
@@ -11263,12 +11284,19 @@ def _process_transcribe_queue():
     return True
 
 
-def _process_redownload_queue():
+def _process_redownload_queue(_preferred_key=None):
     """Process next queued redownload if any. Returns True if one was started."""
     with _redownload_queue_lock:
         if not _redownload_queue:
             return False
-        item = _redownload_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _rq in enumerate(_redownload_queue):
+                if _rq["ch_url"] == _preferred_key:
+                    _pop_idx = _i
+                    break
+        item = _redownload_queue.pop(_pop_idx)
         remaining = len(_redownload_queue)
 
     ch_url = item["ch_url"]
@@ -11415,12 +11443,19 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
         _process_metadata_queue()
 
 
-def _process_metadata_queue():
+def _process_metadata_queue(_preferred_key=None):
     """Pop the next metadata task from the queue and start it."""
     with _metadata_queue_lock:
         if not _metadata_queue:
             return False
-        item = _metadata_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _mq in enumerate(_metadata_queue):
+                if _mq["_key"] == _preferred_key:
+                    _pop_idx = _i
+                    break
+        item = _metadata_queue.pop(_pop_idx)
     with _queue_order_lock:
         try:
             _queue_order.remove(("metadata", item["_key"]))
@@ -13207,12 +13242,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         threading.Thread(target=_worker, daemon=True).start()
 
 
-def _process_mt_queue():
+def _process_mt_queue(_preferred_key=None):
     """Process next queued manual transcription. Returns True if one was started."""
     with _mt_queue_lock:
         if not _mt_queue:
             return False
-        file_path = _mt_queue.pop(0)
+        # Pop the item matching the preferred key (from _queue_order drag reorder), or first item
+        _pop_idx = 0
+        if _preferred_key:
+            for _i, _fp in enumerate(_mt_queue):
+                if _fp == _preferred_key:
+                    _pop_idx = _i
+                    break
+        file_path = _mt_queue.pop(_pop_idx)
         remaining = len(_mt_queue)
     with _queue_order_lock:
         try:

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.1"
+APP_VERSION = "v33.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -235,6 +235,7 @@ _redownload_hist_idx = None      # index of the in-progress placeholder in autor
 _metadata_queue = []  # list of dicts: {"ch_name", "folder_path", "split_years", "split_months", "year", "month", "scope_label"}
 _metadata_queue_lock = threading.Lock()
 _metadata_running = False
+_current_metadata_item = None  # the currently-running metadata item (for queue save/restore)
 
 # GPU Tasks queue — independent from the main job queue
 _gpu_queue = []          # list of dicts: {"type": "mt"|"transcribe"|"encode", ...details}
@@ -551,12 +552,18 @@ def log(text, tag=None):
                 # only re-enable auto-scroll when they reach the very bottom.
                 try:
                     yview = log_box.yview()
-                    if yview[1] >= 0.99:
+                    if _log_user_scrolled:
+                        # User physically scrolled — only re-lock when they
+                        # reach the very bottom (>= 0.999), not the loose 0.99
+                        # threshold.  This prevents the log from snapping back
+                        # when the user scrolls up just a few lines.
+                        if yview[1] >= 0.999:
+                            _log_at_bottom = True
+                            _log_user_scrolled = False
+                        else:
+                            _log_at_bottom = False
+                    elif yview[1] >= 0.99:
                         _log_at_bottom = True
-                        _log_user_scrolled = False
-                    elif _log_user_scrolled:
-                        # User actively scrolled away — stay off until they hit bottom
-                        _log_at_bottom = False
                     elif yview[1] < 0.90:
                         _log_at_bottom = False
                     # Between 0.90-0.99 without user scroll: keep previous value
@@ -761,7 +768,7 @@ def log(text, tag=None):
                             _bk_tag = "sync_bracket"
                         elif any(kw in _txt for kw in ("Fetching captions:", "Re-transcribing",
                                                         "Transcribing", "fetching captions",
-                                                        "done (")):
+                                                        "done (", "no speech detected")):
                             _bk_tag = "trans_bracket"
                             if _base_tag == "simpleline_blue" and "done (" in _txt:
                                 _do_white = True
@@ -893,9 +900,20 @@ def log(text, tag=None):
                             _title_part = _after[:_dash_idx]
                             _done_part = _after[_dash_idx:]
                             if _title_part:
-                                # Color "..." blue — look for truncation ellipsis within the title portion
-                                _dots_pos = _title_part.find("...")
+                                # Color "..." blue ONLY if it's a genuine truncation
+                                # indicator (the last "..." followed only by spaces
+                                # before the em-dash separator), not "..." that is
+                                # part of the original video title.
+                                _dots_pos = _title_part.rfind("...")
+                                _is_trunc = False
                                 if _dots_pos >= 0:
+                                    _after_dots_text = _title_part[_dots_pos + 3:]
+                                    _after_stripped = _after_dots_text.lstrip(' ')
+                                    _is_trunc = (
+                                        _after_stripped == ""
+                                        or _after_stripped.startswith("\u2014")
+                                    )
+                                if _is_trunc:
                                     _pre_dots = _title_part[:_dots_pos]
                                     _dots_str = "..."
                                     _post_dots = _title_part[_dots_pos + 3:]
@@ -3773,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.04.26 12:16am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 11:42am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11414,7 +11432,7 @@ def _process_metadata_queue():
 
 def _start_metadata_task(item):
     """Start a metadata download task as a sync-pipeline job."""
-    global _metadata_running
+    global _metadata_running, _current_metadata_item
 
     if _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled) or _redownload_running or _metadata_running:
         with _metadata_queue_lock:
@@ -11424,11 +11442,12 @@ def _start_metadata_task(item):
         return
 
     _metadata_running = True
+    _current_metadata_item = item
     _update_global_pause_btn_sync()
     _start_internet_monitor()
 
     def _worker():
-        global _metadata_running
+        global _metadata_running, _current_metadata_item
         if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled):
             cancel_event.clear()
 
@@ -11444,6 +11463,7 @@ def _start_metadata_task(item):
             log(f"\n  ⚠ Metadata error: {e}\n", "red")
         finally:
             _metadata_running = False
+            _current_metadata_item = None
             _current_job["label"] = None
             _current_job["url"] = None
             _current_job.pop("_metadata_key", None)
@@ -14362,7 +14382,8 @@ def _log_scan_status(checked, matched, date_disp, title):
         try:
             if 'log_box' in globals() and log_box.winfo_exists():
                 try:
-                    at_bottom = log_box.yview()[1] >= 0.99
+                    _yv = log_box.yview()[1]
+                    at_bottom = (_log_at_bottom and not _log_user_scrolled) or _yv >= 0.999
                 except Exception:
                     at_bottom = True
 
@@ -20207,6 +20228,8 @@ def _tp_open_db(path):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr ON segments(channel, year)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_ch_yr_mo ON segments(channel, year, month)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_title ON segments(title)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_jsonl ON segments(jsonl_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seg_video_id ON segments(video_id)")
     # Migration: add words column for word-level timestamps (added later; safe to ignore if exists)
     try:
         conn.execute("ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''")
@@ -20358,7 +20381,7 @@ def _tp_find_jsonl_files(roots):
             continue
         for dirpath, _, filenames in os.walk(root_dir, followlinks=False):
             for fn in filenames:
-                if fn.endswith(".jsonl"):
+                if fn.endswith(".jsonl") and not fn.lower().endswith("metadata.jsonl"):
                     files.append(os.path.join(dirpath, fn))
     return files
 
@@ -27716,9 +27739,35 @@ class _TranscriptionPanel(ttk.Frame):
 
             if rebuild:
                 try:
-                    self._db_execute("DELETE FROM segments")
-                    self._db_execute("DELETE FROM segments_fts")
+                    # Drop and recreate instead of row-by-row DELETE —
+                    # near-instant regardless of table size.
+                    self._db_execute("DROP TABLE IF EXISTS segments_fts")
+                    self._db_execute("DROP TABLE IF EXISTS segments")
                     self._db_execute("DELETE FROM indexed_files")
+                    self._db_execute("""CREATE TABLE segments (
+                        id         INTEGER PRIMARY KEY,
+                        video_id   TEXT NOT NULL,
+                        title      TEXT NOT NULL,
+                        channel    TEXT NOT NULL,
+                        year       INTEGER,
+                        month      INTEGER,
+                        start_time REAL,
+                        end_time   REAL,
+                        text       TEXT NOT NULL,
+                        jsonl_path TEXT,
+                        words      TEXT DEFAULT ''
+                    )""")
+                    self._db_execute("""CREATE VIRTUAL TABLE segments_fts USING fts5(
+                        text,
+                        content=segments,
+                        content_rowid=id
+                    )""")
+                    self._db_execute("CREATE INDEX idx_seg_channel ON segments(channel)")
+                    self._db_execute("CREATE INDEX idx_seg_ch_yr ON segments(channel, year)")
+                    self._db_execute("CREATE INDEX idx_seg_ch_yr_mo ON segments(channel, year, month)")
+                    self._db_execute("CREATE INDEX idx_seg_title ON segments(title)")
+                    self._db_execute("CREATE INDEX idx_seg_jsonl ON segments(jsonl_path)")
+                    self._db_execute("CREATE INDEX idx_seg_video_id ON segments(video_id)")
                     self._db_commit()
                     self._tp_log("Cleared existing index.")
                 except Exception as e:
@@ -29607,6 +29656,12 @@ def _save_queue_state_now():
     with _redownload_queue_lock:
         for item in _redownload_queue:
             queue_data["redownload"].append(copy.deepcopy(item))
+    # Include the currently-running metadata item so it survives crashes/restarts
+    _snap_meta = copy.deepcopy(_current_metadata_item) if _current_metadata_item is not None else None
+    if _snap_meta is not None and _metadata_running:
+        with _metadata_queue_lock:
+            if not any(q["_key"] == _snap_meta["_key"] for q in _metadata_queue):
+                queue_data["metadata"].append(_snap_meta)
     with _metadata_queue_lock:
         for item in _metadata_queue:
             queue_data["metadata"].append(copy.deepcopy(item))
@@ -29637,6 +29692,11 @@ def _save_queue_state_now():
     if _snap_redownload is not None and _redownload_running:
         try:
             saved_order.insert(0, ("redownload", _snap_redownload["ch_url"]))
+        except (KeyError, TypeError):
+            pass
+    if _snap_meta is not None and _metadata_running:
+        try:
+            saved_order.insert(0, ("metadata", _snap_meta["_key"]))
         except (KeyError, TypeError):
             pass
     queue_data["order"] = saved_order

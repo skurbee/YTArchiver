@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.2"
+APP_VERSION = "v33.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 11:42am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 11:52am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11507,6 +11507,12 @@ def _run_metadata_download(item):
 
     # Get the TP instance (Browse tab) for DB access and metadata helpers
     tp = _tp_panel_ref[0]
+    if tp and not tp._conn and getattr(tp, '_db_loading', False):
+        # DB is still initializing (e.g. building indexes on first launch) — wait
+        for _ in range(60):  # up to 30 seconds
+            time.sleep(0.5)
+            if tp._conn:
+                break
     if not tp or not tp._conn:
         log("Metadata: no database connection.\n", "red")
         return

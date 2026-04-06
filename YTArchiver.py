@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.5"
+APP_VERSION = "v33.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 8:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 1:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11667,6 +11667,129 @@ def _run_metadata_download(item):
         else:
             _need_search.append((title, v_year, v_month, filepath))
             _no_id_count += 1
+
+    # ── Batch-resolve: fetch channel playlist for bulk title→ID matching ──
+    # Instead of searching YouTube one-by-one (which takes ~8s each = days for
+    # large channels), fetch the entire channel's video list in one shot and
+    # match by normalized title.  Only fall back to individual search for leftovers.
+    if len(_need_search) > 10 and ch_url:
+        log(f"  Batch-resolving {len(_need_search):,} video(s) via channel playlist...\n", "dim")
+        _batch_url = ch_url.rstrip("/")
+        if ("/@" in _batch_url or "/channel/" in _batch_url or "/c/" in _batch_url or "/user/" in _batch_url) and not _batch_url.endswith("/videos"):
+            _batch_url = _batch_url + "/videos"
+        _batch_proc = None
+        _batch_map = {}  # normalized_title -> video_id
+        try:
+            if _internet_down.is_set():
+                _block_if_no_internet()
+            _batch_proc = spawn_yt_dlp([
+                "yt-dlp", "--flat-playlist", "--lazy-playlist",
+                "--print", "%(id)s|||%(title)s",
+                "--cookies-from-browser", "firefox",
+                _batch_url
+            ])
+            if _batch_proc:
+                _re_unsafe = re.compile(r'[\\/:*?"<>|]')
+                _re_ws = re.compile(r'\s+')
+                def _norm_title(t):
+                    s = unicodedata.normalize('NFKC', t)
+                    s = _re_unsafe.sub('', s)
+                    s = _re_ws.sub(' ', s).strip()
+                    return s.lower()
+
+                _batch_count = 0
+                _batch_t0 = time.time()
+                _last_batch_log = 0
+                _timeout_s = min(1800, 300 + (len(_need_search) // 1000) * 30)
+                _deadline = time.time() + _timeout_s
+
+                while True:
+                    if cancel_event.is_set():
+                        break
+                    if time.time() > _deadline:
+                        log("  \u26a0 Channel playlist fetch timed out.\n", "red")
+                        break
+                    line = _batch_proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if "|||" in line:
+                        _vid_id, _yt_title = line.split("|||", 1)
+                        _vid_id = _vid_id.strip()
+                        _yt_title = _yt_title.strip()
+                        if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
+                            _norm = _norm_title(_yt_title)
+                            if _norm not in _batch_map:
+                                _batch_map[_norm] = _vid_id
+                            _batch_count += 1
+                            if _batch_count - _last_batch_log >= 500:
+                                _elapsed = int(time.time() - _batch_t0)
+                                log(f"  ...{_batch_count:,} titles fetched ({_elapsed}s elapsed)\n", "dim")
+                                _last_batch_log = _batch_count
+
+                try:
+                    _batch_proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    _batch_proc.kill()
+                    try:
+                        _batch_proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                cleanup_process(_batch_proc)
+                _batch_proc = None
+
+                if _batch_map:
+                    _elapsed = int(time.time() - _batch_t0)
+                    log(f"  Fetched {len(_batch_map):,} titles from channel playlist in {_elapsed}s.\n", "dim")
+
+                    # Build set of known IDs for dedup
+                    _batch_known = set(vid for vid, *_ in _resolved_rows)
+                    try:
+                        for _db_vid, in tp._db_execute(
+                                "SELECT DISTINCT video_id FROM videos WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
+                                (ch_name,)).fetchall():
+                            _batch_known.add(_db_vid)
+                    except Exception:
+                        pass
+
+                    _batch_found = 0
+                    _still_need = []
+                    for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+                        _norm = _norm_title(_s_title)
+                        _matched_id = _batch_map.get(_norm)
+                        if _matched_id and _matched_id not in _batch_known:
+                            _batch_known.add(_matched_id)
+                            _resolved_rows.append((_matched_id, _s_title, _s_year, _s_month, _s_filepath))
+                            _batch_found += 1
+                            _no_id_count -= 1
+                            if _s_filepath:
+                                try:
+                                    tp._db_execute(
+                                        "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                        (_matched_id, _s_filepath))
+                                except Exception:
+                                    pass
+                        else:
+                            _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+
+                    _need_search = _still_need
+                    if _batch_found:
+                        log(f"  Batch-resolved {_batch_found:,} video ID(s) via channel playlist.\n", "green")
+                        try:
+                            tp._db_commit()
+                        except Exception:
+                            pass
+                    if _need_search:
+                        log(f"  {len(_need_search)} video(s) still unmatched \u2014 falling back to individual search.\n", "dim")
+                else:
+                    log("  \u26a0 No titles retrieved from channel playlist.\n", "red")
+        except Exception as e:
+            log(f"  \u26a0 Batch playlist fetch failed: {e}\n", "red")
+        finally:
+            if _batch_proc is not None:
+                cleanup_process(_batch_proc)
 
     # For videos with no video_id, try searching YouTube by title + channel name
     if _need_search and ch_url:

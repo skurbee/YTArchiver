@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.4"
+APP_VERSION = "v33.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 12:03pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.05.26 8:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -20352,17 +20352,39 @@ def _tp_parse_path_meta(jsonl_path, archive_roots):
                     if mn in stem:
                         month = i + 1
                         break
+            # Fallback: derive month from companion video file mtime
+            # (video file mtimes are set to YouTube upload dates)
+            if month is None and year is not None:
+                _clean = p.stem.lstrip(".")
+                for _ext in _CHANNEL_VIDEO_EXTS:
+                    _vf = p.parent / (_clean + _ext)
+                    try:
+                        if _vf.exists():
+                            month = datetime.fromtimestamp(_vf.stat().st_mtime).month
+                            break
+                    except OSError:
+                        pass
             return channel, year, month
         except ValueError:
             continue
     parts = p.parts
     channel = parts[-3] if len(parts) >= 3 else "Unknown"
-    year = None
+    year = month = None
     try:
         year = int(parts[-2])
     except (ValueError, IndexError):
         pass
-    return channel, year, None
+    if year is not None:
+        _clean = p.stem.lstrip(".")
+        for _ext in _CHANNEL_VIDEO_EXTS:
+            _vf = p.parent / (_clean + _ext)
+            try:
+                if _vf.exists():
+                    month = datetime.fromtimestamp(_vf.stat().st_mtime).month
+                    break
+            except OSError:
+                pass
+    return channel, year, month
 
 
 def _tp_index_file(conn, jsonl_path, archive_roots):
@@ -25660,8 +25682,24 @@ class _TranscriptionPanel(ttk.Frame):
             _deferred_iids = []
             for row in rows:
                 rid, video_id, title, ch, year, month, start_time, end_time, text, jsonl_path = row
-                date_str = (f"{year}-{month:02d}" if year and month
-                            else str(year) if year else "")
+                if year and month:
+                    date_str = f"{year}-{month:02d}"
+                elif year and jsonl_path:
+                    # Derive month from companion video file mtime
+                    _jp = Path(jsonl_path)
+                    _cs = _jp.stem.lstrip(".")
+                    _m = None
+                    for _e in _CHANNEL_VIDEO_EXTS:
+                        _vp = _jp.parent / (_cs + _e)
+                        try:
+                            if _vp.exists():
+                                _m = datetime.fromtimestamp(_vp.stat().st_mtime).month
+                                break
+                        except OSError:
+                            pass
+                    date_str = f"{year}-{_m:02d}" if _m else str(year)
+                else:
+                    date_str = str(year) if year else ""
                 q   = query.lower()
                 idx = text.lower().find(q)
                 if idx >= 0:
@@ -26163,25 +26201,28 @@ class _TranscriptionPanel(ttk.Frame):
         bar = tk.Frame(f, bg=self._TP_BG3, padx=10, pady=8)
         bar.pack(fill="x")
 
-        tk.Label(bar, text="Words:", bg=self._TP_BG3, fg=self._TP_FG,
+        # Left group: Words entry + Channel selector
+        _freq_left = tk.Frame(bar, bg=self._TP_BG3)
+
+        tk.Label(_freq_left, text="Words:", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 10)).pack(side="left")
         self._freq_words_var = tk.StringVar()
         self._freq_words_var.trace_add("write", self._on_freq_words_changed)
         self._freq_plotted_text = None
-        e = tk.Entry(bar, textvariable=self._freq_words_var, bg=self._TP_BG2,
+        _freq_entry = tk.Entry(_freq_left, textvariable=self._freq_words_var, bg=self._TP_BG2,
                      fg=self._TP_FG, insertbackground=self._TP_FG,
                      relief="flat", font=("Segoe UI", 11), width=30)
-        e.pack(side="left", padx=8, ipady=5)
-        e.bind("<Return>", lambda _: self._do_frequency())
-        tk.Label(bar, text="(comma-separated)", bg=self._TP_BG3, fg=self._TP_DIM,
+        _freq_entry.pack(side="left", padx=8, ipady=5)
+        _freq_entry.bind("<Return>", lambda _: self._do_frequency())
+        tk.Label(_freq_left, text="(comma-separated)", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 8)).pack(side="left", padx=(0, 12))
 
-        tk.Label(bar, text="Channel:", bg=self._TP_BG3, fg=self._TP_DIM,
+        tk.Label(_freq_left, text="Channel:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
         self._freq_channel_vars = {}       # channel_name → BooleanVar
         self._freq_channel_all  = tk.BooleanVar(value=True)
         self._freq_channel_btn  = tk.Menubutton(
-            bar, text="All ▾", bg=self._TP_BG2, fg=self._TP_FG,
+            _freq_left, text="All ▾", bg=self._TP_BG2, fg=self._TP_FG,
             activebackground=self._TP_BG3, activeforeground=self._TP_FG,
             relief="flat", font=("Segoe UI", 9), padx=8, pady=2,
             indicatoron=False, cursor="hand2", width=18, anchor="w")
@@ -26192,22 +26233,25 @@ class _TranscriptionPanel(ttk.Frame):
         self._freq_channel_btn["menu"] = self._freq_channel_menu
         self._freq_channel_btn.pack(side="left", padx=(0, 12))
 
-        tk.Label(bar, text="Group:", bg=self._TP_BG3, fg=self._TP_DIM,
+        # Right group: Group, Chart, Normalize, Plot, Export
+        _freq_right = tk.Frame(bar, bg=self._TP_BG3)
+
+        tk.Label(_freq_right, text="Group:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
         self._freq_group_var = tk.StringVar(value="Month")
-        ttk.Combobox(bar, textvariable=self._freq_group_var,
+        ttk.Combobox(_freq_right, textvariable=self._freq_group_var,
                      values=["Year", "Month"], width=7,
                      state="readonly").pack(side="left", padx=(0, 12))
 
-        tk.Label(bar, text="Chart:", bg=self._TP_BG3, fg=self._TP_DIM,
+        tk.Label(_freq_right, text="Chart:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
         self._freq_chart_var = tk.StringVar(value="Line")
-        ttk.Combobox(bar, textvariable=self._freq_chart_var,
+        ttk.Combobox(_freq_right, textvariable=self._freq_chart_var,
                      values=["Line", "Bar", "Word Cloud"], width=10,
                      state="readonly").pack(side="left", padx=(0, 12))
 
         self._freq_normalize_var = tk.BooleanVar(value=False)
-        _norm_cb = tk.Checkbutton(bar, text="Normalize", variable=self._freq_normalize_var,
+        _norm_cb = tk.Checkbutton(_freq_right, text="Normalize", variable=self._freq_normalize_var,
                        bg=self._TP_BG3, fg=self._TP_DIM, selectcolor=self._TP_BG3,
                        activebackground=self._TP_BG3, activeforeground=self._TP_FG,
                        font=("Segoe UI", 9))
@@ -26217,19 +26261,61 @@ class _TranscriptionPanel(ttk.Frame):
                  "Instead of raw mention counts, it shows mentions per 1,000 transcript\n"
                  "segments — making it fair to compare channels of different sizes.")
 
-        self._freq_plot_btn = tk.Button(bar, text="Plot", command=self._do_frequency,
+        self._freq_plot_btn = tk.Button(_freq_right, text="Plot", command=self._do_frequency,
                   bg=self._TP_GREEN, fg="white", relief="flat",
                   font=("Segoe UI", 10, "bold"), padx=14,
                   pady=2)
         self._freq_plot_btn.pack(side="left")
 
-        tk.Button(bar, text="Export CSV", command=self._export_frequency_csv,
+        tk.Button(_freq_right, text="Export CSV", command=self._export_frequency_csv,
                   bg=self._TP_BG2, fg=self._TP_FG, relief="flat",
                   font=("Segoe UI", 9), padx=10, pady=2).pack(side="left", padx=(6, 0))
 
-        self._freq_status = tk.Label(bar, text="", bg=self._TP_BG3, fg=self._TP_DIM,
+        self._freq_status = tk.Label(_freq_right, text="", bg=self._TP_BG3, fg=self._TP_DIM,
                                      font=("Segoe UI", 9))
         self._freq_status.pack(side="right", padx=8)
+
+        # Initial layout: single row
+        _freq_left.pack(side="left")
+        _freq_right.pack(side="left")
+
+        # Dynamic reflow: single row when wide enough, two rows when narrow
+        _freq_two_rows = [False]
+        _freq_min_w = [None]
+        _freq_reflow_id = [None]
+
+        def _freq_reflow():
+            _freq_reflow_id[0] = None
+            bar_w = bar.winfo_width()
+            if bar_w < 50:
+                return
+            if _freq_min_w[0] is None:
+                # Capture natural single-row width on first layout
+                _freq_min_w[0] = (_freq_left.winfo_reqwidth()
+                                  + _freq_right.winfo_reqwidth() + 24)
+            if bar_w < _freq_min_w[0] and not _freq_two_rows[0]:
+                _freq_two_rows[0] = True
+                _freq_left.pack_forget()
+                _freq_right.pack_forget()
+                _freq_left.pack(fill="x", pady=(0, 4))
+                _freq_right.pack(anchor="w")
+                _freq_entry.config(width=0)
+                _freq_entry.pack_configure(fill="x", expand=True)
+            elif bar_w >= _freq_min_w[0] and _freq_two_rows[0]:
+                _freq_two_rows[0] = False
+                _freq_left.pack_forget()
+                _freq_right.pack_forget()
+                _freq_left.pack(side="left")
+                _freq_right.pack(side="left")
+                _freq_entry.config(width=30)
+                _freq_entry.pack_configure(fill="none", expand=False)
+
+        def _freq_on_cfg(event):
+            if _freq_reflow_id[0] is not None:
+                bar.after_cancel(_freq_reflow_id[0])
+            _freq_reflow_id[0] = bar.after(50, _freq_reflow)
+
+        bar.bind("<Configure>", _freq_on_cfg)
 
         if not _HAS_MPL:
             tk.Label(f, text="matplotlib not installed.\nRun:  pip install matplotlib",

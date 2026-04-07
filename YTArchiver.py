@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.7"
+APP_VERSION = "v33.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 6:58pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 7:39pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11601,6 +11601,30 @@ def _run_metadata_download(item):
             f"  Check that video files exist in the channel folder.\n", "red")
         return
 
+    # ── Quick pre-check: skip entire pipeline if metadata already covers all videos ──
+    # Avoids expensive YouTube lookups when re-running on already-complete channels.
+    if not refresh:
+        _pc_paths = set()
+        for _, _, v_year, v_month, _ in rows:
+            mp, _ = tp._get_metadata_jsonl_path(
+                ch_name, folder_path, split_years, split_months,
+                year=v_year, month=v_month)
+            _pc_paths.add(mp)
+        _pc_ids = set()
+        for mp in _pc_paths:
+            _pc_ids.update(tp._read_metadata_jsonl(mp).keys())
+        # Count how many video files are covered by existing metadata
+        _pc_covered = 0
+        for vid_id, _, _, _, _ in rows:
+            if vid_id and vid_id in _pc_ids:
+                _pc_covered += 1
+        # If every video with an ID already has metadata AND total metadata
+        # entries cover the full file count, we're done.
+        _pc_with_ids = sum(1 for vid_id, *_ in rows if vid_id)
+        if _pc_covered >= _pc_with_ids and len(_pc_ids) >= len(rows):
+            log(f"Metadata: {scope_label} — all {len(rows)} videos already have metadata.\n", "simpleline")
+            return
+
     log(f"  Found {len(rows)} video(s) — resolving video IDs...\n", "dim")
 
     # Resolve missing video_ids from segments table or JSONL files on disk
@@ -11685,7 +11709,7 @@ def _run_metadata_download(item):
                 _block_if_no_internet()
             _batch_proc = spawn_yt_dlp([
                 "yt-dlp", "--flat-playlist", "--lazy-playlist",
-                "--print", "%(id)s|||%(title)s|||%(upload_date)s",
+                "--print", "%(id)s|||%(title)s|||%(upload_date)s|||%(timestamp)s",
                 "--cookies-from-browser", "firefox",
                 _batch_url
             ])
@@ -11699,6 +11723,7 @@ def _run_metadata_download(item):
                     return s.lower()
 
                 _batch_count = 0
+                _batch_dates_ok = 0
                 _batch_t0 = time.time()
                 _last_batch_log = 0
                 _timeout_s = min(1800, 300 + (len(_need_search) // 1000) * 30)
@@ -11721,13 +11746,24 @@ def _run_metadata_download(item):
                         _vid_id = _parts[0].strip()
                         _yt_title = _parts[1].strip() if len(_parts) > 1 else ""
                         _upload_date = _parts[2].strip() if len(_parts) > 2 else ""
+                        _timestamp = _parts[3].strip() if len(_parts) > 3 else ""
                         if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
                             _norm = _norm_title(_yt_title)
                             if _norm not in _batch_map:
                                 _batch_map[_norm] = _vid_id
-                            # Build date index for date-based elimination resolve
+                            # Build date index — prefer upload_date, fall back to timestamp
+                            _resolved_date = ""
                             if _upload_date and re.fullmatch(r'\d{8}', _upload_date):
-                                _yt_by_date.setdefault(_upload_date, []).append((_vid_id, _yt_title))
+                                _resolved_date = _upload_date
+                            elif _timestamp and _timestamp not in ("NA", "None", ""):
+                                try:
+                                    _resolved_date = datetime.utcfromtimestamp(
+                                        float(_timestamp)).strftime("%Y%m%d")
+                                except (ValueError, OSError):
+                                    pass
+                            if _resolved_date:
+                                _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
+                                _batch_dates_ok += 1
                             _batch_count += 1
                             if _batch_count - _last_batch_log >= 500:
                                 _elapsed = int(time.time() - _batch_t0)
@@ -11747,7 +11783,8 @@ def _run_metadata_download(item):
 
                 if _batch_map:
                     _elapsed = int(time.time() - _batch_t0)
-                    log(f"  Fetched {len(_batch_map):,} titles from channel playlist in {_elapsed}s.\n", "dim")
+                    _date_pct = f" ({_batch_dates_ok}/{_batch_count} with dates)" if _batch_count else ""
+                    log(f"  Fetched {len(_batch_map):,} titles from channel playlist in {_elapsed}s.{_date_pct}\n", "dim")
 
                     # Build set of known IDs for dedup
                     _batch_known = set(vid for vid, *_ in _resolved_rows)
@@ -11904,7 +11941,7 @@ def _run_metadata_download(item):
                         _block_if_no_internet()
                     _dr_proc = spawn_yt_dlp([
                         "yt-dlp", "--flat-playlist", "--lazy-playlist",
-                        "--print", "%(id)s|||%(title)s|||%(upload_date)s",
+                        "--print", "%(id)s|||%(title)s|||%(upload_date)s|||%(timestamp)s",
                         "--cookies-from-browser", "firefox",
                         _dr_url
                     ])
@@ -11929,8 +11966,19 @@ def _run_metadata_download(item):
                             _vid_id = _parts[0].strip()
                             _yt_title = _parts[1].strip() if len(_parts) > 1 else ""
                             _upload_date = _parts[2].strip() if len(_parts) > 2 else ""
-                            if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id) and _upload_date and re.fullmatch(r'\d{8}', _upload_date):
-                                _yt_by_date.setdefault(_upload_date, []).append((_vid_id, _yt_title))
+                            _timestamp = _parts[3].strip() if len(_parts) > 3 else ""
+                            if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
+                                _resolved_date = ""
+                                if _upload_date and re.fullmatch(r'\d{8}', _upload_date):
+                                    _resolved_date = _upload_date
+                                elif _timestamp and _timestamp not in ("NA", "None", ""):
+                                    try:
+                                        _resolved_date = datetime.utcfromtimestamp(
+                                            float(_timestamp)).strftime("%Y%m%d")
+                                    except (ValueError, OSError):
+                                        pass
+                                if _resolved_date:
+                                    _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                             _dr_count += 1
                             if _dr_count - _dr_last_log >= 500:
                                 _elapsed = int(time.time() - _dr_t0)

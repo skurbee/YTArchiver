@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.6"
+APP_VERSION = "v33.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3791,7 +3791,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 1:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 6:58pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11642,6 +11642,7 @@ def _run_metadata_download(item):
                 continue
 
     _need_search = []  # (index, title, v_year, v_month, filepath) for yt-dlp search
+    _yt_by_date = {}   # "YYYYMMDD" -> [(video_id, original_title)] for date-based resolve
     for vid_id, title, v_year, v_month, filepath in rows:
         if not vid_id:
             # Try segments table lookup
@@ -11684,7 +11685,7 @@ def _run_metadata_download(item):
                 _block_if_no_internet()
             _batch_proc = spawn_yt_dlp([
                 "yt-dlp", "--flat-playlist", "--lazy-playlist",
-                "--print", "%(id)s|||%(title)s",
+                "--print", "%(id)s|||%(title)s|||%(upload_date)s",
                 "--cookies-from-browser", "firefox",
                 _batch_url
             ])
@@ -11716,13 +11717,17 @@ def _run_metadata_download(item):
                     if not line:
                         continue
                     if "|||" in line:
-                        _vid_id, _yt_title = line.split("|||", 1)
-                        _vid_id = _vid_id.strip()
-                        _yt_title = _yt_title.strip()
+                        _parts = line.split("|||")
+                        _vid_id = _parts[0].strip()
+                        _yt_title = _parts[1].strip() if len(_parts) > 1 else ""
+                        _upload_date = _parts[2].strip() if len(_parts) > 2 else ""
                         if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
                             _norm = _norm_title(_yt_title)
                             if _norm not in _batch_map:
                                 _batch_map[_norm] = _vid_id
+                            # Build date index for date-based elimination resolve
+                            if _upload_date and re.fullmatch(r'\d{8}', _upload_date):
+                                _yt_by_date.setdefault(_upload_date, []).append((_vid_id, _yt_title))
                             _batch_count += 1
                             if _batch_count - _last_batch_log >= 500:
                                 _elapsed = int(time.time() - _batch_t0)
@@ -11879,13 +11884,200 @@ def _run_metadata_download(item):
             except Exception:
                 pass
 
+    # ── Date-based elimination: match unresolved videos by upload date ──
+    # Most channels upload ≤1-2 videos/day.  For videos that couldn't be
+    # resolved by title matching, we can often identify them by checking what
+    # the channel uploaded on the same date and eliminating the ones we
+    # already matched.
+    if _need_search and ch_url and not cancel_event.is_set():
+        _dr_has_files = any(fp and os.path.isfile(fp) for _, _, _, fp in _need_search)
+        if _dr_has_files:
+            # If batch-resolve didn't populate _yt_by_date, fetch it now
+            if not _yt_by_date:
+                log(f"  Date-resolving {len(_need_search)} video(s) \u2014 fetching channel dates...\n", "dim")
+                _dr_url = ch_url.rstrip("/")
+                if ("/@" in _dr_url or "/channel/" in _dr_url or "/c/" in _dr_url or "/user/" in _dr_url) and not _dr_url.endswith("/videos"):
+                    _dr_url = _dr_url + "/videos"
+                _dr_proc = None
+                try:
+                    if _internet_down.is_set():
+                        _block_if_no_internet()
+                    _dr_proc = spawn_yt_dlp([
+                        "yt-dlp", "--flat-playlist", "--lazy-playlist",
+                        "--print", "%(id)s|||%(title)s|||%(upload_date)s",
+                        "--cookies-from-browser", "firefox",
+                        _dr_url
+                    ])
+                    if _dr_proc:
+                        _dr_deadline = time.time() + 600
+                        _dr_count = 0
+                        _dr_t0 = time.time()
+                        _dr_last_log = 0
+                        while True:
+                            if cancel_event.is_set():
+                                break
+                            if time.time() > _dr_deadline:
+                                log("  \u26a0 Date-resolve: channel listing timed out.\n", "red")
+                                break
+                            line = _dr_proc.stdout.readline()
+                            if not line:
+                                break
+                            line = line.strip()
+                            if not line or "|||" not in line:
+                                continue
+                            _parts = line.split("|||")
+                            _vid_id = _parts[0].strip()
+                            _yt_title = _parts[1].strip() if len(_parts) > 1 else ""
+                            _upload_date = _parts[2].strip() if len(_parts) > 2 else ""
+                            if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id) and _upload_date and re.fullmatch(r'\d{8}', _upload_date):
+                                _yt_by_date.setdefault(_upload_date, []).append((_vid_id, _yt_title))
+                            _dr_count += 1
+                            if _dr_count - _dr_last_log >= 500:
+                                _elapsed = int(time.time() - _dr_t0)
+                                log(f"  ...{_dr_count:,} entries scanned ({_elapsed}s elapsed)\n", "dim")
+                                _dr_last_log = _dr_count
+                        try:
+                            _dr_proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            _dr_proc.kill()
+                            try:
+                                _dr_proc.wait(timeout=5)
+                            except Exception:
+                                pass
+                        cleanup_process(_dr_proc)
+                        _dr_proc = None
+                except Exception as e:
+                    log(f"  \u26a0 Date-resolve: listing failed: {e}\n", "red")
+                finally:
+                    if _dr_proc is not None:
+                        cleanup_process(_dr_proc)
+
+            if _yt_by_date and not cancel_event.is_set():
+                log(f"  Date-resolving {len(_need_search)} video(s) by upload date...\n", "dim")
+
+                # Build known-IDs set to avoid duplicate assignment
+                _date_known = set(vid for vid, *_ in _resolved_rows)
+                try:
+                    for _db_vid, in tp._db_execute(
+                            "SELECT DISTINCT video_id FROM videos WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
+                            (ch_name,)).fetchall():
+                        _date_known.add(_db_vid)
+                except Exception:
+                    pass
+
+                # Title normalizer (same logic as batch-resolve)
+                _dr_re_unsafe = re.compile(r'[\\/:*?"<>|]')
+                _dr_re_ws = re.compile(r'\s+')
+                def _dr_norm(t):
+                    s = unicodedata.normalize('NFKC', t)
+                    s = _dr_re_unsafe.sub('', s)
+                    s = _dr_re_ws.sub(' ', s).strip()
+                    return s.lower()
+
+                _date_found = 0
+                _date_skipped = 0
+                _still_need = []
+
+                for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+                    if cancel_event.is_set():
+                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        continue
+
+                    # Get this file's upload date from mtime
+                    _file_date = None
+                    if _s_filepath and os.path.isfile(_s_filepath):
+                        try:
+                            _mtime = os.path.getmtime(_s_filepath)
+                            _file_date = datetime.fromtimestamp(_mtime).strftime("%Y%m%d")
+                        except (OSError, ValueError):
+                            pass
+
+                    if not _file_date:
+                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        continue
+
+                    # Gather YouTube videos from that date +/- 1 day (timezone safety)
+                    _candidates = []
+                    try:
+                        _dt = datetime.strptime(_file_date, "%Y%m%d")
+                        for _day_off in (-1, 0, 1):
+                            _check = (_dt + timedelta(days=_day_off)).strftime("%Y%m%d")
+                            _candidates.extend(_yt_by_date.get(_check, []))
+                    except ValueError:
+                        _candidates = _yt_by_date.get(_file_date, [])
+
+                    # Remove video IDs we already resolved
+                    _candidates = [(vid, t) for vid, t in _candidates if vid not in _date_known]
+
+                    if not _candidates:
+                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        continue
+
+                    _matched_id = None
+
+                    if len(_candidates) == 1:
+                        # Only 1 unknown video on this date — direct match
+                        _matched_id = _candidates[0][0]
+                    else:
+                        # Multiple candidates — try exact normalized title match first
+                        _local_norm = _dr_norm(_s_title)
+                        _exact = [vid for vid, t in _candidates if _dr_norm(t) == _local_norm]
+                        if len(_exact) == 1:
+                            _matched_id = _exact[0]
+                        else:
+                            # Word-overlap fuzzy match
+                            _local_words = set(re.findall(r'[a-z0-9]+', _local_norm))
+                            if len(_local_words) >= 2:
+                                _best_overlap = 0
+                                _best_vid = None
+                                _best_tied = False
+                                for _c_vid, _c_title in _candidates:
+                                    _c_words = set(re.findall(r'[a-z0-9]+', _dr_norm(_c_title)))
+                                    _overlap = len(_local_words & _c_words)
+                                    if _overlap > _best_overlap:
+                                        _best_overlap = _overlap
+                                        _best_vid = _c_vid
+                                        _best_tied = False
+                                    elif _overlap == _best_overlap and _overlap > 0:
+                                        _best_tied = True
+                                # Accept only if ≥50% word overlap with no tie
+                                if (_best_vid and not _best_tied
+                                        and _best_overlap >= max(2, len(_local_words) * 0.5)):
+                                    _matched_id = _best_vid
+
+                    if _matched_id:
+                        _date_known.add(_matched_id)
+                        _resolved_rows.append((_matched_id, _s_title, _s_year, _s_month, _s_filepath))
+                        _date_found += 1
+                        _no_id_count -= 1
+                        if _s_filepath:
+                            try:
+                                tp._db_execute(
+                                    "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                    (_matched_id, _s_filepath))
+                            except Exception:
+                                pass
+                    else:
+                        _date_skipped += 1
+                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+
+                _need_search = _still_need
+                if _date_found:
+                    log(f"  Date-resolved {_date_found} video ID(s) by upload date.\n", "green")
+                    try:
+                        tp._db_commit()
+                    except Exception:
+                        pass
+                if _date_skipped:
+                    log(f"  ({_date_skipped} skipped \u2014 ambiguous date match)\n", "dim")
+
     if _resolved_rows:
         try:
             tp._db_commit()
         except Exception:
             pass
     if _no_id_count:
-        log(f"  ({_no_id_count} video(s) skipped — no video ID found)\n", "dim")
+        log(f"  ({_no_id_count} video(s) skipped \u2014 no video ID found)\n", "dim")
 
     # Group videos by their target folder
     folder_groups = {}

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.3"
+APP_VERSION = "v35.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 10:07am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 10:21am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -25154,7 +25154,8 @@ class _TranscriptionPanel(ttk.Frame):
     def _browse_retranscribe_status(self, msg):
         """Update progress in the transcript notice area (above the body text).
         Replaces whatever is in the notice area and adjusts all word char
-        offsets by the length delta so highlights and clicks stay correct."""
+        offsets by the length delta so highlights and clicks stay correct.
+        Also pushes a log update so the main log stays in sync."""
         def _update():
             try:
                 tw = self._player_transcript
@@ -25182,6 +25183,15 @@ class _TranscriptionPanel(ttk.Frame):
             except Exception:
                 pass
         self.after(0, _update)
+        # Also push to main log so the mini log stays in sync —
+        # the _whisper_transcribe log() call can lag behind via _ui_queue
+        meta = self._browse_current_meta
+        _title = meta.get("title", "") if meta else ""
+        if _title:
+            _t = _title[:50] + "..." if len(_title) > 50 else _title
+            log(f"  {msg} — \"{_t}\"\n", "whisper_progress")
+        else:
+            log(f"  {msg}\n", "whisper_progress")
 
     def _browse_retranscribe_done(self, success, error_msg=None):
         """Called when re-transcription finishes (from worker thread)."""
@@ -27977,6 +27987,9 @@ class _TranscriptionPanel(ttk.Frame):
         self._player_last_word_idx = -1
 
         self._show_section("browse")
+        # Refresh browse viewer so it picks up any transcript changes
+        # (e.g. after re-transcription while the player was open)
+        self._on_browse_select()
 
     def _player_toggle_pause(self):
         if not self._vlc_player:

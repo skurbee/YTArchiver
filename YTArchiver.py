@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.0"
+APP_VERSION = "v36.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:23am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:55am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11565,6 +11565,18 @@ def _start_metadata_task(item):
             _current_job.pop("_metadata_key", None)
             _tray_stop_spin()
             _update_tray_tooltip("YT Archiver — Idle")
+            # Update disk cache so the channel list shows "Done" instead of "Auto"
+            try:
+                _ch_url = item.get("ch_url", "")
+                if _ch_url:
+                    with config_lock:
+                        _ch_cfg = next((c for c in config.get("channels", [])
+                                        if c.get("url") == _ch_url), None)
+                    if _ch_cfg:
+                        _update_disk_cache_for_channel(_ch_cfg)
+                        _ui_queue.append(refresh_channel_list)
+            except Exception:
+                pass
 
             _queue_started = False
             if _skip_current.is_set():
@@ -11898,10 +11910,12 @@ def _run_metadata_download(item):
                     _need_search = _still_need
                     if _batch_found:
                         log(f"  Batch-resolved {_batch_found:,} video ID(s) via channel playlist.\n", "green")
-                        try:
-                            tp._db_commit()
-                        except Exception:
-                            pass
+                    # Always commit after batch — even partial matches should
+                    # persist so they survive program restarts.
+                    try:
+                        tp._db_commit()
+                    except Exception:
+                        pass
                     if _need_search:
                         log(f"  {len(_need_search)} video(s) still unmatched \u2014 falling back to individual search.\n", "dim")
                 else:
@@ -11986,6 +12000,12 @@ def _run_metadata_download(item):
                                             (_found_id, _s_filepath))
                                     except Exception:
                                         pass
+                                # Commit every 10 finds so progress survives restarts
+                                if _search_found % 10 == 0:
+                                    try:
+                                        tp._db_commit()
+                                    except Exception:
+                                        pass
             except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
                 if _search_proc is not None:
                     try:
@@ -11995,10 +12015,11 @@ def _run_metadata_download(item):
                         pass
         if _search_found:
             log(f"  Found {_search_found} video ID(s) via YouTube search.\n", "dim")
-            try:
-                tp._db_commit()
-            except Exception:
-                pass
+        # Always commit at end — catches the last <10 that didn't trigger periodic commit
+        try:
+            tp._db_commit()
+        except Exception:
+            pass
 
     # ── Date-based elimination: match unresolved videos by upload date ──
     # Most channels upload ≤1-2 videos/day.  For videos that couldn't be

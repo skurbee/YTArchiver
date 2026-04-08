@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.2"
+APP_VERSION = "v35.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:56am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 10:07am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -25152,13 +25152,33 @@ class _TranscriptionPanel(ttk.Frame):
         threading.Thread(target=_retranscribe_worker, daemon=True).start()
 
     def _browse_retranscribe_status(self, msg):
-        """Update status in the player title bar from a worker thread.
-        Uses the title label instead of inserting into the transcript
-        widget — inserting text would shift all char offsets and break
-        the word highlight / click-to-seek mapping."""
+        """Update progress in the transcript notice area (above the body text).
+        Replaces whatever is in the notice area and adjusts all word char
+        offsets by the length delta so highlights and clicks stay correct."""
         def _update():
             try:
-                self._player_title_lbl.config(text=msg)
+                tw = self._player_transcript
+                old_len = self._player_body_char_offset
+                new_text = msg + "\n\n"
+                new_len = len(new_text)
+                delta = new_len - old_len
+
+                tw.config(state="normal")
+                # Delete the current notice area (0 to old_len chars)
+                if old_len > 0:
+                    tw.delete("1.0", f"1.0+{old_len}c")
+                # Insert new status text at the top
+                tw.insert("1.0", new_text, "retrans_status")
+                tw.tag_configure("retrans_status", foreground="#6a9fd6",
+                                 font=("Segoe UI", 9, "italic"))
+                tw.config(state="disabled")
+
+                # Adjust all word char offsets by the delta
+                if delta != 0:
+                    for wd in self._player_words:
+                        wd["cs"] += delta
+                        wd["ce"] += delta
+                self._player_body_char_offset = new_len
             except Exception:
                 pass
         self.after(0, _update)
@@ -25275,6 +25295,7 @@ class _TranscriptionPanel(ttk.Frame):
                 self._player_transcript.insert("end", _yt_suffix, "yt_notice")
                 _body_char_offset += len(_yt_notice) + len(_yt_link) + len(_yt_suffix)
             self._player_transcript.insert("end", body + "\n")
+            self._player_body_char_offset = _body_char_offset
 
         # Rebuild word timing map
         all_words = []
@@ -27649,6 +27670,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._player_active = False
         self._player_poll_id = None
         self._player_words  = []   # [{"w": str, "s": float, "e": float, "cs": int, "ce": int}, ...]
+        self._player_body_char_offset = 0  # chars before body text (notice area)
         self._player_video_path = None
         self._player_last_word_idx = -1
 
@@ -27761,6 +27783,7 @@ class _TranscriptionPanel(ttk.Frame):
                 self._player_transcript.insert("end", _yt_suffix, "yt_notice")
                 _body_char_offset += len(_yt_notice) + len(_yt_link) + len(_yt_suffix)
             self._player_transcript.insert("end", body + "\n")
+            self._player_body_char_offset = _body_char_offset
         else:
             if tx_status == "no_captions":
                 self._player_transcript.insert("end",

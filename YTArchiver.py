@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.3"
+APP_VERSION = "v34.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3793,7 +3793,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -28263,8 +28263,9 @@ class _TranscriptionPanel(ttk.Frame):
                 segs  = self._db_execute(
                     "SELECT COUNT(*) FROM segments").fetchone()[0]
                 vids  = self._db_execute(
-                    "SELECT COUNT(DISTINCT channel || '\x00' || title) "
-                    "FROM segments").fetchone()[0]
+                    "SELECT COUNT(*) FROM "
+                    "(SELECT DISTINCT channel, title FROM segments)"
+                    ).fetchone()[0]
                 chs   = self._db_execute(
                     "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
                 files = self._db_execute(

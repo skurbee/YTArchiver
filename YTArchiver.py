@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.2"
+APP_VERSION = "v36.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 4:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 4:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -22717,15 +22717,6 @@ class _TranscriptionPanel(ttk.Frame):
             year = meta.get("year")
             month = meta.get("month")
             self._show_grid(channel, year, month)
-            # Preload children in background so expanding is instant
-            iid = sel[0]
-            children = self._browse_tree.get_children(iid)
-            if (len(children) == 1
-                    and self._BROWSE_PLACEHOLDER in self._browse_tree.item(children[0], "tags")):
-                self._browse_tree.delete(children[0])
-                self._populate_browse_children(iid, meta)
-                # Keep node collapsed — just preloaded
-                self._browse_tree.item(iid, open=False)
             return
         if meta["type"] != "title":
             return

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.6"
+APP_VERSION = "v35.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -516,11 +516,11 @@ def _sync_mini_logs_timer():
     """
     _changed = False
     try:
-        # Peek at log index before syncing to detect if content changed
-        if 'log_box' in globals() and log_box.winfo_exists():
-            _cur = log_box.index("end-1c")
-            _changed = (_cur != _mini_log_last_end[0])
+        # _sync_mini_logs_from_main sets _mini_log_last_end[0] when it
+        # detects a change, so we just check if the sync did any work.
+        _prev = _mini_log_last_end[0]
         _sync_mini_logs_from_main()
+        _changed = (_mini_log_last_end[0] != _prev)
     except Exception:
         pass
     try:
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 10:44am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:01am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4249,6 +4249,57 @@ log_box.tag_raise("trans_bracket", "transcribe_prefix")
 log_box.tag_raise("meta_bracket", "simpleline")
 log_box.tag_raise("meta_bracket", "simpleline_pink")
 log_box.tag_raise("meta_bracket", "metadata_using")
+
+# Shared tag config for ALL mini logs — defined once to prevent drift between
+# the subs, recent, and browse mini logs.  Must match main log_box colors exactly.
+_MINI_LOG_TAGS = [
+    ("green", {"foreground": C_LOG_GREEN}),
+    ("red", {"foreground": C_LOG_RED}),
+    ("dim", {"foreground": C_LOG_DIM}),
+    ("header", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
+    ("summary", {"foreground": C_LOG_SUM, "font": ("Consolas", 9, "italic")}),
+    ("simpleline", {"foreground": C_TEXT}),
+    ("simpleline_green", {"foreground": C_LOG_GREEN}),
+    ("simpleline_blue", {"foreground": C_LOG_BLUE}),
+    ("simpleline_pink", {"foreground": C_LOG_PINK}),
+    ("simpledownload", {"foreground": C_LOG_GREEN}),
+    ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
+    ("simplestatus_green", {"foreground": C_LOG_GREEN}),
+    ("simplestatus_white", {"foreground": C_TEXT}),
+    ("scanline", {"foreground": C_TEXT}),
+    ("dlprogress", {"foreground": C_TEXT}),
+    ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
+    ("pauselog", {"foreground": C_LOG_HEAD}),
+    ("pausestatus", {"foreground": C_LOG_HEAD}),
+    ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
+    ("filterskip", {"foreground": C_LOG_SUM}),
+    ("filterskip_dim", {"foreground": "#4a5060"}),
+    ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
+    ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
+    ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
+    ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
+    ("whisper_prefix", {"foreground": C_TEXT}),
+    ("whisper_bracket", {"foreground": C_LOG_BLUE}),
+    ("whisper_title", {"foreground": C_TEXT}),
+    ("whisper_progress", {"foreground": C_LOG_BLUE}),
+    ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+    ("whisper_dots", {"foreground": C_LOG_BLUE}),
+    ("encode_progress", {"foreground": C_LOG_BLUE}),
+    ("encode_prefix", {"foreground": C_TEXT}),
+    ("encode_title", {"foreground": C_TEXT}),
+    ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
+    ("encode_dots", {"foreground": C_LOG_BLUE}),
+    ("encode_suffix", {"foreground": C_LOG_BLUE}),
+    ("transcribe_prefix", {"foreground": C_TEXT}),
+    ("transcribe_title", {"foreground": C_TEXT}),
+    ("transcribe_using", {"foreground": C_LOG_BLUE}),
+    ("metadata_using", {"foreground": C_TEXT}),
+    ("dl_white", {"foreground": "#ffffff"}),
+    ("meta_bracket", {"foreground": C_LOG_PINK}),
+    ("trans_bracket", {"foreground": C_LOG_BLUE}),
+    ("sync_bracket", {"foreground": C_LOG_GREEN}),
+    ("trans_dots", {"foreground": C_LOG_BLUE}),
+]
 
 
 # Set initial sash position so the log panel starts with ~3 lines of space
@@ -14446,49 +14497,7 @@ subs_mini_log = tk.Text(_subs_mini_log_frame, state="disabled", height=4,
                          padx=8, pady=4, wrap="none")
 subs_mini_log.grid(row=0, column=0, sticky="ew")
 
-for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
-                             ("red", {"foreground": C_LOG_RED}),
-                             ("header", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
-                             ("summary", {"foreground": C_LOG_SUM, "font": ("Consolas", 9, "italic")}),
-                             ("simpleline", {"foreground": C_TEXT}),
-                             ("simpleline_green", {"foreground": C_LOG_GREEN}),
-                             ("simpleline_blue", {"foreground": C_LOG_BLUE}),
-                             ("simpleline_pink", {"foreground": C_LOG_PINK}),
-                             ("simpledownload", {"foreground": C_LOG_GREEN}),
-                             ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
-                             ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("simplestatus_white", {"foreground": C_TEXT}),
-                             ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
-                             ("pauselog", {"foreground": C_LOG_HEAD}),
-                             ("pausestatus", {"foreground": C_LOG_HEAD}),
-                             ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                             ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("filterskip_dim", {"foreground": "#4a5060"}),
-                             ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
-                             ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
-                             ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
-                             ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_prefix", {"foreground": C_TEXT}),
-                             ("whisper_bracket", {"foreground": C_LOG_BLUE}),
-                             ("whisper_title", {"foreground": C_TEXT}),
-                             ("whisper_progress", {"foreground": C_LOG_BLUE}),
-                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_dots", {"foreground": C_LOG_BLUE}),
-                             ("encode_progress", {"foreground": C_LOG_BLUE}),
-                             ("encode_prefix", {"foreground": C_TEXT}),
-                             ("encode_title", {"foreground": C_TEXT}),
-                             ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("encode_dots", {"foreground": C_LOG_BLUE}),
-                             ("encode_suffix", {"foreground": C_LOG_BLUE}),
-                             ("transcribe_prefix", {"foreground": C_TEXT}),
-                             ("transcribe_title", {"foreground": C_TEXT}),
-                             ("transcribe_using", {"foreground": C_LOG_BLUE}),
-                             ("metadata_using", {"foreground": C_TEXT}),
-                             ("dl_white", {"foreground": "#ffffff"}),
-                             ("meta_bracket", {"foreground": C_LOG_PINK}),
-                             ("trans_bracket", {"foreground": C_LOG_BLUE}),
-                             ("sync_bracket", {"foreground": C_LOG_GREEN}),
-                             ("trans_dots", {"foreground": C_LOG_BLUE})]:
+for _tag_name, _tag_cfg in _MINI_LOG_TAGS:
     subs_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 
@@ -21747,51 +21756,9 @@ class _TranscriptionPanel(ttk.Frame):
                                   highlightthickness=1, highlightbackground="#2a2d33",
                                   highlightcolor="#2a2d33", padx=8, pady=4, wrap="none")
         self._mini_log.grid(row=0, column=0, sticky="ew")
-        # Configure all log tags (must match subs/recent mini logs)
-        for _tn, _tc in [("green", {"foreground": "#3dd68c"}),
-                          ("red", {"foreground": "#ff6b6b"}),
-                          ("header", {"foreground": "#a0aabb", "font": ("Consolas", 9, "bold")}),
-                          ("summary", {"foreground": "#999", "font": ("Consolas", 9, "italic")}),
-                          ("simpleline", {"foreground": self._TP_FG}),
-                          ("simpleline_green", {"foreground": "#3dd68c"}),
-                          ("simpleline_blue", {"foreground": "#7eb8da"}),
-                          ("simpleline_pink", {"foreground": "#e87aac"}),
-                          ("simpledownload", {"foreground": "#3dd68c"}),
-                          ("simplestatus", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
-                          ("simplestatus_green", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
-                          ("simplestatus_white", {"foreground": self._TP_FG}),
-                          ("dlprogress_pct", {"foreground": "#3dd68c"}),
-                          ("pauselog", {"foreground": "#a0aabb"}),
-                          ("pausestatus", {"foreground": "#a0aabb"}),
-                          ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                          ("filterskip", {"foreground": "#999"}),
-                          ("filterskip_dim", {"foreground": "#4a5060"}),
-                          ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
-                          ("tx_head", {"foreground": "#7eb8da", "font": ("Consolas", 9, "bold")}),
-                          ("update_sep", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                          ("update_head", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                          ("whisper_prefix", {"foreground": self._TP_FG}),
-                          ("whisper_bracket", {"foreground": "#7eb8da"}),
-                          ("whisper_title", {"foreground": self._TP_FG}),
-                          ("whisper_progress", {"foreground": "#7eb8da"}),
-                          ("whisper_pct", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
-                          ("whisper_dots", {"foreground": "#7eb8da"}),
-                          ("encode_progress", {"foreground": "#7eb8da"}),
-                          ("encode_prefix", {"foreground": self._TP_FG}),
-                          ("encode_title", {"foreground": self._TP_FG}),
-                          ("encode_pct", {"foreground": "#3dd68c", "font": ("Consolas", 9, "bold")}),
-                          ("encode_dots", {"foreground": "#7eb8da"}),
-                          ("encode_suffix", {"foreground": "#7eb8da"}),
-                          ("transcribe_prefix", {"foreground": self._TP_FG}),
-                          ("transcribe_title", {"foreground": self._TP_FG}),
-                          ("transcribe_using", {"foreground": "#7eb8da"}),
-                          ("metadata_using", {"foreground": self._TP_FG}),
-                          ("dim", {"foreground": "#666"}),
-                          ("dl_white", {"foreground": "#ffffff"}),
-                          ("meta_bracket", {"foreground": "#e87aac"}),
-                          ("trans_bracket", {"foreground": "#7eb8da"}),
-                          ("sync_bracket", {"foreground": "#3dd68c"}),
-                          ("trans_dots", {"foreground": "#7eb8da"})]:
+        # Configure all log tags — uses the shared _MINI_LOG_TAGS list
+        # so colors/fonts are guaranteed identical to subs/recent mini logs
+        for _tn, _tc in _MINI_LOG_TAGS:
             self._mini_log.tag_configure(_tn, **_tc)
 
         self._show_section("browse")
@@ -28988,49 +28955,7 @@ recent_mini_log = tk.Text(_recent_mini_log_frame, state="disabled", height=4,
                            padx=8, pady=4, wrap="none")
 recent_mini_log.grid(row=0, column=0, sticky="ew")
 
-for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
-                             ("red", {"foreground": C_LOG_RED}),
-                             ("header", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
-                             ("summary", {"foreground": C_LOG_SUM, "font": ("Consolas", 9, "italic")}),
-                             ("simpleline", {"foreground": C_TEXT}),
-                             ("simpleline_green", {"foreground": C_LOG_GREEN}),
-                             ("simpleline_blue", {"foreground": C_LOG_BLUE}),
-                             ("simpleline_pink", {"foreground": C_LOG_PINK}),
-                             ("simpledownload", {"foreground": C_LOG_GREEN}),
-                             ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
-                             ("simplestatus_green", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("simplestatus_white", {"foreground": C_TEXT}),
-                             ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
-                             ("pauselog", {"foreground": C_LOG_HEAD}),
-                             ("pausestatus", {"foreground": C_LOG_HEAD}),
-                             ("livestream", {"foreground": "#f5a023", "font": ("Consolas", 9, "bold")}),
-                             ("filterskip", {"foreground": C_LOG_SUM}),
-                             ("filterskip_dim", {"foreground": "#4a5060"}),
-                             ("tx_sep", {"foreground": "#ffffff", "font": ("Consolas", 9, "bold")}),
-                             ("tx_head", {"foreground": C_LOG_BLUE, "font": ("Consolas", 9, "bold")}),
-                             ("update_sep", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
-                             ("update_head", {"foreground": C_LOG_UPDATE, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_prefix", {"foreground": C_TEXT}),
-                             ("whisper_bracket", {"foreground": C_LOG_BLUE}),
-                             ("whisper_title", {"foreground": C_TEXT}),
-                             ("whisper_progress", {"foreground": C_LOG_BLUE}),
-                             ("whisper_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("whisper_dots", {"foreground": C_LOG_BLUE}),
-                             ("encode_progress", {"foreground": C_LOG_BLUE}),
-                             ("encode_prefix", {"foreground": C_TEXT}),
-                             ("encode_title", {"foreground": C_TEXT}),
-                             ("encode_pct", {"foreground": C_LOG_GREEN, "font": ("Consolas", 9, "bold")}),
-                             ("encode_dots", {"foreground": C_LOG_BLUE}),
-                             ("encode_suffix", {"foreground": C_LOG_BLUE}),
-                             ("transcribe_prefix", {"foreground": C_TEXT}),
-                             ("transcribe_title", {"foreground": C_TEXT}),
-                             ("transcribe_using", {"foreground": C_LOG_BLUE}),
-                             ("metadata_using", {"foreground": C_TEXT}),
-                             ("dl_white", {"foreground": "#ffffff"}),
-                             ("meta_bracket", {"foreground": C_LOG_PINK}),
-                             ("trans_bracket", {"foreground": C_LOG_BLUE}),
-                             ("sync_bracket", {"foreground": C_LOG_GREEN}),
-                             ("trans_dots", {"foreground": C_LOG_BLUE})]:
+for _tag_name, _tag_cfg in _MINI_LOG_TAGS:
     recent_mini_log.tag_configure(_tag_name, **_tag_cfg)
 
 # All known log tags for mini-log mirroring (priority order for detection)
@@ -29042,7 +28967,8 @@ for _tag_name, _tag_cfg in [("green", {"foreground": C_LOG_GREEN}),
 # blue/green color in mini-log mirroring — mirrors the tag_raise() calls on the main log.
 _ALL_LOG_TAGS = ("green", "red",
                  "meta_bracket", "trans_bracket", "sync_bracket",
-                 "header", "tx_sep", "tx_head", "summary", "simpleline", "simpleline_green",
+                 "header", "tx_sep", "tx_head", "update_sep", "update_head",
+                 "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpleline_pink", "simpledownload",
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
@@ -29071,11 +28997,17 @@ def _sync_mini_logs_from_main():
 
         # Get total line count in main log
         end_idx = log_box.index("end-1c")
-        # Fast path: skip if nothing changed since last sync
-        if end_idx == _mini_log_last_end[0]:
-            return
-        _mini_log_last_end[0] = end_idx
+        # Fast path: skip if nothing changed since last sync.
+        # Compare both end index AND last-4-lines content so replacements
+        # (like whisper progress updates) that don't change the line count
+        # are still detected.
         total_lines = int(end_idx.split(".")[0])
+        _check_start = max(1, total_lines - 3)
+        _cur_content = log_box.get(f"{_check_start}.0", "end-1c")
+        _cur_key = (end_idx, _cur_content)
+        if _cur_key == _mini_log_last_end[0]:
+            return
+        _mini_log_last_end[0] = _cur_key
         # Empty log check
         if total_lines <= 1 and not log_box.get("1.0", "end-1c").strip():
             _browse_ml2 = _tp_panel_ref[0]._mini_log if (_tp_panel_ref[0] and hasattr(_tp_panel_ref[0], '_mini_log')) else None

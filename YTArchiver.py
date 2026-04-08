@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.0"
+APP_VERSION = "v35.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 8:46am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:33am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -27523,7 +27523,6 @@ class _TranscriptionPanel(ttk.Frame):
         self._player_active = False
         self._player_poll_id = None
         self._player_words  = []   # [{"w": str, "s": float, "e": float, "cs": int, "ce": int}, ...]
-        self._player_segs   = []   # [(start, end, text, char_start, char_end), ...]
         self._player_video_path = None
         self._player_last_word_idx = -1
 
@@ -27549,8 +27548,6 @@ class _TranscriptionPanel(ttk.Frame):
 
         # ── Build transcript ──────────────────────────────────────────
         self._player_words = []
-        self._player_segs = []
-        self._player_prev_tag = None  # for efficient highlight removal
         self._player_transcript.config(state="normal")
         self._player_transcript.delete("1.0", "end")
 
@@ -27704,21 +27701,32 @@ class _TranscriptionPanel(ttk.Frame):
                     idx = body_lower.find(w_lower, search_pos)
                     if idx == -1:
                         break
-                    # Verify word boundary (allow digits/dots adjacent for
-                    # split-decimal tokens like "2mm" inside "2.2mm")
+                    # Verify word boundary.  Relax the left check when
+                    # the token starts with a non-alpha char (e.g. "-10",
+                    # "-selling") — Whisper splits compound words at hyphens
+                    # and the char before the hyphen IS part of the prior word.
                     before = body[idx - 1] if idx > 0 else " "
                     after_i = idx + len(w_lower)
                     after = body[after_i] if after_i < body_len else " "
-                    if not before.isalpha() and (not after.isalpha()
-                                                  or after in ".,!?;:'\""):
+                    left_ok = not before.isalpha() or not w_lower[0].isalpha()
+                    right_ok = not after.isalpha() or after in ".,!?;:'\""
+                    if left_ok and right_ok:
                         best_offset = idx
                         break
                     search_pos = idx + 1
 
                 if best_offset >= 0:
-                    # Determine actual word span (include trailing punctuation)
+                    # Guard: reject matches too far from cursor — prevents
+                    # a single mismatch from cascading through the rest of
+                    # the transcript (e.g. "5-10%" appearing twice).
+                    if best_offset - cursor > 500 and cursor > 0:
+                        continue  # skip — likely matched at a wrong occurrence
+
+                    # Determine actual word span (include trailing punctuation
+                    # but NOT hyphens — Whisper splits "5-10%" into "5","-10","%"
+                    # and consuming the hyphen would break the next token)
                     wend = best_offset + len(w_lower)
-                    while wend < body_len and body[wend] in ".,!?;:'\")-":
+                    while wend < body_len and body[wend] in ".,!?;:'\")" :
                         wend += 1
                     # Store char offsets adjusted for any prefix text (notices)
                     self._player_words.append({

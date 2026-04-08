@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.8"
+APP_VERSION = "v34.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 11:54pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 12:10am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5545,8 +5545,12 @@ def _chan_ctx_show(event):
             _already_syncing = _current_job.get("url") == _ch_url
             if _already_queued or _already_syncing:
                 _chan_ctx_menu.entryconfig(_CTX_IDX_SYNC, label="Already in Sync List",
-                                          state="disabled",
+                                          state="normal", foreground=C_DIM,
                                           command=lambda: None)
+                try:
+                    _chan_ctx_menu.entryconfig(_CTX_IDX_SYNC, activeforeground=C_DIM)
+                except Exception:
+                    pass
             else:
                 _chan_ctx_menu.entryconfig(_CTX_IDX_SYNC, label="Add to Sync List",
                                           state="normal", foreground=C_TEXT,
@@ -5579,7 +5583,7 @@ def _chan_ctx_show(event):
             _gpu_has_items = bool(_gpu_queue)
         if not _has_videos:
             _chan_ctx_menu.entryconfig(_CTX_IDX_TRANSCRIBE, label="No Videos — Sync First",
-                                      state="disabled",
+                                      state="normal", foreground=C_DIM,
                                       command=lambda: None)
             try:
                 _chan_ctx_menu.entryconfig(_CTX_IDX_TRANSCRIBE, activeforeground=C_DIM)
@@ -16513,8 +16517,8 @@ def start_sync_all():
         _update_queue_btn()
         return
 
-    # If a reorg is running, queue the sync for later
-    if _reorg_running or _redownload_running:
+    # If a reorg/redownload/metadata is running, queue the sync for later
+    if _reorg_running or _redownload_running or _metadata_running:
         with _sync_queue_lock:
             # Check if a full sync is already queued
             _channel_urls = {c["url"] for c in channels}
@@ -16529,7 +16533,7 @@ def start_sync_all():
                     _sync_queue.append(_ch_copy)
                     with _queue_order_lock:
                         _queue_order.append(("sync", ch["url"]))
-        _what = "redownload" if _redownload_running else "reorganize"
+        _what = "redownload" if _redownload_running else ("metadata download" if _metadata_running else "reorganize")
         log(f"\n=== Sync added to Sync List ({_what} in progress) ===\n", "header")
         sync_btn.config(state="disabled")
         _update_queue_btn()

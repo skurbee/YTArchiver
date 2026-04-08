@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.9"
+APP_VERSION = "v34.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2684,12 +2684,12 @@ def _scan_channel_disk_info(ch):
     _ch_bytes = 0
     _has_transcripts = False
     _has_metadata = False
-    _dirs_with_tx = set()  # directories containing transcript files
     _video_files = []      # (filepath, title, size, dirpath) for browse registration
+    _transcribed_titles = set()  # per-video titles from Transcript.txt files
+    _tx_hdr_re = re.compile(r'^===\((.+?)\),\s*\(')
     try:
         if os.path.isdir(_ch_folder):
             for _dp, _dns, _fns in os.walk(_ch_folder):
-                _dir_has_tx = False
                 for _fn in _fns:
                     _fn_lower = _fn.lower()
                     if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
@@ -2705,11 +2705,20 @@ def _scan_channel_disk_info(ch):
                         _video_files.append((_fp, os.path.splitext(_fn)[0], _sz, _dp))
                     elif _fn_lower.endswith("transcript.txt") or _fn_lower.endswith(".jsonl"):
                         _has_transcripts = True
-                        _dir_has_tx = True
                     if not _has_metadata and _fn_lower.endswith("metadata.jsonl") and _fn.startswith("."):
                         _has_metadata = True
-                if _dir_has_tx:
-                    _dirs_with_tx.add(_dp)
+                    # Extract per-video titles from Transcript.txt files
+                    if _fn.startswith(_ch_name) and _fn_lower.endswith("transcript.txt"):
+                        try:
+                            with open(os.path.join(_dp, _fn), "r",
+                                      encoding="utf-8") as _txf:
+                                for _txline in _txf:
+                                    if _txline.startswith("===("):
+                                        _txm = _tx_hdr_re.match(_txline.strip())
+                                        if _txm:
+                                            _transcribed_titles.add(_txm.group(1))
+                        except Exception:
+                            pass
     except Exception:
         pass
 
@@ -2733,18 +2742,8 @@ def _scan_channel_disk_info(ch):
                 _candidate = _title[_bracket + 2:-1]
                 if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
                     _vid_id = _candidate
-            # Check if transcript exists in this dir or parents
-            _tx = False
-            _chk = _dp
-            for _ in range(3):
-                if _chk in _dirs_with_tx:
-                    _tx = True
-                    break
-                _p = os.path.dirname(_chk)
-                if _p == _chk:
-                    break
-                _chk = _p
-            _status = "transcribed" if _tx else "pending"
+            # Per-video check: is this title in a Transcript.txt?
+            _status = "transcribed" if _title in _transcribed_titles else "pending"
             try:
                 tp._db_execute(
                     "INSERT OR IGNORE INTO videos "
@@ -3794,7 +3793,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 7:51pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 9:08pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -21164,15 +21163,31 @@ class _TranscriptionPanel(ttk.Frame):
             count = 0
             # Single-pass scan: collect transcript dirs AND video files together
             # to avoid walking the same directory tree twice (was NEW-3 audit item).
-            dirs_with_transcripts = set()
+            # Also extract per-video titles from Transcript.txt files so tx_status
+            # is set per-video, not per-directory (fixes false "transcribed" status
+            # for videos that share a folder with transcribed videos but have no
+            # transcript themselves).
+            channel_transcribed = {}  # {ch_name: set_of_titles}
+            _tx_hdr_re = re.compile(r'^===\((.+?)\),\s*\(')
             pending_videos = []  # (ch_name, root_dir, dirpath, fn, fn_lower)
             for ch_name, ch_path, root_dir in channel_dirs:
+                _ch_titles = channel_transcribed.setdefault(ch_name, set())
                 for dirpath, _, filenames in os.walk(ch_path, followlinks=False):
                     for fn in filenames:
                         fn_lower = fn.lower()
-                        # Track dirs containing transcript/jsonl files
-                        if (fn_lower.endswith('.txt') and 'transcript' in fn_lower) or fn_lower.endswith('.jsonl'):
-                            dirs_with_transcripts.add(dirpath)
+                        # Extract per-video titles from Transcript.txt files
+                        if fn.startswith(ch_name) and fn_lower.endswith("transcript.txt"):
+                            try:
+                                with open(os.path.join(dirpath, fn), "r",
+                                          encoding="utf-8") as _txf:
+                                    for _txline in _txf:
+                                        if _txline.startswith("===("):
+                                            _txm = _tx_hdr_re.match(
+                                                _txline.strip())
+                                            if _txm:
+                                                _ch_titles.add(_txm.group(1))
+                            except Exception:
+                                pass
                         # Collect video files for DB insertion
                         if fn_lower.endswith(self._TP_VIDEO_EXTS) and ".temp." not in fn_lower and not fn_lower.endswith(".part"):
                             pending_videos.append((ch_name, root_dir, dirpath, fn, fn_lower))
@@ -21194,19 +21209,14 @@ class _TranscriptionPanel(ttk.Frame):
                     sz = os.path.getsize(fp)
                 except OSError:
                     sz = None
-                # Check if transcript files exist on disk in this dir
-                # or any parent dir (handles split_years/split_months)
-                has_tx = False
-                _chk = dirpath
-                for _ in range(3):
-                    if _chk in dirs_with_transcripts:
-                        has_tx = True
-                        break
-                    _p = os.path.dirname(_chk)
-                    if _p == _chk:
-                        break
-                    _chk = _p
-                status = "transcribed" if has_tx else "pending"
+                # Per-video check: is this video's title actually in a
+                # Transcript.txt for its channel?  (Previously this was a
+                # directory-level check that falsely marked ~4 000 videos as
+                # "transcribed" just because *other* videos in the same folder
+                # had transcripts.)
+                status = ("transcribed"
+                          if title in channel_transcribed.get(ch_name, set())
+                          else "pending")
                 try:
                     self._db_execute(
                         "INSERT OR IGNORE INTO videos "
@@ -21225,28 +21235,47 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     continue
             self._db_commit()
-            # Reconcile: update any existing 'pending' videos that actually
-            # have transcript files on disk (covers re-scans after transcription)
+            # Reconcile tx_status per-video (both directions):
+            #  - pending  → transcribed  if title IS in a Transcript.txt
+            #  - transcribed → pending   if title is NOT (fixes false positives)
+            # Then update config counters so re-transcription queues catch them.
+            _newly_pending_channels = set()
             try:
-                pending = self._db_execute(
-                    "SELECT id, filepath FROM videos "
-                    "WHERE tx_status='pending' AND filepath IS NOT NULL"
+                _recon_rows = self._db_execute(
+                    "SELECT id, title, channel, tx_status FROM videos "
+                    "WHERE filepath != '__schema_ver__' AND channel != '__ver__'"
                 ).fetchall()
-                for vid_id, fp in pending:
-                    _chk = os.path.dirname(fp)
-                    for _ in range(3):
-                        if _chk in dirs_with_transcripts:
-                            self._db_execute(
-                                "UPDATE videos SET tx_status='transcribed' WHERE id=?",
-                                (vid_id,))
-                            break
-                        _p = os.path.dirname(_chk)
-                        if _p == _chk:
-                            break
-                        _chk = _p
+                for _rid, _rtitle, _rch, _rstatus in _recon_rows:
+                    _is_done = _rtitle in channel_transcribed.get(_rch, set())
+                    if _rstatus == "pending" and _is_done:
+                        self._db_execute(
+                            "UPDATE videos SET tx_status='transcribed' "
+                            "WHERE id=?", (_rid,))
+                    elif _rstatus == "transcribed" and not _is_done:
+                        self._db_execute(
+                            "UPDATE videos SET tx_status='pending' "
+                            "WHERE id=?", (_rid,))
+                        _newly_pending_channels.add(_rch)
                 self._db_commit()
             except Exception:
                 pass
+            # Update config: flag affected channels so they get re-queued
+            if _newly_pending_channels:
+                try:
+                    with config_lock:
+                        for _cfg_ch in config.get("channels", []):
+                            if _cfg_ch.get("name") in _newly_pending_channels:
+                                # Count actual pending videos for this channel
+                                _pcount = self._db_execute(
+                                    "SELECT COUNT(*) FROM videos "
+                                    "WHERE channel=? AND tx_status='pending'",
+                                    (_cfg_ch["name"],)).fetchone()[0]
+                                if _pcount > 0:
+                                    _cfg_ch["transcription_pending"] = _pcount
+                                    _cfg_ch["transcription_complete"] = False
+                        save_config(config)
+                except Exception:
+                    pass
             # Reconcile channel names: fix rows where the channel name from
             # yt-dlp metadata doesn't match the config name (e.g. "David
             # Pakman Show" vs "David Pakman") by matching filepath to channel folder
@@ -21507,46 +21536,39 @@ class _TranscriptionPanel(ttk.Frame):
 
     def prompt_reindex(self, channel_name=""):
         """Called (from worker thread) when a transcription job finishes."""
-        # Update tx_status for transcribed videos in this channel.
-        # Check both the segments DB AND transcript files on disk (covers
-        # channels that have been transcribed but not yet indexed).
+        # Update tx_status per-video for this channel by checking if each
+        # video's title actually appears in a Transcript.txt on disk.
         if self._conn and channel_name:
             try:
+                # Find the channel folder to scan transcripts
+                _roots = self._get_archive_roots()
+                _ch_folder = channel_name
+                with config_lock:
+                    for _cfg in config.get("channels", []):
+                        if _cfg.get("name") == channel_name:
+                            _ch_folder = (_cfg.get("folder_override", "").strip()
+                                          or channel_name)
+                            break
+                _done_titles = set()
+                for _root in _roots:
+                    _ch_path = os.path.join(_root, sanitize_folder(_ch_folder))
+                    if os.path.isdir(_ch_path):
+                        _done_titles |= _scan_existing_transcripts(
+                            _ch_path, channel_name)
                 with self._db_lock:
                     pending = self._db_execute(
-                        "SELECT id, filepath FROM videos "
-                        "WHERE channel=? AND tx_status='pending' AND filepath IS NOT NULL",
+                        "SELECT id, title FROM videos "
+                        "WHERE channel=? AND tx_status='pending' "
+                        "AND filepath IS NOT NULL",
                         (channel_name,)).fetchall()
-                _to_update = []
-                for vid_id, fp in pending:
-                    vid_dir = os.path.dirname(fp)
-                    # Check disk for transcript files in video's dir tree
-                    found = False
-                    _chk = vid_dir
-                    for _ in range(3):
-                        try:
-                            for fn in os.listdir(_chk):
-                                fn_l = fn.lower()
-                                if (fn_l.endswith('.jsonl') or
-                                        (fn_l.endswith('.txt') and 'transcript' in fn_l)):
-                                    found = True
-                                    break
-                        except OSError:
-                            pass
-                        if found:
-                            break
-                        _p = os.path.dirname(_chk)
-                        if _p == _chk:
-                            break
-                        _chk = _p
-                    if found:
-                        _to_update.append(vid_id)
+                _to_update = [vid_id for vid_id, title
+                              in pending if title in _done_titles]
                 if _to_update:
                     with self._db_lock:
                         for _uid in _to_update:
                             self._db_execute(
-                                "UPDATE videos SET tx_status='transcribed' WHERE id=?",
-                                (_uid,))
+                                "UPDATE videos SET tx_status='transcribed' "
+                                "WHERE id=?", (_uid,))
                         self._db_commit()
             except Exception:
                 pass

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.1"
+APP_VERSION = "v35.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:33am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:56am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -25152,23 +25152,13 @@ class _TranscriptionPanel(ttk.Frame):
         threading.Thread(target=_retranscribe_worker, daemon=True).start()
 
     def _browse_retranscribe_status(self, msg):
-        """Update status in the player transcript area from a worker thread."""
+        """Update status in the player title bar from a worker thread.
+        Uses the title label instead of inserting into the transcript
+        widget — inserting text would shift all char offsets and break
+        the word highlight / click-to-seek mapping."""
         def _update():
             try:
-                tw = self._player_transcript
-                tw.config(state="normal")
-                # Remove previous status line if present
-                try:
-                    r0 = tw.index("retrans_status.first")
-                    r1 = tw.index("retrans_status.last")
-                    tw.delete(r0, r1)
-                except Exception:
-                    pass
-                # Insert/replace at the very top of the widget
-                tw.insert("1.0", msg + "\n\n", "retrans_status")
-                tw.tag_configure("retrans_status", foreground="#6a9fd6",
-                                 font=("Segoe UI", 9, "italic"))
-                tw.config(state="disabled")
+                self._player_title_lbl.config(text=msg)
             except Exception:
                 pass
         self.after(0, _update)
@@ -25178,36 +25168,172 @@ class _TranscriptionPanel(ttk.Frame):
         def _finish():
             self._browse_actions_btn.config(state="normal")
             if success:
-                # Reload the player with updated transcript data
                 meta = self._browse_current_meta
                 if meta and self._player_active:
                     title = meta.get("title", "")
                     video_path = meta.get("_video_path") or meta.get("filepath")
-                    db_rows = None
-                    if self._conn and title:
-                        try:
-                            db_rows = self._db_execute(
-                                "SELECT video_id, start_time, end_time, text, words "
-                                "FROM segments WHERE title=? ORDER BY start_time",
-                                (title,)).fetchall()
-                        except Exception:
-                            pass
-                    # Get current playback position to restore after reload
-                    _resume_pos = 0
-                    if self._vlc_player:
-                        try:
-                            _resume_pos = max(0, self._vlc_player.get_time()) / 1000.0
-                        except Exception:
-                            pass
-                    self._open_embedded_player(
-                        video_path, _resume_pos, title=title,
-                        db_rows=db_rows, tx_status="ok")
+                    # Rebuild transcript and word mappings without restarting VLC
+                    self._player_reload_transcript(title, video_path)
                 else:
                     self._on_browse_select()
             else:
                 messagebox.showerror("Re-transcribe Failed",
                     error_msg or "Unknown error occurred.")
         self.after(0, _finish)
+
+    def _player_reload_transcript(self, title, video_path):
+        """Reload just the transcript text and word mappings without restarting VLC.
+        Used after re-transcription to refresh the viewer while keeping video playing."""
+        # Fetch fresh DB rows
+        db_rows = None
+        if self._conn and title:
+            try:
+                db_rows = self._db_execute(
+                    "SELECT video_id, start_time, end_time, text, words "
+                    "FROM segments WHERE title=? ORDER BY start_time",
+                    (title,)).fetchall()
+            except Exception:
+                pass
+
+        # Restore title (was showing "Transcribing - X%" during the process)
+        _player_display_title = title if title else os.path.basename(video_path or "")
+        if (self._browse_current_meta and
+                self._browse_current_meta.get("title") == title and
+                self._browse_current_meta.get("resolution")):
+            _player_display_title += f"  ({self._browse_current_meta['resolution']})"
+        self._player_title_lbl.config(text=_player_display_title)
+
+        # Rebuild transcript text
+        self._player_words = []
+        self._player_transcript.config(state="normal")
+        self._player_transcript.delete("1.0", "end")
+
+        body = ""
+        txt_body_found = False
+        _tx_header = ""
+
+        if video_path and title:
+            vdir = os.path.dirname(video_path)
+            search_dirs = [vdir]
+            for _ in range(2):
+                p = os.path.dirname(search_dirs[-1])
+                if p != search_dirs[-1]:
+                    search_dirs.append(p)
+            for sd in search_dirs:
+                try:
+                    for fn in os.listdir(sd):
+                        if fn.lower().endswith('.txt') and not fn.startswith('.'):
+                            fpath = os.path.join(sd, fn)
+                            section = self._get_txt_section(fpath, title)
+                            if section:
+                                lines = section.split('\n', 1)
+                                _tx_header = lines[0]
+                                body = lines[1].strip() if len(lines) > 1 else ""
+                                if body:
+                                    txt_body_found = True
+                            if txt_body_found:
+                                break
+                except Exception:
+                    pass
+                if txt_body_found:
+                    break
+
+        if not txt_body_found and db_rows:
+            parts = []
+            max_end = -1.0
+            for vid, start, end, seg_text, words_json in db_rows:
+                if start >= max_end - 0.5:
+                    parts.append(seg_text)
+                max_end = max(max_end, end)
+            body = " ".join(parts)
+
+        _body_char_offset = 0
+        if body:
+            _is_yt_source = txt_body_found and _tx_header and (
+                "YT+PUNCTUATION" in _tx_header or "YT CAPTIONS" in _tx_header)
+            if _is_yt_source and db_rows:
+                _yt_notice = "Youtube Auto Captions — "
+                _yt_link = "re-transcribe with Whisper"
+                _yt_suffix = " for improved results\n\n"
+                self._player_transcript.tag_configure(
+                    "yt_notice", foreground="#7a6a3a",
+                    font=("Segoe UI", 8, "italic"))
+                self._player_transcript.tag_configure(
+                    "yt_retranscribe", foreground="#9a8a4a",
+                    font=("Segoe UI", 8, "italic underline"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Enter>",
+                    lambda e: self._player_transcript.config(cursor="hand2"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Leave>",
+                    lambda e: self._player_transcript.config(cursor="xterm"))
+                self._player_transcript.tag_bind(
+                    "yt_retranscribe", "<Button-1>",
+                    lambda e: self._on_retranscribe() or "break")
+                self._player_transcript.insert("end", _yt_notice, "yt_notice")
+                self._player_transcript.insert("end", _yt_link, "yt_retranscribe")
+                self._player_transcript.insert("end", _yt_suffix, "yt_notice")
+                _body_char_offset += len(_yt_notice) + len(_yt_link) + len(_yt_suffix)
+            self._player_transcript.insert("end", body + "\n")
+
+        # Rebuild word timing map
+        all_words = []
+        if db_rows:
+            for vid, start, end, seg_text, words_json in db_rows:
+                if words_json:
+                    try:
+                        wlist = json.loads(words_json)
+                        for w in wlist:
+                            all_words.append((
+                                w.get("s", start), w.get("e", end), w.get("w", "")))
+                    except Exception:
+                        pass
+            all_words.sort(key=lambda x: x[0])
+            deduped = []
+            for s, e, w in all_words:
+                if deduped and abs(s - deduped[-1][0]) < 0.05:
+                    continue
+                deduped.append((s, e, w))
+            all_words = deduped
+
+        if all_words and body:
+            body_lower = body.lower()
+            body_len = len(body)
+            cursor = 0
+            for s, e, w in all_words:
+                w_lower = w.lower().strip(".,!?;:'\"")
+                if not w_lower:
+                    continue
+                best_offset = -1
+                search_pos = cursor
+                while search_pos <= body_len - len(w_lower):
+                    idx = body_lower.find(w_lower, search_pos)
+                    if idx == -1:
+                        break
+                    before = body[idx - 1] if idx > 0 else " "
+                    after_i = idx + len(w_lower)
+                    after = body[after_i] if after_i < body_len else " "
+                    left_ok = not before.isalpha() or not w_lower[0].isalpha()
+                    right_ok = not after.isalpha() or after in ".,!?;:'\""
+                    if left_ok and right_ok:
+                        best_offset = idx
+                        break
+                    search_pos = idx + 1
+                if best_offset >= 0:
+                    if best_offset - cursor > 500 and cursor > 0:
+                        continue
+                    wend = best_offset + len(w_lower)
+                    while wend < body_len and body[wend] in ".,!?;:'\")" :
+                        wend += 1
+                    self._player_words.append({
+                        "w": w, "s": s, "e": e,
+                        "cs": best_offset + _body_char_offset,
+                        "ce": wend + _body_char_offset
+                    })
+                    cursor = wend
+
+        self._player_transcript.config(state="disabled")
+        self._player_last_word_idx = -1  # reset so highlight jumps to current position
 
     def _show_resolution_dialog(self, title_text):
         """Show a modal resolution picker dialog. Returns chosen resolution string or None."""
@@ -27629,7 +27755,7 @@ class _TranscriptionPanel(ttk.Frame):
                     lambda e: self._player_transcript.config(cursor="xterm"))
                 self._player_transcript.tag_bind(
                     "yt_retranscribe", "<Button-1>",
-                    lambda e: self._on_retranscribe())
+                    lambda e: self._on_retranscribe() or "break")
                 self._player_transcript.insert("end", _yt_notice, "yt_notice")
                 self._player_transcript.insert("end", _yt_link, "yt_retranscribe")
                 self._player_transcript.insert("end", _yt_suffix, "yt_notice")
@@ -27910,6 +28036,9 @@ class _TranscriptionPanel(ttk.Frame):
         try:
             char_offset = len(self._player_transcript.get("1.0", idx))
         except Exception:
+            return
+        # Ignore clicks before the first word (notice area)
+        if char_offset < self._player_words[0]["cs"]:
             return
         # Binary search for the word whose char range contains this offset
         lo, hi = 0, len(self._player_words) - 1

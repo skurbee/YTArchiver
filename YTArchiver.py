@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.7"
+APP_VERSION = "v34.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:45pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 11:54pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5152,7 +5152,7 @@ def _chan_ctx_sync_now():
     ch = _ctx_channel["ch"]
     if not ch:
         return
-    if _sync_running or _reorg_running or _redownload_running:
+    if _sync_running or _reorg_running or _redownload_running or _metadata_running:
         # Queue the channel for sync after the current operation finishes
         with _sync_queue_lock:
             # Don't queue duplicates
@@ -5537,7 +5537,7 @@ def _chan_ctx_show(event):
         #               5=Org Year, 6=Org Year/Month, 7=Un-Organize, 8=separator, 9=Re-apply,
         #               10=separator, 11=Transcribe, 12=Download Metadata, 13=separator, 14=Remove
         # Dynamic label: show "Add to Sync List" when a sync/reorg is running
-        if _sync_running or _reorg_running or _redownload_running:
+        if _sync_running or _reorg_running or _redownload_running or _metadata_running:
             # Check if this channel is already queued or actively syncing
             _ch_url = ch.get("url", "")
             with _sync_queue_lock:
@@ -5921,7 +5921,7 @@ def sync_single_channel(_from_queue=False):
 
     # If something is already running, queue instead of starting immediately
     # (_from_queue bypasses this check since the queue processor already owns the slot)
-    if not _from_queue and (_sync_running or _reorg_running or _redownload_running):
+    if not _from_queue and (_sync_running or _reorg_running or _redownload_running or _metadata_running):
         with _sync_queue_lock:
             if not any(q["url"] == ch["url"] for q in _sync_queue):
                 _sync_queue.append(copy.deepcopy(ch))
@@ -28542,7 +28542,7 @@ def on_tab_changed(event):
     if selected == str(tab_download):
         # Re-show cancel/pause buttons if a sync or reorg is still active
         # (they can lose pack state when switching tabs during long operations)
-        if _sync_running or _reorg_running or _redownload_running:
+        if _sync_running or _reorg_running or _redownload_running or _metadata_running:
             _update_queue_btn()
     elif selected == str(tab_settings):
         # Refresh channel tree if it was dirtied while on another tab

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.6"
+APP_VERSION = "v34.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2685,11 +2685,11 @@ def _scan_channel_disk_info(ch):
     _has_transcripts = False
     _has_metadata = False
     _video_files = []      # (filepath, title, size, dirpath) for browse registration
-    _transcribed_titles = set()  # per-video titles from Transcript.txt files
-    _tx_hdr_re = re.compile(r'^===\((.+?)\),\s*\(')
+    _dirs_with_tx = set()  # directories containing transcript files
     try:
         if os.path.isdir(_ch_folder):
             for _dp, _dns, _fns in os.walk(_ch_folder):
+                _dir_has_tx = False
                 for _fn in _fns:
                     _fn_lower = _fn.lower()
                     if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
@@ -2705,20 +2705,11 @@ def _scan_channel_disk_info(ch):
                         _video_files.append((_fp, os.path.splitext(_fn)[0], _sz, _dp))
                     elif _fn_lower.endswith("transcript.txt") or _fn_lower.endswith(".jsonl"):
                         _has_transcripts = True
+                        _dir_has_tx = True
                     if not _has_metadata and _fn_lower.endswith("metadata.jsonl") and _fn.startswith("."):
                         _has_metadata = True
-                    # Extract per-video titles from Transcript.txt files
-                    if _fn.startswith(_ch_name) and _fn_lower.endswith("transcript.txt"):
-                        try:
-                            with open(os.path.join(_dp, _fn), "r",
-                                      encoding="utf-8") as _txf:
-                                for _txline in _txf:
-                                    if _txline.startswith("===("):
-                                        _txm = _tx_hdr_re.match(_txline.strip())
-                                        if _txm:
-                                            _transcribed_titles.add(_txm.group(1))
-                        except Exception:
-                            pass
+                if _dir_has_tx:
+                    _dirs_with_tx.add(_dp)
     except Exception:
         pass
 
@@ -2742,8 +2733,19 @@ def _scan_channel_disk_info(ch):
                 _candidate = _title[_bracket + 2:-1]
                 if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
                     _vid_id = _candidate
-            # Per-video check: is this title in a Transcript.txt?
-            _status = "transcribed" if _title in _transcribed_titles else "pending"
+            # Directory-level check (fast — per-video accuracy comes from
+            # the Browse tab scanner which runs in the background later).
+            _tx = False
+            _chk = _dp
+            for _ in range(3):
+                if _chk in _dirs_with_tx:
+                    _tx = True
+                    break
+                _p = os.path.dirname(_chk)
+                if _p == _chk:
+                    break
+                _chk = _p
+            _status = "transcribed" if _tx else "pending"
             try:
                 tp._db_execute(
                     "INSERT OR IGNORE INTO videos "
@@ -3793,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:32pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:45pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -21846,8 +21848,7 @@ class _TranscriptionPanel(ttk.Frame):
                         "AND tx_status = 'transcribed'"
                     ).fetchone()[0]
                     seg_vids = self._db_execute(
-                        "SELECT COUNT(*) FROM "
-                        "(SELECT DISTINCT channel, title FROM segments)"
+                        "SELECT COUNT(DISTINCT title) FROM segments"
                     ).fetchone()[0]
                 unindexed = max(0, vid_total - seg_vids)
             except Exception:
@@ -21877,7 +21878,7 @@ class _TranscriptionPanel(ttk.Frame):
             try:
                 with self._db_lock:
                     segs = self._db_execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-                    vids = self._db_execute("SELECT COUNT(*) FROM (SELECT DISTINCT channel, title FROM segments)").fetchone()[0]
+                    vids = self._db_execute("SELECT COUNT(DISTINCT title) FROM segments").fetchone()[0]
                     chs  = self._db_execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
                 text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
                 self.after(0, lambda: self._stats_label.config(text=text))
@@ -23093,8 +23094,7 @@ class _TranscriptionPanel(ttk.Frame):
                             "AND tx_status = 'transcribed'"
                         ).fetchone()[0]
                         seg_vids = self._db_execute(
-                            "SELECT COUNT(*) FROM "
-                            "(SELECT DISTINCT channel, title FROM segments)"
+                            "SELECT COUNT(DISTINCT title) FROM segments"
                         ).fetchone()[0]
                     _seg_stale = vid_total > seg_vids
                 except Exception:
@@ -28271,8 +28271,7 @@ class _TranscriptionPanel(ttk.Frame):
                 segs  = self._db_execute(
                     "SELECT COUNT(*) FROM segments").fetchone()[0]
                 vids  = self._db_execute(
-                    "SELECT COUNT(*) FROM "
-                    "(SELECT DISTINCT channel, title FROM segments)"
+                    "SELECT COUNT(DISTINCT title) FROM segments"
                     ).fetchone()[0]
                 chs   = self._db_execute(
                     "SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]

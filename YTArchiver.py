@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.1"
+APP_VERSION = "v36.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:55am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 4:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11692,9 +11692,25 @@ def _run_metadata_download(item):
             if vid_id and vid_id in _pc_ids:
                 _pc_covered += 1
         # If every video with an ID already has metadata AND total metadata
-        # entries cover the full file count, we're done.
+        # entries cover the full file count, we're done.  Videos that previously
+        # failed individual search (deleted/private) are excluded from the total
+        # since they'll never get metadata.
         _pc_with_ids = sum(1 for vid_id, *_ in rows if vid_id)
-        if _pc_covered >= _pc_with_ids and len(_pc_ids) >= len(rows):
+        _pc_search_failed = 0
+        try:
+            _sf_sql = "SELECT COUNT(*) FROM videos WHERE channel=? AND search_failed_ts IS NOT NULL AND video_id IS NULL"
+            _sf_params = [ch_name]
+            if year is not None:
+                _sf_sql += " AND year=?"
+                _sf_params.append(year)
+            if month is not None:
+                _sf_sql += " AND month=?"
+                _sf_params.append(month)
+            _pc_search_failed = tp._db_execute(_sf_sql, _sf_params).fetchone()[0] or 0
+        except Exception:
+            pass
+        _pc_effective = len(rows) - _pc_search_failed
+        if _pc_covered >= _pc_with_ids and len(_pc_ids) >= _pc_effective:
             log(f"Metadata: {scope_label} — all {len(rows)} videos already have metadata.\n", "simpleline")
             return
 
@@ -11772,7 +11788,7 @@ def _run_metadata_download(item):
             if filepath:
                 try:
                     tp._db_execute(
-                        "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
                         (vid_id, filepath))
                 except Exception:
                     pass
@@ -11780,6 +11796,30 @@ def _run_metadata_download(item):
         else:
             _need_search.append((title, v_year, v_month, filepath))
             _no_id_count += 1
+
+    # On refresh, clear search_failed_ts so everything is re-searched.
+    if refresh:
+        try:
+            tp._db_execute(
+                "UPDATE videos SET search_failed_ts=NULL WHERE channel=? AND search_failed_ts IS NOT NULL",
+                (ch_name,))
+            tp._db_commit()
+        except Exception:
+            pass
+
+    # Load previously-searched filepaths (used after batch resolve to skip
+    # the expensive individual search for videos that already failed).
+    _already_searched_fps = set()
+    if not refresh and _need_search:
+        try:
+            for (_sf,) in tp._db_execute(
+                    "SELECT filepath FROM videos "
+                    "WHERE channel=? AND search_failed_ts IS NOT NULL "
+                    "AND video_id IS NULL AND filepath IS NOT NULL",
+                    (ch_name,)).fetchall():
+                _already_searched_fps.add(os.path.normpath(_sf))
+        except Exception:
+            pass
 
     # ── Batch-resolve: fetch channel playlist for bulk title→ID matching ──
     # Instead of searching YouTube one-by-one (which takes ~8s each = days for
@@ -11900,7 +11940,7 @@ def _run_metadata_download(item):
                             if _s_filepath:
                                 try:
                                     tp._db_execute(
-                                        "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
                                         (_matched_id, _s_filepath))
                                 except Exception:
                                     pass
@@ -11925,6 +11965,23 @@ def _run_metadata_download(item):
         finally:
             if _batch_proc is not None:
                 cleanup_process(_batch_proc)
+
+    # Track filepaths that entered individual search, so we can mark failures
+    _search_attempted_fps = set()
+    _search_resolved_fps = set()
+
+    # ── Skip videos previously searched with no match (individual search only) ──
+    # Batch resolve above is cheap (one playlist fetch), but individual search is
+    # ~8s per video.  Skip videos that already went through individual search and
+    # failed — they're likely deleted/private and would just waste time again.
+    if _already_searched_fps and _need_search:
+        _pre_count = len(_need_search)
+        _need_search = [(t, y, m, f) for t, y, m, f in _need_search
+                        if not (f and os.path.normpath(f) in _already_searched_fps)]
+        _skipped_prev = _pre_count - len(_need_search)
+        if _skipped_prev:
+            log(f"  Skipped {_skipped_prev} video(s) previously searched with no match.\n", "dim")
+            _no_id_count -= _skipped_prev
 
     # For videos with no video_id, try searching YouTube by title + channel name
     if _need_search and ch_url:
@@ -11954,6 +12011,8 @@ def _run_metadata_download(item):
                     _tray_start_spin()
                     log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
             _search_i += 1
+            if _s_filepath:
+                _search_attempted_fps.add(os.path.normpath(_s_filepath))
             _trunc_s = _trunc_pad_title(_s_title, _MAX_TITLE_DISPLAY - len("Searching") - 3).rstrip()
             log(f"  \u2014 [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
             _search_proc = None
@@ -11992,11 +12051,13 @@ def _run_metadata_download(item):
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))
                                 _search_found += 1
                                 _no_id_count -= 1
+                                if _s_filepath:
+                                    _search_resolved_fps.add(os.path.normpath(_s_filepath))
                                 # Backfill into videos table
                                 if _s_filepath:
                                     try:
                                         tp._db_execute(
-                                            "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                            "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
                                             (_found_id, _s_filepath))
                                     except Exception:
                                         pass
@@ -12201,7 +12262,7 @@ def _run_metadata_download(item):
                         if _s_filepath:
                             try:
                                 tp._db_execute(
-                                    "UPDATE videos SET video_id=? WHERE filepath=? AND video_id IS NULL",
+                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
                                     (_matched_id, _s_filepath))
                             except Exception:
                                 pass
@@ -12224,6 +12285,25 @@ def _run_metadata_download(item):
             tp._db_commit()
         except Exception:
             pass
+
+    # Mark videos that were individually searched but never resolved, so they
+    # are skipped on future runs (avoids re-searching deleted/private videos).
+    if _search_attempted_fps:
+        _all_resolved_fps = {os.path.normpath(fp) for _, _, _, _, fp in _resolved_rows if fp}
+        _failed_fps = _search_attempted_fps - _all_resolved_fps - _search_resolved_fps
+        if _failed_fps:
+            for _ff in _failed_fps:
+                try:
+                    tp._db_execute(
+                        "UPDATE videos SET search_failed_ts=? WHERE filepath=?",
+                        (time.time(), _ff))
+                except Exception:
+                    pass
+            try:
+                tp._db_commit()
+            except Exception:
+                pass
+
     if _no_id_count:
         log(f"  ({_no_id_count} video(s) skipped \u2014 no video ID found)\n", "dim")
 
@@ -20777,6 +20857,12 @@ def _tp_open_db(path):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_channel ON videos(channel)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_ch_yr ON videos(channel, year)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vid_ch_yr_mo ON videos(channel, year, month)")
+    # Migration: add search_failed_ts column to skip re-searching videos
+    # that were already individually searched with no match found
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN search_failed_ts REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
@@ -22631,6 +22717,15 @@ class _TranscriptionPanel(ttk.Frame):
             year = meta.get("year")
             month = meta.get("month")
             self._show_grid(channel, year, month)
+            # Preload children in background so expanding is instant
+            iid = sel[0]
+            children = self._browse_tree.get_children(iid)
+            if (len(children) == 1
+                    and self._BROWSE_PLACEHOLDER in self._browse_tree.item(children[0], "tags")):
+                self._browse_tree.delete(children[0])
+                self._populate_browse_children(iid, meta)
+                # Keep node collapsed — just preloaded
+                self._browse_tree.item(iid, open=False)
             return
         if meta["type"] != "title":
             return
@@ -23244,7 +23339,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground="#666b75", relief="flat", bd=1)
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
 
         if meta["type"] == "title":
             # Title-level context menu
@@ -24718,7 +24813,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         menu = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
                        activebackground=self._TP_ACCENT, activeforeground="white",
-                       disabledforeground="#666b75", relief="flat", bd=1)
+                       disabledforeground=self._TP_DIM, relief="flat", bd=1)
 
         if video_path:
             menu.add_command(label="  \u25b6  Play Video",

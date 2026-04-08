@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v33.8"
+APP_VERSION = "v33.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -611,7 +611,10 @@ def log(text, tag=None):
                     else:
                         _wp_ins = tk.END
                     # Split text to colorize the percentage green
-                    _wp_match = re.search(r'(\d+%)', text)
+                    # Use the LAST match — titles may contain percentages (e.g. "38% of...")
+                    # but the transcription progress percentage is always at the end
+                    _wp_matches = list(re.finditer(r'(\d+%)', text))
+                    _wp_match = _wp_matches[-1] if _wp_matches else None
                     if _wp_match:
                         _before = text[:_wp_match.start()]
                         _pct_str = _wp_match.group(1)
@@ -3791,7 +3794,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.06.26 7:39pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 7:51pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12215,6 +12218,14 @@ def _run_metadata_download(item):
             _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY - len(_prefix) - 3)
             log(f"[{_fetch_done}/{_fetch_total}] {_prefix} - {_trunc}\n", "simpleline")
 
+            # Block if internet is down — metadata requires internet
+            if _internet_down.is_set():
+                if not _block_if_no_internet():
+                    log(f"{_mode_label}: cancelled.\n", "simpleline")
+                    if changed:
+                        tp._write_metadata_jsonl(meta_path, existing)
+                    return
+
             entry = tp._fetch_video_metadata(vid_id, title)
             if entry:
                 if _is_refresh:
@@ -13393,14 +13404,28 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                         if not text:
                             if _whisper_last_failed:
-                                # Process stalled or crashed — do NOT exclude the video
-                                # (it likely has speech; Whisper just failed to process it).
-                                # It will be retried on the next transcription run.
-                                # Count as skip, not error, so it doesn't block transcription_complete
-                                log(f"  [{idx}/{total}] {fname} — Whisper failed, skipping (will retry next run).\n", "red")
-                                _transcription_log.append((fname, source, time.time() - _t_vid_start, "skipped — process failure (will retry)"))
-                                _whisper_skip_count += 1
-                                continue
+                                # Process crashed — try once with a different model before giving up.
+                                # Rare CTranslate2 crashes can be model-specific (e.g. "small" crashes
+                                # on audio that "large-v3" handles fine).
+                                _fb_model = "large-v3" if _whisper_model_choice != "large-v3" else "medium"
+                                log(f"  [{idx}/{total}] {fname} — Whisper crashed ({_whisper_model_choice}), retrying with {_fb_model}...\n", "red")
+                                _stop_whisper_process(force=True)
+                                time.sleep(1)
+                                text, _vtt_segments = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe, model=_fb_model)
+                                _clear_whisper_progress()
+                                if text:
+                                    text = _whisper_punct_fixup(text)
+                                    source = "Whisper"
+                                    log(f"  [{idx}/{total}] {fname} — fallback model ({_fb_model}) succeeded.\n", "simpleline_green")
+                                    # Restart original model for the next video
+                                    _stop_whisper_process(force=True)
+                                else:
+                                    log(f"  [{idx}/{total}] {fname} — Whisper failed on both models, skipping (will retry next run).\n", "red")
+                                    _transcription_log.append((fname, source, time.time() - _t_vid_start, "skipped — process failure (will retry)"))
+                                    _whisper_skip_count += 1
+                                    # Restart original model for the next video
+                                    _stop_whisper_process(force=True)
+                                    continue
                             # Write exclusion entry so this video is skipped on future transcribes
                             log(f"  [{idx}/{total}] {fname} — no speech detected, excluding.\n", "simpleline")
                             _transcription_log.append((fname, source, time.time() - _t_vid_start, "excluded — no speech"))
@@ -13859,10 +13884,24 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
 
             if not text:
                 if _whisper_last_failed:
-                    log(f"  Whisper process failed — please try again.\n", "red")
+                    # Process crashed — try once with a different model
+                    _fb_model = "large-v3" if _whisper_model_choice != "large-v3" else "medium"
+                    log(f"  Whisper crashed ({_whisper_model_choice}), retrying with {_fb_model}...\n", "red")
+                    _stop_whisper_process(force=True)
+                    time.sleep(1)
+                    text, _ = _whisper_transcribe(file_path, duration=_dur_secs, title=fname,
+                                                  cancel_ev=_ce, pause_ev=_pe, model=_fb_model)
+                    _clear_whisper_progress()
+                    if text:
+                        log(f"  Fallback model ({_fb_model}) succeeded.\n", "simpleline_green")
+                        _stop_whisper_process(force=True)
+                    else:
+                        log(f"  Whisper failed on both models.\n", "red")
+                        _stop_whisper_process(force=True)
+                        return
                 else:
                     log(f"  Whisper returned empty result.\n", "red")
-                return
+                    return
 
             text = _whisper_punct_fixup(text)
 
@@ -14081,11 +14120,22 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
 
                 if not text:
                     if _whisper_last_failed:
-                        # Process stalled or crashed — do NOT exclude the video.
-                        # It will be retried on the next transcription run.
-                        log(f"    Whisper failed, skipping (will retry next run).\n", "red")
-                        _skipped += 1
-                        continue
+                        # Process crashed — try once with a different model before giving up.
+                        _fb_model = "large-v3" if _whisper_model_choice != "large-v3" else "medium"
+                        log(f"    Whisper crashed ({_whisper_model_choice}), retrying with {_fb_model}...\n", "red")
+                        _stop_whisper_process(force=True)
+                        time.sleep(1)
+                        text, _ = _whisper_transcribe(fpath, duration=_dur_secs, title=fname, cancel_ev=_ce, pause_ev=_pe, model=_fb_model)
+                        _clear_whisper_progress()
+                        if text:
+                            text = _whisper_punct_fixup(text)
+                            log(f"    Fallback model ({_fb_model}) succeeded.\n", "simpleline_green")
+                            _stop_whisper_process(force=True)
+                        else:
+                            log(f"    Whisper failed on both models, skipping (will retry next run).\n", "red")
+                            _skipped += 1
+                            _stop_whisper_process(force=True)
+                            continue
                     # Write exclusion entry so this video is skipped on future transcribes
                     log(f"    no speech detected, excluding.\n", "simpleline")
                     try:

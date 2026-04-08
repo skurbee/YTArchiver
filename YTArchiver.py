@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.5"
+APP_VERSION = "v35.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -10515,7 +10515,8 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                 except (json.JSONDecodeError, ValueError):
                     continue
                 if result.get("status") == "starting":
-                    log(f"{_wp}Transcribing{_title_part}, 0% — loading...\n", "whisper_progress")
+                    if not progress_cb:
+                        log(f"{_wp}Transcribing{_title_part}, 0% — loading...\n", "whisper_progress")
                     continue
                 if result.get("status") == "progress":
                     pct = result.get("pct", 0)
@@ -10524,6 +10525,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
                             progress_cb(pct)
                         except Exception:
                             pass
+                        continue  # caller handles logging via progress_cb
                     if _ce.is_set():
                         log(f"{_wp}Transcribing{_title_part}, {pct}% — cancelling after this file...\n", "whisper_progress")
                     elif _pe.is_set():
@@ -25155,7 +25157,8 @@ class _TranscriptionPanel(ttk.Frame):
         """Update progress in the transcript notice area (above the body text).
         Replaces whatever is in the notice area and adjusts all word char
         offsets by the length delta so highlights and clicks stay correct.
-        Also pushes a log update so the main log stays in sync."""
+        Also directly updates the main log (bypasses the complex
+        whisper_progress tag handler which fails silently for retranscribe)."""
         def _update():
             try:
                 tw = self._player_transcript
@@ -25180,6 +25183,27 @@ class _TranscriptionPanel(ttk.Frame):
                         wd["cs"] += delta
                         wd["ce"] += delta
                 self._player_body_char_offset = new_len
+            except Exception:
+                pass
+
+            # Directly update log_box on the main thread — the normal
+            # whisper_progress tag handler silently fails for retranscribe,
+            # so we bypass it and do a simple tag-based replacement here.
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    _stop_whisper_dot_anim()
+                    log_box.config(state="normal")
+                    for _t in ("whisper_dots", "whisper_pct", "whisper_progress",
+                               "whisper_prefix", "whisper_title"):
+                        while True:
+                            _r = log_box.tag_ranges(_t)
+                            if not _r:
+                                break
+                            log_box.delete(_r[0], _r[1])
+                    _log_line = f"  {msg}\n"
+                    log_box.insert(tk.END, _log_line, "whisper_progress")
+                    log_box.see(tk.END)
+                    log_box.config(state="disabled")
             except Exception:
                 pass
         self.after(0, _update)

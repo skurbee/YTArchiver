@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.0"
+APP_VERSION = "v34.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3793,7 +3793,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 9:08pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 9:33pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11667,12 +11667,27 @@ def _run_metadata_download(item):
             except (OSError, PermissionError):
                 continue
 
+    # Also check the videos table for previously batch-resolved IDs (persists
+    # across restarts so we don't re-fetch the channel playlist every time).
+    _db_id_map = {}
+    try:
+        for _dbt, _dbv in tp._db_execute(
+                "SELECT title, video_id FROM videos "
+                "WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
+                (ch_name,)).fetchall():
+            _db_id_map[_dbt] = _dbv
+    except Exception:
+        pass
+
     _need_search = []  # (index, title, v_year, v_month, filepath) for yt-dlp search
     _yt_by_date = {}   # "YYYYMMDD" -> [(video_id, original_title)] for date-based resolve
     for vid_id, title, v_year, v_month, filepath in rows:
         if not vid_id:
             # Try segments table lookup
             vid_id = _seg_id_map.get(title)
+        if not vid_id:
+            # Try videos table (previously resolved IDs)
+            vid_id = _db_id_map.get(title)
         if not vid_id and filepath:
             # Try filename pattern: "Title [VIDEO_ID].ext"
             _base = os.path.splitext(os.path.basename(filepath))[0]
@@ -12394,10 +12409,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
-            if not files_to_process:
+            if not files_to_process and not _jsonl_needed:
                 log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
-                if _jsonl_needed:
-                    log(f"  — {len(_jsonl_needed)} video(s) need searchable .jsonl — will generate next transcription run.\n", "dim")
                 # Record in activity log (0 transcribed — shows as uncolored/white tag)
                 _record_transcription(0, 0, 0, channel_name=ch_name, skipped=0)
                 # Mark channel as fully transcribed
@@ -12409,6 +12422,14 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             break
                     save_config(config)
                 return
+
+            if not files_to_process:
+                # All videos transcribed, but some are missing searchable .jsonl
+                # entries.  Continue to YouTube fetch + backfill instead of
+                # returning early (previously this was a dead loop — "will
+                # generate next run" but next run hit the same early return).
+                log(f"  ✓ All videos already transcribed.\n", "simpleline_green")
+                log(f"  — {len(_jsonl_needed):,} video(s) need searchable .jsonl — generating now...\n", "green")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")

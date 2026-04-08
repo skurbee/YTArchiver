@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.8"
+APP_VERSION = "v35.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:01am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:09am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -25179,16 +25179,33 @@ class _TranscriptionPanel(ttk.Frame):
         """Called when re-transcription finishes (from worker thread)."""
         def _finish():
             self._browse_actions_btn.config(state="normal")
+            # Clear the whisper_progress line from the log
+            try:
+                _stop_whisper_dot_anim()
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    log_box.config(state="normal")
+                    for _t in ("whisper_dots", "whisper_pct", "whisper_progress",
+                               "whisper_prefix", "whisper_title"):
+                        while True:
+                            _r = log_box.tag_ranges(_t)
+                            if not _r:
+                                break
+                            log_box.delete(_r[0], _r[1])
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
             if success:
                 meta = self._browse_current_meta
+                _title = meta.get("title", "") if meta else ""
+                _t = _title[:50] + "..." if len(_title) > 50 else _title
+                log(f"  Re-transcription complete: \"{_t}\"\n", "simpleline_green")
                 if meta and self._player_active:
-                    title = meta.get("title", "")
                     video_path = meta.get("_video_path") or meta.get("filepath")
-                    # Rebuild transcript and word mappings without restarting VLC
-                    self._player_reload_transcript(title, video_path)
+                    self._player_reload_transcript(_title, video_path)
                 else:
                     self._on_browse_select()
             else:
+                log(f"  Re-transcription failed: {error_msg or 'unknown error'}\n", "red")
                 messagebox.showerror("Re-transcribe Failed",
                     error_msg or "Unknown error occurred.")
         self.after(0, _finish)

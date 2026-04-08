@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.5"
+APP_VERSION = "v34.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3793,7 +3793,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:24pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 10:32pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -21836,8 +21836,14 @@ class _TranscriptionPanel(ttk.Frame):
                 return
             try:
                 with self._db_lock:
+                    # Only count videos that have transcripts (tx_status =
+                    # 'transcribed') but aren't in the search index yet.
+                    # Videos with no speech / no captions are excluded —
+                    # they have nothing to index.
                     vid_total = self._db_execute(
-                        "SELECT COUNT(*) FROM videos WHERE filepath != '__schema_ver__'"
+                        "SELECT COUNT(*) FROM videos "
+                        "WHERE filepath != '__schema_ver__' "
+                        "AND tx_status = 'transcribed'"
                     ).fetchone()[0]
                     seg_vids = self._db_execute(
                         "SELECT COUNT(*) FROM "
@@ -23083,7 +23089,8 @@ class _TranscriptionPanel(ttk.Frame):
                     with self._db_lock:
                         vid_total = self._db_execute(
                             "SELECT COUNT(*) FROM videos "
-                            "WHERE filepath != '__schema_ver__' AND channel != '__ver__'"
+                            "WHERE filepath != '__schema_ver__' AND channel != '__ver__' "
+                            "AND tx_status = 'transcribed'"
                         ).fetchone()[0]
                         seg_vids = self._db_execute(
                             "SELECT COUNT(*) FROM "

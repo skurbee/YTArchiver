@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.9"
+APP_VERSION = "v35.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 12:10am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 8:46am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -25095,9 +25095,9 @@ class _TranscriptionPanel(ttk.Frame):
                 _stop_whisper_process()
 
                 try:
-                    self._browse_retranscribe_status(f"Transcribing ({chosen_model}) 0%...")
+                    self._browse_retranscribe_status("Transcribing - 0%")
                     def _on_progress(pct):
-                        self._browse_retranscribe_status(f"Transcribing ({chosen_model}) {pct}%...")
+                        self._browse_retranscribe_status(f"Transcribing - {pct}%")
                     text, segments = _whisper_transcribe(
                         audio_path, duration=_dur_secs, title=title,
                         progress_cb=_on_progress, model=chosen_model)
@@ -25152,19 +25152,58 @@ class _TranscriptionPanel(ttk.Frame):
         threading.Thread(target=_retranscribe_worker, daemon=True).start()
 
     def _browse_retranscribe_status(self, msg):
-        """Update status from a worker thread (no-op now — actions button has no text label)."""
-        pass
+        """Update status in the player transcript area from a worker thread."""
+        def _update():
+            try:
+                tw = self._player_transcript
+                tw.config(state="normal")
+                # Remove previous status line if present
+                try:
+                    r0 = tw.index("retrans_status.first")
+                    r1 = tw.index("retrans_status.last")
+                    tw.delete(r0, r1)
+                except Exception:
+                    pass
+                # Insert/replace at the very top of the widget
+                tw.insert("1.0", msg + "\n\n", "retrans_status")
+                tw.tag_configure("retrans_status", foreground="#6a9fd6",
+                                 font=("Segoe UI", 9, "italic"))
+                tw.config(state="disabled")
+            except Exception:
+                pass
+        self.after(0, _update)
 
     def _browse_retranscribe_done(self, success, error_msg=None):
         """Called when re-transcription finishes (from worker thread)."""
         def _finish():
             self._browse_actions_btn.config(state="normal")
             if success:
-                messagebox.showinfo("Re-transcribe",
-                    "Transcription replaced successfully.\n"
-                    "The viewer will now refresh.")
-                # Refresh the viewer to show new content
-                self._on_browse_select()
+                # Reload the player with updated transcript data
+                meta = self._browse_current_meta
+                if meta and self._player_active:
+                    title = meta.get("title", "")
+                    video_path = meta.get("_video_path") or meta.get("filepath")
+                    db_rows = None
+                    if self._conn and title:
+                        try:
+                            db_rows = self._db_execute(
+                                "SELECT video_id, start_time, end_time, text, words "
+                                "FROM segments WHERE title=? ORDER BY start_time",
+                                (title,)).fetchall()
+                        except Exception:
+                            pass
+                    # Get current playback position to restore after reload
+                    _resume_pos = 0
+                    if self._vlc_player:
+                        try:
+                            _resume_pos = max(0, self._vlc_player.get_time()) / 1000.0
+                        except Exception:
+                            pass
+                    self._open_embedded_player(
+                        video_path, _resume_pos, title=title,
+                        db_rows=db_rows, tx_status="ok")
+                else:
+                    self._on_browse_select()
             else:
                 messagebox.showerror("Re-transcribe Failed",
                     error_msg or "Unknown error occurred.")
@@ -27576,9 +27615,9 @@ class _TranscriptionPanel(ttk.Frame):
             _is_yt_source = txt_body_found and _tx_header and (
                 "YT+PUNCTUATION" in _tx_header or "YT CAPTIONS" in _tx_header)
             if _is_yt_source and db_rows:
-                _yt_notice = "Highlight timing is approximate — "
+                _yt_notice = "Youtube Auto Captions — "
                 _yt_link = "re-transcribe with Whisper"
-                _yt_suffix = " for word-accurate sync.\n\n"
+                _yt_suffix = " for improved results\n\n"
                 self._player_transcript.tag_configure(
                     "yt_notice", foreground="#7a6a3a",
                     font=("Segoe UI", 8, "italic"))
@@ -27651,7 +27690,10 @@ class _TranscriptionPanel(ttk.Frame):
             cursor = 0       # current search position — only moves forward
 
             for s, e, w in all_words:
-                w_lower = w.lower().rstrip(".,!?;:'\"")
+                # Strip punctuation from both ends — Whisper splits decimals
+                # into separate tokens (e.g. "6.3" → "6" + ".3"), so leading
+                # dots must also be stripped for the second token to match.
+                w_lower = w.lower().strip(".,!?;:'\"")
                 if not w_lower:
                     continue
 
@@ -27662,7 +27704,8 @@ class _TranscriptionPanel(ttk.Frame):
                     idx = body_lower.find(w_lower, search_pos)
                     if idx == -1:
                         break
-                    # Verify word boundary
+                    # Verify word boundary (allow digits/dots adjacent for
+                    # split-decimal tokens like "2mm" inside "2.2mm")
                     before = body[idx - 1] if idx > 0 else " "
                     after_i = idx + len(w_lower)
                     after = body[after_i] if after_i < body_len else " "

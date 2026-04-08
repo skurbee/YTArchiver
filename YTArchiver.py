@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v34.1"
+APP_VERSION = "v34.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3793,7 +3793,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 9:33pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.07.26 9:49pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11743,7 +11743,10 @@ def _run_metadata_download(item):
                 _batch_dates_ok = 0
                 _batch_t0 = time.time()
                 _last_batch_log = 0
-                _timeout_s = min(1800, 300 + (len(_need_search) // 1000) * 30)
+                # Timeout scales with total channel size (len(rows)), not just
+                # _need_search — the playlist fetches ALL videos regardless of
+                # how many need resolution.
+                _timeout_s = min(1800, 300 + (len(rows) // 1000) * 60)
                 _deadline = time.time() + _timeout_s
 
                 while True:

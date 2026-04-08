@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v35.9"
+APP_VERSION = "v36.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:09am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 11:23am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -23987,6 +23987,36 @@ class _TranscriptionPanel(ttk.Frame):
         # Load videos in background
         threading.Thread(target=self._grid_load_videos,
                          args=(channel, year, month, _gen), daemon=True).start()
+        # Pre-expand tree for this scope so clicking a video opens instantly
+        # (otherwise _grid_navigate_to_video has to expand lazily with delays)
+        self._grid_preexpand_tree(channel, year, month)
+
+    def _grid_preexpand_tree(self, channel, year, month):
+        """Pre-expand the browse tree for the current grid scope so that
+        title nodes exist by the time the user clicks a video thumbnail."""
+        _chain = [("channel", channel, None, None)]
+        if year is not None:
+            _chain.append(("year", channel, year, None))
+        if month is not None:
+            _chain.append(("month", channel, year, month))
+        self._grid_preexpand_step(_chain, 0)
+
+    def _grid_preexpand_step(self, chain, step):
+        """Expand tree nodes one level at a time for pre-loading (no title selection)."""
+        if step >= len(chain):
+            return  # all levels expanded
+        node_type, channel, year, month = chain[step]
+        for iid, meta in self._browse_items.items():
+            if meta.get("type") == node_type and meta.get("channel") == channel:
+                if node_type == "channel" or \
+                   (node_type == "year" and meta.get("year") == year) or \
+                   (node_type == "month" and meta.get("year") == year and meta.get("month") == month):
+                    self._browse_tree.item(iid, open=True)
+                    self._on_browse_open_for_iid(iid)
+                    self.after(200, lambda: self._grid_preexpand_step(chain, step + 1))
+                    return
+        # Node not found — retry after a short delay
+        self.after(100, lambda: self._grid_preexpand_step(chain, step + 1))
 
     def _hide_grid(self):
         """Hide the video grid and restore the transcript viewer."""

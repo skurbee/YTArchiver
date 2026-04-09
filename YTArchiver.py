@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.4"
+APP_VERSION = "v36.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 7:31pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 8:16pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11842,7 +11842,7 @@ def _run_metadata_download(item):
                 _batch_url
             ])
             if _batch_proc:
-                _re_unsafe = re.compile(r'[\\/:*?"<>|]')
+                _re_unsafe = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
                 _re_ws = re.compile(r'\s+')
                 def _norm_title(t):
                     s = unicodedata.normalize('NFKC', t)
@@ -12019,11 +12019,13 @@ def _run_metadata_download(item):
             try:
                 if _internet_down.is_set():
                     _block_if_no_internet()
+                # Replace filesystem-safe Unicode slashes back to / for YouTube search
+                _search_title = _s_title.replace("\u29f8", "/").replace("\uff0f", "/")
                 _search_cmd = [
                     "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
                     "--skip-download", "--cookies-from-browser", "firefox",
                     "--playlist-items", "1",
-                    f"ytsearch1:{_s_title} {ch_name}"
+                    f"ytsearch1:{_search_title} {ch_name}"
                 ]
                 _search_proc = spawn_yt_dlp(_search_cmd)
                 if _search_proc:

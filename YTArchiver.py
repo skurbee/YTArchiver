@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.3"
+APP_VERSION = "v36.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 4:29pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 7:31pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -22196,21 +22196,29 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_header.pack(fill="x")
         self._grid_breadcrumb_frame = tk.Frame(self._grid_header, bg=self._TP_BG3)
         self._grid_breadcrumb_frame.pack(side="left", fill="x", expand=True)
-        # Sort dropdown
+        # Sort dropdown (button + menu, matching the Actions dropdown style)
+        self._grid_sort_var = tk.StringVar(value="Newest")
+        self._grid_sort_popup = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                                         activebackground=self._TP_ACCENT, activeforeground="white",
+                                         relief="flat", bd=1)
+        def _set_sort(val):
+            self._grid_sort_var.set(val)
+            self._grid_sort_btn.config(text=f"{val} ▾")
+            self._grid_resort()
+        for _sopt in ("Newest", "Oldest", "Most Viewed"):
+            self._grid_sort_popup.add_command(label=f"  {_sopt}", command=lambda v=_sopt: _set_sort(v))
+        def _show_sort_menu():
+            btn = self._grid_sort_btn
+            self._grid_sort_popup.tk_popup(
+                btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+        self._grid_sort_btn = tk.Button(
+            self._grid_header, text="Newest ▾", bg="#3a3a3a", fg=self._TP_FG,
+            activebackground="#555555", activeforeground=self._TP_FG,
+            relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
+            padx=6, command=_show_sort_menu)
+        self._grid_sort_btn.pack(side="right")
         tk.Label(self._grid_header, text="Sort:", bg=self._TP_BG3, fg=self._TP_DIM,
                  font=("Segoe UI", 8)).pack(side="right", padx=(8, 4))
-        self._grid_sort_var = tk.StringVar(value="Newest")
-        self._grid_sort_menu = tk.OptionMenu(
-            self._grid_header, self._grid_sort_var, "Newest", "Oldest", "Most Viewed",
-            command=lambda _: self._grid_resort())
-        self._grid_sort_menu.config(bg="#3a3a3a", fg=self._TP_FG, activebackground="#555",
-                                     activeforeground=self._TP_FG, relief="flat", bd=0,
-                                     font=("Segoe UI", 8), highlightthickness=0,
-                                     cursor="hand2")
-        self._grid_sort_menu["menu"].config(bg=self._TP_BG3, fg=self._TP_FG,
-                                             activebackground=self._TP_ACCENT,
-                                             activeforeground="white")
-        self._grid_sort_menu.pack(side="right")
         # "Download metadata" banner (shown when no metadata available)
         self._grid_meta_banner = tk.Frame(self._grid_frame, bg="#2a2518")
         self._grid_meta_banner_lbl = tk.Label(

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.6"
+APP_VERSION = "v36.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 8:53pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:03pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12311,7 +12311,7 @@ def _run_metadata_download(item):
 
     # Group videos by their target folder
     if len(_resolved_rows) > 500:
-        log(f"  Grouping {len(_resolved_rows):,} video(s) by folder...\n", "whisper_progress")
+        log(f"  Grouping {len(_resolved_rows):,} video(s) by folder...\n", "simpleline")
     folder_groups = {}
     for vid_id, title, v_year, v_month, filepath in _resolved_rows:
         meta_path, subfolder = tp._get_metadata_jsonl_path(
@@ -12337,11 +12337,11 @@ def _run_metadata_download(item):
     _to_fetch = []
     _pc_i = 0
     _pc_total = len(folder_groups)
-    log(f"  Scanning {_pc_total} metadata file(s)...\n", "whisper_progress")
+    log(f"  Scanning {_pc_total} metadata file(s)...\n", "simpleline")
     for meta_path, group in folder_groups.items():
         _pc_i += 1
         if _pc_total > 5 and _pc_i % max(1, _pc_total // 10) == 0:
-            log(f"  Scanning metadata files... {_pc_i}/{_pc_total}\n", "whisper_progress")
+            log(f"  Scanning metadata files... {_pc_i}/{_pc_total}\n", "simpleline")
         existing = tp._read_metadata_jsonl(meta_path)
         group["_existing"] = existing  # cache for reuse below
         for vid_id, title, v_year, v_month, filepath in group["videos"]:
@@ -18013,7 +18013,7 @@ def _show_queue_menu(event=None):
             text_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 
             text_w = tk.Text(text_frame, bg="#2d2d2d", fg="#cccccc",
-                             font=("Segoe UI", 9), height=show_count,
+                             font=("Segoe UI", 9), height=show_count + 1,
                              wrap="none", cursor="arrow",
                              highlightthickness=0, borderwidth=0,
                              padx=4, pady=2,
@@ -18853,7 +18853,7 @@ def _show_gpu_menu(event=None):
             text_frame.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 
             text_w = tk.Text(text_frame, bg="#2d2d2d", fg="#cccccc",
-                             font=("Segoe UI", 9), height=show_count,
+                             font=("Segoe UI", 9), height=show_count + 1,
                              wrap="none", cursor="arrow",
                              highlightthickness=0, borderwidth=0,
                              padx=4, pady=2,

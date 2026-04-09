@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.8"
+APP_VERSION = "v36.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3795,7 +3795,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.08.26 9:03pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.09.26 9:01am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6401,17 +6401,16 @@ def sync_single_channel(_from_queue=False):
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: try YT captions inline right after download;
-                # only queue a GPU task if some videos still need Whisper.
+                # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _start_transcription(
-                        ch["name"], url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
-                        cancel_ev=cancel_event, pause_ev=pause_event,
-                        skip_model_dialog=True, _sync_mode=True, captions_only=True
-                    )
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch["name"], "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
 
                 # Auto-metadata: queue metadata download for this channel after sync
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
@@ -17155,17 +17154,16 @@ def start_sync_all():
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: try YT captions inline right after download;
-                # only queue a GPU task if some videos still need Whisper.
+                # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _start_transcription(
-                        ch_name, url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
-                        cancel_ev=cancel_event, pause_ev=pause_event,
-                        skip_model_dialog=True, _sync_mode=True, captions_only=True
-                    )
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch_name, "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
                     _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
@@ -20591,18 +20589,17 @@ def _run_autorun():
                 # Auto-compress: if channel has compress enabled and new videos were downloaded
                 # (handled via incremental _sc_batch_cb during download; nothing extra needed here)
 
-                # Auto-transcribe: try YT captions inline right after download;
-                # only queue a GPU task if some videos still need Whisper.
+                # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     ch_name_at = ch.get("name", "")
                     _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_at))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
-                    _start_transcription(
-                        ch_name_at, url, _at_folder, _at_sy, _at_sm, combined=not _at_sy,
-                        cancel_ev=cancel_event, pause_ev=pause_event,
-                        skip_model_dialog=True, _sync_mode=True, captions_only=True
-                    )
+                    _add_to_gpu_queue({
+                        "type": "transcribe", "ch_name": ch_name_at, "ch_url": url,
+                        "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
+                        "combined": not _at_sy
+                    })
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
                     _am_name = ch.get("name", "")

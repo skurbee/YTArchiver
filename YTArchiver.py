@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.0"
+APP_VERSION = "v37.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3808,7 +3808,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 2:35pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 2:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12191,7 +12191,7 @@ def _run_metadata_download(item):
     # the channel uploaded on the same date and eliminating the ones we
     # already matched.
     if _need_search and ch_url and not cancel_event.is_set():
-        _dr_has_files = any(fp and os.path.isfile(fp) for _, _, _, fp in _need_search)
+        _dr_has_files = any(fp and os.path.isfile(fp) for _, _, _, _, fp in _need_search)
         if _dr_has_files:
             # If batch-resolve didn't populate _yt_by_date, fetch it now
             if not _yt_by_date:

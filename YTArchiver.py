@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.2"
+APP_VERSION = "v37.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3808,7 +3808,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 3:03pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 3:14pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11693,6 +11693,23 @@ def _run_metadata_download(item):
             f"  Check that video files exist in the channel folder.\n", "red")
         return
 
+    # Load the set of video_ids whose metadata fetch previously failed
+    # (yt-dlp --dump-json returned nothing — deleted/private/region-locked).
+    # These are treated as "permanently done" so we don't re-fetch them on
+    # every metadata run.  Cleared on refresh.
+    _fetch_failed_ids = set()
+    if not refresh:
+        try:
+            for (_ffid,) in tp._db_execute(
+                    "SELECT DISTINCT video_id FROM videos "
+                    "WHERE channel=? AND metadata_fetch_failed_ts IS NOT NULL "
+                    "AND video_id IS NOT NULL AND video_id != ''",
+                    (ch_name,)).fetchall():
+                if _ffid:
+                    _fetch_failed_ids.add(_ffid)
+        except Exception:
+            pass
+
     # ── Quick pre-check: skip entire pipeline if metadata already covers all videos ──
     # Avoids expensive YouTube lookups when re-running on already-complete channels.
     if not refresh:
@@ -11705,10 +11722,12 @@ def _run_metadata_download(item):
         _pc_ids = set()
         for mp in _pc_paths:
             _pc_ids.update(tp._read_metadata_jsonl(mp).keys())
-        # Count how many video files are covered by existing metadata
+        # Count how many video files are covered by existing metadata.
+        # A row counts as "covered" if its video_id is in the JSONL OR if
+        # it was previously marked as fetch-failed (permanently unreachable).
         _pc_covered = 0
         for _, vid_id, _, _, _, _ in rows:
-            if vid_id and vid_id in _pc_ids:
+            if vid_id and (vid_id in _pc_ids or vid_id in _fetch_failed_ids):
                 _pc_covered += 1
         # If every video with an ID already has metadata AND total metadata
         # entries cover the full file count, we're done.  Videos that previously
@@ -11729,7 +11748,10 @@ def _run_metadata_download(item):
         except Exception:
             pass
         _pc_effective = len(rows) - _pc_search_failed
-        if _pc_covered >= _pc_with_ids and len(_pc_ids) >= _pc_effective:
+        # The "len(_pc_ids) >= _pc_effective" check compares JSONL entry count
+        # against total row count.  Add fetch-failed count to JSONL count so
+        # permanently-failed rows don't block this condition.
+        if _pc_covered >= _pc_with_ids and (len(_pc_ids) + len(_fetch_failed_ids)) >= _pc_effective:
             log(f"Metadata: {scope_label} — all {len(rows)} videos already have metadata.\n", "simpleline")
             return
 
@@ -11897,13 +11919,17 @@ def _run_metadata_download(item):
             except Exception:
                 pass
 
-    # On refresh, clear search_failed_ts and id_resolve_failed_ts so everything
-    # is re-searched and re-walked from scratch.
+    # On refresh, clear search_failed_ts, id_resolve_failed_ts, and
+    # metadata_fetch_failed_ts so everything is re-searched, re-walked,
+    # and re-fetched from scratch.
     if refresh:
         try:
             tp._db_execute(
-                "UPDATE videos SET search_failed_ts=NULL, id_resolve_failed_ts=NULL "
-                "WHERE channel=? AND (search_failed_ts IS NOT NULL OR id_resolve_failed_ts IS NOT NULL)",
+                "UPDATE videos SET search_failed_ts=NULL, id_resolve_failed_ts=NULL, "
+                "metadata_fetch_failed_ts=NULL "
+                "WHERE channel=? AND (search_failed_ts IS NOT NULL "
+                "OR id_resolve_failed_ts IS NOT NULL "
+                "OR metadata_fetch_failed_ts IS NOT NULL)",
                 (ch_name,))
             tp._db_commit()
         except Exception:
@@ -12484,6 +12510,10 @@ def _run_metadata_download(item):
         for vid_id, title, v_year, v_month, filepath in group["videos"]:
             if vid_id in existing and not refresh:
                 skipped += 1
+            elif (not refresh) and vid_id and vid_id in _fetch_failed_ids:
+                # Previously failed to fetch (deleted/private/unavailable) —
+                # skip instead of re-trying yt-dlp every run.
+                skipped += 1
             else:
                 _to_fetch.append((meta_path, vid_id, title, v_year, v_month, filepath))
 
@@ -12595,9 +12625,28 @@ def _run_metadata_download(item):
                     tp._download_thumbnail(thumb_url, thumb_dir, title, vid_id)
             else:
                 errors += 1
+                # Mark the row(s) as fetch-failed so we don't re-try this
+                # video every metadata run — deleted/private/region-locked
+                # videos stay skipped until the user explicitly refreshes.
+                if vid_id:
+                    try:
+                        tp._db_execute(
+                            "UPDATE videos SET metadata_fetch_failed_ts=? "
+                            "WHERE channel=? AND video_id=?",
+                            (time.time(), ch_name, vid_id))
+                    except Exception:
+                        pass
 
         if changed:
             tp._write_metadata_jsonl(meta_path, existing)
+
+    # Commit any metadata_fetch_failed_ts marks set during the fetch loop
+    # so they persist across app restarts.
+    if errors > 0:
+        try:
+            tp._db_commit()
+        except Exception:
+            pass
 
     done = _fetch_done + skipped
 
@@ -21055,6 +21104,13 @@ def _tp_open_db(path):
     # every metadata run just because one orphan row exists.
     try:
         conn.execute("ALTER TABLE videos ADD COLUMN id_resolve_failed_ts REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Migration: add metadata_fetch_failed_ts column — marks rows where
+    # yt-dlp --dump-json failed (video deleted/private/region-locked) so we
+    # don't re-fetch the same failing video on every metadata run.
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN metadata_fetch_failed_ts REAL")
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.commit()

@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.1"
+APP_VERSION = "v37.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3808,7 +3808,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 2:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 3:03pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12413,7 +12413,8 @@ def _run_metadata_download(item):
         log(f"  ({_no_id_count} video(s) skipped \u2014 no video ID found)\n", "dim")
 
     # Group videos by their target folder
-    if len(_resolved_rows) > 500:
+    # (suppressed in simple mode — this is transient noise the user doesn't need)
+    if not _is_simple_mode and len(_resolved_rows) > 500:
         log(f"  Grouping {len(_resolved_rows):,} video(s) by folder...\n", "simpleline")
     folder_groups = {}
     for vid_id, title, v_year, v_month, filepath in _resolved_rows:
@@ -12440,10 +12441,43 @@ def _run_metadata_download(item):
     _to_fetch = []
     _pc_i = 0
     _pc_total = len(folder_groups)
-    log(f"  Scanning {_pc_total} metadata file(s)...\n", "simpleline")
+
+    # In simple mode, use an in-place updating scanline instead of logging every
+    # progress step. In verbose mode, keep the original per-10% logging.
+    if not _is_simple_mode:
+        log(f"  Scanning {_pc_total} metadata file(s)...\n", "simpleline")
+
+    def _update_meta_scan_line(i, total):
+        """Write/update an in-place scanline for metadata file scanning (simple mode)."""
+        def _write():
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    try:
+                        _yv = log_box.yview()[1]
+                        at_bottom = (_log_at_bottom and not _log_user_scrolled) or _yv >= 0.999
+                    except Exception:
+                        at_bottom = True
+                    log_box.config(state="normal")
+                    ranges = log_box.tag_ranges("scanline")
+                    if ranges:
+                        log_box.delete(ranges[0], ranges[1])
+                    log_box.insert(tk.END, f"  Scanning metadata files... {i}/{total}\n", "scanline")
+                    if at_bottom:
+                        log_box.see(tk.END)
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            if _root_alive:
+                _ui_queue.append(_write)
+        except Exception:
+            pass
+
     for meta_path, group in folder_groups.items():
         _pc_i += 1
-        if _pc_total > 5 and _pc_i % max(1, _pc_total // 10) == 0:
+        if _is_simple_mode:
+            _update_meta_scan_line(_pc_i, _pc_total)
+        elif _pc_total > 5 and _pc_i % max(1, _pc_total // 10) == 0:
             log(f"  Scanning metadata files... {_pc_i}/{_pc_total}\n", "simpleline")
         existing = tp._read_metadata_jsonl(meta_path)
         group["_existing"] = existing  # cache for reuse below
@@ -12452,6 +12486,28 @@ def _run_metadata_download(item):
                 skipped += 1
             else:
                 _to_fetch.append((meta_path, vid_id, title, v_year, v_month, filepath))
+
+    # In simple mode, clear the transient scanline and leave a persistent
+    # pink-dash summary in its place so the finished state stays in the log.
+    if _is_simple_mode and _pc_total > 0:
+        def _clear_meta_scan_line():
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    log_box.config(state="normal")
+                    ranges = log_box.tag_ranges("scanline")
+                    if ranges:
+                        log_box.delete(ranges[0], ranges[1])
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            if _root_alive:
+                _ui_queue.append(_clear_meta_scan_line)
+        except Exception:
+            pass
+        _plural = "" if _pc_total == 1 else "s"
+        log(f"  \u2014 Scanned {_pc_total} metadata file{_plural}.\n", "simpleline_pink")
+
     _clear_whisper_progress()
 
     _fetch_total = len(_to_fetch)

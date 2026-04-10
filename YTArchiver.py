@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v36.9"
+APP_VERSION = "v37.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3171,11 +3171,17 @@ def _tray_stop_spin(force=False):
     (unless force=True, which is used for pause).
     """
     global _tray_spin_active
-    # If GPU is still running (and not paused), fall back to red spin instead of stopping
+    # Blink-driven tray: if any blink is active, don't let scattered task-handler
+    # calls stop the spin — the blink-stop functions handle the real transition.
+    try:
+        if not force and (_sync_blink.get("active") or _gpu_blink.get("active")):
+            return
+    except NameError:
+        pass  # blink dicts not yet defined during early init
+    # Legacy fallbacks (reached only when blink system is inactive or during init)
     if not force and _gpu_running and not _gpu_truly_paused:
         _tray_start_spin(red=True)
         return
-    # If any sync-pipeline task is still running (or queued), fall back to blue spin instead of stopping
     _has_queued = False
     try:
         with _sync_queue_lock:
@@ -3212,6 +3218,13 @@ def _update_tray_tooltip(text):
     """Update the tray icon tooltip text."""
     if not HAS_TRAY or _tray_icon is None:
         return
+    # Blink-driven tray: don't let scattered task handlers reset to Idle
+    # while the sync/GPU blink is still active — blink stop handles the transition.
+    try:
+        if "Idle" in text and (_sync_blink.get("active") or _gpu_blink.get("active")):
+            return
+    except NameError:
+        pass  # blink dicts not yet defined during early init
     try:
         _tray_icon.title = text
     except Exception:
@@ -3795,7 +3808,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.09.26 9:01am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 2:35pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -7580,6 +7593,8 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
         with _reorg_queue_lock:
             _reorg_running = True
         _update_global_pause_btn_sync()
+        _lbl = _current_job.get("label", f"Reorganizing {channel_name}")
+        _update_tray_tooltip(f"YT Archiver \u2014 {_lbl}")
         try:
             # If a cancel is already in-flight, respect it and bail out
             # instead of clearing it (which would erase user cancel intent).
@@ -11625,7 +11640,11 @@ def _run_metadata_download(item):
         return
 
     # Try videos table first, fall back to scanning the filesystem
-    sql = "SELECT video_id, title, year, month, filepath FROM videos WHERE channel=?"
+    # Row id is fetched so every UPDATE can target the exact row by primary key —
+    # matching by filepath is unreliable when unicode normalization differs between
+    # os.walk (from disk) and yt-dlp stdout (from download), which was causing
+    # search_failed_ts to silently not stick for emoji/unicode titles.
+    sql = "SELECT id, video_id, title, year, month, filepath FROM videos WHERE channel=?"
     params = [ch_name]
     if year is not None:
         sql += " AND year=?"
@@ -11666,7 +11685,8 @@ def _run_metadata_download(item):
                             _vid_id = _candidate
                     # Derive year/month from path
                     _, v_year, v_month = _tp_parse_path_meta(fp, [folder_path])
-                    rows.append((_vid_id, title, v_year, v_month, fp))
+                    # row_id is None for filesystem-fallback rows (not yet in DB)
+                    rows.append((None, _vid_id, title, v_year, v_month, fp))
 
     if not rows:
         log(f"Metadata: {scope_label} — no videos found.\n"
@@ -11677,7 +11697,7 @@ def _run_metadata_download(item):
     # Avoids expensive YouTube lookups when re-running on already-complete channels.
     if not refresh:
         _pc_paths = set()
-        for _, _, v_year, v_month, _ in rows:
+        for _, _, _, v_year, v_month, _ in rows:
             mp, _ = tp._get_metadata_jsonl_path(
                 ch_name, folder_path, split_years, split_months,
                 year=v_year, month=v_month)
@@ -11687,14 +11707,14 @@ def _run_metadata_download(item):
             _pc_ids.update(tp._read_metadata_jsonl(mp).keys())
         # Count how many video files are covered by existing metadata
         _pc_covered = 0
-        for vid_id, _, _, _, _ in rows:
+        for _, vid_id, _, _, _, _ in rows:
             if vid_id and vid_id in _pc_ids:
                 _pc_covered += 1
         # If every video with an ID already has metadata AND total metadata
         # entries cover the full file count, we're done.  Videos that previously
         # failed individual search (deleted/private) are excluded from the total
         # since they'll never get metadata.
-        _pc_with_ids = sum(1 for vid_id, *_ in rows if vid_id)
+        _pc_with_ids = sum(1 for _, vid_id, *_ in rows if vid_id)
         _pc_search_failed = 0
         try:
             _sf_sql = "SELECT COUNT(*) FROM videos WHERE channel=? AND search_failed_ts IS NOT NULL AND video_id IS NULL"
@@ -11715,67 +11735,24 @@ def _run_metadata_download(item):
 
     log(f"  Found {len(rows)} video(s) — resolving video IDs...\n", "dim")
 
-    # Resolve missing video_ids from segments table or JSONL files on disk
+    # ── Staged ID resolution: cheap lookups first, expensive JSONL walk last ──
+    # Previous versions ran the full segments+JSONL+db_id_map pipeline unconditionally,
+    # meaning a large channel with even one orphan row would trigger a full folder
+    # walk on every metadata run.  Now we only escalate to the expensive walk when
+    # cheaper options haven't resolved everything.
     _resolved_rows = []
     _no_id_count = 0
-    _seg_id_map = {}
-    # Try segments table first
-    try:
-        for _st, _sv in tp._db_execute(
-                "SELECT DISTINCT title, video_id FROM segments "
-                "WHERE channel=? AND video_id != ''",
-                (ch_name,)).fetchall():
-            if _sv:
-                _seg_id_map[_st] = _sv
-    except Exception:
-        pass
-    # If segments had nothing, read JSONL files from the channel folder
-    if not _seg_id_map:
-        log(f"  Scanning transcript files for video IDs...\n", "dim")
-        for dirpath, _, filenames in os.walk(folder_path):
-            try:
-                for _fn in filenames:
-                    if _fn.endswith('.jsonl') and _fn.startswith('.'):
-                        _jf = os.path.join(dirpath, _fn)
-                        with open(_jf, 'r', encoding='utf-8', errors='replace') as _fh:
-                            for _jline in _fh:
-                                _jline = _jline.strip()
-                                if not _jline:
-                                    continue
-                                try:
-                                    _jd = json.loads(_jline)
-                                    _jvid = _jd.get("video_id", "")
-                                    _jtitle = _jd.get("title", "")
-                                    if _jvid and _jtitle and _jtitle not in _seg_id_map:
-                                        _seg_id_map[_jtitle] = _jvid
-                                except Exception:
-                                    continue
-            except (OSError, PermissionError):
-                continue
-
-    # Also check the videos table for previously batch-resolved IDs (persists
-    # across restarts so we don't re-fetch the channel playlist every time).
-    _db_id_map = {}
-    try:
-        for _dbt, _dbv in tp._db_execute(
-                "SELECT title, video_id FROM videos "
-                "WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
-                (ch_name,)).fetchall():
-            _db_id_map[_dbt] = _dbv
-    except Exception:
-        pass
-
-    _need_search = []  # (index, title, v_year, v_month, filepath) for yt-dlp search
     _yt_by_date = {}   # "YYYYMMDD" -> [(video_id, original_title)] for date-based resolve
-    for vid_id, title, v_year, v_month, filepath in rows:
-        if not vid_id:
-            # Try segments table lookup
-            vid_id = _seg_id_map.get(title)
-        if not vid_id:
-            # Try videos table (previously resolved IDs)
-            vid_id = _db_id_map.get(title)
-        if not vid_id and filepath:
-            # Try filename pattern: "Title [VIDEO_ID].ext"
+    _need_search = []  # rows still missing IDs — will fall through to batch/individual search
+
+    # ── Pass 1: existing IDs + filename pattern (free, no DB/disk I/O) ──
+    _still_missing = []  # rows needing lookup escalation — 5-tuples: (row_id, title, year, month, filepath)
+    for row_id, vid_id, title, v_year, v_month, filepath in rows:
+        if vid_id:
+            _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
+            continue
+        # Try filename pattern: "Title [VIDEO_ID].ext"
+        if filepath:
             _base = os.path.splitext(os.path.basename(filepath))[0]
             _bracket = _base.rfind(" [")
             if _bracket >= 0 and _base.endswith("]"):
@@ -11783,40 +11760,166 @@ def _run_metadata_download(item):
                 if 10 <= len(_candidate) <= 12 and re.match(r'^[\w-]+$', _candidate):
                     vid_id = _candidate
         if vid_id:
-            # Backfill into videos table if it was missing
-            if filepath:
+            if row_id is not None:
                 try:
                     tp._db_execute(
-                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
-                        (vid_id, filepath))
+                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                        (vid_id, row_id))
                 except Exception:
                     pass
             _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
         else:
-            _need_search.append((title, v_year, v_month, filepath))
-            _no_id_count += 1
+            _still_missing.append((row_id, title, v_year, v_month, filepath))
 
-    # On refresh, clear search_failed_ts so everything is re-searched.
+    # ── Pass 2: cheap DB lookups (segments table + videos table by title) ──
+    # Only run if there are actually rows needing resolution.
+    if _still_missing:
+        _seg_id_map = {}
+        _db_id_map = {}
+        try:
+            for _st, _sv in tp._db_execute(
+                    "SELECT DISTINCT title, video_id FROM segments "
+                    "WHERE channel=? AND video_id != ''",
+                    (ch_name,)).fetchall():
+                if _sv:
+                    _seg_id_map[_st] = _sv
+        except Exception:
+            pass
+        try:
+            for _dbt, _dbv in tp._db_execute(
+                    "SELECT title, video_id FROM videos "
+                    "WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
+                    (ch_name,)).fetchall():
+                _db_id_map[_dbt] = _dbv
+        except Exception:
+            pass
+
+        _still_missing_2 = []
+        for row_id, title, v_year, v_month, filepath in _still_missing:
+            vid_id = _seg_id_map.get(title) or _db_id_map.get(title)
+            if vid_id:
+                if row_id is not None:
+                    try:
+                        tp._db_execute(
+                            "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                            (vid_id, row_id))
+                    except Exception:
+                        pass
+                _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
+            else:
+                _still_missing_2.append((row_id, title, v_year, v_month, filepath))
+        _still_missing = _still_missing_2
+
+    # ── Pass 3: JSONL walk — expensive last resort, skip previously-scanned orphans ──
+    # Filter out rows already marked as id_resolve_failed_ts so one permanent orphan
+    # doesn't cause the full folder walk on every metadata run.
+    if _still_missing:
+        _already_walked_ids = set()
+        if not refresh:
+            try:
+                for (_sid,) in tp._db_execute(
+                        "SELECT id FROM videos "
+                        "WHERE channel=? AND id_resolve_failed_ts IS NOT NULL "
+                        "AND video_id IS NULL",
+                        (ch_name,)).fetchall():
+                    _already_walked_ids.add(_sid)
+            except Exception:
+                pass
+        _walk_candidates = [
+            (rid, t, y, m, f) for rid, t, y, m, f in _still_missing
+            if rid is None or rid not in _already_walked_ids
+        ]
+        _walk_skipped = len(_still_missing) - len(_walk_candidates)
+        if _walk_skipped:
+            log(f"  Skipped {_walk_skipped} known orphan(s) — previously scanned with no match.\n", "dim")
+            # Orphans still count as missing — they just go to _need_search without re-walking
+            _walk_candidate_ids = {id(x) for x in _walk_candidates}  # identity check
+            for _orphan in _still_missing:
+                if id(_orphan) not in _walk_candidate_ids:
+                    _need_search.append(_orphan)
+                    _no_id_count += 1
+
+        if _walk_candidates:
+            log(f"  Scanning transcript files for {len(_walk_candidates)} unresolved ID(s)...\n", "dim")
+            _walk_id_map = {}
+            for dirpath, _, filenames in os.walk(folder_path):
+                try:
+                    for _fn in filenames:
+                        if _fn.endswith('.jsonl') and _fn.startswith('.'):
+                            _jf = os.path.join(dirpath, _fn)
+                            try:
+                                with open(_jf, 'r', encoding='utf-8', errors='replace') as _fh:
+                                    for _jline in _fh:
+                                        _jline = _jline.strip()
+                                        if not _jline:
+                                            continue
+                                        try:
+                                            _jd = json.loads(_jline)
+                                            _jvid = _jd.get("video_id", "")
+                                            _jtitle = _jd.get("title", "")
+                                            if _jvid and _jtitle and _jtitle not in _walk_id_map:
+                                                _walk_id_map[_jtitle] = _jvid
+                                        except Exception:
+                                            continue
+                            except (OSError, PermissionError):
+                                continue
+                except (OSError, PermissionError):
+                    continue
+
+            _walk_resolved = 0
+            for row_id, title, v_year, v_month, filepath in _walk_candidates:
+                vid_id = _walk_id_map.get(title)
+                if vid_id:
+                    if row_id is not None:
+                        try:
+                            tp._db_execute(
+                                "UPDATE videos SET video_id=?, search_failed_ts=NULL, id_resolve_failed_ts=NULL WHERE id=?",
+                                (vid_id, row_id))
+                        except Exception:
+                            pass
+                    _resolved_rows.append((vid_id, title, v_year, v_month, filepath))
+                    _walk_resolved += 1
+                else:
+                    # Mark as walk-failed so we don't re-walk for this row next time
+                    if row_id is not None:
+                        try:
+                            tp._db_execute(
+                                "UPDATE videos SET id_resolve_failed_ts=? WHERE id=?",
+                                (time.time(), row_id))
+                        except Exception:
+                            pass
+                    _need_search.append((row_id, title, v_year, v_month, filepath))
+                    _no_id_count += 1
+            if _walk_resolved:
+                log(f"  Resolved {_walk_resolved} ID(s) from transcript files.\n", "dim")
+            try:
+                tp._db_commit()
+            except Exception:
+                pass
+
+    # On refresh, clear search_failed_ts and id_resolve_failed_ts so everything
+    # is re-searched and re-walked from scratch.
     if refresh:
         try:
             tp._db_execute(
-                "UPDATE videos SET search_failed_ts=NULL WHERE channel=? AND search_failed_ts IS NOT NULL",
+                "UPDATE videos SET search_failed_ts=NULL, id_resolve_failed_ts=NULL "
+                "WHERE channel=? AND (search_failed_ts IS NOT NULL OR id_resolve_failed_ts IS NOT NULL)",
                 (ch_name,))
             tp._db_commit()
         except Exception:
             pass
 
-    # Load previously-searched filepaths (used after batch resolve to skip
+    # Load previously-searched row ids (used after batch resolve to skip
     # the expensive individual search for videos that already failed).
-    _already_searched_fps = set()
+    _already_searched_ids = set()
     if not refresh and _need_search:
         try:
-            for (_sf,) in tp._db_execute(
-                    "SELECT filepath FROM videos "
+            for (_sid,) in tp._db_execute(
+                    "SELECT id FROM videos "
                     "WHERE channel=? AND search_failed_ts IS NOT NULL "
-                    "AND video_id IS NULL AND filepath IS NOT NULL",
+                    "AND video_id IS NULL",
                     (ch_name,)).fetchall():
-                _already_searched_fps.add(os.path.normpath(_sf))
+                _already_searched_ids.add(_sid)
         except Exception:
             pass
 
@@ -11928,7 +12031,7 @@ def _run_metadata_download(item):
 
                     _batch_found = 0
                     _still_need = []
-                    for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+                    for _s_row_id, _s_title, _s_year, _s_month, _s_filepath in _need_search:
                         _norm = _norm_title(_s_title)
                         _matched_id = _batch_map.get(_norm)
                         if _matched_id and _matched_id not in _batch_known:
@@ -11936,15 +12039,15 @@ def _run_metadata_download(item):
                             _resolved_rows.append((_matched_id, _s_title, _s_year, _s_month, _s_filepath))
                             _batch_found += 1
                             _no_id_count -= 1
-                            if _s_filepath:
+                            if _s_row_id is not None:
                                 try:
                                     tp._db_execute(
-                                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
-                                        (_matched_id, _s_filepath))
+                                        "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                                        (_matched_id, _s_row_id))
                                 except Exception:
                                     pass
                         else:
-                            _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                            _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
 
                     _need_search = _still_need
                     if _batch_found:
@@ -11965,18 +12068,19 @@ def _run_metadata_download(item):
             if _batch_proc is not None:
                 cleanup_process(_batch_proc)
 
-    # Track filepaths that entered individual search, so we can mark failures
-    _search_attempted_fps = set()
-    _search_resolved_fps = set()
+    # Track row ids that entered individual search, so we can mark failures
+    # by primary key (robust against unicode/normalization drift in filepaths).
+    _search_attempted_ids = set()
+    _search_resolved_ids = set()
 
     # ── Skip videos previously searched with no match (individual search only) ──
     # Batch resolve above is cheap (one playlist fetch), but individual search is
     # ~8s per video.  Skip videos that already went through individual search and
     # failed — they're likely deleted/private and would just waste time again.
-    if _already_searched_fps and _need_search:
+    if _already_searched_ids and _need_search:
         _pre_count = len(_need_search)
-        _need_search = [(t, y, m, f) for t, y, m, f in _need_search
-                        if not (f and os.path.normpath(f) in _already_searched_fps)]
+        _need_search = [row for row in _need_search
+                        if row[0] is None or row[0] not in _already_searched_ids]
         _skipped_prev = _pre_count - len(_need_search)
         if _skipped_prev:
             log(f"  Skipped {_skipped_prev} video(s) previously searched with no match.\n", "dim")
@@ -11996,7 +12100,7 @@ def _run_metadata_download(item):
                 _known_vids.add(_db_vid)
         except Exception:
             pass
-        for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+        for _s_row_id, _s_title, _s_year, _s_month, _s_filepath in _need_search:
             if cancel_event.is_set():
                 break
             # Pause support during search phase
@@ -12010,8 +12114,8 @@ def _run_metadata_download(item):
                     _tray_start_spin()
                     log(f"  ▶ Metadata resumed at {_fmt_time()}...\n", "pauselog")
             _search_i += 1
-            if _s_filepath:
-                _search_attempted_fps.add(os.path.normpath(_s_filepath))
+            if _s_row_id is not None:
+                _search_attempted_ids.add(_s_row_id)
             _trunc_s = _trunc_pad_title(_s_title, _MAX_TITLE_DISPLAY - len("Searching") - 3).rstrip()
             log(f"  \u2014 [{_search_i}/{len(_need_search)}] Searching: {_trunc_s}\n", "simpleline")
             _search_proc = None
@@ -12052,14 +12156,12 @@ def _run_metadata_download(item):
                                 _resolved_rows.append((_found_id, _s_title, _s_year, _s_month, _s_filepath))
                                 _search_found += 1
                                 _no_id_count -= 1
-                                if _s_filepath:
-                                    _search_resolved_fps.add(os.path.normpath(_s_filepath))
-                                # Backfill into videos table
-                                if _s_filepath:
+                                if _s_row_id is not None:
+                                    _search_resolved_ids.add(_s_row_id)
                                     try:
                                         tp._db_execute(
-                                            "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
-                                            (_found_id, _s_filepath))
+                                            "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                                            (_found_id, _s_row_id))
                                     except Exception:
                                         pass
                                 # Commit every 10 finds so progress survives restarts
@@ -12188,9 +12290,9 @@ def _run_metadata_download(item):
                 _date_skipped = 0
                 _still_need = []
 
-                for _s_title, _s_year, _s_month, _s_filepath in _need_search:
+                for _s_row_id, _s_title, _s_year, _s_month, _s_filepath in _need_search:
                     if cancel_event.is_set():
-                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
                         continue
 
                     # Get this file's upload date from mtime
@@ -12203,7 +12305,7 @@ def _run_metadata_download(item):
                             pass
 
                     if not _file_date:
-                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
                         continue
 
                     # Gather YouTube videos from that date +/- 1 day (timezone safety)
@@ -12220,7 +12322,7 @@ def _run_metadata_download(item):
                     _candidates = [(vid, t) for vid, t in _candidates if vid not in _date_known]
 
                     if not _candidates:
-                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
                         continue
 
                     _matched_id = None
@@ -12260,16 +12362,16 @@ def _run_metadata_download(item):
                         _resolved_rows.append((_matched_id, _s_title, _s_year, _s_month, _s_filepath))
                         _date_found += 1
                         _no_id_count -= 1
-                        if _s_filepath:
+                        if _s_row_id is not None:
                             try:
                                 tp._db_execute(
-                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE filepath=? AND video_id IS NULL",
-                                    (_matched_id, _s_filepath))
+                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                                    (_matched_id, _s_row_id))
                             except Exception:
                                 pass
                     else:
                         _date_skipped += 1
-                        _still_need.append((_s_title, _s_year, _s_month, _s_filepath))
+                        _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
 
                 _need_search = _still_need
                 if _date_found:
@@ -12289,15 +12391,17 @@ def _run_metadata_download(item):
 
     # Mark videos that were individually searched but never resolved, so they
     # are skipped on future runs (avoids re-searching deleted/private videos).
-    if _search_attempted_fps:
-        _all_resolved_fps = {os.path.normpath(fp) for _, _, _, _, fp in _resolved_rows if fp}
-        _failed_fps = _search_attempted_fps - _all_resolved_fps - _search_resolved_fps
-        if _failed_fps:
-            for _ff in _failed_fps:
+    # Uses row id (primary key) instead of filepath so it's robust against
+    # unicode/normalization drift between yt-dlp stdout and os.walk.
+    if _search_attempted_ids:
+        _failed_ids = _search_attempted_ids - _search_resolved_ids
+        if _failed_ids:
+            _now = time.time()
+            for _rid in _failed_ids:
                 try:
                     tp._db_execute(
-                        "UPDATE videos SET search_failed_ts=? WHERE filepath=?",
-                        (time.time(), _ff))
+                        "UPDATE videos SET search_failed_ts=? WHERE id=?",
+                        (_now, _rid))
                 except Exception:
                     pass
             try:
@@ -18604,6 +18708,12 @@ def _sync_blink_start():
     if _sync_blink["active"]:
         return
     _sync_blink["active"] = True
+    # Drive tray: blue spin for sync tasks (unless GPU blink owns red)
+    if not _gpu_blink["active"]:
+        _tray_start_spin(red=False)
+    _lbl = _current_job.get("label")
+    if _lbl:
+        _update_tray_tooltip(f"YT Archiver \u2014 {_lbl}")
     _ensure_blink_running()
 
 
@@ -18615,6 +18725,10 @@ def _sync_blink_stop():
         style.map("SyncQ.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
     except Exception:
         pass
+    # Drive tray: stop spin + idle tooltip (unless GPU blink still owns it)
+    if not _gpu_blink["active"]:
+        _tray_stop_spin(force=True)
+        _update_tray_tooltip("YT Archiver \u2014 Idle")
 
 
 def _gpu_blink_start():
@@ -18622,6 +18736,8 @@ def _gpu_blink_start():
     if _gpu_blink["active"]:
         return
     _gpu_blink["active"] = True
+    # Drive tray: red spin for GPU tasks (takes priority over blue)
+    _tray_start_spin(red=True)
     _ensure_blink_running()
 
 
@@ -18633,6 +18749,12 @@ def _gpu_blink_stop():
         style.map("Gpu.TButton", background=[("pressed", C_BTN), ("active", C_BTN_HVR), ("disabled", C_BORDER)])
     except Exception:
         pass
+    # Drive tray: switch to blue if sync blink active, otherwise stop + idle
+    if _sync_blink["active"]:
+        _tray_start_spin(red=False)
+    else:
+        _tray_stop_spin(force=True)
+        _update_tray_tooltip("YT Archiver \u2014 Idle")
 
 
 def _update_gpu_btn():
@@ -20097,7 +20219,7 @@ def _tick_countdown():
                     else:
                         _cd_text = f"{s}s"
                     autorun_countdown_var.set(f"Next sync in: {_cd_text}")
-                    if not _sync_running:
+                    if not _sync_blink["active"]:
                         _update_tray_tooltip(f"YT Archiver — Next sync in {_cd_text}")
             else:
                 autorun_countdown_var.set("Syncing now...")
@@ -20871,6 +20993,14 @@ def _tp_open_db(path):
         conn.execute("ALTER TABLE videos ADD COLUMN search_failed_ts REAL")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Migration: add id_resolve_failed_ts column — marks rows that went through
+    # the full ID resolution pipeline (segments/db/JSONL walk) and still couldn't
+    # be matched to a video_id.  Prevents the expensive JSONL walk from firing on
+    # every metadata run just because one orphan row exists.
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN id_resolve_failed_ts REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
@@ -21241,9 +21371,13 @@ class _TranscriptionPanel(ttk.Frame):
         INSERT OR IGNORE for videos without a filepath."""
         if not self._conn:
             return
-        # Normalize filepath for consistent storage and matching
+        # Normalize filepath for consistent storage and matching.
+        # NFC unicode normalization ensures emoji/accented characters are stored
+        # in a canonical form so the same video from different sources (yt-dlp
+        # stdout vs. os.walk) produces identical strings — prevents duplicate
+        # rows with subtly-different unicode that would both fail ID resolution.
         if filepath:
-            filepath = os.path.normpath(filepath)
+            filepath = unicodedata.normalize('NFC', os.path.normpath(filepath))
         try:
             if filepath:
                 # Atomic UPSERT on the UNIQUE COLLATE NOCASE filepath column
@@ -21350,7 +21484,7 @@ class _TranscriptionPanel(ttk.Frame):
 
             # Now process all collected video files with transcript info available
             for ch_name, root_dir, dirpath, fn, fn_lower in pending_videos:
-                fp = os.path.normpath(os.path.join(dirpath, fn))
+                fp = unicodedata.normalize('NFC', os.path.normpath(os.path.join(dirpath, fn)))
                 # Derive year / month from path structure
                 _, year, month = _tp_parse_path_meta(fp, [root_dir])
                 title = os.path.splitext(fn)[0]
@@ -28934,12 +29068,12 @@ def on_tab_changed(event):
                 _tab_btns[str(tab_recent)].config(text="  Recent  ")
             _update_tray_badge()
             # Clear the "X new videos downloaded" tooltip since user has seen them
-            if not _sync_running:
+            if not _sync_blink["active"]:
                 nxt = _autorun_next.get("ts")
                 if nxt and (nxt - datetime.now()).total_seconds() > 0:
                     pass  # _tick_countdown will update tooltip
                 else:
-                    _update_tray_tooltip("YT Archiver — Idle")
+                    _update_tray_tooltip("YT Archiver \u2014 Idle")
     elif selected == str(tab_transcriptions):
         _tp_panel.on_shown()
 

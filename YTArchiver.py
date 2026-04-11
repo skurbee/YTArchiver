@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.6"
+APP_VERSION = "v37.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3956,7 +3956,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 6:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 6:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -26033,26 +26033,36 @@ class _TranscriptionPanel(ttk.Frame):
                        activebackground=C_BTN_HVR, activeforeground=self._TP_FG,
                        disabledforeground=self._TP_DIM, bd=0, relief="flat")
 
+        # Helper: add a dimmed no-op menu entry that LOOKS disabled but
+        # isn't actually state="disabled" — Windows renders the native
+        # disabled state with its own ugly grey that ignores our color
+        # settings. Using state="normal" + foreground=C_DIM matches the
+        # subs-tab channel context menu's dim-item look.
+        def _add_dim(lbl):
+            menu.add_command(label=lbl, command=lambda: None)
+            _idx = menu.index(tk.END)
+            menu.entryconfig(_idx, foreground=C_DIM, activeforeground=C_DIM)
+
         if video_path:
             menu.add_command(label="  \u25b6  Play Video",
                              command=lambda: self._open_vlc(
                                  video_path, 0, title=title, db_rows=_db_rows))
         else:
-            menu.add_command(label="  \u25b6  Play Video", state="disabled")
+            _add_dim("  \u25b6  Play Video")
 
         if video_id:
             url = f"https://www.youtube.com/watch?v={video_id}"
             menu.add_command(label="  Open Video \u2014 YouTube",
                              command=lambda u=url: _webbrowser.open(u))
         else:
-            menu.add_command(label="  Open Video \u2014 YouTube", state="disabled")
+            _add_dim("  Open Video \u2014 YouTube")
 
         if video_id:
             menu.add_command(label="  Redownload...",
                              command=lambda vi=video_id, t=title, vp=video_path, ch=channel:
                                  self._on_browse_redownload(vi, t, vp, ch))
         else:
-            menu.add_command(label="  Redownload...", state="disabled")
+            _add_dim("  Redownload...")
 
         # Show in Explorer
         def _show_explorer(vp=video_path, t=title, ch=channel):

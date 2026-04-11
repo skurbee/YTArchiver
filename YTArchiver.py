@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.4"
+APP_VERSION = "v37.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     "autorun_history": [],
     "log_mode": "Simple",
     "autorun_gpu": False,
+    "autorun_sync": False,
     "chan_col_widths": {},
     "recent_col_widths": {},
     "deps_checked": False
@@ -260,6 +261,11 @@ _session_totals_lock = threading.Lock()  # protects session_totals reset
 _mini_log_last_end = [None]
 def _sync_mini_logs_from_main(): pass  # stub until real definition later
 _tp_panel_ref = [None]
+
+# Accumulator for the "Update Transcription Index" popup — we want ONE popup
+# at the end of a queued batch of transcriptions, not one per channel.
+_pending_reindex_names = set()
+_pending_reindex_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Background internet monitor — pings every 5s, pauses all ops on outage
@@ -599,15 +605,17 @@ def log(text, tag=None):
                             if not _wr:
                                 break
                             log_box.delete(_wr[0], _wr[1])
-                    # Insert after simplestatus (if present) and before pausestatus
-                    # so the line always stays below the sync counter and above the
-                    # pause anchor, even when other log messages arrive mid-update.
-                    _ps_r_wp = log_box.tag_ranges("pausestatus")
+                    # Insert ABOVE any pinned simplestatus / pausestatus line so
+                    # the active "Transcribing: X···" pinned line always stays
+                    # at the very bottom of the log. Previously this inserted
+                    # AFTER simplestatus, which pushed the active pinned line
+                    # above the whisper progress line — wrong order.
                     _ss_r_wp = log_box.tag_ranges("simplestatus")
-                    if _ps_r_wp:
+                    _ps_r_wp = log_box.tag_ranges("pausestatus")
+                    if _ss_r_wp:
+                        _wp_ins = log_box.index(_ss_r_wp[0])
+                    elif _ps_r_wp:
                         _wp_ins = log_box.index(_ps_r_wp[0])
-                    elif _ss_r_wp:
-                        _wp_ins = log_box.index(_ss_r_wp[-1])
                     else:
                         _wp_ins = tk.END
                     # Split text to colorize the percentage green
@@ -729,7 +737,7 @@ def log(text, tag=None):
                                     break
                                 log_box.delete(_tu_r[0], _tu_r[1])
 
-                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "simpleline_blue", "simpleline_pink", "red", "summary", "transcribe_using", "metadata_using"):
+                    if use_tag in ("simpledownload", "simpleline", "simpleline_green", "simpleline_blue", "simpleline_pink", "simpleline_redwnl", "simpleline_compress", "simpleline_reorg", "red", "summary", "transcribe_using", "metadata_using"):
                         dl_ranges = log_box.tag_ranges("dlprogress")
                         if dl_ranges:
                             log_box.delete(dl_ranges[0], dl_ranges[1])
@@ -764,14 +772,22 @@ def log(text, tag=None):
                     """Insert text at _ins_pos, splitting [N/M] brackets into colored segments."""
                     _bk_tag = None
                     _do_white = False
-                    if _base_tag in ("simpleline", "simpleline_green", "simpleline_blue", "simpleline_pink",
+                    # Direct tag detection for the dedicated task tags (no keyword sniffing needed)
+                    if _base_tag == "simpleline_redwnl":
+                        _bk_tag = "redwnl_bracket"
+                    elif _base_tag == "simpleline_compress":
+                        _bk_tag = "compress_bracket"
+                    elif _base_tag == "simpleline_reorg":
+                        _bk_tag = "reorg_bracket"
+                    elif _base_tag in ("simpleline", "simpleline_green", "simpleline_blue", "simpleline_pink",
                                      "metadata_using", "header"):
                         if any(kw in _txt for kw in ("SYNCING:", "Downloaded:", "▶",
                                                       "no new videos", "Filtered")):
                             _bk_tag = "sync_bracket"
                         elif any(kw in _txt for kw in ("Fetching captions:", "Re-transcribing",
                                                         "Transcribing", "fetching captions",
-                                                        "done (", "no speech detected")):
+                                                        "done (", "no speech detected",
+                                                        "transcribed.")):
                             _bk_tag = "trans_bracket"
                             if _base_tag == "simpleline_blue" and "done (" in _txt:
                                 _do_white = True
@@ -837,6 +853,79 @@ def log(text, tag=None):
                         return
                     _bk_m = re.search(r'\[(\d+/\d+)\]', _txt)
                     if not _bk_m:
+                        # No [N/M] — but if the line was task-classified by
+                        # base-tag or keyword, we still want its em-dashes to
+                        # be color-coded so things like "  — Transcribing: X"
+                        # or "  — 28k videos already transcribed — skipping."
+                        # render with the right colored em-dash.
+                        _dash_tag = None
+                        if _base_tag == "simpleline_redwnl" or _bk_tag == "redwnl_bracket":
+                            _dash_tag = "simpleline_redwnl"
+                        elif _base_tag == "simpleline_compress" or _bk_tag == "compress_bracket":
+                            _dash_tag = "simpleline_compress"
+                        elif _base_tag == "simpleline_reorg" or _bk_tag == "reorg_bracket":
+                            _dash_tag = "simpleline_reorg"
+                        elif _bk_tag == "trans_bracket":
+                            _dash_tag = "simpleline_blue"
+                        elif _bk_tag == "sync_bracket":
+                            _dash_tag = "simpleline_green"
+                        elif _bk_tag == "meta_bracket":
+                            _dash_tag = "simpleline_pink"
+                        if _dash_tag and "\u2014" in _txt:
+                            # Build a set of colored ranges. Each entry is
+                            # (start, end, color_tag) so different phrases on
+                            # the same line can have different colors (e.g. a
+                            # blue em-dash AND a green ✓ on the same summary
+                            # line).
+                            _highlight_phrases = []
+                            if _bk_tag == "trans_bracket":
+                                _highlight_phrases = ["Transcribing:", "Re-transcribing:"]
+                            elif _bk_tag == "sync_bracket":
+                                _highlight_phrases = ["Syncing:", "SYNCING:"]
+                            elif _bk_tag == "meta_bracket":
+                                _highlight_phrases = ["Metadata:", "Refreshing:"]
+                            _color_ranges = []  # list of (start, end, tag)
+                            for _phrase in _highlight_phrases:
+                                _idx = 0
+                                while True:
+                                    _pi = _txt.find(_phrase, _idx)
+                                    if _pi < 0:
+                                        break
+                                    _color_ranges.append((_pi, _pi + len(_phrase), _dash_tag))
+                                    _idx = _pi + len(_phrase)
+                            # Em-dashes → dash color
+                            _ei = 0
+                            while True:
+                                _di = _txt.find("\u2014", _ei)
+                                if _di < 0:
+                                    break
+                                _color_ranges.append((_di, _di + 1, _dash_tag))
+                                _ei = _di + 1
+                            # Transcription completion line has green accents:
+                            # the ✓ checkmark and the "Completed N" count.
+                            if _bk_tag == "trans_bracket":
+                                _ci = _txt.find("\u2713")
+                                if _ci >= 0:
+                                    _color_ranges.append((_ci, _ci + 1, "simpleline_green"))
+                                _cm = re.search(r'Completed \d+', _txt)
+                                if _cm:
+                                    _color_ranges.append((_cm.start(), _cm.end(), "simpleline_green"))
+                            _color_ranges.sort()
+                            # Walk and emit segments using per-range color
+                            _p = _ins_pos
+                            _pos = 0
+                            for _r_start, _r_end, _r_tag in _color_ranges:
+                                if _r_start > _pos:
+                                    _seg = _txt[_pos:_r_start]
+                                    log_box.insert(_p, _seg, _base_tag)
+                                    _p = log_box.index(f"{_p}+{len(_seg)}c")
+                                _seg = _txt[_r_start:_r_end]
+                                log_box.insert(_p, _seg, _r_tag)
+                                _p = log_box.index(f"{_p}+{len(_seg)}c")
+                                _pos = _r_end
+                            if _pos < len(_txt):
+                                log_box.insert(_p, _txt[_pos:], _base_tag)
+                            return
                         log_box.insert(_ins_pos, _txt, _base_tag)
                         return
                     _is_meta = (_bk_tag == "meta_bracket")
@@ -940,6 +1029,8 @@ def log(text, tag=None):
                 if (_is_simple_mode
                         and use_tag in ("simpledownload", "red", "summary", "header", "tx_sep", "tx_head",
                                         "update_sep", "update_head", "simpleline_blue", "simpleline_pink", "simpleline", "simpleline_green",
+                                        "simpleline_redwnl", "simpleline_compress", "simpleline_reorg",
+                                        "transcribe_using", "metadata_using",
                                         "pauselog")):
                     ss_ranges = log_box.tag_ranges("simplestatus")
                     if ss_ranges:
@@ -1367,71 +1458,59 @@ def log_simple_status(text=None, extra_tag=None, segments=None):
                     for _ri in range(len(_ps_ranges) - 2, -1, -2):
                         log_box.delete(_ps_ranges[_ri], _ps_ranges[_ri + 1])
 
+                # Delete the existing simplestatus (we'll re-insert at the end
+                # after whisper/encode progress, so it always sits at the very
+                # bottom of the log).
                 ranges = log_box.tag_ranges("simplestatus")
                 if ranges:
-                    _pos = log_box.index(ranges[0])
                     log_box.delete(ranges[0], ranges[1])
-                    # Insert each segment with its color tag simultaneously to avoid
-                    # a brief grey flash that occurs if we insert with "simplestatus"
-                    # alone and then apply color tags in a separate step.
-                    if segments is not None:
-                        _seg_p = _pos
-                        for _st, _stag in segments:
-                            if _st:
-                                _stags = ("simplestatus", _stag) if _stag else "simplestatus"
-                                log_box.insert(_seg_p, _st, _stags)
-                                _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
-                    elif extra_tag and _full_text:
-                        log_box.insert(_pos, _full_text, "simplestatus")
-                        _new_end = log_box.index(f"{_pos}+{len(_full_text)}c")
-                        log_box.tag_add(extra_tag, _pos, _new_end)
-                    else:
-                        log_box.insert(_pos, _full_text, "simplestatus")
-                else:
-                    _ins_start = log_box.index(tk.END)
-                    if segments is not None:
-                        _seg_p = _ins_start
-                        for _st, _stag in segments:
-                            if _st:
-                                _stags = ("simplestatus", _stag) if _stag else "simplestatus"
-                                log_box.insert(tk.END, _st, _stags)
-                                _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
-                    elif extra_tag and _full_text:
-                        log_box.insert(tk.END, _full_text, "simplestatus")
-                        _new_end = log_box.index(f"{_ins_start}+{len(_full_text)}c")
-                        log_box.tag_add(extra_tag, _ins_start, _new_end)
-                    else:
-                        log_box.insert(tk.END, _full_text, "simplestatus")
 
-                # Re-insert encode/whisper progress AFTER simplestatus (before pausestatus)
+                # Re-insert encode/whisper progress at tk.END FIRST so it ends
+                # up above the simplestatus we're about to insert. This is the
+                # simpler ordering — previously we tried to insert progress
+                # above an existing simplestatus position, which had subtle
+                # edge cases when the dot animation tick mutated positions
+                # between insert calls.
                 if _saved_parts:
-                    _ps_r_ep = log_box.tag_ranges("pausestatus")
-                    _ins_pt = log_box.index(_ps_r_ep[0]) if _ps_r_ep else tk.END
                     for _s_text, _s_tag in _saved_parts:
-                        log_box.insert(_ins_pt, _s_text, _s_tag)
-                        if _ins_pt != tk.END:
-                            _ins_pt = log_box.index(f"{_ins_pt} + {len(_s_text)}c")
+                        log_box.insert(tk.END, _s_text, _s_tag)
                     # Re-apply encode_prefix/encode_title overlays lost during save/restore
-                    _ep_r = log_box.tag_ranges("encode_progress")
-                    if _ep_r:
-                        _ep_start = _ep_r[-2]
-                        _ep_text = log_box.get(_ep_r[-2], _ep_r[-1])
-                        _enc_i = _ep_text.find("ENCODING")
-                        if _enc_i >= 0:
-                            # Match ": title (duration) - " or ": title - " after "ENCODING"
-                            _pfx_m = re.match(
+                    _ep_r2 = log_box.tag_ranges("encode_progress")
+                    if _ep_r2:
+                        _ep_start2 = _ep_r2[-2]
+                        _ep_text2 = log_box.get(_ep_r2[-2], _ep_r2[-1])
+                        _enc_i2 = _ep_text2.find("ENCODING")
+                        if _enc_i2 >= 0:
+                            _pfx_m2 = re.match(
                                 r'^(: .+?)(\s+\((?:\?|\d+h\d+m|\d+m\d+s)\)\s*-\s*|\s*-\s*)(.*)$',
-                                _ep_text[_enc_i + 8:]
+                                _ep_text2[_enc_i2 + 8:]
                             )
-                            if _pfx_m:
-                                _pfx_end = log_box.index(f"{_ep_start}+{_enc_i}c")
-                                log_box.tag_add("encode_prefix", _ep_start, _pfx_end)
-                                _ttl_start = log_box.index(f"{_ep_start}+{_enc_i + 8}c")
-                                _ttl_end = log_box.index(
-                                    f"{_ttl_start}+{len(_pfx_m.group(1))}c")
-                                log_box.tag_add("encode_title", _ttl_start, _ttl_end)
-                    # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
+                            if _pfx_m2:
+                                _pfx_end2 = log_box.index(f"{_ep_start2}+{_enc_i2}c")
+                                log_box.tag_add("encode_prefix", _ep_start2, _pfx_end2)
+                                _ttl_start2 = log_box.index(f"{_ep_start2}+{_enc_i2 + 8}c")
+                                _ttl_end2 = log_box.index(
+                                    f"{_ttl_start2}+{len(_pfx_m2.group(1))}c")
+                                log_box.tag_add("encode_title", _ttl_start2, _ttl_end2)
                     _reapply_whisper_overlays()
+
+                # Now insert the simplestatus at tk.END — guaranteed to be the
+                # very last line of the log, sitting below any whisper progress
+                # we just restored.
+                _ins_start = log_box.index(tk.END)
+                if segments is not None:
+                    _seg_p = _ins_start
+                    for _st, _stag in segments:
+                        if _st:
+                            _stags = ("simplestatus", _stag) if _stag else "simplestatus"
+                            log_box.insert(tk.END, _st, _stags)
+                            _seg_p = log_box.index(f"{_seg_p}+{len(_st)}c")
+                elif extra_tag and _full_text:
+                    log_box.insert(tk.END, _full_text, "simplestatus")
+                    _new_end = log_box.index(f"{_ins_start}+{len(_full_text)}c")
+                    log_box.tag_add(extra_tag, _ins_start, _new_end)
+                else:
+                    log_box.insert(tk.END, _full_text, "simplestatus")
 
                 # Re-insert pausestatus at the very bottom (after simplestatus)
                 for _ps_text in _saved_ps:
@@ -1798,10 +1877,66 @@ def _simple_anim_tick():
         if _anim_mode == "redownload":
             # Redownload mode: [x/total] REDOWNLOADING: channel···
             log_simple_status(segments=[
-                ("[", "simplestatus_green"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_green"),
-                (" REDOWNLOADING:", "simplestatus_green"),
+                ("[", "simplestatus_redwnl"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_redwnl"),
+                (" REDOWNLOADING:", "simplestatus_redwnl"),
                 (f" {ch}", "simplestatus_white"),
-                (d, "simplestatus_green"),
+                (d, "simplestatus_redwnl"),
+                ("\n", None),
+            ])
+            return  # finally block handles rescheduling
+
+        if _anim_mode == "transcribe":
+            # Transcribe mode: shows "[x/total] Transcribing: channel···" once
+            # the file count is known, or just "Transcribing: channel···" while
+            # we're still in the scanning/matching phase (so the user always
+            # has an active line at the bottom from the moment a transcribe
+            # job starts).
+            if n > 0:
+                log_simple_status(segments=[
+                    ("[", "trans_bracket"), (f"{i}/{n}", "simplestatus_white"), ("]", "trans_bracket"),
+                    (" Transcribing:", "trans_bracket"),
+                    (f" {ch}", "simplestatus_white"),
+                    (d, "trans_bracket"),
+                    ("\n", None),
+                ])
+            else:
+                log_simple_status(segments=[
+                    ("Transcribing:", "trans_bracket"),
+                    (f" {ch}", "simplestatus_white"),
+                    (d, "trans_bracket"),
+                    ("\n", None),
+                ])
+            return  # finally block handles rescheduling
+
+        if _anim_mode == "metadata":
+            # Metadata mode: [x/total] FETCHING METADATA: channel···
+            log_simple_status(segments=[
+                ("[", "meta_bracket"), (f"{i}/{n}", "simplestatus_white"), ("]", "meta_bracket"),
+                (" FETCHING METADATA:", "meta_bracket"),
+                (f" {ch}", "simplestatus_white"),
+                (d, "meta_bracket"),
+                ("\n", None),
+            ])
+            return  # finally block handles rescheduling
+
+        if _anim_mode == "compress":
+            # Compress mode: [x/total] COMPRESSING: channel···
+            log_simple_status(segments=[
+                ("[", "simplestatus_compress"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_compress"),
+                (" COMPRESSING:", "simplestatus_compress"),
+                (f" {ch}", "simplestatus_white"),
+                (d, "simplestatus_compress"),
+                ("\n", None),
+            ])
+            return  # finally block handles rescheduling
+
+        if _anim_mode == "reorg":
+            # Reorg mode: [x/total] REORGANIZING: channel···
+            log_simple_status(segments=[
+                ("[", "simplestatus_reorg"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_reorg"),
+                (" REORGANIZING:", "simplestatus_reorg"),
+                (f" {ch}", "simplestatus_white"),
+                (d, "simplestatus_reorg"),
                 ("\n", None),
             ])
             return  # finally block handles rescheduling
@@ -2694,9 +2829,19 @@ def _scan_channel_disk_info(ch):
                     _fn_lower = _fn.lower()
                     if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
                             and ".temp." not in _fn_lower
-                            and ".part" not in _fn_lower):
+                            and ".part" not in _fn_lower
+                            and "_temp_compress" not in _fn_lower
+                            and "_backlog_temp" not in _fn_lower):
                         _num_vids += 1
-                        _fp = os.path.join(_dp, _fn)
+                        # MUST normalize via os.path.normpath + NFC so the filepath
+                        # matches what register_video stores. Otherwise the same file
+                        # ends up with two rows in `videos` (one mixed-slash from
+                        # this scanner, one all-backslash from register_video) and
+                        # the unique constraint can't dedupe them.
+                        _fp = unicodedata.normalize(
+                            'NFC',
+                            os.path.normpath(os.path.join(_dp, _fn))
+                        )
                         try:
                             _sz = os.path.getsize(_fp)
                             _ch_bytes += _sz
@@ -3395,6 +3540,9 @@ C_LOG_HEAD = "#a0aabb"
 C_LOG_SUM = "#f5a623"
 C_LOG_PINK = "#e87aac"
 C_LOG_UPDATE = "#38d9e0"
+C_LOG_REDWNL = "#c7e64f"    # chartreuse / yellow-green — Redownload identity
+C_LOG_COMPRESS = "#c084fc"  # purple — Compression identity
+C_LOG_REORG = "#ff8c42"     # orange — Reorg identity
 
 root.configure(bg=C_BG)
 
@@ -3808,7 +3956,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 9:06pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 5:29pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4096,11 +4244,14 @@ autorun_history_text = tk.Text(
 autorun_history_text.grid(row=0, column=0, sticky="nsew")
 hist_scroll.config(command=autorun_history_text.yview)
 
-autorun_history_text.tag_configure("hist_blue",    foreground=C_LOG_BLUE)
-autorun_history_text.tag_configure("hist_green",   foreground=C_LOG_GREEN)
-autorun_history_text.tag_configure("hist_amber",   foreground=C_LOG_SUM)
-autorun_history_text.tag_configure("hist_pink",    foreground=C_LOG_PINK)
-autorun_history_text.tag_configure("hist_row_alt", background="#101520")
+autorun_history_text.tag_configure("hist_blue",     foreground=C_LOG_BLUE)
+autorun_history_text.tag_configure("hist_green",    foreground=C_LOG_GREEN)
+autorun_history_text.tag_configure("hist_amber",    foreground=C_LOG_SUM)
+autorun_history_text.tag_configure("hist_pink",     foreground=C_LOG_PINK)
+autorun_history_text.tag_configure("hist_redwnl",   foreground=C_LOG_REDWNL)
+autorun_history_text.tag_configure("hist_compress", foreground=C_LOG_COMPRESS)
+autorun_history_text.tag_configure("hist_reorg",    foreground=C_LOG_REORG)
+autorun_history_text.tag_configure("hist_row_alt",  background="#101520")
 
 # Prevent interaction (visual-only)
 autorun_history_text.bind("<Button-1>",  lambda e: "break")
@@ -4208,6 +4359,9 @@ log_box.tag_configure("simpleline", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpleline_green", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("simpleline_blue", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("simpleline_pink", foreground=C_LOG_PINK, font=("Consolas", 9))
+log_box.tag_configure("simpleline_redwnl", foreground=C_LOG_REDWNL, font=("Consolas", 9))
+log_box.tag_configure("simpleline_compress", foreground=C_LOG_COMPRESS, font=("Consolas", 9))
+log_box.tag_configure("simpleline_reorg", foreground=C_LOG_REORG, font=("Consolas", 9))
 log_box.tag_configure("transcribe_using", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("metadata_using", foreground=C_TEXT, font=("Consolas", 9))
 log_box.tag_configure("simpledownload", foreground=C_LOG_GREEN)
@@ -4242,7 +4396,14 @@ log_box.tag_raise("transcribe_title", "transcribe_using")
 log_box.tag_configure("sync_bracket", foreground=C_LOG_GREEN, font=("Consolas", 9))
 log_box.tag_configure("trans_bracket", foreground=C_LOG_BLUE, font=("Consolas", 9))
 log_box.tag_configure("meta_bracket", foreground=C_LOG_PINK, font=("Consolas", 9))
+log_box.tag_configure("redwnl_bracket", foreground=C_LOG_REDWNL, font=("Consolas", 9))
+log_box.tag_configure("compress_bracket", foreground=C_LOG_COMPRESS, font=("Consolas", 9))
+log_box.tag_configure("reorg_bracket", foreground=C_LOG_REORG, font=("Consolas", 9))
 log_box.tag_configure("trans_dots", foreground=C_LOG_BLUE, font=("Consolas", 9))
+# Live status segments for redownload/compress/reorg modes
+log_box.tag_configure("simplestatus_redwnl", foreground=C_LOG_REDWNL)
+log_box.tag_configure("simplestatus_compress", foreground=C_LOG_COMPRESS)
+log_box.tag_configure("simplestatus_reorg", foreground=C_LOG_REORG)
 log_box.tag_configure("dl_white", foreground="#ffffff", font=("Consolas", 9))
 # simplestatus_green must override simplestatus so SYNCING label stays green
 log_box.tag_raise("simplestatus_green", "simplestatus")
@@ -4262,6 +4423,22 @@ log_box.tag_raise("trans_bracket", "transcribe_prefix")
 log_box.tag_raise("meta_bracket", "simpleline")
 log_box.tag_raise("meta_bracket", "simpleline_pink")
 log_box.tag_raise("meta_bracket", "metadata_using")
+log_box.tag_raise("redwnl_bracket", "simpleline")
+log_box.tag_raise("redwnl_bracket", "simpleline_redwnl")
+log_box.tag_raise("redwnl_bracket", "simpleline_green")
+log_box.tag_raise("redwnl_bracket", "header")
+log_box.tag_raise("compress_bracket", "simpleline")
+log_box.tag_raise("compress_bracket", "simpleline_compress")
+log_box.tag_raise("compress_bracket", "simpleline_blue")
+# Make sure colored em-dash overlays win over the plain "scanline" foreground
+log_box.tag_raise("simpleline_blue", "scanline")
+log_box.tag_raise("simpleline_pink", "scanline")
+log_box.tag_raise("simpleline_green", "scanline")
+log_box.tag_raise("compress_bracket", "header")
+log_box.tag_raise("reorg_bracket", "simpleline")
+log_box.tag_raise("reorg_bracket", "simpleline_reorg")
+log_box.tag_raise("reorg_bracket", "simpleline_green")
+log_box.tag_raise("reorg_bracket", "header")
 
 # Shared tag config for ALL mini logs — defined once to prevent drift between
 # the subs, recent, and browse mini logs.  Must match main log_box colors exactly.
@@ -4311,6 +4488,12 @@ _MINI_LOG_TAGS = [
     ("meta_bracket", {"foreground": C_LOG_PINK}),
     ("trans_bracket", {"foreground": C_LOG_BLUE}),
     ("sync_bracket", {"foreground": C_LOG_GREEN}),
+    ("redwnl_bracket", {"foreground": C_LOG_REDWNL}),
+    ("compress_bracket", {"foreground": C_LOG_COMPRESS}),
+    ("reorg_bracket", {"foreground": C_LOG_REORG}),
+    ("simpleline_redwnl", {"foreground": C_LOG_REDWNL}),
+    ("simpleline_compress", {"foreground": C_LOG_COMPRESS}),
+    ("simpleline_reorg", {"foreground": C_LOG_REORG}),
     ("trans_dots", {"foreground": C_LOG_BLUE}),
 ]
 
@@ -6482,9 +6665,16 @@ def sync_single_channel(_from_queue=False):
             # If a newer job has taken over (user cancelled + started new sync),
             # don't touch any shared state — the new job owns it now.
             if _job_generation == _my_gen:
-                # Check for queued syncs, reorg, or transcription jobs before fully finishing.
-                # Keep _sync_running=True until we confirm nothing else is queued,
-                # to prevent a race where another sync starts in the gap.
+                # Clear _sync_running BEFORE calling _process_next_queued so
+                # chained tasks (metadata/redownload/etc.) don't see us as
+                # "still running" and silently re-queue themselves. This matches
+                # the pattern already used by _sync_worker (batch path). The
+                # race window for another sync starting in this gap is handled
+                # by the queue_order lock and the start_sync_all busy check.
+                _sync_running = False
+                _current_sync_ch = None
+                _clear_sync_progress()
+
                 _queue_started = False
                 if _skip_current.is_set():
                     _skip_current.clear()
@@ -6525,9 +6715,8 @@ def sync_single_channel(_from_queue=False):
                     _queue_batch_err = 0
                     _queue_batch_skip = 0
                     _queue_batch_t_start = None
-                    _sync_running = False
-                    _current_sync_ch = None
-                    _clear_sync_progress()
+                    # (_sync_running, _current_sync_ch, _clear_sync_progress
+                    # already cleared above, before _process_next_queued)
                     if _root_alive:
                         def _on_single_sync_done(_fdl=_final_dl):
                             _validate_download_btn()
@@ -6690,6 +6879,16 @@ def _process_next_queued():
                 has_items = bool(_redownload_queue)
             if has_items:
                 return _process_redownload_queue(_preferred_key=key)
+        elif source == "video":
+            with _video_dl_queue_lock:
+                has_items = bool(_video_dl_queue)
+            if has_items:
+                # _process_video_dl_queue blocks on each download, so we spawn
+                # a worker thread and return True to signal "dispatched".
+                # The ("video", "batch") entry is removed from _queue_order
+                # inside _process_video_dl_queue's cleanup.
+                threading.Thread(target=_process_video_dl_queue, daemon=True).start()
+                return True
         elif source == "metadata":
             with _metadata_queue_lock:
                 has_items = bool(_metadata_queue)
@@ -6709,6 +6908,10 @@ def _process_video_dl_queue():
     with _video_dl_queue_lock:
         queued = list(_video_dl_queue)
         _video_dl_queue.clear()
+    # Strip the ("video", "batch") entry from _queue_order so the Sync Tasks
+    # popup doesn't show a phantom video item once we drain the real queue.
+    with _queue_order_lock:
+        _queue_order[:] = [(s, k) for s, k in _queue_order if s != "video"]
     if not queued:
         return
     _update_queue_btn()
@@ -7196,7 +7399,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
             moved_count += 1
             if not is_simple:
                 rel_target = os.path.relpath(target_dir, folder_path)
-                log(f"  [{moved_count}/{total}] → {filename}  →  {rel_target}\n", "green")
+                log(f"  [{moved_count}/{total}] → {filename}  →  {rel_target}\n", "simpleline_reorg")
             # Move companion files (thumbnail, subtitle, metadata) alongside the video
             _src_dir = os.path.dirname(filepath)
             _base_no_ext = os.path.splitext(filename)[0]
@@ -8926,7 +9129,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
 
             fname_short = fname if len(fname) <= 50 else fname[:47] + "..."
             if not _is_simple_mode:
-                log(f"\n  [{idx}/{total}] {fname} ({dur_str})\n", "simpleline")
+                log(f"\n  [{idx}/{total}] {fname} ({dur_str})\n", "simpleline_compress")
 
             # Pre-flight disk space check: need ~2x file size for temp + original
             try:
@@ -9075,8 +9278,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         new_mb = new_size / (1024 * 1024)
                         _rt_str = f", {duration / _encode_elapsed:.1f}x realtime" if duration > 0 and _encode_elapsed > 0 else ""
                         if _is_simple_mode:
-                            log(f"    [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline_blue")
-                        log(f"    ✓ {_fmt_enc_size(orig_mb)} → {_fmt_enc_size(new_mb)} ({ratio:.0f}% smaller, took {_elapsed_str}{_rt_str})\n", "simpleline_blue")
+                            log(f"    [{idx}/{total}] {fname_short} ({dur_str})\n", "simpleline_compress")
+                        log(f"    ✓ {_fmt_enc_size(orig_mb)} → {_fmt_enc_size(new_mb)} ({ratio:.0f}% smaller, took {_elapsed_str}{_rt_str})\n", "simpleline_compress")
                     except Exception as e:
                         err_count += 1
                         log(f"    ⚠ Replace failed: {e}\n", "red")
@@ -9124,7 +9327,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             if err_count:
                 log(f", {err_count} errors", "simpleline_green")
             log(f" ({_t_str})\n", "simpleline_green")
-            _record_compression(ch_name, done_count, err_count, elapsed, batch_num)
+            _record_compression(ch_name, done_count, err_count, elapsed, batch_num, skipped=skipped)
             _invalidate_channel_disk_cache(ch_url)
 
     if _sync_mode:
@@ -9422,7 +9625,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     orig_fname = os.path.basename(orig_path)
                     fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
                     if not _is_simple_mode:
-                        log(f"\n  [{batch_start + idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline")
+                        log(f"\n  [{batch_start + idx + 1}/{len(work_list)}] {fname_short}\n", "simpleline_compress")
 
                     # Download at new quality
                     dl_path = os.path.join(temp_dir, f"{vid_id}.mp4")
@@ -9619,8 +9822,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                                 _bl_dur_str = f"{int(_bl_duration // 60)}m{int(_bl_duration % 60):02d}s" if _bl_duration > 0 else "?"
                                 _bl_rt_str = f", {_bl_duration / _bl_encode_elapsed:.1f}x realtime" if _bl_duration > 0 and _bl_encode_elapsed > 0 else ""
                                 if _is_simple_mode:
-                                    log(f"    [{batch_start + idx + 1}/{len(work_list)}] {fname_short} ({_bl_dur_str})\n", "simpleline_blue")
-                                log(f"    ✓ {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({_bl_ratio:.0f}% smaller, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_blue")
+                                    log(f"    [{batch_start + idx + 1}/{len(work_list)}] {fname_short} ({_bl_dur_str})\n", "simpleline_compress")
+                                log(f"    ✓ {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({_bl_ratio:.0f}% smaller, took {_bl_elapsed_str}{_bl_rt_str})\n", "simpleline_compress")
                             except Exception as e:
                                 log(f"    ⚠ Replace failed: {e}\n", "red")
                                 batch_errors += 1
@@ -10095,7 +10298,19 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             return
 
         total_to_do = len(work_list)
-        log(f"  Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+        # Sample-and-confirm: process the first 10 files, then ask user before tearing
+        # through the rest of a large channel. Skip the popup if the user is resuming
+        # an interrupted run, or if the whole job is small enough that 10 ≈ everything.
+        _SAMPLE_SIZE = 10
+        _sample_results = []  # list of (orig_size_bytes, new_size_bytes) for successful replacements
+        _sample_done = bool(done_ids) or total_to_do <= _SAMPLE_SIZE
+
+        if _sample_done and not done_ids:
+            log(f"  Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+        elif _sample_done:
+            log(f"  Matched {total_to_do} file(s). Resuming redownload at {_res_label}...\n", "simpleline")
+        else:
+            log(f"  Matched {total_to_do} file(s). Checking the first {_SAMPLE_SIZE} at {_res_label}...\n", "simpleline")
         _record_redownload_start(ch_name, _res_label, total_to_do)
         _rd_start_time = time.time()
 
@@ -10115,6 +10330,154 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             _target_height = int(new_res) if new_res != "best" else 0
         except (ValueError, TypeError):
             _target_height = 0
+
+        def _show_sample_popup(avg_pct, direction, current_res_label, sample_n):
+            """Show modal: Continue / Change Resolution / Cancel.
+            Returns 'continue', a new resolution string, or 'cancel'."""
+            result = [None]
+
+            def _build():
+                try:
+                    dlg = tk.Toplevel(root)
+                    dlg.title("Redownload Sample Complete")
+                    dlg.configure(bg=C_BG)
+                    dlg.transient(root)
+                    dlg.resizable(False, False)
+                    try:
+                        _apply_dark_title_bar(dlg)
+                    except Exception:
+                        pass
+
+                    # Header
+                    tk.Label(dlg, text="Sample Complete",
+                             font=("Segoe UI", 12, "bold"),
+                             bg=C_BG, fg=C_TEXT).pack(padx=24, pady=(18, 4))
+
+                    tk.Label(dlg,
+                             text=f"{sample_n} files redownloaded at {current_res_label}",
+                             font=("Segoe UI", 9),
+                             bg=C_BG, fg=C_DIM).pack(padx=24, pady=(0, 12))
+
+                    # Stats
+                    _stat_color = C_LOG_GREEN if direction == "smaller" else C_LOG_REDWNL
+                    tk.Label(dlg,
+                             text=f"Average size change:  {abs(avg_pct):.0f}% {direction}",
+                             font=("Segoe UI", 10, "bold"),
+                             bg=C_BG, fg=_stat_color).pack(padx=24, pady=(0, 18))
+
+                    # Buttons
+                    btn_frame = tk.Frame(dlg, bg=C_BG)
+                    btn_frame.pack(padx=24, pady=(0, 18))
+
+                    def _continue():
+                        result[0] = "continue"
+                        try: dlg.destroy()
+                        except Exception: pass
+
+                    def _change():
+                        # Swap the dialog body for a resolution picker
+                        for _w in dlg.winfo_children():
+                            try: _w.destroy()
+                            except Exception: pass
+
+                        tk.Label(dlg, text="Change Resolution",
+                                 font=("Segoe UI", 12, "bold"),
+                                 bg=C_BG, fg=C_TEXT).pack(padx=24, pady=(18, 4))
+                        tk.Label(dlg, text="Pick a new target and we'll continue from where we left off.",
+                                 font=("Segoe UI", 9),
+                                 bg=C_BG, fg=C_DIM).pack(padx=24, pady=(0, 12))
+
+                        _res_var = tk.StringVar(value=new_res)
+                        _picker_frame = tk.Frame(dlg, bg=C_BG)
+                        _picker_frame.pack(padx=24, pady=(0, 14))
+                        for _opt in RESOLUTION_OPTIONS:
+                            if _opt == "audio":
+                                continue  # nonsensical for video redownload
+                            _disp = "Best" if _opt == "best" else f"{_opt}p"
+                            tk.Radiobutton(_picker_frame, text=_disp, value=_opt,
+                                           variable=_res_var,
+                                           bg=C_BG, fg=C_TEXT,
+                                           selectcolor=C_INPUT,
+                                           activebackground=C_BG,
+                                           activeforeground=C_TEXT,
+                                           font=("Segoe UI", 9),
+                                           anchor="w").pack(fill="x", padx=10, pady=1)
+
+                        _picker_btns = tk.Frame(dlg, bg=C_BG)
+                        _picker_btns.pack(padx=24, pady=(4, 18))
+
+                        def _apply():
+                            _picked = _res_var.get()
+                            result[0] = _picked if _picked else "cancel"
+                            try: dlg.destroy()
+                            except Exception: pass
+
+                        tk.Button(_picker_btns, text="Apply",
+                                  bg=C_SYNC, fg=C_TEXT, activebackground=C_SYNC_H,
+                                  activeforeground=C_TEXT, relief="flat", bd=0,
+                                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                                  width=12, command=_apply).pack(side="left", padx=4)
+                        tk.Button(_picker_btns, text="Cancel",
+                                  bg=C_CANCEL, fg=C_TEXT, activebackground="#8a2222",
+                                  activeforeground=C_TEXT, relief="flat", bd=0,
+                                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                                  width=12, command=_cancel).pack(side="left", padx=4)
+                        dlg.update_idletasks()
+                        _recenter()
+
+                    def _cancel():
+                        result[0] = "cancel"
+                        try: dlg.destroy()
+                        except Exception: pass
+
+                    tk.Button(btn_frame, text="Continue",
+                              bg=C_SYNC, fg=C_TEXT, activebackground=C_SYNC_H,
+                              activeforeground=C_TEXT, relief="flat", bd=0,
+                              font=("Segoe UI", 9, "bold"), cursor="hand2",
+                              width=14, command=_continue).pack(side="left", padx=4)
+                    tk.Button(btn_frame, text="Change Resolution",
+                              bg=C_PRIMARY, fg=C_TEXT, activebackground=C_PRIMARY_H,
+                              activeforeground=C_TEXT, relief="flat", bd=0,
+                              font=("Segoe UI", 9, "bold"), cursor="hand2",
+                              width=18, command=_change).pack(side="left", padx=4)
+                    tk.Button(btn_frame, text="Cancel",
+                              bg=C_CANCEL, fg=C_TEXT, activebackground="#8a2222",
+                              activeforeground=C_TEXT, relief="flat", bd=0,
+                              font=("Segoe UI", 9, "bold"), cursor="hand2",
+                              width=14, command=_cancel).pack(side="left", padx=4)
+
+                    dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+                    def _recenter():
+                        try:
+                            dlg.update_idletasks()
+                            _rw = dlg.winfo_width()
+                            _rh = dlg.winfo_height()
+                            _sw = root.winfo_width()
+                            _sh = root.winfo_height()
+                            _rx = root.winfo_rootx()
+                            _ry = root.winfo_rooty()
+                            _x = _rx + (_sw - _rw) // 2
+                            _y = _ry + (_sh - _rh) // 2
+                            dlg.geometry(f"+{_x}+{_y}")
+                        except Exception:
+                            pass
+
+                    _recenter()
+                    dlg.grab_set()
+                    dlg.lift()
+                    dlg.focus_set()
+                except Exception as _e:
+                    result[0] = "cancel"
+
+            if _root_alive:
+                _ui_queue.append(_build)
+                while result[0] is None and not _ce.is_set():
+                    time.sleep(0.1)
+                if _ce.is_set() and result[0] is None:
+                    return "cancel"
+                return result[0]
+            return "cancel"
 
         def _probe_height(path):
             """Return video height of a file via ffprobe, or 0 on failure."""
@@ -10150,7 +10513,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             orig_fname = os.path.basename(orig_path)
             fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
             if not _is_simple_mode:
-                log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                log(f"\n  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline_redwnl")
 
             try:
                 os.makedirs(temp_dir, exist_ok=True)
@@ -10164,7 +10527,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 _existing_h = _probe_height(orig_path)
                 if _existing_h == _target_height:
                     if _is_simple_mode:
-                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline_redwnl")
                     log(f"    ↔ Already at {_target_height}p, skipping.\n", "dim")
                     skipped_quality += 1
                     done_ids.add(vid_id)
@@ -10242,7 +10605,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                             except Exception:
                                 pass
                             if _is_simple_mode:
-                                log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                                log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline_redwnl")
                             log(f"    ↔ Already at best quality ({_dl_h}p), skipping.\n", "dim")
                             skipped_quality += 1
                             done_ids.add(vid_id)
@@ -10269,7 +10632,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     o_mb = orig_size / (1024 * 1024)
                     n_mb = new_size / (1024 * 1024)
                     if _is_simple_mode:
-                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline")
+                        log(f"  [{idx + 1}/{total_to_do}] {fname_short}\n", "simpleline_redwnl")
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
@@ -10279,12 +10642,47 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     done += 1
                     done_ids.add(vid_id)
                     _save_progress(done_ids)
+                    # Track sample stats (only successful replacements with known orig size)
+                    if not _sample_done and orig_size > 0:
+                        _sample_results.append((orig_size, new_size))
                 except Exception as e:
                     log(f"    ⚠ Replace failed: {e}\n", "red")
                     errors += 1
             except Exception as e:
                 log(f"    ⚠ Error: {e}\n", "red")
                 errors += 1
+
+            # ── Sample checkpoint: after the first 10 successful replacements ──
+            if (not _sample_done
+                    and len(_sample_results) >= _SAMPLE_SIZE
+                    and (idx + 1) < total_to_do
+                    and not _ce.is_set()):
+                _avg_pct = sum((n / o - 1) * 100 for o, n in _sample_results) / len(_sample_results)
+                _avg_dir = "larger" if _avg_pct >= 0 else "smaller"
+                log(f"\n  Sample of {len(_sample_results)} files complete. "
+                    f"Average size: {abs(_avg_pct):.0f}% {_avg_dir}. Awaiting confirmation...\n",
+                    "simpleline_redwnl")
+                _choice = _show_sample_popup(_avg_pct, _avg_dir, _res_label, len(_sample_results))
+                if _choice == "cancel":
+                    log(f"  ⛔ Redownload cancelled by user after sample.\n", "red")
+                    _ce.set()  # use the cancel flag to break the outer loop cleanly
+                    break
+                elif _choice == "continue":
+                    log(f"  ▶ Continuing redownload at {_res_label}.\n", "simpleline_redwnl")
+                    _sample_done = True
+                else:
+                    # New resolution string
+                    new_res = _choice
+                    fmt = build_format_string(new_res)
+                    _res_label = "Best" if new_res == "best" else f"{new_res}p"
+                    try:
+                        _target_height = int(new_res) if new_res != "best" else 0
+                    except (ValueError, TypeError):
+                        _target_height = 0
+                    log(f"  ↻ Switching to {_res_label}. Re-sampling...\n", "simpleline_redwnl")
+                    # Reset sample tracking so we get a fresh popup at the new resolution
+                    _sample_results = []
+                    # _sample_done stays False so we re-check after another _SAMPLE_SIZE files
 
         if _is_simple_mode:
             _stop_simple_anim()
@@ -11509,7 +11907,7 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
         })
     with _queue_order_lock:
         _queue_order.append(("metadata", _key))
-    log(f"\n=== Added to Sync List: Download {scope_label} Metadata ===\n", "header")
+    log(f"  \u2014 Added metadata download to sync-tasks queue\n", "simpleline_pink")
     _update_queue_btn()
     _save_queue_state()
 
@@ -11519,7 +11917,10 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
 
 
 def _process_metadata_queue(_preferred_key=None):
-    """Pop the next metadata task from the queue and start it."""
+    """Pop the next metadata task from the queue and start it.
+    Returns True only if the task actually started — if it was re-queued
+    because another sync-pipeline task is active, returns False so the caller
+    can fall through to its own cleanup path."""
     with _metadata_queue_lock:
         if not _metadata_queue:
             return False
@@ -11536,12 +11937,16 @@ def _process_metadata_queue(_preferred_key=None):
             _queue_order.remove(("metadata", item["_key"]))
         except ValueError:
             pass
-    _start_metadata_task(item)
-    return True
+    # _start_metadata_task may re-queue the item (via _metadata_queue.insert(0, ...))
+    # if another sync-pipeline task is currently running. Propagate the actual result
+    # so the caller knows whether to keep its own state alive or finalise.
+    return _start_metadata_task(item)
 
 
 def _start_metadata_task(item):
-    """Start a metadata download task as a sync-pipeline job."""
+    """Start a metadata download task as a sync-pipeline job.
+    Returns True if the task actually started, False if it was re-queued
+    because another sync-pipeline task is currently active."""
     global _metadata_running, _current_metadata_item
 
     if _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled) or _redownload_running or _metadata_running:
@@ -11549,7 +11954,7 @@ def _start_metadata_task(item):
             _metadata_queue.insert(0, item)
         with _queue_order_lock:
             _queue_order.insert(0, ("metadata", item["_key"]))
-        return
+        return False
 
     _metadata_running = True
     _current_metadata_item = item
@@ -11610,6 +12015,8 @@ def _start_metadata_task(item):
         threading.Thread(target=_worker, daemon=True).start()
     except Exception:
         _metadata_running = False
+        return False
+    return True
 
 
 def _run_metadata_download(item):
@@ -12542,12 +12949,16 @@ def _run_metadata_download(item):
 
     _fetch_total = len(_to_fetch)
     if _fetch_total == 0 and skipped > 0:
-        log(f"{_mode_label}: {scope_label} — all {skipped} videos already have metadata.\n", "simpleline")
+        log(f"  \u2014 All {skipped} videos already have metadata.\n", "simpleline_pink")
         return
     if skipped:
-        log(f"{_mode_label}: {scope_label} — {_fetch_total} to fetch ({skipped} already done).\n", "simpleline")
+        log(f"  \u2014 {_fetch_total} to fetch ({skipped} already done).\n", "simpleline_pink")
     else:
-        log(f"{_mode_label}: {scope_label} — {_fetch_total} videos to process.\n", "simpleline")
+        log(f"  \u2014 {_fetch_total} videos to process.\n", "simpleline_pink")
+
+    # Pin a live status line at the bottom of the log while metadata is fetching
+    if _is_simple_mode and _fetch_total > 0:
+        _start_simple_anim(ch_name, 1, _fetch_total, mode="metadata")
 
     _fetch_done = 0
     _changed_paths = set()
@@ -12555,6 +12966,9 @@ def _run_metadata_download(item):
     for meta_path, group in folder_groups.items():
         if cancel_event.is_set():
             log(f"{_mode_label}: cancelled.\n", "simpleline")
+            if _is_simple_mode:
+                _stop_simple_anim()
+                clear_simple_status()
             return
         subfolder = group["subfolder"]
         existing = group["_existing"]
@@ -12574,6 +12988,9 @@ def _run_metadata_download(item):
                 log(f"{_mode_label}: cancelled.\n", "simpleline")
                 if changed:
                     tp._write_metadata_jsonl(meta_path, existing)
+                if _is_simple_mode:
+                    _stop_simple_anim()
+                    clear_simple_status()
                 return
             # Pause support
             if pause_event.is_set() and not cancel_event.is_set():
@@ -12588,12 +13005,22 @@ def _run_metadata_download(item):
 
             if vid_id in existing and not refresh:
                 continue
+            # Must match the pre-count skip logic (line ~12830) exactly, otherwise
+            # the [N/total] counter gets out of sync: pre-count skips previously-
+            # failed IDs → _fetch_total excludes them, but if this loop *doesn't*
+            # also skip them we end up with N > total (e.g. [5/1]) and the failed
+            # IDs get re-fetched every single run.
+            if (not refresh) and vid_id and vid_id in _fetch_failed_ids:
+                continue
 
             _fetch_done += 1
+            if _is_simple_mode:
+                _simple_anim_state["idx"] = _fetch_done
+                _simple_anim_state["total"] = _fetch_total
             _is_refresh = vid_id in existing and refresh
             _prefix = "Refresh" if _is_refresh else "Metadata"
             _trunc = _trunc_pad_title(title, _MAX_TITLE_DISPLAY - len(_prefix) - 3)
-            log(f"[{_fetch_done}/{_fetch_total}] {_prefix} - {_trunc}\n", "simpleline")
+            log(f"  \u2014 [{_fetch_done}/{_fetch_total}] {_prefix} - {_trunc}\n", "simpleline_pink")
 
             # Block if internet is down — metadata requires internet
             if _internet_down.is_set():
@@ -12601,6 +13028,9 @@ def _run_metadata_download(item):
                     log(f"{_mode_label}: cancelled.\n", "simpleline")
                     if changed:
                         tp._write_metadata_jsonl(meta_path, existing)
+                    if _is_simple_mode:
+                        _stop_simple_anim()
+                        clear_simple_status()
                     return
 
             entry = tp._fetch_video_metadata(vid_id, title)
@@ -12649,17 +13079,27 @@ def _run_metadata_download(item):
             pass
 
     done = _fetch_done + skipped
+    _new_count = _fetch_done - errors  # videos that actually got new metadata this run
 
-    _parts = [f"{done} processed"]
+    # Pink em-dash completion line — matches the "Added metadata download..." style.
+    _parts = []
+    if _new_count:
+        _parts.append(f"{_new_count} New")
     if refreshed:
-        _parts.append(f"{refreshed} refreshed")
-    if skipped:
-        _parts.append(f"{skipped} already had metadata")
+        _parts.append(f"{refreshed} Refreshed")
     if errors:
-        _parts.append(f"{errors} failed")
-    log(f"=== Metadata Complete: {scope_label} — {', '.join(_parts)} ===\n", "simpleline_green")
+        _parts.append(f"{errors} Failed")
+    if _parts:
+        _summary = ", ".join(_parts)
+    elif skipped:
+        _summary = "All videos already have metadata"
+    else:
+        _summary = "No videos to process"
+    log(f"  \u2014 Metadata for {scope_label} download complete. {_summary}\n", "simpleline_pink")
+    if _is_simple_mode:
+        _stop_simple_anim()
+        clear_simple_status()
     _meta_elapsed = time.time() - _meta_t0
-    _new_count = done - skipped - errors
     _record_metadata(ch_name, _new_count, refreshed, skipped, errors, _meta_elapsed)
 
     # Invalidate grid cache for this channel so thumbnails refresh on next view
@@ -12741,6 +13181,73 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _whisper_available = None  # None = not checked yet
         _user_skipped_whisper = False  # True if user chose "skip" at Whisper model prompt
 
+        # Simple-mode scanline helper: writes a single transient line at
+        # the bottom of the log (tagged "scanline") that replaces itself
+        # on each update. Used to collapse the verbose phase messages
+        # (scanning local → found N → fetching YT → etc.) into one
+        # updating line so the simple log stays tidy. When the scanning
+        # phase finishes, we promote the final message to a permanent
+        # "— N matched to YouTube" line and clear the scanline.
+        # Defined before the try block so the finally clause can still
+        # call _tx_scan_clear() even if the try body raises early.
+        def _tx_scan(msg):
+            def _write():
+                try:
+                    if 'log_box' in globals() and log_box.winfo_exists():
+                        try:
+                            _yv = log_box.yview()[1]
+                            at_bottom = (_log_at_bottom and not _log_user_scrolled) or _yv >= 0.999
+                        except Exception:
+                            at_bottom = True
+                        log_box.config(state="normal")
+                        ranges = log_box.tag_ranges("scanline")
+                        if ranges:
+                            log_box.delete(ranges[0], ranges[1])
+                        # Insert above any pinned simplestatus / pausestatus line
+                        # if one is present (e.g. a sync running concurrently),
+                        # otherwise at the very end of the log.
+                        _ss_r = log_box.tag_ranges("simplestatus")
+                        if _ss_r:
+                            _ins_pos = _ss_r[0]
+                        else:
+                            _ps_r = log_box.tag_ranges("pausestatus")
+                            _ins_pos = _ps_r[0] if _ps_r else tk.END
+                        # Insert in 3 segments so the leading em-dash is blue
+                        # (transcription identity) instead of plain scanline grey.
+                        # All segments still carry the "scanline" tag so a later
+                        # _tx_scan / _tx_scan_clear can find and remove the line.
+                        _start = log_box.index(_ins_pos)
+                        log_box.insert(_start, "  ", "scanline")
+                        log_box.insert(f"{_start}+2c", "\u2014", ("scanline", "simpleline_blue"))
+                        log_box.insert(f"{_start}+3c", f" {msg}\n", "scanline")
+                        if at_bottom:
+                            log_box.see(tk.END)
+                        log_box.config(state="disabled")
+                except Exception:
+                    pass
+            try:
+                if _root_alive:
+                    _ui_queue.append(_write)
+            except Exception:
+                pass
+
+        def _tx_scan_clear():
+            def _clear():
+                try:
+                    if 'log_box' in globals() and log_box.winfo_exists():
+                        log_box.config(state="normal")
+                        ranges = log_box.tag_ranges("scanline")
+                        if ranges:
+                            log_box.delete(ranges[0], ranges[1])
+                        log_box.config(state="disabled")
+                except Exception:
+                    pass
+            try:
+                if _root_alive:
+                    _ui_queue.append(_clear)
+            except Exception:
+                pass
+
         try:
             # Only clear cancel for standalone (non-sync) transcription jobs;
             # in sync mode the cancel_event is shared and clearing it would
@@ -12749,12 +13256,29 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _ce.clear()
                 _ui_queue.append(_update_queue_btn)
 
-            log(f"\n{'='*60}\n", "tx_sep")
-            log(f"  TRANSCRIBING: {ch_name}\n", "tx_head")
-            log(f"{'='*60}\n\n", "tx_sep")
+            # ── Header ──
+            # Simple mode: one blue-em-dash line, no ASCII borders.
+            # Verbose mode: the full TRANSCRIBING: {ch} box.
+            if _is_simple_mode:
+                log(f"  \u2014 Transcribing: {ch_name}\n", "simpleline")
+                # Start the pinned status line immediately so the user always
+                # has an active line at the bottom — even during the scanning
+                # / YT-fetch / matching phases (which can take a while on big
+                # channels). The (idx, total) values default to 0 here; the
+                # tick handler shows just "Transcribing: channel···" while
+                # they're zero, then switches to "[N/M] Transcribing: ..."
+                # once the matching phase populates them below.
+                _start_simple_anim(ch_name, 0, 0, mode="transcribe")
+            else:
+                log(f"\n{'='*60}\n", "tx_sep")
+                log(f"  TRANSCRIBING: {ch_name}\n", "tx_head")
+                log(f"{'='*60}\n\n", "tx_sep")
 
             # ── Step 1: Scan local video files ──────────────────────────
-            log("  — Scanning local video files...\n", "simpleline")
+            if _is_simple_mode:
+                _tx_scan("Scanning local video files...")
+            else:
+                log("  — Scanning local video files...\n", "simpleline")
             local_files = {}  # filename_no_ext -> full_path
             for dirpath, _, files in os.walk(folder):
                 for f in files:
@@ -12769,7 +13293,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 log("  ⚠ No video files found in channel folder.\n", "red")
                 return
 
-            log(f"  — Found {len(local_files)} video file(s) on disk.\n", "simpleline")
+            if _is_simple_mode:
+                _tx_scan(f"Found {len(local_files)} video file(s) on disk.")
+            else:
+                log(f"  — Found {len(local_files)} video file(s) on disk.\n", "simpleline")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -12785,7 +13312,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     files_to_process[fname] = fpath
 
             if already_done:
-                log(f"  — {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
+                if _is_simple_mode:
+                    _tx_scan(f"{len(already_done)} video(s) already transcribed — skipping.")
+                else:
+                    log(f"  — {len(already_done)} video(s) already transcribed — skipping.\n", "simpleline")
 
             _jsonl_existing = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
@@ -12838,8 +13368,86 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _whisper_cache_set = set()
 
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
-            log("  — Fetching YouTube video list for caption matching...\n", "simpleline")
             yt_title_to_id = {}  # yt_title -> video_id
+
+            # OPTIMIZATION: small-batch shortcut.
+            # For huge channels (28k+ videos like David Pakman), enumerating the
+            # entire playlist via `yt-dlp --flat-playlist` takes 5-10 minutes,
+            # which is awful when the user just wants to transcribe a handful
+            # of newly-downloaded videos. When the batch is small AND we have
+            # a channel URL to scope the search, do a per-file YouTube search
+            # instead — ~3s per file, ~15s for 5 files vs 5-10 min for the
+            # full enumeration. Triggered for batches up to _SMALL_BATCH_TX
+            # files; larger batches still use the full fetch (where the
+            # per-file overhead would dominate).
+            _SMALL_BATCH_TX = 10
+            _use_per_file_search = (
+                len(files_to_process) > 0
+                and len(files_to_process) <= _SMALL_BATCH_TX
+                and bool(ch_url)
+                and not retranscribe
+            )
+
+            def _per_file_yt_search(_search_title):
+                """Run a single 'ytsearch1:<title> <channel>' lookup. Returns
+                the found video_id only if the result's channel matches
+                ch_name (loose normalized comparison). Used by the small-batch
+                shortcut to avoid enumerating the entire channel playlist."""
+                _norm_ch = re.sub(r'[\s\-_\.]+', '', ch_name).lower()
+                _q = unicodedata.normalize('NFKC', _search_title)
+                _cmd = [
+                    "yt-dlp", "--dump-json", "--no-warnings", "--skip-download",
+                    "--cookies-from-browser", "firefox",
+                    "--playlist-items", "1",
+                    f"ytsearch1:{_q} {ch_name}",
+                ]
+                _proc = spawn_yt_dlp(_cmd)
+                if _proc is None:
+                    return None
+                try:
+                    _stdout, _ = _proc.communicate(timeout=30)
+                    try:
+                        cleanup_process(_proc)
+                    except Exception:
+                        pass
+                    if _proc.returncode == 0 and _stdout.strip():
+                        _data = json.loads(_stdout)
+                        _fid = _data.get("id", "")
+                        _fch = _data.get("channel", "") or _data.get("uploader", "")
+                        if _fid and re.sub(r'[\s\-_\.]+', '', _fch).lower() == _norm_ch:
+                            return _fid
+                except Exception:
+                    try:
+                        cleanup_process(_proc)
+                    except Exception:
+                        pass
+                return None
+
+            if _use_per_file_search:
+                # Small-batch path: per-file YT search instead of channel-wide
+                # enumeration. Each search is ~3s; 10 files ≈ 30s vs 5-10 min
+                # for the full --flat-playlist scan on a 28k+ video channel.
+                if _is_simple_mode:
+                    _tx_scan(f"Small batch ({len(files_to_process)} files) — searching YouTube per file...")
+                else:
+                    log(f"  — Small batch ({len(files_to_process)} files) — searching YouTube per file.\n", "simpleline")
+                _files_iter = list(files_to_process.items())
+                for _si, (_sfname, _sfpath) in enumerate(_files_iter, 1):
+                    if _ce.is_set():
+                        break
+                    if _is_simple_mode:
+                        _tx_scan(f"Searching YouTube for new file ({_si}/{len(_files_iter)})...")
+                    _vid = _per_file_yt_search(_sfname)
+                    if _vid:
+                        yt_title_to_id[_sfname] = _vid
+                if _is_simple_mode:
+                    _tx_scan(f"{len(yt_title_to_id)} of {len(_files_iter)} new file(s) matched via per-file search.")
+                else:
+                    log(f"  — Per-file YT search: {len(yt_title_to_id)} of {len(_files_iter)} matched.\n", "simpleline")
+                if _ce.is_set():
+                    log(f"\n  ⛔ Transcription cancelled.\n", "red")
+                    return
+
             def _fetch_yt_title_map(use_cookies):
                 """Fetch title→id map from YouTube playlist. Returns {} on failure.
                 Cancel-aware: polls _ce every second so cancellation doesn't block 5 min.
@@ -12903,7 +13511,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _pg = int(_pm.group(1))
                                     if _pg >= _last_page + 10:
                                         _last_page = _pg
-                                        log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
+                                        if _is_simple_mode:
+                                            _tx_scan(f"Scanning YouTube catalog (page {_pg})...")
+                                        else:
+                                            log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
                             except queue.Empty:
                                 break
                         if _stdout_done.is_set() and _stderr_done.is_set() and _stdout_queue.empty():
@@ -12940,27 +13551,37 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # Fetch with internet-outage protection: if internet dropped during the
             # playlist fetch, the result is likely incomplete — wait for restore and
             # re-fetch from scratch rather than proceeding with a partial list.
-            while not _ce.is_set():
-                _internet_went_down_during.clear()  # arm the dirty flag
-                if not _block_if_no_internet(cancel_ev=_ce):
-                    break  # cancelled
-                yt_title_to_id = _fetch_yt_title_map(use_cookies=True)
-                if not yt_title_to_id and not _ce.is_set():
-                    log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
-                    yt_title_to_id = _fetch_yt_title_map(use_cookies=False)
-                # Check if internet dropped during the fetch — if so, the list may be
-                # incomplete.  Wait for restore and retry the whole fetch.
-                if _internet_went_down_during.is_set() and not _ce.is_set():
-                    log("  ⚠ Internet dropped during playlist fetch — will re-fetch after restore.\n", "red")
+            # SKIPPED entirely when the small-batch shortcut already populated
+            # yt_title_to_id via per-file search above.
+            if not _use_per_file_search:
+                if _is_simple_mode:
+                    _tx_scan("Fetching YouTube video list for caption matching...")
+                else:
+                    log("  — Fetching YouTube video list for caption matching...\n", "simpleline")
+                while not _ce.is_set():
+                    _internet_went_down_during.clear()  # arm the dirty flag
                     if not _block_if_no_internet(cancel_ev=_ce):
                         break  # cancelled
-                    log("  Retrying YouTube video list fetch...\n", "simpleline")
-                    continue  # retry from the top
-                break  # clean fetch — proceed
-            if not yt_title_to_id:
-                log("  ⚠ Could not retrieve video list — all files will use Whisper.\n", "red")
-            else:
-                log(f"  — Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+                    yt_title_to_id = _fetch_yt_title_map(use_cookies=True)
+                    if not yt_title_to_id and not _ce.is_set():
+                        log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+                        yt_title_to_id = _fetch_yt_title_map(use_cookies=False)
+                    # Check if internet dropped during the fetch — if so, the list may be
+                    # incomplete.  Wait for restore and retry the whole fetch.
+                    if _internet_went_down_during.is_set() and not _ce.is_set():
+                        log("  ⚠ Internet dropped during playlist fetch — will re-fetch after restore.\n", "red")
+                        if not _block_if_no_internet(cancel_ev=_ce):
+                            break  # cancelled
+                        log("  Retrying YouTube video list fetch...\n", "simpleline")
+                        continue  # retry from the top
+                    break  # clean fetch — proceed
+                if not yt_title_to_id:
+                    log("  ⚠ Could not retrieve video list — all files will use Whisper.\n", "red")
+                else:
+                    if _is_simple_mode:
+                        _tx_scan(f"Found {len(yt_title_to_id)} video(s) on YouTube.")
+                    else:
+                        log(f"  — Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Transcription cancelled.\n", "red")
@@ -13272,10 +13893,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             matched.sort(key=_safe_mtime, reverse=True)
             unmatched.sort(key=_safe_mtime, reverse=True)
 
-            log(f"  — {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
-            if unmatched:
-                log(f"  — {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
-            log("\n", "simpleline")
+            if _is_simple_mode:
+                # Promote the final scanning result to a permanent log line
+                # (the transient scanline is cleared and replaced).
+                _tx_scan_clear()
+                log(f"  \u2014 {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
+                if unmatched:
+                    log(f"  \u2014 {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
+            else:
+                log(f"  — {len(matched)} file(s) matched to YouTube titles (will try auto-captions).\n", "simpleline")
+                if unmatched:
+                    log(f"  — {len(unmatched)} file(s) unmatched (will use Whisper).\n", "simpleline")
+                log("\n", "simpleline")
 
             # Write initial whisper cache with pre-scan unmatched files so that
             # a restart mid-Phase A can skip re-checking files already identified.
@@ -13289,6 +13918,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     pass
 
             total = len(matched) + len(unmatched)
+            # The pinned status line was already started at the top of the
+            # transcribe worker with placeholder (0, 0); just update the state
+            # now that we know the real total. The tick handler picks up the
+            # new values on its next 500ms cycle.
+            if _is_simple_mode:
+                _simple_anim_state["idx"] = 1
+                _simple_anim_state["total"] = total
             temp_dir = os.path.join(folder, "_transcribe_temp")
             # Wipe any stale temp dir from a previous cancelled/interrupted run.
             # yt-dlp's default no-overwrite behaviour means leftover .vtt files
@@ -13338,6 +13974,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             for _mi, (fname, fpath, vid_id) in enumerate(matched):
                 idx += 1
                 _check_idx += 1
+                if _is_simple_mode:
+                    _simple_anim_state["idx"] = idx
+                    _simple_anim_state["total"] = total
                 _fname_trunc_src = unicodedata.normalize('NFKC', fname)
                 # Compute title width based on prefix so ... always lands at same column
                 _fname_trunc = _trunc_pad_title(_fname_trunc_src, _MAX_TITLE_DISPLAY).rstrip()
@@ -13378,7 +14017,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     time.sleep(random.uniform(0.5, 1.5))
 
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _whisper_queued > 0 else ""
-                log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
+                log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
                 _t_vid_start = time.time()
 
                 # Block if internet is down (background monitor handles detection)
@@ -13454,7 +14093,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _consec_caption_fails = 0  # reset on success
                 _caption_successes += 1
                 if _punct_loaded:
-                    log(f"    Adding punctuation...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] Transcribing \"{_fname_trunc}\" - Adding punctuation...{_w_suffix}\n", "transcribe_using")
+                    log(f"    Adding punctuation...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] \"{_fname_trunc}\" - Adding punctuation...{_w_suffix}\n", "transcribe_using")
                     text = _punctuate_text(text)
 
                 # Get date/duration from local file mtime
@@ -13515,7 +14154,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # Realtime ratio e.g. ", 3.0x realtime"
                 _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                 if _is_simple_mode:
-                    _prefix = f"[{idx}/{total}] "
+                    _prefix = f"  \u2014 [{idx}/{total}] "
                     _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                     _fname_norm = unicodedata.normalize('NFKC', fname)
                     _dur_raw = f"({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
@@ -13592,12 +14231,19 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 unmatched.sort(key=_safe_mtime_u, reverse=True)
 
                 # ── Model selection ──
-                log(f"\n  — {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
+                # In simple mode the "N file(s) unmatched (will use Whisper)"
+                # line above already conveys this — and the "Whisper model
+                # loaded" line below covers model selection — so we suppress
+                # both the redundant "X need Whisper" and "Using Whisper model"
+                # lines to keep the simple-mode log tidy.
+                if not _is_simple_mode:
+                    log(f"\n  — {len(unmatched)} video(s) need Whisper AI transcription.\n", "simpleline")
 
                 if skip_model_dialog:
                     # GPU Tasks mode — model already chosen, skip dialog
                     _stop_whisper_process()
-                    log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+                    if not _is_simple_mode:
+                        log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
                     _model_result = [_whisper_model_choice]
                     _model_timed_out = [False]
                 else:
@@ -13717,7 +14363,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _stop_whisper_process()
                     if _model_timed_out[0]:
                         log(f"  — No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
-                    else:
+                    elif not _is_simple_mode:
                         log(f"  — Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
                 # Check if Whisper is available (only once)
@@ -13754,6 +14400,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _whisper_available:
                     for fname, fpath in unmatched:
                         idx += 1
+                        if _is_simple_mode:
+                            _simple_anim_state["idx"] = idx
+                            _simple_anim_state["total"] = total
 
                         # Pause check
                         _pl = "GPU Tasks" if _sync_mode else "Sync"
@@ -13912,7 +14561,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         # Realtime ratio e.g. ", 3.0x realtime"
                         _rt_str = f", {_dur_secs / _vid_elapsed:.1f}x realtime" if _dur_secs > 0 and _vid_elapsed > 0 else ""
                         if _is_simple_mode:
-                            _prefix = f"[{idx}/{total}] "
+                            _prefix = f"  \u2014 [{idx}/{total}] "
                             _suffix = f"done ({_src_part} {_ve_str}{_rt_str})"
                             _fname_norm = unicodedata.normalize('NFKC', fname)
                             _dur_raw = f"({_vd_m}m {_vd_s:02d}s)" if _dur_secs > 0 else ""
@@ -13946,12 +14595,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         os.remove(_whisper_cache_path)
                 except Exception:
                     pass
-                log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
-                if err_count:
-                    log(f", {err_count} errors", "simpleline_green")
-                if _whisper_skip_count:
-                    log(f", {_whisper_skip_count} skipped (will retry)", "simpleline_green")
-                log(".\n", "simpleline_green")
+                if not _is_simple_mode:
+                    log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
+                    if err_count:
+                        log(f", {err_count} errors", "simpleline_green")
+                    if _whisper_skip_count:
+                        log(f", {_whisper_skip_count} skipped (will retry)", "simpleline_green")
+                    log(".\n", "simpleline_green")
                 # Mark channel as fully transcribed (only if not cancelled and no real errors)
                 # Whisper skips (process failures) don't block completion — they retry next run
                 if err_count == 0:
@@ -13975,29 +14625,45 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 else:
                     _total_str = f"{_t_secs}s"
 
-                log("\n" + "=" * 50 + "\n", "summary")
-                log(f"TRANSCRIPTION SUMMARY: {ch_name}\n", "summary")
-                log(f"Total time: {_total_str}\n", "summary")
-                log(f"Completed: {done_count}  |  Errors: {err_count}\n", "summary")
-                log("-" * 50 + "\n", "summary")
-                for _tl_name, _tl_source, _tl_secs, _tl_err in _transcription_log:
-                    _tl_m, _tl_s = divmod(int(_tl_secs), 60)
-                    _tl_time = f"{_tl_m}m {_tl_s:02d}s" if _tl_m else f"{_tl_s}s"
-                    if _tl_err:
-                        log(f"  ✗ {_tl_name}  [{_tl_source}]  {_tl_time}  ERROR: {_tl_err}\n", "red")
-                    else:
-                        log(f"  ✓ {_tl_name}  [{_tl_source}]  {_tl_time}\n", "dim")
-                log("=" * 50 + "\n", "summary")
+                if _is_simple_mode:
+                    # Single-line summary for simple mode:
+                    #   — ✓ Apple Explained transcribed. Completed 1 - Errors 0 - Took 5s
+                    # The em-dash renders blue, the ✓ and "Completed N" render
+                    # green, everything else white (handled in _segmented_insert).
+                    log(f"  \u2014 \u2713 {ch_name} transcribed. Completed {done_count} - Errors {err_count} - Took {_total_str}\n",
+                        "simpleline")
+                else:
+                    log("\n" + "=" * 50 + "\n", "summary")
+                    log(f"TRANSCRIPTION SUMMARY: {ch_name}\n", "summary")
+                    log(f"Total time: {_total_str}\n", "summary")
+                    log(f"Completed: {done_count}  |  Errors: {err_count}\n", "summary")
+                    log("-" * 50 + "\n", "summary")
+                    for _tl_name, _tl_source, _tl_secs, _tl_err in _transcription_log:
+                        _tl_m, _tl_s = divmod(int(_tl_secs), 60)
+                        _tl_time = f"{_tl_m}m {_tl_s:02d}s" if _tl_m else f"{_tl_s}s"
+                        if _tl_err:
+                            log(f"  ✗ {_tl_name}  [{_tl_source}]  {_tl_time}  ERROR: {_tl_err}\n", "red")
+                        else:
+                            log(f"  ✓ {_tl_name}  [{_tl_source}]  {_tl_time}\n", "dim")
+                    log("=" * 50 + "\n", "summary")
 
-            # Record in autorun history
+            # Record in autorun history — just this run's done count, not the
+            # cumulative including previously-transcribed videos. The activity
+            # log line should answer "what did THIS run accomplish?", not
+            # "how many videos does this channel have transcribed in total?".
             if done_count > 0 or err_count > 0 or _whisper_skip_count > 0:
                 _t_rec_elapsed = time.time() - _t_total_start
-                _record_transcription(done_count + _prior_done, err_count, _t_rec_elapsed,
+                _record_transcription(done_count, err_count, _t_rec_elapsed,
                                       channel_name=ch_name, skipped=_whisper_skip_count)
 
-            # Notify transcription panel to offer re-index
+            # Notify transcription panel to update tx_status in DB. The popup
+            # itself is deferred — we want ONE popup at the end of the batch,
+            # not one per channel — so we accumulate the channel name and
+            # flush in the finally block when the queue is fully drained.
             if done_count > 0 and _tp_panel_ref[0] is not None:
-                _tp_panel_ref[0].prompt_reindex(ch_name)
+                _tp_panel_ref[0].prompt_reindex(ch_name, _defer_popup=True)
+                with _pending_reindex_lock:
+                    _pending_reindex_names.add(ch_name)
 
         except Exception as e:
             log(f"\n  ⚠ Transcription error: {e}\n", "red")
@@ -14005,6 +14671,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _transcribe_running = False
             _transcribe_sync_controlled = False
             _clear_whisper_progress()  # Remove whisper progress line after transcription completes
+            if _is_simple_mode:
+                _stop_simple_anim()
+                clear_simple_status()
+                _tx_scan_clear()  # Remove any leftover transient scanline
             if not _sync_mode:
                 _stop_whisper_process()  # Free GPU memory (skip in sync_mode — GPU worker manages this)
                 _stop_punct_process()   # Free GPU memory
@@ -14025,6 +14695,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _process_next_queued()
                 elif not _ce.is_set():
                     _process_next_queued()
+
+            # If the transcribe queue is fully drained AND we're running as a
+            # standalone transcription (not driven by the GPU worker), flush
+            # the accumulated reindex popup so the user gets ONE dialog for the
+            # whole batch instead of one per channel. When _sync_mode is True,
+            # the GPU worker is responsible for flushing after its own queue
+            # is drained.
+            if not _sync_mode:
+                with _transcribe_queue_lock:
+                    _tq_empty = not _transcribe_queue
+                if _tq_empty and _tp_panel_ref[0] is not None:
+                    _tp_panel_ref[0].offer_pending_reindex()
 
     if _sync_mode:
         _worker()  # Run synchronously — caller is the GPU worker thread
@@ -14213,7 +14895,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
             if skip_model_dialog:
                 # GPU Tasks mode — model already chosen
                 _stop_whisper_process()
-                log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
+                if not _is_simple_mode:
+                    log(f"  — Using Whisper model: {_whisper_model_choice}\n", "simpleline")
             else:
                 # Model selection dialog
                 model_choice, timed_out = _ask_whisper_model_dialog(
@@ -14230,7 +14913,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
 
                 if timed_out:
                     log(f"  — No user input, defaulting to {_whisper_model_choice} model\n", "simpleline")
-                else:
+                elif not _is_simple_mode:
                     log(f"  — Selected Whisper model: {_whisper_model_choice}\n", "simpleline")
 
             # Check CUDA availability
@@ -14453,7 +15136,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                     return
 
             _stop_whisper_process()
-            log(f"  — Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
+            if not _is_simple_mode:
+                log(f"  — Using Whisper model: {_whisper_model_choice}\n\n", "simpleline")
 
             _t_start = time.time()
             _whisper_counter["idx"] = 0
@@ -17819,12 +18503,44 @@ def toggle_pause():
 
 
 def _sync_task_finished():
-    """Called when sync/reorg/redownload/metadata finishes — resets job state and updates sync tasks button."""
+    """Called when sync/reorg/redownload/metadata finishes — resets job state and updates sync tasks button.
+    If autorun_sync is enabled, also kicks off the next queued item so an
+    auto-metadata-after-sync (or similar chain) starts without a manual click."""
     if not _sync_running and not _reorg_running and not _redownload_running and not _metadata_running:
         pause_event.clear()
         _current_job["label"] = None
         _current_job["url"] = None
         _update_queue_btn()
+        # Auto-chain: if any sync-pipeline queue still has items and autorun_sync
+        # is enabled, dispatch the next one. Without this, items added during a
+        # running task (e.g. auto-metadata after a sync) sit there until the user
+        # manually hits Start.
+        if config.get("autorun_sync", False):
+            _has_pending = False
+            with _sync_queue_lock:
+                if _sync_queue:
+                    _has_pending = True
+            if not _has_pending:
+                with _reorg_queue_lock:
+                    if _reorg_queue:
+                        _has_pending = True
+            if not _has_pending:
+                with _redownload_queue_lock:
+                    if _redownload_queue:
+                        _has_pending = True
+            if not _has_pending:
+                with _metadata_queue_lock:
+                    if _metadata_queue:
+                        _has_pending = True
+            if not _has_pending:
+                with _video_dl_queue_lock:
+                    if _video_dl_queue:
+                        _has_pending = True
+            if _has_pending and _root_alive:
+                try:
+                    _ui_queue.append(_process_next_queued)
+                except Exception:
+                    pass
 
 
 # --- Sync Tasks Button ---
@@ -18209,6 +18925,27 @@ def _show_queue_menu(event=None):
         hdr_text = f"  Sync Tasks ({len(items)})" if items else "  Sync Tasks (empty)"
         tk.Label(hdr, text=hdr_text, bg="#2d2d2d", fg="#888888",
                  font=("Segoe UI", 9, "italic"), anchor="w").pack(side="left")
+        # Autorun checkbox — auto-start the next queued sync-pipeline item when
+        # the current one finishes (mirrors the GPU Tasks Auto checkbox).
+        _autorun_sync_var = tk.BooleanVar(value=config.get("autorun_sync", False))
+        def _toggle_autorun_sync():
+            _val = _autorun_sync_var.get()
+            with config_lock:
+                config["autorun_sync"] = _val
+            save_config(config)
+            # If we just turned it on and there's something queued, kick it now
+            if _val and _root_alive:
+                try:
+                    _ui_queue.append(_sync_task_finished)
+                except Exception:
+                    pass
+        _autorun_sync_cb = tk.Checkbutton(hdr, text="Auto", bg="#2d2d2d", fg="#888888",
+                                           selectcolor="#2d2d2d", activebackground="#2d2d2d",
+                                           activeforeground="#cccccc", font=("Segoe UI", 8),
+                                           variable=_autorun_sync_var, command=_toggle_autorun_sync,
+                                           bd=0, highlightthickness=0, pady=0, padx=2)
+        _autorun_sync_cb.pack(side="right")
+        _ToolTip(_autorun_sync_cb, "Auto-start the next Sync Tasks item when the current one finishes (e.g. auto-metadata after a sync)")
 
         if items:
             max_visible = 10
@@ -19668,6 +20405,10 @@ def _gpu_start():
             _save_queue_state()
             # Safety: ensure main cancel/pause buttons are hidden after GPU work
             _ui_queue.append(_sync_task_finished)
+            # Flush any deferred reindex popups accumulated during the
+            # transcribe tasks that ran through this GPU worker.
+            if _tp_panel_ref[0] is not None:
+                _tp_panel_ref[0].offer_pending_reindex()
 
     if not _has_transcribe_tasks:
         # No transcription tasks — skip model dialog and start immediately
@@ -19970,7 +20711,15 @@ def _insert_hist_line(tw, entry, row_tags):
         rdl_m = re.search(r'\b(\d+) replaced\b', rest)
         rdl_count = int(rdl_m.group(1)) if rdl_m else 0
         _is_running = "running..." in rest
-        prefix_tags = ("hist_green",) + row_tags if (rdl_count > 0 or _is_running) else row_tags
+        prefix_tags = ("hist_redwnl",) + row_tags if (rdl_count > 0 or _is_running) else row_tags
+    elif kind == "Cmprss":
+        _cmp_m = re.search(r'\b(\d+) compressed\b', rest)
+        _cmp_count = int(_cmp_m.group(1)) if _cmp_m else 0
+        prefix_tags = ("hist_compress",) + row_tags if _cmp_count > 0 else row_tags
+    elif kind == "Reorg":
+        _ror_m = re.search(r'\b(\d+) (?:moved|reorganized)\b', rest)
+        _ror_count = int(_ror_m.group(1)) if _ror_m else 0
+        prefix_tags = ("hist_reorg",) + row_tags if _ror_count > 0 else row_tags
     else:
         prefix_tags = row_tags
     tw.insert(tk.END, prefix, prefix_tags)
@@ -19988,11 +20737,15 @@ def _insert_hist_line(tw, entry, row_tags):
             patterns.append((r'\b\d+ downloaded\b', "hist_green"))
     elif kind == "ReDwnl":
         if "running..." in rest:
-            patterns.append((r'▶ running\.\.\.', "hist_green"))
+            patterns.append((r'▶ running\.\.\.', "hist_redwnl"))
         else:
             rdl_m = re.search(r'\b(\d+) replaced\b', rest)
             if rdl_m and int(rdl_m.group(1)) > 0:
-                patterns.append((r'\b\d+ replaced\b', "hist_green"))
+                patterns.append((r'\b\d+ replaced\b', "hist_redwnl"))
+    elif kind == "Cmprss":
+        patterns.append((r'\b[1-9]\d* compressed\b', "hist_compress"))
+    elif kind == "Reorg":
+        patterns.append((r'\b[1-9]\d* (?:moved|reorganized)\b', "hist_reorg"))
     # Amber skipped for any kind, only when non-zero
     patterns.append((r'\b[1-9]\d* skipped\b', "hist_amber"))
 
@@ -20163,7 +20916,7 @@ def _record_transcription(done_count, err_count, elapsed_secs, channel_name="", 
         _ui_queue.append(_refresh_autorun_history)
 
 
-def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=None):
+def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=None, skipped=0):
     _now = datetime.now()
     ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
     date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
@@ -20178,9 +20931,12 @@ def _record_compression(ch_name, done_count, err_count, elapsed_secs, batch_num=
     else:
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
-    batch_part = f" Batch {batch_num} —" if batch_num is not None else ""
     ch_part = f"  {ch_name}  —" if ch_name else " " * 7
-    line = f"[Cmprss] {ts_date} —{ch_part}{batch_part}  {done_count:>4} {'compressed':<11} · {err_count:>1} errors · {dur}"
+    # batch_num is intentionally NOT inserted into the line — it broke column
+    # alignment with other rows and "Batch 12" reads as confusing for what is
+    # often a single-video auto-compress run. The batch number is still visible
+    # in the GPU current-task label while the compress is running.
+    line = f"[Cmprss] {ts_date} —{ch_part}  {done_count:>4} {'compressed':<11} · {skipped:>4} skipped · {err_count:>1} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -20207,12 +20963,15 @@ def _record_metadata(ch_name, new_count, refreshed, skipped, errors, elapsed_sec
         dur = f"took {secs}s"
     ts_date = f"{ts}, {date}".ljust(16)
     ch_part = f"  {ch_name}  —" if ch_name else " " * 7
-    # Stats: aligned columns matching other log types
+    # Stats: aligned columns matching other log types.
+    # Metadata's "skipped" column really means "videos that already had metadata
+    # and didn't need re-fetching" — displaying that as "skipped" reads like an
+    # error, so we label it "existing" instead.
     if refreshed and not new_count:
         _prim_count, _prim_label = refreshed, "refreshed"
     else:
         _prim_count, _prim_label = new_count, "fetched"
-    line = f"[Metdta] {ts_date} —{ch_part}  {_prim_count:>4} {_prim_label:<11} · {skipped:>4} skipped · {errors:>1} errors · {dur}"
+    line = f"[Metdta] {ts_date} —{ch_part}  {_prim_count:>4} {_prim_label:<11} · {skipped:>5} existing · {errors:>1} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
         hist.append(line)
@@ -21591,7 +22350,11 @@ class _TranscriptionPanel(ttk.Frame):
                             except Exception:
                                 pass
                         # Collect video files for DB insertion
-                        if fn_lower.endswith(self._TP_VIDEO_EXTS) and ".temp." not in fn_lower and not fn_lower.endswith(".part"):
+                        if (fn_lower.endswith(self._TP_VIDEO_EXTS)
+                                and ".temp." not in fn_lower
+                                and not fn_lower.endswith(".part")
+                                and "_temp_compress" not in fn_lower
+                                and "_backlog_temp" not in fn_lower):
                             pending_videos.append((ch_name, root_dir, dirpath, fn, fn_lower))
 
             # Now process all collected video files with transcript info available
@@ -21810,6 +22573,7 @@ class _TranscriptionPanel(ttk.Frame):
         threading.Thread(target=_worker, daemon=True).start()
 
     _VIDEOS_SCHEMA_VER = 5  # bump to force clear — COLLATE NOCASE on filepath
+    _VIDEOS_DEDUPE_VER = 2  # bump to re-run the slash-mismatch dedupe pass
 
     def _ensure_videos_populated(self):
         """Clear stale data if schema version changed.
@@ -21836,6 +22600,124 @@ class _TranscriptionPanel(ttk.Frame):
                     "VALUES ('__ver__','__ver__','__schema_ver__',?)",
                     (str(self._VIDEOS_SCHEMA_VER),))
                 self._db_commit()
+        except Exception:
+            pass
+        # One-time dedupe pass: merge rows that point to the same physical file
+        # but with different slash styles in the filepath. The bug was in
+        # _scan_channel_disk_info, which inserted un-normalized paths
+        # (e.g. "Z:/Archive/.../Whole Channels\3kliksphilip\..."), while
+        # register_video stores normalized backslash paths. The unique
+        # constraint compares strings, not normalized paths, so the same file
+        # could end up with two rows.
+        self._dedupe_slash_mismatch_videos()
+
+    def _dedupe_slash_mismatch_videos(self):
+        """One-time pass: merge `videos` rows that point to the same file
+        with different slash styles. Marks completion via a sentinel row so
+        it only runs once per _VIDEOS_DEDUPE_VER bump."""
+        if not self._conn:
+            return
+        try:
+            _dedupe_ver = 0
+            try:
+                row = self._db_execute(
+                    "SELECT tx_status FROM videos WHERE filepath='__dedupe_ver__' LIMIT 1"
+                ).fetchone()
+                _dedupe_ver = int(row[0]) if row else 0
+            except Exception:
+                pass
+            if _dedupe_ver >= self._VIDEOS_DEDUPE_VER:
+                return  # already done
+            # Bucket every row by (channel, normalized_filepath)
+            from collections import defaultdict
+            _buckets = defaultdict(list)
+            try:
+                for _rid, _ch, _vid, _fp, _ts in self._db_execute(
+                        "SELECT id, channel, video_id, filepath, tx_status FROM videos"
+                        ).fetchall():
+                    if not _fp or _fp in ("__schema_ver__", "__dedupe_ver__"):
+                        continue
+                    _key = (_ch, os.path.normpath(_fp).lower())
+                    _buckets[_key].append((_rid, _vid, _fp, _ts))
+            except Exception:
+                return
+            _merged = 0
+            _deleted = 0
+            _normalized = 0
+            for _key, _rows in _buckets.items():
+                if len(_rows) < 2:
+                    # Singleton — just normalize the filepath if needed so a
+                    # later register_video write doesn't create a new sibling.
+                    _r_id, _r_vid, _r_fp, _r_ts = _rows[0]
+                    _norm_only = os.path.normpath(_r_fp)
+                    if _r_fp != _norm_only:
+                        try:
+                            self._db_execute(
+                                "UPDATE videos SET filepath=? WHERE id=?",
+                                (_norm_only, _r_id))
+                            _normalized += 1
+                        except Exception:
+                            pass
+                    continue
+                # Pick the keeper: prefer (a) row whose filepath is already
+                # normpath-clean, (b) row that has a video_id, (c) lowest id.
+                def _score(_r):
+                    _r_id, _r_vid, _r_fp, _r_ts = _r
+                    _is_clean = 1 if _r_fp == os.path.normpath(_r_fp) else 0
+                    _has_vid = 1 if _r_vid else 0
+                    return (_is_clean, _has_vid, -_r_id)
+                _rows.sort(key=_score, reverse=True)
+                _keeper = _rows[0]
+                _keep_id, _keep_vid, _keep_fp, _keep_ts = _keeper
+                # If keeper's filepath is not normalized, fix it
+                _norm_fp = os.path.normpath(_keep_fp)
+                if _keep_fp != _norm_fp:
+                    try:
+                        self._db_execute(
+                            "UPDATE videos SET filepath=? WHERE id=?",
+                            (_norm_fp, _keep_id))
+                        _normalized += 1
+                    except Exception:
+                        pass
+                # If keeper has no video_id but a sibling does, copy it over
+                if not _keep_vid:
+                    for _sib in _rows[1:]:
+                        if _sib[1]:
+                            try:
+                                self._db_execute(
+                                    "UPDATE videos SET video_id=? WHERE id=?",
+                                    (_sib[1], _keep_id))
+                            except Exception:
+                                pass
+                            break
+                # Delete the losers
+                for _sib in _rows[1:]:
+                    try:
+                        self._db_execute("DELETE FROM videos WHERE id=?", (_sib[0],))
+                        _deleted += 1
+                    except Exception:
+                        pass
+                _merged += 1
+            try:
+                # Use the existing '__ver__' channel name so the Browse tree's
+                # `channel != '__ver__'` filters automatically hide this sentinel.
+                self._db_execute(
+                    "INSERT OR REPLACE INTO videos (title,channel,filepath,tx_status) "
+                    "VALUES ('__ver__','__ver__','__dedupe_ver__',?)",
+                    (str(self._VIDEOS_DEDUPE_VER),))
+                self._db_commit()
+            except Exception:
+                pass
+            if _merged or _normalized:
+                try:
+                    _msg_parts = []
+                    if _merged:
+                        _msg_parts.append(f"merged {_merged} duplicate video rows ({_deleted} stale removed)")
+                    if _normalized:
+                        _msg_parts.append(f"normalized {_normalized} filepaths")
+                    log(f"  🔧 Database cleanup: {'; '.join(_msg_parts)}.\n", "simpleline_green")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -21936,8 +22818,11 @@ class _TranscriptionPanel(ttk.Frame):
 
     # ── Cross-communication ───────────────────────────────────────────────────
 
-    def prompt_reindex(self, channel_name=""):
-        """Called (from worker thread) when a transcription job finishes."""
+    def prompt_reindex(self, channel_name="", _defer_popup=False):
+        """Called (from worker thread) when a transcription job finishes.
+        If _defer_popup is True, runs the DB update but does NOT show the popup —
+        the caller is responsible for calling offer_pending_reindex() once the
+        whole batch of transcriptions is done."""
         # Update tx_status per-video for this channel by checking if each
         # video's title actually appears in a Transcript.txt on disk.
         if self._conn and channel_name:
@@ -21974,6 +22859,8 @@ class _TranscriptionPanel(ttk.Frame):
                         self._db_commit()
             except Exception:
                 pass
+        if _defer_popup:
+            return
         def _on_main():
             if not self._loaded:
                 self._pending_reindex = channel_name
@@ -21982,8 +22869,41 @@ class _TranscriptionPanel(ttk.Frame):
             self._refresh_browse()
         self.after(0, _on_main)
 
+    def offer_pending_reindex(self):
+        """Show a single reindex popup for all channels accumulated in
+        _pending_reindex_names since the last flush. Called when the
+        transcribe queue is fully drained."""
+        global _pending_reindex_names
+        with _pending_reindex_lock:
+            _names = sorted(_pending_reindex_names)
+            _pending_reindex_names = set()
+        if not _names:
+            return
+        # Build display string: one channel → `"Name"`, many → `N channels`
+        if len(_names) == 1:
+            _label = _names[0]
+        else:
+            _label = f"{len(_names)} channels"
+        def _on_main():
+            if not self._loaded:
+                self._pending_reindex = _label
+                return
+            self._maybe_offer_reindex(_label)
+            self._refresh_browse()
+        self.after(0, _on_main)
+
     def _maybe_offer_reindex(self, channel_name):
-        name_str = f" for \"{channel_name}\"" if channel_name else ""
+        # channel_name may be a real channel ("Apple Explained") or a batch
+        # label like "5 channels". Format without quotes for batch labels.
+        if not channel_name:
+            name_str = ""
+            _plural = ""
+        elif re.match(r'^\d+\s+channels?$', channel_name):
+            name_str = f" for {channel_name}"
+            _plural = "s"
+        else:
+            name_str = f" for \"{channel_name}\""
+            _plural = ""
         # Custom dialog with 60-second auto-dismiss (defaults to "No")
         _result = {"ans": False}
         dlg = tk.Toplevel(self.winfo_toplevel())
@@ -21997,7 +22917,7 @@ class _TranscriptionPanel(ttk.Frame):
         _countdown = [60]
 
         msg = tk.Label(dlg,
-                       text=f"Transcription{name_str} is complete.\n\n"
+                       text=f"Transcription{_plural}{name_str} {'are' if _plural else 'is'} complete.\n\n"
                             "Update the transcription search index now?",
                        bg="#2d2d2d", fg="#cccccc", font=("Segoe UI", 10),
                        wraplength=320, justify="left", padx=16, pady=16)

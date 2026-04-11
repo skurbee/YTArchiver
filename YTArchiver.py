@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.7"
+APP_VERSION = "v37.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3956,7 +3956,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 6:19pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 6:50pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12141,9 +12141,16 @@ def _run_metadata_download(item):
         # failed individual search (deleted/private) are excluded from the total
         # since they'll never get metadata.
         _pc_with_ids = sum(1 for _, vid_id, *_ in rows if vid_id)
-        _pc_search_failed = 0
+        # Only count rows as "permanently unreachable" if date-based resolution
+        # has ALSO been tried and failed (date_resolve_failed_ts is set). Rows
+        # that only have search_failed_ts still deserve a shot via date-based
+        # (pass 6 in the pipeline) — it works even for titles that broke the
+        # YouTube search ranking (e.g. heavy emoji titles).
+        _pc_date_failed = 0
         try:
-            _sf_sql = "SELECT COUNT(*) FROM videos WHERE channel=? AND search_failed_ts IS NOT NULL AND video_id IS NULL"
+            _sf_sql = (
+                "SELECT COUNT(*) FROM videos WHERE channel=? "
+                "AND date_resolve_failed_ts IS NOT NULL AND video_id IS NULL")
             _sf_params = [ch_name]
             if year is not None:
                 _sf_sql += " AND year=?"
@@ -12151,15 +12158,22 @@ def _run_metadata_download(item):
             if month is not None:
                 _sf_sql += " AND month=?"
                 _sf_params.append(month)
-            _pc_search_failed = tp._db_execute(_sf_sql, _sf_params).fetchone()[0] or 0
+            _pc_date_failed = tp._db_execute(_sf_sql, _sf_params).fetchone()[0] or 0
         except Exception:
             pass
-        _pc_effective = len(rows) - _pc_search_failed
+        _pc_effective = len(rows) - _pc_date_failed
         # The "len(_pc_ids) >= _pc_effective" check compares JSONL entry count
         # against total row count.  Add fetch-failed count to JSONL count so
         # permanently-failed rows don't block this condition.
         if _pc_covered >= _pc_with_ids and (len(_pc_ids) + len(_fetch_failed_ids)) >= _pc_effective:
-            log(f"Metadata: {scope_label} — all {len(rows)} videos already have metadata.\n", "simpleline")
+            if _pc_date_failed > 0:
+                _plural = "" if _pc_date_failed == 1 else "s"
+                log(f"  \u2014 {_pc_with_ids} video(s) have metadata. "
+                    f"{_pc_date_failed} video{_plural} unmatchable "
+                    f"(all resolution methods exhausted — use Refresh Metadata to retry).\n",
+                    "simpleline_pink")
+            else:
+                log(f"  \u2014 All {len(rows)} videos already have metadata.\n", "simpleline_pink")
             return
 
     log(f"  Found {len(rows)} video(s) — resolving video IDs...\n", "dim")
@@ -12326,16 +12340,16 @@ def _run_metadata_download(item):
             except Exception:
                 pass
 
-    # On refresh, clear search_failed_ts, id_resolve_failed_ts, and
-    # metadata_fetch_failed_ts so everything is re-searched, re-walked,
-    # and re-fetched from scratch.
+    # On refresh, clear ALL failure flags so everything is re-searched,
+    # re-walked, re-date-resolved, and re-fetched from scratch.
     if refresh:
         try:
             tp._db_execute(
                 "UPDATE videos SET search_failed_ts=NULL, id_resolve_failed_ts=NULL, "
-                "metadata_fetch_failed_ts=NULL "
+                "date_resolve_failed_ts=NULL, metadata_fetch_failed_ts=NULL "
                 "WHERE channel=? AND (search_failed_ts IS NOT NULL "
                 "OR id_resolve_failed_ts IS NOT NULL "
+                "OR date_resolve_failed_ts IS NOT NULL "
                 "OR metadata_fetch_failed_ts IS NOT NULL)",
                 (ch_name,))
             tp._db_commit()
@@ -12510,6 +12524,12 @@ def _run_metadata_download(item):
     # Batch resolve above is cheap (one playlist fetch), but individual search is
     # ~8s per video.  Skip videos that already went through individual search and
     # failed — they're likely deleted/private and would just waste time again.
+    #
+    # Keep the FULL pre-filter list around for the date-based pass (pass 6) —
+    # date-based resolution doesn't care about title matching, so it can still
+    # rescue rows that title-search failed on (e.g. heavy-emoji titles that
+    # broke YouTube's search ranking).
+    _need_search_full = list(_need_search)
     if _already_searched_ids and _need_search:
         _pre_count = len(_need_search)
         _need_search = [row for row in _need_search
@@ -12623,7 +12643,30 @@ def _run_metadata_download(item):
     # resolved by title matching, we can often identify them by checking what
     # the channel uploaded on the same date and eliminating the ones we
     # already matched.
-    if _need_search and ch_url and not cancel_event.is_set():
+    #
+    # IMPORTANT: use the full pre-filter list (_need_search_full), minus rows
+    # that already went through date-based and failed, AND minus rows that
+    # pass 5 resolved just now. Date-based doesn't care about title matching,
+    # so rows with search_failed_ts still deserve a shot here.
+    _already_date_failed = set()
+    if not refresh:
+        try:
+            for (_did,) in tp._db_execute(
+                    "SELECT id FROM videos "
+                    "WHERE channel=? AND date_resolve_failed_ts IS NOT NULL "
+                    "AND video_id IS NULL",
+                    (ch_name,)).fetchall():
+                _already_date_failed.add(_did)
+        except Exception:
+            pass
+    _resolved_fps = {fp for _, _, _, _, fp in _resolved_rows}
+    _need_search_date = [
+        r for r in _need_search_full
+        if (r[0] is None or r[0] not in _already_date_failed)
+        and r[4] not in _resolved_fps
+    ]
+    if _need_search_date and ch_url and not cancel_event.is_set():
+        _need_search = _need_search_date  # reassign so existing code below works
         _dr_has_files = any(fp and os.path.isfile(fp) for _, _, _, _, fp in _need_search)
         if _dr_has_files:
             # If batch-resolve didn't populate _yt_by_date, fetch it now
@@ -12798,13 +12841,23 @@ def _run_metadata_download(item):
                         if _s_row_id is not None:
                             try:
                                 tp._db_execute(
-                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL WHERE id=?",
+                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL, date_resolve_failed_ts=NULL WHERE id=?",
                                     (_matched_id, _s_row_id))
                             except Exception:
                                 pass
                     else:
                         _date_skipped += 1
                         _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                        # Mark as date-resolve-failed so the pre-check at the
+                        # top of future runs can treat this row as permanently
+                        # unreachable (all methods exhausted) and fast-exit.
+                        if _s_row_id is not None:
+                            try:
+                                tp._db_execute(
+                                    "UPDATE videos SET date_resolve_failed_ts=? WHERE id=?",
+                                    (time.time(), _s_row_id))
+                            except Exception:
+                                pass
 
                 _need_search = _still_need
                 if _date_found:
@@ -21870,6 +21923,15 @@ def _tp_open_db(path):
     # don't re-fetch the same failing video on every metadata run.
     try:
         conn.execute("ALTER TABLE videos ADD COLUMN metadata_fetch_failed_ts REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Migration: add date_resolve_failed_ts column — marks rows that went
+    # through date-based resolution (pass 6 in the metadata flow — match
+    # file mtime against channel's YouTube upload dates) and still couldn't
+    # be matched. Separate from search_failed_ts so we know when ALL
+    # resolution methods have been exhausted, not just title-based search.
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN date_resolve_failed_ts REAL")
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.commit()

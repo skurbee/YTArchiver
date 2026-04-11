@@ -84,7 +84,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.3"
+APP_VERSION = "v37.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3808,7 +3808,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 3:14pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.10.26 9:06pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -22536,6 +22536,11 @@ class _TranscriptionPanel(ttk.Frame):
 
         # Internal state for browse tree items
         self._browse_items = {}  # iid → {"type": "channel"/"year"/"month"/"file", ...}
+        # Tracks iids currently being populated by a background query.
+        # Prevents the duplicate-year-node race where collapsing + re-expanding
+        # a channel while its year query is still in flight fires two threads
+        # that each insert a full set of year nodes.
+        self._browse_loading_iids = set()
 
         # Loading overlay — shown until the startup disk scan completes
         self._disk_scan_complete = False
@@ -22604,6 +22609,10 @@ class _TranscriptionPanel(ttk.Frame):
         meta = self._browse_items.get(iid)
         if not meta:
             return
+        # Skip if a previous populate is still in flight for this iid —
+        # prevents duplicate year/month nodes from racing background threads.
+        if iid in self._browse_loading_iids:
+            return
         children = self._browse_tree.get_children(iid)
         if (len(children) == 1
                 and self._BROWSE_PLACEHOLDER in self._browse_tree.item(children[0], "tags")):
@@ -22615,6 +22624,11 @@ class _TranscriptionPanel(ttk.Frame):
         iid = self._browse_tree.focus()
         meta = self._browse_items.get(iid)
         if not meta:
+            return
+        # Skip if a previous populate is still in flight for this iid —
+        # prevents the duplicate-year-node race when the user collapses and
+        # re-expands a channel while its background year query is still running.
+        if iid in self._browse_loading_iids:
             return
         children = self._browse_tree.get_children(iid)
         # Only populate if the single child is the dummy placeholder
@@ -22641,6 +22655,10 @@ class _TranscriptionPanel(ttk.Frame):
             if not split_years:
                 self._populate_browse_titles(iid, ch, None, None)
                 return
+            # Mark as loading so a collapse+re-expand during the background
+            # query doesn't spawn a second query thread (the race that was
+            # producing duplicate year nodes).
+            self._browse_loading_iids.add(iid)
             # Show placeholder while loading
             _load_iid = tree.insert(iid, "end", text="  Loading...",
                                      tags=(self._BROWSE_PLACEHOLDER,))
@@ -22652,20 +22670,34 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     years = []
                 def _apply():
-                    if not tree.exists(iid):
-                        return
                     try:
-                        tree.delete(_load_iid)
-                    except Exception:
-                        pass
-                    if not years:
-                        self._populate_browse_titles(iid, ch, None, None)
-                        return
-                    for (yr,) in years:
-                        yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
-                        self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr,
-                                                       "split_months": split_months}
-                        tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                        if not tree.exists(iid):
+                            return
+                        # Guard against duplicate-apply: if someone else already
+                        # populated this node (e.g. an orphaned earlier thread
+                        # that somehow got past the loading-iid guard), bail
+                        # instead of inserting another set of year nodes.
+                        _existing = tree.get_children(iid)
+                        _has_real_children = any(
+                            self._BROWSE_PLACEHOLDER not in tree.item(_c, "tags")
+                            for _c in _existing
+                        )
+                        if _has_real_children:
+                            return
+                        try:
+                            tree.delete(_load_iid)
+                        except Exception:
+                            pass
+                        if not years:
+                            self._populate_browse_titles(iid, ch, None, None)
+                            return
+                        for (yr,) in years:
+                            yr_iid = tree.insert(iid, "end", text=f"📅  {yr}", open=False)
+                            self._browse_items[yr_iid] = {"type": "year", "channel": ch, "year": yr,
+                                                           "split_months": split_months}
+                            tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                    finally:
+                        self._browse_loading_iids.discard(iid)
                 self.after(0, _apply)
             threading.Thread(target=_query_years, daemon=True).start()
 
@@ -22674,6 +22706,8 @@ class _TranscriptionPanel(ttk.Frame):
             if not meta.get("split_months", False):
                 self._populate_browse_titles(iid, ch, yr, None)
                 return
+            # Mark as loading (see year-query comment above)
+            self._browse_loading_iids.add(iid)
             _load_iid = tree.insert(iid, "end", text="  Loading...",
                                      tags=(self._BROWSE_PLACEHOLDER,))
             def _query_months():
@@ -22684,21 +22718,32 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     months = []
                 def _apply():
-                    if not tree.exists(iid):
-                        return
                     try:
-                        tree.delete(_load_iid)
-                    except Exception:
-                        pass
-                    if months and len(months) > 1:
-                        for (mo,) in months:
-                            mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
-                            mo_iid = tree.insert(iid, "end", text=f"📄  {mo_name}", open=False)
-                            self._browse_items[mo_iid] = {
-                                "type": "month", "channel": ch, "year": yr, "month": mo}
-                            tree.insert(mo_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
-                    else:
-                        self._populate_browse_titles(iid, ch, yr, None)
+                        if not tree.exists(iid):
+                            return
+                        # Same duplicate-apply guard as the year query
+                        _existing = tree.get_children(iid)
+                        _has_real_children = any(
+                            self._BROWSE_PLACEHOLDER not in tree.item(_c, "tags")
+                            for _c in _existing
+                        )
+                        if _has_real_children:
+                            return
+                        try:
+                            tree.delete(_load_iid)
+                        except Exception:
+                            pass
+                        if months and len(months) > 1:
+                            for (mo,) in months:
+                                mo_name = _TP_MONTH_NAMES[mo - 1].capitalize() if 1 <= mo <= 12 else str(mo)
+                                mo_iid = tree.insert(iid, "end", text=f"📄  {mo_name}", open=False)
+                                self._browse_items[mo_iid] = {
+                                    "type": "month", "channel": ch, "year": yr, "month": mo}
+                                tree.insert(mo_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                        else:
+                            self._populate_browse_titles(iid, ch, yr, None)
+                    finally:
+                        self._browse_loading_iids.discard(iid)
                 self.after(0, _apply)
             threading.Thread(target=_query_months, daemon=True).start()
 

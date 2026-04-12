@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.4"
+APP_VERSION = "v38.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3969,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 9:41pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 10:01pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12503,8 +12503,8 @@ def _run_metadata_download(item):
     # large channels), fetch the entire channel's video list in one shot and
     # match by normalized title.  Only fall back to individual search for leftovers.
     # Run Pass 4 whenever there are any unresolved rows — even for small
-    # channels. The playlist fetch is cheap, and it populates _yt_by_date /
-    # _yt_all_list for Pass 6 and Pass 6a so they don't need a second fetch.
+    # channels. The playlist fetch is cheap, and it populates _yt_by_date
+    # for Pass 6 and Pass 6a so they don't need a second fetch.
     # Previously this was gated on >10 unresolved rows, which meant small
     # channels with a handful of stuck videos got stuck in Pass 6's own
     # fallback fetch path — and that path dropped undated videos silently.
@@ -12925,7 +12925,7 @@ def _run_metadata_download(item):
                 # ── Pass 6a: Fuzzy title matching via thefuzz ─────────
                 # For each unresolved local file, score its base filename
                 # against EVERY YT title in the channel using the
-                # token_sort_ratio scorer, collect matches ≥ 85, sort
+                # token_sort_ratio scorer, collect matches ≥ 75, sort
                 # descending, greedy-assign each file to its best unused
                 # YT video. Handles emoji titles, reordered words, and
                 # minor punctuation differences — cases the custom
@@ -12986,7 +12986,7 @@ def _run_metadata_download(item):
                                 except Exception:
                                     pass
                         if _fz_found:
-                            log(f"  \u2014 Fuzzy-matched {_fz_found} video ID(s) via thefuzz.\n", "simpleline_pink")
+                            log(f"  \u2014 Matched {_fz_found} video ID(s) by title.\n", "simpleline_pink")
                             try:
                                 tp._db_commit()
                             except Exception:
@@ -13177,14 +13177,14 @@ def _run_metadata_download(item):
                     if _6b_candidates:
                         # Smart cap: scale the fetch count to how many local
                         # rows actually need resolving. 3 unresolved rows →
-                        # max 10 fetches. 10 unresolved rows → max 30. Never
-                        # more than 30 (~90s of per-ID fetches).
+                        # max 9 fetches (floor of 5). 10 unresolved rows →
+                        # max 30. Never more than 30 (~90s of per-ID fetches).
                         _MAX_6B = min(30, max(5, len(_need_search) * 3))
                         if len(_6b_candidates) > _MAX_6B:
                             _6b_candidates = _6b_candidates[:_MAX_6B]
                         # Verbose-mode only diagnostic — hidden in simple mode
                         log(f"  Pass 6b: {len(_6b_candidates)} plausible "
-                            f"candidate(s) from {len(_6b_raw)} undated entries "
+                            f"candidate(s) from {len(_6b_raw)} no-date entries "
                             f"(cap {_MAX_6B}, {len(_need_search)} row(s) need matching).\n",
                             "dim")
 
@@ -13214,8 +13214,7 @@ def _run_metadata_download(item):
                                     if cancel_event.is_set():
                                         break
                                     if time.time() > _6b_deadline:
-                                        log("  \u26a0 Pass 6b: per-ID "
-                                            "date fetch timed out.\n", "red")
+                                        log("  \u26a0 Date fetch timed out.\n", "red")
                                         break
                                     line = _6b_proc.stdout.readline()
                                     if not line:
@@ -13260,7 +13259,7 @@ def _run_metadata_download(item):
                                 cleanup_process(_6b_proc)
                                 _6b_proc = None
                         except Exception as e:
-                            log(f"  \u26a0 Pass 6b: per-ID fetch failed: {e}\n", "red")
+                            log(f"  \u26a0 Date fetch failed: {e}\n", "red")
                         finally:
                             if _6b_proc is not None:
                                 cleanup_process(_6b_proc)

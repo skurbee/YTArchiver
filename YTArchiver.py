@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.0"
+APP_VERSION = "v38.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3967,7 +3967,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:09pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:23pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12176,6 +12176,50 @@ def _run_metadata_download(item):
             f"  Check that video files exist in the channel folder.\n", "red")
         return
 
+    # ── Stale date-failure cleanup ──
+    # Clear date_resolve_failed_ts on rows whose file mtime has changed
+    # since the failure was recorded. This lets external re-dating tools
+    # like FixDates v5 invalidate prior "unmatchable" flags — the next
+    # run picks those rows back up and retries date-based matching.
+    # Rows with NULL stored mtime (from before the migration) are also
+    # cleared so pre-v38.1 failures get a fresh shot.
+    if not refresh:
+        try:
+            _stale_sql = (
+                "SELECT id, filepath, date_resolve_failed_mtime FROM videos "
+                "WHERE channel=? AND date_resolve_failed_ts IS NOT NULL "
+                "AND video_id IS NULL")
+            _stale_params = [ch_name]
+            if year is not None:
+                _stale_sql += " AND year=?"
+                _stale_params.append(year)
+            if month is not None:
+                _stale_sql += " AND month=?"
+                _stale_params.append(month)
+            _stale_ids_to_clear = []
+            for _sid, _sfp, _stored_mtime in tp._db_execute(_stale_sql, _stale_params).fetchall():
+                if not _sfp or not os.path.isfile(_sfp):
+                    continue
+                try:
+                    _cur_mtime = os.path.getmtime(_sfp)
+                except OSError:
+                    continue
+                # Treat as "unchanged" only if stored mtime is set and matches
+                # within a 1-second tolerance (float precision / FS granularity).
+                if _stored_mtime is None or abs(_cur_mtime - _stored_mtime) > 1.0:
+                    _stale_ids_to_clear.append(_sid)
+            if _stale_ids_to_clear:
+                _phs = ",".join("?" for _ in _stale_ids_to_clear)
+                tp._db_execute(
+                    f"UPDATE videos SET date_resolve_failed_ts=NULL, "
+                    f"date_resolve_failed_mtime=NULL WHERE id IN ({_phs})",
+                    _stale_ids_to_clear)
+                tp._db_commit()
+                log(f"  \u2014 Cleared {len(_stale_ids_to_clear)} stale date-failure "
+                    f"flag(s) (file mtime changed).\n", "simpleline_pink")
+        except Exception:
+            pass
+
     # Load the set of video_ids whose metadata fetch previously failed
     # (yt-dlp --dump-json returned nothing — deleted/private/region-locked).
     # These are treated as "permanently done" so we don't re-fetch them on
@@ -12425,7 +12469,8 @@ def _run_metadata_download(item):
         try:
             tp._db_execute(
                 "UPDATE videos SET search_failed_ts=NULL, id_resolve_failed_ts=NULL, "
-                "date_resolve_failed_ts=NULL, metadata_fetch_failed_ts=NULL "
+                "date_resolve_failed_ts=NULL, date_resolve_failed_mtime=NULL, "
+                "metadata_fetch_failed_ts=NULL "
                 "WHERE channel=? AND (search_failed_ts IS NOT NULL "
                 "OR id_resolve_failed_ts IS NOT NULL "
                 "OR date_resolve_failed_ts IS NOT NULL "
@@ -12897,7 +12942,8 @@ def _run_metadata_download(item):
                                     tp._db_execute(
                                         "UPDATE videos SET video_id=?, "
                                         "search_failed_ts=NULL, "
-                                        "date_resolve_failed_ts=NULL WHERE id=?",
+                                        "date_resolve_failed_ts=NULL, "
+                                        "date_resolve_failed_mtime=NULL WHERE id=?",
                                         (_yt_vid, _s_row_id))
                                 except Exception:
                                     pass
@@ -13005,7 +13051,8 @@ def _run_metadata_download(item):
                         if _s_row_id is not None:
                             try:
                                 tp._db_execute(
-                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL, date_resolve_failed_ts=NULL WHERE id=?",
+                                    "UPDATE videos SET video_id=?, search_failed_ts=NULL, "
+                                    "date_resolve_failed_ts=NULL, date_resolve_failed_mtime=NULL WHERE id=?",
                                     (_matched_id, _s_row_id))
                             except Exception:
                                 pass
@@ -13015,11 +13062,17 @@ def _run_metadata_download(item):
                         # Mark as date-resolve-failed so the pre-check at the
                         # top of future runs can treat this row as permanently
                         # unreachable (all methods exhausted) and fast-exit.
+                        # Store the file's current mtime alongside the flag so
+                        # a later external re-dating (e.g. FixDates v5) can
+                        # invalidate the stale failure — the cleanup pass at
+                        # the top of _run_metadata_download clears flags whose
+                        # stored mtime no longer matches the live file.
                         if _s_row_id is not None:
                             try:
                                 tp._db_execute(
-                                    "UPDATE videos SET date_resolve_failed_ts=? WHERE id=?",
-                                    (time.time(), _s_row_id))
+                                    "UPDATE videos SET date_resolve_failed_ts=?, "
+                                    "date_resolve_failed_mtime=? WHERE id=?",
+                                    (time.time(), _mtime, _s_row_id))
                             except Exception:
                                 pass
 
@@ -22097,6 +22150,15 @@ def _tp_open_db(path):
     # resolution methods have been exhausted, not just title-based search.
     try:
         conn.execute("ALTER TABLE videos ADD COLUMN date_resolve_failed_ts REAL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Migration: add date_resolve_failed_mtime column — stores the file's
+    # mtime at the time date-resolution failed. On subsequent runs, if the
+    # current file mtime differs from this stored value, the failure flag
+    # is considered stale and cleared (the file has been re-dated externally,
+    # e.g. by FixDates v5, so date-based matching deserves another shot).
+    try:
+        conn.execute("ALTER TABLE videos ADD COLUMN date_resolve_failed_mtime REAL")
     except sqlite3.OperationalError:
         pass  # column already exists
     conn.commit()

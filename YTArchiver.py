@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.6"
+APP_VERSION = "v38.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3969,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 10:23pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 11:19pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13209,15 +13209,27 @@ def _run_metadata_download(item):
                                     for vid, _ in _6b_candidates]
                         _6b_dates = {}  # vid -> "YYYYMMDD"
                         _6b_proc = None
+                        _6b_batch_file = None
                         try:
                             if _internet_down.is_set():
                                 _block_if_no_internet()
+                            # Write URLs to a temp batch file instead of
+                            # passing them as command-line args. Windows has
+                            # a ~32K char limit on command lines (WinError
+                            # 206) — hundreds of URLs easily exceed that.
+                            import tempfile as _tf_6b
+                            _6b_batch_file = _tf_6b.NamedTemporaryFile(
+                                mode='w', suffix='.txt', delete=False,
+                                encoding='utf-8')
+                            _6b_batch_file.write('\n'.join(_6b_urls))
+                            _6b_batch_file.close()
                             _6b_cmd = [
                                 "yt-dlp", "--skip-download", "--no-warnings",
                                 "--print",
                                 "%(id)s|||%(upload_date)s|||%(timestamp)s",
                                 "--cookies-from-browser", "firefox",
-                            ] + _6b_urls
+                                "--batch-file", _6b_batch_file.name,
+                            ]
                             _6b_proc = spawn_yt_dlp(_6b_cmd)
                             if _6b_proc:
                                 _6b_t0 = time.time()
@@ -13282,6 +13294,11 @@ def _run_metadata_download(item):
                         finally:
                             if _6b_proc is not None:
                                 cleanup_process(_6b_proc)
+                            if _6b_batch_file is not None:
+                                try:
+                                    os.unlink(_6b_batch_file.name)
+                                except OSError:
+                                    pass
 
                         # Match each remaining unresolved local row by file
                         # mtime against the fetched candidate dates. Tolerance

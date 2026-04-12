@@ -19,6 +19,17 @@ import glob
 from datetime import datetime, timedelta
 import unicodedata
 import difflib
+# Optional: thefuzz provides token-sort fuzzy matching that handles emoji
+# titles and reordered words much better than our custom _norm_title.
+# Used by the metadata resolver's fuzzy pass in _run_metadata_download.
+# Degrades gracefully if not installed — pipeline falls back to
+# normalized / word-overlap matching as before.
+try:
+    from thefuzz import fuzz as _fuzz
+    _FUZZ_AVAILABLE = True
+except ImportError:
+    _fuzz = None
+    _FUZZ_AVAILABLE = False
 import hashlib
 import urllib.request
 import sqlite3
@@ -84,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.8"
+APP_VERSION = "v37.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3956,7 +3967,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 6:50pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 7:23pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -11883,15 +11894,21 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
         _redownload_running = False
 
 
-def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label, refresh=False):
-    """Add a metadata download task to the Sync-Tasks queue."""
+def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label, refresh=False, _quiet=False):
+    """Add a metadata download task to the Sync-Tasks queue.
+    Pass _quiet=True to suppress the per-channel "Added metadata download..."
+    log line — bulk-queue callers (e.g. "Metadata for all channels") emit
+    their own single summary line after the loop instead of spamming one
+    line per channel."""
     _key = f"metadata:{ch_name}:{year}:{month}"
     with _metadata_queue_lock:
         if any(q["_key"] == _key for q in _metadata_queue):
-            log(f"  ⚠ {scope_label} metadata is already in the queue.\n", "simpleline")
+            if not _quiet:
+                log(f"  ⚠ {scope_label} metadata is already in the queue.\n", "simpleline")
             return
         if _metadata_running and _current_job.get("_metadata_key") == _key:
-            log(f"  ⚠ {scope_label} metadata is already running.\n", "simpleline")
+            if not _quiet:
+                log(f"  ⚠ {scope_label} metadata is already running.\n", "simpleline")
             return
         _metadata_queue.append({
             "ch_name": ch_name,
@@ -11907,7 +11924,8 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
         })
     with _queue_order_lock:
         _queue_order.append(("metadata", _key))
-    log(f"  \u2014 Added metadata download to sync-tasks queue\n", "simpleline_pink")
+    if not _quiet:
+        log(f"  \u2014 Added metadata download to sync-tasks queue\n", "simpleline_pink")
     _update_queue_btn()
     _save_queue_state()
 
@@ -12741,8 +12759,6 @@ def _run_metadata_download(item):
                         cleanup_process(_dr_proc)
 
             if _yt_by_date and not cancel_event.is_set():
-                log(f"  Date-resolving {len(_need_search)} video(s) by upload date...\n", "dim")
-
                 # Build known-IDs set to avoid duplicate assignment
                 _date_known = set(vid for vid, *_ in _resolved_rows)
                 try:
@@ -12752,6 +12768,74 @@ def _run_metadata_download(item):
                         _date_known.add(_db_vid)
                 except Exception:
                     pass
+
+                # ── Pass 6a: Fuzzy title matching via thefuzz ─────────
+                # Same algorithm as FixDates v5 — for each unresolved
+                # local file, score its base filename against EVERY YT
+                # title in the channel using token_sort_ratio, collect
+                # matches ≥ 85, sort descending, greedy-assign each file
+                # to its best unused YT video. Handles emoji titles,
+                # reordered words, minor punctuation differences — cases
+                # our custom _norm_title / word-overlap matching fails on.
+                # Runs BEFORE date-based matching so it catches files
+                # whose mtimes are wrong (e.g. downloaded without upload
+                # date preservation).
+                if _FUZZ_AVAILABLE:
+                    _all_yt_videos = [
+                        (vid, t)
+                        for entries in _yt_by_date.values()
+                        for vid, t in entries
+                        if vid not in _date_known
+                    ]
+                    if _all_yt_videos and _need_search:
+                        _fz_potential = []
+                        for _f_idx, (_s_row_id, _s_title, _s_year, _s_month, _s_filepath) in enumerate(_need_search):
+                            if cancel_event.is_set():
+                                break
+                            _local_base = (os.path.splitext(os.path.basename(_s_filepath))[0]
+                                           if _s_filepath else _s_title).lower()
+                            for _yt_vid, _yt_title in _all_yt_videos:
+                                _score = _fuzz.token_sort_ratio(_local_base, _yt_title.lower())
+                                if _score >= 85:
+                                    _fz_potential.append((_score, _f_idx, _yt_vid, _yt_title))
+                        _fz_potential.sort(key=lambda m: m[0], reverse=True)
+                        _fz_matched_files = set()
+                        _fz_matched_vids = set()
+                        _fz_found = 0
+                        for _score, _f_idx, _yt_vid, _yt_title in _fz_potential:
+                            if _f_idx in _fz_matched_files or _yt_vid in _fz_matched_vids:
+                                continue
+                            _fz_matched_files.add(_f_idx)
+                            _fz_matched_vids.add(_yt_vid)
+                            _date_known.add(_yt_vid)
+                            (_s_row_id, _s_title, _s_year, _s_month, _s_filepath) = _need_search[_f_idx]
+                            _resolved_rows.append((_yt_vid, _s_title, _s_year, _s_month, _s_filepath))
+                            _fz_found += 1
+                            _no_id_count -= 1
+                            if _s_row_id is not None:
+                                try:
+                                    tp._db_execute(
+                                        "UPDATE videos SET video_id=?, "
+                                        "search_failed_ts=NULL, "
+                                        "date_resolve_failed_ts=NULL WHERE id=?",
+                                        (_yt_vid, _s_row_id))
+                                except Exception:
+                                    pass
+                        if _fz_found:
+                            log(f"  \u2014 Fuzzy-matched {_fz_found} video ID(s) via thefuzz.\n", "simpleline_pink")
+                            try:
+                                tp._db_commit()
+                            except Exception:
+                                pass
+                            # Strip fuzzy-matched rows from _need_search so the
+                            # date-based loop below doesn't re-process them.
+                            _need_search = [
+                                r for i, r in enumerate(_need_search)
+                                if i not in _fz_matched_files
+                            ]
+
+                if _need_search:
+                    log(f"  Date-resolving {len(_need_search)} video(s) by upload date...\n", "dim")
 
                 # Title normalizer (same logic as batch-resolve)
                 _dr_re_unsafe = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
@@ -26354,9 +26438,9 @@ class _TranscriptionPanel(ttk.Frame):
             folder_path = os.path.join(base, folder) if base else folder
             sy = ch_cfg.get("split_years", False)
             sm = ch_cfg.get("split_months", False)
-            _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, None, None, ch_name)
+            _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, None, None, ch_name, _quiet=True)
             queued += 1
-        log(f"\n=== Queued metadata download for {queued} channel(s) ===\n", "header")
+        log(f"  \u2014 Added metadata download to queue for {queued} channel(s)\n", "simpleline_pink")
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""

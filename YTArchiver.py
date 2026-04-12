@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.1"
+APP_VERSION = "v38.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3090,7 +3090,9 @@ def _run_startup_disk_scan():
                 _ui_queue.append(refresh_channel_dropdowns)
 
     # Reconcile channel names: fix rows where yt-dlp metadata channel name
-    # doesn't match the config name (e.g. "David Pakman Show" vs "David Pakman")
+    # doesn't match the user-configured channel name (e.g. YouTube might
+    # return "Example Channel Show" while the local config stores it as
+    # "Example Channel").
     tp = _tp_panel_ref[0]
     if tp:
         if not tp._conn:
@@ -3967,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:23pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:49pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12054,9 +12056,10 @@ def _run_metadata_download(item):
 
     # ── Live prep scanline: shows current phase during slow resolution ──
     # Only surfaces after 5s of elapsed prep time, so fast channels (<100
-    # videos) never see extra clutter. For big channels like David Pakman
-    # where Pass 4 (yt-dlp playlist fetch) can take many minutes, this gives
-    # live feedback so it doesn't look stuck. Reuses the "scanline" tag so
+    # videos) never see extra clutter. For large channels (thousands of
+    # videos) where Pass 4 (yt-dlp playlist fetch) can take many minutes,
+    # this gives live feedback so it doesn't look stuck. Reuses the
+    # "scanline" tag so
     # the later "Scanning metadata files X/Y" line seamlessly takes over.
     _prep_state = {"start": time.time(), "shown": False}
 
@@ -12178,11 +12181,12 @@ def _run_metadata_download(item):
 
     # ── Stale date-failure cleanup ──
     # Clear date_resolve_failed_ts on rows whose file mtime has changed
-    # since the failure was recorded. This lets external re-dating tools
-    # like FixDates v5 invalidate prior "unmatchable" flags — the next
-    # run picks those rows back up and retries date-based matching.
-    # Rows with NULL stored mtime (from before the migration) are also
-    # cleared so pre-v38.1 failures get a fresh shot.
+    # since the failure was recorded. This lets any external re-dating
+    # (manual touch, file utilities, the built-in Date Fix feature, etc.)
+    # invalidate prior "unmatchable" flags — the next run picks those rows
+    # back up and retries date-based matching. Rows with NULL stored mtime
+    # (from before this column existed) are also cleared so any pre-existing
+    # failures get a fresh shot.
     if not refresh:
         try:
             _stale_sql = (
@@ -12498,7 +12502,13 @@ def _run_metadata_download(item):
     # Instead of searching YouTube one-by-one (which takes ~8s each = days for
     # large channels), fetch the entire channel's video list in one shot and
     # match by normalized title.  Only fall back to individual search for leftovers.
-    if len(_need_search) > 10 and ch_url:
+    # Run Pass 4 whenever there are any unresolved rows — even for small
+    # channels. The playlist fetch is cheap, and it populates _yt_by_date /
+    # _yt_all_list for Pass 6 and Pass 6a so they don't need a second fetch.
+    # Previously this was gated on >10 unresolved rows, which meant small
+    # channels with a handful of stuck videos got stuck in Pass 6's own
+    # fallback fetch path — and that path dropped undated videos silently.
+    if _need_search and ch_url:
         _update_meta_prep_line(f"Fetching channel playlist for {len(_need_search):,} video(s)...")
         log(f"  Batch-resolving {len(_need_search):,} video(s) via channel playlist...\n", "dim")
         _batch_url = ch_url.rstrip("/")
@@ -12570,6 +12580,18 @@ def _run_metadata_download(item):
                             if _resolved_date:
                                 _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 _batch_dates_ok += 1
+                            else:
+                                # yt-dlp flat-playlist sometimes returns "NA" for
+                                # upload_date and timestamp on certain videos.
+                                # Previously these were silently dropped from
+                                # _yt_by_date, making them invisible to Pass 6a
+                                # fuzzy matching (which builds its candidate
+                                # list from _yt_by_date.values()). Stash them
+                                # under a "" sentinel key so fuzzy still sees
+                                # them — Pass 6's date-based matcher looks up
+                                # "YYYYMMDD" keys so it naturally ignores this
+                                # bucket.
+                                _yt_by_date.setdefault("", []).append((_vid_id, _yt_title))
                             _batch_count += 1
                             # Throttled live scanline update (simple mode only)
                             _now = time.time()
@@ -12855,6 +12877,12 @@ def _run_metadata_download(item):
                                         pass
                                 if _resolved_date:
                                     _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
+                                else:
+                                    # Undated video — stash in "" bucket so Pass 6a
+                                    # fuzzy matching can still see it. Pass 6's
+                                    # date-based matcher naturally ignores this
+                                    # bucket since it only looks up "YYYYMMDD" keys.
+                                    _yt_by_date.setdefault("", []).append((_vid_id, _yt_title))
                             _dr_count += 1
                             # Throttled live scanline update (simple mode only)
                             _now_dr = time.time()
@@ -12895,16 +12923,16 @@ def _run_metadata_download(item):
                     pass
 
                 # ── Pass 6a: Fuzzy title matching via thefuzz ─────────
-                # Same algorithm as FixDates v5 — for each unresolved
-                # local file, score its base filename against EVERY YT
-                # title in the channel using token_sort_ratio, collect
-                # matches ≥ 85, sort descending, greedy-assign each file
-                # to its best unused YT video. Handles emoji titles,
-                # reordered words, minor punctuation differences — cases
-                # our custom _norm_title / word-overlap matching fails on.
-                # Runs BEFORE date-based matching so it catches files
-                # whose mtimes are wrong (e.g. downloaded without upload
-                # date preservation).
+                # For each unresolved local file, score its base filename
+                # against EVERY YT title in the channel using the
+                # token_sort_ratio scorer, collect matches ≥ 85, sort
+                # descending, greedy-assign each file to its best unused
+                # YT video. Handles emoji titles, reordered words, and
+                # minor punctuation differences — cases the custom
+                # _norm_title / word-overlap matching fails on. Runs
+                # BEFORE date-based matching so it catches files whose
+                # mtimes are wrong (e.g. downloaded without upload date
+                # preservation).
                 if _FUZZ_AVAILABLE:
                     _all_yt_videos = [
                         (vid, t)
@@ -12942,6 +12970,7 @@ def _run_metadata_download(item):
                                     tp._db_execute(
                                         "UPDATE videos SET video_id=?, "
                                         "search_failed_ts=NULL, "
+                                        "id_resolve_failed_ts=NULL, "
                                         "date_resolve_failed_ts=NULL, "
                                         "date_resolve_failed_mtime=NULL WHERE id=?",
                                         (_yt_vid, _s_row_id))
@@ -13063,10 +13092,10 @@ def _run_metadata_download(item):
                         # top of future runs can treat this row as permanently
                         # unreachable (all methods exhausted) and fast-exit.
                         # Store the file's current mtime alongside the flag so
-                        # a later external re-dating (e.g. FixDates v5) can
-                        # invalidate the stale failure — the cleanup pass at
-                        # the top of _run_metadata_download clears flags whose
-                        # stored mtime no longer matches the live file.
+                        # any later external re-dating can invalidate the
+                        # stale failure — the cleanup pass at the top of
+                        # _run_metadata_download clears flags whose stored
+                        # mtime no longer matches the live file.
                         if _s_row_id is not None:
                             try:
                                 tp._db_execute(
@@ -13642,8 +13671,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             yt_title_to_id = {}  # yt_title -> video_id
 
             # OPTIMIZATION: small-batch shortcut.
-            # For huge channels (28k+ videos like David Pakman), enumerating the
-            # entire playlist via `yt-dlp --flat-playlist` takes 5-10 minutes,
+            # For very large channels (tens of thousands of videos), enumerating
+            # the entire playlist via `yt-dlp --flat-playlist` takes 5-10 minutes,
             # which is awful when the user just wants to transcribe a handful
             # of newly-downloaded videos. When the batch is small AND we have
             # a channel URL to scope the search, do a per-file YouTube search
@@ -22156,7 +22185,7 @@ def _tp_open_db(path):
     # mtime at the time date-resolution failed. On subsequent runs, if the
     # current file mtime differs from this stored value, the failure flag
     # is considered stale and cleared (the file has been re-dated externally,
-    # e.g. by FixDates v5, so date-based matching deserves another shot).
+    # so date-based matching deserves another shot).
     try:
         conn.execute("ALTER TABLE videos ADD COLUMN date_resolve_failed_mtime REAL")
     except sqlite3.OperationalError:
@@ -22731,8 +22760,9 @@ class _TranscriptionPanel(ttk.Frame):
                 except Exception:
                     pass
             # Reconcile channel names: fix rows where the channel name from
-            # yt-dlp metadata doesn't match the config name (e.g. "David
-            # Pakman Show" vs "David Pakman") by matching filepath to channel folder
+            # yt-dlp metadata doesn't match the local config name (YouTube's
+            # display name can drift from the user-chosen folder name) by
+            # matching filepath to channel folder.
             try:
                 _cfg_map = {}  # folder_name -> config channel name
                 for _ch_cfg in channels_cfg:
@@ -22893,11 +22923,10 @@ class _TranscriptionPanel(ttk.Frame):
             pass
         # One-time dedupe pass: merge rows that point to the same physical file
         # but with different slash styles in the filepath. The bug was in
-        # _scan_channel_disk_info, which inserted un-normalized paths
-        # (e.g. "Z:/Archive/.../Whole Channels\3kliksphilip\..."), while
-        # register_video stores normalized backslash paths. The unique
-        # constraint compares strings, not normalized paths, so the same file
-        # could end up with two rows.
+        # _scan_channel_disk_info, which inserted un-normalized paths mixing
+        # forward and backward slashes, while register_video stores normalized
+        # backslash paths. The unique constraint compares strings, not
+        # normalized paths, so the same file could end up with two rows.
         self._dedupe_slash_mismatch_videos()
 
     def _dedupe_slash_mismatch_videos(self):
@@ -31378,9 +31407,9 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                         if _idx >= 0:
                             _vid = video_url[_idx + len(_pat):][:11]
                             break
-                # Resolve yt-dlp channel name to config channel name so the
-                # browse tree doesn't show duplicates (e.g. "David Pakman Show"
-                # vs "David Pakman" when the config name differs from YT name)
+                # Resolve yt-dlp channel name to the local config channel name
+                # so the browse tree doesn't show duplicates when YouTube's
+                # display name differs from the user's chosen folder name.
                 _db_channel = channel
                 if filepath:
                     with config_lock:

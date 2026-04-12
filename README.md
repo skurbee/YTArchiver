@@ -61,5 +61,5 @@ Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whi
 EXE in releases has icon bundled. If you run the .py seperately, download the .ico and put it in the same /dir.
 
 
-Line by line, it's roughly 50% Claude-Code, 30% Copilot, 20% me :)
+Line by line, it's roughly 90% Claude-Code, 5% Copilot, 5% me :)
 

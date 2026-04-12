@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.5"
+APP_VERSION = "v38.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3969,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 10:01pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 10:23pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13125,17 +13125,33 @@ def _run_metadata_download(item):
                     log(f"  ({_date_skipped} skipped \u2014 ambiguous date match)\n", "dim")
 
                 # ── Pass 6b: per-ID date fetch for stuck rows ──────────
+                # ONE-SHOT LEGACY/MIGRATION CLEANUP. This pass only fires
+                # for rows that entered the DB with NULL video_id — which
+                # happens for (a) stragglers from older YTArchiver versions
+                # that didn't write vid_id at download time, (b) files
+                # imported from other tools, and (c) manually-dropped files
+                # that got picked up by the browse-tab scanner. Normal
+                # fresh-user downloads never reach this pass: the DLTRACK
+                # line from yt-dlp already populates video_id at
+                # record_download() time, so Pass 1 resolves them
+                # immediately and _need_search is empty.
+                #
+                # Because this is a cleanup (not a recurring pass), there
+                # is no cap — it runs until every plausible candidate has
+                # been checked. Once a stuck row is rescued its video_id
+                # is written to the DB, and it's filtered out by Pass 1
+                # on all future runs. The fuzzy ≥50 pre-filter stays to
+                # avoid fetching dates for candidates that couldn't
+                # plausibly match any unresolved row on title alone — this
+                # prevents waste on huge channels (e.g. 5000 videos, 35
+                # stuck rows).
+                #
                 # Some channels return upload_date=NA for every video in
                 # --flat-playlist mode, which means _yt_by_date has no
                 # dated buckets and Pass 6's date-based matcher fails. For
                 # any rows still unresolved AND any unmatched candidates
                 # stashed in the "" bucket, drop --flat-playlist and fetch
-                # the real upload date per-ID. Bounded cost: only runs for
-                # the handful of candidates left after Pass 6a, and only
-                # when local rows are still unresolved. This is the "we
-                # know the file's date, just use it" path Scott asked for
-                # — works on any channel where the local file mtime is
-                # accurate, regardless of what flat-playlist does.
+                # the real upload date per-ID.
                 if (_need_search and "" in _yt_by_date and ch_url
                         and not cancel_event.is_set()):
                     _6b_raw = [(vid, t) for vid, t in _yt_by_date[""]
@@ -13175,17 +13191,15 @@ def _run_metadata_download(item):
                         _6b_candidates = _6b_raw
 
                     if _6b_candidates:
-                        # Smart cap: scale the fetch count to how many local
-                        # rows actually need resolving. 3 unresolved rows →
-                        # max 9 fetches (floor of 5). 10 unresolved rows →
-                        # max 30. Never more than 30 (~90s of per-ID fetches).
-                        _MAX_6B = min(30, max(5, len(_need_search) * 3))
-                        if len(_6b_candidates) > _MAX_6B:
-                            _6b_candidates = _6b_candidates[:_MAX_6B]
+                        # No cap — Pass 6b is a one-shot cleanup, run it to
+                        # completion. The fuzzy pre-filter above already
+                        # dropped candidates that couldn't plausibly match
+                        # any unresolved row on title alone, so the list is
+                        # bounded by how much real work there is.
                         # Verbose-mode only diagnostic — hidden in simple mode
                         log(f"  Pass 6b: {len(_6b_candidates)} plausible "
                             f"candidate(s) from {len(_6b_raw)} no-date entries "
-                            f"(cap {_MAX_6B}, {len(_need_search)} row(s) need matching).\n",
+                            f"({len(_need_search)} row(s) need matching).\n",
                             "dim")
 
                         _update_meta_prep_line(
@@ -13207,7 +13221,12 @@ def _run_metadata_download(item):
                             _6b_proc = spawn_yt_dlp(_6b_cmd)
                             if _6b_proc:
                                 _6b_t0 = time.time()
-                                _6b_deadline = time.time() + 600
+                                # 30-minute deadline — Pass 6b is a one-shot
+                                # legacy/migration cleanup and can legitimately
+                                # need to process hundreds of candidates in a
+                                # single run. Runaway subprocess protection
+                                # only; normal progress is cancel-event gated.
+                                _6b_deadline = time.time() + 1800
                                 _6b_count = 0
                                 _6b_last_scanline = 0.0
                                 while True:

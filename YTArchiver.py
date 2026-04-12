@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.8"
+APP_VERSION = "v38.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2591,9 +2591,9 @@ _RE_TITLE_UNSAFE = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
 _RE_TITLE_WS = re.compile(r'\s+')
 
 def _normalize_yt_title(title):
-    """Normalize a YouTube title for matching: NFKC, strip unsafe chars, collapse whitespace, lowercase."""
+    """Normalize a YouTube title for matching: NFKC, replace unsafe chars with space (matches yt-dlp sanitization), collapse whitespace, lowercase."""
     s = unicodedata.normalize('NFKC', title)
-    s = _RE_TITLE_UNSAFE.sub('', s)
+    s = _RE_TITLE_UNSAFE.sub(' ', s)
     s = _RE_TITLE_WS.sub(' ', s).strip()
     return s.lower()
 
@@ -3947,7 +3947,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 11:23am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 12:37pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13004,6 +13004,16 @@ def _run_metadata_download(item):
 
                     if not _candidates:
                         _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                        # No YouTube video exists on this date — mark as
+                        # permanently failed so future runs skip it.
+                        if _s_row_id is not None:
+                            try:
+                                tp._db_execute(
+                                    "UPDATE videos SET date_resolve_failed_ts=?, "
+                                    "date_resolve_failed_mtime=? WHERE id=?",
+                                    (time.time(), _mtime, _s_row_id))
+                            except Exception:
+                                pass
                         continue
 
                     _matched_id = None
@@ -13182,6 +13192,7 @@ def _run_metadata_download(item):
                             _6b_batch_file.close()
                             _6b_cmd = [
                                 "yt-dlp", "--skip-download", "--no-warnings",
+                                "--socket-timeout", "30",
                                 "--print",
                                 "%(id)s|||%(upload_date)s|||%(timestamp)s",
                                 "--cookies-from-browser", "firefox",
@@ -13190,12 +13201,10 @@ def _run_metadata_download(item):
                             _6b_proc = spawn_yt_dlp(_6b_cmd)
                             if _6b_proc:
                                 _6b_t0 = time.time()
-                                # 30-minute deadline — Pass 6b is a one-shot
-                                # legacy/migration cleanup and can legitimately
-                                # need to process hundreds of candidates in a
-                                # single run. Runaway subprocess protection
-                                # only; normal progress is cancel-event gated.
-                                _6b_deadline = time.time() + 1800
+                                # Scale deadline with candidate count —
+                                # 30s per video (matches socket-timeout),
+                                # 120s minimum for overhead.
+                                _6b_deadline = time.time() + max(120, len(_6b_candidates) * 30)
                                 _6b_count = 0
                                 _6b_last_scanline = 0.0
                                 while True:

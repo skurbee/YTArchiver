@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v37.9"
+APP_VERSION = "v37.10"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3967,7 +3967,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 7:23pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:09pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12052,6 +12052,64 @@ def _run_metadata_download(item):
 
     log(f"Metadata: preparing {scope_label}...\n", "simpleline")
 
+    # ── Live prep scanline: shows current phase during slow resolution ──
+    # Only surfaces after 5s of elapsed prep time, so fast channels (<100
+    # videos) never see extra clutter. For big channels like David Pakman
+    # where Pass 4 (yt-dlp playlist fetch) can take many minutes, this gives
+    # live feedback so it doesn't look stuck. Reuses the "scanline" tag so
+    # the later "Scanning metadata files X/Y" line seamlessly takes over.
+    _prep_state = {"start": time.time(), "shown": False}
+
+    def _update_meta_prep_line(text):
+        if not _is_simple_mode:
+            return
+        if not _prep_state["shown"] and (time.time() - _prep_state["start"]) < 5.0:
+            return  # grace period — fast channels skip this entirely
+        _prep_state["shown"] = True
+        def _write():
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    try:
+                        _yv = log_box.yview()[1]
+                        at_bottom = (_log_at_bottom and not _log_user_scrolled) or _yv >= 0.999
+                    except Exception:
+                        at_bottom = True
+                    log_box.config(state="normal")
+                    ranges = log_box.tag_ranges("scanline")
+                    if ranges:
+                        log_box.delete(ranges[0], ranges[1])
+                    log_box.insert(tk.END, f"  {text}\n", "scanline")
+                    if at_bottom:
+                        log_box.see(tk.END)
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            if _root_alive:
+                _ui_queue.append(_write)
+        except Exception:
+            pass
+
+    def _clear_meta_prep_line():
+        if not _is_simple_mode or not _prep_state["shown"]:
+            return
+        _prep_state["shown"] = False
+        def _write():
+            try:
+                if 'log_box' in globals() and log_box.winfo_exists():
+                    log_box.config(state="normal")
+                    ranges = log_box.tag_ranges("scanline")
+                    if ranges:
+                        log_box.delete(ranges[0], ranges[1])
+                    log_box.config(state="disabled")
+            except Exception:
+                pass
+        try:
+            if _root_alive:
+                _ui_queue.append(_write)
+        except Exception:
+            pass
+
     # Get the TP instance (Browse tab) for DB access and metadata helpers
     tp = _tp_panel_ref[0]
     if tp and not tp._conn and getattr(tp, '_db_loading', False):
@@ -12138,6 +12196,7 @@ def _run_metadata_download(item):
     # ── Quick pre-check: skip entire pipeline if metadata already covers all videos ──
     # Avoids expensive YouTube lookups when re-running on already-complete channels.
     if not refresh:
+        _update_meta_prep_line(f"Checking existing metadata ({len(rows):,} video(s))...")
         _pc_paths = set()
         for _, _, _, v_year, v_month, _ in rows:
             mp, _ = tp._get_metadata_jsonl_path(
@@ -12184,6 +12243,7 @@ def _run_metadata_download(item):
         # against total row count.  Add fetch-failed count to JSONL count so
         # permanently-failed rows don't block this condition.
         if _pc_covered >= _pc_with_ids and (len(_pc_ids) + len(_fetch_failed_ids)) >= _pc_effective:
+            _clear_meta_prep_line()
             if _pc_date_failed > 0:
                 _plural = "" if _pc_date_failed == 1 else "s"
                 log(f"  \u2014 {_pc_with_ids} video(s) have metadata. "
@@ -12301,6 +12361,7 @@ def _run_metadata_download(item):
                     _no_id_count += 1
 
         if _walk_candidates:
+            _update_meta_prep_line(f"Scanning transcripts for {len(_walk_candidates):,} unresolved ID(s)...")
             log(f"  Scanning transcript files for {len(_walk_candidates)} unresolved ID(s)...\n", "dim")
             _walk_id_map = {}
             for dirpath, _, filenames in os.walk(folder_path):
@@ -12393,6 +12454,7 @@ def _run_metadata_download(item):
     # large channels), fetch the entire channel's video list in one shot and
     # match by normalized title.  Only fall back to individual search for leftovers.
     if len(_need_search) > 10 and ch_url:
+        _update_meta_prep_line(f"Fetching channel playlist for {len(_need_search):,} video(s)...")
         log(f"  Batch-resolving {len(_need_search):,} video(s) via channel playlist...\n", "dim")
         _batch_url = ch_url.rstrip("/")
         if ("/@" in _batch_url or "/channel/" in _batch_url or "/c/" in _batch_url or "/user/" in _batch_url) and not _batch_url.endswith("/videos"):
@@ -12421,6 +12483,7 @@ def _run_metadata_download(item):
                 _batch_dates_ok = 0
                 _batch_t0 = time.time()
                 _last_batch_log = 0
+                _last_batch_scanline = 0.0
                 # Timeout scales with total channel size (len(rows)), not just
                 # _need_search — the playlist fetches ALL videos regardless of
                 # how many need resolution.
@@ -12463,6 +12526,13 @@ def _run_metadata_download(item):
                                 _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 _batch_dates_ok += 1
                             _batch_count += 1
+                            # Throttled live scanline update (simple mode only)
+                            _now = time.time()
+                            if _now - _last_batch_scanline >= 1.0:
+                                _elapsed_s = int(_now - _batch_t0)
+                                _update_meta_prep_line(
+                                    f"Fetching channel playlist... {_batch_count:,} titles ({_elapsed_s}s)")
+                                _last_batch_scanline = _now
                             if _batch_count - _last_batch_log >= 500:
                                 _elapsed = int(time.time() - _batch_t0)
                                 log(f"  ...{_batch_count:,} titles fetched ({_elapsed}s elapsed)\n", "dim")
@@ -12559,6 +12629,7 @@ def _run_metadata_download(item):
 
     # For videos with no video_id, try searching YouTube by title + channel name
     if _need_search and ch_url:
+        _update_meta_prep_line(f"Searching YouTube for {len(_need_search)} video(s)...")
         log(f"  Searching YouTube for {len(_need_search)} video(s) with no ID...\n", "dim")
         _search_found = 0
         _search_i = 0
@@ -12689,6 +12760,7 @@ def _run_metadata_download(item):
         if _dr_has_files:
             # If batch-resolve didn't populate _yt_by_date, fetch it now
             if not _yt_by_date:
+                _update_meta_prep_line(f"Date-resolving {len(_need_search)} video(s) \u2014 fetching channel dates...")
                 log(f"  Date-resolving {len(_need_search)} video(s) \u2014 fetching channel dates...\n", "dim")
                 _dr_url = ch_url.rstrip("/")
                 if ("/@" in _dr_url or "/channel/" in _dr_url or "/c/" in _dr_url or "/user/" in _dr_url) and not _dr_url.endswith("/videos"):
@@ -12708,6 +12780,7 @@ def _run_metadata_download(item):
                         _dr_count = 0
                         _dr_t0 = time.time()
                         _dr_last_log = 0
+                        _dr_last_scanline = 0.0
                         while True:
                             if cancel_event.is_set():
                                 break
@@ -12738,6 +12811,13 @@ def _run_metadata_download(item):
                                 if _resolved_date:
                                     _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                             _dr_count += 1
+                            # Throttled live scanline update (simple mode only)
+                            _now_dr = time.time()
+                            if _now_dr - _dr_last_scanline >= 1.0:
+                                _elapsed_s_dr = int(_now_dr - _dr_t0)
+                                _update_meta_prep_line(
+                                    f"Date-resolving... {_dr_count:,} entries ({_elapsed_s_dr}s)")
+                                _dr_last_scanline = _now_dr
                             if _dr_count - _dr_last_log >= 500:
                                 _elapsed = int(time.time() - _dr_t0)
                                 log(f"  ...{_dr_count:,} entries scanned ({_elapsed}s elapsed)\n", "dim")
@@ -12998,6 +13078,7 @@ def _run_metadata_download(item):
 
     total = sum(len(g["videos"]) for g in folder_groups.values())
     if total == 0:
+        _clear_meta_prep_line()
         log(f"Metadata: {scope_label} — no videos with video IDs found.\n", "simpleline")
         return
     _meta_t0 = time.time()

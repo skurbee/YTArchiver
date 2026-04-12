@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.7"
+APP_VERSION = "v38.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -1885,71 +1885,28 @@ def _simple_anim_tick():
         dl_cur = _simple_anim_state["dl_current"]
         ch_tot = _simple_anim_state["ch_total"]
 
-        if _anim_mode == "redownload":
-            # Redownload mode: [x/total] REDOWNLOADING: channel···
-            log_simple_status(segments=[
-                ("[", "simplestatus_redwnl"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_redwnl"),
-                (" REDOWNLOADING:", "simplestatus_redwnl"),
-                (f" {ch}", "simplestatus_white"),
-                (d, "simplestatus_redwnl"),
-                ("\n", None),
-            ])
-            return  # finally block handles rescheduling
-
-        if _anim_mode == "transcribe":
-            # Transcribe mode: shows "[x/total] Transcribing: channel···" once
-            # the file count is known, or just "Transcribing: channel···" while
-            # we're still in the scanning/matching phase (so the user always
-            # has an active line at the bottom from the moment a transcribe
-            # job starts).
-            if n > 0:
+        # Data-driven rendering for non-sync modes
+        _ANIM_MODES = {
+            "redownload": ("simplestatus_redwnl", " REDOWNLOADING:"),
+            "transcribe": ("trans_bracket", " Transcribing:"),
+            "metadata":   ("meta_bracket", " FETCHING METADATA:"),
+            "compress":   ("simplestatus_compress", " COMPRESSING:"),
+            "reorg":      ("simplestatus_reorg", " REORGANIZING:"),
+        }
+        if _anim_mode in _ANIM_MODES:
+            _tag, _label = _ANIM_MODES[_anim_mode]
+            # Transcribe shows no counter while still in the scanning phase (n=0)
+            if _anim_mode == "transcribe" and n <= 0:
                 log_simple_status(segments=[
-                    ("[", "trans_bracket"), (f"{i}/{n}", "simplestatus_white"), ("]", "trans_bracket"),
-                    (" Transcribing:", "trans_bracket"),
-                    (f" {ch}", "simplestatus_white"),
-                    (d, "trans_bracket"),
-                    ("\n", None),
+                    ("Transcribing:", _tag), (f" {ch}", "simplestatus_white"),
+                    (d, _tag), ("\n", None),
                 ])
             else:
                 log_simple_status(segments=[
-                    ("Transcribing:", "trans_bracket"),
-                    (f" {ch}", "simplestatus_white"),
-                    (d, "trans_bracket"),
-                    ("\n", None),
+                    ("[", _tag), (f"{i}/{n}", "simplestatus_white"), ("]", _tag),
+                    (_label, _tag), (f" {ch}", "simplestatus_white"),
+                    (d, _tag), ("\n", None),
                 ])
-            return  # finally block handles rescheduling
-
-        if _anim_mode == "metadata":
-            # Metadata mode: [x/total] FETCHING METADATA: channel···
-            log_simple_status(segments=[
-                ("[", "meta_bracket"), (f"{i}/{n}", "simplestatus_white"), ("]", "meta_bracket"),
-                (" FETCHING METADATA:", "meta_bracket"),
-                (f" {ch}", "simplestatus_white"),
-                (d, "meta_bracket"),
-                ("\n", None),
-            ])
-            return  # finally block handles rescheduling
-
-        if _anim_mode == "compress":
-            # Compress mode: [x/total] COMPRESSING: channel···
-            log_simple_status(segments=[
-                ("[", "simplestatus_compress"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_compress"),
-                (" COMPRESSING:", "simplestatus_compress"),
-                (f" {ch}", "simplestatus_white"),
-                (d, "simplestatus_compress"),
-                ("\n", None),
-            ])
-            return  # finally block handles rescheduling
-
-        if _anim_mode == "reorg":
-            # Reorg mode: [x/total] REORGANIZING: channel···
-            log_simple_status(segments=[
-                ("[", "simplestatus_reorg"), (f"{i}/{n}", "simplestatus_white"), ("]", "simplestatus_reorg"),
-                (" REORGANIZING:", "simplestatus_reorg"),
-                (f" {ch}", "simplestatus_white"),
-                (d, "simplestatus_reorg"),
-                ("\n", None),
-            ])
             return  # finally block handles rescheduling
 
         # Dynamically update total if items were added to the sync queue
@@ -2131,7 +2088,7 @@ def _startup_cleanup_temps():
             return
         total_cleaned = 0
         for ch in channels:
-            folder_name = sanitize_folder(ch.get("folder_override", "") or ch.get("name", ""))
+            folder_name = _channel_folder_name(ch)
             ch_folder = os.path.join(out_dir, folder_name)
             if not os.path.isdir(ch_folder):
                 continue
@@ -2548,6 +2505,14 @@ def detect_url_type(url):
     return "unknown"
 
 
+def _ensure_videos_tab(url):
+    """Append /videos to channel URLs to target the videos tab specifically."""
+    url = url.rstrip("/")
+    if ("/@" in url or "/channel/" in url or "/c/" in url or "/user/" in url) and not url.endswith("/videos"):
+        url += "/videos"
+    return url
+
+
 def build_format_string(resolution):
     resolution = str(resolution).lower().strip()
     # Audio-only mode: prefer m4a (AAC) then best audio, no video stream
@@ -2615,6 +2580,22 @@ def sanitize_folder(name):
     if result.upper().split('.')[0] in _RESERVED_NAMES:
         result = "_" + result
     return result
+
+
+def _channel_folder_name(ch):
+    """Return the sanitized folder name for a channel config dict."""
+    return sanitize_folder(ch.get("folder_override", "").strip() or ch.get("name", ""))
+
+
+_RE_TITLE_UNSAFE = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
+_RE_TITLE_WS = re.compile(r'\s+')
+
+def _normalize_yt_title(title):
+    """Normalize a YouTube title for matching: NFKC, strip unsafe chars, collapse whitespace, lowercase."""
+    s = unicodedata.normalize('NFKC', title)
+    s = _RE_TITLE_UNSAFE.sub('', s)
+    s = _RE_TITLE_WS.sub(' ', s).strip()
+    return s.lower()
 
 
 def _format_bytes(n, dash_if_zero=True):
@@ -2823,7 +2804,7 @@ def _scan_channel_disk_info(ch):
     """
     with config_lock:
         _base_dir = config.get("output_dir", "").strip() or BASE_DIR
-    _folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    _folder_name = _channel_folder_name(ch)
     _ch_folder = os.path.join(_base_dir, _folder_name)
     _ch_name = ch.get("name", "")
     _num_vids = 0
@@ -2839,10 +2820,7 @@ def _scan_channel_disk_info(ch):
                 for _fn in _fns:
                     _fn_lower = _fn.lower()
                     if (_fn_lower.endswith(_CHANNEL_VIDEO_EXTS)
-                            and ".temp." not in _fn_lower
-                            and ".part" not in _fn_lower
-                            and "_temp_compress" not in _fn_lower
-                            and "_backlog_temp" not in _fn_lower):
+                            and not _is_partial_file(_fn)):
                         _num_vids += 1
                         # MUST normalize via os.path.normpath + NFC so the filepath
                         # matches what register_video stores. Otherwise the same file
@@ -2927,7 +2905,7 @@ def _scan_channel_disk_info(ch):
 def _channel_has_transcripts(ch):
     """Quick check if a channel folder contains any Transcript.txt files."""
     _base_dir = config.get("output_dir", "").strip() or BASE_DIR
-    _folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    _folder_name = _channel_folder_name(ch)
     _ch_folder = os.path.join(_base_dir, _folder_name)
     try:
         if os.path.isdir(_ch_folder):
@@ -3969,7 +3947,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 11:19pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 11:23am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5377,7 +5355,7 @@ def _chan_ctx_open_folder():
         return
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
-    folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    folder_name = _channel_folder_name(ch)
     path = os.path.join(base, folder_name)
 
     if not os.path.exists(path):
@@ -5449,7 +5427,7 @@ def _chan_ctx_get_folder():
         return None
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
-    folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    folder_name = _channel_folder_name(ch)
     return os.path.join(base, folder_name)
 
 
@@ -5576,7 +5554,7 @@ def _queue_pending_transcriptions():
         if ch.get("transcription_complete", False) and ch.get("transcription_pending", 0) > 0:
             ch_name = ch.get("name", "")
             ch_url = ch.get("url", "")
-            folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+            folder = os.path.join(out_dir, _channel_folder_name(ch))
             sy = ch.get("split_years", False)
             sm = ch.get("split_months", False)
             _add_to_gpu_queue({
@@ -5610,7 +5588,7 @@ def _queue_all_transcriptions():
     for ch in channels:
         ch_name = ch.get("name", "")
         ch_url = ch.get("url", "")
-        folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+        folder = os.path.join(out_dir, _channel_folder_name(ch))
         sy = ch.get("split_years", False)
         sm = ch.get("split_months", False)
         _add_to_gpu_queue({
@@ -6459,7 +6437,7 @@ def sync_single_channel(_from_queue=False):
             _sc_batch_cb = None
             _sc_bsize = ch.get("compress_batch_size", 20)
             if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS and ch.get("resolution", "") != "audio":
-                _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                _sc_folder = os.path.join(out_dir, _channel_folder_name(ch))
                 _sc_prompt_shown = [False]
                 def _sc_batch_cb(count, batch_paths, _ch=ch, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                     _b = _get_next_compress_batch(_u)
@@ -6612,7 +6590,7 @@ def sync_single_channel(_from_queue=False):
 
                 # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
-                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                    _at_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
                     _add_to_gpu_queue({
@@ -6623,7 +6601,7 @@ def sync_single_channel(_from_queue=False):
 
                 # Auto-metadata: queue metadata download for this channel after sync
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
-                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch["name"]))
+                    _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
                     _add_to_metadata_queue(ch["name"], url, _am_folder, _am_sy, _am_sm,
@@ -6688,13 +6666,7 @@ def sync_single_channel(_from_queue=False):
                 _current_sync_ch = None
                 _clear_sync_progress()
 
-                _queue_started = False
-                if _skip_current.is_set():
-                    _skip_current.clear()
-                    cancel_event.clear()
-                    _queue_started = _process_next_queued()
-                elif not cancel_event.is_set():
-                    _queue_started = _process_next_queued()
+                _queue_started = _drain_skip_and_advance(cancel_event)
 
                 if not _queue_started:
                     # End of queue batch (or single-channel sync) — fire final summary if batch
@@ -6909,6 +6881,19 @@ def _process_next_queued():
                 return _process_metadata_queue(_preferred_key=key)
     # Fallback: try each queue in case _queue_order is out of sync
     return _process_sync_queue() or _process_reorg_queue() or _process_transcribe_queue() or _process_mt_queue() or _process_redownload_queue() or _process_metadata_queue()
+
+
+def _drain_skip_and_advance(cancel_ev=None):
+    """Clear skip/cancel if skip was requested, then process next queued item.
+    Returns True if a queued item was started, False otherwise."""
+    if _skip_current.is_set():
+        _skip_current.clear()
+        if cancel_ev is not None:
+            cancel_ev.clear()
+        return _process_next_queued()
+    elif cancel_ev is None or not cancel_ev.is_set():
+        return _process_next_queued()
+    return False
 
 
 def _process_video_dl_queue():
@@ -7866,12 +7851,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                 _reorg_done_job["id"] = root.after(5000, lambda: reorg_done_label.pack_forget())
             _ui_queue.append(_reorg_done)
             # Process any queued jobs in insertion order
-            if _skip_current.is_set():
-                _skip_current.clear()
-                cancel_event.clear()
-                _process_next_queued()
-            elif not cancel_event.is_set():
-                _process_next_queued()
+            _drain_skip_and_advance(cancel_event)
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -8985,6 +8965,15 @@ def _ffprobe_duration(file_path):
         return float(result.stdout.strip())
     except Exception:
         return 0
+
+
+def _format_duration_hms(secs):
+    """Format seconds as H:MM:SS or M:SS string. Returns '' if secs <= 0."""
+    if secs <= 0:
+        return ""
+    hrs, remainder = divmod(int(secs), 3600)
+    mins, sec = divmod(remainder, 60)
+    return f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
 
 
 def _fmt_enc_size(mb):
@@ -11329,6 +11318,18 @@ def _fetch_auto_captions(video_id, temp_dir, cookies_forced=False):
     return (text if text else None), segments, _needed_cookies
 
 
+def _resolve_upload_date(upload_date, timestamp):
+    """Resolve a YYYYMMDD date string from yt-dlp upload_date or timestamp fields."""
+    if upload_date and re.fullmatch(r'\d{8}', upload_date):
+        return upload_date
+    if timestamp and timestamp not in ("NA", "None", ""):
+        try:
+            return datetime.utcfromtimestamp(float(timestamp)).strftime("%Y%m%d")
+        except (ValueError, OSError):
+            pass
+    return ""
+
+
 def _format_upload_date(date_str):
     """Convert YYYYMMDD to (MM.DD.YYYY) display format."""
     if len(date_str) == 8 and date_str.isdigit():
@@ -11876,13 +11877,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
             _invalidate_channel_disk_cache(ch_url)
 
             # Process next queued item
-            _queue_started = False
-            if _skip_current.is_set():
-                _skip_current.clear()
-                cancel_event.clear()
-                _queue_started = _process_next_queued()
-            elif not cancel_event.is_set():
-                _queue_started = _process_next_queued()
+            _queue_started = _drain_skip_and_advance(cancel_event)
             if not _queue_started:
                 try:
                     _ui_queue.append(_sync_task_finished)
@@ -12017,13 +12012,7 @@ def _start_metadata_task(item):
             except Exception:
                 pass
 
-            _queue_started = False
-            if _skip_current.is_set():
-                _skip_current.clear()
-                cancel_event.clear()
-                _queue_started = _process_next_queued()
-            elif not cancel_event.is_set():
-                _queue_started = _process_next_queued()
+            _queue_started = _drain_skip_and_advance(cancel_event)
             if not _queue_started:
                 try:
                     _ui_queue.append(_sync_task_finished)
@@ -12159,7 +12148,7 @@ def _run_metadata_download(item):
                     fn_lower = fn.lower()
                     if not any(fn_lower.endswith(ext) for ext in _VIDEO_EXTS):
                         continue
-                    if ".temp." in fn_lower or fn_lower.endswith(".part"):
+                    if _is_partial_file(fn):
                         continue
                     fp = os.path.join(dirpath, fn)
                     title = os.path.splitext(fn)[0]
@@ -12511,9 +12500,7 @@ def _run_metadata_download(item):
     if _need_search and ch_url:
         _update_meta_prep_line(f"Fetching channel playlist for {len(_need_search):,} video(s)...")
         log(f"  Batch-resolving {len(_need_search):,} video(s) via channel playlist...\n", "dim")
-        _batch_url = ch_url.rstrip("/")
-        if ("/@" in _batch_url or "/channel/" in _batch_url or "/c/" in _batch_url or "/user/" in _batch_url) and not _batch_url.endswith("/videos"):
-            _batch_url = _batch_url + "/videos"
+        _batch_url = _ensure_videos_tab(ch_url)
         _batch_proc = None
         _batch_map = {}  # normalized_title -> video_id
         try:
@@ -12526,13 +12513,7 @@ def _run_metadata_download(item):
                 _batch_url
             ])
             if _batch_proc:
-                _re_unsafe = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
-                _re_ws = re.compile(r'\s+')
-                def _norm_title(t):
-                    s = unicodedata.normalize('NFKC', t)
-                    s = _re_unsafe.sub('', s)
-                    s = _re_ws.sub(' ', s).strip()
-                    return s.lower()
+                _norm_title = _normalize_yt_title
 
                 _batch_count = 0
                 _batch_dates_ok = 0
@@ -12568,15 +12549,7 @@ def _run_metadata_download(item):
                             if _norm not in _batch_map:
                                 _batch_map[_norm] = _vid_id
                             # Build date index — prefer upload_date, fall back to timestamp
-                            _resolved_date = ""
-                            if _upload_date and re.fullmatch(r'\d{8}', _upload_date):
-                                _resolved_date = _upload_date
-                            elif _timestamp and _timestamp not in ("NA", "None", ""):
-                                try:
-                                    _resolved_date = datetime.utcfromtimestamp(
-                                        float(_timestamp)).strftime("%Y%m%d")
-                                except (ValueError, OSError):
-                                    pass
+                            _resolved_date = _resolve_upload_date(_upload_date, _timestamp)
                             if _resolved_date:
                                 _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 _batch_dates_ok += 1
@@ -12829,9 +12802,7 @@ def _run_metadata_download(item):
             if not _yt_by_date:
                 _update_meta_prep_line(f"Date-resolving {len(_need_search)} video(s) \u2014 fetching channel dates...")
                 log(f"  Date-resolving {len(_need_search)} video(s) \u2014 fetching channel dates...\n", "dim")
-                _dr_url = ch_url.rstrip("/")
-                if ("/@" in _dr_url or "/channel/" in _dr_url or "/c/" in _dr_url or "/user/" in _dr_url) and not _dr_url.endswith("/videos"):
-                    _dr_url = _dr_url + "/videos"
+                _dr_url = _ensure_videos_tab(ch_url)
                 _dr_proc = None
                 try:
                     if _internet_down.is_set():
@@ -12866,15 +12837,7 @@ def _run_metadata_download(item):
                             _upload_date = _parts[2].strip() if len(_parts) > 2 else ""
                             _timestamp = _parts[3].strip() if len(_parts) > 3 else ""
                             if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
-                                _resolved_date = ""
-                                if _upload_date and re.fullmatch(r'\d{8}', _upload_date):
-                                    _resolved_date = _upload_date
-                                elif _timestamp and _timestamp not in ("NA", "None", ""):
-                                    try:
-                                        _resolved_date = datetime.utcfromtimestamp(
-                                            float(_timestamp)).strftime("%Y%m%d")
-                                    except (ValueError, OSError):
-                                        pass
+                                _resolved_date = _resolve_upload_date(_upload_date, _timestamp)
                                 if _resolved_date:
                                     _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 else:
@@ -13002,13 +12965,7 @@ def _run_metadata_download(item):
                     log(f"  Date-resolving {len(_need_search)} video(s) by upload date...\n", "dim")
 
                 # Title normalizer (same logic as batch-resolve)
-                _dr_re_unsafe = re.compile(r'[\\/:*?"<>|\u29f8\uff0f]')
-                _dr_re_ws = re.compile(r'\s+')
-                def _dr_norm(t):
-                    s = unicodedata.normalize('NFKC', t)
-                    s = _dr_re_unsafe.sub('', s)
-                    s = _dr_re_ws.sub(' ', s).strip()
-                    return s.lower()
+                _dr_norm = _normalize_yt_title
 
                 _date_found = 0
                 _date_skipped = 0
@@ -13258,15 +13215,7 @@ def _run_metadata_download(item):
                                     _udate = _parts[1].strip() if len(_parts) > 1 else ""
                                     _ts = _parts[2].strip() if len(_parts) > 2 else ""
                                     if len(_vid) == 11:
-                                        _resolved_d = ""
-                                        if _udate and re.fullmatch(r'\d{8}', _udate):
-                                            _resolved_d = _udate
-                                        elif _ts and _ts not in ("NA", "None", ""):
-                                            try:
-                                                _resolved_d = datetime.utcfromtimestamp(
-                                                    float(_ts)).strftime("%Y%m%d")
-                                            except (ValueError, OSError):
-                                                pass
+                                        _resolved_d = _resolve_upload_date(_udate, _ts)
                                         if _resolved_d:
                                             _6b_dates[_vid] = _resolved_d
                                     _6b_count += 1
@@ -13864,7 +13813,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 for f in files:
                     if f.lower().endswith(_MEDIA_EXTS):
                         # Skip partial/temp files from interrupted downloads
-                        if ".temp." in f.lower() or ".part" in f.lower():
+                        if _is_partial_file(f):
                             continue
                         fname_no_ext = os.path.splitext(f)[0]
                         local_files[fname_no_ext] = os.path.join(dirpath, f)
@@ -14168,14 +14117,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 return
 
             # ── Step 3.5: Title normalization helper + punctuation sweep for already-done ─
-            _re_unsafe_chars = re.compile(r'[\\/:*?"<>|]')
-            _re_whitespace   = re.compile(r'\s+')
-            def _normalize_title(title):
-                """Normalize a title for matching: NFKC (fullwidth→ASCII), strip unsafe chars, lowercase."""
-                s = unicodedata.normalize('NFKC', title)
-                s = _re_unsafe_chars.sub('', s)
-                s = _re_whitespace.sub(' ', s).strip()
-                return s.lower()
+            _normalize_title = _normalize_yt_title
 
             # Build normalized YT title → video_id lookup (used by backfill and Pass 2)
             _yt_norm_backfill = {}
@@ -14681,18 +14623,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 year_num, month_num = mtime.year, mtime.month
                 upload_date = mtime.strftime("%Y%m%d")
 
-                dur_str = ""
-                _dur_secs = 0
-                try:
-                    probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
-                                 "format=duration", "-of", "csv=p=0", fpath]
-                    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
-                    _dur_secs = float(probe_result.stdout.strip())
-                    hrs, remainder = divmod(int(_dur_secs), 3600)
-                    mins, sec = divmod(remainder, 60)
-                    dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
-                except Exception:
-                    pass
+                _dur_secs = _ffprobe_duration(fpath)
+                dur_str = _format_duration_hms(_dur_secs)
 
                 # Write transcript entry
                 txt_path, subfolder = _get_transcript_filename(
@@ -14998,18 +14930,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             break
 
                         # Get duration BEFORE whisper (needed for progress %)
-                        _dur_secs = 0
-                        dur_str = ""
-                        try:
-                            probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
-                                         "format=duration", "-of", "csv=p=0", fpath]
-                            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30, startupinfo=startupinfo)
-                            _dur_secs = float(probe_result.stdout.strip())
-                            hrs, remainder = divmod(int(_dur_secs), 3600)
-                            mins, sec = divmod(remainder, 60)
-                            dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
-                        except Exception:
-                            pass
+                        _dur_secs = _ffprobe_duration(fpath)
+                        dur_str = _format_duration_hms(_dur_secs)
 
                         if not _is_simple_mode:
                             _dur_hint = f" ({dur_str})" if dur_str else ""
@@ -15524,15 +15446,7 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                     return
 
             # Get duration for progress reporting
-            _dur_secs = 0
-            try:
-                probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
-                             "format=duration", "-of", "csv=p=0", file_path]
-                probe_result = subprocess.run(probe_cmd, capture_output=True,
-                                              text=True, timeout=30, startupinfo=startupinfo)
-                _dur_secs = float(probe_result.stdout.strip())
-            except Exception:
-                pass
+            _dur_secs = _ffprobe_duration(file_path)
 
             if _ce.is_set():
                 log(f"\n  Cancelled.\n", "red")
@@ -15751,19 +15665,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                 log(f"  [{i+1}/{len(files)}] {fname}\n", "simpleline")
 
                 # Get duration
-                dur_str = ""
-                _dur_secs = 0
-                try:
-                    probe_cmd = ["ffprobe", "-v", "quiet", "-show_entries",
-                                 "format=duration", "-of", "csv=p=0", fpath]
-                    probe_result = subprocess.run(probe_cmd, capture_output=True,
-                                                  text=True, timeout=30, startupinfo=startupinfo)
-                    _dur_secs = float(probe_result.stdout.strip())
-                    hrs, remainder = divmod(int(_dur_secs), 3600)
-                    mins, sec = divmod(remainder, 60)
-                    dur_str = f"{hrs}:{mins:02d}:{sec:02d}" if hrs else f"{mins}:{sec:02d}"
-                except Exception:
-                    pass
+                _dur_secs = _ffprobe_duration(fpath)
+                dur_str = _format_duration_hms(_dur_secs)
 
                 # Get date from file mtime
                 try:
@@ -16593,12 +16496,7 @@ def internal_run_subscribe_before_date(url, date_str):
 
         log(f"  Found {len(ids):,} videos before that date — archiving them...\n", "dim")
         with io_lock:
-            existing = set()
-            if os.path.exists(ARCHIVE_FILE):
-                with open(ARCHIVE_FILE, encoding="utf-8") as f_:
-                    for l in f_:
-                        p = l.strip().split()
-                        if p: existing.add(p[-1])
+            existing = _load_archived_ids()
             new_ids = [i for i in ids if i not in existing]
             if new_ids:
                 try:
@@ -16718,9 +16616,7 @@ def _prefetch_total(url):
     proc = None
     try:
         # Target /videos tab specifically to avoid getting tab count (3) instead of video count
-        _url = url.rstrip("/")
-        if ("/@" in _url or "/channel/" in _url or "/c/" in _url or "/user/" in _url) and not _url.endswith("/videos"):
-            _url = _url + "/videos"
+        _url = _ensure_videos_tab(url)
 
         # Use DEVNULL stderr so stdout only has the playlist_count value
         cmd = [
@@ -16843,9 +16739,7 @@ def _enumerate_all_video_ids(url):
     try:
         log("  Enumerating all video IDs (first run only, this may take a while)...\n", "green")
         # Target /videos tab to avoid multi-tab confusion (channel URL returns 3 tabs)
-        _enum_url = url.rstrip("/")
-        if ("/@" in _enum_url or "/channel/" in _enum_url or "/c/" in _enum_url or "/user/" in _enum_url) and not _enum_url.endswith("/videos"):
-            _enum_url = _enum_url + "/videos"
+        _enum_url = _ensure_videos_tab(url)
 
         proc = spawn_yt_dlp([
             "yt-dlp", "--flat-playlist", "--lazy-playlist", "--print", "id",
@@ -16958,9 +16852,7 @@ def _check_new_videos(url, cached_ids, check_count=100):
     proc = None
     new_ids = []
     try:
-        _check_url = url.rstrip("/")
-        if ("/@" in _check_url or "/channel/" in _check_url or "/c/" in _check_url or "/user/" in _check_url) and not _check_url.endswith("/videos"):
-            _check_url = _check_url + "/videos"
+        _check_url = _ensure_videos_tab(url)
 
         proc = spawn_yt_dlp([
             "yt-dlp", "--flat-playlist", "--lazy-playlist",
@@ -17057,10 +16949,7 @@ def _quick_check_new_uploads(url, check_count=5):
     """
     proc = None
     try:
-        _qc_url = url.rstrip("/")
-        if ("/@" in _qc_url or "/channel/" in _qc_url or "/c/" in _qc_url
-                or "/user/" in _qc_url) and not _qc_url.endswith("/videos"):
-            _qc_url = _qc_url + "/videos"
+        _qc_url = _ensure_videos_tab(url)
         proc = spawn_yt_dlp([
             "yt-dlp", "--flat-playlist", "--lazy-playlist",
             "--playlist-end", str(check_count),
@@ -17213,13 +17102,7 @@ def internal_run_subscribe_blocking(url):
             return False
 
         with io_lock:
-            existing = set()
-            if os.path.exists(ARCHIVE_FILE):
-                with open(ARCHIVE_FILE, encoding="utf-8") as f:
-                    for l in f:
-                        p = l.strip().split()
-                        if p: existing.add(p[-1])
-
+            existing = _load_archived_ids()
             new_ids = [i for i in ids if i not in existing]
             if new_ids:
                 try:
@@ -18068,7 +17951,7 @@ def start_download():
     url_entry.event_generate("<FocusOut>")
     vid_custom_name_var.set("")
 
-    if _sync_running or _reorg_running or _redownload_running or _transcribe_running or _metadata_running:
+    if _any_task_running():
         # Queue the download for after the current operation finishes
         with _video_dl_queue_lock:
             _video_dl_queue.append((cmd, True))
@@ -18510,7 +18393,7 @@ def start_sync_all():
                 _sc_batch_cb = None
                 _sc_bsize = ch.get("compress_batch_size", 20)
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
-                    _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _sc_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _sc_prompt_shown = [False]
                     def _sc_batch_cb(count, batch_paths, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                         _b = _get_next_compress_batch(_u)
@@ -18629,7 +18512,7 @@ def start_sync_all():
 
                 # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
-                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _at_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
                     _add_to_gpu_queue({
@@ -18639,7 +18522,7 @@ def start_sync_all():
                     })
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
-                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
                     _add_to_metadata_queue(ch_name, url, _am_folder, _am_sy, _am_sm,
@@ -19140,7 +19023,7 @@ def _update_sync_badge():
     """Update the green badge count on the Sync Tasks button."""
     # Fast count — just check queue lengths instead of building full item lists
     n = 0
-    if _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
+    if _current_job["label"] and _any_task_running():
         n += 1  # currently running item
     with _sync_queue_lock:
         n += len(_sync_queue)
@@ -19236,9 +19119,9 @@ def _get_queue_items():
 
     # Show currently processing item first — but not during batch syncs (batch entry covers it)
     if _current_job["label"] and not (_has_batch and _sync_running):
-        if (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running) and pause_event.is_set():
+        if _any_task_running() and pause_event.is_set():
             _active_lbl = _active_label(_current_job["label"]) + " (Paused)"
-        elif _sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running:
+        elif _any_task_running():
             _active_lbl = _active_label(_current_job["label"], with_dots=True)
         else:
             _active_lbl = _current_job["label"]
@@ -19470,7 +19353,7 @@ def _show_queue_menu(event=None):
             # Just update the dot animation on the active item in the Text widget
             _tw = _state.get("text_widget")
             _al = _state.get("active_line")
-            if _tw and _al and _current_job["label"] and (_sync_running or _reorg_running or _transcribe_running or _redownload_running or _metadata_running):
+            if _tw and _al and _current_job["label"] and _any_task_running():
                 try:
                     if pause_event.is_set():
                         _fresh = f"▶ {_current_job['label']} (Paused)"
@@ -21631,6 +21514,11 @@ def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, sk
         _ui_queue.append(_refresh_autorun_history)
 
 
+def _any_task_running():
+    """True if any pipeline task is currently running (sync, reorg, redownload, transcribe, metadata)."""
+    return _sync_running or _reorg_running or _redownload_running or _transcribe_running or _metadata_running
+
+
 def _sync_pipeline_busy():
     """Return True if any sync-pipeline task is running or has items queued."""
     if _sync_running or _redownload_running or _reorg_running:
@@ -22038,7 +21926,7 @@ def _run_autorun():
                 _sc_batch_cb = None
                 _sc_bsize = ch.get("compress_batch_size", 20)
                 if ch.get("compress_enabled", False) and _sc_level in _QUALITY_OPTIONS:
-                    _sc_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name))
+                    _sc_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _sc_prompt_shown = [False]
                     def _sc_batch_cb(count, batch_paths, _ch=ch, _cn=ch_name, _u=url, _f=_sc_folder, _lv=_sc_level, _bs=_sc_bsize):
                         _b = _get_next_compress_batch(_u)
@@ -22158,7 +22046,7 @@ def _run_autorun():
                 # Auto-transcribe: queue as GPU task so user can pause/manage it.
                 if c_dl > 0 and ch.get("auto_transcribe", False) and not cancel_event.is_set():
                     ch_name_at = ch.get("name", "")
-                    _at_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or ch_name_at))
+                    _at_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
                     _add_to_gpu_queue({
@@ -22169,7 +22057,7 @@ def _run_autorun():
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
                     _am_name = ch.get("name", "")
-                    _am_folder = os.path.join(out_dir, sanitize_folder(ch.get("folder_override", "") or _am_name))
+                    _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
                     _add_to_metadata_queue(_am_name, url, _am_folder, _am_sy, _am_sm,
@@ -22281,13 +22169,7 @@ def _run_autorun():
                     _ui_queue.append(_update_queue_btn)
 
                 # Check for queued jobs in insertion order before fully finishing
-                _queue_started = False
-                if _skip_current.is_set():
-                    _skip_current.clear()
-                    cancel_event.clear()
-                    _queue_started = _process_next_queued()
-                elif not cancel_event.is_set():
-                    _queue_started = _process_next_queued()
+                _queue_started = _drain_skip_and_advance(cancel_event)
 
                 if _root_alive and not _queue_started:
                     _iv = interval_mins
@@ -22949,10 +22831,7 @@ class _TranscriptionPanel(ttk.Frame):
                                 pass
                         # Collect video files for DB insertion
                         if (fn_lower.endswith(self._TP_VIDEO_EXTS)
-                                and ".temp." not in fn_lower
-                                and not fn_lower.endswith(".part")
-                                and "_temp_compress" not in fn_lower
-                                and "_backlog_temp" not in fn_lower):
+                                and not _is_partial_file(fn)):
                             pending_videos.append((ch_name, root_dir, dirpath, fn, fn_lower))
 
             # Now process all collected video files with transcript info available
@@ -24976,8 +24855,7 @@ class _TranscriptionPanel(ttk.Frame):
                                 for fn in filenames:
                                     fn_lower = fn.lower()
                                     if fn_lower.endswith(self._TP_VIDEO_EXTS) \
-                                       and ".temp." not in fn_lower \
-                                       and not fn_lower.endswith(".part"):
+                                       and not _is_partial_file(fn):
                                         disk_count += 1
                     db_count = 0
                     try:
@@ -30426,7 +30304,7 @@ class _TranscriptionPanel(ttk.Frame):
             with config_lock:
                 _out_dir = config.get("output_dir", "").strip() or BASE_DIR
                 for ch in config.get("channels", []):
-                    _ch_folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch.get("name", ""))
+                    _ch_folder_name = _channel_folder_name(ch)
                     if not _ch_folder_name:
                         continue
                     ch_folder = os.path.join(_out_dir, _ch_folder_name)
@@ -31316,7 +31194,7 @@ def _try_find_by_title(entry):
 
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
-    folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    folder_name = _channel_folder_name(ch)
     channel_dir = os.path.join(base, folder_name)
     if not os.path.isdir(channel_dir):
         return None
@@ -31359,7 +31237,7 @@ def _get_channel_dir(entry):
         return None
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
-    folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    folder_name = _channel_folder_name(ch)
     channel_dir = os.path.join(base, folder_name)
     return channel_dir if os.path.isdir(channel_dir) else None
 
@@ -31384,7 +31262,7 @@ def _try_locate_moved_file(entry, original_fp):
 
     with config_lock:
         base = config.get("output_dir", "").strip() or BASE_DIR
-    folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+    folder_name = _channel_folder_name(ch)
     channel_dir = os.path.join(base, folder_name)
 
     # Build candidate paths based on current split settings
@@ -32052,7 +31930,7 @@ def _check_channel_folders():
 
     missing = []
     for ch in channels:
-        folder_name = sanitize_folder(ch.get("folder_override", "").strip() or ch["name"])
+        folder_name = _channel_folder_name(ch)
         folder_path = os.path.join(base, folder_name)
         if not os.path.isdir(folder_path):
             # Only flag channels that have been initialized (new channels won't have folders yet)

@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.2"
+APP_VERSION = "v38.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3969,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 8:49pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 9:22pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -13114,6 +13114,207 @@ def _run_metadata_download(item):
                         pass
                 if _date_skipped:
                     log(f"  ({_date_skipped} skipped \u2014 ambiguous date match)\n", "dim")
+
+                # ── Pass 6b: per-ID date fetch for stuck rows ──────────
+                # Some channels return upload_date=NA for every video in
+                # --flat-playlist mode, which means _yt_by_date has no
+                # dated buckets and Pass 6's date-based matcher fails. For
+                # any rows still unresolved AND any unmatched candidates
+                # stashed in the "" bucket, drop --flat-playlist and fetch
+                # the real upload date per-ID. Bounded cost: only runs for
+                # the handful of candidates left after Pass 6a, and only
+                # when local rows are still unresolved. This is the "we
+                # know the file's date, just use it" path Scott asked for
+                # — works on any channel where the local file mtime is
+                # accurate, regardless of what flat-playlist does.
+                if (_need_search and "" in _yt_by_date and ch_url
+                        and not cancel_event.is_set()):
+                    _6b_candidates = [(vid, t) for vid, t in _yt_by_date[""]
+                                      if vid not in _date_known]
+                    if _6b_candidates:
+                        # Safety cap in case a weird channel has tons of
+                        # undated entries — 50 per-ID fetches is about 2-3
+                        # minutes max and covers every real-world case.
+                        _MAX_6B = 50
+                        if len(_6b_candidates) > _MAX_6B:
+                            log(f"  \u2014 Pass 6b: capping fetch to {_MAX_6B} "
+                                f"of {len(_6b_candidates)} undated candidates.\n",
+                                "simpleline_pink")
+                            _6b_candidates = _6b_candidates[:_MAX_6B]
+
+                        _update_meta_prep_line(
+                            f"Fetching real dates for {len(_6b_candidates)} "
+                            f"undated candidate(s)...")
+                        log(f"  Fetching real dates for {len(_6b_candidates)} "
+                            f"undated candidate(s) via per-ID lookup...\n", "dim")
+
+                        _6b_urls = [f"https://www.youtube.com/watch?v={vid}"
+                                    for vid, _ in _6b_candidates]
+                        _6b_dates = {}  # vid -> "YYYYMMDD"
+                        _6b_proc = None
+                        try:
+                            if _internet_down.is_set():
+                                _block_if_no_internet()
+                            _6b_cmd = [
+                                "yt-dlp", "--skip-download", "--no-warnings",
+                                "--print",
+                                "%(id)s|||%(upload_date)s|||%(timestamp)s",
+                                "--cookies-from-browser", "firefox",
+                            ] + _6b_urls
+                            _6b_proc = spawn_yt_dlp(_6b_cmd)
+                            if _6b_proc:
+                                _6b_t0 = time.time()
+                                _6b_deadline = time.time() + 600
+                                _6b_count = 0
+                                _6b_last_scanline = 0.0
+                                while True:
+                                    if cancel_event.is_set():
+                                        break
+                                    if time.time() > _6b_deadline:
+                                        log("  \u26a0 Pass 6b: per-ID "
+                                            "date fetch timed out.\n", "red")
+                                        break
+                                    line = _6b_proc.stdout.readline()
+                                    if not line:
+                                        break
+                                    line = line.strip()
+                                    if not line or "|||" not in line:
+                                        continue
+                                    _parts = line.split("|||")
+                                    _vid = _parts[0].strip()
+                                    _udate = _parts[1].strip() if len(_parts) > 1 else ""
+                                    _ts = _parts[2].strip() if len(_parts) > 2 else ""
+                                    if len(_vid) == 11:
+                                        _resolved_d = ""
+                                        if _udate and re.fullmatch(r'\d{8}', _udate):
+                                            _resolved_d = _udate
+                                        elif _ts and _ts not in ("NA", "None", ""):
+                                            try:
+                                                _resolved_d = datetime.utcfromtimestamp(
+                                                    float(_ts)).strftime("%Y%m%d")
+                                            except (ValueError, OSError):
+                                                pass
+                                        if _resolved_d:
+                                            _6b_dates[_vid] = _resolved_d
+                                    _6b_count += 1
+                                    _now_6b = time.time()
+                                    if _now_6b - _6b_last_scanline >= 1.0:
+                                        _elapsed_6b = int(_now_6b - _6b_t0)
+                                        _update_meta_prep_line(
+                                            f"Fetching real dates... "
+                                            f"{_6b_count:,}/{len(_6b_candidates)} "
+                                            f"({_elapsed_6b}s)")
+                                        _6b_last_scanline = _now_6b
+                                try:
+                                    _6b_proc.wait(timeout=30)
+                                except subprocess.TimeoutExpired:
+                                    _6b_proc.kill()
+                                    try:
+                                        _6b_proc.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                                cleanup_process(_6b_proc)
+                                _6b_proc = None
+                        except Exception as e:
+                            log(f"  \u26a0 Pass 6b: per-ID fetch failed: {e}\n", "red")
+                        finally:
+                            if _6b_proc is not None:
+                                cleanup_process(_6b_proc)
+
+                        # Match each remaining unresolved local row by file
+                        # mtime against the fetched candidate dates. Tolerance
+                        # of ±1 day for timezone safety (same as Pass 6).
+                        if _6b_dates:
+                            _6b_found = 0
+                            _6b_still_need = []
+                            _6b_title_lookup = {vid: t for vid, t in _6b_candidates}
+                            for _s_row_id, _s_title, _s_year, _s_month, _s_filepath in _need_search:
+                                if cancel_event.is_set():
+                                    _6b_still_need.append(
+                                        (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                                    continue
+                                _file_date_6b = None
+                                if _s_filepath and os.path.isfile(_s_filepath):
+                                    try:
+                                        _m_6b = os.path.getmtime(_s_filepath)
+                                        _file_date_6b = datetime.fromtimestamp(
+                                            _m_6b).strftime("%Y%m%d")
+                                    except (OSError, ValueError):
+                                        pass
+                                if not _file_date_6b:
+                                    _6b_still_need.append(
+                                        (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                                    continue
+                                try:
+                                    _fd_dt_6b = datetime.strptime(
+                                        _file_date_6b, "%Y%m%d")
+                                except ValueError:
+                                    _6b_still_need.append(
+                                        (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                                    continue
+                                # Collect candidates within ±1 day
+                                _date_hits = []
+                                for _cv, _cd in _6b_dates.items():
+                                    if _cv in _date_known:
+                                        continue
+                                    try:
+                                        _cd_dt_6b = datetime.strptime(_cd, "%Y%m%d")
+                                        if abs((_cd_dt_6b - _fd_dt_6b).days) <= 1:
+                                            _date_hits.append((_cv, _cd))
+                                    except ValueError:
+                                        continue
+                                _matched_6b = None
+                                if len(_date_hits) == 1:
+                                    # Unambiguous date match — trust it
+                                    _matched_6b = _date_hits[0][0]
+                                elif len(_date_hits) > 1 and _FUZZ_AVAILABLE:
+                                    # Multiple uploads on the same date — use
+                                    # fuzzy title ratio as tiebreaker. More
+                                    # lenient threshold (70) since date has
+                                    # already narrowed the field.
+                                    _local_base_6b = (
+                                        os.path.splitext(os.path.basename(_s_filepath))[0].lower()
+                                        if _s_filepath else _s_title.lower())
+                                    _best_6b_score = 0
+                                    _best_6b_vid = None
+                                    for _cv, _cd in _date_hits:
+                                        _cand_title_6b = _6b_title_lookup.get(_cv, "").lower()
+                                        _score_6b = _fuzz.token_sort_ratio(
+                                            _local_base_6b, _cand_title_6b)
+                                        if _score_6b > _best_6b_score:
+                                            _best_6b_score = _score_6b
+                                            _best_6b_vid = _cv
+                                    if _best_6b_score >= 70:
+                                        _matched_6b = _best_6b_vid
+                                if _matched_6b:
+                                    _date_known.add(_matched_6b)
+                                    _resolved_rows.append(
+                                        (_matched_6b, _s_title, _s_year, _s_month, _s_filepath))
+                                    _6b_found += 1
+                                    _no_id_count -= 1
+                                    if _s_row_id is not None:
+                                        try:
+                                            tp._db_execute(
+                                                "UPDATE videos SET video_id=?, "
+                                                "search_failed_ts=NULL, "
+                                                "id_resolve_failed_ts=NULL, "
+                                                "date_resolve_failed_ts=NULL, "
+                                                "date_resolve_failed_mtime=NULL "
+                                                "WHERE id=?",
+                                                (_matched_6b, _s_row_id))
+                                        except Exception:
+                                            pass
+                                else:
+                                    _6b_still_need.append(
+                                        (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                            _need_search = _6b_still_need
+                            if _6b_found:
+                                log(f"  \u2014 Resolved {_6b_found} video ID(s) "
+                                    f"via per-ID date lookup.\n", "simpleline_pink")
+                                try:
+                                    tp._db_commit()
+                                except Exception:
+                                    pass
 
     if _resolved_rows:
         try:

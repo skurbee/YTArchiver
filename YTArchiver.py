@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.3"
+APP_VERSION = "v38.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3969,7 +3969,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 9:22pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.11.26 9:41pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12949,7 +12949,16 @@ def _run_metadata_download(item):
                                            if _s_filepath else _s_title).lower()
                             for _yt_vid, _yt_title in _all_yt_videos:
                                 _score = _fuzz.token_sort_ratio(_local_base, _yt_title.lower())
-                                if _score >= 85:
+                                # Threshold lowered from 85 to 75 — Pass 6a is
+                                # the primary resolver after dates broke across
+                                # the board (flat-playlist returns NA for
+                                # upload_date on every channel). A stricter
+                                # threshold meant more rows fell through to the
+                                # expensive Pass 6b per-ID date fetch. 75 is
+                                # still confident for distinct titles but
+                                # catches more minor drift (emoji strip, case
+                                # differences, punctuation variations).
+                                if _score >= 75:
                                     _fz_potential.append((_score, _f_idx, _yt_vid, _yt_title))
                         _fz_potential.sort(key=lambda m: m[0], reverse=True)
                         _fz_matched_files = set()
@@ -13129,24 +13138,58 @@ def _run_metadata_download(item):
                 # accurate, regardless of what flat-playlist does.
                 if (_need_search and "" in _yt_by_date and ch_url
                         and not cancel_event.is_set()):
-                    _6b_candidates = [(vid, t) for vid, t in _yt_by_date[""]
-                                      if vid not in _date_known]
+                    _6b_raw = [(vid, t) for vid, t in _yt_by_date[""]
+                               if vid not in _date_known]
+                    # ── Fuzzy pre-filter ──
+                    # The "" bucket can contain hundreds of YT videos for a
+                    # channel (flat-playlist returns NA dates universally now,
+                    # so every video ends up here). Blindly fetching 50 random
+                    # dates was wasteful. Instead, score every candidate's
+                    # title against every unresolved local row and keep only
+                    # the plausible ones (score ≥ 50). A score of 50 is well
+                    # below Pass 6a's confident 75 threshold but still catches
+                    # "this candidate is at least in the ballpark of a local
+                    # file's title" — which is what we want before committing
+                    # to an expensive per-ID date fetch.
+                    _6b_candidates = []
+                    if _FUZZ_AVAILABLE and _6b_raw:
+                        _6b_best_scores = {}  # vid -> best score across need_search
+                        for _s_row_id, _s_title, _, _, _s_filepath in _need_search:
+                            _local_base_pf = (
+                                os.path.splitext(os.path.basename(_s_filepath))[0].lower()
+                                if _s_filepath else _s_title.lower())
+                            for _vid_pf, _title_pf in _6b_raw:
+                                _s_pf = _fuzz.token_sort_ratio(
+                                    _local_base_pf, _title_pf.lower())
+                                if _s_pf > _6b_best_scores.get(_vid_pf, 0):
+                                    _6b_best_scores[_vid_pf] = _s_pf
+                        # Keep plausible candidates (≥ 50), sorted best first
+                        _6b_plausible = [(v, t) for v, t in _6b_raw
+                                         if _6b_best_scores.get(v, 0) >= 50]
+                        _6b_plausible.sort(
+                            key=lambda vt: _6b_best_scores.get(vt[0], 0),
+                            reverse=True)
+                        _6b_candidates = _6b_plausible
+                    else:
+                        # No fuzzy available — fall back to raw list unchanged.
+                        _6b_candidates = _6b_raw
+
                     if _6b_candidates:
-                        # Safety cap in case a weird channel has tons of
-                        # undated entries — 50 per-ID fetches is about 2-3
-                        # minutes max and covers every real-world case.
-                        _MAX_6B = 50
+                        # Smart cap: scale the fetch count to how many local
+                        # rows actually need resolving. 3 unresolved rows →
+                        # max 10 fetches. 10 unresolved rows → max 30. Never
+                        # more than 30 (~90s of per-ID fetches).
+                        _MAX_6B = min(30, max(5, len(_need_search) * 3))
                         if len(_6b_candidates) > _MAX_6B:
-                            log(f"  \u2014 Pass 6b: capping fetch to {_MAX_6B} "
-                                f"of {len(_6b_candidates)} undated candidates.\n",
-                                "simpleline_pink")
                             _6b_candidates = _6b_candidates[:_MAX_6B]
+                        # Verbose-mode only diagnostic — hidden in simple mode
+                        log(f"  Pass 6b: {len(_6b_candidates)} plausible "
+                            f"candidate(s) from {len(_6b_raw)} undated entries "
+                            f"(cap {_MAX_6B}, {len(_need_search)} row(s) need matching).\n",
+                            "dim")
 
                         _update_meta_prep_line(
-                            f"Fetching real dates for {len(_6b_candidates)} "
-                            f"undated candidate(s)...")
-                        log(f"  Fetching real dates for {len(_6b_candidates)} "
-                            f"undated candidate(s) via per-ID lookup...\n", "dim")
+                            f"Matching {len(_need_search)} video(s) by upload date...")
 
                         _6b_urls = [f"https://www.youtube.com/watch?v={vid}"
                                     for vid, _ in _6b_candidates]
@@ -13201,7 +13244,8 @@ def _run_metadata_download(item):
                                     if _now_6b - _6b_last_scanline >= 1.0:
                                         _elapsed_6b = int(_now_6b - _6b_t0)
                                         _update_meta_prep_line(
-                                            f"Fetching real dates... "
+                                            f"Matching {len(_need_search)} video(s) "
+                                            f"by upload date... "
                                             f"{_6b_count:,}/{len(_6b_candidates)} "
                                             f"({_elapsed_6b}s)")
                                         _6b_last_scanline = _now_6b
@@ -13309,8 +13353,8 @@ def _run_metadata_download(item):
                                         (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
                             _need_search = _6b_still_need
                             if _6b_found:
-                                log(f"  \u2014 Resolved {_6b_found} video ID(s) "
-                                    f"via per-ID date lookup.\n", "simpleline_pink")
+                                log(f"  \u2014 Matched {_6b_found} video(s) "
+                                    f"by upload date.\n", "simpleline_pink")
                                 try:
                                     tp._db_commit()
                                 except Exception:

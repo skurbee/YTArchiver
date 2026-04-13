@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v38.9"
+APP_VERSION = "v39.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -315,8 +315,9 @@ def _write_sync_progress():
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, _SYNC_PROGRESS_PATH)
-    except Exception:
-        pass
+    except Exception as _sp_err:
+        if not _is_simple_mode:
+            log(f"  ⚠ Failed to save sync progress: {_sp_err}\n", "dim")
 
 
 def _clear_sync_progress():
@@ -1137,15 +1138,19 @@ def log(text, tag=None):
                     # Re-apply whisper_prefix/whisper_title overlays lost during save/restore
                     _reapply_whisper_overlays()
 
-                # Cap verbose log at 20000 lines to prevent unbounded memory growth;
-                # when exceeded, trim to 15000 — enough headroom for large single syncs
+                # Cap log to prevent unbounded memory growth;
+                # verbose mode uses a higher cap (50k) since users want maximum detail.
                 global _log_write_count
                 _log_write_count += 1
                 if _log_write_count % 200 == 0:
                     try:
                         line_count = int(log_box.index("end-1c").split(".")[0])
-                        if line_count > 20000:
-                            log_box.delete("1.0", f"{line_count - 15000}.0")
+                        _cap = 20000 if _is_simple_mode else 50000
+                        _keep = 15000 if _is_simple_mode else 40000
+                        if line_count > _cap:
+                            if not _is_simple_mode:
+                                log_box.insert("end", f"  [log trimmed: {line_count:,} lines exceeded {_cap:,} cap, kept most recent {_keep:,}]\n")
+                            log_box.delete("1.0", f"{line_count - _keep}.0")
                             # Re-apply active overlay tags whose anchors may have
                             # been destroyed by the trim above.
                             _reapply_whisper_overlays()
@@ -2223,8 +2228,9 @@ def show_notification(title, message):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 startupinfo=startupinfo
             )
-        except Exception:
-            pass
+        except Exception as _notif_err:
+            if not _is_simple_mode:
+                log(f"  [notification] Failed to show notification: {_notif_err}\n", "dim")
 
 
 def check_directory_writable(path):
@@ -2844,8 +2850,9 @@ def _scan_channel_disk_info(ch):
                         _has_metadata = True
                 if _dir_has_tx:
                     _dirs_with_tx.add(_dp)
-    except Exception:
-        pass
+    except Exception as _scan_err:
+        if not _is_simple_mode:
+            log(f"  [disk scan] Error scanning channel folder: {_scan_err}\n", "dim")
 
     # Register videos in the browse panel's videos table
     tp = _tp_panel_ref[0]
@@ -3932,7 +3939,8 @@ style.map("Recent.Treeview.Heading",
 # Transcriptions panel treeview
 style.configure("TP.Treeview",
                 background="#161719", foreground="#dde1e8", fieldbackground="#161719",
-                borderwidth=0, rowheight=24, font=("Segoe UI", 9))
+                borderwidth=0, rowheight=24, font=("Segoe UI", 9),
+                indent=24)
 style.configure("TP.Treeview.Heading",
                 background="#1c1e21", foreground="#4a9eff", relief="flat",
                 font=("Segoe UI", 9, "bold"), padding=[6, 4])
@@ -3942,12 +3950,50 @@ style.map("TP.Treeview",
 style.map("TP.Treeview.Heading",
           background=[("active", "#252729")])
 
+# Search progress bar style (thin, dark-themed, accent-colored)
+style.configure("Search.Horizontal.TProgressbar",
+                troughcolor="#1c1e21", background="#4a9eff",
+                thickness=3, borderwidth=0)
+
+# Custom larger +/- expand indicators for TP.Treeview (14x14 px)
+try:
+    _ind_size = 14
+    _ind_bg = "#161719"
+    _ind_fg = "#8a8e96"
+    # Build closed indicator (+)
+    _img_closed = tk.PhotoImage(width=_ind_size, height=_ind_size)
+    _img_closed.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
+    for _px in range(3, _ind_size - 3):
+        _img_closed.put(_ind_fg, to=(_px, _ind_size // 2, _px + 1, _ind_size // 2 + 1))  # horizontal
+        _img_closed.put(_ind_fg, to=(_ind_size // 2, _px, _ind_size // 2 + 1, _px + 1))  # vertical
+    # Build open indicator (-)
+    _img_open = tk.PhotoImage(width=_ind_size, height=_ind_size)
+    _img_open.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
+    for _px in range(3, _ind_size - 3):
+        _img_open.put(_ind_fg, to=(_px, _ind_size // 2, _px + 1, _ind_size // 2 + 1))  # horizontal only
+    # Empty image for leaf nodes (no children)
+    _img_empty = tk.PhotoImage(width=_ind_size, height=_ind_size)
+    _img_empty.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
+    style.element_create("TP.indicator", "image", _img_closed,
+                         ("user1", "!user2", _img_open),
+                         ("!user1", _img_empty),
+                         sticky="w", width=_ind_size, height=_ind_size)
+    style.layout("TP.Treeview.Item", [
+        ("TP.Treeview.padding", {"sticky": "nswe", "children": [
+            ("TP.indicator", {"side": "left", "sticky": ""}),
+            ("Treeitem.image", {"side": "left", "sticky": ""}),
+            ("Treeitem.text", {"side": "left", "sticky": ""}),
+        ]}),
+    ])
+except Exception:
+    pass  # fall back to default indicators
+
 header_strip = tk.Frame(root, bg=C_BG, height=42)
 header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 12:37pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 7:12pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5090,13 +5136,13 @@ def refresh_channel_dropdowns():
         elif _is_queued_t:
             trans_str = "Queued"
         elif t_complete and t_pending > 0:
-            trans_str = f"✓ -{t_pending}"
+            trans_str = f"\U0001f7e1 {'A ' if auto_t else ''}\u2713 -{t_pending}"
         elif t_complete:
-            trans_str = "✓ Done" if auto_t else "✓"
+            trans_str = f"\U0001f7e2 {'A ' if auto_t else ''}\u2713"
         elif auto_t:
-            trans_str = "✓ Auto"
+            trans_str = "A"
         else:
-            trans_str = "—"
+            trans_str = ""
 
         # Metadata status column
         _ch_name_m = c.get("name", "")
@@ -8400,9 +8446,11 @@ _model_name = os.environ.get("WHISPER_MODEL", "large-v3")
 _device = os.environ.get("WHISPER_DEVICE", "cuda")
 _compute = os.environ.get("WHISPER_COMPUTE", "float16")
 
+_cuda_fallback_reason = None
 try:
     model = WhisperModel(_model_name, device=_device, compute_type=_compute)
-except Exception:
+except Exception as _cuda_err:
+    _cuda_fallback_reason = str(_cuda_err)
     _device = "cpu"
     _compute = "default"
     model = WhisperModel(_model_name, device=_device, compute_type=_compute)
@@ -8410,7 +8458,10 @@ except Exception:
 # Restore stderr for real errors during transcription, keep stdout suppressed
 sys.stderr = sys.__stderr__
 
-_out.write(json.dumps({"status": "ready", "device": _device}) + "\n")
+_ready_msg = {"status": "ready", "device": _device}
+if _cuda_fallback_reason:
+    _ready_msg["cuda_fallback_reason"] = _cuda_fallback_reason
+_out.write(json.dumps(_ready_msg) + "\n")
 _out.flush()
 
 for line in sys.stdin:
@@ -8625,7 +8676,9 @@ def _check_punct_installed():
             capture_output=True, text=True, timeout=30, startupinfo=startupinfo
         )
         return result.returncode == 0 and "ok" in result.stdout
-    except Exception:
+    except Exception as _cp_err:
+        if not _is_simple_mode:
+            log(f"  [punct check] Error: {_cp_err}\n", "dim")
         return False
 
 
@@ -8731,7 +8784,9 @@ def _check_whisper_installed():
             capture_output=True, text=True, timeout=30, startupinfo=startupinfo
         )
         return result.returncode == 0 and "True" in result.stdout
-    except Exception:
+    except Exception as _cw_err:
+        if not _is_simple_mode:
+            log(f"  [whisper check] Error: {_cw_err}\n", "dim")
         return False
 
 
@@ -8837,6 +8892,8 @@ def _start_whisper_process(model=None):
                 return False
             if info.get("status") == "ready":
                 log(f"  — ✓ Whisper model loaded ({_model}, {info.get('device', '?').upper()}).\n", "simpleline_green")
+                if not _is_simple_mode and info.get("cuda_fallback_reason"):
+                    log(f"    [CUDA fallback] Fell back to CPU: {info['cuda_fallback_reason']}\n", "dim")
                 # Start a single reader thread for the lifetime of this subprocess.
                 # Previous code created a new reader thread per _whisper_transcribe()
                 # call — but old threads kept blocking on readline(), racing with new
@@ -8882,7 +8939,9 @@ def _check_cuda_available():
             capture_output=True, text=True, timeout=30, startupinfo=startupinfo
         ) if os.path.exists(_WHISPER_PYTHON) else None
         return result is not None and "True" in result.stdout
-    except Exception:
+    except Exception as _cc_err:
+        if not _is_simple_mode:
+            log(f"  [CUDA check] Error: {_cc_err}\n", "dim")
         return False
 
 
@@ -8962,8 +9021,12 @@ def _ffprobe_duration(file_path):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
         )
+        if not _is_simple_mode and result.returncode != 0:
+            log(f"  [ffprobe duration] exit {result.returncode}: {result.stderr.strip()}\n", "dim")
         return float(result.stdout.strip())
-    except Exception:
+    except Exception as _fpd_err:
+        if not _is_simple_mode:
+            log(f"  [ffprobe duration] Error for {os.path.basename(file_path)}: {_fpd_err}\n", "dim")
         return 0
 
 
@@ -8995,8 +9058,12 @@ def _ffprobe_height(file_path):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
         )
+        if not _is_simple_mode and result.returncode != 0:
+            log(f"  [ffprobe height] exit {result.returncode}: {result.stderr.strip()}\n", "dim")
         return int(result.stdout.strip())
-    except Exception:
+    except Exception as _fph_err:
+        if not _is_simple_mode:
+            log(f"  [ffprobe height] Error for {os.path.basename(file_path)}: {_fph_err}\n", "dim")
         return 0
 
 
@@ -9009,8 +9076,12 @@ def _ffprobe_is_compressed(file_path):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", startupinfo=startupinfo, timeout=30
         )
+        if not _is_simple_mode and result.returncode != 0:
+            log(f"  [ffprobe compressed] exit {result.returncode}: {result.stderr.strip()}\n", "dim")
         return "ytarchiver_compressed=1" in result.stdout
-    except Exception:
+    except Exception as _fpc_err:
+        if not _is_simple_mode:
+            log(f"  [ffprobe compressed] Error for {os.path.basename(file_path)}: {_fpc_err}\n", "dim")
         return False
 
 
@@ -9139,8 +9210,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 if not _check_disk_space(fpath, _orig_sz * 2):
                     log(f"  ⚠ Skipping {fname} — insufficient disk space (need ~{_orig_sz * 2 // (1024*1024)} MB free)\n", "red")
                     continue
-            except OSError:
-                pass
+            except OSError as _sz_err:
+                if not _is_simple_mode:
+                    log(f"  [disk check] Could not get file size for {fname}: {_sz_err}\n", "dim")
 
             # Build temp output path (keep original extension so os.replace
             # doesn't leave a container/extension mismatch, e.g. .mkv with MP4 data)
@@ -9171,6 +9243,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
             ]
 
             try:
+                if not _is_simple_mode:
+                    log(f"  [ffmpeg cmd] {' '.join(cmd)}\n", "dim")
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     startupinfo=startupinfo, encoding="utf-8", errors="replace"
@@ -9184,6 +9258,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 if _is_simple_mode:
                     _load_info = f"[{idx}/{total}] ENCODING: {fname_short} ({dur_str}) - " if duration > 0 else f"[{idx}/{total}] ENCODING: {fname_short} - "
                     _update_encode_progress(f"{_load_info}loading\n")
+                else:
+                    log(f"  [ffmpeg] Initializing encoder for {fname_short}...\n", "dim")
 
                 # Parse progress from stderr
                 _time_re = _FFMPEG_TIME_RE
@@ -9198,6 +9274,12 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         except Exception:
                             proc.kill()
                         break
+
+                    # Verbose: show every raw ffmpeg stderr line
+                    if not _is_simple_mode:
+                        _stripped = line.rstrip()
+                        if _stripped:
+                            log(f"    [ffmpeg] {_stripped}\n", "dim")
 
                     m = _time_re.search(line)
                     if m and duration > 0:
@@ -9229,7 +9311,8 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     try:
                         proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:
-                        pass  # process is a zombie; nothing more we can do
+                        if not _is_simple_mode:
+                            log(f"  ⚠ ffmpeg process became a zombie (PID {proc.pid}) — could not terminate\n", "dim")
                 with _ffmpeg_lock:
                     _ffmpeg_proc = None
                     _gpu_actively_encoding = False
@@ -9241,8 +9324,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     try:
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
-                    except Exception:
-                        pass
+                    except Exception as _tc_err:
+                        if not _is_simple_mode:
+                            log(f"    ⚠ Could not clean up temp file on cancel: {_tc_err}\n", "dim")
                     break
 
                 # Format elapsed time
@@ -9261,8 +9345,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         log(f"    ⚠ Compressed output too small ({new_size:,} bytes vs {orig_size:,} original) — skipping replacement.\n", "red")
                         try:
                             os.remove(temp_path)
-                        except Exception:
-                            pass
+                        except Exception as _tc4_err:
+                            if not _is_simple_mode:
+                                log(f"    ⚠ Could not clean up temp file: {_tc4_err}\n", "dim")
                         err_count += 1
                         continue
 
@@ -9273,8 +9358,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         _safe_replace(temp_path, fpath)
                         try:
                             os.utime(fpath, (orig_stat.st_atime, orig_stat.st_mtime))
-                        except OSError:
-                            pass
+                        except OSError as _ut_err:
+                            if not _is_simple_mode:
+                                log(f"    ⚠ Could not restore file timestamp: {_ut_err}\n", "dim")
                         done_count += 1
                         orig_mb = orig_size / (1024 * 1024)
                         new_mb = new_size / (1024 * 1024)
@@ -9287,16 +9373,18 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         log(f"    ⚠ Replace failed: {e}\n", "red")
                         try:
                             os.remove(temp_path)
-                        except Exception:
-                            pass
+                        except Exception as _tc2_err:
+                            if not _is_simple_mode:
+                                log(f"    ⚠ Could not clean up temp file after replace failure: {_tc2_err}\n", "dim")
                 else:
                     err_count += 1
                     log(f"    ⚠ ffmpeg failed (exit code {proc.returncode}, took {_elapsed_str})\n", "red")
                     try:
                         if os.path.exists(temp_path):
                             os.remove(temp_path)
-                    except Exception:
-                        pass
+                    except Exception as _tc3_err:
+                        if not _is_simple_mode:
+                            log(f"    ⚠ Could not clean up temp file after ffmpeg failure: {_tc3_err}\n", "dim")
 
             except FileNotFoundError:
                 err_count += 1
@@ -9311,8 +9399,9 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                 try:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
-                except Exception:
-                    pass
+                except Exception as _tc5_err:
+                    if not _is_simple_mode:
+                        log(f"    ⚠ Could not clean up temp file after error: {_tc5_err}\n", "dim")
 
         # ── Summary ──
         elapsed = time.time() - t_start
@@ -9646,6 +9735,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     ]
 
                     if not _is_simple_mode:
+                        log(f"    [yt-dlp cmd] {' '.join(dl_cmd)}\n", "dim")
                         log(f"    Downloading ({resolution})...\n", "simpleline")
                     try:
                         dl_proc = spawn_yt_dlp(dl_cmd)
@@ -9662,6 +9752,8 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         try:
                             dl_proc.wait(timeout=300)
                         except subprocess.TimeoutExpired:
+                            if not _is_simple_mode:
+                                log(f"    ⚠ yt-dlp timed out after 300s, killing process\n", "dim")
                             dl_proc.kill()
                             dl_proc.wait()
                         with proc_lock:
@@ -10078,16 +10170,18 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 json.dump({"ch_url": ch_url, "resolution": new_res,
                            "done_ids": list(done_ids)}, f)
             os.replace(_tmp, _PROGRESS_FILE)
-        except Exception:
-            pass
+        except Exception as _rp_err:
+            if not _is_simple_mode:
+                log(f"  ⚠ Failed to save redownload progress: {_rp_err}\n", "dim")
 
     def _clear_progress():
         """Remove progress file after a complete run."""
         try:
             if os.path.exists(_PROGRESS_FILE):
                 os.remove(_PROGRESS_FILE)
-        except Exception:
-            pass
+        except Exception as _rpc_err:
+            if not _is_simple_mode:
+                log(f"  ⚠ Failed to clear redownload progress file: {_rpc_err}\n", "dim")
 
     def _fetch_yt_list(use_cookies):
         """Fetch YouTube video list (id→title) using spawn_yt_dlp with cancel support.
@@ -10731,7 +10825,7 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
     _n_chunks = max(1, int(total_duration / _CHUNK_LEN) + (1 if total_duration % _CHUNK_LEN > 0 else 0))
 
     # Log the main [X/X] line for this video, then sections will appear indented below it
-    _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _is_simple_mode and _whisper_counter['total'] else "    "
+    _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] " if _whisper_counter['total'] else "    "
     _title_disp = title
     if _title_disp:
         _title_disp = _trunc_pad_title(_title_disp, _MAX_TITLE_DISPLAY).rstrip()
@@ -10817,8 +10911,9 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
             # Clean up chunk file immediately to save disk space
             try:
                 os.remove(_chunk_path)
-            except Exception:
-                pass
+            except Exception as _chk_err:
+                if not _is_simple_mode:
+                    log(f"    ⚠ Could not clean up chunk file: {_chk_err}\n", "dim")
 
             if _text:
                 all_text_parts.append(_text)
@@ -10902,7 +10997,7 @@ def _whisper_transcribe(audio_path, duration=0, title="", cancel_ev=None, pause_
         # _log_prefix overrides this (used by chunked transcription for indented section lines).
         if _log_prefix is not None:
             _wp = _log_prefix
-        elif _is_simple_mode and _whisper_counter['total']:
+        elif _whisper_counter['total']:
             _wp = f"[{_whisper_counter['idx']}/{_whisper_counter['total']}] "
         else:
             _wp = "    "
@@ -13339,12 +13434,18 @@ def _run_metadata_download(item):
                                                 "date_resolve_failed_mtime=NULL "
                                                 "WHERE id=?",
                                                 (_matched_6b, _s_row_id))
-                                        except Exception:
-                                            pass
+                                        except Exception as _db_err:
+                                            if not _is_simple_mode:
+                                                log(f"    ⚠ DB update failed for video_id={_matched_6b}: {_db_err}\n", "dim")
                                 else:
                                     _6b_still_need.append(
                                         (_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
                             _need_search = _6b_still_need
+                            if not _is_simple_mode:
+                                _6b_elapsed = int(time.time() - _6b_t0) if '_6b_t0' in locals() else 0
+                                log(f"  Pass 6b summary: {len(_6b_dates)} dates fetched, "
+                                    f"{_6b_found} matched, {len(_6b_still_need)} still unresolved "
+                                    f"({_6b_elapsed}s elapsed)\n", "dim")
                             if _6b_found:
                                 log(f"  \u2014 Matched {_6b_found} video(s) "
                                     f"by upload date.\n", "simpleline_pink")
@@ -13384,7 +13485,7 @@ def _run_metadata_download(item):
 
     # Group videos by their target folder
     # (suppressed in simple mode — this is transient noise the user doesn't need)
-    if not _is_simple_mode and len(_resolved_rows) > 500:
+    if not _is_simple_mode:
         log(f"  Grouping {len(_resolved_rows):,} video(s) by folder...\n", "simpleline")
     folder_groups = {}
     for vid_id, title, v_year, v_month, filepath in _resolved_rows:
@@ -13448,7 +13549,7 @@ def _run_metadata_download(item):
         _pc_i += 1
         if _is_simple_mode:
             _update_meta_scan_line(_pc_i, _pc_total)
-        elif _pc_total > 5 and _pc_i % max(1, _pc_total // 10) == 0:
+        else:
             log(f"  Scanning metadata files... {_pc_i}/{_pc_total}\n", "simpleline")
         existing = tp._read_metadata_jsonl(meta_path)
         group["_existing"] = existing  # cache for reuse below
@@ -14445,8 +14546,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     with open(_tmp_path, "w", encoding="utf-8") as _wf:
                         json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                     os.replace(_tmp_path, _whisper_cache_path)
-                except Exception:
-                    pass
+                except Exception as _wc_err:
+                    if not _is_simple_mode:
+                        log(f"    ⚠ Failed to write Whisper cache: {_wc_err}\n", "dim")
 
             total = len(matched) + len(unmatched)
             # The pinned status line was already started at the top of the
@@ -14549,6 +14651,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
                 _w_suffix = f" ({_whisper_queued} queued for Whisper)" if _whisper_queued > 0 else ""
                 log(f"  [{idx}/{total}] {fname} — fetching captions...{_w_suffix}\n" if not _is_simple_mode else f"[{_check_idx}/{total}] \"{_fname_trunc}\" - fetching captions...{_w_suffix}\n", "transcribe_using")
+                if not _is_simple_mode:
+                    log(f"    [caption] vid_id={vid_id}, cookies_forced={_cookies_forced}, consec_fails={_consec_caption_fails}\n", "dim")
                 _t_vid_start = time.time()
 
                 # Block if internet is down (background monitor handles detection)
@@ -14559,7 +14663,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _prefetch_future is not None:
                     try:
                         text, _vtt_segments, _needed_cookies = _prefetch_future.result(timeout=120)
-                    except Exception:
+                    except Exception as _pf_ex:
+                        if not _is_simple_mode:
+                            log(f"    [prefetch] Failed: {_pf_ex}\n", "dim")
                         text, _vtt_segments, _needed_cookies = None, [], False
                     _prefetch_future = None
                 else:
@@ -14594,8 +14700,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             with open(_tmp_path, "w", encoding="utf-8") as _wf:
                                 json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                             os.replace(_tmp_path, _whisper_cache_path)
-                        except Exception:
-                            pass
+                        except Exception as _wc2_err:
+                            if not _is_simple_mode:
+                                log(f"    ⚠ Failed to update Whisper cache: {_wc2_err}\n", "dim")
                         continue
 
                 # Adaptive cookie forcing: if cookieless keeps failing but cookies
@@ -14650,6 +14757,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     with open(txt_path, "a", encoding="utf-8") as f:
                         f.write(entry)
                     _modified_txt_files.add(txt_path)
+                    if not _is_simple_mode:
+                        log(f"    [wrote] {txt_path} ({len(entry):,} bytes)\n", "dim")
                 except Exception as e:
                     log(f"  ⚠ Error writing transcript: {e}\n", "red")
                     _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
@@ -14660,6 +14769,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _vtt_segments:
                     _jsonl_path = _get_jsonl_path(txt_path)
                     _write_jsonl_entry(_jsonl_path, vid_id, fname, _vtt_segments)
+                    if not _is_simple_mode:
+                        log(f"    [wrote] {_jsonl_path} ({len(_vtt_segments)} segments)\n", "dim")
 
                 _vid_elapsed = time.time() - _t_vid_start
                 _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -14725,8 +14836,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                         with open(_tmp_path, "w", encoding="utf-8") as _wf:
                             json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                         os.replace(_tmp_path, _whisper_cache_path)
-                    except Exception:
-                        pass
+                    except Exception as _wc3_err:
+                        if not _is_simple_mode:
+                            log(f"    ⚠ Failed to write Whisper cache (GPU handoff): {_wc3_err}\n", "dim")
                 return  # skip Phase B
 
             # ── Write Whisper pending cache ──────────────────────────────
@@ -14738,8 +14850,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     with open(_tmp_path, "w", encoding="utf-8") as _wf:
                         json.dump([{"fname": fn, "fpath": fp} for fn, fp in unmatched], _wf)
                     os.replace(_tmp_path, _whisper_cache_path)
-                except Exception:
-                    pass
+                except Exception as _wc4_err:
+                    if not _is_simple_mode:
+                        log(f"    ⚠ Failed to write Whisper pending cache: {_wc4_err}\n", "dim")
 
             # ── Phase B: Process unmatched files (Whisper) ──────────────
             if unmatched and not _ce.is_set():
@@ -15009,8 +15122,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                                     _excl_jsonl = _get_jsonl_path(_excl_txt)
                                     _excl_placeholder = [{"start": 0.0, "end": 0.01, "text": "(no speech detected)"}]
                                     _write_jsonl_entry(_excl_jsonl, "", fname, _excl_placeholder)
-                                except Exception:
-                                    pass
+                                except Exception as _jp_err:
+                                    if not _is_simple_mode:
+                                        log(f"    ⚠ Failed to write JSONL placeholder: {_jp_err}\n", "dim")
                                 _modified_txt_files.add(_excl_txt)
                                 done_count += 1
                             except Exception as _excl_e:
@@ -15042,6 +15156,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             with open(txt_path, "a", encoding="utf-8") as f:
                                 f.write(entry)
                             _modified_txt_files.add(txt_path)
+                            if not _is_simple_mode:
+                                log(f"    [wrote] {txt_path} ({len(entry):,} bytes)\n", "dim")
                         except Exception as e:
                             log(f"  ⚠ Error writing transcript: {e}\n", "red")
                             _transcription_log.append((fname, source, time.time() - _t_vid_start, str(e)))
@@ -15057,6 +15173,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                             _w_vid_id = (yt_title_to_id.get(fname)
                                          or _yt_normalized.get(_normalize_for_match(fname), ""))
                             _write_jsonl_entry(_jsonl_path, _w_vid_id, fname, _vtt_segments)
+                            if not _is_simple_mode:
+                                log(f"    [wrote] {_jsonl_path} ({len(_vtt_segments)} segments)\n", "dim")
 
                         _vid_elapsed = time.time() - _t_vid_start
                         _transcription_log.append((fname, source, _vid_elapsed, None))
@@ -15096,16 +15214,18 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # Cleanup temp dir
             try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            except Exception as _td_err:
+                if not _is_simple_mode:
+                    log(f"  ⚠ Could not clean up temp dir: {_td_err}\n", "dim")
 
             if not _ce.is_set():
                 # Phase B complete — clear the Whisper pending cache
                 try:
                     if os.path.exists(_whisper_cache_path):
                         os.remove(_whisper_cache_path)
-                except Exception:
-                    pass
+                except Exception as _wcc_err:
+                    if not _is_simple_mode:
+                        log(f"  ⚠ Could not clean up Whisper cache file: {_wcc_err}\n", "dim")
                 if not _is_simple_mode:
                     log(f"\n  ✓ Transcription complete: {done_count} done", "simpleline_green")
                     if err_count:
@@ -16627,15 +16747,16 @@ def _prefetch_total(url):
         # Target /videos tab specifically to avoid getting tab count (3) instead of video count
         _url = _ensure_videos_tab(url)
 
-        # Use DEVNULL stderr so stdout only has the playlist_count value
+        # Use PIPE stderr in verbose mode to surface yt-dlp diagnostics
         cmd = [
             "yt-dlp", "--flat-playlist", "--no-warnings", "--playlist-end", "1",
             "--print", "%(playlist_count)s", "--cookies-from-browser", "firefox", _url
         ]
+        _stderr_mode = subprocess.PIPE if not _is_simple_mode else subprocess.DEVNULL
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=_stderr_mode,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
@@ -16659,6 +16780,15 @@ def _prefetch_total(url):
             proc.stdout.read()
         except Exception:
             pass
+        # Verbose: drain and log stderr from channel count fetch
+        if not _is_simple_mode and proc.stderr:
+            try:
+                _stderr_out = proc.stderr.read().strip()
+                if _stderr_out:
+                    for _sl in _stderr_out.splitlines():
+                        log(f"  [yt-dlp count stderr] {_sl}\n", "dim")
+            except Exception:
+                pass
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -16685,7 +16815,7 @@ def _prefetch_total(url):
                  "--dump-single-json", "--no-download",
                  "--cookies-from-browser", "firefox", _url],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE if not _is_simple_mode else subprocess.DEVNULL,
                 encoding="utf-8",
                 errors="replace",
                 startupinfo=startupinfo
@@ -16693,6 +16823,15 @@ def _prefetch_total(url):
             with proc_lock:
                 active_processes.append(proc)
             raw = proc.stdout.read()
+            # Verbose: drain and log stderr from fallback count fetch
+            if not _is_simple_mode and proc.stderr:
+                try:
+                    _stderr_out2 = proc.stderr.read().strip()
+                    if _stderr_out2:
+                        for _sl2 in _stderr_out2.splitlines():
+                            log(f"  [yt-dlp count-fallback stderr] {_sl2}\n", "dim")
+                except Exception:
+                    pass
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
@@ -16709,8 +16848,12 @@ def _prefetch_total(url):
             except Exception:
                 pass
 
+        if not _is_simple_mode:
+            log(f"  [yt-dlp] Could not determine channel video count for {_url}\n", "dim")
         return 0
-    except Exception:
+    except Exception as _pf_err:
+        if not _is_simple_mode:
+            log(f"  [yt-dlp] prefetch_total error: {_pf_err}\n", "dim")
         return 0
     finally:
         if proc:
@@ -16783,8 +16926,8 @@ def _enumerate_all_video_ids(url):
                 # Update simple mode animation with actual count
                 _simple_anim_state["enum_count"] = _enum_count
                 _simple_anim_state["enum_page"] = max(1, _enum_count // 30)
-                # Verbose mode: log progress every 500 IDs
-                if not is_simple and _enum_count - _last_verbose_log >= 500:
+                # Verbose mode: log progress every 100 IDs
+                if not is_simple and _enum_count - _last_verbose_log >= 100:
                     _elapsed = int(time.time() - _start_time)
                     log(f"  ...{_enum_count:,} IDs enumerated ({_elapsed}s elapsed)\n", "dim")
                     _last_verbose_log = _enum_count
@@ -16898,7 +17041,9 @@ def _check_new_videos(url, cached_ids, check_count=100):
         except subprocess.TimeoutExpired:
             pass
         return new_ids
-    except Exception:
+    except Exception as _cnv_err:
+        if not _is_simple_mode:
+            log(f"  [check_new_videos] Error: {_cnv_err}\n", "dim")
         return []
     finally:
         cleanup_process(proc)
@@ -17055,7 +17200,9 @@ def _prefetch_livestreams(url):
             except subprocess.TimeoutExpired:
                 pass
         return results
-    except Exception:
+    except Exception as _pfl_err:
+        if not _is_simple_mode:
+            log(f"  [prefetch_livestreams] Error: {_pfl_err}\n", "dim")
         return []
     finally:
         cleanup_process(proc)
@@ -17268,11 +17415,15 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 cancel_event.set()
                 break
 
-            # Suppress noisy yt-dlp pip/update nag messages
+            # Suppress noisy yt-dlp pip/update nag messages (show in verbose)
             if "installed yt-dlp with pip" in line_lower or "use that to update" in line_lower:
+                if not is_simple_mode:
+                    log(f"  [yt-dlp] {line.rstrip()}\n", "dim")
                 continue
-            # Suppress max-downloads reached message (handled by batch logic)
+            # Suppress max-downloads reached message (handled by batch logic; show in verbose)
             if "maximum number of downloads" in line_lower:
+                if not is_simple_mode:
+                    log(f"  [yt-dlp] {line.rstrip()}\n", "dim")
                 continue
 
             # Extract video ID before any simple-mode continues so that
@@ -17491,8 +17642,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                     ud = datetime.strptime(upload_date_str, "%Y%m%d")
                                     ud_ts = ud.replace(hour=12).timestamp()
                                     os.utime(filepath, (ud_ts, ud_ts))
-                                except (ValueError, OSError):
-                                    pass
+                                except (ValueError, OSError) as _utime_err:
+                                    if not is_simple_mode:
+                                        log(f"  ⚠ Could not set upload-date timestamp: {_utime_err}\n", "dim")
 
                                 # Fix folder placement: yt-dlp's template may use approximate_date
                                 # which can put files in the wrong year/month folder. Check and move
@@ -17542,8 +17694,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                                     if not is_simple_mode:
                                                         _rel = os.path.relpath(_correct_dir, _base_dir)
                                                         log(f"  → Moved to correct folder: {_rel}\n", "dim")
-                                except (ValueError, IndexError, OSError, shutil.Error):
-                                    pass
+                                except (ValueError, IndexError, OSError, shutil.Error) as _ff_err:
+                                    if not is_simple_mode:
+                                        log(f"  ⚠ Folder-fix failed: {_ff_err}\n", "dim")
                             else:
                                 # upload_date was NA/invalid — file keeps --mtime date (HTTP Last-Modified)
                                 log(f"  ⚠ No upload date for '{parts[1][:50]}' — file date may be inaccurate.\n", "dim")
@@ -17562,8 +17715,9 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 try:
                                     _batch_start = len(_tracked_paths) - compress_batch_size
                                     on_batch_ready(dl_count, list(_tracked_paths[_batch_start:]))
-                                except Exception:
-                                    pass
+                                except Exception as _br_err:
+                                    if not is_simple_mode:
+                                        log(f"  ⚠ Batch-ready callback error: {_br_err}\n", "dim")
 
                         # Stop merge "Finishing..." animation if running
                         try:
@@ -17574,11 +17728,12 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 if _old_merge_job:
                                     _ui_queue.append(lambda j=_old_merge_job: root.after_cancel(j) if root.winfo_exists() else None)
                                 clear_simple_status()
-                        except Exception:
-                            pass
+                        except Exception as _ma_err:
+                            if not is_simple_mode:
+                                log(f"  ⚠ Merge animation cleanup error: {_ma_err}\n", "dim")
 
                     if not is_simple_mode:
-                        pass  # Don't log the raw DLTRACK line even in verbose
+                        log(f"  [DLTRACK] {line.rstrip()}\n", "dim")
                     continue
                 except Exception as _dltrack_err:
                     log(f"  ⚠ DLTRACK parse error: {_dltrack_err}\n", "red")
@@ -17595,7 +17750,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                 current_dl_size_bytes = parsed
 
                         _now = time.monotonic()
-                        if _now - _prog_last_ts < 0.15 and pct_val != 100.0:
+                        # In verbose mode, no throttle — show every progress line
+                        if is_simple_mode and _now - _prog_last_ts < 0.15 and pct_val != 100.0:
                             continue
                         _prog_last_ts = _now
                         _prog_last_pct = pct_val
@@ -17661,7 +17817,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     session_totals["skip"] += 1
 
                 checked = skip_count + dl_count + dur_count
-                if checked == 1 or checked % 25 == 0:
+                if checked == 1 or checked % (25 if is_simple_mode else 1) == 0:
                     log_progress_bar(checked, channel_total)
                 if is_simple_mode:
                     continue
@@ -17684,11 +17840,15 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                 # Do NOT count it — the "filtered" counter should only reflect genuinely
                 # new videos the program has never seen before.
                 if _skip_title_raw in _seen_filter_titles:
+                    if not is_simple_mode:
+                        log(f"  [re-skip] Already seen filter-rejected: {_skip_title_raw}\n", "dim")
                     continue
 
                 # Also check ID-based archive as a secondary guard (works for duration filters
                 # where yt-dlp does log the video ID before the filter message).
                 if current_vid_id and current_vid_id in _local_archived_set:
+                    if not is_simple_mode:
+                        log(f"  [re-skip] Already archived: {current_vid_id}\n", "dim")
                     continue
 
                 # Only count genuinely new filter-rejected videos (after dedup).
@@ -17870,8 +18030,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                     if is_simple_mode:
                         _update_simple_dl(dl_count, 0, batch_size=compress_batch_size if on_batch_ready else 0)
                     else:
-                        if dl_count % 10 == 0:
-                            log(f"  ── {dl_count} downloaded so far (this channel)...\n", "dim")
+                        log(f"  ── {dl_count} downloaded so far (this channel)...\n", "dim")
 
             if not is_simple_mode:
                 log(line)
@@ -21118,10 +21277,9 @@ autorun_clear_btn = ttk.Button(autorun_frame, text="Clear", command=_clear_autor
                                style="TButton", padding=[4, 1])
 
 ttk.Label(autorun_frame, text="Log:", style="Dim.TLabel").grid(row=0, column=5, sticky="e", padx=(0, 6))
-_log_mode_frame = ttk.Frame(autorun_frame)
-_log_mode_frame.grid(row=0, column=6, sticky="w")
-ttk.Radiobutton(_log_mode_frame, text="Verbose", variable=log_mode_var, value="Verbose").pack(side="left", padx=(0, 8))
-ttk.Radiobutton(_log_mode_frame, text="Simple", variable=log_mode_var, value="Simple").pack(side="left")
+_log_mode_combo = _combo(autorun_frame, textvariable=log_mode_var,
+                         values=["Simple", "Verbose"], state="readonly", width=8)
+_log_mode_combo.grid(row=0, column=6, sticky="w")
 
 
 def _save_log_mode(*_):
@@ -24000,6 +24158,22 @@ class _TranscriptionPanel(ttk.Frame):
 
         tree.delete(*tree.get_children())
         self._browse_items.clear()
+
+        # "All Channels" aggregate node at the top
+        _all_was_open = ("channel", "__all__", None, None) in _open_keys
+        _all_iid = tree.insert("", "end", text="\U0001F4DA  All Channels", open=_all_was_open)
+        self._browse_items[_all_iid] = {"type": "channel", "channel": "__all__"}
+        tree.insert(_all_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+        if _all_was_open:
+            self._on_browse_open_for_iid(_all_iid)
+
+        # Visual separator
+        _sep_iid = tree.insert("", "end", text="─────────────", tags=("browse_sep",))
+        tree.tag_configure("browse_sep", foreground="#333333")
+        # Prevent selection of the separator
+        tree.tag_bind("browse_sep", "<<TreeviewSelect>>",
+                      lambda _: tree.selection_remove(_sep_iid) if tree.exists(_sep_iid) else None)
+
         for (ch,) in channels:
             _was_open = ("channel", ch, None, None) in _open_keys
             ch_iid = tree.insert("", "end", text=f"\U0001F4C1  {ch}", open=_was_open)
@@ -24057,6 +24231,46 @@ class _TranscriptionPanel(ttk.Frame):
         tree = self._browse_tree
         if meta["type"] == "channel":
             ch = meta["channel"]
+
+            # "All Channels" aggregate — always show year subnodes with months
+            if ch == "__all__":
+                self._browse_loading_iids.add(iid)
+                _load_iid = tree.insert(iid, "end", text="  Loading...",
+                                         tags=(self._BROWSE_PLACEHOLDER,))
+                def _query_all_years():
+                    try:
+                        years = self._db_execute(
+                            "SELECT DISTINCT year FROM videos WHERE channel != '__ver__' "
+                            "AND year IS NOT NULL ORDER BY year"
+                        ).fetchall()
+                    except Exception:
+                        years = []
+                    def _apply():
+                        try:
+                            if not tree.exists(iid):
+                                return
+                            _existing = tree.get_children(iid)
+                            _has_real = any(
+                                self._BROWSE_PLACEHOLDER not in tree.item(_c, "tags")
+                                for _c in _existing)
+                            if _has_real:
+                                return
+                            try:
+                                tree.delete(_load_iid)
+                            except Exception:
+                                pass
+                            for (yr,) in years:
+                                yr_iid = tree.insert(iid, "end", text=f"\U0001F4C5  {yr}", open=False)
+                                self._browse_items[yr_iid] = {
+                                    "type": "year", "channel": "__all__", "year": yr,
+                                    "split_months": True}
+                                tree.insert(yr_iid, "end", text="", tags=(self._BROWSE_PLACEHOLDER,))
+                        finally:
+                            self._browse_loading_iids.discard(iid)
+                    self.after(0, _apply)
+                threading.Thread(target=_query_all_years, daemon=True).start()
+                return
+
             split_years, split_months = self._get_channel_org(ch)
             if not split_years:
                 self._populate_browse_titles(iid, ch, None, None)
@@ -24118,9 +24332,14 @@ class _TranscriptionPanel(ttk.Frame):
                                      tags=(self._BROWSE_PLACEHOLDER,))
             def _query_months():
                 try:
-                    months = self._db_execute(
-                        "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "
-                        "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
+                    if ch == "__all__":
+                        months = self._db_execute(
+                            "SELECT DISTINCT month FROM videos WHERE channel != '__ver__' "
+                            "AND year=? AND month IS NOT NULL ORDER BY month", (yr,)).fetchall()
+                    else:
+                        months = self._db_execute(
+                            "SELECT DISTINCT month FROM videos WHERE channel=? AND year=? "
+                            "AND month IS NOT NULL ORDER BY month", (ch, yr)).fetchall()
                 except Exception:
                     months = []
                 def _apply():
@@ -25787,7 +26006,8 @@ class _TranscriptionPanel(ttk.Frame):
             self._grid_loading_frame.place_forget()
             if not self._grid_canvas_frame.winfo_ismapped():
                 self._grid_canvas_frame.pack(fill="both", expand=True)
-            self._grid_build_cards(reset=True, _keep_photos=True)
+            # Apply the user's current sort selection (not just cached order)
+            self._grid_resort()
             return
         # No cache — show loading overlay on top of canvas (canvas keeps its size)
         self._grid_canvas.delete("all")
@@ -25799,7 +26019,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_meta_banner.pack_forget()
         if not self._grid_canvas_frame.winfo_ismapped():
             self._grid_canvas_frame.pack(fill="both", expand=True)
-        self._grid_loading_lbl.config(text=f"Loading {channel}...")
+        _loading_name = "All Channels" if channel == "__all__" else channel
+        self._grid_loading_lbl.config(text=f"Loading {_loading_name}...")
         self._grid_loading_progress.config(text="Querying database...")
         self._grid_loading_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._grid_loading_frame.lift()  # ensure overlay is on top of canvas
@@ -25856,8 +26077,13 @@ class _TranscriptionPanel(ttk.Frame):
             return
         if gen != self._grid_gen:
             return  # stale request
-        sql = "SELECT title, filepath, video_id, tx_status FROM videos WHERE channel=?"
-        params = [channel]
+        _is_all = channel == "__all__"
+        if _is_all:
+            sql = "SELECT title, filepath, video_id, tx_status, channel FROM videos WHERE channel != '__ver__'"
+            params = []
+        else:
+            sql = "SELECT title, filepath, video_id, tx_status, channel FROM videos WHERE channel=?"
+            params = [channel]
         if year is not None:
             sql += " AND year=?"
             params.append(year)
@@ -25877,69 +26103,129 @@ class _TranscriptionPanel(ttk.Frame):
             text=f"Found {len(rows)} videos — loading metadata..."))
         import datetime as _dt
         videos = []
-        for title, filepath, video_id, tx_status in rows:
+        for row in rows:
+            title, filepath, video_id, tx_status = row[0], row[1], row[2], row[3]
+            _vid_channel = row[4] if len(row) > 4 else channel
             videos.append({
                 "title": title, "filepath": filepath,
                 "video_id": video_id, "tx_status": tx_status,
+                "channel": _vid_channel,
                 "mtime": 0.0, "date_str": "",
             })
 
         # Load metadata if available
-        ch_cfg = None
-        with config_lock:
-            for ch in config.get("channels", []):
-                if ch.get("name", "") == channel:
-                    ch_cfg = ch
-                    break
         metadata = {}
         has_metadata = False
         thumb_dir = None
-        if ch_cfg:
-            folder = ch_cfg.get("folder_override") or sanitize_folder(channel)
+        _all_thumb_dirs = []  # for __all__ mode: collect all thumbnail dirs
+
+        if _is_all:
+            # Iterate ALL channel configs and merge metadata + thumbnail dirs
             with config_lock:
-                base = config.get("output_dir", "")
-            folder_path = os.path.join(base, folder) if base else folder
-            sy = ch_cfg.get("split_years", False)
-            sm = ch_cfg.get("split_months", False)
-            # When viewing at channel root with split_years, merge metadata
-            # from ALL per-year (and per-month) JSONL files so sorting works
-            if sy and year is None:
+                _all_chs = list(config.get("channels", []))
+                _base = config.get("output_dir", "")
+            for _ac in _all_chs:
+                if gen != self._grid_gen:
+                    return
+                _ac_name = _ac.get("name", "")
+                _ac_folder = _ac.get("folder_override") or sanitize_folder(_ac_name)
+                _ac_fp = os.path.join(_base, _ac_folder) if _base else _ac_folder
+                _ac_sy = _ac.get("split_years", False)
+                _ac_sm = _ac.get("split_months", False)
                 try:
-                    for _yd in os.listdir(folder_path):
-                        _yp = os.path.join(folder_path, _yd)
-                        if os.path.isdir(_yp) and _yd.isdigit():
-                            _yr = int(_yd)
-                            if sm:
-                                # Scan month subfolders for per-month metadata
-                                try:
-                                    for _md in os.listdir(_yp):
-                                        _mp = os.path.join(_yp, _md)
-                                        if os.path.isdir(_mp):
-                                            # Extract month number from folder name
-                                            _mn = _md.split(" ", 1)[0]
-                                            if _mn.isdigit():
-                                                _mpath, _ = self._get_metadata_jsonl_path(
-                                                    channel, folder_path, sy, sm,
-                                                    year=_yr, month=int(_mn))
-                                                metadata.update(self._read_metadata_jsonl(_mpath))
-                                except OSError:
-                                    pass
-                            else:
-                                _mpath, _ = self._get_metadata_jsonl_path(
-                                    channel, folder_path, sy, sm, year=_yr, month=None)
-                                metadata.update(self._read_metadata_jsonl(_mpath))
+                    if _ac_sy:
+                        for _yd in os.listdir(_ac_fp):
+                            _yp = os.path.join(_ac_fp, _yd)
+                            if os.path.isdir(_yp) and _yd.isdigit():
+                                _yr = int(_yd)
+                                if year is not None and _yr != year:
+                                    continue
+                                if _ac_sm:
+                                    try:
+                                        for _md in os.listdir(_yp):
+                                            _mp = os.path.join(_yp, _md)
+                                            if os.path.isdir(_mp):
+                                                _mn = _md.split(" ", 1)[0]
+                                                if _mn.isdigit():
+                                                    if month is not None and int(_mn) != month:
+                                                        continue
+                                                    _mpath, _ = self._get_metadata_jsonl_path(
+                                                        _ac_name, _ac_fp, _ac_sy, _ac_sm,
+                                                        year=_yr, month=int(_mn))
+                                                    metadata.update(self._read_metadata_jsonl(_mpath))
+                                                    _td = os.path.join(_mp, ".Thumbnails")
+                                                    if os.path.isdir(_td):
+                                                        _all_thumb_dirs.append(_td)
+                                    except OSError:
+                                        pass
+                                else:
+                                    _mpath, _ = self._get_metadata_jsonl_path(
+                                        _ac_name, _ac_fp, _ac_sy, _ac_sm, year=_yr, month=None)
+                                    metadata.update(self._read_metadata_jsonl(_mpath))
+                                    _td = os.path.join(_yp, ".Thumbnails")
+                                    if os.path.isdir(_td):
+                                        _all_thumb_dirs.append(_td)
+                    else:
+                        _mpath, _sf = self._get_metadata_jsonl_path(
+                            _ac_name, _ac_fp, _ac_sy, _ac_sm, year=year, month=month)
+                        metadata.update(self._read_metadata_jsonl(_mpath))
+                        _td = os.path.join(_sf, ".Thumbnails")
+                        if os.path.isdir(_td):
+                            _all_thumb_dirs.append(_td)
                 except OSError:
                     pass
-                has_metadata = bool(metadata)
-                subfolder = folder_path
-            else:
-                meta_path, subfolder = self._get_metadata_jsonl_path(
-                    channel, folder_path, sy, sm, year=year, month=month)
-                metadata = self._read_metadata_jsonl(meta_path)
-                has_metadata = bool(metadata)
-            thumb_dir = os.path.join(subfolder, ".Thumbnails")
-            if not os.path.isdir(thumb_dir):
-                thumb_dir = None
+            has_metadata = bool(metadata)
+        else:
+            ch_cfg = None
+            with config_lock:
+                for ch in config.get("channels", []):
+                    if ch.get("name", "") == channel:
+                        ch_cfg = ch
+                        break
+            if ch_cfg:
+                folder = ch_cfg.get("folder_override") or sanitize_folder(channel)
+                with config_lock:
+                    base = config.get("output_dir", "")
+                folder_path = os.path.join(base, folder) if base else folder
+                sy = ch_cfg.get("split_years", False)
+                sm = ch_cfg.get("split_months", False)
+                # When viewing at channel root with split_years, merge metadata
+                # from ALL per-year (and per-month) JSONL files so sorting works
+                if sy and year is None:
+                    try:
+                        for _yd in os.listdir(folder_path):
+                            _yp = os.path.join(folder_path, _yd)
+                            if os.path.isdir(_yp) and _yd.isdigit():
+                                _yr = int(_yd)
+                                if sm:
+                                    try:
+                                        for _md in os.listdir(_yp):
+                                            _mp = os.path.join(_yp, _md)
+                                            if os.path.isdir(_mp):
+                                                _mn = _md.split(" ", 1)[0]
+                                                if _mn.isdigit():
+                                                    _mpath, _ = self._get_metadata_jsonl_path(
+                                                        channel, folder_path, sy, sm,
+                                                        year=_yr, month=int(_mn))
+                                                    metadata.update(self._read_metadata_jsonl(_mpath))
+                                    except OSError:
+                                        pass
+                                else:
+                                    _mpath, _ = self._get_metadata_jsonl_path(
+                                        channel, folder_path, sy, sm, year=_yr, month=None)
+                                    metadata.update(self._read_metadata_jsonl(_mpath))
+                    except OSError:
+                        pass
+                    has_metadata = bool(metadata)
+                    subfolder = folder_path
+                else:
+                    meta_path, subfolder = self._get_metadata_jsonl_path(
+                        channel, folder_path, sy, sm, year=year, month=month)
+                    metadata = self._read_metadata_jsonl(meta_path)
+                    has_metadata = bool(metadata)
+                thumb_dir = os.path.join(subfolder, ".Thumbnails")
+                if not os.path.isdir(thumb_dir):
+                    thumb_dir = None
 
         if gen != self._grid_gen:
             return
@@ -25992,6 +26278,7 @@ class _TranscriptionPanel(ttk.Frame):
                     v["date_str"] = ""
 
         # Fetch mtimes for all videos missing metadata dates (needed for sorting)
+        # and ffprobe duration for videos missing metadata duration (needed for badge)
         for v in videos:
             if not v["date_str"] and v["filepath"]:
                 try:
@@ -25999,6 +26286,13 @@ class _TranscriptionPanel(ttk.Frame):
                     v["mtime"] = mt
                     v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
                 except OSError:
+                    pass
+            if not v["duration"] and v["filepath"]:
+                try:
+                    _probed = _ffprobe_duration(v["filepath"])
+                    if _probed > 0:
+                        v["duration"] = _probed
+                except Exception:
                     pass
 
         # Deduplicate: if multiple videos share the same video_id, keep the first
@@ -26015,7 +26309,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         self.after(0, lambda: self._grid_loading_progress.config(
             text=f"Scanning thumbnails..."))
-        # Sort: prefer metadata upload_date, fall back to mtime
+        # Initial sort by date (will be re-sorted to match dropdown in _grid_finish_load)
         def _sort_key(v):
             if v["upload_date"]:
                 return v["upload_date"]
@@ -26052,8 +26346,12 @@ class _TranscriptionPanel(ttk.Frame):
                     pass
         if thumb_dir:
             _scan_thumb_dir(thumb_dir)
+        # All Channels mode: scan all collected thumbnail dirs
+        if _is_all and _all_thumb_dirs:
+            for _atd in _all_thumb_dirs:
+                _scan_thumb_dir(_atd)
         # If viewing at channel root with split_years, scan ALL year/month .Thumbnails
-        if ch_cfg and ch_cfg.get("split_years", False) and not year:
+        if not _is_all and ch_cfg and ch_cfg.get("split_years", False) and not year:
             try:
                 for _yd in os.listdir(folder_path):
                     _yp = os.path.join(folder_path, _yd)
@@ -26071,7 +26369,7 @@ class _TranscriptionPanel(ttk.Frame):
             except OSError:
                 pass
         # If viewing a specific year with split_months, also scan month .Thumbnails
-        elif ch_cfg and ch_cfg.get("split_months", False) and year and not month:
+        elif not _is_all and ch_cfg and ch_cfg.get("split_months", False) and year and not month:
             try:
                 year_path = os.path.join(folder_path, str(year)) if ch_cfg.get("split_years", False) else folder_path
                 for _md in os.listdir(year_path):
@@ -26139,7 +26437,8 @@ class _TranscriptionPanel(ttk.Frame):
             text=f"Building grid — {len(self._grid_videos)} videos...")
         self._grid_suppress_resize = True
         self.update_idletasks()  # force geometry settle so canvas has real dimensions
-        self._grid_build_cards()
+        # Apply the user's current sort selection (not just default Newest)
+        self._grid_resort()
         # Re-enable resize after a short delay (let any pending Configure events drain)
         self.after(500, self._grid_enable_resize)
 
@@ -26280,10 +26579,11 @@ class _TranscriptionPanel(ttk.Frame):
                 anchor="nw", width=card_w - 12,
                 tags=("card",))
 
-            # Stats text (views + date, channel name in search mode)
+            # Stats text (views + date, channel name in search/all-channels mode)
             stats_parts = []
             _is_search = self._grid_scope and self._grid_scope[0] == "__search__"
-            if _is_search and v.get("channel"):
+            _is_all_view = self._grid_scope and self._grid_scope[0] == "__all__"
+            if (_is_search or _is_all_view) and v.get("channel"):
                 stats_parts.append(v["channel"])
             if v["view_count"]:
                 vc = v["view_count"]
@@ -26728,7 +27028,7 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _update_meta_banner(self, has_metadata, channel, year, month):
         """Show/hide/update the metadata banner based on queue state."""
-        if has_metadata:
+        if channel == "__all__" or has_metadata:
             self._grid_meta_banner.pack_forget()
             return
         queued = self._is_metadata_queued_or_running(channel, year, month)
@@ -27970,6 +28270,12 @@ class _TranscriptionPanel(ttk.Frame):
                  insertbackground=self._TP_FG, relief="flat",
                  font=("Segoe UI", 9), width=5).pack(side="left")
 
+        # Indeterminate progress bar (shown during search)
+        self._search_progress = ttk.Progressbar(f, mode="indeterminate",
+                                                 style="Search.Horizontal.TProgressbar",
+                                                 length=200)
+        # Don't pack yet — shown/hidden dynamically during search
+
         pane = tk.PanedWindow(f, orient="horizontal", bg="#0a0b0d",
                               sashwidth=5, sashpad=0, relief="flat")
         pane.pack(fill="both", expand=True, padx=6, pady=(4, 0))
@@ -28107,6 +28413,8 @@ class _TranscriptionPanel(ttk.Frame):
         self._search_running = True
         self._search_btn.config(state="disabled", text="Searching…")
         self._search_count.config(text="")
+        self._search_progress.pack(fill="x", padx=10, pady=(2, 0))
+        self._search_progress.start(15)
         channel   = self._s_channel_var.get()
         yr_from   = self._s_year_from_var.get().strip()
         yr_to     = self._s_year_to_var.get().strip()
@@ -28199,9 +28507,15 @@ class _TranscriptionPanel(ttk.Frame):
                 self._search_running = False
                 if _root_alive:
                     _ui_queue.append(lambda: self._search_btn.config(state="normal", text="Search"))
+                    def _stop_progress():
+                        self._search_progress.stop()
+                        self._search_progress.pack_forget()
+                    _ui_queue.append(_stop_progress)
 
         def _populate(rows):
             self._search_running = False
+            self._search_progress.stop()
+            self._search_progress.pack_forget()
             self._tree.delete(*self._tree.get_children())
             self._result_meta.clear()
             _deferred_iids = []
@@ -28232,6 +28546,21 @@ class _TranscriptionPanel(ttk.Frame):
                     snippet = ("…" if s0 > 0 else "") + text[s0:s0 + 160].replace("\n", " ")
                 else:
                     snippet = text[:160].replace("\n", " ")
+                # Bracket-highlight matched terms in snippet for visual scanning
+                _ql = len(q)
+                if _ql > 0:
+                    _sl = snippet.lower()
+                    _parts = []
+                    _i = 0
+                    while _i < len(snippet):
+                        _hit = _sl.find(q, _i)
+                        if _hit < 0:
+                            _parts.append(snippet[_i:])
+                            break
+                        _parts.append(snippet[_i:_hit])
+                        _parts.append("[" + snippet[_hit:_hit + _ql] + "]")
+                        _i = _hit + _ql
+                    snippet = "".join(_parts)
                 txt_path   = self._get_txt_path(jsonl_path) if jsonl_path else None
                 iid = self._tree.insert("", "end", values=(ch, date_str, title, snippet))
                 self._result_meta[iid] = {
@@ -29448,7 +29777,20 @@ class _TranscriptionPanel(ttk.Frame):
                                        sliderlength=14, width=10,
                                        activebackground=self._TP_ACCENT)
         self._player_slider.grid(row=0, column=2, sticky="ew", padx=(0, 10))
-        self._player_slider.bind("<ButtonPress-1>", lambda e: setattr(self, '_player_seeking', True))
+        def _player_on_slider_click(e):
+            """Click anywhere on the seek bar to jump to that position."""
+            self._player_seeking = True
+            # Calculate click position as fraction of trough width
+            slider_len = self._player_slider.cget("sliderlength") or 14
+            trough_start = slider_len // 2
+            trough_end = self._player_slider.winfo_width() - slider_len // 2
+            trough_w = max(1, trough_end - trough_start)
+            frac = max(0.0, min(1.0, (e.x - trough_start) / trough_w))
+            val = int(frac * 1000)
+            self._player_slider.set(val)
+            self._player_on_slider_drag(e)
+            return "break"  # prevent default tk.Scale trough-click behavior
+        self._player_slider.bind("<ButtonPress-1>", _player_on_slider_click)
         self._player_slider.bind("<B1-Motion>", self._player_on_slider_drag)
         self._player_slider.bind("<ButtonRelease-1>", self._player_on_slider_release)
         self._player_seeking = False
@@ -32350,8 +32692,9 @@ def _save_queue_state_now():
         with open(_tmp, "w", encoding="utf-8") as f:
             json.dump(queue_data, f, indent=2)
         os.replace(_tmp, QUEUE_FILE)
-    except Exception:
-        pass
+    except Exception as _qs_err:
+        if not _is_simple_mode:
+            log(f"  ⚠ Failed to save queue state: {_qs_err}\n", "dim")
 
 
 def _load_queue_state():

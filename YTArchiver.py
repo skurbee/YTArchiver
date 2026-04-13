@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.6"
+APP_VERSION = "v39.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3974,7 +3974,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:09am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 1:27am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -10231,6 +10231,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         return result
 
     def _worker():
+        nonlocal new_res
         _ce = cancel_ev or cancel_event
         _pe = pause_ev or pause_event
         _res_label = "Best" if new_res == "best" else f"{new_res}p"
@@ -15581,12 +15582,12 @@ def _start_manual_transcription():
             return
         folder_path = os.path.normpath(folder_path)
 
-        # Count video files
+        # Count video files (recurse into subdirs)
         _vid_exts = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
                      ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
-        vid_count = sum(1 for f in os.listdir(folder_path)
-                        if os.path.isfile(os.path.join(folder_path, f))
-                        and os.path.splitext(f)[1].lower() in _vid_exts)
+        vid_count = sum(1 for _dp, _dns, _fns in os.walk(folder_path)
+                        for f in _fns
+                        if os.path.splitext(f)[1].lower() in _vid_exts)
         if vid_count == 0:
             log(f"  No video/audio files found in folder.\n", "red")
             return

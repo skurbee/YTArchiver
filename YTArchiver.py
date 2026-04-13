@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.8"
+APP_VERSION = "v39.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -161,7 +161,10 @@ DEFAULT_CONFIG = {
     "autorun_sync": False,
     "chan_col_widths": {},
     "recent_col_widths": {},
-    "deps_checked": False
+    "deps_checked": False,
+    "auto_index_enabled": False,
+    "auto_index_threshold": 10,
+    "downloads_since_last_index": 0
 }
 
 GPU_BATCH_LIMIT = 5  # max unprocessed encode batches per channel before sync skips it
@@ -3157,13 +3160,15 @@ def _run_startup_disk_scan():
             except Exception:
                 pass
 
-    log("== Disk scan complete. ==\n", "simpleline_green")
+    log("--- Disk scan complete ---\n", "simpleline_green")
     # Refresh browse tree now that videos have been registered
     if tp and tp._loaded and _root_alive:
         tp._disk_scan_complete = True
         _ui_queue.append(tp._refresh_browse)
         # Check if disk has more files than the DB (shows warning icon if so)
         _ui_queue.append(tp._check_index_freshness)
+        # Silently preload grid data for all channels in the background
+        _ui_queue.append(tp._start_grid_preload)
 
 
 config = load_config()
@@ -4007,7 +4012,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:07pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:59pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -24274,8 +24279,11 @@ class _TranscriptionPanel(ttk.Frame):
         self._grid_bg_rects = {}     # idx -> canvas rect id (for hover highlight)
         self._grid_thumb_items = {}  # idx -> canvas item id (for thumbnail replacement)
         self._grid_hover_idx = -1    # currently hovered card index
-        self._grid_cache = collections.OrderedDict()  # scope -> {"videos": [...], "photos": {...}, "has_metadata": bool}  (LRU, max 20 scopes)
-        self._GRID_CACHE_MAX = 20
+        self._grid_cache = collections.OrderedDict()  # scope -> {"videos": [...], "photos": {...}, "has_metadata": bool}  (LRU)
+        self._GRID_CACHE_MAX = 200
+        self._grid_preload_done = False
+        self._grid_preload_running = False
+        self._grid_preload_cancel = False
         self._vf = vf                # reference to the viewer frame
 
         pane.add(right, minsize=300)
@@ -24304,6 +24312,8 @@ class _TranscriptionPanel(ttk.Frame):
 
     def _refresh_browse(self):
         """Populate the browse tree — lazy: only top-level channels at first."""
+        # Cancel any in-flight background preload (data may be changing)
+        self._grid_preload_cancel = True
         if not self._conn:
             return
         def _query():
@@ -24365,6 +24375,11 @@ class _TranscriptionPanel(ttk.Frame):
             # If channel was previously expanded, re-populate its children
             if _was_open:
                 self._on_browse_open_for_iid(ch_iid)
+
+        # Restart background grid preload if disk scan is complete
+        if self._disk_scan_complete:
+            self._grid_preload_done = False
+            self.after(2000, self._start_grid_preload)
 
     def _on_browse_open_for_iid(self, iid):
         """Populate children for a specific iid (used during expansion state restore)."""
@@ -26188,6 +26203,8 @@ class _TranscriptionPanel(ttk.Frame):
             self._grid_loading_frame.place_forget()
             if not self._grid_canvas_frame.winfo_ismapped():
                 self._grid_canvas_frame.pack(fill="both", expand=True)
+                # Force geometry pass so canvas has real dimensions before card layout
+                self._grid_canvas_frame.update_idletasks()
             # Apply the user's current sort selection (not just cached order)
             self._grid_resort()
             return
@@ -26259,12 +26276,15 @@ class _TranscriptionPanel(ttk.Frame):
         self._browse_back_btn.pack(side="left", padx=(6, 0), before=self._browse_viewer_title)
         self._transcript_container.pack(fill="both", expand=True)
 
-    def _grid_load_videos(self, channel, year, month, gen=0):
-        """Background: query videos and metadata for the grid."""
+    def _grid_load_videos_data(self, channel, year, month,
+                               progress_cb=None, abort_check=None, skip_ffprobe=False):
+        """Pure data loader: query videos, metadata, thumbnails for a scope.
+        Returns (videos_list, has_metadata) or None if aborted/failed.
+        Does NOT touch any UI state or self._grid_videos."""
         if not self._conn:
-            return
-        if gen != self._grid_gen:
-            return  # stale request
+            return None
+        if abort_check and abort_check():
+            return None
         _is_all = channel == "__all__"
         if _is_all:
             sql = "SELECT title, filepath, video_id, tx_status, channel FROM videos WHERE channel != '__ver__'"
@@ -26282,13 +26302,13 @@ class _TranscriptionPanel(ttk.Frame):
             with self._db_lock:
                 rows = self._db_execute(sql, params).fetchall()
         except Exception:
-            return
-        if gen != self._grid_gen:
-            return
+            return None
+        if abort_check and abort_check():
+            return None
 
         # Build video dicts
-        self.after(0, lambda: self._grid_loading_progress.config(
-            text=f"Found {len(rows)} videos — loading metadata..."))
+        if progress_cb:
+            progress_cb(f"Found {len(rows)} videos — loading metadata...")
         import datetime as _dt
         videos = []
         for row in rows:
@@ -26314,11 +26334,11 @@ class _TranscriptionPanel(ttk.Frame):
                 _base = config.get("output_dir", "")
             _all_total = len(_all_chs)
             for _ac_idx, _ac in enumerate(_all_chs):
-                if gen != self._grid_gen:
-                    return
+                if abort_check and abort_check():
+                    return None
                 _ac_name = _ac.get("name", "")
-                self.after(0, lambda n=_ac_name, i=_ac_idx, t=_all_total: self._grid_loading_progress.config(
-                    text=f"Loading metadata... {i + 1}/{t} — {n}"))
+                if progress_cb:
+                    progress_cb(f"Loading metadata... {_ac_idx + 1}/{_all_total} — {_ac_name}")
                 _ac_folder = _ac.get("folder_override") or sanitize_folder(_ac_name)
                 _ac_fp = os.path.join(_base, _ac_folder) if _base else _ac_folder
                 _ac_sy = _ac.get("split_years", False)
@@ -26418,8 +26438,8 @@ class _TranscriptionPanel(ttk.Frame):
                 if not os.path.isdir(thumb_dir):
                     thumb_dir = None
 
-        if gen != self._grid_gen:
-            return
+        if abort_check and abort_check():
+            return None
 
         # Build title→video_id reverse map from metadata so videos without ID
         # in their filename can still be matched to metadata and thumbnails
@@ -26478,7 +26498,7 @@ class _TranscriptionPanel(ttk.Frame):
                     v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
                 except OSError:
                     pass
-            if not _is_all and not v["duration"] and v["filepath"]:
+            if not skip_ffprobe and not _is_all and not v["duration"] and v["filepath"]:
                 try:
                     _probed = _ffprobe_duration(v["filepath"])
                     if _probed > 0:
@@ -26502,8 +26522,8 @@ class _TranscriptionPanel(ttk.Frame):
         if _is_all:
             videos = [v for v in videos if v["date_str"] or v["upload_date"]]
 
-        self.after(0, lambda: self._grid_loading_progress.config(
-            text=f"Scanning thumbnails..."))
+        if progress_cb:
+            progress_cb("Scanning thumbnails...")
         # Initial sort by date (will be re-sorted to match dropdown in _grid_finish_load)
         def _sort_key(v):
             if v["upload_date"]:
@@ -26543,8 +26563,8 @@ class _TranscriptionPanel(ttk.Frame):
             _scan_thumb_dir(thumb_dir)
         # All Channels mode: scan all collected thumbnail dirs
         if _is_all and _all_thumb_dirs:
-            self.after(0, lambda: self._grid_loading_progress.config(
-                text=f"Scanning thumbnails across {len(_all_thumb_dirs)} folders..."))
+            if progress_cb:
+                progress_cb(f"Scanning thumbnails across {len(_all_thumb_dirs)} folders...")
             for _atd in _all_thumb_dirs:
                 _scan_thumb_dir(_atd)
         # If viewing at channel root with split_years, scan ALL year/month .Thumbnails
@@ -26575,8 +26595,8 @@ class _TranscriptionPanel(ttk.Frame):
                         _scan_thumb_dir(os.path.join(_mp, ".Thumbnails"))
             except OSError:
                 pass
-        if gen != self._grid_gen:
-            return
+        if abort_check and abort_check():
+            return None
         for v in videos:
             if v["video_id"]:
                 v["thumb_path"] = _thumb_files.get(v["video_id"])
@@ -26584,8 +26604,109 @@ class _TranscriptionPanel(ttk.Frame):
                 # Fallback: match by normalized title (handles fullwidth chars, trailing dots, etc.)
                 v["thumb_path"] = _thumb_by_title.get(_norm_title(v["title"][:100]))
 
+        return (videos, has_metadata)
+
+    def _grid_load_videos(self, channel, year, month, gen=0):
+        """Background: query videos and metadata for the grid."""
+        if gen != self._grid_gen:
+            return
+
+        def _progress(text):
+            self.after(0, lambda t=text: self._grid_loading_progress.config(text=t))
+
+        result = self._grid_load_videos_data(
+            channel, year, month,
+            progress_cb=_progress,
+            abort_check=lambda: gen != self._grid_gen)
+
+        if result is None or gen != self._grid_gen:
+            return
+
+        videos, has_metadata = result
         self._grid_videos = videos
         self.after(0, lambda: self._grid_render(has_metadata, channel, year, month, gen))
+
+    # ── Background grid preloading ────────────────────────────────────────
+
+    def _start_grid_preload(self):
+        """Kick off background grid preloading (called after disk scan completes)."""
+        if self._grid_preload_done or self._grid_preload_running:
+            return
+        self._grid_preload_running = True
+        self._grid_preload_cancel = False
+        threading.Thread(target=self._grid_preload_worker, daemon=True).start()
+
+    def _grid_preload_worker(self):
+        """Background thread: waits for UI to settle, then preloads all channel grids."""
+        try:
+            time.sleep(1.0)  # let browse tree and UI settle first
+            self._grid_preload_all()
+        finally:
+            self._grid_preload_running = False
+
+    def _grid_preload_all(self):
+        """Iterate all channels + 'All Channels', preloading grid data into cache."""
+        if not self._conn:
+            return
+        try:
+            with self._db_lock:
+                rows = self._db_execute(
+                    "SELECT DISTINCT channel FROM videos "
+                    "WHERE channel != '__ver__' ORDER BY channel COLLATE NOCASE"
+                ).fetchall()
+        except Exception:
+            return
+
+        channels = [r[0] for r in rows]
+
+        # Preload "All Channels" first (most likely first click)
+        if not self._grid_preload_cancel:
+            self._grid_preload_scope("__all__", None, None)
+
+        # Then individual channels
+        for ch in channels:
+            if self._grid_preload_cancel:
+                return
+            self._grid_preload_scope(ch, None, None)
+            time.sleep(0.2)
+
+        self._grid_preload_done = True
+        log("--- Browse tab preload complete ---\n", "simpleline_green")
+
+    def _grid_preload_scope(self, channel, year, month):
+        """Preload a single scope's data into _grid_cache (background thread).
+        Does NOT create PhotoImage objects or touch any active grid state."""
+        scope = (channel, year, month)
+
+        # Skip if already cached or user is actively viewing this scope
+        if scope in self._grid_cache or self._grid_scope == scope:
+            return
+
+        result = self._grid_load_videos_data(
+            channel, year, month,
+            progress_cb=None,
+            abort_check=lambda: self._grid_preload_cancel or self._grid_scope == scope,
+            skip_ffprobe=True)
+
+        if result is None:
+            return
+
+        videos, has_metadata = result
+
+        # Skip if user navigated here or another path already cached it
+        if self._grid_scope == scope or scope in self._grid_cache:
+            return
+
+        # Insert into cache on the main thread (OrderedDict not thread-safe)
+        def _insert():
+            if scope not in self._grid_cache and self._grid_scope != scope:
+                self._grid_cache[scope] = {
+                    "videos": videos,
+                    "photos": {},
+                    "has_metadata": has_metadata,
+                }
+        if _root_alive:
+            self.after(0, _insert)
 
     def _grid_render(self, has_metadata, channel, year, month, gen=0):
         """Render the video grid on the main thread."""
@@ -30729,6 +30850,39 @@ class _TranscriptionPanel(ttk.Frame):
         tk.Label(bf, textvariable=self._idx_progress_var, bg=self._TP_BG,
                  fg=self._TP_DIM, font=("Segoe UI", 9)).pack(side="left", padx=8)
 
+        # Auto-update settings
+        af = tk.Frame(f, bg=self._TP_BG)
+        af.pack(fill="x", padx=14, pady=(2, 6))
+        self._auto_index_var = tk.BooleanVar(value=config.get("auto_index_enabled", False))
+        self._auto_index_threshold_var = tk.StringVar(value=str(config.get("auto_index_threshold", 10)))
+        def _toggle_auto_index():
+            with config_lock:
+                config["auto_index_enabled"] = self._auto_index_var.get()
+            save_config(config)
+        tk.Checkbutton(af, text="Auto-update index every", variable=self._auto_index_var,
+                       command=_toggle_auto_index,
+                       bg=self._TP_BG, fg=self._TP_DIM, selectcolor=self._TP_BG,
+                       activebackground=self._TP_BG, activeforeground=self._TP_FG,
+                       font=("Segoe UI", 9), bd=0, highlightthickness=0).pack(side="left")
+        def _save_threshold(_e=None):
+            raw = self._auto_index_threshold_var.get().strip()
+            try:
+                val = max(1, min(9999, int(raw)))
+            except (ValueError, TypeError):
+                val = 10
+            self._auto_index_threshold_var.set(str(val))
+            with config_lock:
+                config["auto_index_threshold"] = val
+            save_config(config)
+        _thresh_entry = tk.Entry(af, textvariable=self._auto_index_threshold_var,
+                                 bg=self._TP_BG2, fg=self._TP_FG, insertbackground=self._TP_FG,
+                                 relief="flat", font=("Segoe UI", 9), width=4, justify="center")
+        _thresh_entry.pack(side="left", padx=4)
+        _thresh_entry.bind("<FocusOut>", _save_threshold)
+        _thresh_entry.bind("<Return>", _save_threshold)
+        tk.Label(af, text="downloads", bg=self._TP_BG, fg=self._TP_DIM,
+                 font=("Segoe UI", 9)).pack(side="left")
+
         # Log
         lf = tk.Frame(f, bg=self._TP_BG)
         lf.pack(fill="both", expand=True, padx=14, pady=6)
@@ -30972,8 +31126,25 @@ class _TranscriptionPanel(ttk.Frame):
                 "Set an output folder in the Download tab settings,\n"
                 "or add archive root folders here.")
             return
+        with config_lock:
+            config["downloads_since_last_index"] = 0
+        save_config(config)
         threading.Thread(target=self._run_index,
                          args=(roots, rebuild), daemon=True).start()
+
+    def _maybe_auto_index(self):
+        """Silently trigger an incremental index update after N downloads."""
+        if self._index_running:
+            return
+        roots = self._get_archive_roots()
+        if not roots:
+            return
+        with config_lock:
+            config["downloads_since_last_index"] = 0
+        save_config(config)
+        self._tp_log("─── Auto-index triggered ───")
+        threading.Thread(target=self._run_index,
+                         args=(roots, False), daemon=True).start()
 
     def _confirm_rebuild(self):
         if _dark_askquestion(
@@ -32096,6 +32267,17 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                     if len(recent) > RECENT_MAX: config["recent_downloads"] = recent[:RECENT_MAX]
                 save_config(config)
                 refresh_recent_list()
+                # Auto-index counter
+                with config_lock:
+                    _aic = config.get("downloads_since_last_index", 0) + 1
+                    config["downloads_since_last_index"] = _aic
+                    _ai_on = config.get("auto_index_enabled", False)
+                    _ai_th = config.get("auto_index_threshold", 10)
+                save_config(config)
+                if _ai_on and _aic >= _ai_th:
+                    _tp = _tp_panel_ref[0]
+                    if _tp:
+                        _tp._maybe_auto_index()
             if _root_alive:
                 root.after(0, _sync_no_fp)
             return
@@ -32173,6 +32355,18 @@ def record_download(title, channel, date, size_bytes="", duration_s="", filepath
                 if _tab_btns.get(str(tab_recent)):
                     _tab_btns[str(tab_recent)].config(text=f"  Recent ({_ct})  ")
                 _update_tray_badge()
+
+            # Auto-index counter
+            with config_lock:
+                _aic = config.get("downloads_since_last_index", 0) + 1
+                config["downloads_since_last_index"] = _aic
+                _ai_on = config.get("auto_index_enabled", False)
+                _ai_th = config.get("auto_index_threshold", 10)
+            save_config(config)
+            if _ai_on and _aic >= _ai_th:
+                _tp = _tp_panel_ref[0]
+                if _tp:
+                    _tp._maybe_auto_index()
 
         if _root_alive: _ui_queue.append(_sync)
 

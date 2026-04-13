@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.1"
+APP_VERSION = "v39.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3960,7 +3960,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 7:59pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 8:11pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -23764,7 +23764,14 @@ class _TranscriptionPanel(ttk.Frame):
         self._all_videos_lbl = tk.Label(hdr, text="All Videos", bg=self._TP_BG3, fg=self._TP_FG,
                  font=("Segoe UI", 11, "bold"))
         self._all_videos_lbl.pack(side="left")
-        self._all_videos_lbl.bind("<Button-3>", lambda e: self._secret_download_all_metadata())
+        def _show_all_videos_menu(e):
+            m = tk.Menu(self, tearoff=0, bg=self._TP_BG3, fg=self._TP_FG,
+                        activebackground=self._TP_ACCENT, activeforeground="white",
+                        relief="flat", bd=1)
+            m.add_command(label="  Queue all for Metadata", command=self._secret_download_all_metadata)
+            m.add_command(label="  Refresh all (update views/likes)", command=self._secret_refresh_all_metadata)
+            m.tk_popup(e.x_root, e.y_root)
+        self._all_videos_lbl.bind("<Button-3>", _show_all_videos_menu)
         # Title search bar — search video titles across all channels
         self._browse_search_var = tk.StringVar()
         _search_frame = tk.Frame(hdr, bg=self._TP_BG2, highlightthickness=1,
@@ -26242,10 +26249,10 @@ class _TranscriptionPanel(ttk.Frame):
         # Enrich videos with metadata
         for v in videos:
             m = metadata.get(v["video_id"]) if v["video_id"] else None
-            v["view_count"] = m.get("view_count", 0) if m else 0
-            v["like_count"] = m.get("like_count", 0) if m else 0
-            v["duration"] = m.get("duration", 0) if m else 0
-            v["upload_date"] = m.get("upload_date", "") if m else ""
+            v["view_count"] = (m.get("view_count") or 0) if m else 0
+            v["like_count"] = (m.get("like_count") or 0) if m else 0
+            v["duration"] = (m.get("duration") or 0) if m else 0
+            v["upload_date"] = (m.get("upload_date") or "") if m else ""
             if m and m.get("upload_date"):
                 try:
                     _ud = m["upload_date"]
@@ -26897,7 +26904,7 @@ class _TranscriptionPanel(ttk.Frame):
                 return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
             return "00000000"
         if sort == "Most Viewed":
-            self._grid_videos.sort(key=lambda x: x.get("view_count", 0), reverse=True)
+            self._grid_videos.sort(key=lambda x: x.get("view_count") or 0, reverse=True)
         elif sort == "Oldest":
             self._grid_videos.sort(key=_date_key)
         else:  # Newest
@@ -27063,6 +27070,37 @@ class _TranscriptionPanel(ttk.Frame):
             _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, None, None, ch_name, _quiet=True)
             queued += 1
         log(f"  \u2014 Added metadata download to queue for {queued} channel(s)\n", "simpleline_pink")
+
+    def _secret_refresh_all_metadata(self):
+        """Queue metadata REFRESH for ALL saved channels — updates views/likes only."""
+        if not _dark_askquestion("Refresh All Metadata",
+                "Refresh metadata for all channels?\n\n"
+                "This will re-fetch view counts and like counts\n"
+                "for every video. Comments will not be updated.\n"
+                "This may take a while.",
+                yes_text="Refresh All", no_text="Cancel"):
+            return
+        with config_lock:
+            channels = list(config.get("channels", []))
+        if not channels:
+            log("No channels configured.\n", "red")
+            return
+        channels = sorted(channels, key=lambda c: c.get("name", "").lower())
+        queued = 0
+        for ch_cfg in channels:
+            ch_name = ch_cfg.get("name", "")
+            if not ch_name:
+                continue
+            ch_url = ch_cfg.get("url", "")
+            folder = ch_cfg.get("folder_override") or sanitize_folder(ch_name)
+            with config_lock:
+                base = config.get("output_dir", "")
+            folder_path = os.path.join(base, folder) if base else folder
+            sy = ch_cfg.get("split_years", False)
+            sm = ch_cfg.get("split_months", False)
+            _add_to_metadata_queue(ch_name, ch_url, folder_path, sy, sm, None, None, ch_name, refresh=True, _quiet=True)
+            queued += 1
+        log(f"  \u2014 Queued metadata refresh for {queued} channel(s)\n", "simpleline_pink")
 
     def _on_retranscribe(self):
         """Transcribe or re-transcribe the currently viewed video using Whisper."""

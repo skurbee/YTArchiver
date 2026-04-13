@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.9"
+APP_VERSION = "v40.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4012,7 +4012,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:59pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 1:13pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -26527,10 +26527,11 @@ class _TranscriptionPanel(ttk.Frame):
         # Initial sort by date (will be re-sorted to match dropdown in _grid_finish_load)
         def _sort_key(v):
             if v["upload_date"]:
-                return v["upload_date"]
+                return (v["upload_date"], v.get("mtime") or 0.0)
             if v["mtime"]:
-                return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
-            return "00000000"
+                return (_dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d"),
+                        v["mtime"])
+            return ("00000000", 0.0)
         videos.sort(key=_sort_key, reverse=True)
 
         # Find thumbnail paths — scan .Thumbnails folders.
@@ -27228,10 +27229,13 @@ class _TranscriptionPanel(ttk.Frame):
         sort = self._grid_sort_var.get()
         def _date_key(v):
             if v["upload_date"]:
-                return v["upload_date"]
+                # Use mtime as tiebreaker so same-day videos stay in
+                # consistent order across re-sorts
+                return (v["upload_date"], v.get("mtime") or 0.0)
             if v["mtime"]:
-                return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
-            return "00000000"
+                return (_dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d"),
+                        v["mtime"])
+            return ("00000000", 0.0)
         if sort == "Most Viewed":
             self._grid_videos.sort(key=lambda x: x.get("view_count") or 0, reverse=True)
         elif sort == "Oldest":

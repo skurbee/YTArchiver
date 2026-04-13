@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.2"
+APP_VERSION = "v39.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3960,7 +3960,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 8:11pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 8:43pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6612,13 +6612,16 @@ def sync_single_channel(_from_queue=False):
                         "combined": not _at_sy
                     })
 
-                # Auto-metadata: queue metadata download for this channel after sync
+                # Auto-metadata: fetch metadata for just the newly downloaded videos
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
                     _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
+                    with _last_run_counts_lock:
+                        _am_vid_ids = list(_last_run_counts.get("downloaded_vid_ids", []))
                     _add_to_metadata_queue(ch["name"], url, _am_folder, _am_sy, _am_sm,
-                                           None, None, ch["name"])
+                                           None, None, ch["name"],
+                                           video_ids=_am_vid_ids if _am_vid_ids else None)
 
                 # Snapshot session_totals under lock for consistent summary
                 with _session_totals_lock:
@@ -11953,7 +11956,7 @@ def _start_redownload_task(ch_name, ch_url, folder, resolution):
         _redownload_running = False
 
 
-def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label, refresh=False, _quiet=False):
+def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_months, year, month, scope_label, refresh=False, _quiet=False, video_ids=None):
     """Add a metadata download task to the Sync-Tasks queue.
     Pass _quiet=True to suppress the per-channel "Added metadata download..."
     log line — bulk-queue callers (e.g. "Metadata for all channels") emit
@@ -11979,6 +11982,7 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
             "month": month,
             "scope_label": scope_label,
             "refresh": refresh,
+            "video_ids": video_ids,
             "_key": _key,
         })
     with _queue_order_lock:
@@ -12102,8 +12106,78 @@ def _run_metadata_download(item):
     month = item["month"]
     scope_label = item["scope_label"]
     refresh = item.get("refresh", False)
+    _direct_vid_ids = item.get("video_ids")
+
+    # Pause check before starting (respects pause between queued channels)
+    if pause_event.is_set() and not cancel_event.is_set():
+        log(f"  \u23f8 Metadata paused at {_fmt_time()} \u2014 click Resume.\n", "pausestatus")
+        _tray_stop_spin(force=True)
+        while pause_event.is_set() and not cancel_event.is_set():
+            time.sleep(0.5)
+        clear_pause_status()
+        if cancel_event.is_set():
+            return
+        _tray_start_spin()
+        log(f"  \u25b6 Metadata resumed at {_fmt_time()}...\n", "pauselog")
 
     log(f"Metadata: preparing {scope_label}...\n", "simpleline")
+
+    # ── Fast path: when specific video IDs are provided (e.g. from auto-metadata
+    # after a sync), skip the entire multi-pass resolution pipeline and just fetch
+    # metadata directly for those IDs. This avoids the expensive channel playlist
+    # enumeration that can take minutes for large channels.
+    if _direct_vid_ids:
+        tp = _tp_panel_ref[0]
+        if not tp or not tp._conn:
+            log("Metadata: no database connection.\n", "red")
+            return
+        _n = len(_direct_vid_ids)
+        log(f"  \u2014 Fetching metadata for {_n} newly downloaded video{'s' if _n != 1 else ''}...\n", "simpleline_pink")
+        if _is_simple_mode and _n > 0:
+            _start_simple_anim(ch_name, 1, _n, mode="metadata")
+        _done = 0
+        for vid_id in _direct_vid_ids:
+            if cancel_event.is_set():
+                break
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  \u23f8 Metadata paused at {_fmt_time()} \u2014 click Resume.\n", "pausestatus")
+                while pause_event.is_set() and not cancel_event.is_set():
+                    time.sleep(0.5)
+                clear_pause_status()
+                if not cancel_event.is_set():
+                    log(f"  \u25b6 Metadata resumed at {_fmt_time()}...\n", "pauselog")
+            # Look up title + filepath from DB for this video_id
+            _row = None
+            try:
+                _row = tp._db_execute(
+                    "SELECT title, filepath, year, month FROM videos WHERE channel=? AND video_id=?",
+                    (ch_name, vid_id)).fetchone()
+            except Exception:
+                pass
+            _title = _row[0] if _row else vid_id
+            _trunc = _trunc_pad_title(_title, _MAX_TITLE_DISPLAY - 15)
+            _done += 1
+            if _is_simple_mode:
+                _simple_anim_state["idx"] = _done
+                _simple_anim_state["total"] = _n
+            log(f"  \u2014 [{_done}/{_n}] Metadata - {_trunc}\n", "simpleline_pink")
+            entry = tp._fetch_video_metadata(vid_id, _title)
+            if entry:
+                # Determine the correct JSONL path
+                _v_year = _row[2] if _row else None
+                _v_month = _row[3] if _row else None
+                meta_path, _ = tp._get_metadata_jsonl_path(
+                    ch_name, folder_path, split_years, split_months,
+                    year=_v_year, month=_v_month)
+                existing = tp._read_metadata_jsonl(meta_path)
+                existing[vid_id] = entry
+                tp._write_metadata_jsonl(meta_path, existing)
+        if _is_simple_mode:
+            _stop_simple_anim()
+            clear_simple_status()
+        if not cancel_event.is_set():
+            log(f"  \u2714 Metadata complete: {_done} video{'s' if _done != 1 else ''} fetched.\n", "simpleline_green")
+        return
 
     # ── Live prep scanline: shows current phase during slow resolution ──
     # Only surfaces after 5s of elapsed prep time, so fast channels (<100
@@ -17312,6 +17386,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
     _prog_last_pct = -1.0
     _speed_samples = []
     _tracked_paths = []  # file paths captured at DLTRACK time for per-batch compression
+    _downloaded_vid_ids = []  # video IDs of newly downloaded videos (for targeted metadata fetch)
     _local_archived_set = _load_archived_ids()   # ID-based dedup (works when yt-dlp logs the ID)
     _seen_filter_titles = _load_seen_filter_titles()  # title-based dedup (works even when ID is not logged)
     _seen_filter_batch = []  # batch buffer for seen-filter-title file writes
@@ -17992,6 +18067,7 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                         session_totals["dl"] += 1
                     if current_vid_id:
                         _local_archived_set.add(current_vid_id)
+                        _downloaded_vid_ids.append(current_vid_id)
                     _write_sync_progress()
 
                     if is_simple_mode:
@@ -18054,7 +18130,8 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
 
     with _last_run_counts_lock:
         _last_run_counts.update({"dl": dl_count, "skip": skip_count, "dur": dur_count, "err": err_count,
-                                 "skipped_titles": list(_skipped_dur_titles)})
+                                 "skipped_titles": list(_skipped_dur_titles),
+                                 "downloaded_vid_ids": list(_downloaded_vid_ids)})
     return dl_count
 
 
@@ -18660,8 +18737,11 @@ def start_sync_all():
                     _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
+                    with _last_run_counts_lock:
+                        _am_vid_ids = list(_last_run_counts.get("downloaded_vid_ids", []))
                     _add_to_metadata_queue(ch_name, url, _am_folder, _am_sy, _am_sm,
-                                           None, None, ch_name)
+                                           None, None, ch_name,
+                                           video_ids=_am_vid_ids if _am_vid_ids else None)
 
             _in_deferred_streams = False
             if deferred_streams and not cancel_event.is_set():
@@ -22194,8 +22274,11 @@ def _run_autorun():
                     _am_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _am_sy = ch.get("split_years", False)
                     _am_sm = ch.get("split_months", False)
+                    with _last_run_counts_lock:
+                        _am_vid_ids = list(_last_run_counts.get("downloaded_vid_ids", []))
                     _add_to_metadata_queue(_am_name, url, _am_folder, _am_sy, _am_sm,
-                                           None, None, _am_name)
+                                           None, None, _am_name,
+                                           video_ids=_am_vid_ids if _am_vid_ids else None)
 
             # Capture last channel's batch state before deferred streams may clobber loop variables
             _last_batch_url = url

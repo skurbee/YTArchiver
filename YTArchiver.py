@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.3"
+APP_VERSION = "v39.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3960,7 +3960,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 8:43pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 9:52pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -18998,21 +18998,21 @@ def _clear_all_logs():
     global _log_at_bottom, _log_user_scrolled
     log_box.config(state="normal")
 
-    # Preserve pause/resume lines — collect all pauselog/pausestatus ranges sorted by position
+    # Preserve pause/resume lines ONLY if a task is actively paused right now
     _preserved = []
-    _all_pause_ranges = []
-    for _ptag in ("pauselog", "pausestatus"):
-        _pr = log_box.tag_ranges(_ptag)
-        for _pi in range(0, len(_pr), 2):
-            _all_pause_ranges.append((_pr[_pi], _pr[_pi + 1], _ptag))
-    # Sort by position so lines are re-inserted in order
-    _all_pause_ranges.sort(key=lambda x: [int(p) for p in str(x[0]).split(".")])
-    for _ps, _pe_idx, _ptag in _all_pause_ranges:
-        _preserved.append((log_box.get(_ps, _pe_idx), _ptag))
+    if pause_event.is_set() and (_sync_running or _reorg_running or _redownload_running or _metadata_running):
+        _all_pause_ranges = []
+        for _ptag in ("pauselog", "pausestatus"):
+            _pr = log_box.tag_ranges(_ptag)
+            for _pi in range(0, len(_pr), 2):
+                _all_pause_ranges.append((_pr[_pi], _pr[_pi + 1], _ptag))
+        _all_pause_ranges.sort(key=lambda x: [int(p) for p in str(x[0]).split(".")])
+        for _ps, _pe_idx, _ptag in _all_pause_ranges:
+            _preserved.append((log_box.get(_ps, _pe_idx), _ptag))
 
     log_box.delete("1.0", tk.END)
 
-    # Re-insert preserved pause/resume lines
+    # Re-insert preserved pause/resume lines (only if still paused)
     for _ptext, _ptag in _preserved:
         log_box.insert(tk.END, _ptext, _ptag)
 

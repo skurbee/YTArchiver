@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.0"
+APP_VERSION = "v39.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3939,8 +3939,7 @@ style.map("Recent.Treeview.Heading",
 # Transcriptions panel treeview
 style.configure("TP.Treeview",
                 background="#161719", foreground="#dde1e8", fieldbackground="#161719",
-                borderwidth=0, rowheight=24, font=("Segoe UI", 9),
-                indent=24)
+                borderwidth=0, rowheight=24, font=("Segoe UI", 9))
 style.configure("TP.Treeview.Heading",
                 background="#1c1e21", foreground="#4a9eff", relief="flat",
                 font=("Segoe UI", 9, "bold"), padding=[6, 4])
@@ -3955,45 +3954,13 @@ style.configure("Search.Horizontal.TProgressbar",
                 troughcolor="#1c1e21", background="#4a9eff",
                 thickness=3, borderwidth=0)
 
-# Custom larger +/- expand indicators for TP.Treeview (14x14 px)
-try:
-    _ind_size = 14
-    _ind_bg = "#161719"
-    _ind_fg = "#8a8e96"
-    # Build closed indicator (+)
-    _img_closed = tk.PhotoImage(width=_ind_size, height=_ind_size)
-    _img_closed.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
-    for _px in range(3, _ind_size - 3):
-        _img_closed.put(_ind_fg, to=(_px, _ind_size // 2, _px + 1, _ind_size // 2 + 1))  # horizontal
-        _img_closed.put(_ind_fg, to=(_ind_size // 2, _px, _ind_size // 2 + 1, _px + 1))  # vertical
-    # Build open indicator (-)
-    _img_open = tk.PhotoImage(width=_ind_size, height=_ind_size)
-    _img_open.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
-    for _px in range(3, _ind_size - 3):
-        _img_open.put(_ind_fg, to=(_px, _ind_size // 2, _px + 1, _ind_size // 2 + 1))  # horizontal only
-    # Empty image for leaf nodes (no children)
-    _img_empty = tk.PhotoImage(width=_ind_size, height=_ind_size)
-    _img_empty.put(_ind_bg, to=(0, 0, _ind_size, _ind_size))
-    style.element_create("TP.indicator", "image", _img_closed,
-                         ("user1", "!user2", _img_open),
-                         ("!user1", _img_empty),
-                         sticky="w", width=_ind_size, height=_ind_size)
-    style.layout("TP.Treeview.Item", [
-        ("TP.Treeview.padding", {"sticky": "nswe", "children": [
-            ("TP.indicator", {"side": "left", "sticky": ""}),
-            ("Treeitem.image", {"side": "left", "sticky": ""}),
-            ("Treeitem.text", {"side": "left", "sticky": ""}),
-        ]}),
-    ])
-except Exception:
-    pass  # fall back to default indicators
 
 header_strip = tk.Frame(root, bg=C_BG, height=42)
 header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 7:12pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 7:59pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5110,8 +5077,8 @@ def refresh_channel_dropdowns():
             except Exception:
                 ls_str = ls_raw[:12]
 
-        # Compress column — checkmark if any compression settings enabled
-        compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _QUALITY_OPTIONS else "—"
+        # Compress column — checkmark if enabled, blank if not
+        compress_str = "✓" if c.get("compress_enabled", False) and c.get("compress_level", "") in _QUALITY_OPTIONS else ""
 
         # Transcribed status column — only show Running/Queued for transcription tasks, not encode
         auto_t = c.get("auto_transcribe", False)
@@ -5136,9 +5103,9 @@ def refresh_channel_dropdowns():
         elif _is_queued_t:
             trans_str = "Queued"
         elif t_complete and t_pending > 0:
-            trans_str = f"\U0001f7e1 {'A ' if auto_t else ''}\u2713 -{t_pending}"
+            trans_str = f"{'A ' if auto_t else ''}\u2713 -{t_pending}"
         elif t_complete:
-            trans_str = f"\U0001f7e2 {'A ' if auto_t else ''}\u2713"
+            trans_str = f"{'A ' if auto_t else ''}\u2713"
         elif auto_t:
             trans_str = "A"
         else:
@@ -5155,11 +5122,11 @@ def refresh_channel_dropdowns():
         elif _is_queued_m:
             meta_str = "Queued"
         elif _has_meta:
-            meta_str = "✓ Done" if auto_m else "✓"
+            meta_str = f"{'A ' if auto_m else ''}\u2713"
         elif auto_m:
-            meta_str = "✓ Auto"
+            meta_str = "A"
         else:
-            meta_str = "—"
+            meta_str = ""
 
         # Look up # of vids and size on disk from the cache (populated by
         # background scan after startup, or by per-channel rescan after actions).
@@ -26029,7 +25996,9 @@ class _TranscriptionPanel(ttk.Frame):
                          args=(channel, year, month, _gen), daemon=True).start()
         # Pre-expand tree for this scope so clicking a video opens instantly
         # (otherwise _grid_navigate_to_video has to expand lazily with delays)
-        self._grid_preexpand_tree(channel, year, month)
+        # Skip for __all__ — it has no title nodes to preexpand
+        if channel != "__all__":
+            self._grid_preexpand_tree(channel, year, month)
 
     def _grid_preexpand_tree(self, channel, year, month):
         """Pre-expand the browse tree for the current grid scope so that
@@ -26039,12 +26008,16 @@ class _TranscriptionPanel(ttk.Frame):
             _chain.append(("year", channel, year, None))
         if month is not None:
             _chain.append(("month", channel, year, month))
-        self._grid_preexpand_step(_chain, 0)
+        _gen = getattr(self, '_grid_gen', 0)
+        self._grid_preexpand_step(_chain, 0, _gen)
 
-    def _grid_preexpand_step(self, chain, step):
+    def _grid_preexpand_step(self, chain, step, gen=0):
         """Expand tree nodes one level at a time for pre-loading (no title selection)."""
         if step >= len(chain):
             return  # all levels expanded
+        # Abort if scope changed since this was scheduled
+        if gen and gen != getattr(self, '_grid_gen', 0):
+            return
         node_type, channel, year, month = chain[step]
         for iid, meta in self._browse_items.items():
             if meta.get("type") == node_type and meta.get("channel") == channel:
@@ -26053,10 +26026,10 @@ class _TranscriptionPanel(ttk.Frame):
                    (node_type == "month" and meta.get("year") == year and meta.get("month") == month):
                     self._browse_tree.item(iid, open=True)
                     self._on_browse_open_for_iid(iid)
-                    self.after(200, lambda: self._grid_preexpand_step(chain, step + 1))
+                    self.after(200, lambda: self._grid_preexpand_step(chain, step + 1, gen))
                     return
         # Node not found — retry after a short delay
-        self.after(100, lambda: self._grid_preexpand_step(chain, step + 1))
+        self.after(100, lambda: self._grid_preexpand_step(chain, step + 1, gen))
 
     def _hide_grid(self):
         """Hide the video grid and restore the transcript viewer."""
@@ -26124,10 +26097,13 @@ class _TranscriptionPanel(ttk.Frame):
             with config_lock:
                 _all_chs = list(config.get("channels", []))
                 _base = config.get("output_dir", "")
-            for _ac in _all_chs:
+            _all_total = len(_all_chs)
+            for _ac_idx, _ac in enumerate(_all_chs):
                 if gen != self._grid_gen:
                     return
                 _ac_name = _ac.get("name", "")
+                self.after(0, lambda n=_ac_name, i=_ac_idx, t=_all_total: self._grid_loading_progress.config(
+                    text=f"Loading metadata... {i + 1}/{t} — {n}"))
                 _ac_folder = _ac.get("folder_override") or sanitize_folder(_ac_name)
                 _ac_fp = os.path.join(_base, _ac_folder) if _base else _ac_folder
                 _ac_sy = _ac.get("split_years", False)
@@ -26287,7 +26263,7 @@ class _TranscriptionPanel(ttk.Frame):
                     v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
                 except OSError:
                     pass
-            if not v["duration"] and v["filepath"]:
+            if not _is_all and not v["duration"] and v["filepath"]:
                 try:
                     _probed = _ffprobe_duration(v["filepath"])
                     if _probed > 0:
@@ -26306,6 +26282,10 @@ class _TranscriptionPanel(ttk.Frame):
                 _seen_vids.add(vid)
             _deduped.append(v)
         videos = _deduped
+
+        # All Channels: hide videos with no date (no metadata date, no file mtime)
+        if _is_all:
+            videos = [v for v in videos if v["date_str"] or v["upload_date"]]
 
         self.after(0, lambda: self._grid_loading_progress.config(
             text=f"Scanning thumbnails..."))
@@ -26348,6 +26328,8 @@ class _TranscriptionPanel(ttk.Frame):
             _scan_thumb_dir(thumb_dir)
         # All Channels mode: scan all collected thumbnail dirs
         if _is_all and _all_thumb_dirs:
+            self.after(0, lambda: self._grid_loading_progress.config(
+                text=f"Scanning thumbnails across {len(_all_thumb_dirs)} folders..."))
             for _atd in _all_thumb_dirs:
                 _scan_thumb_dir(_atd)
         # If viewing at channel root with split_years, scan ALL year/month .Thumbnails
@@ -26754,13 +26736,14 @@ class _TranscriptionPanel(ttk.Frame):
                      bg=_bg, fg=_fg, font=_font_current).pack(side="left")
             return
         # Channel segment — clickable if viewing a year/month
+        _display_name = "All Channels" if channel == "__all__" else channel
         if year is not None or month is not None:
-            ch_lbl = tk.Label(self._grid_breadcrumb_frame, text=channel, bg=_bg,
+            ch_lbl = tk.Label(self._grid_breadcrumb_frame, text=_display_name, bg=_bg,
                               fg=self._TP_ACCENT, font=_font_link, cursor="hand2")
             ch_lbl.pack(side="left")
             ch_lbl.bind("<Button-1>", lambda e, c=channel: self._show_grid(c))
         else:
-            tk.Label(self._grid_breadcrumb_frame, text=channel, bg=_bg,
+            tk.Label(self._grid_breadcrumb_frame, text=_display_name, bg=_bg,
                      fg=_fg, font=_font_current).pack(side="left")
         if year is not None:
             tk.Label(self._grid_breadcrumb_frame, text="  /  ", bg=_bg,
@@ -26914,7 +26897,7 @@ class _TranscriptionPanel(ttk.Frame):
                 return _dt.datetime.fromtimestamp(v["mtime"]).strftime("%Y%m%d")
             return "00000000"
         if sort == "Most Viewed":
-            self._grid_videos.sort(key=lambda x: x["view_count"], reverse=True)
+            self._grid_videos.sort(key=lambda x: x.get("view_count", 0), reverse=True)
         elif sort == "Oldest":
             self._grid_videos.sort(key=_date_key)
         else:  # Newest

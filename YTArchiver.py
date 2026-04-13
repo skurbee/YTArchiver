@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.4"
+APP_VERSION = "v39.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -829,8 +829,8 @@ def log(text, tag=None):
                                 log_box.insert(_p, "\u2014", "simpleline_pink")
                                 _p = log_box.index(f"{_p}+1c")
                                 _rem = _rem[_di + 1:]
-                        elif _base_tag == "simpleline_pink" and "\u2014" in _txt:
-                            # Pink lines: color only the — pink, rest in default simpleline
+                        elif _base_tag in ("simpleline_pink", "simpleline_blue") and "\u2014" in _txt:
+                            # Pink/blue queue lines: color only the — in its color, rest default
                             _p = _ins_pos
                             _remaining = _txt
                             while _remaining:
@@ -841,7 +841,7 @@ def log(text, tag=None):
                                 if _di > 0:
                                     log_box.insert(_p, _remaining[:_di], "simpleline")
                                     _p = log_box.index(f"{_p}+{_di}c")
-                                log_box.insert(_p, "\u2014", "simpleline_pink")
+                                log_box.insert(_p, "\u2014", _base_tag)
                                 _p = log_box.index(f"{_p}+1c")
                                 _remaining = _remaining[_di + 1:]
                         elif _base_tag in ("simpleline", "simpleline_green") and _txt.lstrip().startswith("\u2014") and "\u2014" in _txt:
@@ -924,19 +924,25 @@ def log(text, tag=None):
                                     _color_ranges.append((_cm.start(), _cm.end(), "simpleline_green"))
                             _color_ranges.sort()
                             # Walk and emit segments using per-range color
+                            # For task-colored tags without brackets, non-dash
+                            # text should be default (white) so only the em-dash
+                            # carries the task color — matching blue/pink behavior.
+                            _nondash_tag = ("simpleline" if _base_tag in (
+                                "simpleline_compress", "simpleline_redwnl", "simpleline_reorg"
+                            ) else _base_tag)
                             _p = _ins_pos
                             _pos = 0
                             for _r_start, _r_end, _r_tag in _color_ranges:
                                 if _r_start > _pos:
                                     _seg = _txt[_pos:_r_start]
-                                    log_box.insert(_p, _seg, _base_tag)
+                                    log_box.insert(_p, _seg, _nondash_tag)
                                     _p = log_box.index(f"{_p}+{len(_seg)}c")
                                 _seg = _txt[_r_start:_r_end]
                                 log_box.insert(_p, _seg, _r_tag)
                                 _p = log_box.index(f"{_p}+{len(_seg)}c")
                                 _pos = _r_end
                             if _pos < len(_txt):
-                                log_box.insert(_p, _txt[_pos:], _base_tag)
+                                log_box.insert(_p, _txt[_pos:], _nondash_tag)
                             return
                         log_box.insert(_ins_pos, _txt, _base_tag)
                         return
@@ -1163,9 +1169,7 @@ def log(text, tag=None):
 
                 # Skip auto-scroll for transient/passive messages that shouldn't
                 # disrupt the user's current scroll position
-                _skip_scroll = (
-                    (use_tag == "header" and "Added to GPU Tasks:" in text)
-                )
+                _skip_scroll = False
                 if at_bottom and not _skip_scroll:
                     log_box.see(tk.END)
                 log_box.config(state="disabled")
@@ -3960,7 +3964,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 9:52pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 11:22pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5411,7 +5415,7 @@ def _chan_ctx_sync_now():
                 _sync_queue.append(copy.deepcopy(ch))
                 with _queue_order_lock:
                     _queue_order.append(("sync", ch["url"]))
-                log(f"\n=== Added {ch['name']} to sync queue ===\n", "header")
+                log(f"\n=== Added to Sync List: {ch['name']} ===\n", "header")
             else:
                 log(f"  ⚠ {ch['name']} is already in the sync queue.\n", "simpleline")
         _update_queue_btn()
@@ -6182,7 +6186,7 @@ def sync_single_channel(_from_queue=False):
                 _sync_queue.append(copy.deepcopy(ch))
                 with _queue_order_lock:
                     _queue_order.append(("sync", ch["url"]))
-                log(f"\n=== Added {ch['name']} to sync queue ===\n", "header")
+                log(f"\n=== Added to Sync List: {ch['name']} ===\n", "header")
             else:
                 log(f"  ⚠ {ch['name']} is already in the sync queue.\n", "simpleline")
         _update_queue_btn()
@@ -6609,7 +6613,7 @@ def sync_single_channel(_from_queue=False):
                     _add_to_gpu_queue({
                         "type": "transcribe", "ch_name": ch["name"], "ch_url": url,
                         "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
+                        "combined": not _at_sy, "model": "small"
                     })
 
                 # Auto-metadata: fetch metadata for just the newly downloaded videos
@@ -7304,7 +7308,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
     total = len(all_files)
     if total == 0:
         log(f"  No video files found in {folder_path}\n", "dim")
-        log(f"--- Reorganization complete ---\n", "header")
+        log(f"\n=== Reorganization Complete ===\n", "header")
         return
 
     log(f"  Found {total:,} video file(s) to process...\n", "dim")
@@ -7469,7 +7473,7 @@ def _reorganize_channel_folder(channel_name, folder_path, target_years, target_m
     if cleaned: summary_parts.append(f"{cleaned:,} empty folders removed")
 
     log(f"  ✓ Done: {', '.join(summary_parts)}\n", "simpleline_green")
-    log(f"--- Reorganization complete ---\n", "summary")
+    log(f"\n=== Reorganization Complete ===\n", "header")
     return True
 
 
@@ -7799,7 +7803,7 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
                 _reorg_queue.append((channel_name, folder_path, target_years, target_months, ch_url, recheck_dates))
                 with _queue_order_lock:
                     _queue_order.append(("reorg", ch_url or channel_name))
-                log(f"\n=== Added {channel_name} reorganize to Sync List ===\n", "header")
+                log(f"\n=== Added to Sync List: Reorganize {channel_name} ===\n", "header")
             else:
                 log(f"  ⚠ {channel_name} is already in the reorganize queue.\n", "simpleline")
         _update_queue_btn()
@@ -11743,7 +11747,7 @@ def _add_to_gpu_queue(item, _quiet=False):
                 if not _quiet:
                     log(f"  ⚠ {item['ch_name']} is already in the GPU Tasks queue.\n", "simpleline")
                 return
-            label = f"Transcribe {item['ch_name']}"
+            label = "transcription"
         elif item["type"] == "encode":
             _bn = item.get("batch_num")
             if _bn is not None:
@@ -11753,7 +11757,7 @@ def _add_to_gpu_queue(item, _quiet=False):
                     if not _quiet:
                         log(f"  ⚠ {item['ch_name']} Batch {_bn} compression is already in the GPU Tasks queue.\n", "simpleline")
                     return
-                label = f"Compress {item['ch_name']}, Batch {_bn}"
+                label = f"compression for {item['ch_name']}, Batch {_bn}"
             else:
                 # Non-batch: dedup by channel URL (original behavior)
                 if any(q.get("ch_url") == item["ch_url"] and q["type"] == "encode" for q in _gpu_queue) or \
@@ -11761,7 +11765,7 @@ def _add_to_gpu_queue(item, _quiet=False):
                     if not _quiet:
                         log(f"  ⚠ {item['ch_name']} compression is already in the GPU Tasks queue.\n", "simpleline")
                     return
-                label = f"Compress {item['ch_name']}"
+                label = f"compression for {item['ch_name']}"
         elif item["type"] == "backlog_encode":
             if any(q.get("ch_url") == item["ch_url"] and q["type"] == "backlog_encode" for q in _gpu_queue) or \
                (_cur and _cur.get("ch_url") == item.get("ch_url") and _cur.get("type") == "backlog_encode"):
@@ -11790,7 +11794,12 @@ def _add_to_gpu_queue(item, _quiet=False):
         else:
             label = "GPU Task"
         _gpu_queue.append(item)
-    log(f"=== Added to GPU Tasks: {label} ===\n", "header")
+    _gpu_type = item.get("type", "")
+    if _gpu_type in ("transcribe", "mt"):
+        _gpu_log_tag = "simpleline_blue"
+    else:
+        _gpu_log_tag = "simpleline_compress"
+    log(f"  \u2014 Added {label} to GPU-tasks queue\n", _gpu_log_tag)
     _update_gpu_btn()
     _save_queue_state()
     # Refresh channel list so Transcribed column shows "Queued" immediately.
@@ -13837,7 +13846,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 _transcribe_queue.append((ch_name, ch_url, folder, split_years, split_months, combined))
                 with _queue_order_lock:
                     _queue_order.append(("transcribe", ch_url))
-                log(f"\n=== Added {ch_name} transcription to Sync List ===\n", "header")
+                log(f"\n=== Added to Sync List: Transcribe {ch_name} ===\n", "header")
             else:
                 log(f"  ⚠ {ch_name} is already in the transcription queue.\n", "simpleline")
         _update_queue_btn()
@@ -18730,7 +18739,7 @@ def start_sync_all():
                     _add_to_gpu_queue({
                         "type": "transcribe", "ch_name": ch_name, "ch_url": url,
                         "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
+                        "combined": not _at_sy, "model": "small"
                     })
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
@@ -20933,9 +20942,16 @@ def _gpu_start():
         _gpu_popup["win"] = None
 
     # Only show Whisper model dialog if queue contains transcription tasks
+    # that don't already have a model specified (auto-transcribe sets "small")
     _has_transcribe_tasks = False
     with _gpu_queue_lock:
-        _has_transcribe_tasks = any(q["type"] in ("transcribe", "mt") for q in _gpu_queue)
+        _has_transcribe_tasks = any(q["type"] in ("transcribe", "mt") and not q.get("model") for q in _gpu_queue)
+        # If all transcribe tasks have a model pre-set, use the first one
+        if not _has_transcribe_tasks:
+            for q in _gpu_queue:
+                if q["type"] in ("transcribe", "mt") and q.get("model"):
+                    _whisper_model_choice = q["model"]
+                    break
 
     def _gpu_worker():
         global _gpu_running, _gpu_current_item, _gpu_truly_paused
@@ -20998,6 +21014,10 @@ def _gpu_start():
                         _gpu_current["ch_url"] = item.get("ch_url")
                         _update_gpu_btn()
                         _ui_queue.append(refresh_channel_dropdowns)
+                        # Use model from queue item if specified (auto-transcribe uses "small")
+                        _item_model = item.get("model")
+                        if _item_model:
+                            _whisper_model_choice = _item_model
                         _start_transcription(
                             item["ch_name"], item["ch_url"], item["folder"],
                             item["split_years"], item["split_months"], item["combined"],
@@ -21052,7 +21072,7 @@ def _gpu_start():
                 _update_gpu_btn()
 
             if not _gpu_cancel.is_set():
-                log(f"\n  ✓ All GPU Tasks completed.\n", "simpleline_green")
+                pass  # silent completion — individual tasks log their own status
         except Exception as e:
             log(f"\n  ⚠ GPU Tasks error: {e}\n", "red")
             try:
@@ -22266,7 +22286,7 @@ def _run_autorun():
                     _add_to_gpu_queue({
                         "type": "transcribe", "ch_name": ch_name_at, "ch_url": url,
                         "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy
+                        "combined": not _at_sy, "model": "small"
                     })
 
                 if c_dl > 0 and ch.get("auto_metadata", False) and not cancel_event.is_set():
@@ -23564,27 +23584,16 @@ class _TranscriptionPanel(ttk.Frame):
         self.after(0, _on_main)
 
     def offer_pending_reindex(self):
-        """Show a single reindex popup for all channels accumulated in
-        _pending_reindex_names since the last flush. Called when the
-        transcribe queue is fully drained."""
+        """No-op — reindex popup removed. The index warning banner in Browse
+        already tells users when videos are un-indexed."""
         global _pending_reindex_names
         with _pending_reindex_lock:
-            _names = sorted(_pending_reindex_names)
-            _pending_reindex_names = set()
-        if not _names:
-            return
-        # Build display string: one channel → `"Name"`, many → `N channels`
-        if len(_names) == 1:
-            _label = _names[0]
-        else:
-            _label = f"{len(_names)} channels"
-        def _on_main():
-            if not self._loaded:
-                self._pending_reindex = _label
-                return
-            self._maybe_offer_reindex(_label)
-            self._refresh_browse()
-        self.after(0, _on_main)
+            _pending_reindex_names.clear()
+        # Still refresh the browse tree so new transcriptions show up
+        try:
+            self.after(0, self._refresh_browse)
+        except Exception:
+            pass
 
     def _maybe_offer_reindex(self, channel_name):
         # channel_name may be a real channel ("Apple Explained") or a batch

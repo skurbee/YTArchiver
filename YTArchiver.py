@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.0"
+APP_VERSION = "v40.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2367,6 +2367,7 @@ def _handle_disk_error():
     # Pause GPU tasks
     if not _gpu_pause.is_set():
         _gpu_pause.set()
+    _update_redownload_hist_pause()
     # Stop the tray spinner immediately — the sync worker thread may still be
     # blocked waiting for yt-dlp output and won't reach its own pause check yet.
     _tray_stop_spin(force=True)
@@ -2417,6 +2418,7 @@ def _disk_retry_check():
                     pause_event.clear()
                 if _gpu_pause.is_set():
                     _gpu_pause.clear()
+                _update_redownload_hist_pause()
             else:
                 log(f"  ⚠ Disk still unwritable — retrying in {_DISK_RETRY_MINUTES} minutes...\n", "red")
                 try:
@@ -4012,7 +4014,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 1:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 3:43pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -19069,6 +19071,7 @@ def _global_toggle_pause():
     else:
         pause_event.set()
         _gpu_pause.set()
+    _update_redownload_hist_pause()
     _update_global_pause_btn_sync()
 
 
@@ -19307,6 +19310,7 @@ def toggle_pause():
         # No OS-level process suspend needed — the worker thread will
         # stop reading stdout at the next pause check, the pipe buffer
         # fills up, and yt-dlp naturally blocks on its next write.
+    _update_redownload_hist_pause()
 
 
 def _sync_task_finished():
@@ -21868,6 +21872,29 @@ def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, sk
         _ui_queue.append(_refresh_autorun_history)
 
 
+def _update_redownload_hist_pause():
+    """Update the in-progress redownload history line to reflect pause/resume state."""
+    global _redownload_hist_marker
+    if not _redownload_running or _redownload_hist_marker is None:
+        return
+    _paused = pause_event.is_set()
+    _old_suffix = "⏸ paused" if not _paused else "▶ running..."
+    _new_suffix = "⏸ paused" if _paused else "▶ running..."
+    if _old_suffix not in _redownload_hist_marker:
+        return
+    _new_line = _redownload_hist_marker.replace(_old_suffix, _new_suffix)
+    with config_lock:
+        hist = config.get("autorun_history", [])
+        for _hi, _hline in enumerate(hist):
+            if _hline == _redownload_hist_marker:
+                hist[_hi] = _new_line
+                break
+    _redownload_hist_marker = _new_line
+    save_config(config)
+    if _root_alive:
+        _ui_queue.append(_refresh_autorun_history)
+
+
 def _any_task_running():
     """True if any pipeline task is currently running (sync, reorg, redownload, transcribe, metadata)."""
     return _sync_running or _reorg_running or _redownload_running or _transcribe_running or _metadata_running
@@ -22987,6 +23014,11 @@ class _TranscriptionPanel(ttk.Frame):
             pass  # on_shown() will retry if needed
         finally:
             self._db_loading = False
+        # Run schema/dedupe checks here in the background thread (not on main
+        # thread) so they never block the UI.  These are fast DB queries that
+        # only do real work on first launch or after a schema bump.
+        if self._conn is not None:
+            self._ensure_videos_populated()
         # DB ready — eagerly build UI on the main thread so the Browse tab
         # is instant when the user eventually clicks it.
         if self._conn is not None and not self._loaded:
@@ -23001,7 +23033,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._tp_extra_roots = list(config.get("tp_archive_roots", []))
         self._build_ui()
         self._refresh_stats_label()
-        self._ensure_videos_populated()
+        # _ensure_videos_populated() now runs in _preload_db_async (background thread)
 
     def on_shown(self):
         """Called the first time the Transcriptions tab is selected."""
@@ -23045,6 +23077,8 @@ class _TranscriptionPanel(ttk.Frame):
                     "DB Error", f"Could not open transcription index:\n{err}")
             self.after(0, _on_db_error)
             return
+        # Run schema/dedupe checks in this background thread before building UI
+        self._ensure_videos_populated()
         self.after(0, self._finish_load)
 
     def _finish_load(self):
@@ -23052,8 +23086,7 @@ class _TranscriptionPanel(ttk.Frame):
         self._tp_extra_roots = list(config.get("tp_archive_roots", []))
         self._build_ui()
         self._refresh_stats_label()
-        # Auto-scan archive if videos table is empty (first-time migration)
-        self._ensure_videos_populated()
+        # _ensure_videos_populated() now runs in _preload_db_async (background thread)
         if self._pending_reindex is not None:
             self.after(300, lambda: self._maybe_offer_reindex(self._pending_reindex))
             self._pending_reindex = None
@@ -23953,11 +23986,17 @@ class _TranscriptionPanel(ttk.Frame):
         if not self._conn:
             return
         def _query():
+            # Use a separate read-only connection so these slow aggregate
+            # queries (COUNT DISTINCT on 8M rows = ~48s) don't hold _db_lock
+            # and block the disk scan / grid preload threads.
             try:
-                with self._db_lock:
-                    segs = self._db_execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-                    vids = self._db_execute("SELECT COUNT(DISTINCT title) FROM segments").fetchone()[0]
-                    chs  = self._db_execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                _stats_conn = sqlite3.connect(_TP_DB_PATH, check_same_thread=False)
+                _stats_conn.execute("PRAGMA journal_mode=WAL")
+                _stats_conn.execute("PRAGMA query_only=ON")
+                segs = _stats_conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+                vids = _stats_conn.execute("SELECT COUNT(DISTINCT title) FROM segments").fetchone()[0]
+                chs  = _stats_conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
+                _stats_conn.close()
                 text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
                 self.after(0, lambda: self._stats_label.config(text=text))
             except Exception:
@@ -25293,17 +25332,22 @@ class _TranscriptionPanel(ttk.Frame):
                         pass
                     _disk_stale = disk_count > db_count
                 # Check 2: videos table vs segments table (transcript index)
+                # Use a separate read-only connection so the slow COUNT DISTINCT
+                # on segments (~41s) doesn't hold _db_lock and block other threads.
                 _seg_stale = False
                 try:
-                    with self._db_lock:
-                        vid_total = self._db_execute(
-                            "SELECT COUNT(*) FROM videos "
-                            "WHERE filepath != '__schema_ver__' AND channel != '__ver__' "
-                            "AND tx_status = 'transcribed'"
-                        ).fetchone()[0]
-                        seg_vids = self._db_execute(
-                            "SELECT COUNT(DISTINCT title) FROM segments"
-                        ).fetchone()[0]
+                    _fc = sqlite3.connect(_TP_DB_PATH, check_same_thread=False)
+                    _fc.execute("PRAGMA journal_mode=WAL")
+                    _fc.execute("PRAGMA query_only=ON")
+                    vid_total = _fc.execute(
+                        "SELECT COUNT(*) FROM videos "
+                        "WHERE filepath != '__schema_ver__' AND channel != '__ver__' "
+                        "AND tx_status = 'transcribed'"
+                    ).fetchone()[0]
+                    seg_vids = _fc.execute(
+                        "SELECT COUNT(DISTINCT title) FROM segments"
+                    ).fetchone()[0]
+                    _fc.close()
                     _seg_stale = vid_total > seg_vids
                 except Exception:
                     pass

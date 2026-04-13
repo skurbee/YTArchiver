@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.5"
+APP_VERSION = "v39.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2950,7 +2950,8 @@ def _update_disk_cache_for_channel(ch):
                 "last_updated": time.time(),
             }
     _save_disk_cache()
-    # Clear stale transcription_complete flag if no transcript files exist on disk
+    # Clear stale transcription/metadata pending flags if no files exist on disk
+    _need_save = False
     if not _has_tx and _tx_complete_snap:
         with config_lock:
             for _cfg_ch in config.get("channels", []):
@@ -2958,6 +2959,15 @@ def _update_disk_cache_for_channel(ch):
                     _cfg_ch["transcription_complete"] = False
                     _cfg_ch.pop("transcription_pending", None)
                     break
+        _need_save = True
+    if not _has_meta:
+        with config_lock:
+            for _cfg_ch in config.get("channels", []):
+                if _cfg_ch.get("url") == _url:
+                    if _cfg_ch.pop("metadata_pending", None) is not None:
+                        _need_save = True
+                    break
+    if _need_save:
         save_config(config)
 
 
@@ -3016,7 +3026,7 @@ def _run_startup_disk_scan():
     """
     with config_lock:
         _channels = list(config.get("channels", []))
-        _stale = [_c for _c in _channels if _c.get("transcription_complete", False)]
+        _stale = [_c for _c in _channels if _c.get("transcription_complete", False) or _c.get("metadata_pending", 0) > 0]
     with _disk_cache_lock:
         _missing = [_c for _c in _channels if _c.get("url") not in _disk_cache]
 
@@ -3964,7 +3974,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.12.26 11:22pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:09am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5121,10 +5131,13 @@ def refresh_channel_dropdowns():
         _is_running_m = _metadata_running and _current_job.get("_metadata_key", "").startswith(f"metadata:{_ch_name_m}:")
         _is_queued_m = _ch_name_m in _mq_ch_names
         _has_meta = _disk_cache_snap.get(ch_url_t, {}).get("has_metadata", False) if ch_url_t else False
+        m_pending = c.get("metadata_pending", 0)
         if _is_running_m:
             meta_str = "Running"
         elif _is_queued_m:
             meta_str = "Queued"
+        elif _has_meta and m_pending > 0:
+            meta_str = f"{'A ' if auto_m else ''}\u2713 -{m_pending}"
         elif _has_meta:
             meta_str = f"{'A ' if auto_m else ''}\u2713"
         elif auto_m:
@@ -5561,29 +5574,39 @@ _chan_ctx_menu.add_separator()
 
 
 def _queue_pending_transcriptions():
-    """Queue all channels with ✓ -X (new unprocessed videos) for GPU transcription."""
+    """Queue all channels with ✓ -X (new unprocessed videos) for transcription and metadata."""
     with config_lock:
         out_dir = config.get("output_dir", "")
         channels = copy.deepcopy(sorted(config.get("channels", []),
                           key=lambda c: c.get("name", "").lower()))
-    added = 0
+    t_added = 0
+    m_added = 0
     for ch in channels:
+        ch_name = ch.get("name", "")
+        ch_url = ch.get("url", "")
+        folder = os.path.join(out_dir, _channel_folder_name(ch))
+        sy = ch.get("split_years", False)
+        sm = ch.get("split_months", False)
         if ch.get("transcription_complete", False) and ch.get("transcription_pending", 0) > 0:
-            ch_name = ch.get("name", "")
-            ch_url = ch.get("url", "")
-            folder = os.path.join(out_dir, _channel_folder_name(ch))
-            sy = ch.get("split_years", False)
-            sm = ch.get("split_months", False)
             _add_to_gpu_queue({
                 "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
                 "folder": folder, "split_years": sy, "split_months": sm,
                 "combined": not sy
             })
-            added += 1
-    if added:
-        log(f"  ↺ Queued {added} channel(s) with new videos for transcription.\n", "simpleline_green")
+            t_added += 1
+        if ch.get("metadata_pending", 0) > 0:
+            _add_to_metadata_queue(ch_name, ch_url, folder, sy, sm,
+                                   None, None, ch_name, _quiet=True)
+            m_added += 1
+    _parts = []
+    if t_added:
+        _parts.append(f"{t_added} for transcription")
+    if m_added:
+        _parts.append(f"{m_added} for metadata")
+    if _parts:
+        log(f"  \u21ba Queued {', '.join(_parts)}.\n", "simpleline_green")
     else:
-        log(f"  No channels with pending transcriptions found.\n", "dim")
+        log(f"  No channels with pending transcriptions or metadata found.\n", "dim")
 
 
 def _queue_all_transcriptions():
@@ -6593,12 +6616,13 @@ def sync_single_channel(_from_queue=False):
                 _invalidate_channel_disk_cache(url)
                 _ui_queue.append(refresh_channel_dropdowns)
 
-                # New videos downloaded — track pending transcription count
+                # New videos downloaded — track pending transcription + metadata counts
                 if c_dl > 0:
                     with config_lock:
                         for _tp_ch in config.get("channels", []):
                             if _tp_ch["url"] == url:
                                 _tp_ch["transcription_pending"] = _tp_ch.get("transcription_pending", 0) + c_dl
+                                _tp_ch["metadata_pending"] = _tp_ch.get("metadata_pending", 0) + c_dl
                                 break
                     save_config(config)
 
@@ -12103,6 +12127,18 @@ def _start_metadata_task(item):
     return True
 
 
+def _clear_metadata_pending(ch_url):
+    """Reset metadata_pending to 0 for the channel with the given URL."""
+    if not ch_url:
+        return
+    with config_lock:
+        for _cfg_ch in config.get("channels", []):
+            if _cfg_ch.get("url") == ch_url:
+                _cfg_ch["metadata_pending"] = 0
+                break
+    save_config(config)
+
+
 def _run_metadata_download(item):
     """Worker: fetch metadata for all videos in the given scope.
     Uses the TranscriptionParser instance methods via the global reference."""
@@ -12181,10 +12217,21 @@ def _run_metadata_download(item):
                 existing = tp._read_metadata_jsonl(meta_path)
                 existing[vid_id] = entry
                 tp._write_metadata_jsonl(meta_path, existing)
+                # Decrement pending count per successful fetch
+                if ch_url:
+                    with config_lock:
+                        for _cfg_ch in config.get("channels", []):
+                            if _cfg_ch.get("url") == ch_url:
+                                _mp = _cfg_ch.get("metadata_pending", 0)
+                                if _mp > 0:
+                                    _cfg_ch["metadata_pending"] = _mp - 1
+                                break
+                    save_config(config)
         if _is_simple_mode:
             _stop_simple_anim()
             clear_simple_status()
         if not cancel_event.is_set():
+            _clear_metadata_pending(ch_url)
             log(f"  \u2714 Metadata complete: {_done} video{'s' if _done != 1 else ''} fetched.\n", "simpleline_green")
         return
 
@@ -12430,10 +12477,11 @@ def _run_metadata_download(item):
                 _plural = "" if _pc_date_failed == 1 else "s"
                 log(f"  \u2014 {_pc_with_ids} video(s) have metadata. "
                     f"{_pc_date_failed} video{_plural} unmatchable "
-                    f"(all resolution methods exhausted — use Refresh Metadata to retry).\n",
+                    f"(all resolution methods exhausted — video likely deleted).\n",
                     "simpleline_pink")
             else:
                 log(f"  \u2014 All {len(rows)} videos already have metadata.\n", "simpleline_pink")
+            _clear_metadata_pending(ch_url)
             return
 
     log(f"  Found {len(rows)} video(s) — resolving video IDs...\n", "dim")
@@ -12665,6 +12713,7 @@ def _run_metadata_download(item):
                 _batch_t0 = time.time()
                 _last_batch_log = 0
                 _last_batch_scanline = 0.0
+                _batch_pause_notified = False
                 # Timeout scales with total channel size (len(rows)), not just
                 # _need_search — the playlist fetches ALL videos regardless of
                 # how many need resolution.
@@ -12715,9 +12764,13 @@ def _run_metadata_download(item):
                             _now = time.time()
                             if _now - _last_batch_scanline >= 1.0:
                                 _elapsed_s = int(_now - _batch_t0)
+                                _pause_suffix = " — will pause after this step" if pause_event.is_set() else ""
                                 _update_meta_prep_line(
-                                    f"Fetching channel playlist... {_batch_count:,} titles ({_elapsed_s}s)")
+                                    f"Fetching channel playlist... {_batch_count:,} titles ({_elapsed_s}s){_pause_suffix}")
                                 _last_batch_scanline = _now
+                                if pause_event.is_set() and not _batch_pause_notified:
+                                    _batch_pause_notified = True
+                                    log(f"  \u23f8 Pause requested — will pause after playlist fetch completes.\n", "pauselog")
                             if _batch_count - _last_batch_log >= 500:
                                 _elapsed = int(time.time() - _batch_t0)
                                 log(f"  ...{_batch_count:,} titles fetched ({_elapsed}s elapsed)\n", "dim")
@@ -12733,6 +12786,19 @@ def _run_metadata_download(item):
                         pass
                 cleanup_process(_batch_proc)
                 _batch_proc = None
+
+                # Honor pause request after playlist fetch completes
+                if pause_event.is_set() and not cancel_event.is_set():
+                    _clear_meta_prep_line()
+                    log(f"  \u23f8 Metadata paused at {_fmt_time()} \u2014 click Resume.\n", "pausestatus")
+                    _tray_stop_spin(force=True)
+                    while pause_event.is_set() and not cancel_event.is_set():
+                        time.sleep(0.5)
+                    clear_pause_status()
+                    if cancel_event.is_set():
+                        return
+                    _tray_start_spin()
+                    log(f"  \u25b6 Metadata resumed at {_fmt_time()}...\n", "pauselog")
 
                 if _batch_map:
                     _elapsed = int(time.time() - _batch_t0)
@@ -13639,6 +13705,7 @@ def _run_metadata_download(item):
     _fetch_total = len(_to_fetch)
     if _fetch_total == 0 and skipped > 0:
         log(f"  \u2014 All {skipped} videos already have metadata.\n", "simpleline_pink")
+        _clear_metadata_pending(ch_url)
         return
     if skipped:
         log(f"  \u2014 {_fetch_total} to fetch ({skipped} already done).\n", "simpleline_pink")
@@ -13738,6 +13805,16 @@ def _run_metadata_download(item):
                     refreshed += 1
                 else:
                     existing[vid_id] = entry
+                    # Decrement pending count per successful NEW fetch (not refresh)
+                    if ch_url:
+                        with config_lock:
+                            for _cfg_ch in config.get("channels", []):
+                                if _cfg_ch.get("url") == ch_url:
+                                    _mp = _cfg_ch.get("metadata_pending", 0)
+                                    if _mp > 0:
+                                        _cfg_ch["metadata_pending"] = _mp - 1
+                                    break
+                        save_config(config)
                 changed = True
                 thumb_url = entry.get("thumbnail_url", "")
                 if thumb_url:
@@ -13790,6 +13867,8 @@ def _run_metadata_download(item):
         clear_simple_status()
     _meta_elapsed = time.time() - _meta_t0
     _record_metadata(ch_name, _new_count, refreshed, skipped, errors, _meta_elapsed)
+    if not cancel_event.is_set():
+        _clear_metadata_pending(ch_url)
 
     # Invalidate grid cache for this channel so thumbnails refresh on next view
     if tp and (_new_count > 0 or refreshed > 0):
@@ -18718,13 +18797,15 @@ def start_sync_all():
                     _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
 
-                # New videos downloaded — track pending transcription count
+                # New videos downloaded — track pending transcription + metadata counts
                 if c_dl > 0:
                     ch["transcription_pending"] = ch.get("transcription_pending", 0) + c_dl
+                    ch["metadata_pending"] = ch.get("metadata_pending", 0) + c_dl
                     with config_lock:
                         for _cfg_ch in config.get("channels", []):
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
+                                _cfg_ch["metadata_pending"] = _cfg_ch.get("metadata_pending", 0) + c_dl
                                 break
                         save_config(config)
 
@@ -22265,12 +22346,13 @@ def _run_autorun():
                     _invalidate_channel_disk_cache(url)
                     _ui_queue.append(refresh_channel_dropdowns)
 
-                # New videos downloaded — track pending transcription count
+                # New videos downloaded — track pending transcription + metadata counts
                 if c_dl > 0:
                     with config_lock:
                         for _cfg_ch in config.get("channels", []):
                             if _cfg_ch.get("url") == url:
                                 _cfg_ch["transcription_pending"] = _cfg_ch.get("transcription_pending", 0) + c_dl
+                                _cfg_ch["metadata_pending"] = _cfg_ch.get("metadata_pending", 0) + c_dl
                                 break
                         save_config(config)
 

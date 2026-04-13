@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v39.7"
+APP_VERSION = "v39.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -860,6 +860,38 @@ def log(text, tag=None):
                                 log_box.insert(_p, "\u2014", "simpleline_blue")
                                 _p = log_box.index(f"{_p}+1c")
                                 _remaining = _remaining[_di + 1:]
+                        elif _base_tag == "simpledownload":
+                            # Download complete: green em dash, ✓, and size; white text
+                            # All segments get "dl_line" marker so _clear_simpledownload_lines can remove the whole line
+                            _color_ranges = []
+                            _ei = 0
+                            while True:
+                                _di = _txt.find("\u2014", _ei)
+                                if _di < 0:
+                                    break
+                                _color_ranges.append((_di, _di + 1, "simpledownload"))
+                                _ei = _di + 1
+                            _ci = _txt.find("\u2713")
+                            if _ci >= 0:
+                                _color_ranges.append((_ci, _ci + 1, "simpledownload"))
+                            _sm = re.search(r'\([\d.,]+\s*[KMGT]?B\)', _txt)
+                            if _sm:
+                                _color_ranges.append((_sm.start(), _sm.end(), "simpledownload"))
+                            _color_ranges.sort()
+                            _p = _ins_pos
+                            _pos = 0
+                            for _r_start, _r_end, _r_tag in _color_ranges:
+                                if _r_start > _pos:
+                                    _seg = _txt[_pos:_r_start]
+                                    log_box.insert(_p, _seg, ("simpleline", "dl_line"))
+                                    _p = log_box.index(f"{_p}+{len(_seg)}c")
+                                _seg = _txt[_r_start:_r_end]
+                                log_box.insert(_p, _seg, (_r_tag, "dl_line"))
+                                _p = log_box.index(f"{_p}+{len(_seg)}c")
+                                _pos = _r_end
+                            if _pos < len(_txt):
+                                log_box.insert(_p, _txt[_pos:], ("simpleline", "dl_line"))
+                            return
                         else:
                             log_box.insert(_ins_pos, _txt, _base_tag)
                         return
@@ -1806,9 +1838,10 @@ def _clear_simpledownload_lines():
             if 'log_box' in globals() and log_box.winfo_exists():
                 log_box.config(state="normal")
 
-                ranges = list(log_box.tag_ranges("simpledownload"))
-                for i in range(len(ranges) - 1, -1, -2):
-                    log_box.delete(ranges[i - 1], ranges[i])
+                for _dl_tag in ("dl_line", "simpledownload"):
+                    ranges = list(log_box.tag_ranges(_dl_tag))
+                    for i in range(len(ranges) - 1, -1, -2):
+                        log_box.delete(ranges[i - 1], ranges[i])
                 log_box.config(state="disabled")
         except Exception:
             pass
@@ -1896,11 +1929,11 @@ def _simple_anim_tick():
 
         # Data-driven rendering for non-sync modes
         _ANIM_MODES = {
-            "redownload": ("simplestatus_redwnl", " REDOWNLOADING:"),
+            "redownload": ("simplestatus_redwnl", " Redownloading:"),
             "transcribe": ("trans_bracket", " Transcribing:"),
-            "metadata":   ("meta_bracket", " FETCHING METADATA:"),
-            "compress":   ("simplestatus_compress", " COMPRESSING:"),
-            "reorg":      ("simplestatus_reorg", " REORGANIZING:"),
+            "metadata":   ("meta_bracket", " Fetching Metadata:"),
+            "compress":   ("simplestatus_compress", " Compressing:"),
+            "reorg":      ("simplestatus_reorg", " Reorganizing:"),
         }
         if _anim_mode in _ANIM_MODES:
             _tag, _label = _ANIM_MODES[_anim_mode]
@@ -3974,7 +4007,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 1:27am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 12:07pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8710,7 +8743,7 @@ def _start_punct_process():
             return True  # Already running
 
         try:
-            log("  Loading punctuation model...\n", "simpleline_blue")
+            log("  — Loading punctuation model...\n", "simpleline")
             _punct_proc = subprocess.Popen(
                 [_WHISPER_PYTHON, "-c", _PUNCT_SCRIPT],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -8739,7 +8772,7 @@ def _start_punct_process():
                     _stop_punct_process()
                     return False
                 if info.get("status") == "ready":
-                    log(f"  — ✓ Punctuation model loaded ({info.get('device', '?').upper()}).\n", "simpleline_green")
+                    log(f"  — ✓ Punctuation model loaded ({info.get('device', '?').upper()}).\n", "simpleline")
                     return True
                 elif info.get("status") == "error":
                     log(f"  ⚠ Punctuation model failed: {info.get('text', 'unknown')}\n", "red")
@@ -17742,10 +17775,10 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                             _disp_chan = channel_name[:_chan_max].ljust(_chan_max)
                             _date_col = f" {_disp_date}  " if _disp_date else "  "
                             _disp_size = _size_str.rjust(10) if _size_str else ""
-                            log(f"  ✓ {_disp_title}  {_disp_chan}{_date_col}{_disp_size}\n", "simpledownload")
+                            log(f" — ✓ {_disp_title}  {_disp_chan}{_date_col}{_disp_size}\n", "simpledownload")
                         else:
                             _size_str2 = f"  ({_fmt_size(size_bytes)})" if size_bytes and size_bytes not in ("NA", "None", "none", "") else ""
-                            log(f"  ✓ {parts[1]}  —  {channel_name}{_size_str2}\n", "simpledownload")
+                            log(f" — ✓ {parts[1]}  —  {channel_name}{_size_str2}\n", "simpledownload")
                             if filepath and os.path.exists(filepath):
                                 try:
                                     _rel_fp = os.path.relpath(filepath)

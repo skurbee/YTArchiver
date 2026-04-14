@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.1"
+APP_VERSION = "v40.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3176,6 +3176,17 @@ def _run_startup_disk_scan():
 config = load_config()
 _load_disk_cache()
 
+# Restore last-used Whisper model so GPU tasks don't re-prompt after restart
+_whisper_model_choice = config.get("whisper_model", "small")
+
+# Remove orphaned "running..." / "paused" redownload history lines
+# (left behind if app crashed during a redownload)
+_hist = config.get("autorun_history", [])
+_hist_before = len(_hist)
+config["autorun_history"] = [h for h in _hist if not ("[ReDwnl]" in h and ("running..." in h or "\u23f8 paused" in h))]
+if len(config["autorun_history"]) < _hist_before:
+    save_config(config)
+
 # Migrate old compress level names → new quality names
 _config_migrated = False
 for _ch_mig in config.get("channels", []):
@@ -4014,7 +4025,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 3:43pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 8:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5702,7 +5713,22 @@ def _chan_ctx_transcribe():
                            "folder": folder, "split_years": False, "split_months": False, "combined": True})
         return
 
-    # Show dialog: Combined vs Follow organization
+    # If already transcribed, follow the existing organization without asking
+    tp = _tp_panel_ref[0]
+    if tp and tp._conn:
+        try:
+            with tp._db_lock:
+                _tx_count = tp._db_execute(
+                    "SELECT COUNT(*) FROM videos WHERE channel=? AND tx_status='transcribed'",
+                    (ch_name,)).fetchone()[0]
+            if _tx_count > 0:
+                _add_to_gpu_queue({"type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
+                                   "folder": folder, "split_years": sy, "split_months": sm, "combined": False})
+                return
+        except Exception:
+            pass
+
+    # First time transcribing — show dialog: Combined vs Follow organization
     dlg = tk.Toplevel(root)
     dlg.title("Transcribe Channel")
     dlg.configure(bg=C_BG)
@@ -8450,7 +8476,7 @@ _whisper_proc = None  # persistent Whisper subprocess (model stays loaded)
 _whisper_line_queue = None  # queue.Queue for subprocess stdout lines (module-level to avoid race)
 _whisper_starting = False  # guard against concurrent startup attempts
 _whisper_last_failed = False  # True when last whisper call was a stall/crash (not "no speech")
-_whisper_model_choice = "large-v3"  # selected model — set via dialog before transcription
+_whisper_model_choice = "small"  # selected model — restored from config or set via dialog
 _whisper_model_lock = threading.Lock()  # protects _whisper_model_choice during re-transcription
 _ffmpeg_proc = None  # ffmpeg encode subprocess (for compression feature)
 
@@ -10446,12 +10472,10 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             log(f"  Matched {total_to_do} file(s). Resuming redownload at {_res_label}...\n", "simpleline")
         else:
             log(f"  Matched {total_to_do} file(s). Checking the first {_SAMPLE_SIZE} at {_res_label}...\n", "simpleline")
-        _record_redownload_start(ch_name, _res_label, total_to_do)
         _rd_start_time = time.time()
 
-        # Start simple mode animation for redownload
-        if _is_simple_mode:
-            _start_simple_anim(ch_name, 1, total_to_do, mode="redownload")
+        # Bottom-pinned animated status (same as sync/metadata/etc.)
+        _start_simple_anim(ch_name, 1, total_to_do, mode="redownload")
 
         # ── Step 4: Download each video at new resolution and replace ──
         fmt = build_format_string(new_res)
@@ -10640,10 +10664,9 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             if _ce.is_set():
                 break
 
-            # Update simple mode status line
-            if _is_simple_mode:
-                _simple_anim_state["idx"] = idx + 1
-                _simple_anim_state["total"] = total_to_do
+            # Update bottom-pinned status line
+            _simple_anim_state["idx"] = idx + 1
+            _simple_anim_state["total"] = total_to_do
 
             orig_fname = os.path.basename(orig_path)
             fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
@@ -10819,9 +10842,8 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     _sample_results = []
                     # _sample_done stays False so we re-check after another _SAMPLE_SIZE files
 
-        if _is_simple_mode:
-            _stop_simple_anim()
-            clear_simple_status()
+        _stop_simple_anim()
+        clear_simple_status()
 
         # Cleanup temp dir
         try:
@@ -15163,6 +15185,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _user_skipped_whisper = True
                 else:
                     _whisper_model_choice = _model_result[0]
+                    config["whisper_model"] = _model_result[0]
+                    save_config(config)
                     # If model changed, stop old process so it relaunches with new model
                     _stop_whisper_process()
                     if _model_timed_out[0]:
@@ -15710,6 +15734,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                     return
 
                 _whisper_model_choice = model_choice
+                config["whisper_model"] = model_choice
+                save_config(config)
                 _stop_whisper_process()
 
                 if timed_out:
@@ -19895,11 +19921,25 @@ def _show_queue_menu(event=None):
                     return
                 if _item_data[target_line - 1][0] == "current":
                     return
-                # Map line numbers to _queue_order indices (skip "current" items)
-                src_qo = src_line - 1 - sum(1 for d in _item_data[:src_line - 1] if d[0] == "current")
-                dst_qo = target_line - 1 - sum(1 for d in _item_data[:target_line - 1] if d[0] == "current")
+                # Use item keys to find the correct _queue_order entries
+                # (position-based math breaks when batch sync collapses
+                # multiple _queue_order entries into one display row)
+                src_source, _, _, src_key = _item_data[src_line - 1]
+                dst_source, _, _, dst_key = _item_data[target_line - 1]
                 with _queue_order_lock:
-                    if 0 <= src_qo < len(_queue_order) and 0 <= dst_qo < len(_queue_order):
+                    # Find source entry in _queue_order by key
+                    src_qo = None
+                    for _qi, (_qs, _qk) in enumerate(_queue_order):
+                        if _qk == src_key and _qs in (src_source, "sync"):
+                            src_qo = _qi
+                            break
+                    # Find destination entry in _queue_order by key
+                    dst_qo = None
+                    for _qi, (_qs, _qk) in enumerate(_queue_order):
+                        if _qk == dst_key and _qs in (dst_source, "sync"):
+                            dst_qo = _qi
+                            break
+                    if src_qo is not None and dst_qo is not None:
                         moved = _queue_order.pop(src_qo)
                         _queue_order.insert(dst_qo, moved)
                 _save_queue_state()
@@ -21065,17 +21105,23 @@ def _gpu_start():
         _gpu_popup["win"].destroy()
         _gpu_popup["win"] = None
 
-    # Only show Whisper model dialog if queue contains transcription tasks
-    # that don't already have a model specified (auto-transcribe sets "small")
+    # Stamp any transcription tasks that lack a model with the saved choice
+    # so we don't re-prompt after a restart (model is persisted in config).
+    # _has_transcribe_tasks = True only if tasks exist that still need prompting
+    # (i.e. they had no model AND there was no saved model to fall back on).
     _has_transcribe_tasks = False
     with _gpu_queue_lock:
-        _has_transcribe_tasks = any(q["type"] in ("transcribe", "mt") and not q.get("model") for q in _gpu_queue)
-        # If all transcribe tasks have a model pre-set, use the first one
-        if not _has_transcribe_tasks:
-            for q in _gpu_queue:
-                if q["type"] in ("transcribe", "mt") and q.get("model"):
-                    _whisper_model_choice = q["model"]
-                    break
+        for q in _gpu_queue:
+            if q["type"] in ("transcribe", "mt") and not q.get("model"):
+                if _whisper_model_choice:
+                    q["model"] = _whisper_model_choice
+                else:
+                    _has_transcribe_tasks = True
+        # Use the first task's model as the active choice
+        for q in _gpu_queue:
+            if q["type"] in ("transcribe", "mt") and q.get("model"):
+                _whisper_model_choice = q["model"]
+                break
 
     def _gpu_worker():
         global _gpu_running, _gpu_current_item, _gpu_truly_paused
@@ -21336,6 +21382,8 @@ def _gpu_start():
     if model_choice is None:
         return
     _whisper_model_choice = model_choice
+    config["whisper_model"] = model_choice
+    save_config(config)
     _stop_whisper_process()
 
     if timed_out:
@@ -21807,30 +21855,14 @@ _redownload_hist_marker = None   # unique marker string to find the placeholder 
 _redownload_hist_idx = None      # index into history list for the placeholder line
 
 def _record_redownload_start(ch_name, res_label, total_count):
-    """Insert an in-progress placeholder for a redownload job into the activity log."""
-    global _redownload_hist_idx, _redownload_hist_marker
-    _now = datetime.now()
-    ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
-    date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
-    ts_date = f"{ts}, {date}".ljust(16)
-    ch_part = f"  {ch_name}  —" if ch_name else " " * 7
-    line = f"[ReDwnl] {ts_date} —{ch_part}  {total_count:>4} total        · ▶ running..."
-    _redownload_hist_marker = line  # store the exact line for later lookup
-    with config_lock:
-        hist = config.setdefault("autorun_history", [])
-        hist.append(line)
-        if len(hist) > AUTORUN_HISTORY_MAX:
-            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
-            hist = config["autorun_history"]
-        _redownload_hist_idx = len(hist) - 1
-    save_config(config)
-    if _root_alive:
-        _ui_queue.append(_refresh_autorun_history)
+    """No longer used — redownload now shows live status via the bottom-pinned
+    animated line (same as sync/metadata/etc.) instead of an activity history
+    placeholder.  Kept as a stub so any stale references don't crash."""
+    pass
 
 
 def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, skipped=0):
-    """Replace the in-progress placeholder with the completed redownload stats."""
-    global _redownload_hist_idx, _redownload_hist_marker
+    """Record completed redownload stats to the activity history."""
     _now = datetime.now()
     ts = _now.strftime("%-I:%M%p").lower().lstrip("0") if os.name != "nt" else _now.strftime("%I:%M%p").lower().lstrip("0")
     date = _now.strftime("%b {d}").replace("{d}", str(_now.day))
@@ -21849,50 +21881,18 @@ def _record_redownload_finish(ch_name, done, errors, elapsed_secs, res_label, sk
     line = f"[ReDwnl] {ts_date} —{ch_part}  {done:>4} {'replaced':<11} · {skipped:>4} skipped ·  {errors} errors · {dur}"
     with config_lock:
         hist = config.setdefault("autorun_history", [])
-        # Find the placeholder by stored marker string (immune to index drift)
-        _found = False
-        if _redownload_hist_marker:
-            for _hi, _hline in enumerate(hist):
-                if _hline == _redownload_hist_marker:
-                    hist[_hi] = line
-                    _found = True
-                    break
-        # Fallback to index if marker search fails
-        if not _found and _redownload_hist_idx is not None and 0 <= _redownload_hist_idx < len(hist):
-            hist[_redownload_hist_idx] = line
-            _found = True
-        if not _found:
-            hist.append(line)
-            if len(hist) > AUTORUN_HISTORY_MAX:
-                config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
-        _redownload_hist_idx = None
-        _redownload_hist_marker = None
+        hist.append(line)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            config["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
     save_config(config)
     if _root_alive:
         _ui_queue.append(_refresh_autorun_history)
 
 
 def _update_redownload_hist_pause():
-    """Update the in-progress redownload history line to reflect pause/resume state."""
-    global _redownload_hist_marker
-    if not _redownload_running or _redownload_hist_marker is None:
-        return
-    _paused = pause_event.is_set()
-    _old_suffix = "⏸ paused" if not _paused else "▶ running..."
-    _new_suffix = "⏸ paused" if _paused else "▶ running..."
-    if _old_suffix not in _redownload_hist_marker:
-        return
-    _new_line = _redownload_hist_marker.replace(_old_suffix, _new_suffix)
-    with config_lock:
-        hist = config.get("autorun_history", [])
-        for _hi, _hline in enumerate(hist):
-            if _hline == _redownload_hist_marker:
-                hist[_hi] = _new_line
-                break
-    _redownload_hist_marker = _new_line
-    save_config(config)
-    if _root_alive:
-        _ui_queue.append(_refresh_autorun_history)
+    """No-op — redownload pause/resume state is now shown by the bottom-pinned
+    animated status line (same as sync/metadata/etc.), not in the activity history."""
+    pass
 
 
 def _any_task_running():
@@ -26528,27 +26528,41 @@ class _TranscriptionPanel(ttk.Frame):
             if m and m.get("upload_date"):
                 try:
                     _ud = m["upload_date"]
-                    v["date_str"] = f"{_TP_MONTH_NAMES[int(_ud[4:6]) - 1].capitalize()} {int(_ud[6:8]):02d}, {_ud[:4]}" if len(_ud) == 8 else ""
+                    if len(_ud) == 8:
+                        v["date_str"] = f"{_TP_MONTH_NAMES[int(_ud[4:6]) - 1].capitalize()} {int(_ud[6:8]):02d}, {_ud[:4]}"
+                    elif len(_ud) >= 4:
+                        # Non-standard length — extract year so date_str isn't
+                        # empty (avoids falling through to the mtime fallback)
+                        v["date_str"] = _ud[:4]
+                    else:
+                        v["date_str"] = ""
                 except Exception:
                     v["date_str"] = ""
 
-        # Fetch mtimes for all videos missing metadata dates (needed for sorting)
-        # and ffprobe duration for videos missing metadata duration (needed for badge)
-        for v in videos:
-            if not v["date_str"] and v["filepath"]:
-                try:
-                    mt = os.path.getmtime(v["filepath"])
-                    v["mtime"] = mt
-                    v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
-                except OSError:
-                    pass
-            if not skip_ffprobe and not _is_all and not v["duration"] and v["filepath"]:
-                try:
-                    _probed = _ffprobe_duration(v["filepath"])
-                    if _probed > 0:
-                        v["duration"] = _probed
-                except Exception:
-                    pass
+        # Fetch mtimes for videos missing metadata dates (needed for sorting)
+        # and ffprobe duration for videos missing metadata duration (needed for badge).
+        # Skip for "All Channels" — dateless videos are filtered out below anyway,
+        # so the expensive per-file stat calls aren't worth it at aggregate scale.
+        if not _is_all:
+            _mtime_checked = 0
+            for v in videos:
+                if abort_check and _mtime_checked % 200 == 0 and abort_check():
+                    return None
+                if not v["date_str"] and v["filepath"]:
+                    _mtime_checked += 1
+                    try:
+                        mt = os.path.getmtime(v["filepath"])
+                        v["mtime"] = mt
+                        v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
+                    except OSError:
+                        pass
+                if not skip_ffprobe and not v["duration"] and v["filepath"]:
+                    try:
+                        _probed = _ffprobe_duration(v["filepath"])
+                        if _probed > 0:
+                            v["duration"] = _probed
+                    except Exception:
+                        pass
 
         # Deduplicate: if multiple videos share the same video_id, keep the first
         _seen_vids = set()
@@ -26610,7 +26624,9 @@ class _TranscriptionPanel(ttk.Frame):
         if _is_all and _all_thumb_dirs:
             if progress_cb:
                 progress_cb(f"Scanning thumbnails across {len(_all_thumb_dirs)} folders...")
-            for _atd in _all_thumb_dirs:
+            for _atd_idx, _atd in enumerate(_all_thumb_dirs):
+                if abort_check and abort_check():
+                    return None
                 _scan_thumb_dir(_atd)
         # If viewing at channel root with split_years, scan ALL year/month .Thumbnails
         if not _is_all and ch_cfg and ch_cfg.get("split_years", False) and not year:
@@ -26704,7 +26720,8 @@ class _TranscriptionPanel(ttk.Frame):
 
         channels = [r[0] for r in rows]
 
-        # Preload "All Channels" first (most likely first click)
+        # Preload "All Channels" first (default Browse view).  The mtime loop
+        # is skipped for this scope so it's fast despite the large row count.
         if not self._grid_preload_cancel:
             self._grid_preload_scope("__all__", None, None)
 
@@ -26855,16 +26872,10 @@ class _TranscriptionPanel(ttk.Frame):
         if start >= end:
             return
 
-        # Fill mtimes/date_str for this batch
+        # NOTE: mtimes/date_str are pre-populated by _grid_load_videos_data()
+        # on a background thread.  Do not call os.path.getmtime() here — this
+        # runs on the main thread and blocking file I/O can freeze the UI.
         import datetime as _dt
-        for v in self._grid_videos[start:end]:
-            if not v["date_str"] and v["filepath"]:
-                try:
-                    mt = os.path.getmtime(v["filepath"])
-                    v["mtime"] = mt
-                    v["date_str"] = _dt.datetime.fromtimestamp(mt).strftime("%b %d, %Y")
-                except OSError:
-                    pass
 
         # Remove old "load more" indicator before appending
         self._grid_canvas.delete("load_more")

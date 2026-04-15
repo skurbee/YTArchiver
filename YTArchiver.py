@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.5"
+APP_VERSION = "v40.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 6:18pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 6:45pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -21296,6 +21296,12 @@ def _gpu_start():
 
                 try:
                     if item["type"] == "mt":
+                        # Honour a per-item model override (set by the
+                        # /cmd/retranscribe command API). Mirrors the
+                        # transcribe-branch pattern a few lines down.
+                        _item_model = item.get("model")
+                        if _item_model:
+                            _whisper_model_choice = _item_model
                         if item.get("folder_path"):
                             _gpu_current["label"] = f"M.T. {item['folder_name']} ({item['vid_count']} files)"
                             _gpu_current["ch_url"] = None
@@ -33810,6 +33816,8 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/cmd/ping":
             return self._cmd_ping()
+        if self.path == "/cmd/gpu-status":
+            return self._cmd_gpu_status()
         self._json(404, {"ok": False, "error": "unknown_command", "path": self.path})
 
     def do_POST(self):
@@ -33847,14 +33855,100 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
             "queued_commands": depth,
         })
 
+    def _cmd_gpu_status(self):
+        """Expose the GPU queue + current job + Whisper progress.
+        Used by the viewer to show 'currently transcribing X%' banners on
+        the watch view and auto-refresh the transcript panel when the
+        job completes. Polled every few seconds while a viewer watch
+        view is open — cheap, read-only, no locks beyond a brief one
+        to snapshot the queue."""
+        # Snapshot the queue + current item under the GPU queue lock.
+        try:
+            with _gpu_queue_lock:
+                q = list(_gpu_queue)
+                cur = _gpu_current_item
+        except Exception:
+            q, cur = [], None
+
+        def _brief(item):
+            """Trim an item dict down to fields the viewer actually needs."""
+            if not isinstance(item, dict):
+                return None
+            fp = item.get("file_path") or ""
+            return {
+                "type": item.get("type"),
+                "file_path": fp,
+                "file_name": os.path.basename(fp) if fp else "",
+                "ch_url": item.get("ch_url"),
+                "ch_name": item.get("ch_name"),
+                "model": item.get("model"),
+                "folder_path": item.get("folder_path"),
+                "folder_name": item.get("folder_name"),
+            }
+
+        cur_brief = _brief(cur) if cur else None
+
+        # Whisper progress — parse the pct string kept by the log panel's
+        # progress line. Empty / non-numeric means "not in percent phase"
+        # (e.g. still loading the model, or not a whisper task at all).
+        whisper_pct = None
+        try:
+            pct_str = (_whisper_dots.get("pct_str") or "").strip()
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", pct_str)
+            if m:
+                whisper_pct = float(m.group(1))
+        except Exception:
+            pass
+
+        # Also expose the batch counter (e.g. "3/17") so viewers can show
+        # per-channel batch transcription progress if they want.
+        whisper_batch = None
+        try:
+            ci = _whisper_counter.get("idx", 0) or 0
+            ct = _whisper_counter.get("total", 0) or 0
+            if ct > 0:
+                whisper_batch = {"idx": ci, "total": ct}
+        except Exception:
+            pass
+
+        if cur_brief is not None:
+            cur_brief["whisper_pct"] = whisper_pct
+            cur_brief["whisper_active"] = bool(_whisper_dots.get("active"))
+            cur_brief["whisper_batch"] = whisper_batch
+            cur_brief["label"] = _gpu_current.get("label")
+            # For "mt" items in particular, model can come from the item OR
+            # from the global choice if the item didn't specify. Report the
+            # effective model so the viewer can display "re-transcribing
+            # with <model>" accurately.
+            if not cur_brief.get("model"):
+                try:
+                    cur_brief["model"] = _whisper_model_choice
+                except Exception:
+                    pass
+
+        self._json(200, {
+            "ok": True,
+            "running": cur is not None,
+            "gpu_paused": bool(_gpu_pause.is_set()),
+            "current": cur_brief,
+            "queue": [b for b in (_brief(it) for it in q) if b],
+            "queue_depth": len(q),
+        })
+
     def _cmd_retranscribe(self, body):
         """Drop a single-file manual-transcription job onto the GPU queue —
         identical to right-clicking the video in the Browse tab and picking
-        'Re-transcribe with Whisper'. Takes (channel, video_id), looks up
-        the video's file_path in YTArchiver's own DB, then enqueues via
-        _add_to_gpu_queue({'type': 'mt', 'file_path': ...})."""
+        'Re-transcribe with Whisper'. Takes (channel, video_id, [model]),
+        looks up the video's file_path in YTArchiver's own DB, then enqueues
+        via _add_to_gpu_queue({'type': 'mt', 'file_path': ..., 'model': ...}).
+        If model is omitted the GPU worker falls back to the current
+        _whisper_model_choice (matches native behaviour)."""
         ch  = body.get("channel") or ""
         vid = body.get("video_id") or ""
+        model = (body.get("model") or "").strip()
+        _valid_models = {"tiny", "small", "medium", "large-v3"}
+        if model and model not in _valid_models:
+            return self._json(400, {"ok": False, "error": f"unknown model: {model}"})
         if not (ch and vid):
             return self._json(400, {"ok": False, "error": "missing channel/video_id"})
 
@@ -33887,9 +33981,13 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
         # Enqueue on the main thread (same path as the right-click
         # "Re-transcribe" action in the Browse tab). _add_to_gpu_queue
         # logs "— Added M.T. <filename> to GPU-tasks queue" and updates UI.
+        # Pass model through — the gpu_worker's mt branch honors it.
+        item = {"type": "mt", "file_path": file_path}
+        if model:
+            item["model"] = model
         def _enqueue():
             try:
-                _add_to_gpu_queue({"type": "mt", "file_path": file_path})
+                _add_to_gpu_queue(item)
             except Exception as e:
                 _cmd_log_on_main(
                     f"  [cmd] enqueue failed: {e}\n", "red")
@@ -33900,6 +33998,7 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
             "queued": True,
             "title": title,
             "file_path": file_path,
+            "model": model or "default",
         })
 
     # ── Repair commands ──────────────────────────────────────────

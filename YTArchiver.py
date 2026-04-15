@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.2"
+APP_VERSION = "v40.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -3335,6 +3335,18 @@ def _tray_spin_loop():
                 pass
             _tray_spin_stop_ev.wait(0.25)
             continue
+        # Mirror the sync-task buttons: when sync is paused, freeze the blue
+        # tray spinner on the base icon so the taskbar icon stops animating.
+        # (The blink system keeps _sync_blink active to hold the solid button
+        # colour — without this check, the tray/taskbar kept spinning.)
+        if not _use_red and pause_event.is_set():
+            try:
+                if _tray_base_img is not None:
+                    _tray_icon.icon = _tray_base_img
+            except Exception:
+                pass
+            _tray_spin_stop_ev.wait(0.25)
+            continue
         _tray_spin_idx = (_tray_spin_idx + 1) % len(_frames)
         try:
             _tray_icon.icon = _frames[_tray_spin_idx]
@@ -4025,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.13.26 8:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 12:29am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9243,11 +9255,11 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
         for idx, (fname, fpath) in enumerate(files_to_compress.items(), 1):
             # Pause check
             if _pe.is_set() and not _ce.is_set():
-                log(f"\n  ⏸ Compression paused.\n", "pauselog")
+                log(f"  ⏸ Compression paused at {_fmt_time()}.\n", "pauselog")
                 while _pe.is_set() and not _ce.is_set():
                     time.sleep(0.25)
                 if not _ce.is_set():
-                    log(f"  ▶ Compression resuming...\n", "pauselog")
+                    log(f"  ▶ Compression resumed at {_fmt_time()}...\n", "pauselog")
 
             if _ce.is_set():
                 log(f"\n  ⛔ Compression cancelled.\n", "red")
@@ -9726,11 +9738,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
 
             # Pause check
             if _pe.is_set() and not _ce.is_set():
-                log(f"\n  ⏸ Backlog paused.\n", "pauselog")
+                log(f"  ⏸ Backlog paused at {_fmt_time()}.\n", "pauselog")
                 while _pe.is_set() and not _ce.is_set():
                     time.sleep(0.25)
                 if not _ce.is_set():
-                    log(f"  ▶ Backlog resuming...\n", "pauselog")
+                    log(f"  ▶ Backlog resumed at {_fmt_time()}...\n", "pauselog")
 
             batch_start = batch_num * batch_size
             batch_end = min(batch_start + batch_size, len(work_list))
@@ -9771,11 +9783,11 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                         break
 
                     if _pe.is_set() and not _ce.is_set():
-                        log(f"\n  ⏸ Backlog paused.\n", "pauselog")
+                        log(f"  ⏸ Backlog paused at {_fmt_time()}.\n", "pauselog")
                         while _pe.is_set() and not _ce.is_set():
                             time.sleep(0.25)
                         if not _ce.is_set():
-                            log(f"  ▶ Backlog resuming...\n", "pauselog")
+                            log(f"  ▶ Backlog resumed at {_fmt_time()}...\n", "pauselog")
 
                     orig_fname = os.path.basename(orig_path)
                     fname_short = orig_fname if len(orig_fname) <= 50 else orig_fname[:47] + "..."
@@ -10522,18 +10534,64 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     tk.Label(dlg,
                              text=f"Average size change:  {abs(avg_pct):.0f}% {direction}",
                              font=("Segoe UI", 10, "bold"),
-                             bg=C_BG, fg=_stat_color).pack(padx=24, pady=(0, 18))
+                             bg=C_BG, fg=_stat_color).pack(padx=24, pady=(0, 6))
+
+                    # Auto-continue countdown — dialog continues automatically
+                    # after 5 minutes so an unattended run isn't stuck forever
+                    # waiting on the sample-confirm modal.
+                    _POPUP_TIMEOUT_SECS = 300
+                    _remaining = [_POPUP_TIMEOUT_SECS]
+                    _tick_job = [None]
+                    _countdown_lbl = tk.Label(dlg, text="",
+                                              font=("Segoe UI", 9),
+                                              bg=C_BG, fg=C_DIM)
+                    _countdown_lbl.pack(padx=24, pady=(0, 12))
+
+                    def _fmt_remaining(s):
+                        m, ss = divmod(max(0, s), 60)
+                        return f"Auto-continuing in {m}:{ss:02d}..."
+
+                    def _cancel_tick():
+                        if _tick_job[0] is not None:
+                            try:
+                                root.after_cancel(_tick_job[0])
+                            except Exception:
+                                pass
+                            _tick_job[0] = None
+
+                    def _tick():
+                        _tick_job[0] = None
+                        try:
+                            if not dlg.winfo_exists():
+                                return
+                        except Exception:
+                            return
+                        _remaining[0] -= 1
+                        if _remaining[0] <= 0:
+                            result[0] = "continue"
+                            try: dlg.destroy()
+                            except Exception: pass
+                            return
+                        try:
+                            _countdown_lbl.config(text=_fmt_remaining(_remaining[0]))
+                        except Exception:
+                            pass
+                        _tick_job[0] = root.after(1000, _tick)
 
                     # Buttons
                     btn_frame = tk.Frame(dlg, bg=C_BG)
                     btn_frame.pack(padx=24, pady=(0, 18))
 
                     def _continue():
+                        _cancel_tick()
                         result[0] = "continue"
                         try: dlg.destroy()
                         except Exception: pass
 
                     def _change():
+                        # User is interacting — cancel the auto-continue timer
+                        # so they don't get rug-pulled while picking a res.
+                        _cancel_tick()
                         # Swap the dialog body for a resolution picker
                         for _w in dlg.winfo_children():
                             try: _w.destroy()
@@ -10585,6 +10643,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                         _recenter()
 
                     def _cancel():
+                        _cancel_tick()
                         result[0] = "cancel"
                         try: dlg.destroy()
                         except Exception: pass
@@ -10626,6 +10685,9 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     dlg.grab_set()
                     dlg.lift()
                     dlg.focus_set()
+                    # Prime the countdown label and kick off the tick loop
+                    _countdown_lbl.config(text=_fmt_remaining(_remaining[0]))
+                    _tick_job[0] = root.after(1000, _tick)
                 except Exception as _e:
                     result[0] = "cancel"
 
@@ -10655,11 +10717,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 break
 
             if _pe.is_set():
-                log(f"\n  ⏸ Redownload paused.\n", "pauselog")
+                log(f"  ⏸ Redownload paused at {_fmt_time()}.\n", "pauselog")
                 while _pe.is_set() and not _ce.is_set():
                     time.sleep(0.25)
                 if not _ce.is_set():
-                    log(f"  ▶ Redownload resuming...\n", "pauselog")
+                    log(f"  ▶ Redownload resumed at {_fmt_time()}...\n", "pauselog")
 
             if _ce.is_set():
                 break
@@ -21652,13 +21714,61 @@ def _parse_hist_entry(entry):
     return prefix, ch_name, stats
 
 
-def _rebuild_hist_line(prefix, ch_name, stats, col_width):
-    """Reassemble an activity-log entry with a uniform channel column width."""
+def _center_pad(s, w):
+    """Center `s` in a field of width `w` (pads with spaces; never truncates)."""
+    if len(s) >= w:
+        return s
+    pad = w - len(s)
+    left = pad // 2
+    return " " * left + s + " " * (pad - left)
+
+
+def _parse_stats_cols(stats):
+    """Parse a stats string (the portion after the channel) into a list of
+    cell strings. Each cell except the last is a ``"<digits> <label>"`` pair;
+    the last cell is the free-form duration. Returns None if the string
+    doesn't look like a stats block.
+    """
+    parts = [p.strip() for p in re.split(r'\s+·\s+', stats) if p.strip()]
+    if len(parts) < 2:
+        return None
+    for part in parts[:-1]:
+        if not re.match(r'^\d+\s+\S', part):
+            return None
+    return parts
+
+
+def _rebuild_hist_line(prefix, ch_name, stats, col_width,
+                      stat_cells=None, cell_widths=None, cell_count=None):
+    """Reassemble an activity-log entry with a uniform channel column width.
+
+    When stat_cells / cell_widths / cell_count are provided, each stat cell is
+    center-aligned in its computed column width so rows line up vertically.
+    For 3-cell entries (old Metdta format) an empty placeholder is inserted at
+    the left so the existing/errors/dur columns still align with 4-cell rows.
+    """
     if len(ch_name) > col_width:
         ch_disp = ch_name[:col_width - 1] + "\u2026"
     else:
         ch_disp = ch_name
-    return f"{prefix}  {ch_disp:<{col_width}s}  —{stats}"
+    ch_padded = _center_pad(ch_disp, col_width)
+    if stat_cells and cell_widths and cell_count:
+        padded_cells = list(stat_cells)
+        while len(padded_cells) < cell_count:
+            padded_cells.insert(0, "")  # align from the right
+        parts_out = []
+        for i in range(cell_count):
+            cell = padded_cells[i]
+            cell_padded = _center_pad(cell, cell_widths[i])
+            if i > 0:
+                prev = padded_cells[i - 1]
+                if (not prev.strip()) or (not cell.strip()):
+                    parts_out.append("   ")  # skip the dot when a cell is empty
+                else:
+                    parts_out.append(" · ")
+            parts_out.append(cell_padded)
+        return f"{prefix}  {ch_padded}  —  {''.join(parts_out)}"
+    return f"{prefix}  {ch_padded}  —{stats}"
 
 
 def _refresh_autorun_history():
@@ -21681,22 +21791,48 @@ def _refresh_autorun_history():
     # Parse all entries to find channel names and determine uniform column width
     parsed = []
     longest_ch = 0
+    stat_cells_list = []   # per-entry list of cells (or None)
+    cell_count = 0         # max cells seen across entries
     for entry in history:
         p = _parse_hist_entry(entry)
         parsed.append(p)
+        cells = _parse_stats_cols(p[2]) if p else None
+        stat_cells_list.append(cells)
         if p:
             longest_ch = max(longest_ch, len(p[1]))
+        if cells:
+            cell_count = max(cell_count, len(cells))
+
+    # Per-column width: right-align shorter rows so last column (dur) always
+    # maps to cell_widths[-1] even when an entry has fewer cells than the max.
+    cell_widths = [0] * cell_count
+    for cells in stat_cells_list:
+        if not cells:
+            continue
+        offset = cell_count - len(cells)
+        for i, c in enumerate(cells):
+            cell_widths[offset + i] = max(cell_widths[offset + i], len(c))
+
+    # Total width of the stats block once we join with " · " (or "   " for
+    # empty-cell gaps) — used below to decide how wide the channel column
+    # can grow without overflowing.
+    if cell_count > 0:
+        stats_total = sum(cell_widths) + 3 * (cell_count - 1)
+    else:
+        stats_total = 0
 
     if longest_ch > 0:
-        # Use the longest stats section to ensure all lines fit
         max_fixed = 0
-        for p in parsed:
-            if p:
-                # 2 (indent) + len(prefix) + 2 ("  ") + ch_col + 3 ("  —") + len(stats)
+        for idx, p in enumerate(parsed):
+            if not p:
+                continue
+            if stat_cells_list[idx]:
+                # 2 (indent) + prefix + 2 ("  ") + ch_col + 5 ("  —  ") + stats_total
+                fixed = 2 + len(p[0]) + 2 + 5 + stats_total
+            else:
                 fixed = 2 + len(p[0]) + 2 + 3 + len(p[2])
-                max_fixed = max(max_fixed, fixed)
+            max_fixed = max(max_fixed, fixed)
         avail_for_ch = max(4, max_chars - max_fixed)
-        # Column width: fit available space, but never wider than the longest name
         col_width = max(4, min(longest_ch, avail_for_ch))
     else:
         col_width = 22  # fallback
@@ -21705,7 +21841,12 @@ def _refresh_autorun_history():
         row_tags = ("hist_row_alt",) if idx % 2 == 0 else ()
         p = parsed[idx]
         if p:
-            fitted = _rebuild_hist_line(p[0], p[1], p[2], col_width)
+            fitted = _rebuild_hist_line(
+                p[0], p[1], p[2], col_width,
+                stat_cells=stat_cells_list[idx],
+                cell_widths=cell_widths if stat_cells_list[idx] else None,
+                cell_count=cell_count if stat_cells_list[idx] else None,
+            )
         else:
             fitted = entry
         _insert_hist_line(autorun_history_text, fitted, row_tags)

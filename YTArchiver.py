@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.3"
+APP_VERSION = "v40.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 12:29am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:04am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -4537,6 +4537,9 @@ _MINI_LOG_TAGS = [
     ("simplestatus", {"foreground": C_LOG_HEAD, "font": ("Consolas", 9, "bold")}),
     ("simplestatus_green", {"foreground": C_LOG_GREEN}),
     ("simplestatus_white", {"foreground": C_TEXT}),
+    ("simplestatus_redwnl", {"foreground": C_LOG_REDWNL}),
+    ("simplestatus_compress", {"foreground": C_LOG_COMPRESS}),
+    ("simplestatus_reorg", {"foreground": C_LOG_REORG}),
     ("scanline", {"foreground": C_TEXT}),
     ("dlprogress", {"foreground": C_TEXT}),
     ("dlprogress_pct", {"foreground": C_LOG_GREEN}),
@@ -4903,8 +4906,8 @@ def _res_check_click():
                 return
             def _ask():
                 _rd_ask = _dark_askquestion(
-                    "Re-download at Selected Resolution",
-                    f"Re-download {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
+                    "Redownload at Selected Resolution",
+                    f"Redownload {len(all_videos):,} existing video(s) at Best quality, replacing the originals?"
                 )
                 if _rd_ask:
                     _add_to_redownload_queue(ch_name, ch_url, _rd_folder, sel_res)
@@ -4969,7 +4972,7 @@ def _res_check_click():
                     total_count = len(all_videos)
                     log(f"  {mismatch_count:,}/{total_count:,} video(s) are not at {_new_res_label}.\n", "simpleline")
                     _rd_ask = _dark_askquestion(
-                        "Re-download at Selected Resolution",
+                        "Redownload at Selected Resolution",
                         f"Redownload {mismatch_count:,}/{total_count:,} video(s) at {_new_res_label}, replacing the originals?"
                     )
                     if _rd_ask:
@@ -5377,7 +5380,7 @@ def on_channel_double_click(event):
 settings_chan_tree.bind("<Double-Button-1>", on_channel_double_click)
 
 
-def on_chan_list_select(event):
+def on_chan_list_select(event=None):
     if settings_chan_tree.selection():
         sync_single_btn.config(state="normal")
         remove_channel_btn.pack(side="left", padx=(0, 8))
@@ -5597,7 +5600,7 @@ def _chan_ctx_unorganize():
 
 _chan_ctx_menu.add_command(label="Org. Folder by Year", command=_chan_ctx_org_by_year)
 _chan_ctx_menu.add_command(label="Org. Folder by Year/Month", command=_chan_ctx_org_by_year_month)
-_chan_ctx_menu.add_command(label="Un-Organize Folder", command=_chan_ctx_unorganize)
+_chan_ctx_menu.add_command(label="Un-Org. Folder", command=_chan_ctx_unorganize)
 
 _chan_ctx_menu.add_separator()
 
@@ -6134,6 +6137,7 @@ def add_channel():
                         ch["compress_batch_size"] = int(new_compress_batch_var.get())
                     except (ValueError, TypeError):
                         ch["compress_batch_size"] = 20
+                        log(f"  ⚠ Invalid batch size for {name} — using default (20)\n", "dim")
                     # Capture values needed after lock release to avoid stale ch reads
                     _ch_resolution_snap = ch.get("resolution", "720")
                     break
@@ -6211,7 +6215,7 @@ def add_channel():
                             _bl_ask = _dark_askquestion(
                                 "Apply to Existing Videos",
                                 f"Apply compression to {_bl_count:,} existing video(s)?\n\n"
-                                f"Re-download at {_bl_res_label}{_bl_out_label}, "
+                                f"Redownload at {_bl_res_label}{_bl_out_label}, "
                                 f"quality: {_snap['c_level']} (~{_bl_bitrate} MB/hr)."
                             )
                             if _bl_ask:
@@ -6255,7 +6259,7 @@ def add_channel():
                             _rd_ask = _dark_askquestion(
                                 "Apply to Existing Downloads",
                                 f"Resolution changed from {_old_res_label} to {_new_res_label}.\n\n"
-                                f"Re-download {_rd_count:,} existing video(s) at {_new_res_label}, "
+                                f"Redownload {_rd_count:,} existing video(s) at {_new_res_label}, "
                                 f"replacing the originals?"
                             )
                             if _rd_ask:
@@ -7100,7 +7104,7 @@ def remove_channel():
         "Remove Channel",
         f"Remove \"{removed_name}\" from your subscription list.\n\n"
         "Delete this channel's video IDs from the blocklist?\n\n"
-        "• Yes — IDs are removed, so they could be re-downloaded if re-added\n"
+        "• Yes — IDs are removed, so they could be redownloaded if re-added\n"
         "• No  — videos already archived stay skipped on future syncs",
         yes_text="Yes", no_text="No"
     )
@@ -8234,7 +8238,7 @@ def _parse_vtt_to_segments(vtt_path):
             _capped.append(seg)
             continue
         words = seg["text"].split()
-        n = max(2, int(dur / _MAX_SEG_SECS) + (1 if dur % _MAX_SEG_SECS > 1 else 0))
+        n = max(2, int(dur / _MAX_SEG_SECS) + (1 if dur % _MAX_SEG_SECS > 0 else 0))
         cdur = dur / n
         wper = max(1, len(words) // n)
         for ci in range(n):
@@ -8603,7 +8607,7 @@ for line in sys.stdin:
                                  "t": t, "w": w_data})
             elif raw_words:
                 # Split at actual word boundaries using real timestamps
-                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 1 else 0))
+                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 0 else 0))
                 wpc = max(1, len(raw_words) // n_chunks)
                 for ci in range(n_chunks):
                     wi0 = ci * wpc
@@ -8620,7 +8624,7 @@ for line in sys.stdin:
             else:
                 # Fallback: proportional split (no word timestamps available)
                 words = t.split()
-                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 1 else 0))
+                n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 0 else 0))
                 chunk_dur = dur / n_chunks
                 wpc = max(1, len(words) // n_chunks)
                 for ci in range(n_chunks):
@@ -9564,7 +9568,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             log(f"  ✓ All videos already compressed!\n", "simpleline_green")
             return
 
-        log(f"  {len(files_to_process)} file(s) to re-download and compress.\n", "simpleline")
+        log(f"  {len(files_to_process)} file(s) to redownload and compress.\n", "simpleline")
 
         if _ce.is_set():
             return
@@ -9831,7 +9835,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             if not _is_simple_mode:
                                 log(f"    ⚠ yt-dlp timed out after 300s, killing process\n", "dim")
                             dl_proc.kill()
-                            dl_proc.wait()
+                            try:
+                                dl_proc.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                pass
                         with proc_lock:
                             if dl_proc in active_processes:
                                 active_processes.remove(dl_proc)
@@ -10910,8 +10917,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         # Cleanup temp dir
         try:
             if os.path.isdir(temp_dir):
-                import shutil as _shutil
-                _shutil.rmtree(temp_dir, ignore_errors=True)
+                shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -11070,8 +11076,7 @@ def _whisper_transcribe_chunked(audio_path, total_duration, title="", cancel_ev=
     finally:
         # Clean up temp directory
         try:
-            import shutil as _shutil
-            _shutil.rmtree(_chunk_tmp_dir, ignore_errors=True)
+            shutil.rmtree(_chunk_tmp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -12457,7 +12462,7 @@ def _run_metadata_download(item):
         scan_path = folder_path
         if year is not None:
             scan_path = os.path.join(scan_path, str(year))
-        if month is not None and 1 <= (month or 0) <= 12:
+        if month is not None and 1 <= month <= 12:
             scan_path = os.path.join(scan_path, MONTH_NAMES.get(month, f"{month:02d} Unknown"))
         if os.path.isdir(scan_path):
             for dirpath, _, filenames in os.walk(scan_path):
@@ -14818,9 +14823,8 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # would cause it to skip the subtitle download entirely, making
             # _fetch_auto_captions silently return None for those videos.
             try:
-                import shutil as _shutil_init
                 if os.path.isdir(temp_dir):
-                    _shutil_init.rmtree(temp_dir, ignore_errors=True)
+                    shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception:
                 pass
             os.makedirs(temp_dir, exist_ok=True)
@@ -14917,6 +14921,10 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 if _prefetch_future is not None:
                     try:
                         text, _vtt_segments, _needed_cookies = _prefetch_future.result(timeout=120)
+                    except concurrent.futures.TimeoutError:
+                        if not _is_simple_mode:
+                            log(f"    [prefetch] Timed out after 120s\n", "dim")
+                        text, _vtt_segments, _needed_cookies = None, [], False
                     except Exception as _pf_ex:
                         if not _is_simple_mode:
                             log(f"    [prefetch] Failed: {_pf_ex}\n", "dim")
@@ -15247,8 +15255,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                     _user_skipped_whisper = True
                 else:
                     _whisper_model_choice = _model_result[0]
-                    config["whisper_model"] = _model_result[0]
-                    save_config(config)
+                    with config_lock:
+                        config["whisper_model"] = _model_result[0]
+                        save_config(config)
                     # If model changed, stop old process so it relaunches with new model
                     _stop_whisper_process()
                     if _model_timed_out[0]:
@@ -15796,8 +15805,9 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                     return
 
                 _whisper_model_choice = model_choice
-                config["whisper_model"] = model_choice
-                save_config(config)
+                with config_lock:
+                    config["whisper_model"] = model_choice
+                    save_config(config)
                 _stop_whisper_process()
 
                 if timed_out:
@@ -15818,8 +15828,8 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
                 def _ask_install():
                     _install_result[0] = messagebox.askyesno(
                         "Install Whisper AI",
-                        "Whisper AI is required for transcription.\n\n"
-                        "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
+                        "Whisper AI is needed for transcription.\n\n"
+                        "Whisper requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
                 _ui_queue.append(_ask_install)
@@ -16002,8 +16012,8 @@ def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, p
                 def _ask_install():
                     _install_result[0] = messagebox.askyesno(
                         "Install Whisper AI",
-                        "Whisper AI is required for transcription.\n\n"
-                        "This requires ~2.5 GB of downloads (plus model download on first use).\n\n"
+                        "Whisper AI is needed for transcription.\n\n"
+                        "Whisper requires ~2.5 GB of downloads (plus model download on first use).\n\n"
                         "Install now?")
 
                 _ui_queue.append(_ask_install)
@@ -17916,8 +17926,13 @@ def internal_run_cmd_blocking(cmd, channel_total=0, live_ids=None, on_batch_read
                                         _file_dir = os.path.dirname(filepath)
                                         _file_name = os.path.basename(filepath)
                                         _year = upload_date_str[:4]
-                                        _month_num = int(upload_date_str[4:6])
-                                        _month_name = MONTH_NAMES.get(_month_num, f"{_month_num:02d} Unknown")
+                                        try:
+                                            _month_num = int(upload_date_str[4:6])
+                                            if not 1 <= _month_num <= 12:
+                                                raise ValueError("month out of range")
+                                            _month_name = MONTH_NAMES.get(_month_num, f"{_month_num:02d} Unknown")
+                                        except (ValueError, TypeError):
+                                            _month_name = "Unknown Month"
 
                                         # Determine what the correct folder should be
                                         # Walk up from template to find the channel base folder
@@ -21186,7 +21201,7 @@ def _gpu_start():
                 break
 
     def _gpu_worker():
-        global _gpu_running, _gpu_current_item, _gpu_truly_paused
+        global _gpu_running, _gpu_current_item, _gpu_truly_paused, _whisper_model_choice
         _tray_start_spin(red=True)  # red indicator for any GPU task (encode/transcribe)
         try:
             while True:
@@ -21444,8 +21459,9 @@ def _gpu_start():
     if model_choice is None:
         return
     _whisper_model_choice = model_choice
-    config["whisper_model"] = model_choice
-    save_config(config)
+    with config_lock:
+        config["whisper_model"] = model_choice
+        save_config(config)
     _stop_whisper_process()
 
     if timed_out:
@@ -23031,9 +23047,6 @@ def _tp_find_jsonl_files(roots):
     return files
 
 
-_tp_panel_ref = [None]
-
-
 class _TranscriptionPanel(ttk.Frame):
     """Embedded transcription search panel — mirrors TranscriptionParser."""
 
@@ -24130,6 +24143,7 @@ class _TranscriptionPanel(ttk.Frame):
             # Use a separate read-only connection so these slow aggregate
             # queries (COUNT DISTINCT on 8M rows = ~48s) don't hold _db_lock
             # and block the disk scan / grid preload threads.
+            _stats_conn = None
             try:
                 _stats_conn = sqlite3.connect(_TP_DB_PATH, check_same_thread=False)
                 _stats_conn.execute("PRAGMA journal_mode=WAL")
@@ -24137,11 +24151,16 @@ class _TranscriptionPanel(ttk.Frame):
                 segs = _stats_conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
                 vids = _stats_conn.execute("SELECT COUNT(DISTINCT title) FROM segments").fetchone()[0]
                 chs  = _stats_conn.execute("SELECT COUNT(DISTINCT channel) FROM segments").fetchone()[0]
-                _stats_conn.close()
-                text = f"{segs:,} segments\n{vids:,} videos\n{chs} channels"
+                text = f"{segs:,} segments\n{vids:,} videos\n{chs:,} channels"
                 self.after(0, lambda: self._stats_label.config(text=text))
             except Exception:
                 pass
+            finally:
+                if _stats_conn is not None:
+                    try:
+                        _stats_conn.close()
+                    except Exception:
+                        pass
         threading.Thread(target=_query, daemon=True).start()
 
     # ── Browse section ────────────────────────────────────────────────────────
@@ -24275,7 +24294,7 @@ class _TranscriptionPanel(ttk.Frame):
                                             activebackground=self._TP_ACCENT, activeforeground="white",
                                             disabledforeground=self._TP_DIM, relief="flat", bd=1)
         self._browse_actions_menu.add_command(label="  Re-transcribe", command=self._on_retranscribe)
-        self._browse_actions_menu.add_command(label="  Re-download...", command=self._on_browse_redownload)
+        self._browse_actions_menu.add_command(label="  Redownload...", command=self._on_browse_redownload)
         def _show_actions_menu():
             btn = self._browse_actions_btn
             self._browse_actions_menu.tk_popup(
@@ -25069,7 +25088,13 @@ class _TranscriptionPanel(ttk.Frame):
             def _check_video():
                 found = bool(self._find_video_file(_check_title, _check_txt))
                 if found:
-                    self.after(0, lambda: self._browse_actions_btn.config(state="normal"))
+                    def _apply():
+                        # Only enable if the user hasn't selected a different video
+                        # since this check was queued (stale-thread race guard).
+                        if (self._browse_current_meta
+                                and self._browse_current_meta.get("title") == _check_title):
+                            self._browse_actions_btn.config(state="normal")
+                    self.after(0, _apply)
             threading.Thread(target=_check_video, daemon=True).start()
         self._browse_actions_btn.config(state="normal" if _enable_actions else "disabled")
 
@@ -25476,6 +25501,7 @@ class _TranscriptionPanel(ttk.Frame):
                 # Use a separate read-only connection so the slow COUNT DISTINCT
                 # on segments (~41s) doesn't hold _db_lock and block other threads.
                 _seg_stale = False
+                _fc = None
                 try:
                     _fc = sqlite3.connect(_TP_DB_PATH, check_same_thread=False)
                     _fc.execute("PRAGMA journal_mode=WAL")
@@ -25488,10 +25514,15 @@ class _TranscriptionPanel(ttk.Frame):
                     seg_vids = _fc.execute(
                         "SELECT COUNT(DISTINCT title) FROM segments"
                     ).fetchone()[0]
-                    _fc.close()
                     _seg_stale = vid_total > seg_vids
                 except Exception:
                     pass
+                finally:
+                    if _fc is not None:
+                        try:
+                            _fc.close()
+                        except Exception:
+                            pass
                 self.after(0, lambda: self._update_index_warn(
                     _disk_stale or _seg_stale))
             except Exception:
@@ -25738,7 +25769,7 @@ class _TranscriptionPanel(ttk.Frame):
             scope_label = channel
             if year is not None:
                 scope_label += f" / {year}"
-            if month is not None and 1 <= (month or 0) <= 12:
+            if month is not None and 1 <= month <= 12:
                 scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
 
             if _pending > 0:
@@ -25831,13 +25862,13 @@ class _TranscriptionPanel(ttk.Frame):
         # For year/month scoped redownloads, point to the subfolder
         if year is not None:
             folder_path = os.path.join(folder_path, str(year))
-        if month is not None and 1 <= (month or 0) <= 12:
+        if month is not None and 1 <= month <= 12:
             folder_path = os.path.join(folder_path, f"{month:02d}")
 
         scope_label = ch_name
         if year is not None:
             scope_label += f" / {year}"
-        if month is not None and 1 <= (month or 0) <= 12:
+        if month is not None and 1 <= month <= 12:
             scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
 
         resolution = self._show_resolution_dialog(f"Redownload: {scope_label}")
@@ -25933,7 +25964,7 @@ class _TranscriptionPanel(ttk.Frame):
         scope_label = ch_name
         if year is not None:
             scope_label += f" / {year}"
-        if month is not None and 1 <= (month or 0) <= 12:
+        if month is not None and 1 <= month <= 12:
             scope_label += f" / {_TP_MONTH_NAMES[month - 1].capitalize()}"
 
         # Check if metadata already exists for this scope
@@ -26670,7 +26701,11 @@ class _TranscriptionPanel(ttk.Frame):
                 try:
                     _ud = m["upload_date"]
                     if len(_ud) == 8:
-                        v["date_str"] = f"{_TP_MONTH_NAMES[int(_ud[4:6]) - 1].capitalize()} {int(_ud[6:8]):02d}, {_ud[:4]}"
+                        _mn = int(_ud[4:6])
+                        if 1 <= _mn <= 12:
+                            v["date_str"] = f"{_TP_MONTH_NAMES[_mn - 1].capitalize()} {int(_ud[6:8]):02d}, {_ud[:4]}"
+                        else:
+                            v["date_str"] = _ud[:4]  # fall back to year-only on bad month
                     elif len(_ud) >= 4:
                         # Non-standard length — extract year so date_str isn't
                         # empty (avoids falling through to the mtime fallback)
@@ -27289,7 +27324,7 @@ class _TranscriptionPanel(ttk.Frame):
             else:
                 tk.Label(self._grid_breadcrumb_frame, text=str(year), bg=_bg,
                          fg=_fg, font=_font_current).pack(side="left")
-        if month is not None and 1 <= (month or 0) <= 12:
+        if month is not None and 1 <= month <= 12:
             tk.Label(self._grid_breadcrumb_frame, text="  /  ", bg=_bg,
                      fg=_dim, font=_font_sep).pack(side="left")
             tk.Label(self._grid_breadcrumb_frame, text=_TP_MONTH_NAMES[month - 1].capitalize(),
@@ -31283,7 +31318,7 @@ class _TranscriptionPanel(ttk.Frame):
                 yr    = self._db_execute(
                     "SELECT MIN(year), MAX(year) FROM segments "
                     "WHERE year IS NOT NULL").fetchone()
-                yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] else "N/A"
+                yr_str  = f"{yr[0]} – {yr[1]}" if yr and yr[0] and yr[1] else "N/A"
                 db_mb   = (os.path.getsize(_TP_DB_PATH) / 1_048_576
                            if os.path.exists(_TP_DB_PATH) else 0)
                 text = (f"Segments  : {segs:,}\n"
@@ -31686,7 +31721,7 @@ def _sort_recent_tree(col, reverse):
 
         l.sort(key=lambda t: parse_dur(t[0]), reverse=reverse)
     elif col == "time":
-        l.sort(key=lambda t: int(recent_tree.set(t[1], "orig_idx")), reverse=not reverse)
+        l.sort(key=lambda t: int(recent_tree.set(t[1], "orig_idx")), reverse=reverse)
     else:
         l.sort(key=lambda t: t[0].lower(), reverse=reverse)
 
@@ -31785,9 +31820,12 @@ for _tag_name, _tag_cfg in _MINI_LOG_TAGS:
 # blue/green color in mini-log mirroring — mirrors the tag_raise() calls on the main log.
 _ALL_LOG_TAGS = ("green", "red",
                  "meta_bracket", "trans_bracket", "sync_bracket",
+                 "redwnl_bracket", "compress_bracket", "reorg_bracket",
                  "header", "tx_sep", "tx_head", "update_sep", "update_head",
                  "summary", "simpleline", "simpleline_green",
                  "simpleline_blue", "simpleline_pink", "simpledownload",
+                 "simpleline_redwnl", "simpleline_compress", "simpleline_reorg",
+                 "simplestatus_redwnl", "simplestatus_compress", "simplestatus_reorg",
                  "simplestatus_green", "simplestatus_white", "simplestatus",
                  "dlprogress_pct", "dlprogress", "scanline",
                  "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim", "dim",
@@ -31798,8 +31836,6 @@ _ALL_LOG_TAGS = ("green", "red",
                  "metadata_using",
                  "dl_white", "trans_dots")
 
-
-_mini_log_last_end = [None]  # track last log_box end index to skip if unchanged
 
 def _sync_mini_logs_from_main():
     """Mirror the last 4 lines from the main log_box to both mini logs.
@@ -32618,9 +32654,10 @@ def _first_launch_dep_check():
     def _has_ffmpeg():
         try:
             subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, startupinfo=startupinfo)
+                           stderr=subprocess.STDOUT, startupinfo=startupinfo,
+                           timeout=10)
             return True
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
     _ytdlp_ok = _has_ytdlp()
@@ -32868,7 +32905,7 @@ def check_dependencies():
                             [sys.executable, "-m", "pip", "install", pkg],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             encoding="utf-8", errors="replace",
-                            startupinfo=startupinfo
+                            startupinfo=startupinfo, timeout=600
                         )
                     except Exception:
                         pass
@@ -33019,7 +33056,7 @@ def run_startup_updates():
                 ["yt-dlp", "--version"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 encoding="utf-8", errors="replace",
-                startupinfo=startupinfo
+                startupinfo=startupinfo, timeout=10
             )
             return r.stdout.strip() if r.stdout else "unknown"
         except Exception:
@@ -33084,6 +33121,10 @@ def run_startup_updates():
                 proc.wait(timeout=45)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
                 log("  ⚠ yt-dlp update check timed out (45s). Skipping update.\n", "red")
 
             full_output = "".join(update_output).lower()

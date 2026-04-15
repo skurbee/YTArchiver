@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.4"
+APP_VERSION = "v40.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:04am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 6:18pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12155,8 +12155,15 @@ def _add_to_metadata_queue(ch_name, ch_url, folder_path, split_years, split_mont
     _update_queue_btn()
     _save_queue_state()
 
-    # If nothing else is running, start processing immediately
-    if not _sync_running and not _reorg_running and not (_transcribe_running and _transcribe_sync_controlled) and not _redownload_running and not _metadata_running:
+    # If nothing else is running AND sync isn't paused, start processing
+    # immediately. The pause_event guard fixes a bug where adding metadata
+    # while the sync queue is paused caused the new task to fire right
+    # away instead of queueing behind the pause. When the user un-pauses,
+    # toggle_pause() will kick the queue so this item still runs.
+    if (not _sync_running and not _reorg_running
+            and not (_transcribe_running and _transcribe_sync_controlled)
+            and not _redownload_running and not _metadata_running
+            and not pause_event.is_set()):
         _process_metadata_queue()
 
 
@@ -12190,10 +12197,18 @@ def _process_metadata_queue(_preferred_key=None):
 def _start_metadata_task(item):
     """Start a metadata download task as a sync-pipeline job.
     Returns True if the task actually started, False if it was re-queued
-    because another sync-pipeline task is currently active."""
+    because another sync-pipeline task is currently active (or the
+    sync pipeline is paused)."""
     global _metadata_running, _current_metadata_item
 
-    if _sync_running or _reorg_running or (_transcribe_running and _transcribe_sync_controlled) or _redownload_running or _metadata_running:
+    # Re-queue at the head (preserving intended order) if another task is
+    # running OR if the user has the sync pipeline paused. Without the
+    # pause check, a different caller path could still pop and start this
+    # item even though the user explicitly paused.
+    if (_sync_running or _reorg_running
+            or (_transcribe_running and _transcribe_sync_controlled)
+            or _redownload_running or _metadata_running
+            or pause_event.is_set()):
         with _metadata_queue_lock:
             _metadata_queue.insert(0, item)
         with _queue_order_lock:
@@ -19155,13 +19170,18 @@ def _gpb_has_sync_queued():
 
 
 def _global_start_all():
-    """Start both sync queue and GPU queue if they have pending items."""
+    """Start both sync queue and GPU queue if they have pending items.
+    Explicitly clears both pause events — clicking Start means the user
+    wants to run, so any prior pause (including the implicit one set
+    on launch when items are restored) needs to lift."""
     if _gpb_has_sync_queued():
+        pause_event.clear()
         cancel_event.clear()
         _process_next_queued()
     with _gpu_queue_lock:
         _has_gpu = bool(_gpu_queue)
     if _has_gpu and not _gpu_running:
+        _gpu_pause.clear()
         _gpu_start()
 
 
@@ -19403,7 +19423,8 @@ def _fmt_time():
 
 
 def toggle_pause():
-    if pause_event.is_set():
+    _resuming = pause_event.is_set()
+    if _resuming:
         pause_event.clear()
         # No OS-level process resume needed — the worker thread will
         # exit its pause loop and resume reading stdout, which unblocks
@@ -19415,13 +19436,46 @@ def toggle_pause():
         # fills up, and yt-dlp naturally blocks on its next write.
     _update_redownload_hist_pause()
 
+    # On resume: if nothing was actively running during the pause (e.g. the
+    # user paused while idle and queued items), kick the queue so items
+    # added while paused actually start instead of sitting forever.
+    if _resuming:
+        _any_running = (_sync_running or _reorg_running or _redownload_running
+                        or _metadata_running
+                        or (_transcribe_running and _transcribe_sync_controlled))
+        if not _any_running:
+            _has_pending = False
+            with _sync_queue_lock:
+                if _sync_queue: _has_pending = True
+            if not _has_pending:
+                with _reorg_queue_lock:
+                    if _reorg_queue: _has_pending = True
+            if not _has_pending:
+                with _redownload_queue_lock:
+                    if _redownload_queue: _has_pending = True
+            if not _has_pending:
+                with _metadata_queue_lock:
+                    if _metadata_queue: _has_pending = True
+            if not _has_pending:
+                with _video_dl_queue_lock:
+                    if _video_dl_queue: _has_pending = True
+            if _has_pending and _root_alive:
+                try:
+                    _ui_queue.append(_process_next_queued)
+                except Exception:
+                    pass
+
 
 def _sync_task_finished():
     """Called when sync/reorg/redownload/metadata finishes — resets job state and updates sync tasks button.
     If autorun_sync is enabled, also kicks off the next queued item so an
     auto-metadata-after-sync (or similar chain) starts without a manual click."""
     if not _sync_running and not _reorg_running and not _redownload_running and not _metadata_running:
-        pause_event.clear()
+        # Intentionally do NOT clear pause_event here. When the user manually
+        # pauses the sync pipeline, their intent should survive any task
+        # completion — otherwise adding a new item after the current one
+        # finishes would silently override the pause. Disk-error auto-resume
+        # clears pause explicitly from _check_and_resume() when appropriate.
         _current_job["label"] = None
         _current_job["url"] = None
         _update_queue_btn()
@@ -20053,6 +20107,11 @@ def _show_queue_menu(event=None):
                     # Not running but has queued items — show Start
                     def _start_sync_queue():
                         popup.destroy()
+                        # Explicit Start click = user lifts any pause. The
+                        # launch-with-items flow auto-sets pause; without
+                        # clearing it here, _start_metadata_task's pause
+                        # guard would re-queue and nothing runs.
+                        pause_event.clear()
                         cancel_event.clear()
                         _process_next_queued()
                     tk.Button(btn_row, text="\u25B6 Start", bg="#3a6a3a", fg="#cccccc",
@@ -26125,13 +26184,44 @@ class _TranscriptionPanel(ttk.Frame):
             return None
 
     def _download_thumbnail(self, url, thumb_dir, title, video_id):
-        """Download a thumbnail image to the .Thumbnails folder."""
+        """Download a thumbnail image to the .Thumbnails folder.
+
+        Deduplication: if a thumbnail with this [<video_id>] already lives
+        in this folder under a *different* title (because YouTube renamed
+        the video since we last fetched it), rename it to match the new
+        title rather than saving a second copy. Before this guard was added
+        each YT rename produced a second thumbnail file for the same video,
+        which is what caused the 38 duplicate-video_id cases the viewer's
+        integrity check surfaced on 2026-04-15.
+        """
         # Build filename from title + video_id (matching video file naming)
         safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:100]
         fname = f"{safe_title} [{video_id}].jpg"
         fpath = os.path.join(thumb_dir, fname)
         if os.path.isfile(fpath):
-            return  # already downloaded
+            return  # already downloaded under the current name
+
+        # Dedupe by [<video_id>] — rename rather than write a second copy.
+        try:
+            if os.path.isdir(thumb_dir):
+                bracket = f"[{video_id}]"
+                for existing in os.listdir(thumb_dir):
+                    if not existing.lower().endswith(
+                            ('.jpg', '.jpeg', '.png', '.webp')):
+                        continue
+                    if bracket in existing and existing != fname:
+                        existing_path = os.path.join(thumb_dir, existing)
+                        existing_ext = os.path.splitext(existing)[1]
+                        new_fname = f"{safe_title} [{video_id}]{existing_ext}"
+                        new_path = os.path.join(thumb_dir, new_fname)
+                        try:
+                            os.replace(existing_path, new_path)
+                            return  # migrated in place — nothing to download
+                        except OSError:
+                            pass  # rename failed; fall through to download
+        except OSError:
+            pass
+
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -33327,6 +33417,11 @@ def _save_queue_state_now():
         for item in _gpu_queue:
             queue_data["gpu"].append(copy.deepcopy(item))
     queue_data["gpu_paused"] = _gpu_pause.is_set()
+    # Persist sync-pipeline pause state too — matches the gpu_paused pattern
+    # so the user's explicit pause survives a restart. On load, pause_event
+    # is re-set if this was true OR if any sync-pipeline items were restored
+    # (belt-and-suspenders so restored queues never auto-start on launch).
+    queue_data["sync_paused"] = pause_event.is_set()
     with _queue_order_lock:
         saved_order = list(_queue_order)
     # Prepend the currently-running item's order entry (it was removed from
@@ -33439,6 +33534,17 @@ def _load_queue_state():
         # Restore GPU pause state
         if queue_data.get("gpu_paused", False) and gpu_restored > 0:
             _gpu_pause.set()
+        # Sync-pipeline pause: restore if it was saved as paused, OR if any
+        # sync-pipeline items were restored (safety — Scott's rule:
+        # launching with items in queue should never auto-start; the user
+        # must explicitly hit resume). Counts everything except gpu-only.
+        _sync_pipeline_restored = bool(
+            queue_data.get("sync") or queue_data.get("reorg")
+            or queue_data.get("transcribe") or queue_data.get("redownload")
+            or queue_data.get("metadata") or queue_data.get("video")
+        )
+        if queue_data.get("sync_paused", False) or _sync_pipeline_restored:
+            pause_event.set()
         # Restore unified queue ordering
         saved_order = queue_data.get("order", [])
         if saved_order:
@@ -33630,5 +33736,412 @@ def _defocus_on_click(e):
 
 
 root.bind_all("<Button-1>", _defocus_on_click, add="+")
+
+
+# ── Command receiver ───────────────────────────────────────────────────
+# A tiny stdlib HTTP server on 127.0.0.1:9855 that accepts commands
+# from the ArchivePlayer-based "YouTube tab" viewer project. Runs in a
+# daemon thread — stops automatically with the app.
+#
+# See ArchiveBrowserWithYTTest/YTARCHIVER_HANDOFF.md for the full command
+# surface plan. Initial implementation: /cmd/ping for liveness probes
+# and /cmd/retranscribe which queues a request and logs it to the main
+# window. The receiver deliberately does not process retranscribes
+# itself — it writes to a shared queue and surfaces a message in the
+# log so the user can action them from the Browse tab. Automating the
+# whole flow is a follow-up change that needs to factor the existing
+# _on_retranscribe worker out of its UI callbacks.
+
+import http.server as _http_server
+import socket as _cmd_socket
+
+_CMD_PORT = 9855
+
+
+def _cmd_log_on_main(msg, tag=None):
+    """Bounce log() onto the tk main thread from the HTTP server thread."""
+    try:
+        if _root_alive:
+            root.after(0, lambda m=msg, t=tag: log(m, t))
+    except Exception:
+        # Pre-mainloop or post-teardown: fall back to stdout.
+        try:
+            sys.stdout.write(msg)
+        except Exception:
+            pass
+
+
+class _CmdHandler(_http_server.BaseHTTPRequestHandler):
+    server_version = f"YTArchiver-CMD/{APP_VERSION}"
+
+    def _json(self, code, body):
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        # Viewer runs on the same machine; allow cross-port fetch from it.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except Exception:
+            pass
+
+    def _read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/cmd/ping":
+            return self._cmd_ping()
+        self._json(404, {"ok": False, "error": "unknown_command", "path": self.path})
+
+    def do_POST(self):
+        if self.path == "/cmd/ping":
+            return self._cmd_ping()
+        body = self._read_body()
+        if self.path == "/cmd/retranscribe":
+            return self._cmd_retranscribe(body)
+        if self.path == "/cmd/repair-orphans":
+            return self._cmd_repair_orphans(body)
+        if self.path == "/cmd/repair-duplicates":
+            return self._cmd_repair_duplicates(body)
+        if self.path == "/cmd/repair-mismatches":
+            return self._cmd_repair_mismatches(body)
+        self._json(404, {"ok": False, "error": "unknown_command", "path": self.path})
+
+    # Silence BaseHTTPRequestHandler's default stdout access-log chatter.
+    def log_message(self, fmt, *args):
+        pass
+
+    # Endpoints ----------------------------------------------------------
+
+    def _cmd_ping(self):
+        # Report the live GPU queue depth so the viewer can show it.
+        try:
+            with _gpu_queue_lock:
+                depth = len(_gpu_queue)
+        except Exception:
+            depth = 0
+        self._json(200, {
+            "ok": True,
+            "version": APP_VERSION,
+            "hostname": _cmd_socket.gethostname(),
+            "pid": os.getpid(),
+            "queued_commands": depth,
+        })
+
+    def _cmd_retranscribe(self, body):
+        """Drop a single-file manual-transcription job onto the GPU queue —
+        identical to right-clicking the video in the Browse tab and picking
+        'Re-transcribe with Whisper'. Takes (channel, video_id), looks up
+        the video's file_path in YTArchiver's own DB, then enqueues via
+        _add_to_gpu_queue({'type': 'mt', 'file_path': ...})."""
+        ch  = body.get("channel") or ""
+        vid = body.get("video_id") or ""
+        if not (ch and vid):
+            return self._json(400, {"ok": False, "error": "missing channel/video_id"})
+
+        # Look up the video in YTArchiver's own index DB
+        try:
+            conn = sqlite3.connect(
+                f"file:{_TP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+            row = conn.execute(
+                "SELECT title, filepath FROM videos "
+                "WHERE video_id=? AND channel=? LIMIT 1",
+                (vid, ch)
+            ).fetchone()
+            conn.close()
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": f"db query: {e}"})
+
+        if not row:
+            return self._json(404, {
+                "ok": False,
+                "error": f"Video {vid} not found in YTArchiver's DB for channel {ch}"
+            })
+
+        title, file_path = row
+        if not file_path or not os.path.isfile(file_path):
+            return self._json(404, {
+                "ok": False,
+                "error": f"Video file not found on disk: {file_path}"
+            })
+
+        # Enqueue on the main thread (same path as the right-click
+        # "Re-transcribe" action in the Browse tab). _add_to_gpu_queue
+        # logs "— Added M.T. <filename> to GPU-tasks queue" and updates UI.
+        def _enqueue():
+            try:
+                _add_to_gpu_queue({"type": "mt", "file_path": file_path})
+            except Exception as e:
+                _cmd_log_on_main(
+                    f"  [cmd] enqueue failed: {e}\n", "red")
+        root.after(0, _enqueue)
+
+        self._json(200, {
+            "ok": True,
+            "queued": True,
+            "title": title,
+            "file_path": file_path,
+        })
+
+    # ── Repair commands ──────────────────────────────────────────
+    # These accept the diagnostic output of the viewer's integrity
+    # check and clean up the affected archive state. They never touch
+    # .mp4 files — only thumbnails and DB flags. Prevention of future
+    # corruption lives in the patched _download_thumbnail dedupe guard.
+
+    def _cmd_repair_orphans(self, body):
+        """Clear date_resolve_failed_ts / search_failed_ts / id_resolve_failed_ts
+        flags on rows matching (channel, year, filename) so YTArchiver's
+        normal multi-pass metadata resolver retries them next time the
+        channel is fetched. The user still has to queue metadata fetch
+        afterwards — this just resets the 'already tried, gave up' flag."""
+        items = body.get("items") or []
+        if not isinstance(items, list):
+            return self._json(400, {"ok": False, "error": "items must be list"})
+        with config_lock:
+            out_dir = config.get("output_dir", "")
+        if not out_dir:
+            return self._json(500, {"ok": False, "error": "output_dir not configured"})
+
+        cleared = 0
+        not_found = 0
+        try:
+            conn = sqlite3.connect(_TP_DB_PATH, timeout=10.0)
+            try:
+                for it in items:
+                    ch = (it.get("channel") or "").strip()
+                    yr = str(it.get("year") or "").strip()
+                    fn = (it.get("filename") or "").strip()
+                    if not (ch and yr and fn):
+                        not_found += 1
+                        continue
+                    # Normalize slashes so the DB lookup matches. YTArchiver
+                    # stores filepaths with all OS-native backslashes on
+                    # Windows, but config["output_dir"] can be forward-slash
+                    # (Z:/Archive/...) which os.path.join doesn't fix.
+                    path = os.path.normpath(os.path.join(out_dir, ch, yr, fn))
+                    row = conn.execute(
+                        "SELECT id FROM videos WHERE filepath=? LIMIT 1",
+                        (path,)
+                    ).fetchone()
+                    if not row:
+                        not_found += 1
+                        continue
+                    conn.execute(
+                        "UPDATE videos SET "
+                        "date_resolve_failed_ts=NULL, "
+                        "date_resolve_failed_mtime=NULL, "
+                        "search_failed_ts=NULL, "
+                        "id_resolve_failed_ts=NULL, "
+                        "metadata_fetch_failed_ts=NULL "
+                        "WHERE id=?",
+                        (row[0],)
+                    )
+                    cleared += 1
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": f"db: {e}"})
+
+        _cmd_log_on_main(
+            f"  [cmd] Repair orphans: cleared retry flags on {cleared} row(s)"
+            f" ({not_found} not found). Queue channel metadata to retry.\n",
+            "dim")
+        self._json(200, {
+            "ok": True,
+            "cleared": cleared,
+            "not_found": not_found,
+            "message": ("Retry flags cleared. Queue channel metadata fetch "
+                        "to attempt resolution again."),
+        })
+
+    def _cmd_repair_duplicates(self, body):
+        """For each duplicate [video_id], ask the videos table what title
+        YTArchiver associates with that id. Whichever thumbnail's title
+        prefix matches that canonical title wins; the others are deleted.
+        If no title matches (all wrong), keep the newest by mtime and
+        delete the rest — preserves at least one artifact while removing
+        the duplicate. .mp4 files are never touched."""
+        items = body.get("items") or []
+        if not isinstance(items, list):
+            return self._json(400, {"ok": False, "error": "items must be list"})
+        with config_lock:
+            out_dir = config.get("output_dir", "")
+        if not out_dir:
+            return self._json(500, {"ok": False, "error": "output_dir not configured"})
+
+        deleted = 0
+        kept = 0
+        no_canonical_kept = 0
+        errors = []
+
+        def _thumb_path(loc):
+            return os.path.join(
+                out_dir,
+                loc.get("channel", ""),
+                str(loc.get("year", "")),
+                ".Thumbnails",
+                loc.get("thumb_filename", ""),
+            )
+
+        try:
+            conn = sqlite3.connect(f"file:{_TP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+        except Exception as e:
+            return self._json(500, {"ok": False, "error": f"db: {e}"})
+
+        try:
+            for it in items:
+                vid = (it.get("video_id") or "").strip()
+                locs = it.get("locations") or []
+                if not (vid and locs):
+                    continue
+
+                row = conn.execute(
+                    "SELECT title FROM videos WHERE video_id=? LIMIT 1",
+                    (vid,)
+                ).fetchone()
+                canonical_title = row[0] if row else None
+
+                kept_idx = -1
+                if canonical_title:
+                    canonical_norm = _normalize_yt_title(canonical_title)
+                    for idx, loc in enumerate(locs):
+                        stem = os.path.splitext(loc.get("thumb_filename", ""))[0]
+                        m = re.search(r"\s\[" + re.escape(vid) + r"\]\s*$", stem)
+                        prefix = stem[:m.start()].rstrip() if m else stem
+                        if _normalize_yt_title(prefix) == canonical_norm:
+                            kept_idx = idx
+                            break
+
+                if kept_idx < 0:
+                    # No match — keep newest by mtime so we don't erase all.
+                    times = []
+                    for idx, loc in enumerate(locs):
+                        try:
+                            t = os.path.getmtime(_thumb_path(loc))
+                        except OSError:
+                            t = 0
+                        times.append((t, idx))
+                    times.sort(reverse=True)
+                    if times:
+                        kept_idx = times[0][1]
+                        no_canonical_kept += 1
+
+                for idx, loc in enumerate(locs):
+                    path = _thumb_path(loc)
+                    if idx == kept_idx:
+                        kept += 1
+                        continue
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            deleted += 1
+                        # If the file is already gone, silently count it
+                        # as success — the goal state is achieved.
+                    except OSError as e:
+                        errors.append({"path": path, "error": str(e)})
+        finally:
+            conn.close()
+
+        _cmd_log_on_main(
+            f"  [cmd] Repair duplicates: deleted {deleted} extra thumbnail(s), "
+            f"kept {kept} ({no_canonical_kept} by mtime fallback)"
+            f"{', ' + str(len(errors)) + ' errors' if errors else ''}\n",
+            "dim")
+        self._json(200, {
+            "ok": True,
+            "deleted": deleted,
+            "kept": kept,
+            "no_canonical_kept": no_canonical_kept,
+            "errors": errors,
+        })
+
+    def _cmd_repair_mismatches(self, body):
+        """Delete the thumbnail whose embedded [id] disagrees with the
+        Metadata.jsonl entry for that title. YTArchiver's next metadata
+        fetch will re-download the right thumbnail under the correct id."""
+        items = body.get("items") or []
+        if not isinstance(items, list):
+            return self._json(400, {"ok": False, "error": "items must be list"})
+        with config_lock:
+            out_dir = config.get("output_dir", "")
+        if not out_dir:
+            return self._json(500, {"ok": False, "error": "output_dir not configured"})
+
+        deleted = 0
+        already_gone = 0
+        errors = []
+        for it in items:
+            ch = it.get("channel", "")
+            yr = str(it.get("year", ""))
+            fn = it.get("thumbnail_filename", "")
+            if not (ch and yr and fn):
+                continue
+            path = os.path.join(out_dir, ch, yr, ".Thumbnails", fn)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+                    deleted += 1
+                else:
+                    already_gone += 1
+            except OSError as e:
+                errors.append({"path": path, "error": str(e)})
+
+        _cmd_log_on_main(
+            f"  [cmd] Repair mismatches: deleted {deleted} wrong thumbnail(s)"
+            f"{' (' + str(already_gone) + ' already gone)' if already_gone else ''}"
+            f"{', ' + str(len(errors)) + ' errors' if errors else ''}\n",
+            "dim")
+        self._json(200, {
+            "ok": True,
+            "deleted": deleted,
+            "already_gone": already_gone,
+            "errors": errors,
+        })
+
+
+def _start_cmd_server():
+    try:
+        srv = _http_server.ThreadingHTTPServer(("127.0.0.1", _CMD_PORT), _CmdHandler)
+    except OSError as e:
+        _cmd_log_on_main(
+            f"  [cmd] Port {_CMD_PORT} busy — viewer integration disabled ({e})\n",
+            "red")
+        return
+
+    def _serve():
+        try:
+            srv.serve_forever()
+        except Exception as e:
+            _cmd_log_on_main(f"  [cmd] server died: {e}\n", "red")
+
+    t = threading.Thread(target=_serve, name="ytarchiver-cmd-server", daemon=True)
+    t.start()
+    _cmd_log_on_main(
+        f"  [cmd] Viewer-integration receiver listening on 127.0.0.1:{_CMD_PORT}\n",
+        "dim")
+
+
+_start_cmd_server()
 
 root.mainloop()

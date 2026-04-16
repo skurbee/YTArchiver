@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.5"
+APP_VERSION = "v41.6"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 4:03pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 4:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12550,10 +12550,23 @@ def _run_metadata_download(item):
                     except Exception:
                         at_bottom = True
                     log_box.config(state="normal")
+                    # Drop any prior version of THIS prep line.
                     ranges = log_box.tag_ranges("scanline")
                     if ranges:
                         log_box.delete(ranges[0], ranges[1])
-                    log_box.insert(tk.END, f"  {text}\n", "scanline")
+                    # Insert ABOVE the bottom-pinned simplestatus anim line so
+                    # the two transient lines (transcribe anim + metadata
+                    # playlist-fetch progress) don't fight for tk.END. Also
+                    # prefix with a pink em-dash so the line carries the
+                    # metadata-task identity color, matching the rest of the
+                    # metadata pipeline's log lines.
+                    ss_ranges = log_box.tag_ranges("simplestatus")
+                    _ins = log_box.index(ss_ranges[0]) if ss_ranges else log_box.index(tk.END)
+                    log_box.insert(_ins, "  ", "scanline")
+                    _p = log_box.index(f"{_ins}+2c")
+                    log_box.insert(_p, "\u2014", ("scanline", "simpleline_pink"))
+                    _p = log_box.index(f"{_p}+1c")
+                    log_box.insert(_p, f" {text}\n", "scanline")
                     if at_bottom:
                         log_box.see(tk.END)
                     log_box.config(state="disabled")

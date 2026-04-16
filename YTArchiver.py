@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.6"
+APP_VERSION = "v41.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 4:47pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 5:44pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -5826,14 +5826,20 @@ def _queue_all_transcriptions():
         folder = os.path.join(out_dir, _channel_folder_name(ch))
         sy = ch.get("split_years", False)
         sm = ch.get("split_months", False)
+        # _quiet=True suppresses the per-channel "Added X to GPU-tasks queue"
+        # spam — when bulk-queuing 100+ channels, the user only needs the
+        # single summary line below, not 100 individual entries.
         _add_to_gpu_queue({
             "type": "transcribe", "ch_name": ch_name, "ch_url": ch_url,
             "folder": folder, "split_years": sy, "split_months": sm,
             "combined": not sy
-        })
+        }, _quiet=True)
         added += 1
     if added:
-        log(f"  ↺ Queued ALL {added} channel(s) for transcription.\n", "simpleline_green")
+        # Leading em-dash gets painted blue (transcription identity) by the
+        # simpleline_green + leading-em-dash painter rule; the ↺ + text stay
+        # green so the line still reads as a "queue success" summary.
+        log(f"  \u2014 ↺ Queued ALL {added} channel(s) for transcription.\n", "simpleline_green")
     else:
         log(f"  No channels found.\n", "dim")
 
@@ -12091,7 +12097,8 @@ def _add_to_gpu_queue(item, _quiet=False):
         _gpu_log_tag = "simpleline_blue"
     else:
         _gpu_log_tag = "simpleline_compress"
-    log(f"  \u2014 Added {label} to GPU-tasks queue\n", _gpu_log_tag)
+    if not _quiet:
+        log(f"  \u2014 Added {label} to GPU-tasks queue\n", _gpu_log_tag)
     _update_gpu_btn()
     _save_queue_state()
     # Refresh channel list so Transcribed column shows "Queued" immediately.
@@ -14505,9 +14512,23 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             already_done = _scan_existing_transcripts(folder, ch_name)
             if retranscribe:
                 already_done = set()  # re-transcribe everything
+            # Normalize titles for matching: NFKC collapses fullwidth ？/：/／
+            # to their ASCII counterparts. Filename stems use fullwidth chars
+            # (Windows can't put ?/:/etc in filenames) but transcript headers
+            # may use either form depending on whether the title came from
+            # YouTube's API (ASCII) or from the filename (fullwidth). Without
+            # this normalization, a WHISPER entry written via re-transcribe
+            # (ASCII title from DB) won't match the on-disk filename stem
+            # (fullwidth) — so the skip check fails and auto-transcribe
+            # re-processes the file with auto-captions, OVERWRITING the
+            # Whisper transcription. NFKC equates the two forms.
+            import unicodedata as _ud
+            def _norm_for_skip(s):
+                return _ud.normalize("NFKC", s or "").strip()
+            already_done_norm = {_norm_for_skip(t) for t in already_done}
             files_to_process = {}
             for fname, fpath in local_files.items():
-                if fname not in already_done:
+                if _norm_for_skip(fname) not in already_done_norm:
                     files_to_process[fname] = fpath
 
             if already_done:
@@ -14518,7 +14539,13 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
 
             _jsonl_existing = (
                 _scan_existing_jsonl(folder, ch_name) if already_done else set())
-            _jsonl_needed = already_done - _jsonl_existing if already_done else set()
+            # Same NFKC normalization for jsonl-needed: a WHISPER .jsonl entry
+            # written under the ASCII title shouldn't trigger backfill of the
+            # fullwidth-titled .txt entry (they're the same video).
+            _jsonl_existing_norm = {_norm_for_skip(t) for t in _jsonl_existing}
+            _jsonl_needed = (
+                {t for t in already_done if _norm_for_skip(t) not in _jsonl_existing_norm}
+                if already_done else set())
 
             if not files_to_process and not _jsonl_needed:
                 log(f"  \u2014 \u2713 All videos already transcribed!\n", "simpleline_green")
@@ -16283,12 +16310,21 @@ def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
     global _transcribe_running, _transcribe_sync_controlled, _whisper_model_choice
 
     file_path   = item["file_path"]
-    title       = item["title"]
     video_id    = item.get("video_id") or ""
     txt_path    = item["txt_path"]
     jsonl_path  = item["jsonl_path"]
     chosen_model = item.get("model") or _whisper_model_choice
     fname       = os.path.splitext(os.path.basename(file_path))[0]
+    # Use the on-disk filename stem as the transcript title, NOT the DB
+    # title. The DB title may have been pulled from YouTube's API and
+    # contain ASCII chars (?, :, /) that the filesystem can't store —
+    # the file on disk uses fullwidth replacements (？, ：, ／). If we
+    # write the new WHISPER entry under the API title, the next
+    # auto-transcribe scan won't recognize the file as transcribed
+    # (its stem doesn't match the entry's title) and will overwrite
+    # with auto-captions. v41.4's purge-by-video_id removes the OLD
+    # entry whatever its title was, so we're free to use the stem.
+    title       = fname
 
     _ce = cancel_ev or cancel_event
     _pe = pause_ev or pause_event

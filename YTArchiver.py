@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.1"
+APP_VERSION = "v41.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -711,6 +711,7 @@ def log(text, tag=None):
                         return
 
                     if use_tag not in ("red", "simpleline", "simpleline_green", "simpleline_blue", "simpleline_pink",
+                                       "simpleline_redwnl", "simpleline_compress", "simpleline_reorg",
                                        "summary", "header", "tx_sep", "tx_head", "update_sep", "update_head",
                                        "simpledownload", "pauselog", "pausestatus", "livestream", "filterskip", "filterskip_dim",
                                        "transcribe_using", "metadata_using"):
@@ -2602,15 +2603,19 @@ def _fetch_channel_art(ch_url, folder_path, force=False):
         except Exception:
             pass
 
-    # Single yt-dlp call: get channel-level info, no video enumeration.
+    # Single yt-dlp call: dump the channel-level JSON (no item enumeration).
     # Use the channel URL WITHOUT /videos appended so we get the channel header.
+    # `--print` requires items, so we can't use it with `--playlist-items 0`.
+    # `--dump-single-json --flat-playlist --playlist-items 0` returns the
+    # channel/playlist's own metadata as one JSON object — the .thumbnails
+    # array on it has both the avatar (id="avatar_uncropped") and the banner
+    # (id="banner_uncropped"), plus several pre-cropped variants.
     base_url = ch_url.rstrip("/")
     if base_url.endswith("/videos"):
         base_url = base_url[:-len("/videos")]
     cmd = [
         "yt-dlp", "--skip-download", "--no-warnings",
-        "--playlist-items", "0",  # don't enumerate any videos
-        "--print", "%(thumbnails)j",
+        "--dump-single-json", "--flat-playlist", "--playlist-items", "0",
         "--cookies-from-browser", "firefox",
         base_url,
     ]
@@ -2623,16 +2628,11 @@ def _fetch_channel_art(ch_url, folder_path, force=False):
         cleanup_process(proc)
         if proc.returncode != 0 or not stdout.strip():
             return
-        # Take the LAST JSON line — yt-dlp may emit multiple lines for tabbed channels
-        thumbs = None
-        for line in stdout.strip().splitlines():
-            line = line.strip()
-            if not line.startswith("["):
-                continue
-            try:
-                thumbs = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return
+        thumbs = data.get("thumbnails") or []
         if not thumbs:
             return
 
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 12:46am", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 1:23pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

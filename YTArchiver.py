@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.3"
+APP_VERSION = "v41.4"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 1:39pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 2:36pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -16278,15 +16278,24 @@ def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
         text = _whisper_punct_fixup(text)
 
         # Replace the existing entry in the per-year .txt and .jsonl so
-        # both YTArchiver and the viewer see the new transcript.
+        # both YTArchiver and the viewer see the new transcript. JSONL
+        # runs FIRST so its video_id-based purge can report back which
+        # extra titles existed for this video (in case the title drifted
+        # since the original transcription, e.g. "huge change.." vs
+        # "huge change..."). Those extra titles are then passed to the
+        # txt replacer so it can clean them up too.
+        _extra_titles = set()
         try:
-            _tp_panel._replace_txt_entry(txt_path, title, text, chosen_model)
-        except Exception as e:
-            log(f"  \u26a0 Failed to update {os.path.basename(txt_path)}: {e}\n", "red")
-        try:
-            _tp_panel._replace_jsonl_entry(jsonl_path, title, video_id, segments)
+            _extra_titles = _tp_panel._replace_jsonl_entry(
+                jsonl_path, title, video_id, segments) or set()
         except Exception as e:
             log(f"  \u26a0 Failed to update {os.path.basename(jsonl_path)}: {e}\n", "red")
+        try:
+            _tp_panel._replace_txt_entry(
+                txt_path, title, text, chosen_model,
+                extra_titles_to_remove=_extra_titles)
+        except Exception as e:
+            log(f"  \u26a0 Failed to update {os.path.basename(txt_path)}: {e}\n", "red")
 
         # Re-index the .jsonl so search results reflect the new segments
         # without waiting for the background indexer.
@@ -28320,15 +28329,20 @@ class _TranscriptionPanel(ttk.Frame):
                 self._browse_retranscribe_status("Restoring punctuation...")
                 text = _whisper_punct_fixup(text)
 
-                # --- Replace old entry in .txt ---
+                # --- Replace old entry in .jsonl + .txt ---
+                # JSONL first so its video_id-based purge can report extra
+                # stale titles (drifted titles for the same video) back to
+                # the txt replacer. See _replace_jsonl_entry docstring.
                 self._browse_retranscribe_status("Replacing transcript...")
-                self._replace_txt_entry(txt_path, title, text, chosen_model)
-
-                # --- Replace old entry in .jsonl ---
+                _extra_titles = set()
                 if jsonl_path:
-                    self._replace_jsonl_entry(
-                        jsonl_path, title, video_id or "", segments)
+                    _extra_titles = self._replace_jsonl_entry(
+                        jsonl_path, title, video_id or "", segments) or set()
+                self._replace_txt_entry(
+                    txt_path, title, text, chosen_model,
+                    extra_titles_to_remove=_extra_titles)
 
+                if jsonl_path:
                     # --- Re-index this JSONL file in the DB ---
                     self._browse_retranscribe_status("Re-indexing...")
                     roots = self._get_archive_roots()
@@ -28815,37 +28829,62 @@ class _TranscriptionPanel(ttk.Frame):
 
         threading.Thread(target=_redownload_worker, daemon=True).start()
 
-    def _replace_txt_entry(self, txt_path, title, new_text, model_name):
-        """Replace a single video's entry in the transcript .txt file."""
+    def _replace_txt_entry(self, txt_path, title, new_text, model_name,
+                            extra_titles_to_remove=None):
+        """Replace a single video's entry in the transcript .txt file.
+
+        `extra_titles_to_remove`: optional iterable of additional titles whose
+        entries should ALSO be removed before appending the new one. Used by
+        the retranscribe flow: when a video's title has drifted (e.g.
+        "huge change.." was the old YT-captions entry, now we're writing
+        "huge change..." for Whisper), the title-only matcher would miss
+        the old entry and leave both in place. The jsonl replace step
+        figures out the full set of stale titles by video_id and feeds them
+        in here so all of them get cleaned up in the txt too.
+        """
         try:
             with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except FileNotFoundError:
             content = ""
 
-        # Find and remove the old entry
+        # Build the set of titles to purge: the canonical one + any extras
+        # discovered via video_id matching in the jsonl pass.
+        _purge = {(t or "").strip() for t in (extra_titles_to_remove or ())}
+        _purge.add(title.strip())
+        _purge.discard("")
+
+        # Find every header that matches any purge-set title and remove it
+        # (along with its body, which runs from this header to the next one).
+        # Iterate from the end so positions stay valid as we slice content.
         matches = list(self._HEADER_RE.finditer(content))
         new_content = content
         _found_old = False
-        for i, m in enumerate(matches):
-            if m.group(1).strip() == title.strip():
-                end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-                new_content = content[:m.start()] + content[end:]
-                _found_old = True
-                break
-        if not _found_old and content.strip():
-            log(f"  \u26a0 Could not find old entry for \"{title}\" in transcript file; appending new version.\n", "dim")
-
-        # Parse old header for date/duration if available
+        # Capture date/duration from the FIRST removed entry so the new
+        # header inherits them (preserves provenance across re-transcribes).
         _date_fmt = "(Unknown date)"
         _dur_fmt = "(Unknown length)"
-        _old_header_re = re.compile(
-            r'^===\(' + re.escape(title) + r'\),\s*(\([^)]*\)),\s*(\([^)]*\)),',
-            re.MULTILINE)
-        _old_match = _old_header_re.search(content)
-        if _old_match:
-            _date_fmt = _old_match.group(1)
-            _dur_fmt = _old_match.group(2)
+        _captured_provenance = False
+        for i in range(len(matches) - 1, -1, -1):
+            m = matches[i]
+            entry_title = m.group(1).strip()
+            if entry_title not in _purge:
+                continue
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
+            if not _captured_provenance:
+                # Re-parse this entry's header to grab its date/duration.
+                _hdr_re = re.compile(
+                    r'^===\(' + re.escape(entry_title) + r'\),\s*(\([^)]*\)),\s*(\([^)]*\)),',
+                    re.MULTILINE)
+                _hm = _hdr_re.search(new_content[m.start():end])
+                if _hm:
+                    _date_fmt = _hm.group(1)
+                    _dur_fmt = _hm.group(2)
+                    _captured_provenance = True
+            new_content = new_content[:m.start()] + new_content[end:]
+            _found_old = True
+        if not _found_old and content.strip():
+            log(f"  \u26a0 Could not find old entry for \"{title}\" in transcript file; appending new version.\n", "dim")
 
         # Build new entry
         _model_tag = f"WHISPER {model_name.upper()}"
@@ -28864,7 +28903,13 @@ class _TranscriptionPanel(ttk.Frame):
         os.replace(_tmp, txt_path)
 
     def _replace_jsonl_entry(self, jsonl_path, title, video_id, new_segments):
-        """Replace a single video's segments in the .jsonl file."""
+        """Replace a single video's segments in the .jsonl file.
+
+        Returns the SET of distinct titles that existed for this video_id
+        (or matched the canonical title) so the caller can pass them to
+        _replace_txt_entry — that way both files get fully cleaned up
+        even when the title has drifted (e.g. "huge change.." → "...").
+        """
         # Clear hidden + read-only attributes so we can write (re-set by _write_jsonl_entry)
         if os.name == "nt":
             try:
@@ -28880,7 +28925,9 @@ class _TranscriptionPanel(ttk.Frame):
             except Exception:
                 pass
 
-        # Read existing lines, filter out old entries for this title
+        # Read existing lines, filter out old entries either by title match
+        # OR by video_id match (catches stale entries whose title has drifted
+        # since the original transcription).
         old_lines = []
         try:
             with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -28889,14 +28936,21 @@ class _TranscriptionPanel(ttk.Frame):
             pass
 
         kept_lines = []
+        removed_titles = set()
+        _vid = (video_id or "").strip()
+        _title_norm = (title or "").strip()
         for line in old_lines:
             line_s = line.strip()
             if not line_s:
                 continue
             try:
                 seg = json.loads(line_s)
-                if seg.get("title", "").strip() == title.strip():
-                    continue  # Skip old entries for this title
+                seg_title = (seg.get("title") or "").strip()
+                seg_vid = (seg.get("video_id") or "").strip()
+                if seg_title == _title_norm or (_vid and seg_vid == _vid):
+                    if seg_title:
+                        removed_titles.add(seg_title)
+                    continue  # Skip old entries
             except Exception:
                 pass
             kept_lines.append(line if line.endswith("\n") else line + "\n")
@@ -28909,6 +28963,7 @@ class _TranscriptionPanel(ttk.Frame):
 
         # Append new segments (also re-hides the file)
         _write_jsonl_entry(jsonl_path, video_id, title, new_segments)
+        return removed_titles
 
     def _on_browse_word_double_click(self, event):
         """Double-clicking a word in the browse viewer opens the Open Local/YT menu."""

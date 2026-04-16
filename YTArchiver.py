@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.0"
+APP_VERSION = "v41.1"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -2561,6 +2561,135 @@ def _ensure_videos_tab(url):
     return url
 
 
+_CHANNEL_ART_REFRESH_DAYS = 30  # re-grab if older than this on a metadata sweep
+
+
+def _fetch_channel_art(ch_url, folder_path, force=False):
+    """Download channel avatar + banner via yt-dlp into <folder_path>/.ChannelArt/.
+
+    Files written:
+      <folder_path>/.ChannelArt/avatar.jpg   (highest-res circular avatar)
+      <folder_path>/.ChannelArt/banner.jpg   (channel banner / header art)
+
+    Skips if both files exist and are newer than _CHANNEL_ART_REFRESH_DAYS
+    (unless force=True). Errors are swallowed — channel art is best-effort,
+    a missing avatar should never block a metadata sweep.
+    """
+    if not ch_url or not folder_path:
+        return
+    art_dir = os.path.join(folder_path, ".ChannelArt")
+    avatar_path = os.path.join(art_dir, "avatar.jpg")
+    banner_path = os.path.join(art_dir, "banner.jpg")
+
+    # Skip if recent and not forced
+    if not force:
+        try:
+            now = time.time()
+            cutoff = _CHANNEL_ART_REFRESH_DAYS * 86400
+            if (os.path.isfile(avatar_path) and (now - os.path.getmtime(avatar_path)) < cutoff
+                    and os.path.isfile(banner_path) and (now - os.path.getmtime(banner_path)) < cutoff):
+                return  # both files exist and are recent
+        except OSError:
+            pass
+
+    try:
+        os.makedirs(art_dir, exist_ok=True)
+    except OSError:
+        return
+    if os.name == "nt":
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(os.path.normpath(art_dir), 0x02)
+        except Exception:
+            pass
+
+    # Single yt-dlp call: get channel-level info, no video enumeration.
+    # Use the channel URL WITHOUT /videos appended so we get the channel header.
+    base_url = ch_url.rstrip("/")
+    if base_url.endswith("/videos"):
+        base_url = base_url[:-len("/videos")]
+    cmd = [
+        "yt-dlp", "--skip-download", "--no-warnings",
+        "--playlist-items", "0",  # don't enumerate any videos
+        "--print", "%(thumbnails)j",
+        "--cookies-from-browser", "firefox",
+        base_url,
+    ]
+    proc = None
+    try:
+        proc = spawn_yt_dlp(cmd)
+        if not proc:
+            return
+        stdout, _ = proc.communicate(timeout=60)
+        cleanup_process(proc)
+        if proc.returncode != 0 or not stdout.strip():
+            return
+        # Take the LAST JSON line — yt-dlp may emit multiple lines for tabbed channels
+        thumbs = None
+        for line in stdout.strip().splitlines():
+            line = line.strip()
+            if not line.startswith("["):
+                continue
+            try:
+                thumbs = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        if not thumbs:
+            return
+
+        # YouTube channel thumbnails come tagged with `id`:
+        #   "avatar_uncropped" → highest-res circular avatar (preferred)
+        #   "avatar"           → smaller cropped version
+        #   "banner_uncropped" → highest-res banner
+        # Fall back to picking the largest by area when ids are missing.
+        def _pick_by_id(prefix):
+            best = None
+            best_area = 0
+            for t in thumbs:
+                tid = (t.get("id") or "").lower()
+                if not tid.startswith(prefix):
+                    continue
+                w = t.get("width") or 0
+                h = t.get("height") or 0
+                area = (w or 1) * (h or 1)
+                if area >= best_area:
+                    best = t
+                    best_area = area
+            return best
+
+        avatar = _pick_by_id("avatar")
+        banner = _pick_by_id("banner")
+
+        def _download(url, dest):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                with open(dest, "wb") as f:
+                    f.write(data)
+                return True
+            except Exception:
+                return False
+
+        if avatar and avatar.get("url"):
+            _download(avatar["url"], avatar_path)
+        if banner and banner.get("url"):
+            _download(banner["url"], banner_path)
+    except subprocess.TimeoutExpired:
+        if proc:
+            try:
+                proc.kill()
+                cleanup_process(proc)
+            except Exception:
+                pass
+    except Exception:
+        # Best-effort. Never let channel art failure block a metadata sweep.
+        if proc:
+            try:
+                cleanup_process(proc)
+            except Exception:
+                pass
+
+
 def build_format_string(resolution):
     resolution = str(resolution).lower().strip()
     # Audio-only mode: prefer m4a (AAC) then best audio, no video stream
@@ -4037,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:45pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 12:46am", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -12314,6 +12443,14 @@ def _run_metadata_download(item):
 
     log(f"Metadata: preparing {scope_label}...\n", "simpleline")
 
+    # ── Channel art: grab profile pic + banner if missing/stale (best-effort) ──
+    # Cheap enough to call on every sweep; the helper skips if files are <30 days
+    # old. Used by the ArchiveBrowser viewer to render channel-grid avatars.
+    try:
+        _fetch_channel_art(ch_url, folder_path)
+    except Exception:
+        pass
+
     # ── Fast path: when specific video IDs are provided (e.g. from auto-metadata
     # after a sync), skip the entire multi-pass resolution pipeline and just fetch
     # metadata directly for those IDs. This avoids the expensive channel playlist
@@ -12641,7 +12778,65 @@ def _run_metadata_download(item):
     _resolved_rows = []
     _no_id_count = 0
     _yt_by_date = {}   # "YYYYMMDD" -> [(video_id, original_title)] for date-based resolve
+    _vid_to_date = {}  # video_id -> "YYYYMMDD" — reverse index for date-drift validation
     _need_search = []  # rows still missing IDs — will fall through to batch/individual search
+
+    # ── Date-drift validation helper ──
+    # mtime IS the YouTube upload date (yt-dlp sets it at download). Any
+    # title-to-ID match whose upload_date sits >365 days from the file's mtime
+    # is almost certainly bogus — most commonly when a channel has multiple
+    # same-titled videos (Jimmy Kimmel "Guillermo at the Oscars" annual,
+    # weekly recap shows, etc.) and the matcher picks the wrong one.
+    _DATE_DRIFT_TOLERANCE_DAYS = 365
+
+    def _date_drift_days(filepath, vid_id):
+        """Return |file_mtime - upload_date| in days, or None if either is missing.
+        Uses _vid_to_date populated from the channel playlist fetch."""
+        if not filepath or not vid_id:
+            return None
+        upload_yyyymmdd = _vid_to_date.get(vid_id, "")
+        if not upload_yyyymmdd or len(upload_yyyymmdd) != 8:
+            return None
+        try:
+            up_dt = datetime.strptime(upload_yyyymmdd, "%Y%m%d")
+            mt = datetime.fromtimestamp(os.path.getmtime(filepath))
+            return abs((mt - up_dt).total_seconds()) / 86400.0
+        except (OSError, ValueError):
+            return None
+
+    def _pick_best_candidate(candidates, filepath):
+        """Pick (vid_id, upload_date) closest to filepath's mtime. Reject the
+        whole match if best is >_DATE_DRIFT_TOLERANCE_DAYS away. Returns
+        vid_id or None."""
+        if not candidates:
+            return None
+        if not filepath or not os.path.isfile(filepath):
+            # No mtime to compare — fall back to first candidate (legacy behavior)
+            return candidates[0][0]
+        try:
+            mt = datetime.fromtimestamp(os.path.getmtime(filepath))
+        except OSError:
+            return candidates[0][0]
+        best_vid, best_diff = None, float('inf')
+        for vid, upload_date in candidates:
+            if not upload_date or len(upload_date) != 8:
+                continue
+            try:
+                up_dt = datetime.strptime(upload_date, "%Y%m%d")
+                diff = abs((mt - up_dt).total_seconds()) / 86400.0
+                if diff < best_diff:
+                    best_diff = diff
+                    best_vid = vid
+            except ValueError:
+                continue
+        # If no candidate had a valid date, accept the first one (it might
+        # still be correct — just unverifiable here)
+        if best_vid is None:
+            return candidates[0][0]
+        # Reject if drift is way too large — clearly the wrong video
+        if best_diff > _DATE_DRIFT_TOLERANCE_DAYS:
+            return None
+        return best_vid
 
     # ── Pass 1: existing IDs + filename pattern (free, no DB/disk I/O) ──
     _still_missing = []  # rows needing lookup escalation — 5-tuples: (row_id, title, year, month, filepath)
@@ -12672,15 +12867,25 @@ def _run_metadata_download(item):
     # ── Pass 2: cheap DB lookups (segments table + videos table by title) ──
     # Only run if there are actually rows needing resolution.
     if _still_missing:
-        _seg_id_map = {}
+        # Build (title -> set of distinct video_ids) so we can DETECT
+        # ambiguous titles (channel reuses titles across years — Jimmy
+        # Kimmel "Guillermo at the Oscars" annual, weekly recap shows,
+        # etc.) and refuse to short-circuit for them. They'll fall
+        # through to Pass 4/6 which can disambiguate by date.
+        _seg_id_map = {}     # title -> single vid_id (when unambiguous)
+        _seg_amb = set()     # titles seen with multiple distinct IDs
         _db_id_map = {}
+        _db_amb = set()
         try:
             for _st, _sv in tp._db_execute(
                     "SELECT DISTINCT title, video_id FROM segments "
                     "WHERE channel=? AND video_id != ''",
                     (ch_name,)).fetchall():
                 if _sv:
-                    _seg_id_map[_st] = _sv
+                    if _st in _seg_id_map and _seg_id_map[_st] != _sv:
+                        _seg_amb.add(_st)
+                    else:
+                        _seg_id_map[_st] = _sv
         except Exception:
             pass
         try:
@@ -12688,12 +12893,19 @@ def _run_metadata_download(item):
                     "SELECT title, video_id FROM videos "
                     "WHERE channel=? AND video_id IS NOT NULL AND video_id != ''",
                     (ch_name,)).fetchall():
-                _db_id_map[_dbt] = _dbv
+                if _dbt in _db_id_map and _db_id_map[_dbt] != _dbv:
+                    _db_amb.add(_dbt)
+                else:
+                    _db_id_map[_dbt] = _dbv
         except Exception:
             pass
 
         _still_missing_2 = []
         for row_id, title, v_year, v_month, filepath in _still_missing:
+            # Skip ambiguous titles — they need date disambiguation in Pass 4/6
+            if title in _seg_amb or title in _db_amb:
+                _still_missing_2.append((row_id, title, v_year, v_month, filepath))
+                continue
             vid_id = _seg_id_map.get(title) or _db_id_map.get(title)
             if vid_id:
                 if row_id is not None:
@@ -12887,10 +13099,18 @@ def _run_metadata_download(item):
                         _timestamp = _parts[3].strip() if len(_parts) > 3 else ""
                         if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
                             _norm = _norm_title(_yt_title)
-                            if _norm not in _batch_map:
-                                _batch_map[_norm] = _vid_id
                             # Build date index — prefer upload_date, fall back to timestamp
                             _resolved_date = _resolve_upload_date(_upload_date, _timestamp)
+                            # Store ALL candidates per normalized title (date as
+                            # the disambiguator). Previously this was first-wins,
+                            # which caused channels with recurring same-titled
+                            # videos (annual specials, weekly recaps) to assign
+                            # the same video_id to every instance — corrupting
+                            # downstream metadata for all but one of them.
+                            _batch_map.setdefault(_norm, []).append((_vid_id, _resolved_date or ""))
+                            # Reverse map for date-drift validation in other passes
+                            if _resolved_date:
+                                _vid_to_date[_vid_id] = _resolved_date
                             if _resolved_date:
                                 _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 _batch_dates_ok += 1
@@ -12963,11 +13183,22 @@ def _run_metadata_download(item):
                         pass
 
                     _batch_found = 0
+                    _batch_drift_rejected = 0
                     _still_need = []
                     for _s_row_id, _s_title, _s_year, _s_month, _s_filepath in _need_search:
                         _norm = _norm_title(_s_title)
-                        _matched_id = _batch_map.get(_norm)
-                        if _matched_id and _matched_id not in _batch_known:
+                        _candidates = _batch_map.get(_norm) or []
+                        # Filter out IDs already assigned (legacy dedup)
+                        _candidates = [c for c in _candidates if c[0] not in _batch_known]
+                        # Pick best-by-date if multiple candidates; reject if drift > 365d.
+                        _matched_id = _pick_best_candidate(_candidates, _s_filepath)
+                        if _matched_id is None and _candidates:
+                            # Date validation rejected ALL candidates as too-far-drift
+                            # (e.g. "Counter-Strike Beta 2" 2008 file, only candidate
+                            # is the 2026 "Animgraph" video). Don't assign — let Pass 6
+                            # date-based matching try, or leave it unmatched.
+                            _batch_drift_rejected += 1
+                        if _matched_id:
                             _batch_known.add(_matched_id)
                             _resolved_rows.append((_matched_id, _s_title, _s_year, _s_month, _s_filepath))
                             _batch_found += 1
@@ -12981,6 +13212,10 @@ def _run_metadata_download(item):
                                     pass
                         else:
                             _still_need.append((_s_row_id, _s_title, _s_year, _s_month, _s_filepath))
+                    if _batch_drift_rejected:
+                        log(f"  \u2014 Rejected {_batch_drift_rejected} title match(es) due to date drift "
+                            f">365d (avoiding the same-titled-video bug). Falling through to date-based matching.\n",
+                            "simpleline_pink")
 
                     _need_search = _still_need
                     if _batch_found:
@@ -13088,7 +13323,30 @@ def _run_metadata_download(item):
                         if not _ch_match and _found_channel:
                             # Fallback: compare normalized channel names
                             _ch_match = _norm(_found_channel) == _norm(ch_name)
-                        if _found_id and _ch_match:
+                        # Date drift validation: if the search returned a video whose
+                        # upload_date is far from the local file's mtime, it's almost
+                        # certainly the wrong result. yt-dlp's search occasionally
+                        # returns fuzzy matches that share a substring of the query
+                        # but are entirely different videos.
+                        _date_ok = True
+                        if _found_id and _ch_match and _s_filepath:
+                            _found_upload = _search_data.get("upload_date", "") or ""
+                            if _found_upload and len(_found_upload) == 8:
+                                try:
+                                    _fu_dt = datetime.strptime(_found_upload, "%Y%m%d")
+                                    _fp_mt = datetime.fromtimestamp(os.path.getmtime(_s_filepath))
+                                    _drift = abs((_fp_mt - _fu_dt).total_seconds()) / 86400.0
+                                    if _drift > _DATE_DRIFT_TOLERANCE_DAYS:
+                                        _date_ok = False
+                                        log(f"    \u2014 Skipped (search result upload_date "
+                                            f"{_found_upload} drifts {int(_drift)}d from file mtime "
+                                            f"\u2014 likely wrong video)\n", "simpleline_pink")
+                                except (OSError, ValueError):
+                                    pass  # missing mtime or bad date — allow through
+                                # Cache the upload_date for future repairs
+                                if _date_ok:
+                                    _vid_to_date[_found_id] = _found_upload
+                        if _found_id and _ch_match and _date_ok:
                             if _found_id in _known_vids:
                                 log(f"    \u2014 Skipped (ID already belongs to another video)\n", "simpleline_pink")
                             else:
@@ -13197,6 +13455,7 @@ def _run_metadata_download(item):
                             if re.fullmatch(r'[A-Za-z0-9_-]{11}', _vid_id):
                                 _resolved_date = _resolve_upload_date(_upload_date, _timestamp)
                                 if _resolved_date:
+                                    _vid_to_date[_vid_id] = _resolved_date  # for date-drift validation
                                     _yt_by_date.setdefault(_resolved_date, []).append((_vid_id, _yt_title))
                                 else:
                                     # Undated video — stash in "" bucket so Pass 6a

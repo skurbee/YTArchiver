@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.6"
+APP_VERSION = "v40.7"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 6:45pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 7:00pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15939,6 +15939,115 @@ def _run_manual_transcription(file_path, cancel_ev=None, pause_ev=None,
         threading.Thread(target=_worker, daemon=True).start()
 
 
+def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
+    """Re-transcribe a single archived video, writing the result back into
+    the per-year Transcript.txt + Transcript.jsonl that YTArchiver's Browse
+    tab + external viewers read. This is the command-triggered equivalent
+    of the Browse tab's right-click 'Re-transcribe with Whisper' flow
+    (reproduces the body of _TranscriptionPanel._on_retranscribe's worker
+    without needing a UI dialog).
+
+    item dict requires: file_path, title, video_id, txt_path, jsonl_path.
+    Optional: model (else falls back to current _whisper_model_choice).
+    Callers: _gpu_worker's mt branch (when item.retranscribe is True).
+    """
+    global _transcribe_running, _transcribe_sync_controlled, _whisper_model_choice
+
+    file_path   = item["file_path"]
+    title       = item["title"]
+    video_id    = item.get("video_id") or ""
+    txt_path    = item["txt_path"]
+    jsonl_path  = item["jsonl_path"]
+    chosen_model = item.get("model") or _whisper_model_choice
+    fname       = os.path.splitext(os.path.basename(file_path))[0]
+
+    _ce = cancel_ev or cancel_event
+    _pe = pause_ev or pause_event
+    _transcribe_running = True
+    _transcribe_sync_controlled = False
+    _update_global_pause_btn_sync()
+    _start_internet_monitor()
+
+    try:
+        if _ce.is_set():
+            return
+
+        log(f"\n{'=' * 60}\n", "header")
+        log(f"  RE-TRANSCRIBE: {fname}\n", "header")
+        log(f"  Model: {chosen_model}\n", "simpleline")
+        log(f"{'=' * 60}\n\n", "header")
+
+        if not os.path.isfile(file_path):
+            log(f"  File not found: {file_path}\n", "red")
+            return
+
+        if not _check_cuda_available():
+            log(f"  \u26a0 No CUDA GPU detected \u2014 Whisper unavailable.\n", "red")
+            return
+
+        if not _check_whisper_installed():
+            log("  Whisper AI is not installed.\n", "red")
+            return
+
+        _dur_secs = _ffprobe_duration(file_path)
+        if _ce.is_set():
+            return
+
+        _whisper_counter["idx"] = 1
+        _whisper_counter["total"] = 1
+        _t_start = time.time()
+
+        _stop_whisper_process()  # ensure fresh model load
+        log(f"  Transcribing with Whisper ({chosen_model})...\n", "simpleline")
+        text, segments = _whisper_transcribe(
+            file_path, duration=_dur_secs, title=fname,
+            cancel_ev=_ce, pause_ev=_pe, model=chosen_model)
+        _clear_whisper_progress()
+
+        if not text:
+            log(f"  Whisper returned empty result.\n", "red")
+            return
+
+        text = _whisper_punct_fixup(text)
+
+        # Replace the existing entry in the per-year .txt and .jsonl so
+        # both YTArchiver and the viewer see the new transcript.
+        try:
+            _tp_panel._replace_txt_entry(txt_path, title, text, chosen_model)
+        except Exception as e:
+            log(f"  \u26a0 Failed to update {os.path.basename(txt_path)}: {e}\n", "red")
+        try:
+            _tp_panel._replace_jsonl_entry(jsonl_path, title, video_id, segments)
+        except Exception as e:
+            log(f"  \u26a0 Failed to update {os.path.basename(jsonl_path)}: {e}\n", "red")
+
+        # Re-index the .jsonl so search results reflect the new segments
+        # without waiting for the background indexer.
+        try:
+            _roots = _tp_panel._get_archive_roots()
+            _got_lock = _tp_panel._db_lock.acquire(timeout=60)
+            if _got_lock:
+                try:
+                    _tp_index_file(_tp_panel._conn, jsonl_path, _roots)
+                finally:
+                    _tp_panel._db_lock.release()
+        except Exception as e:
+            log(f"  \u26a0 Re-index failed (search may be stale): {e}\n", "dim")
+
+        elapsed = time.time() - _t_start
+        _m, _s = divmod(int(elapsed), 60)
+        _time_str = f"{_m}min {_s:02d}sec" if _m else f"{_s}sec"
+        log(f"\n  Re-transcription complete: \"{title[:50]}\" ({_time_str})\n",
+            "simpleline_green")
+
+    except Exception as e:
+        log(f"\n  Re-transcribe error: {e}\n", "red")
+    finally:
+        _transcribe_running = False
+        _transcribe_sync_controlled = False
+        _clear_whisper_progress()
+
+
 def _run_manual_transcription_folder(folder_path, folder_name, cancel_ev=None, pause_ev=None,
                                       _sync_mode=False):
     """Run manual transcription of all video/audio files in a folder.
@@ -21310,6 +21419,22 @@ def _gpu_start():
                                 item["folder_path"], item["folder_name"],
                                 cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
                                 _sync_mode=True
+                            )
+                        elif item.get("retranscribe"):
+                            # Re-transcribe flow triggered by /cmd/retranscribe.
+                            # Must update the per-year Transcript.txt + .jsonl
+                            # (what YTArchiver's Browse tab and the viewer
+                            # both read) rather than writing a standalone
+                            # <video>.txt like _run_manual_transcription does.
+                            # See _run_retranscribe_job below — reproduces
+                            # the Browse-tab _on_retranscribe worker logic.
+                            fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
+                            _gpu_current["label"] = f"Re-transcribe {fname}"
+                            _gpu_current["ch_url"] = None
+                            _update_gpu_btn()
+                            _run_retranscribe_job(
+                                item,
+                                cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
                             )
                         else:
                             fname = os.path.splitext(os.path.basename(item["file_path"]))[0]
@@ -33952,13 +34077,22 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
         if not (ch and vid):
             return self._json(400, {"ok": False, "error": "missing channel/video_id"})
 
-        # Look up the video in YTArchiver's own index DB
+        # Look up the video in YTArchiver's own index DB. Join segments
+        # to pick up the jsonl_path (the per-year Transcript.jsonl that
+        # YTArchiver's Browse tab reads). We need this so the re-transcribe
+        # can update the SAME files the UI reads — otherwise we'd produce
+        # a separate .txt next to the .mp4 and the two apps would go
+        # out of sync on what this video's transcript contains.
         try:
             conn = sqlite3.connect(
                 f"file:{_TP_DB_PATH}?mode=ro", uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT title, filepath FROM videos "
-                "WHERE video_id=? AND channel=? LIMIT 1",
+                "SELECT v.title AS title, v.filepath AS filepath, "
+                "       s.jsonl_path AS jsonl_path "
+                "FROM videos v "
+                "LEFT JOIN segments s ON s.video_id = v.video_id "
+                "WHERE v.video_id=? AND v.channel=? LIMIT 1",
                 (vid, ch)
             ).fetchone()
             conn.close()
@@ -33971,20 +34105,65 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
                 "error": f"Video {vid} not found in YTArchiver's DB for channel {ch}"
             })
 
-        title, file_path = row
+        title = row["title"]
+        file_path = row["filepath"]
+        jsonl_path = row["jsonl_path"]
         if not file_path or not os.path.isfile(file_path):
             return self._json(404, {
                 "ok": False,
                 "error": f"Video file not found on disk: {file_path}"
             })
 
-        # Enqueue on the main thread (same path as the right-click
-        # "Re-transcribe" action in the Browse tab). _add_to_gpu_queue
-        # logs "— Added M.T. <filename> to GPU-tasks queue" and updates UI.
-        # Pass model through — the gpu_worker's mt branch honors it.
+        # Derive the per-year .txt path from the .jsonl path the same way
+        # _tp_panel._get_txt_path does: drop the leading dot (hidden attr
+        # on the .jsonl) and swap the extension. If no jsonl_path was
+        # stored yet (rare — video without any segments in the DB), fall
+        # back to scanning the parent dir for a " Transcript.jsonl" file.
+        txt_path = None
+        if jsonl_path:
+            _jn = os.path.normpath(jsonl_path)
+            _jd = os.path.dirname(_jn)
+            _jb = os.path.basename(_jn).lstrip(".")
+            if _jb.lower().endswith(".jsonl"):
+                _jb = _jb[:-6] + ".txt"
+            txt_path = os.path.join(_jd, _jb)
+        else:
+            # Fallback: walk the video's folder and find the transcript files
+            _vd = os.path.dirname(file_path)
+            try:
+                for fn in os.listdir(_vd):
+                    if fn.startswith(".") and fn.lower().endswith(" transcript.jsonl"):
+                        jsonl_path = os.path.join(_vd, fn)
+                    elif not fn.startswith(".") and fn.lower().endswith(" transcript.txt"):
+                        txt_path = os.path.join(_vd, fn)
+            except OSError:
+                pass
+
+        # Build the mt queue item. When `retranscribe: True` is set, the
+        # GPU worker takes a different save path (see _gpu_worker's mt
+        # branch): it replaces the entry in the per-year .txt and .jsonl
+        # via _tp_panel._replace_txt_entry / _replace_jsonl_entry, so
+        # both YTArchiver's Browse tab and the viewer pick up the change
+        # immediately. Without this flag mt would write a standalone
+        # <video>.txt alongside the .mp4 and neither app would read it.
         item = {"type": "mt", "file_path": file_path}
         if model:
             item["model"] = model
+        if jsonl_path and txt_path:
+            item.update({
+                "retranscribe": True,
+                "title": title,
+                "video_id": vid,
+                "channel": ch,
+                "txt_path": os.path.normpath(txt_path),
+                "jsonl_path": os.path.normpath(jsonl_path),
+            })
+        else:
+            _cmd_log_on_main(
+                f"  [cmd] Re-transcribe {vid}: no per-year .jsonl/.txt found "
+                f"in {os.path.dirname(file_path)} — falling back to standalone save\n",
+                "dim")
+
         def _enqueue():
             try:
                 _add_to_gpu_queue(item)
@@ -33999,6 +34178,9 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
             "title": title,
             "file_path": file_path,
             "model": model or "default",
+            "retranscribe_mode": bool(item.get("retranscribe")),
+            "txt_path": item.get("txt_path"),
+            "jsonl_path": item.get("jsonl_path"),
         })
 
     # ── Repair commands ──────────────────────────────────────────

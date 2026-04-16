@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.9"
+APP_VERSION = "v41.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:17pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:45pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9197,7 +9197,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                     if "_temp_compress" not in tp.lower() and ".temp." not in tp.lower() and ".part" not in tp.lower():
                         local_files[os.path.basename(tp)] = tp
             if not local_files:
-                log("  No target video files found for this batch.\n", "simpleline")
+                log("  \u2014 No target video files found for this batch.\n", "simpleline_compress")
                 return
         else:
             local_files = {}
@@ -9211,7 +9211,7 @@ def _compress_channel(ch_name, ch_url, folder, bitrate_mbhr, split_years, split_
                         local_files[f] = fpath
 
             if not local_files:
-                log("  No video files found to compress.\n", "simpleline")
+                log("  \u2014 No video files found to compress.\n", "simpleline_compress")
                 return
 
         if not _is_simple_mode:
@@ -9546,10 +9546,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                     local_files[f] = fpath
 
         if not local_files:
-            log("  No video files found.\n", "simpleline")
+            log("  \u2014 No video files found.\n", "simpleline_compress")
             return
 
-        log(f"  Found {len(local_files)} local video file(s).\n", "simpleline")
+        log(f"  \u2014 Found {len(local_files)} local video file(s).\n", "simpleline_compress")
 
         # ── Step 2: Filter already-compressed ──
         files_to_process = {}
@@ -9563,18 +9563,18 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                 files_to_process[fname] = fpath
 
         if skipped_compressed:
-            log(f"  {skipped_compressed} file(s) already compressed — skipping.\n", "simpleline")
+            log(f"  \u2014 {skipped_compressed} file(s) already compressed \u2014 skipping.\n", "simpleline_compress")
         if not files_to_process:
-            log(f"  ✓ All videos already compressed!\n", "simpleline_green")
+            log(f"  \u2014 \u2713 All videos already compressed!\n", "simpleline_compress")
             return
 
-        log(f"  {len(files_to_process)} file(s) to redownload and compress.\n", "simpleline")
+        log(f"  \u2014 {len(files_to_process)} file(s) to redownload and compress.\n", "simpleline_compress")
 
         if _ce.is_set():
             return
 
         # ── Step 3: Fetch YouTube video list for ID matching ──
-        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline")
+        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline_compress")
         yt_title_to_id = {}
         try:
             enum_cmd = [
@@ -9635,7 +9635,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
                             _pg = int(_pm.group(1))
                             if _pg >= _last_page + 10:
                                 _last_page = _pg
-                                log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
+                                log(f"  \u2014 Scanning YouTube catalog (page {_pg})...\n", "simpleline_compress")
                     except queue.Empty:
                         break
                 if _so_done.is_set() and _se_done.is_set() and _stdout_q.empty():
@@ -9653,7 +9653,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             except subprocess.TimeoutExpired:
                 _enum_proc.kill()
             cleanup_process(_enum_proc)
-            log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+            log(f"  \u2014 Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline_compress")
         except Exception as e:
             log(f"  ⚠ Could not fetch YouTube list: {e}\n", "red")
             return
@@ -9719,10 +9719,10 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
         if skipped_no_match:
             log(f"  ⚠ {skipped_no_match} file(s) could not be matched to YouTube videos.\n", "red")
         if not work_list:
-            log(f"  No files to process after matching.\n", "simpleline")
+            log(f"  \u2014 No files to process after matching.\n", "simpleline_compress")
             return
 
-        log(f"  Matched {len(work_list)} file(s) for backlog processing.\n", "simpleline")
+        log(f"  \u2014 Matched {len(work_list)} file(s) for backlog processing.\n", "simpleline_compress")
 
         # ── Step 5: Process in batches ──
         temp_dir = os.path.join(folder, "_BACKLOG_TEMP")
@@ -10303,7 +10303,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                         _pg = int(_pm.group(1))
                         if _pg >= _last_page + 10:
                             _last_page = _pg
-                            log(f"  — Scanning YouTube catalog (page {_pg})...\n", "simpleline")
+                            log(f"  \u2014 Scanning YouTube catalog (page {_pg})...\n", "simpleline_redwnl")
         finally:
             try:
                 proc.wait(timeout=300)
@@ -10334,19 +10334,19 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     local_files[f] = fpath
 
         if not local_files:
-            log("  No video files found.\n", "simpleline")
+            log("  \u2014 No video files found.\n", "simpleline_redwnl")
             return
 
-        log(f"  \u2014 Found {len(local_files)} local file(s).\n", "simpleline")
+        log(f"  \u2014 Found {len(local_files)} local file(s).\n", "simpleline_redwnl")
 
         if _ce.is_set():
-            log("  Redownload cancelled before YouTube fetch.\n", "simpleline")
+            log("  \u2014 Redownload cancelled before YouTube fetch.\n", "simpleline_redwnl")
             return
 
         # ── Step 2: Fetch YouTube video list for ID matching ──
         # Try with cookies first; fall back to without cookies for public channels.
         # Protected by internet monitor: if internet drops mid-fetch, wait and retry.
-        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline")
+        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline_redwnl")
         while not _ce.is_set():
             _internet_went_down_during.clear()  # arm the dirty flag
             if not _block_if_no_internet(cancel_ev=_ce):
@@ -10363,7 +10363,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             if not yt_title_to_id:
                 # Retry without cookies — useful for public channels where Firefox
                 # cookies are not configured or cause authentication errors.
-                log("  No videos returned with cookies — retrying without cookies...\n", "simpleline")
+                log("  \u2014 No videos returned with cookies \u2014 retrying without cookies...\n", "simpleline_redwnl")
                 yt_title_to_id = _fetch_yt_list(use_cookies=False) or {}
                 if _ce.is_set():
                     break
@@ -10373,22 +10373,22 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                 log("  ⚠ Internet dropped during playlist fetch — will re-fetch after restore.\n", "red")
                 if not _block_if_no_internet(cancel_ev=_ce):
                     break  # cancelled
-                log("  Retrying YouTube video list fetch...\n", "simpleline")
+                log("  \u2014 Retrying YouTube video list fetch...\n", "simpleline_redwnl")
                 continue  # retry from the top
             break  # clean fetch — proceed
 
         if _ce.is_set():
-            log("  Redownload cancelled during YouTube fetch.\n", "simpleline")
+            log("  \u2014 Redownload cancelled during YouTube fetch.\n", "simpleline_redwnl")
             return
 
         if not yt_title_to_id:
             log("  ⚠ Could not retrieve video list from YouTube. Check the channel URL and your internet connection.\n", "red")
             return
 
-        log(f"  Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline")
+        log(f"  \u2014 Found {len(yt_title_to_id)} video(s) on YouTube.\n", "simpleline_redwnl")
 
         if _ce.is_set():
-            log("  Redownload cancelled after YouTube fetch.\n", "simpleline")
+            log("  \u2014 Redownload cancelled after YouTube fetch.\n", "simpleline_redwnl")
             return
 
         # ── Step 3: Build normalized lookup and match local files ──
@@ -10461,7 +10461,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         if skipped_no_match:
             log(f"  ⚠ {skipped_no_match} file(s) could not be matched to YouTube videos.\n", "red")
         if not work_list:
-            log("  No files to process after matching.\n", "simpleline")
+            log("  \u2014 No files to process after matching.\n", "simpleline_redwnl")
             return
 
         # ── Resume: skip videos already completed in a previous run ──
@@ -10471,9 +10471,9 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             work_list = [(vid_id, fp) for vid_id, fp in work_list if vid_id not in done_ids]
             skipped_prev = before - len(work_list)
             if skipped_prev:
-                log(f"  Resuming — {skipped_prev} video(s) already redownloaded, {len(work_list)} remaining.\n", "simpleline_green")
+                log(f"  \u2014 Resuming \u2014 {skipped_prev} video(s) already redownloaded, {len(work_list)} remaining.\n", "simpleline_redwnl")
         if not work_list:
-            log("  All files already redownloaded.\n", "simpleline_green")
+            log("  \u2014 All files already redownloaded.\n", "simpleline_redwnl")
             _clear_progress()
             return
 
@@ -10486,11 +10486,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         _sample_done = bool(done_ids) or total_to_do <= _SAMPLE_SIZE
 
         if _sample_done and not done_ids:
-            log(f"  Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline")
+            log(f"  \u2014 Matched {total_to_do} file(s). Starting redownload at {_res_label}...\n", "simpleline_redwnl")
         elif _sample_done:
-            log(f"  Matched {total_to_do} file(s). Resuming redownload at {_res_label}...\n", "simpleline")
+            log(f"  \u2014 Matched {total_to_do} file(s). Resuming redownload at {_res_label}...\n", "simpleline_redwnl")
         else:
-            log(f"  Matched {total_to_do} file(s). Checking the first {_SAMPLE_SIZE} at {_res_label}...\n", "simpleline")
+            log(f"  \u2014 Matched {total_to_do} file(s). Checking the first {_SAMPLE_SIZE} at {_res_label}...\n", "simpleline_redwnl")
         _rd_start_time = time.time()
 
         # Bottom-pinned animated status (same as sync/metadata/etc.)

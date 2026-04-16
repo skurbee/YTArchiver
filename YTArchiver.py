@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.7"
+APP_VERSION = "v41.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -1916,7 +1916,16 @@ def _simple_anim_tick():
 
         _anim_mode = _simple_anim_state.get("mode", "sync")
 
-        if pause_event.is_set():
+        # Determine which pause flag governs the currently-running task.
+        # GPU-worker tasks (transcribe / encode triggered from the GPU queue)
+        # use _gpu_pause; sync-pipeline tasks (sync, metadata, reorg, etc.)
+        # use the global pause_event. Showing "PAUSED" based on the wrong
+        # flag was misleading the user — pause_event sometimes lingers from
+        # an earlier sync action even after the current task is GPU-driven
+        # and not actually paused.
+        _is_gpu_task = (_anim_mode in ("transcribe", "compress")) and _gpu_running
+        _paused_now = _gpu_pause.is_set() if _is_gpu_task else pause_event.is_set()
+        if _paused_now:
             # Show static paused state instead of animated dots
             i = _simple_anim_state["idx"]
             n = _simple_anim_state["total"]
@@ -4166,7 +4175,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 5:44pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 5:57pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

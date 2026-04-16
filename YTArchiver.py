@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.4"
+APP_VERSION = "v41.5"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 2:36pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 4:03pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -6845,10 +6845,17 @@ def sync_single_channel(_from_queue=False):
                     _at_folder = os.path.join(out_dir, _channel_folder_name(ch))
                     _at_sy = ch.get("split_years", False)
                     _at_sm = ch.get("split_months", False)
+                    # Pass the freshly-downloaded video_ids so transcription
+                    # can skip the slow channel-wide playlist enumeration
+                    # (page-by-page scan up to ~10 min on big channels) and
+                    # use the IDs sync just collected.
+                    with _last_run_counts_lock:
+                        _at_vid_ids = list(_last_run_counts.get("downloaded_vid_ids", []))
                     _add_to_gpu_queue({
                         "type": "transcribe", "ch_name": ch["name"], "ch_url": url,
                         "folder": _at_folder, "split_years": _at_sy, "split_months": _at_sm,
-                        "combined": not _at_sy, "model": "small"
+                        "combined": not _at_sy, "model": "small",
+                        "video_ids": _at_vid_ids if _at_vid_ids else None,
                     })
 
                 # Auto-metadata: fetch metadata for just the newly downloaded videos
@@ -14314,7 +14321,7 @@ def _has_pending_redownload(ch_url):
 
 def _start_transcription(ch_name, ch_url, folder, split_years, split_months, combined,
                          cancel_ev=None, pause_ev=None, skip_model_dialog=False, _sync_mode=False,
-                         captions_only=False, retranscribe=False):
+                         captions_only=False, retranscribe=False, video_ids=None):
     """Start transcribing a channel. Queues if something is already running.
 
     cancel_ev/pause_ev: optional threading.Events (default to global cancel_event/pause_event).
@@ -14322,6 +14329,11 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
     _sync_mode: if True, run the worker body directly (blocking) instead of spawning a thread.
     captions_only: if True (always with _sync_mode=True), run only Phase A (auto-captions+punctuation)
                    inline; queue a GPU task for any videos that still need Whisper, then return.
+    video_ids: optional list of YouTube video_ids that sync just downloaded.
+                   When provided, the title→ID resolver pre-populates from the
+                   DB instead of running the slow channel-wide `--flat-playlist`
+                   scan (5-10 min on big channels). Filenames are looked up
+                   per-vid in the videos table.
     """
     global _transcribe_running
 
@@ -14544,6 +14556,41 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # ── Step 3: Fetch YT playlist for title→ID matching ─────────
             yt_title_to_id = {}  # yt_title -> video_id
 
+            # OPTIMIZATION: pre-populated IDs from sync.
+            # When the caller (auto-transcribe-after-sync) passes the list of
+            # video_ids that were just downloaded, we already know what titles
+            # are in this batch — look up their on-disk filenames in
+            # YTArchiver's own DB and seed yt_title_to_id directly. Skips both
+            # the per-file YT search AND the full channel-wide playlist fetch.
+            # Saves 5-10 minutes on large channels (the page-220 catalog scan
+            # Scott pointed out).
+            if video_ids and not retranscribe:
+                _tp_inst = _tp_panel_ref[0] if '_tp_panel_ref' in globals() else None
+                _seeded = 0
+                if _tp_inst and _tp_inst._conn:
+                    for _vid in video_ids:
+                        try:
+                            _r = _tp_inst._db_execute(
+                                "SELECT title, filepath FROM videos "
+                                "WHERE channel=? AND video_id=?",
+                                (ch_name, _vid)).fetchone()
+                        except Exception:
+                            _r = None
+                        if not _r or not _r[1]:
+                            continue
+                        # The transcription loop keys yt_title_to_id by the
+                        # file's basename-without-extension (filename stem),
+                        # which is what _per_file_yt_search uses too.
+                        _stem = os.path.splitext(os.path.basename(_r[1]))[0]
+                        yt_title_to_id[_stem] = _vid
+                        _seeded += 1
+                if _seeded:
+                    if _is_simple_mode:
+                        _tx_scan(f"Seeded {_seeded} ID(s) from sync \u2014 skipping channel scan.")
+                    else:
+                        log(f"  \u2014 Seeded {_seeded} video ID(s) from sync \u2014 "
+                            f"skipping channel scan.\n", "simpleline")
+
             # OPTIMIZATION: small-batch shortcut.
             # For very large channels (tens of thousands of videos), enumerating
             # the entire playlist via `yt-dlp --flat-playlist` takes 5-10 minutes,
@@ -14553,10 +14600,17 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # instead — ~3s per file, ~15s for 5 files vs 5-10 min for the
             # full enumeration. Triggered for batches up to _SMALL_BATCH_TX
             # files; larger batches still use the full fetch (where the
-            # per-file overhead would dominate).
+            # per-file overhead would dominate). Skipped entirely if the
+            # sync-seed above already covered every file in the batch.
             _SMALL_BATCH_TX = 10
+            _all_files_seeded = (
+                bool(yt_title_to_id)
+                and all(os.path.splitext(_fn)[0] in yt_title_to_id
+                        for _fn in files_to_process)
+            )
             _use_per_file_search = (
-                len(files_to_process) > 0
+                not _all_files_seeded
+                and len(files_to_process) > 0
                 and len(files_to_process) <= _SMALL_BATCH_TX
                 and bool(ch_url)
                 and not retranscribe
@@ -14726,8 +14780,9 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             # playlist fetch, the result is likely incomplete — wait for restore and
             # re-fetch from scratch rather than proceeding with a partial list.
             # SKIPPED entirely when the small-batch shortcut already populated
-            # yt_title_to_id via per-file search above.
-            if not _use_per_file_search:
+            # yt_title_to_id via per-file search above, OR when the sync-seed
+            # already gave us every file's ID (no need to ask YouTube at all).
+            if not _use_per_file_search and not _all_files_seeded:
                 if _is_simple_mode:
                     _tx_scan("Fetching YouTube video list for caption matching...")
                 else:
@@ -21739,7 +21794,8 @@ def _gpu_start():
                             item["split_years"], item["split_months"], item["combined"],
                             cancel_ev=_gpu_cancel, pause_ev=_gpu_pause,
                             skip_model_dialog=True, _sync_mode=True,
-                            retranscribe=item.get("retranscribe", False)
+                            retranscribe=item.get("retranscribe", False),
+                            video_ids=item.get("video_ids"),
                         )
                     elif item["type"] == "encode":
                         _ebn = item.get("batch_num")

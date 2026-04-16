@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.2"
+APP_VERSION = "v41.3"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4166,7 +4166,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 1:23pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 1:39pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -34157,6 +34157,13 @@ import http.server as _http_server
 import socket as _cmd_socket
 
 _CMD_PORT = 9855
+# Bind to 0.0.0.0 so client viewers on the LAN (other machines) can reach
+# the receiver too — the host's ArchivePlayer/ArchiveBrowser viewer is no
+# longer the only thing that can trigger re-transcribe / repair commands.
+# Local-network only; no auth (trusted home network). Override via the
+# YTARCHIVER_CMD_BIND env var if you need to lock back down to 127.0.0.1
+# (e.g. running on a multi-tenant machine).
+_CMD_BIND = os.environ.get("YTARCHIVER_CMD_BIND", "0.0.0.0")
 
 
 def _cmd_log_on_main(msg, tag=None):
@@ -34673,12 +34680,17 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
 
 def _start_cmd_server():
     try:
-        srv = _http_server.ThreadingHTTPServer(("127.0.0.1", _CMD_PORT), _CmdHandler)
+        srv = _http_server.ThreadingHTTPServer((_CMD_BIND, _CMD_PORT), _CmdHandler)
     except OSError as e:
         _cmd_log_on_main(
             f"  [cmd] Port {_CMD_PORT} busy — viewer integration disabled ({e})\n",
             "red")
         return
+    # Surface the bind so there's no mystery about who can reach this.
+    _cmd_log_on_main(
+        f"  [cmd] Receiver listening on {_CMD_BIND}:{_CMD_PORT}"
+        f"{' (LAN-accessible)' if _CMD_BIND == '0.0.0.0' else ' (localhost only)'}\n",
+        "dim")
 
     def _serve():
         try:

@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.8"
+APP_VERSION = "v41.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4175,7 +4175,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 5:57pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 6:13pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -8078,6 +8078,13 @@ def _run_reorganize_auto(channel_name, folder_path, target_years, target_months,
             # instead of clearing it (which would erase user cancel intent).
             if cancel_event.is_set():
                 return
+            # Entry-time pause check (matches metadata + redownload + transcribe).
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  \u23f8 Reorganize paused at {_fmt_time()} \u2014 click Resume.\n", "pauselog")
+                while pause_event.is_set() and not cancel_event.is_set():
+                    time.sleep(0.25)
+                if not cancel_event.is_set():
+                    log(f"  \u25b6 Reorganize resumed at {_fmt_time()}...\n", "pauselog")
             _ui_queue.append(lambda: _update_queue_btn())
             if recheck_dates and ch_url:
                 _fix_file_dates(ch_url, folder_path)
@@ -10472,6 +10479,19 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         _pe = pause_ev or pause_event
         _res_label = "Best" if new_res == "best" else f"{new_res}p"
         log(f"\n=== Resolution Redownload: {ch_name} ({_res_label}) ===\n", "header")
+
+        # Entry-time pause check: if the queue is paused (e.g. auto-pause-on-
+        # restore at launch), wait BEFORE doing all the catalog scanning.
+        # Without this, the user sees "Found 6005 videos. Matched 2850 files.
+        # Checking the first 10..." and THEN a sudden pause — looks like the
+        # task spontaneously decided to pause itself mid-flow. Pausing right
+        # at task entry is much clearer.
+        if _pe.is_set() and not _ce.is_set():
+            log(f"  \u23f8 Redownload paused at {_fmt_time()} \u2014 click Resume.\n", "pauselog")
+            while _pe.is_set() and not _ce.is_set():
+                time.sleep(0.25)
+            if not _ce.is_set():
+                log(f"  \u25b6 Redownload resumed at {_fmt_time()}...\n", "pauselog")
 
         # ── Step 1: Scan local video files ──
         # Key: filename (without path), Value: full path.  Use the LAST path seen for
@@ -14393,6 +14413,20 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
         _tray_start_spin(red=True)
         _update_tray_tooltip(f"YT Archiver — Transcribing {ch_name}")
         _ui_queue.append(refresh_channel_dropdowns)
+
+        # Entry-time pause check (matches metadata + redownload patterns).
+        # If the queue is paused (e.g. auto-pause-on-restore at launch),
+        # block here BEFORE doing the local-file scan + YT playlist fetch.
+        # Otherwise the user sees lots of preliminary work then a sudden
+        # pause mid-flow and thinks the task spontaneously paused itself.
+        if _pe.is_set() and not _ce.is_set():
+            log(f"  \u23f8 Transcription paused at {_fmt_time()} \u2014 click Resume.\n", "pauselog")
+            _tray_stop_spin(force=True)
+            while _pe.is_set() and not _ce.is_set():
+                time.sleep(0.25)
+            if not _ce.is_set():
+                _tray_start_spin(red=True)
+                log(f"  \u25b6 Transcription resumed at {_fmt_time()}...\n", "pauselog")
         _whisper_available = None  # None = not checked yet
         _user_skipped_whisper = False  # True if user chose "skip" at Whisper model prompt
 
@@ -19042,6 +19076,18 @@ def start_sync_all():
                         with _queue_order_lock:
                             _queue_order.append(("sync", ch["url"]))
             _update_queue_btn()
+
+            # Entry-time pause check (matches metadata + redownload + transcribe + reorg).
+            # If the queue is paused (e.g. auto-pause-on-restore at launch),
+            # block here BEFORE doing the per-channel enumeration / yt-dlp work.
+            # Otherwise the user sees one channel start processing then a sudden
+            # pause and thinks the system spontaneously paused itself.
+            if pause_event.is_set() and not cancel_event.is_set():
+                log(f"  \u23f8 Sync paused at {_fmt_time()} \u2014 click Resume.\n", "pauselog")
+                while pause_event.is_set() and not cancel_event.is_set():
+                    time.sleep(0.25)
+                if not cancel_event.is_set():
+                    log(f"  \u25b6 Sync resumed at {_fmt_time()}...\n", "pauselog")
 
             processed = 0
             _gpu_skip_count = 0  # consecutive GPU batch limit skips
@@ -34115,6 +34161,18 @@ def _load_queue_state():
         )
         if queue_data.get("sync_paused", False) or _sync_pipeline_restored:
             pause_event.set()
+            # Surface the auto-pause clearly on launch so the user
+            # isn't confused later when a task enters its first pause
+            # check mid-flow ("why did Redownload pause itself?"). The
+            # `must explicitly hit resume` rule lives here intentionally
+            # — see line ~34107 — but it needs to be visible right at
+            # restore time, not implicit.
+            if _sync_pipeline_restored:
+                _restore_pause_notice = (
+                    "  ⏸ Sync queue restored \u2014 PAUSED on launch. "
+                    "Click Resume to start processing.\n"
+                )
+                _ui_queue.append(lambda _t=_restore_pause_notice: log(_t, "pauselog"))
         # Restore unified queue ordering
         saved_order = queue_data.get("order", [])
         if saved_order:

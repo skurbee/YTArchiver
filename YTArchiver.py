@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.7"
+APP_VERSION = "v40.8"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 7:00pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 7:13pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -15972,10 +15972,15 @@ def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
         if _ce.is_set():
             return
 
-        log(f"\n{'=' * 60}\n", "header")
-        log(f"  RE-TRANSCRIBE: {fname}\n", "header")
-        log(f"  Model: {chosen_model}\n", "simpleline")
-        log(f"{'=' * 60}\n\n", "header")
+        # Verbose block — header banner + "Transcribing with Whisper"
+        # line. Hidden in simple mode so the log stays compact; in that
+        # mode the user still sees the queue-added line + whisper
+        # progress (%) line which is enough context.
+        if not _is_simple_mode:
+            log(f"\n{'=' * 60}\n", "header")
+            log(f"  RE-TRANSCRIBE: {fname}\n", "header")
+            log(f"  Model: {chosen_model}\n", "simpleline")
+            log(f"{'=' * 60}\n\n", "header")
 
         if not os.path.isfile(file_path):
             log(f"  File not found: {file_path}\n", "red")
@@ -15998,7 +16003,8 @@ def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
         _t_start = time.time()
 
         _stop_whisper_process()  # ensure fresh model load
-        log(f"  Transcribing with Whisper ({chosen_model})...\n", "simpleline")
+        if not _is_simple_mode:
+            log(f"  Transcribing with Whisper ({chosen_model})...\n", "simpleline")
         text, segments = _whisper_transcribe(
             file_path, duration=_dur_secs, title=fname,
             cancel_ev=_ce, pause_ev=_pe, model=chosen_model)

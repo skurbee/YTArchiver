@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v41.9"
+APP_VERSION = "v42.0"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4175,7 +4175,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 6:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 6:18pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -34168,10 +34168,7 @@ def _load_queue_state():
             # — see line ~34107 — but it needs to be visible right at
             # restore time, not implicit.
             if _sync_pipeline_restored:
-                _restore_pause_notice = (
-                    "  ⏸ Sync queue restored \u2014 PAUSED on launch. "
-                    "Click Resume to start processing.\n"
-                )
+                _restore_pause_notice = "  \u23f8 Sync queue restored \u2014 PAUSED\n"
                 _ui_queue.append(lambda _t=_restore_pause_notice: log(_t, "pauselog"))
         # Restore unified queue ordering
         saved_order = queue_data.get("order", [])

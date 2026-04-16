@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v40.8"
+APP_VERSION = "v40.9"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -4037,7 +4037,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 7:13pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.15.26 11:17pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 
@@ -9574,7 +9574,7 @@ def _backlog_compress_channel(ch_name, ch_url, folder, resolution, bitrate_mbhr,
             return
 
         # ── Step 3: Fetch YouTube video list for ID matching ──
-        log("  Fetching YouTube video list for ID matching...\n", "simpleline")
+        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline")
         yt_title_to_id = {}
         try:
             enum_cmd = [
@@ -10337,7 +10337,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
             log("  No video files found.\n", "simpleline")
             return
 
-        log(f"  Found {len(local_files)} local file(s).\n", "simpleline")
+        log(f"  \u2014 Found {len(local_files)} local file(s).\n", "simpleline")
 
         if _ce.is_set():
             log("  Redownload cancelled before YouTube fetch.\n", "simpleline")
@@ -10346,7 +10346,7 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
         # ── Step 2: Fetch YouTube video list for ID matching ──
         # Try with cookies first; fall back to without cookies for public channels.
         # Protected by internet monitor: if internet drops mid-fetch, wait and retry.
-        log("  Fetching YouTube video list for ID matching...\n", "simpleline")
+        log("  \u2014 Fetching YouTube video list for ID matching...\n", "simpleline")
         while not _ce.is_set():
             _internet_went_down_during.clear()  # arm the dirty flag
             if not _block_if_no_internet(cancel_ev=_ce):
@@ -10863,9 +10863,11 @@ def _backlog_redownload_channel(ch_name, ch_url, folder, new_res,
                     if orig_size > 0:
                         _sz_ratio = (new_size / orig_size - 1) * 100
                         _sz_dir = "larger" if _sz_ratio >= 0 else "smaller"
-                        log(f"    ✓ {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({abs(_sz_ratio):.0f}% {_sz_dir})\n", "simpleline_green")
+                        # Redownload result lines: chartreuse-yellow tag so the
+                        # em-dash + size text matches the redownload task identity.
+                        log(f"    \u2014 \u2713 {_fmt_enc_size(o_mb)} → {_fmt_enc_size(n_mb)} ({abs(_sz_ratio):.0f}% {_sz_dir})\n", "simpleline_redwnl")
                     else:
-                        log(f"    ✓ {_fmt_enc_size(n_mb)} (replaced at {_res_label})\n", "simpleline_green")
+                        log(f"    \u2014 \u2713 {_fmt_enc_size(n_mb)} (replaced at {_res_label})\n", "simpleline_redwnl")
                     done += 1
                     done_ids.add(vid_id)
                     _save_progress(done_ids)
@@ -14235,7 +14237,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
             _jsonl_needed = already_done - _jsonl_existing if already_done else set()
 
             if not files_to_process and not _jsonl_needed:
-                log(f"  ✓ All videos already transcribed!\n", "simpleline_green")
+                log(f"  \u2014 \u2713 All videos already transcribed!\n", "simpleline_green")
                 # Record in activity log (0 transcribed — shows as uncolored/white tag)
                 _record_transcription(0, 0, 0, channel_name=ch_name, skipped=0)
                 # Mark channel as fully transcribed
@@ -14253,7 +14255,7 @@ def _start_transcription(ch_name, ch_url, folder, split_years, split_months, com
                 # entries.  Continue to YouTube fetch + backfill instead of
                 # returning early (previously this was a dead loop — "will
                 # generate next run" but next run hit the same early return).
-                log(f"  ✓ All videos already transcribed.\n", "simpleline_green")
+                log(f"  \u2014 \u2713 All videos already transcribed.\n", "simpleline_green")
                 log(f"  — {len(_jsonl_needed):,} video(s) need searchable .jsonl — generating now...\n", "green")
 
             if _ce.is_set():
@@ -16043,8 +16045,11 @@ def _run_retranscribe_job(item, cancel_ev=None, pause_ev=None):
         elapsed = time.time() - _t_start
         _m, _s = divmod(int(elapsed), 60)
         _time_str = f"{_m}min {_s:02d}sec" if _m else f"{_s}sec"
-        log(f"\n  Re-transcription complete: \"{title[:50]}\" ({_time_str})\n",
-            "simpleline_green")
+        # Match the regular transcription-complete line format so the
+        # painter colors it consistently — "[N/N]" blue, title white,
+        # " — done (...)" blue. No leading \n so it sits flush under
+        # the progress line it's replacing.
+        log(f"[1/1] {title} \u2014 done ({_time_str})\n", "simpleline_blue")
 
     except Exception as e:
         log(f"\n  Re-transcribe error: {e}\n", "red")

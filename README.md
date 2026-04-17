@@ -1,6 +1,7 @@
 # YTArchiver
 
-*Currently working on a complete overhaul to pywebview (HTML/CSS/JS) instead of a monolithic & sluggish tkinter app. Will be out soon (hopefully)*
+*Currently working on a complete overhaul to pywebview (HTML/CSS/JS) instead of a monolithic & sluggish tkinter app. 
+Will be out soon (hopefully)*
 
 Download, organize, transcribe, search, compress, and browse entire channels
 

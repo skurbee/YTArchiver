@@ -1,5 +1,6 @@
 # YTArchiver
 
+*Currently working on a complete overhaul to pywebview (HTML/CSS/JS) instead of tkinter, will be out soon*
 
 Download, organize, transcribe, search, compress, and browse entire channels
 

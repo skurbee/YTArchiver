@@ -95,7 +95,7 @@ else:
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
-APP_VERSION = "v42.1"
+APP_VERSION = "v42.2"
 
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_config.json")
 ARCHIVE_FILE = os.path.join(APP_DATA_DIR, "ytarchiver_archive.txt")
@@ -1042,9 +1042,9 @@ def log(text, tag=None):
                         else:
                             log_box.insert(_p, _after, _base_tag)
                     elif _is_redwnl and _after:
-                        # Redownload simple lines: `  [N/M] title.ext\n` —
-                        # title in white, only the extension keeps the
-                        # redownload color (matches download/transcribe style).
+                        # Redownload simple lines: `  [N/M] title.ext\n` — title
+                        # and extension both white. If the filename was truncated
+                        # (ends in "..."), color the ellipsis yellow.
                         _rd_m = re.match(r'^(\s*)(.+?)(\.[A-Za-z0-9]{2,5})(\s*\n?)$', _after, re.DOTALL)
                         if _rd_m:
                             if _rd_m.group(1):
@@ -1052,12 +1052,22 @@ def log(text, tag=None):
                                 _p = log_box.index(f"{_p}+{len(_rd_m.group(1))}c")
                             log_box.insert(_p, _rd_m.group(2), "dl_white")
                             _p = log_box.index(f"{_p}+{len(_rd_m.group(2))}c")
-                            log_box.insert(_p, _rd_m.group(3), _base_tag)
+                            log_box.insert(_p, _rd_m.group(3), "dl_white")
                             _p = log_box.index(f"{_p}+{len(_rd_m.group(3))}c")
                             if _rd_m.group(4):
                                 log_box.insert(_p, _rd_m.group(4), _base_tag)
                         else:
-                            log_box.insert(_p, _after, "dl_white")
+                            _tr_m = re.match(r'^(.*?)(\.\.\.)(\s*\n?)$', _after, re.DOTALL)
+                            if _tr_m:
+                                if _tr_m.group(1):
+                                    log_box.insert(_p, _tr_m.group(1), "dl_white")
+                                    _p = log_box.index(f"{_p}+{len(_tr_m.group(1))}c")
+                                log_box.insert(_p, _tr_m.group(2), _base_tag)
+                                _p = log_box.index(f"{_p}+{len(_tr_m.group(2))}c")
+                                if _tr_m.group(3):
+                                    log_box.insert(_p, _tr_m.group(3), _base_tag)
+                            else:
+                                log_box.insert(_p, _after, "dl_white")
                     elif _do_white and _after:
                         _dash_idx = _after.find(" — done (")
                         if _dash_idx >= 0:
@@ -4193,7 +4203,7 @@ header_strip.pack(fill="x", side="top")
 header_strip.pack_propagate(False)
 tk.Label(header_strip, text="YT ARCHIVER", bg=C_BG, fg=C_TEXT,
          font=("Segoe UI Semibold", 13), anchor="w").pack(side="left", padx=16, pady=10)
-tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 7:37pm", bg=C_BG, fg=C_DIM,
+tk.Label(header_strip, text=f"{APP_VERSION} - 04.16.26 8:47pm", bg=C_BG, fg=C_DIM,
          font=("Segoe UI", 8), anchor="w").pack(side="left", pady=14)
 tk.Frame(root, bg=C_BORDER_LT, height=1).pack(fill="x", side="top")
 

@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 4:08pm ───────────────────────
+# ── Version header — last updated 4.20.26 4:20pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v47.4"
-APP_VERSION_DATE = "4.20.26 4:08pm"
+APP_VERSION      = "v47.5"
+APP_VERSION_DATE = "4.20.26 4:20pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2704,58 +2704,139 @@ class Api:
         if not base:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name as _cfn
-        from backend.transcribe import _scan_existing_transcript_titles
+        from backend.transcribe import (_scan_existing_transcript_titles,
+                                         _norm_title)
         import re as _re
         folder = os.path.join(base, _cfn(ch))
         pending_hint = int(ch.get("transcription_pending", 0) or 0)
 
-        # Pull already-transcribed titles from aggregate `{ch} Transcript.txt`
-        already_titles = _scan_existing_transcript_titles(folder, name)
-        # And from the FTS index (tx_status='transcribed'|'done').
+        # Pull already-transcribed titles + video IDs from every
+        # aggregate `*Transcript.txt` file. Dict is keyed by NORMALIZED
+        # title so trailing-whitespace / case / unicode differences
+        # between filename and stored title stop causing false
+        # "needs transcribing" hits.
+        already = _scan_existing_transcript_titles(folder, name)
+        done_vids = {vid for (_raw, vid) in already.values() if vid}
+
+        # Per-video .jsonl sidecar OR .vtt sidecar (either one means
+        # transcription machinery already handled this file).
+        def _sidecar_exists(base_path: str) -> bool:
+            return (os.path.isfile(base_path + ".jsonl")
+                    or os.path.isfile(base_path + ".en.vtt")
+                    or os.path.isfile(base_path + ".en-US.vtt"))
+
+        # FTS index: any filepath already marked transcribed / done.
+        # We match BY NORMALIZED FILEPATH, not title, because the DB's
+        # filepath is authoritative for the machine-local file.
+        db_done_paths = set()
         db_done_titles = set()
         try:
             from backend.index import _open as _idx_open
             conn = _idx_open()
             if conn is not None:
                 rows = conn.execute(
-                    """SELECT title FROM videos
+                    """SELECT filepath, title FROM videos
                        WHERE channel = ? COLLATE NOCASE
                          AND tx_status IN ('transcribed', 'done')""",
                     (name,),
                 ).fetchall()
                 for r in rows:
-                    t = (r[0] or "").strip()
+                    fp = (r[0] or "").strip()
+                    if fp:
+                        db_done_paths.add(os.path.normpath(fp).lower())
+                    t = (r[1] or "").strip()
                     if t:
-                        db_done_titles.add(t)
+                        db_done_titles.add(_norm_title(t))
         except Exception:
             pass
 
-        queued = 0
+        # Snapshot what's already queued/running so rapid double-clicks
+        # don't re-queue the same video while the first pass hasn't
+        # landed its completion callback yet.
+        queued_paths = set()
+        try:
+            with self._transcribe._jobs_lock:
+                for j in self._transcribe._jobs:
+                    p = j.get("path") or ""
+                    if p:
+                        queued_paths.add(os.path.normpath(p).lower())
+            cj = self._transcribe._current_job
+            if cj:
+                p = cj.get("path") or ""
+                if p:
+                    queued_paths.add(os.path.normpath(p).lower())
+        except Exception:
+            pass
+
         skipped = 0
         bulk = []  # (video_path, plain_title)
+        missed_preview: list = []  # first 3 titles that looked pending
         for dp, _dns, fns in os.walk(folder):
             for fn in fns:
-                if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
+                low = fn.lower()
+                if not low.endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
                     continue
                 video = os.path.join(dp, fn)
                 base_path = os.path.splitext(video)[0]
                 title = os.path.splitext(fn)[0]
                 plain_title = _re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$",
                                       "", title) or title
-                # Per-video legacy sidecar
-                if os.path.isfile(base_path + ".jsonl"):
+                vid_m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", title)
+                vid_id = vid_m.group(1) if vid_m else ""
+
+                # 0. Already queued or running — skip immediately
+                if os.path.normpath(video).lower() in queued_paths:
                     skipped += 1
                     continue
-                # Aggregate `{ch} Transcript.txt` contains this title
-                if plain_title in already_titles:
+
+                # 1. Per-video .jsonl / .en.vtt sidecar
+                if _sidecar_exists(base_path):
                     skipped += 1
                     continue
-                # Index DB says it's done
-                if plain_title in db_done_titles or title in db_done_titles:
+                # 2. DB filepath match
+                if os.path.normpath(video).lower() in db_done_paths:
                     skipped += 1
                     continue
+                # 3. Aggregate title match (normalized, either with or
+                #    without `[videoId]` tail)
+                nt_plain = _norm_title(plain_title)
+                nt_full = _norm_title(title)
+                if nt_plain in already or nt_full in already:
+                    skipped += 1
+                    continue
+                # 4. Video-ID match against any aggregate-stored ID
+                if vid_id and vid_id in done_vids:
+                    skipped += 1
+                    continue
+                # 5. DB title match (fallback)
+                if nt_plain in db_done_titles or nt_full in db_done_titles:
+                    skipped += 1
+                    continue
+                if len(missed_preview) < 3:
+                    missed_preview.append(plain_title)
                 bulk.append((video, plain_title))
 
+        # Zero the counter BEFORE enqueuing. `enqueue()` calls
+        # `_bump_transcription_pending(+1)` per video, so after N enqueues
+        # the counter = 0 + N = N. When the worker completes each job it
+        # calls `_bump(-1)`, bringing the counter back down to 0. Without
+        # this pre-zero, the stale drift (e.g. 730) compounds instead of
+        # being replaced: end state would be 730 + N → 730 forever.
+        try:
+            cfg2 = load_config()
+            for _ch in cfg2.get("channels", []):
+                _n = _ch.get("name") or ""
+                _f = _ch.get("folder") or _ch.get("folder_override") or ""
+                if _n == name or _f == name:
+                    _ch["transcription_pending"] = 0
+                    _ch["transcription_complete"] = True
+                    break
+            from backend.ytarchiver_config import save_config as _sc
+            _sc(cfg2)
+        except Exception:
+            pass
+
+        queued = 0
         if bulk:
             # Tag every enqueue with the same bulk_id so the queue popover
             # can coalesce them into a single "Transcribing {ch} (X videos)"
@@ -2769,29 +2850,21 @@ class Api:
                                          bulk_index=idx)
                 queued += 1
 
-        # If actual pending is 0 but counter said >0, reset the counter so
-        # the badge updates. Also flip transcription_complete=True.
-        if queued == 0 and pending_hint > 0:
-            try:
-                cfg2 = load_config()
-                for _ch in cfg2.get("channels", []):
-                    _n = _ch.get("name") or ""
-                    _f = _ch.get("folder") or _ch.get("folder_override") or ""
-                    if _n == name or _f == name:
-                        _ch["transcription_pending"] = 0
-                        _ch["transcription_complete"] = True
-                        break
-                from backend.ytarchiver_config import save_config as _sc
-                _sc(cfg2)
-            except Exception:
-                pass
-
-        self._log_stream.emit([
+        # Log preview of what the scan flagged as pending so the user can
+        # see exactly which titles failed every check — helpful when the
+        # drift is the result of title-format mismatches we still miss.
+        segs = [
             ["[GPU] ", "trans_bracket"],
             [f"Queue pending for {name}: ", "simpleline_blue"],
             [f"{queued} queued, {skipped} already done "
              f"(counter was {pending_hint})\n", "simpleline"],
-        ])
+        ]
+        self._log_stream.emit(segs)
+        for mt in missed_preview:
+            self._log_stream.emit([
+                ["[GPU] ", "trans_bracket"],
+                [f"  \u2014 flagged pending: {mt}\n", "dim"],
+            ])
         self._log_stream.flush()
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "hint": pending_hint}
@@ -2844,14 +2917,16 @@ class Api:
         elif combined is None:
             combined = True # unorganized channels always combine
 
-        # Build a set of already-transcribed titles from the AGGREGATED
-        # `{ch_name} ... Transcript.txt` files. the user reported that the old
-        # check only looked at per-video `.jsonl` sidecars (legacy format)
-        # and missed aggregated transcripts, so it was saying "all
-        # already transcribed" falsely in some cases — or the reverse
-        # depending on which format was on disk. Fix: check BOTH paths.
-        from backend.transcribe import _scan_existing_transcript_titles
-        already_titles = _scan_existing_transcript_titles(folder, name)
+        # Build a dict of already-transcribed titles (normalized) + stored
+        # video IDs from every aggregate Transcript.txt under this folder.
+        # The scan is now permissive (any *Transcript.txt, unicode-normalized
+        # keys, dual plain/with-id variants) so minor string differences
+        # between filename and stored title stop producing false
+        # "needs transcribing" hits.
+        from backend.transcribe import (_scan_existing_transcript_titles,
+                                         _norm_title)
+        already = _scan_existing_transcript_titles(folder, name)
+        done_vids = {vid for (_raw, vid) in already.values() if vid}
 
         skipped = 0
         bulk = []  # (video_path, plain_title)
@@ -2863,17 +2938,22 @@ class Api:
                 video = os.path.join(dp, fn)
                 base_path = os.path.splitext(video)[0]
                 title = os.path.splitext(fn)[0]
-                # Strip any trailing [videoId] from the title — OLD-format
-                # files still carry it; the aggregated scan stores plain
-                # titles without the bracket.
                 plain_title = _re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$",
                                       "", title) or title
+                vid_m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", title)
+                vid_id = vid_m.group(1) if vid_m else ""
                 # Per-video legacy .jsonl sidecar (OLD format)
                 if os.path.isfile(base_path + ".jsonl"):
                     skipped += 1
                     continue
-                # NEW aggregated `{ch} Transcript.txt` contains this title
-                if plain_title in already_titles:
+                # Aggregate title match (normalized, either with or
+                # without `[videoId]` tail)
+                if (_norm_title(plain_title) in already
+                        or _norm_title(title) in already):
+                    skipped += 1
+                    continue
+                # Video-ID match against any aggregate-stored ID
+                if vid_id and vid_id in done_vids:
                     skipped += 1
                     continue
                 bulk.append((video, plain_title))

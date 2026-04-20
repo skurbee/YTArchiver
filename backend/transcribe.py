@@ -393,26 +393,70 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
         return False
 
 
-def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> set:
-    """Return the set of video titles that already have an entry in any
-    {ch_name} ... Transcript.txt under folder_path. Matches YTArchiver.py:11800."""
-    existing = set()
+def _norm_title(s: str) -> str:
+    """Normalize a title for comparison: NFC unicode, strip, collapse
+    internal whitespace, lowercase. Call before comparing titles pulled
+    from filenames vs aggregate transcripts — small differences (trailing
+    spaces, combining marks, case) shouldn't produce false-positive
+    "needs transcribing" matches."""
+    import unicodedata as _ud
+    if not s:
+        return ""
+    t = _ud.normalize("NFC", s).strip().lower()
+    # Collapse internal whitespace to single spaces.
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> dict:
+    """Return `{norm_title: (raw_title, video_id_or_empty)}` for every
+    entry in ANY Transcript.txt under `folder_path`.
+
+    Earlier this only considered files whose name started with `ch_name`,
+    which missed aggregate files whose filename drifted from the channel
+    name (rename, special-char stripping, per-year split with different
+    prefix, etc.). The scan is now permissive: ANY `*Transcript.txt`
+    under the channel folder contributes its titles. Unicode-normalized
+    keys mean trailing-whitespace / combining-mark differences stop
+    producing false "needs transcribing" matches.
+
+    Mirrors YTArchiver.py:11800 but uses dict output so callers can do
+    both title-match and videoID-match lookups.
+    """
+    existing: dict = {}
+    # Captures title (group 1) up to the FIRST `), (` — greedy-enough
+    # for most cases. Titles that legitimately contain `), (` would need
+    # a stricter grammar but that's rare enough to ignore.
     pattern = re.compile(r"^===\((.+?)\),\s*\(")
+    # `[ABCDEF12345]` YouTube id suffix (for extracting ids stored in
+    # aggregate titles that were written with the `[id]` tail still on).
+    id_pattern = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
     if not folder_path or not os.path.isdir(folder_path):
         return existing
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
-            if f.startswith(ch_name) and f.endswith("Transcript.txt"):
-                try:
-                    with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
-                        for line in fh:
-                            if not line.startswith("===("):
-                                continue
-                            m = pattern.match(line.strip())
-                            if m:
-                                existing.add(m.group(1))
-                except Exception:
-                    pass
+            if not f.endswith("Transcript.txt"):
+                continue
+            try:
+                with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if not line.startswith("===("):
+                            continue
+                        m = pattern.match(line.strip())
+                        if not m:
+                            continue
+                        raw = m.group(1)
+                        vid_id = ""
+                        im = id_pattern.search(raw)
+                        if im:
+                            vid_id = im.group(1)
+                        # Store TWO variants so callers can match either:
+                        # title-with-[id] OR title-without-[id].
+                        raw_plain = id_pattern.sub("", raw).strip() or raw
+                        existing[_norm_title(raw)] = (raw, vid_id)
+                        existing[_norm_title(raw_plain)] = (raw, vid_id)
+            except Exception:
+                pass
     return existing
 
 
@@ -1684,7 +1728,8 @@ class TranscribeManager:
                 if titles is None:
                     titles = _scan_existing_transcript_titles(folder, channel)
                     _title_cache[cache_key] = titles
-                return title in titles
+                # `titles` is a dict keyed by the normalized title form.
+                return _norm_title(title) in titles
 
             recovered = 0
             for j in jobs:
@@ -1720,12 +1765,23 @@ class TranscribeManager:
         self._paused.clear()
 
     def is_active(self) -> bool:
-        """True if the worker thread is alive (actively processing or paused
-        between chunks / between jobs). Used by the UI to drive the icon-btn
-        blink state so the button doesn't briefly flicker to idle-grey when
-        the worker is parked on the pause event between items."""
-        wt = self._worker_thread
-        return bool(wt and wt.is_alive())
+        """True if a GPU job is currently running OR jobs remain queued.
+
+        Earlier versions returned `self._worker_thread.is_alive()`, but
+        that leaves the blink state stuck ON after the last job finishes:
+        the worker sets `_current_job=None` + fires `set_current_gpu(None)`
+        → `_on_queue_changed` runs → `is_alive()` still True → blink keeps
+        going → next loop iteration finally breaks out → thread dies →
+        no final notify fires → UI never repaints to idle.
+
+        Using job-state instead of thread-liveness breaks that race: once
+        the queue is empty and no job is running, is_active() returns False
+        immediately and the final notify paints the button to idle.
+        """
+        if self._current_job is not None:
+            return True
+        with self._jobs_lock:
+            return len(self._jobs) > 0
 
     def skip_current(self):
         """Cancel the currently-running job but keep the queue + worker alive.

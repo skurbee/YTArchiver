@@ -1,3 +1,14 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Build output
+build/
+dist/
+
+# Claude Code hooks / deploy flag
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

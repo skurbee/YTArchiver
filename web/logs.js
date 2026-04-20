@@ -1,0 +1,1974 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   logs.js — YTArchiver log rendering (hot path)
+
+   Log line data format:
+     segments = [[text, tag?], [text, tag?], ...]
+     tag = string class name (e.g. "simpleline_pink") OR array of classes OR null
+
+   Matches tkinter's tag system: each segment of a line carries one or
+   more tags; CSS classes on <span> produce the colors.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+(function () {
+  "use strict";
+
+  // Scroll state per log container (user-scrolled = don't auto-snap to bottom)
+  const scrollState = new WeakMap();
+
+  // Progress tags that should replace their previous emission instead of
+  // appending a new line each tick. Matches YTArchiver's log_box.insert
+  // pattern where whisper_progress / encode_progress lines replace in-place.
+  const INPLACE_TAGS = new Set([
+    "whisper_progress", "whisper_pct", "whisper_dots",
+    "encode_progress",  "encode_pct",  "encode_dots",
+    "startup_loading",
+  ]);
+
+  function _inplaceKind(segments) {
+    // Classify the line as "whisper" or "encode" or "startup" if its tag
+    // is a known progress family; the log-batch renderer replaces the
+    // previous line of the same kind instead of appending a new one.
+    //
+    // sync_row_N tags are per-channel: the live header emit and the
+    // done-summary emit for channel N both carry `sync_row_12` (or
+    // whatever index). That way channel 12's summary replaces channel
+    // 12's header — but channel 13's live emit appends a new row
+    // because its kind ("sync_row_13") has no prior match.
+    for (const seg of segments || []) {
+      if (!seg) continue;
+      const tag = seg[1];
+      const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
+      for (const t of tags) {
+        // Per-job unique kinds MUST come before the prefix-only
+        // matches — without the per-job check, two transcriptions
+        // in the same channel would both classify as "whisper" and
+        // the second video's "Loading punctuation..." would stomp
+        // the first video's "— ✓ Transcription" done line out of
+        // the log. Scott reported exactly that: David Pakman had
+        // 2 downloads + 2 transcriptions per the activity row,
+        // but the main log showed zero transcription lines.
+        if (t && t.startsWith("whisper_job_"))  return t;
+        if (t && t.startsWith("whisper_"))      return "whisper";
+        if (t && t.startsWith("encode_"))       return "encode";
+        if (t && t.startsWith("startup_"))      return "startup";
+        if (t && t.startsWith("sync_row_"))     return t;  // per-channel unique kind
+        if (t && t.startsWith("dlrow_"))        return t;  // per-video unique kind
+      }
+    }
+    return null;
+  }
+
+  // Remove the in-place "Loading…" line once startup has genuinely completed.
+  // Called by the backend via evaluate_js once the background sweep finishes.
+  // Also re-mirrors mini logs so they don't keep showing the stale Loading line.
+  window.clearStartupLine = function () {
+    const el = document.getElementById("main-log");
+    if (!el) return;
+    el.querySelectorAll('.log-line[data-inplace="startup"]').forEach(n => n.remove());
+    if (typeof window._mirrorMiniLogs === "function") window._mirrorMiniLogs();
+  };
+
+  // Two-slot startup indicator — backend drives via
+  // window._setIndicator(slot, text|null) where slot is "sweep" or
+  // "preload". Sweep slot carries disk-scan / indexing progress;
+  // preload slot carries the browse-tab preload progress. They can
+  // both run in parallel, so both slots may be visible at once.
+  window._setIndicator = function (slot, text) {
+    const el = document.getElementById("browse-preload-slot-" + slot);
+    if (!el) return;
+    if (!text) {
+      el.hidden = true;
+      el.textContent = "";
+    } else {
+      el.hidden = false;
+      el.textContent = text;
+    }
+  };
+  // Back-compat shim for any caller still using the pre-split name.
+  window._setPreloadIndicator = function (text) {
+    window._setIndicator("sweep", text);
+  };
+
+  function tagClasses(tag) {
+    if (!tag) return "";
+    if (Array.isArray(tag)) {
+      return tag.map(t => "t-" + t).join(" ");
+    }
+    return "t-" + tag;
+  }
+
+  function buildLine(segments, lineClass) {
+    const line = document.createElement("div");
+    line.className = lineClass ? "log-line " + lineClass : "log-line";
+    for (const seg of segments) {
+      if (!seg) continue;
+      const text = seg[0] == null ? "" : String(seg[0]);
+      const tag = seg[1];
+      const span = document.createElement("span");
+      const cls = tagClasses(tag);
+      if (cls) span.className = cls;
+      span.textContent = text;
+      line.appendChild(span);
+    }
+    return line;
+  }
+
+  function isAtBottom(el) {
+    const gap = el.scrollHeight - el.clientHeight - el.scrollTop;
+    return gap < 4;
+  }
+
+  function maybeSnapToBottom(el) {
+    const st = scrollState.get(el) || {};
+    if (!st.userScrolled) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  function wireUserScrollDetection(el) {
+    if (!el || scrollState.has(el)) return;
+    const st = { userScrolled: false };
+    scrollState.set(el, st);
+
+    // Build the "↓ Latest" floating affordance once, parented to the frame.
+    const frame = el.parentElement;
+    let jumpBtn = null;
+    if (frame && !frame.querySelector(".log-jump-latest")) {
+      const pos = getComputedStyle(frame).position;
+      if (pos === "static") frame.style.position = "relative";
+      jumpBtn = document.createElement("button");
+      jumpBtn.className = "log-jump-latest";
+      jumpBtn.type = "button";
+      jumpBtn.textContent = "\u2193 Latest";
+      jumpBtn.title = "Scroll to newest (auto-follow)";
+      jumpBtn.style.display = "none";
+      jumpBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        st.userScrolled = false;
+        el.scrollTop = el.scrollHeight;
+        jumpBtn.style.display = "none";
+      });
+      frame.appendChild(jumpBtn);
+    } else if (frame) {
+      jumpBtn = frame.querySelector(".log-jump-latest");
+    }
+    const refreshBtn = () => {
+      if (!jumpBtn) return;
+      jumpBtn.style.display = st.userScrolled && !isAtBottom(el) ? "" : "none";
+    };
+
+    // Single scroll handler covers every input method (wheel, scrollbar
+    // drag, keyboard PgUp/End, touchpad momentum). Rule: if we're NOT at
+    // the bottom after a scroll event, the user has scrolled away — stop
+    // auto-following. Reaching the bottom again re-enables follow.
+    //
+    // Programmatic `el.scrollTop = el.scrollHeight` also fires a scroll
+    // event, but it always lands at bottom → isAtBottom=true → doesn't
+    // flip the flag. Safe.
+    el.addEventListener("scroll", () => {
+      st.userScrolled = !isAtBottom(el);
+      refreshBtn();
+    });
+  }
+
+  // ─── Public API ──────────────────────────────────────────────────────
+
+  /** Build one grid-aligned activity-log row.
+   *  Coloring rule (matches the real YTArchiver screenshot): ONLY the
+   *  [Kind] tag and the primary "N replaced / N fetched / N downloaded"
+   *  cell get the tag color. Time, channel, em-dashes, skipped, errors,
+   *  took all stay default. */
+  // Inline regex-highlight map for autorun history cells — mirrors
+  // YTArchiver.py:22290-22369 _insert_hist_line inline-color rules:
+  //   "N downloaded"  → green
+  //   "N transcribed" → blue
+  //   "N replaced"    → chartreuse (redwnl)
+  //   "N compressed"  → purple
+  //   "N moved"       → orange (reorg)
+  //   "N fetched"     → pink
+  //   "N skipped"     → amber (uses c-log-sum)
+  //   "N errors?"     → red
+  // Only match non-zero counts — "0 skipped" / "0 errors" should stay dim
+  // default color (matches YTArchiver.py _insert_hist_line behavior: tags
+  // are only applied when the count is > 0).
+  const _HIST_HILITE = [
+    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi,       "t-hist_green"],
+    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
+    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi,      "t-hist_redwnl"],
+    [/\b([1-9]\d*)\s+(compressed)\b/gi,           "t-hist_compress"],
+    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi,        "t-hist_reorg"],
+    [/\b([1-9]\d*)\s+(fetched|refreshed)\b/gi,    "t-hist_pink"],
+    [/\b([1-9]\d*)\s+skipped\b/gi,                "t-hist_skipped"],
+    [/\b([1-9]\d*)\s+errors?\b/gi,                "t-hist_error"],
+  ];
+
+  function _buildHistCell(text, extra, colored, tagCls) {
+    // Slow-path builder that tokenizes text against _HIST_HILITE and emits
+    // per-match coloured <span>s so the plain-dark default cell shows
+    // "4 downloaded" green + "2 skipped" amber + "1 error" red inline.
+    const s = document.createElement("span");
+    const baseCls = ((colored ? tagCls : "") + " " + (extra || "")).trim();
+    if (baseCls) s.className = baseCls;
+    if (text == null || text === "") return s;
+
+    // Build an index of (start, end, cls) ranges
+    const ranges = [];
+    for (const [rx, cls] of _HIST_HILITE) {
+      let m;
+      rx.lastIndex = 0;
+      while ((m = rx.exec(text)) !== null) {
+        ranges.push({ start: m.index, end: m.index + m[0].length, cls });
+        if (m.index === rx.lastIndex) rx.lastIndex++;
+      }
+    }
+    if (!ranges.length) { s.textContent = String(text); return s; }
+    ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+    // De-overlap: keep the first, drop any that starts before previous end
+    const kept = [];
+    let cursor = -1;
+    for (const r of ranges) {
+      if (r.start >= cursor) { kept.push(r); cursor = r.end; }
+    }
+    // Walk the string and split into text + span chunks
+    let pos = 0;
+    for (const r of kept) {
+      if (r.start > pos) s.appendChild(document.createTextNode(text.slice(pos, r.start)));
+      const m = document.createElement("span");
+      m.className = r.cls;
+      m.textContent = text.slice(r.start, r.end);
+      s.appendChild(m);
+      pos = r.end;
+    }
+    if (pos < text.length) s.appendChild(document.createTextNode(text.slice(pos)));
+    return s;
+  }
+
+  function buildActivityRow(entry) {
+    if (entry.segments && !entry.cells) {
+      return buildLine(entry.segments, entry.alt ? "hist_row_alt" : "");
+    }
+    const c = entry.cells || {};
+    const tag = c.row_tag || "";
+    const tagCls = tag ? "t-" + tag : "";
+    const line = document.createElement("div");
+    line.className = "log-line" + (entry.alt ? " hist_row_alt" : "");
+    const cell = (text, extra, colored) => {
+      const s = document.createElement("span");
+      const cls = ((colored ? tagCls : "") + " " + (extra || "")).trim();
+      if (cls) s.className = cls;
+      s.textContent = text == null ? "" : String(text);
+      return s;
+    };
+    // ONLY kind + primary take the row tag color.
+    // Secondary / errors cells get inline-regex highlighting instead.
+    line.appendChild(cell(`[${c.kind || ""}]`, "hist-col-kind", true));
+    line.appendChild(cell(c.time_date || "", "hist-col-time",    false));
+    line.appendChild(cell("\u2014",           "hist-col-dash",    false));
+    line.appendChild(cell(c.channel || "",    "hist-col-channel", false));
+    line.appendChild(cell("\u2014",           "hist-col-dash",    false));
+    line.appendChild(cell(c.primary || "",    "hist-col-num",     true));
+    line.appendChild(_buildHistCell(c.secondary || "", "hist-col-num", false, tagCls));
+    line.appendChild(_buildHistCell(c.errors   || "", "hist-col-num", false, tagCls));
+    line.appendChild(cell(c.took || "",       "hist-col-took",    false));
+    return line;
+  }
+
+  /** Replace the whole activity log with a list of entries. */
+  window.renderActivityLog = function (entries) {
+    const el = document.getElementById("activity-log");
+    if (!el) return;
+    wireUserScrollDetection(el);
+    el.innerHTML = "";
+    entries.forEach((entry) => {
+      el.appendChild(buildActivityRow(entry));
+    });
+    // First render — force scroll to bottom so the newest row is visible.
+    // `maybeSnapToBottom` alone can fire before the browser has laid out
+    // the new rows, leaving scrollTop at 0. Delay via rAF + one more tick.
+    maybeSnapToBottom(el);
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+      setTimeout(() => { el.scrollTop = el.scrollHeight; }, 30);
+    });
+  };
+
+  /** Append a single activity log entry. */
+  window.appendActivityLog = function (entry) {
+    const el = document.getElementById("activity-log");
+    if (!el) return;
+    wireUserScrollDetection(el);
+    el.appendChild(buildActivityRow(entry));
+    maybeSnapToBottom(el);
+  };
+
+  // ── Mini-log mirror ─────────────────────────────────────────────────
+  // Project rule: "MINI LOGS SHOULD ALWAYS SHOW EXACTLY WHAT THE MAIN LOG
+  // SHOWS. NO DISCREPANCIES."  Instead of maintaining a parallel append
+  // buffer (which drifts when the main log removes lines in-place, e.g.
+  // clearStartupLine, whisper_progress replacements), we snapshot the last
+  // N lines of the main log into each mini after every mutation.
+  const MINI_LOG_IDS = ["subs-mini-log", "browse-mini-log",
+                        "recent-mini-log", "settings-mini-log"];
+  const MINI_LINES   = 5;
+
+  function mirrorMiniLogs() {
+    const main = document.getElementById("main-log");
+    if (!main) return;
+    const all = main.children;
+    const start = Math.max(0, all.length - MINI_LINES);
+    for (const id of MINI_LOG_IDS) {
+      const m = document.getElementById(id);
+      if (!m) continue;
+      // Rebuild mini as an exact slice clone of the last N main lines
+      m.innerHTML = "";
+      for (let i = start; i < all.length; i++) {
+        m.appendChild(all[i].cloneNode(true));
+      }
+    }
+  }
+  window._mirrorMiniLogs = mirrorMiniLogs;
+
+  /** Bulk render main log (initial). */
+  window.renderMainLog = function (lines) {
+    const el = document.getElementById("main-log");
+    if (!el) return;
+    wireUserScrollDetection(el);
+    const frag = document.createDocumentFragment();
+    for (const segs of lines) {
+      frag.appendChild(buildLine(segs));
+    }
+    el.innerHTML = "";
+    el.appendChild(frag);
+    maybeSnapToBottom(el);
+    mirrorMiniLogs();
+  };
+
+  /** Append a single line to the main log (hot path — called from Python). */
+  window.appendMainLog = function (segments) {
+    const el = document.getElementById("main-log");
+    if (!el) return;
+    wireUserScrollDetection(el);
+    el.appendChild(buildLine(segments));
+    // Trim if we get ridiculous (tkinter caps ~8000 lines)
+    const cap = 8000;
+    const keep = 6000;
+    if (el.childElementCount > cap) {
+      const toRemove = el.childElementCount - keep;
+      for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+      // Drop a one-time warning at the top of the new log window so the
+      // user knows older lines got trimmed. Matches YTArchiver.py:1222
+      // inline trim marker. Re-emits periodically if trimming continues.
+      const existing = el.querySelector(".log-line.log-trim-warn");
+      if (existing) existing.remove();
+      const warn = buildLine([["  \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+      warn.classList.add("log-trim-warn");
+      el.insertBefore(warn, el.firstChild);
+    }
+    maybeSnapToBottom(el);
+    mirrorMiniLogs();
+  };
+
+  /** Append to a mini log (by element id). NO-OP — kept for backward-compat.
+   *  Mini logs are now a pure mirror of the last 5 main-log lines. */
+  window.appendMiniLog = function () {};
+
+  /** Clear a log container. */
+  window.clearLog = function (id) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+    // If the main log was cleared, clear the mirrors too.
+    if (id === "main-log") mirrorMiniLogs();
+  };
+
+  /** Batched log delivery from Python. Called by LogStreamer.
+   *  payload = { main: [ [segments], [segments], ... ],
+   *              activity: [ { cells, alt }, ... ] }
+   *  Special segment tags signal in-place replacement:
+   *   - "whisper_progress" or "encode_progress" → replace the previous
+   *     line carrying that same tag (so progress bar ticks in place). */
+  window._logBatch = function (payload) {
+    if (!payload) return;
+    if (Array.isArray(payload.main) && payload.main.length) {
+      const el = document.getElementById("main-log");
+      if (el) {
+        // Wire user-scroll detection on first batch. Without this, the
+        // scrollState map never gets an entry for #main-log, `userScrolled`
+        // is undefined, and `!undefined === true` makes every batch
+        // auto-scroll to the bottom — snapping away from the user's
+        // read position.
+        wireUserScrollDetection(el);
+        const frag = document.createDocumentFragment();
+        for (const segs of payload.main) {
+          const line = buildLine(segs);
+          const inplaceKind = _inplaceKind(segs);
+          if (inplaceKind) {
+            line.dataset.inplace = inplaceKind;
+            // Look for the prior line of this kind in BOTH the committed
+            // log AND the in-progress fragment. Without checking the
+            // fragment, a single 60ms LogStreamer batch that contains
+            // both a placeholder ("Adding punctuation...") and its
+            // replacement ("[1/1] done") would append BOTH — the fragment
+            // hasn't been flushed to `el` yet, so `el.querySelectorAll`
+            // doesn't see the placeholder that arrived earlier in the
+            // same batch. The frag match wins when present because it
+            // is newer than anything already in `el`.
+            const allInFrag = frag.querySelectorAll(
+              `.log-line[data-inplace="${inplaceKind}"]`);
+            const lastInFrag = allInFrag[allInFrag.length - 1];
+            if (lastInFrag) {
+              lastInFrag.replaceWith(line);
+              continue;
+            }
+            const allInEl = el.querySelectorAll(
+              `.log-line[data-inplace="${inplaceKind}"]`);
+            const lastInEl = allInEl[allInEl.length - 1];
+            if (lastInEl) {
+              lastInEl.replaceWith(line);
+              continue;
+            }
+          }
+          frag.appendChild(line);
+        }
+        el.appendChild(frag);
+        // Same scroll-freeze / trim behavior as appendMainLog
+        const cap = 8000, keep = 6000;
+        if (el.childElementCount > cap) {
+          const toRemove = el.childElementCount - keep;
+          for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+          // Inline trim warning, same pattern as appendMainLog.
+          const existing = el.querySelector(".log-line.log-trim-warn");
+          if (existing) existing.remove();
+          const warn = buildLine([["  \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+          warn.classList.add("log-trim-warn");
+          el.insertBefore(warn, el.firstChild);
+        }
+        const st = scrollState.get(el) || {};
+        if (!st.userScrolled) el.scrollTop = el.scrollHeight;
+        // Mirror the last N main-log lines into every mini log (Subs / Browse
+        // / Recent / Settings). One snapshot per batch — not per line —
+        // so mini logs track main exactly.
+        mirrorMiniLogs();
+      }
+    }
+    if (Array.isArray(payload.activity) && payload.activity.length) {
+      const el = document.getElementById("activity-log");
+      if (el) {
+        // Same wiring fix as main-log above — without this the activity
+        // log would auto-snap on every batch.
+        wireUserScrollDetection(el);
+        const frag = document.createDocumentFragment();
+        for (const entry of payload.activity) frag.appendChild(buildActivityRow(entry));
+        el.appendChild(frag);
+        const st = scrollState.get(el) || {};
+        if (!st.userScrolled) el.scrollTop = el.scrollHeight;
+      }
+    }
+  };
+
+  /** Render the Subs tab channel table. */
+  window.renderSubsTable = function (rows, totalLabel) {
+    const tbody = document.getElementById("subs-table-body");
+    if (!tbody) return;
+    window._subsAllRows = rows;          // keep a copy for the filter
+    _renderSubsFiltered(rows);
+    const totalEl = document.getElementById("subs-total-size");
+    if (totalEl && totalLabel) totalEl.textContent = totalLabel;
+    // Re-apply the Avg column visibility in case this is the first render
+    // (class would otherwise only be applied on Settings open / change).
+    // Default undefined -> show, matching legacy behavior.
+    const tbl = document.getElementById("subs-table");
+    if (tbl && window._subsShowAvg === false) tbl.classList.add("hide-avg-col");
+  };
+
+  function _renderSubsFiltered(rows) {
+    const tbody = document.getElementById("subs-table-body");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      // Per-channel "Sync now" is accessed via right-click → Sync now
+      // (matches the original tkinter version). No inline hover button.
+      tr.innerHTML = `
+        <td class="col-folder">${escapeHtml(r.folder)}</td>
+        <td>${escapeHtml(r.res)}</td>
+        <td>${escapeHtml(r.min)}</td>
+        <td>${escapeHtml(r.max)}</td>
+        <td class="col-mark">${escapeHtml(r.compress)}</td>
+        <td class="col-mark">${escapeHtml(r.transcribe)}</td>
+        <td class="col-mark">${escapeHtml(r.metadata)}</td>
+        <td>${escapeHtml(r.last_sync)}</td>
+        <td>${escapeHtml(r.n_vids)}</td>
+        <td>${escapeHtml(r.size)}</td>
+        <td>${escapeHtml(r.avg_size || "—")}</td>
+      `;
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+  }
+
+  window._applySubsFilter = function (query) {
+    const all = window._subsAllRows || [];
+    const q = (query || "").toLowerCase().trim();
+    if (!q) { _renderSubsFiltered(all); return; }
+    const filtered = all.filter(r => (r.folder || "").toLowerCase().includes(q));
+    _renderSubsFiltered(filtered);
+  };
+
+  // Toggle visibility of the Avg filesize column on the Subs table.
+  // Wired from Settings ("Show Avg filesize in subs tab"). CSS handles
+  // the actual hide via `.hide-avg-col th:last-child, .hide-avg-col td:last-child`.
+  // Cached on window._subsShowAvg so future renders respect the choice.
+  window._applySubsAvgVisibility = function (show) {
+    window._subsShowAvg = !!show;
+    const tbl = document.getElementById("subs-table");
+    if (!tbl) return;
+    tbl.classList.toggle("hide-avg-col", !show);
+  };
+
+  /** Render the Recent tab downloads. Dispatches between the legacy
+   *  table ("list") and the thumbnail grid ("grid") based on the
+   *  user's setting (cached on window._recentViewMode, set by
+   *  window._applyRecentViewMode — default "list"). */
+  window.renderRecentTable = function (rows) {
+    window._recentAllRows = rows || [];
+    _dispatchRecent(window._recentAllRows);
+  };
+
+  window._applyRecentFilter = function (query) {
+    const all = window._recentAllRows || [];
+    const q = (query || "").toLowerCase().trim();
+    const filtered = !q ? all : all.filter(r =>
+      (r.title || "").toLowerCase().includes(q) ||
+      (r.channel || "").toLowerCase().includes(q)
+    );
+    _dispatchRecent(filtered);
+  };
+
+  // Flip which view is visible + pick the matching renderer. Called at
+  // boot via the runtime_info seed and live whenever the Settings radio
+  // changes. Remembers the choice on window so filter re-applies can
+  // dispatch without needing to re-read the setting each time.
+  window._applyRecentViewMode = function (mode) {
+    const m = (mode === "grid") ? "grid" : "list";
+    window._recentViewMode = m;
+    const listFrame = document.getElementById("recent-list-frame");
+    const gridFrame = document.getElementById("recent-grid-frame");
+    if (listFrame) listFrame.style.display = (m === "list") ? "" : "none";
+    if (gridFrame) gridFrame.style.display = (m === "grid") ? "" : "none";
+    // Re-render the current dataset through the newly-active view so
+    // switching modes doesn't leave the other view empty.
+    if (Array.isArray(window._recentAllRows)) {
+      _dispatchRecent(window._recentAllRows);
+    }
+  };
+
+  function _dispatchRecent(rows) {
+    if (window._recentViewMode === "grid") {
+      _renderRecentFilteredGrid(rows);
+    } else {
+      _renderRecentFiltered(rows);
+    }
+  }
+
+  function _renderRecentFiltered(rows) {
+    const tbody = document.getElementById("recent-table-body");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="col-title"   title="${escapeAttr(r.title)}">${escapeHtml(r.title)}</td>
+        <td class="col-channel">${escapeHtml(r.channel)}</td>
+        <td class="col-time">${escapeHtml(r.time)}</td>
+        <td class="col-length right">${escapeHtml(r.duration)}</td>
+        <td class="col-size right">${escapeHtml(r.size)}</td>
+      `;
+      // Stash the full row data so handlers can reach filepath/video_id/etc.
+      tr.dataset.filepath = r.filepath || "";
+      tr.dataset.videoId  = r.video_id || "";
+      tr.dataset.title    = r.title || "";
+      tr.dataset.channel  = r.channel || "";
+      tr.title = "Double-click to play in Watch view";
+      // Double-click opens the video in the embedded Watch view with transcript
+      tr.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        const v = {
+          title:    tr.dataset.title,
+          channel:  tr.dataset.channel,
+          filepath: tr.dataset.filepath,
+          video_id: tr.dataset.videoId,
+          duration: r.duration || "",
+          uploaded: r.time || "",
+        };
+        // Switch to Browse tab + Watch view (call the helper in app.js).
+        if (typeof window._openVideoInWatch === "function") {
+          window._openVideoInWatch(v);
+        } else if (v.filepath && window.pywebview?.api?.browse_open_video) {
+          // Fallback — external player
+          window.pywebview.api.browse_open_video(v.filepath);
+        }
+      });
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+
+    // Row click selection — supports Ctrl/Shift multi-select
+    const allRows = [...tbody.querySelectorAll("tr")];
+
+    // Show/hide Clear list + Delete File buttons based on rows
+    const hasItems = allRows.length > 0;
+    const clearBtn  = document.getElementById("btn-clear-recent");
+    const delBtn    = document.getElementById("btn-delete-file");
+    if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
+    if (delBtn)   delBtn.style.display   = "none"; // revealed when a row is selected
+
+    let lastClickedIdx = -1;
+    allRows.forEach((tr, idx) => {
+      tr.addEventListener("click", (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          // Toggle this row's selection
+          tr.classList.toggle("row-selected");
+        } else if (e.shiftKey && lastClickedIdx >= 0) {
+          // Range-select from last clicked to this one
+          const [a, b] = [Math.min(lastClickedIdx, idx), Math.max(lastClickedIdx, idx)];
+          allRows.forEach((r, i) => {
+            if (i >= a && i <= b) r.classList.add("row-selected");
+          });
+        } else {
+          allRows.forEach(r => r.classList.remove("row-selected"));
+          tr.classList.add("row-selected");
+        }
+        lastClickedIdx = idx;
+        const any = tbody.querySelectorAll("tr.row-selected").length;
+        if (delBtn) {
+          delBtn.style.display = any ? "" : "none";
+          delBtn.textContent = any > 1 ? `Delete ${any} files` : "Delete File";
+        }
+      });
+    });
+  };
+
+  // ─── Recent grid renderer ───────────────────────────────────────────
+  //
+  // Thumbnail-card view of recent downloads — visually matches the video
+  // grid inside a channel (same _buildVideoCard helper). Selection isn't
+  // exposed on cards (no multi-select) because the Browse grid doesn't
+  // have it either; users who need bulk-delete can flip back to List.
+  //
+  // Click behavior mirrors the Browse grid:
+  //   - single-click → open in Watch view (embedded player + transcript)
+  //   - double-click → open in external player (VLC / system default)
+  //
+  // The Delete File button depends on selection and is therefore hidden
+  // in this mode; Clear list remains functional.
+  function _renderRecentFilteredGrid(rows) {
+    const grid = document.getElementById("recent-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    // _buildVideoCard was made public earlier in this file; fall back to
+    // a plain-text row if somehow it's missing so the view isn't blank.
+    const build = window._buildVideoCard;
+    const frag  = document.createDocumentFragment();
+    for (const r of rows) {
+      const v = {
+        title:         r.title || "",
+        channel:       r.channel || "",
+        filepath:      r.filepath || "",
+        video_id:      r.video_id || "",
+        duration:      r.duration || "",
+        uploaded:      r.uploaded || r.time || "",
+        size_bytes:    r.size_bytes || 0,
+        thumbnail_url: r.thumbnail_url || "",
+        // Recent is a cross-channel view — force the channel line on so
+        // every card identifies its channel (Browse cards don't need it).
+        show_channel:  true,
+      };
+      if (!build) {
+        const d = document.createElement("div");
+        d.className = "video-card";
+        d.textContent = v.title;
+        frag.appendChild(d);
+        continue;
+      }
+      // onVideoClick → open Watch view (same path the list view uses on dblclick).
+      const onClick = (vv) => {
+        if (typeof window._openVideoInWatch === "function") {
+          window._openVideoInWatch(vv);
+        } else if (vv.filepath && window.pywebview?.api?.browse_open_video) {
+          window.pywebview.api.browse_open_video(vv.filepath);
+        }
+      };
+      const card = build(v, onClick);
+      frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+
+    // Button visibility — Clear list follows "has items", Delete File is
+    // hidden in grid mode since there's no card-selection UX.
+    const hasItems  = rows.length > 0;
+    const clearBtn  = document.getElementById("btn-clear-recent");
+    const delBtn    = document.getElementById("btn-delete-file");
+    if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
+    if (delBtn)   delBtn.style.display   = "none";
+  }
+
+  /** Render the queue popovers for Sync Tasks + GPU Tasks. */
+  window.renderQueues = function (queues) {
+    renderTaskList("sync-tasks-body", queues.sync, "No sync tasks queued.", "sync");
+    renderTaskList("gpu-tasks-body",  queues.gpu,  "No GPU tasks queued.",  "gpu");
+    _updateBadge("badge-sync", (queues.sync || []).length);
+    _updateBadge("badge-gpu",  (queues.gpu  || []).length);
+  };
+
+  function _updateBadge(id, n) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (!n || n <= 0) {
+      el.hidden = true;
+      el.textContent = "0";
+      return;
+    }
+    el.hidden = false;
+    el.textContent = n > 99 ? "99+" : String(n);
+  }
+
+  // In-memory queue state so drag-to-rearrange can update order.
+  const _queueState = { sync: [], gpu: [] };
+  // Exposed so context menus elsewhere (Subs tab) can check whether a
+  // channel is currently queued / running and label menu items dynamically.
+  // Mirrors OLD's dynamic-label mutation (YTArchiver.py:5596 _chan_ctx_menu).
+  window._queueStateSnapshot = () => ({
+    sync: _queueState.sync.slice(),
+    gpu:  _queueState.gpu.slice(),
+  });
+  // Convenience: does `channelName` have a sync queued? (running or queued)
+  window._queueHasSyncForChannel = (channelName) => {
+    const n = (channelName || "").toLowerCase();
+    if (!n) return null;
+    const match = (t) => {
+      const s = String(t?.name || t?.url || "").toLowerCase();
+      return s.includes(n) ? t.status || "queued" : null;
+    };
+    for (const t of _queueState.sync) {
+      const s = match(t);
+      if (s) return s;   // "running" | "queued"
+    }
+    return null;
+  };
+  // Convenience: does a GPU task (transcribe/encode/compress) reference this channel?
+  window._queueHasGpuForChannel = (channelName) => {
+    const n = (channelName || "").toLowerCase();
+    if (!n) return null;
+    for (const t of _queueState.gpu) {
+      const s = String(t?.name || t?.title || "").toLowerCase();
+      if (s.includes(n)) return t.status || "queued";
+    }
+    return null;
+  };
+
+  function renderTaskList(bodyId, list, emptyText, queueKind) {
+    const body = document.getElementById(bodyId);
+    if (!body) return;
+    _queueState[queueKind] = (list || []).slice();
+    paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
+  }
+
+  function paintTaskList(body, list, emptyText, queueKind) {
+    body.innerHTML = "";
+    if (!list || list.length === 0) {
+      body.innerHTML = `<div class="queue-empty">${emptyText}</div>`;
+      return;
+    }
+    list.forEach((t, i) => {
+      const row = document.createElement("div");
+      const statusCls = t.status || "queued";
+      row.className = `queue-task-row ${statusCls}`;
+      row.draggable = true;
+      row.dataset.idx = i;
+      row.dataset.queue = queueKind;
+
+      const stateGlyph =
+        statusCls === "running" ? "\u25B6" :
+        statusCls === "paused"  ? "\u275A\u275A" :
+                                  "\u25CB";
+
+      // Color the verb (Downloading/Transcribing/Metadata) in tag color
+      const nameHtml = colorizeTaskName(t.name);
+
+      // Cycling dots after the active task's name ("..."/".. "/".  ") —
+      // pure CSS animation via ::after content keyframes. Matches
+      // YTArchiver.py:20131 _active_label cycling dots.
+      const dotsSpan = statusCls === "running" ? '<span class="queue-task-dots"></span>' : "";
+
+      row.innerHTML = `
+        <span class="queue-task-index">${i + 1}.</span>
+        <span class="queue-task-state ${statusCls}">${stateGlyph}</span>
+        <span class="queue-task-name"></span>${dotsSpan}
+        <button class="queue-task-close" title="Remove">&times;</button>
+      `;
+      row.querySelector(".queue-task-name").innerHTML = nameHtml;
+
+      row.querySelector(".queue-task-close").addEventListener("click", (e) => {
+        e.stopPropagation();
+        const idx = Number(row.dataset.idx);
+        const removed = _queueState[queueKind][idx];
+        _queueState[queueKind].splice(idx, 1);
+        paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
+        // Notify backend (best-effort; no-op in preview mode)
+        if (window.pywebview?.api) {
+          if (queueKind === "sync" && window.pywebview.api.queues_sync_remove) {
+            window.pywebview.api.queues_sync_remove(removed?.url || removed?.name || "");
+          } else if (queueKind === "gpu" && window.pywebview.api.queues_gpu_remove) {
+            window.pywebview.api.queues_gpu_remove(removed?.id || removed?.path || removed?.name || "");
+          }
+        }
+      });
+
+      // Right-click menu on queue rows: skip / move-to-top / cancel-or-remove
+      // Mirrors YTArchiver.py:20570-20584 (sync) + 21441-21455 (gpu) — each
+      // destructive action pops a confirm, matching the old app's askyesno flow.
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const idx = Number(row.dataset.idx);
+        const api = window.pywebview?.api;
+        const items = [];
+        const taskLabel = (t.name || t.title || t.url || "this task").toString().slice(0, 60);
+        // "Skip this job" — only meaningful for the currently-running item.
+        // Old app: messagebox.askyesno("Skip Current", "Cancel the current job
+        // and move to the next one in queue?")
+        if (statusCls === "running") {
+          items.push({ label: "Skip this job",
+            action: async () => {
+              const ok = await (window.askConfirm
+                ? window.askConfirm("Skip current job",
+                    "Cancel the current job and move to the next one in queue?",
+                    { confirm: "Skip", danger: true })
+                : Promise.resolve(confirm(
+                    "Cancel the current job and move to the next one in queue?")));
+              if (!ok) return;
+              if (queueKind === "sync") api?.sync_skip_current?.();
+              else                      api?.gpu_skip_current?.();
+            }});
+        }
+        items.push(
+          { label: "Move to top",
+            action: () => {
+              if (idx <= 0) return;
+              const [taken] = _queueState[queueKind].splice(idx, 1);
+              _queueState[queueKind].unshift(taken);
+              paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
+              if (queueKind === "sync" && api?.queues_sync_reorder)
+                api.queues_sync_reorder(taken?.url || taken?.name || "", 0);
+              else if (queueKind === "gpu" && api?.queues_gpu_reorder)
+                api.queues_gpu_reorder(taken?.id || taken?.path || taken?.name || "", 0);
+            }},
+          // Old app: messagebox.askyesno("Remove from Queue", ...) line 20382
+          { label: statusCls === "running" ? "Cancel task" : "Remove from queue",
+            cls: "dim",
+            action: async () => {
+              const title = statusCls === "running" ? "Cancel task" : "Remove from queue";
+              const msg   = statusCls === "running"
+                ? `Cancel "${taskLabel}"?\n\nThe current job will stop.`
+                : `Remove "${taskLabel}" from the queue?`;
+              const ok = await (window.askConfirm
+                ? window.askConfirm(title, msg, { confirm: title, danger: true })
+                : Promise.resolve(confirm(msg)));
+              if (!ok) return;
+              row.querySelector(".queue-task-close")?.click();
+            }},
+        );
+        if (window.showContextMenu) window.showContextMenu(ev.clientX, ev.clientY, items);
+      });
+
+      // Drag-and-drop (HTML5)
+      row.addEventListener("dragstart", (e) => {
+        row.classList.add("drag-src");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", String(i));
+      });
+      row.addEventListener("dragend", () => {
+        row.classList.remove("drag-src");
+        body.querySelectorAll(".drag-target-above, .drag-target-below")
+            .forEach(el => el.classList.remove("drag-target-above", "drag-target-below"));
+      });
+      row.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        const rect = row.getBoundingClientRect();
+        const halfway = rect.top + rect.height / 2;
+        row.classList.toggle("drag-target-above", e.clientY < halfway);
+        row.classList.toggle("drag-target-below", e.clientY >= halfway);
+      });
+      row.addEventListener("dragleave", () => {
+        row.classList.remove("drag-target-above", "drag-target-below");
+      });
+      row.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const srcIdx = Number(e.dataTransfer.getData("text/plain"));
+        const dstIdx = Number(row.dataset.idx);
+        if (Number.isNaN(srcIdx) || srcIdx === dstIdx) return;
+        const rect = row.getBoundingClientRect();
+        const below = e.clientY >= rect.top + rect.height / 2;
+        const list = _queueState[queueKind];
+        const [moved] = list.splice(srcIdx, 1);
+        let insertAt = dstIdx;
+        if (srcIdx < dstIdx) insertAt -= 1;
+        if (below) insertAt += 1;
+        list.splice(insertAt, 0, moved);
+        paintTaskList(body, list, emptyText, queueKind);
+        // Phase 6: notify Python of reorder
+      });
+
+      body.appendChild(row);
+    });
+  }
+
+  function colorizeTaskName(name) {
+    // Color the action verb in its tag color — mirrors YTArchiver's
+    // log palette so Downloading=green, Metadata=pink, Transcribing=blue,
+    // Redownloading=chartreuse, Encoding/Compressing=purple, Moving/Reorg=orange.
+    // (Hex values live in styles.css as var(--c-log-*).)
+    // Both present-continuous (running) and plain-verb (queued) forms.
+    // Longer verbs listed first so "Redownloading" isn't matched by "Download".
+    const verbs = [
+      ["Redownloading",  "qv-redwnl"],    // chartreuse #c7e64f
+      ["Redownload",     "qv-redwnl"],
+      ["Downloading",    "qv-sync"],      // green  #3dd68c
+      ["Download",       "qv-sync"],
+      ["Transcribing",   "qv-trans"],     // blue   #6cb4ee
+      ["Transcribe",     "qv-trans"],
+      ["Metadata",       "qv-meta"],      // pink   #e87aac
+      ["Compressing",    "qv-compress"],  // purple #c084fc
+      ["Compress",       "qv-compress"],
+      ["Encoding",       "qv-compress"],
+      ["Encode",         "qv-compress"],
+      ["Moving",         "qv-reorg"],     // orange #ff8c42
+      ["Reorg",          "qv-reorg"],
+      ["Syncing",        "qv-sync"],
+      ["Sync",           "qv-sync"],
+    ];
+    for (const [verb, cls] of verbs) {
+      if (name.startsWith(verb)) {
+        const rest = name.slice(verb.length);
+        return `<span class="${cls}">${escapeHtml(verb)}</span>${escapeHtml(rest)}`;
+      }
+    }
+    return escapeHtml(name);
+  }
+
+  /** Legacy tree renderer — no-op since Browse switched to the channel
+      grid layout. Kept so existing call sites don't error. */
+  window.renderBrowseTree = function (_rows) { /* no-op */ };
+
+  // ─── Browse tab: YouTube-style 3-view flow ───────────────────────────
+
+  // Deterministic gradient from a string (first letter → hue).
+  function gradientFor(name) {
+    const s = (name || "").trim();
+    const first = (s[0] || "?").toUpperCase();
+    const codepoint = first.charCodeAt(0);
+    const hue = (codepoint * 47) % 360;
+    const hue2 = (hue + 40) % 360;
+    return `linear-gradient(135deg, hsl(${hue}, 55%, 28%) 0%, hsl(${hue2}, 60%, 18%) 100%)`;
+  }
+
+  /** Render the Channels grid (Browse tab landing view).
+   *
+   *  YouTube-style: banner fills the card, circular PFP overlaps
+   *  bottom-left, name + stats in a dark-gradient overlay below.
+   *  Images use <img loading="lazy"> so 100+ channels don't fetch all
+   *  thumbnails on mount (fixes scroll lag the user reported).
+   */
+  window.renderChannelGrid = function (channels, onChannelClick) {
+    const grid = document.getElementById("channel-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    for (const c of channels) {
+      const name = c.folder || c.name || "";
+      const vids = c.n_vids || c.video_count || "—";
+      const size = c.size || "";
+      const first = (name[0] || "?").toUpperCase();
+
+      const bannerUrl = c.banner_url || "";
+      const avatarUrl = c.avatar_url || "";
+      // Banner priority: explicit banner > avatar zoomed-to-fill > gradient.
+      const bannerSrc = bannerUrl || avatarUrl || "";
+
+      const card = document.createElement("div");
+      card.className = "channel-card";
+      if (!bannerSrc) {
+        // Pure-gradient fallback gets the tinted bg directly.
+        card.style.background = gradientFor(name);
+      }
+      if (typeof c.transcription_pending === "number") {
+        card.dataset.pendingTx = String(c.transcription_pending);
+      }
+      if (typeof c.metadata_pending === "number") {
+        card.dataset.pendingMeta = String(c.metadata_pending);
+      }
+
+      const bgImg = bannerSrc
+        ? `<img class="channel-card-bg" src="${bannerSrc}" loading="lazy" decoding="async" alt="" />`
+        : "";
+      const avatarImg = avatarUrl
+        ? `<img class="channel-avatar" src="${avatarUrl}" loading="lazy" decoding="async" alt="" />`
+        : "";
+      const letterHtml = (!bannerSrc && !avatarUrl)
+        ? `<div class="channel-letter">${escapeHtml(first)}</div>`
+        : "";
+
+      card.innerHTML = `
+        ${bgImg}
+        ${letterHtml}
+        <div class="channel-card-overlay">
+          <div class="channel-card-name"></div>
+          <div class="channel-card-meta"></div>
+        </div>
+        ${avatarImg}
+      `;
+      card.querySelector(".channel-card-name").textContent = name;
+      card.querySelector(".channel-card-meta").textContent =
+        `${vids}${vids && vids !== "—" ? " videos" : ""}${size ? "  \u00b7  " + size : ""}`;
+
+      // Swap to gradient if the banner image fails to load.
+      const bgEl = card.querySelector(".channel-card-bg");
+      if (bgEl) {
+        bgEl.addEventListener("error", () => {
+          bgEl.remove();
+          card.style.background = gradientFor(name);
+          if (!avatarUrl && !card.querySelector(".channel-letter")) {
+            const d = document.createElement("div");
+            d.className = "channel-letter";
+            d.textContent = first;
+            card.insertBefore(d, card.firstChild);
+          }
+        }, { once: true });
+      }
+
+      card.addEventListener("click", () => onChannelClick && onChannelClick(c));
+      frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+
+    // Prefetch banner + avatar images in the background, throttled to a
+    // few parallel fetches at a time. By the time the user scrolls past
+    // the first viewport, the later cards' images are already in the
+    // browser cache and decoded — no more pop-in. Runs on idle time so
+    // it never blocks main-thread scrolling.
+    _prefetchChannelArt(channels);
+  };
+
+  let _prefetchQueue = [];
+  let _prefetchActive = 0;
+  // 2 concurrent is enough \u2014 more than this stacks decode work on
+  // the main thread and creates the very lag we're trying to prevent.
+  const PREFETCH_MAX_CONCURRENT = 2;
+  // Only prefetch enough cards to fill the first couple of viewports.
+  // Past that, let `<img loading="lazy">` pull the rest on demand as
+  // the user scrolls. Prefetching all 100+ banners up-front floods the
+  // decoder and makes scroll janky for the first 10-20 seconds.
+  const PREFETCH_LIMIT = 40;
+
+  function _prefetchChannelArt(channels) {
+    const first = channels.slice(0, PREFETCH_LIMIT);
+    const urls = [];
+    for (const c of first) {
+      if (c.banner_url) urls.push(c.banner_url);
+    }
+    for (const c of first) {
+      if (c.avatar_url && c.avatar_url !== c.banner_url) urls.push(c.avatar_url);
+    }
+    _prefetchQueue = urls;
+    for (let i = 0; i < PREFETCH_MAX_CONCURRENT; i++) _pumpPrefetch();
+  }
+
+  function _pumpPrefetch() {
+    if (!_prefetchQueue.length) return;
+    if (_prefetchActive >= PREFETCH_MAX_CONCURRENT) return;
+    const url = _prefetchQueue.shift();
+    if (!url) return;
+    _prefetchActive++;
+    const img = new Image();
+    img.decoding = "async";
+    img.fetchPriority = "low";
+    const done = () => {
+      _prefetchActive--;
+      // Schedule the next pump inside an idle callback so decodes
+      // only run when the main thread isn't busy rendering scrolls.
+      const next = () => _pumpPrefetch();
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(next, { timeout: 500 });
+      } else {
+        setTimeout(next, 100);
+      }
+    };
+    img.addEventListener("load",  done, { once: true });
+    img.addEventListener("error", done, { once: true });
+    img.src = url;
+  }
+
+  /** Render the Videos grid (inside a channel). */
+  function _buildVideoCard(v, onVideoClick) {
+    const card = document.createElement("div");
+    card.className = "video-card";
+    card.dataset.filepath = v.filepath || "";
+    card.dataset.videoId  = v.video_id || "";
+    card.dataset.title    = v.title || "";
+    // Use a real <img> tag for thumbnails rather than CSS
+    // `background: url(...)` — the image tag is far more forgiving of
+    // http://127.0.0.1 URLs through pywebview's webview, and failed loads
+    // trigger a clean `onerror` swap to the gradient placeholder.
+    const hasThumb = !!v.thumbnail_url;
+    const imgTag = hasThumb
+      ? `<img class="video-thumb-img" src="${v.thumbnail_url}" alt=""
+              loading="lazy" decoding="async" />`
+      : "";
+    card.innerHTML = `
+      <div class="video-thumb" style="${hasThumb ? '' : `background: ${gradientFor(v.title)};`}">
+        ${imgTag}
+        ${hasThumb ? '' : '<span>&#9654;</span>'}
+        <span class="video-duration-badge"></span>
+      </div>
+      <div class="video-card-body">
+        <div class="video-card-title"></div>
+        <div class="video-card-channel"></div>
+        <div class="video-card-meta"></div>
+      </div>
+    `;
+    // Swap to gradient placeholder if the thumb fails to load
+    const imgEl = card.querySelector(".video-thumb-img");
+    if (imgEl) {
+      imgEl.addEventListener("error", () => {
+        const tf = imgEl.parentElement;
+        if (tf) {
+          tf.style.background = gradientFor(v.title);
+          imgEl.remove();
+          const ph = document.createElement("span");
+          ph.innerHTML = "&#9654;";
+          tf.insertBefore(ph, tf.firstChild);
+        }
+      }, { once: true });
+    }
+    card.querySelector(".video-duration-badge").textContent = v.duration || "";
+    card.querySelector(".video-card-title").textContent = v.title || "";
+    // Channel line — opt-in via v.show_channel so contexts like the
+    // Recent grid (many channels mixed together) get it, while the
+    // Browse video grid (already scoped to one channel) doesn't show
+    // a redundant channel name on every card.
+    const chEl = card.querySelector(".video-card-channel");
+    if (chEl) {
+      if (v.show_channel && v.channel) {
+        chEl.textContent = v.channel;
+        chEl.style.display = "";
+      } else {
+        chEl.style.display = "none";
+      }
+    }
+    const metaParts = [];
+    // Pretty-print the upload date as "Nov 15, 2025" instead of the raw
+    // "2025-11-15" that the backend emits. Accepts any ISO-ish YYYY-MM-DD
+    // or date-time string; unparseable values fall back to verbatim.
+    if (v.uploaded) metaParts.push(_fmtCardDate(v.uploaded));
+    if (v.size_bytes) metaParts.push(_fmtBytes(v.size_bytes));
+    if (v.views) metaParts.push(v.views + " views");
+    if (v.tx_status === "transcribed") metaParts.push("transcribed");
+    card.querySelector(".video-card-meta").textContent = metaParts.join("  \u00b7  ");
+    card.addEventListener("click", () => onVideoClick && onVideoClick(v));
+
+    // Hover preview: after ~400ms on a thumbnail, pop a larger preview
+    // overlay anchored to the card. Mirrors YTArchiver.py:26834
+    // _show_browse_thumbnail. Canceled on mouse-leave. Does not fire on
+    // cards that have no thumbnail.
+    if (v.thumbnail_url) {
+      let hoverTimer = null;
+      let overlay = null;
+      const showOverlay = () => {
+        if (overlay) return;
+        overlay = document.createElement("div");
+        overlay.className = "video-hover-preview";
+        const img = document.createElement("img");
+        img.src = v.thumbnail_url;
+        img.alt = "";
+        overlay.appendChild(img);
+        const cap = document.createElement("div");
+        cap.className = "video-hover-preview-caption";
+        cap.textContent = v.title || "";
+        overlay.appendChild(cap);
+        document.body.appendChild(overlay);
+        // Position to the right of the card (clamped to viewport)
+        const rect = card.getBoundingClientRect();
+        const targetW = 420, targetH = 236;
+        let x = rect.right + 10;
+        let y = rect.top;
+        if (x + targetW > window.innerWidth - 10) {
+          x = Math.max(10, rect.left - targetW - 10);
+        }
+        if (y + targetH > window.innerHeight - 10) {
+          y = Math.max(10, window.innerHeight - targetH - 10);
+        }
+        overlay.style.left = x + "px";
+        overlay.style.top  = y + "px";
+      };
+      const cancel = () => {
+        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+        if (overlay) {
+          overlay.remove();
+          overlay = null;
+        }
+      };
+      card.addEventListener("mouseenter", () => {
+        hoverTimer = setTimeout(showOverlay, 400);
+      });
+      card.addEventListener("mouseleave", cancel);
+      card.addEventListener("mousedown", cancel);
+    }
+
+    card.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (v.filepath && window.pywebview?.api?.browse_open_video) {
+        window.pywebview.api.browse_open_video(v.filepath);
+      }
+    });
+    return card;
+  }
+  // Public alias so other renderers (e.g. renderRecentGrid) can reuse the
+  // same card builder without duplicating markup + hover-preview logic.
+  window._buildVideoCard = _buildVideoCard;
+
+  function _yearOf(v) {
+    // Prefer upload_ts (ms epoch from added_ts*1000); fall back to r.year
+    if (typeof v.upload_ts === "number" && v.upload_ts > 0) {
+      return new Date(v.upload_ts).getFullYear();
+    }
+    if (v.year) return Number(v.year);
+    // Last resort: try to parse 'uploaded' (e.g. "2024-05-20")
+    const m = (v.uploaded || "").match(/\b(19|20)\d{2}\b/);
+    return m ? Number(m[0]) : null;
+  }
+
+  window.renderVideoGrid = function (videos, onVideoClick, opts) {
+    const grid = document.getElementById("video-grid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    const groupByYear = !!(opts && opts.groupByYear);
+    // `groupByMonth` only makes sense nested inside `groupByYear`;
+    // without a year context, "March" alone is ambiguous across years.
+    // Automatically treat month-grouping as implying year-grouping.
+    const groupByMonth = !!(opts && opts.groupByMonth);
+    const useYear = groupByYear || groupByMonth;
+
+    // Lazy-load: on channels with 500+ videos, rendering all thumbnails at
+    // once causes jank + high memory. Match YTArchiver.py:28108 (fires at
+    // 85% scroll) by batching 60 cards per append cycle with an
+    // IntersectionObserver sentinel.
+    // Mirrors OLD `_grid_check_load_more` / `_grid_build_cards(reset=False)`.
+    const BATCH = 60;
+    const LAZY_THRESHOLD = 120;  // only lazy-load when enough videos to matter
+    const useLazy = !useYear && videos.length > LAZY_THRESHOLD;
+
+    if (useLazy) {
+      grid.classList.remove("video-grid-grouped");
+      let cursor = 0;
+      const appendBatch = () => {
+        const end = Math.min(cursor + BATCH, videos.length);
+        const frag = document.createDocumentFragment();
+        for (let i = cursor; i < end; i++) {
+          frag.appendChild(_buildVideoCard(videos[i], onVideoClick));
+        }
+        // Remove old sentinel if present, append batch, add new sentinel
+        const oldSentinel = grid.querySelector(".video-grid-sentinel");
+        oldSentinel?.remove();
+        grid.appendChild(frag);
+        cursor = end;
+        if (cursor < videos.length) {
+          const sentinel = document.createElement("div");
+          sentinel.className = "video-grid-sentinel";
+          sentinel.textContent = `\u2026 ${videos.length - cursor} more, scroll to load`;
+          grid.appendChild(sentinel);
+          _observeGridSentinel(sentinel, appendBatch);
+        }
+      };
+      appendBatch();
+      return;
+    }
+
+    if (!useYear) {
+      grid.classList.remove("video-grid-grouped");
+      const frag = document.createDocumentFragment();
+      for (const v of videos) frag.appendChild(_buildVideoCard(v, onVideoClick));
+      grid.appendChild(frag);
+      return;
+    }
+
+    // Group in the order they arrive (caller already sorted).
+    const buckets = new Map();          // year -> array of videos
+    const order   = [];                 // year order of first occurrence
+    const unknown = [];
+    for (const v of videos) {
+      const y = _yearOf(v);
+      if (y == null) { unknown.push(v); continue; }
+      if (!buckets.has(y)) { buckets.set(y, []); order.push(y); }
+      buckets.get(y).push(v);
+    }
+    if (unknown.length) { buckets.set("?", unknown); order.push("?"); }
+
+    // Render: grid becomes a single column of <section>s each containing its
+    // own internal grid of cards. CSS handles the visual gaps.
+    grid.classList.add("video-grid-grouped");
+    const frag = document.createDocumentFragment();
+    for (const y of order) {
+      const vids = buckets.get(y);
+      const section = document.createElement("section");
+      section.className = "video-grid-year-section";
+      section.dataset.year = String(y);
+      const head = document.createElement("header");
+      head.className = "video-grid-year-head";
+      const arrow = document.createElement("span");
+      arrow.className = "vgy-arrow";
+      arrow.textContent = "\u25BE";  // ▾
+      const label = document.createElement("span");
+      label.className = "vgy-label";
+      label.textContent = (y === "?" ? "Unknown" : String(y));
+      const count = document.createElement("span");
+      count.className = "vgy-count";
+      count.textContent = `(${vids.length})`;
+      head.append(arrow, label, count);
+      section.appendChild(head);
+
+      const inner = document.createElement("div");
+      inner.className = "video-grid-year-inner";
+      if (groupByMonth && y !== "?") {
+        // Second-level grouping: month within year. Month order
+        // follows the caller's sort — videos arrive already sorted
+        // so the first month we see is the newest (or oldest).
+        const mBuckets = new Map();
+        const mOrder   = [];
+        const mUnknown = [];
+        for (const v of vids) {
+          const m = _monthOf(v);
+          if (m == null) { mUnknown.push(v); continue; }
+          if (!mBuckets.has(m)) { mBuckets.set(m, []); mOrder.push(m); }
+          mBuckets.get(m).push(v);
+        }
+        if (mUnknown.length) { mBuckets.set("?", mUnknown); mOrder.push("?"); }
+        for (const m of mOrder) {
+          const mVids = mBuckets.get(m);
+          const mSec = document.createElement("section");
+          mSec.className = "video-grid-month-section";
+          mSec.dataset.month = String(m);
+          const mHead = document.createElement("header");
+          mHead.className = "video-grid-month-head";
+          const mArrow = document.createElement("span");
+          mArrow.className = "vgy-arrow";
+          mArrow.textContent = "\u25BE";
+          const mLabel = document.createElement("span");
+          mLabel.className = "vgy-label";
+          mLabel.textContent = (m === "?" ? "Unknown" : _MONTH_NAMES[m] || `Month ${m}`);
+          const mCount = document.createElement("span");
+          mCount.className = "vgy-count";
+          mCount.textContent = `(${mVids.length})`;
+          mHead.append(mArrow, mLabel, mCount);
+          mSec.appendChild(mHead);
+          const mInner = document.createElement("div");
+          mInner.className = "video-grid-year-inner";
+          for (const v of mVids) mInner.appendChild(_buildVideoCard(v, onVideoClick));
+          mSec.appendChild(mInner);
+          mHead.addEventListener("click", () => {
+            const collapsed = mSec.classList.toggle("collapsed");
+            mArrow.textContent = collapsed ? "\u25B8" : "\u25BE";
+          });
+          inner.appendChild(mSec);
+        }
+      } else {
+        for (const v of vids) inner.appendChild(_buildVideoCard(v, onVideoClick));
+      }
+      section.appendChild(inner);
+
+      head.addEventListener("click", () => {
+        const collapsed = section.classList.toggle("collapsed");
+        arrow.textContent = collapsed ? "\u25B8" : "\u25BE";  // ▸ : ▾
+      });
+
+      frag.appendChild(section);
+    }
+    grid.appendChild(frag);
+  };
+
+  const _MONTH_NAMES = {
+    1: "January", 2: "February", 3: "March",      4: "April",
+    5: "May",     6: "June",     7: "July",       8: "August",
+    9: "September", 10: "October", 11: "November", 12: "December",
+  };
+
+  function _monthOf(v) {
+    // Prefer the explicit `month` field (set from DB row's year/month
+    // columns, which come from the yyyy/mm folder structure on disk);
+    // fall back to parsing from upload_ts epoch if month is missing.
+    if (v && typeof v.month === "number" && v.month >= 1 && v.month <= 12) {
+      return v.month;
+    }
+    if (v && v.upload_ts) {
+      try {
+        const d = new Date(Number(v.upload_ts));
+        if (!Number.isNaN(d.getTime())) return d.getMonth() + 1;
+      } catch {}
+    }
+    return null;
+  }
+
+  function _fmtBytes(b) {
+    if (!b) return "";
+    const units = ["B","KB","MB","GB","TB"];
+    let i = 0, v = b;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
+  }
+
+  // Pretty-print a date string (accepts YYYY-MM-DD or any Date-parseable
+  // form) as e.g. "Nov 15, 2025". Returns the original string unchanged
+  // if it can't be parsed so existing displays never regress to "NaN".
+  const _MON_ABBR = ["Jan","Feb","Mar","Apr","May","Jun",
+                     "Jul","Aug","Sep","Oct","Nov","Dec"];
+  function _fmtCardDate(s) {
+    if (!s) return "";
+    // Prefer a strict YYYY-MM-DD match so we don't trip on Date's
+    // timezone-shifted parsing of bare ISO dates (which can roll
+    // "2025-11-15" into Nov 14 on negative-UTC offsets).
+    const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) {
+      const y = Number(m[1]);
+      const mo = Number(m[2]);
+      const d  = Number(m[3]);
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        return `${_MON_ABBR[mo - 1]} ${d}, ${y}`;
+      }
+    }
+    // Fallback — hand off to Date() for other formats (ISO with time, etc.)
+    const dt = new Date(s);
+    if (!isNaN(dt.getTime())) {
+      return `${_MON_ABBR[dt.getMonth()]} ${dt.getDate()}, ${dt.getFullYear()}`;
+    }
+    return String(s);
+  }
+
+  // Shared IntersectionObserver so big channels don't make thousands of them.
+  let _gridIO = null;
+  const _gridSentinelCallbacks = new WeakMap();
+  function _observeGridSentinel(sentinel, cb) {
+    if (!_gridIO) {
+      _gridIO = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) {
+            const fn = _gridSentinelCallbacks.get(e.target);
+            if (fn) {
+              _gridIO.unobserve(e.target);
+              _gridSentinelCallbacks.delete(e.target);
+              fn();
+            }
+          }
+        }
+      }, { rootMargin: "400px" });
+    }
+    _gridSentinelCallbacks.set(sentinel, cb);
+    _gridIO.observe(sentinel);
+  }
+
+  /** Retranscribe completion hook — called by Python via evaluate_js
+   *  when a `transcribe_retranscribe` job finishes. If the completed
+   *  video is the one currently on screen, refetch the transcript and
+   *  re-render the Watch view (this flips the source banner from
+   *  "auto-captions — approximate" to "Whisper transcription"). Mirrors
+   *  ArchivePlayer `_ytStartProgressPoll`'s post-finish refresh at
+   *  static/app.js:1209-1221. */
+  window._onRetranscribeComplete = async function (payload) {
+    try {
+      const { video_id, filepath } = payload || {};
+      const wv = document.getElementById("view-watch");
+      if (!wv || wv.style.display === "none") return;
+      const cur = window._watchCurrentVideo || null;
+      if (!cur) return;
+      const match = (video_id && cur.video_id && video_id === cur.video_id)
+                 || (filepath && cur.filepath &&
+                     String(filepath).toLowerCase() === String(cur.filepath).toLowerCase());
+      if (!match) return;
+      const api = window.pywebview?.api;
+      if (!api?.browse_get_transcript) return;
+      const res = await api.browse_get_transcript({
+        video_id: cur.video_id || undefined,
+        title:    cur.title || "",
+      });
+      let segments = [];
+      let sourceInfo = null;
+      if (Array.isArray(res)) segments = res;
+      else if (res && res.segments) {
+        segments = res.segments;
+        sourceInfo = res.source || null;
+      }
+      if (!segments.length) return;
+      const transcript = segments.map(seg => ({
+        ts: (window._formatTs ? window._formatTs(seg.s) : ""),
+        text: seg.t, words: seg.w, s: seg.s, e: seg.e,
+      }));
+      // Re-render in place — same API signature as the initial open.
+      window.renderWatchView(cur, transcript, sourceInfo);
+      window._showToast?.("Re-transcription complete \u2014 transcript updated.", "ok");
+    } catch (e) { /* ignore */ }
+  };
+
+  /** Render the Watch view: loads the real video file into <video> and
+   *  builds per-word transcript spans with (s, e) timestamps for karaoke.
+   *
+   *  transcript items: { s, e, t, w:[{w,s,e},...], ts } — s/e in seconds.
+   *  source: { source: "whisper"|"yt_captions_punct"|"yt_captions_raw"|"unknown", raw: "..." }
+   *  `video.filepath` is used to request a file:// URL from the backend.
+   *
+   *  Render mode: single continuous flowing body (no per-segment divs,
+   *  no [timestamp] inline prefixes) — matches ArchivePlayer. A source
+   *  banner above the body tells the user whether the transcript came
+   *  from Whisper or YouTube auto-captions, and for auto-captions offers
+   *  an inline "Re-transcribe with Whisper" link for better accuracy.
+   */
+  window.renderWatchView = function (video, transcript, sourceInfo) {
+    const title = document.getElementById("watch-title");
+    const meta  = document.getElementById("watch-meta");
+    const tr    = document.getElementById("watch-transcript");
+    const vEl   = document.getElementById("watch-video");
+    const ph    = document.getElementById("watch-video-placeholder");
+    if (!title || !meta || !tr) return;
+
+    title.textContent = video.title || "Video Title";
+    const parts = [];
+    if (video.channel)   parts.push(video.channel);
+    if (video.uploaded)  parts.push(video.uploaded);
+    if (video.duration)  parts.push(video.duration);
+    if (video.views)     parts.push(video.views + " views");
+    meta.textContent = parts.join("  \u00b7  ");
+
+    // Stash for `_onRetranscribeComplete` — when the Python side finishes
+    // a retranscribe, it pushes an event; the handler checks this ref
+    // to decide whether the completed job matches what's on screen.
+    window._watchCurrentVideo = video;
+
+    _loadVideoSource(video, vEl, ph);
+    _loadWatchMetadataDrawer(video);
+
+    tr.innerHTML = "";
+    if (!transcript || transcript.length === 0) {
+      tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
+      _unbindKaraoke(vEl);
+      return;
+    }
+
+    const frag = document.createDocumentFragment();
+
+    // Source banner — Whisper / YT auto-captions / unknown. Mirrors
+    // ArchivePlayer's `_ytSourceBannerHTML`.
+    const bannerEl = _buildSourceBanner(sourceInfo, video);
+    if (bannerEl) frag.appendChild(bannerEl);
+
+    // Flatten every word across every segment into one continuous flowing
+    // body. No per-segment div, no inline [timestamp] prefixes — matches
+    // ArchivePlayer. The `seg` wrappers are kept for karaoke so the whole
+    // block highlights while the active word inside it gets stronger styling.
+    const body = document.createElement("div");
+    body.className = "watch-transcript-body";
+    const segEls = [];
+    for (const seg of transcript) {
+      const segEl = document.createElement("span");
+      segEl.className = "seg";
+      segEl.dataset.s = seg.s ?? 0;
+      segEl.dataset.e = seg.e ?? 0;
+      const words = Array.isArray(seg.words) && seg.words.length
+        ? seg.words
+        : (seg.w && seg.w.length ? seg.w : null);
+      if (words) {
+        for (const wobj of words) {
+          const span = document.createElement("span");
+          span.className = "word";
+          span.dataset.s = wobj.s ?? 0;
+          span.dataset.e = wobj.e ?? 0;
+          span.textContent = (wobj.w || "") + " ";
+          span.addEventListener("click", () => _seekTo(vEl, wobj.s ?? 0));
+          segEl.appendChild(span);
+        }
+      } else {
+        const span = document.createElement("span");
+        span.className = "word";
+        span.textContent = (seg.t || seg.text || "") + " ";
+        span.addEventListener("click", () => _seekTo(vEl, seg.s ?? 0));
+        segEl.appendChild(span);
+      }
+      // Trailing space between segments keeps words from running together.
+      segEl.appendChild(document.createTextNode(" "));
+      body.appendChild(segEl);
+      segEls.push(segEl);
+    }
+    frag.appendChild(body);
+    tr.appendChild(frag);
+    _bindKaraoke(vEl, tr, segEls);
+  };
+
+  /** Build the source-banner div for the Watch view transcript panel.
+   *  Returns a DOM element or null. Mirrors ArchivePlayer's
+   *  `_ytSourceBannerHTML` (static/app.js:1106) EXACTLY — same text,
+   *  same four cases, same link wording. The "unknown, no raw" case
+   *  returns null so no banner appears at all (ArchivePlayer returns
+   *  the empty string for that case). */
+  function _buildSourceBanner(sourceInfo, video) {
+    const src = (sourceInfo && sourceInfo.source) || "unknown";
+    const raw = (sourceInfo && sourceInfo.raw) || "";
+
+    const banner = document.createElement("div");
+    banner.className = "watch-src-banner";
+    const dot = document.createElement("span");
+    dot.className = "watch-src-dot";
+
+    const buildRetranscribeLink = () => {
+      const a = document.createElement("a");
+      a.href = "#";
+      a.className = "watch-retranscribe-link";
+      a.textContent = "re-transcribe with Whisper";
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        const btn = document.getElementById("btn-watch-retranscribe");
+        if (btn) btn.click();
+      });
+      return a;
+    };
+
+    if (src === "whisper") {
+      banner.classList.add("whisper");
+      banner.appendChild(dot);
+      // Raw like "WHISPER small" or "WHISPER:small" — pull everything
+      // after the first whitespace/colon as the model label.
+      const parts = (raw || "").trim().split(/[\s:]+/);
+      const model = parts.length > 1 ? parts.slice(1).join(" ") : "";
+      const txt = document.createElement("span");
+      txt.textContent = model
+        ? `Whisper transcription \u2014 ${model.toLowerCase()} model`
+        : "Whisper transcription";
+      banner.appendChild(txt);
+      return banner;
+    }
+    if (src === "yt_captions_punct") {
+      banner.classList.add("yt");
+      banner.appendChild(dot);
+      banner.appendChild(document.createTextNode(
+        "YouTube auto-captions (punctuation restored) \u2014 transcript is approximate \u00b7 "));
+      banner.appendChild(buildRetranscribeLink());
+      banner.appendChild(document.createTextNode(" for improved results"));
+      return banner;
+    }
+    if (src === "yt_captions_raw") {
+      banner.classList.add("yt");
+      banner.appendChild(dot);
+      banner.appendChild(document.createTextNode(
+        "YouTube auto-captions \u2014 transcript is approximate \u00b7 "));
+      banner.appendChild(buildRetranscribeLink());
+      banner.appendChild(document.createTextNode(" for improved results"));
+      return banner;
+    }
+    // Unknown. Per ArchivePlayer app.js:1140 — don't flag with a warning
+    // since we genuinely don't know. Show a neutral tag if we have a raw
+    // string, otherwise NOTHING at all.
+    if (raw) {
+      banner.classList.add("unknown");
+      banner.appendChild(dot);
+      banner.appendChild(document.createTextNode(`Source: ${raw}`));
+      return banner;
+    }
+    return null;
+  }
+
+  // Load + render the Watch-view metadata drawer. Reads the aggregated
+  // `.{ch_name} Metadata.jsonl` via the `browse_get_video_metadata` Api.
+  // Matches YTArchiver.py:26750 _fetch_video_metadata display: description,
+  // view_count, like_count, upload_date, top 50 comments.
+  async function _loadWatchMetadataDrawer(video) {
+    const drawer = document.getElementById("watch-meta-drawer");
+    if (!drawer) return;
+    const statsEl    = document.getElementById("watch-meta-stats");
+    const descEl     = document.getElementById("watch-meta-description");
+    const commentsEl = document.getElementById("watch-meta-comments");
+    const countEl    = document.getElementById("watch-meta-comments-count");
+    // Reset state immediately so a slow fetch doesn't bleed previous video's data
+    if (statsEl) statsEl.textContent = "";
+    if (descEl) descEl.textContent = "Loading\u2026";
+    if (commentsEl) commentsEl.innerHTML = "";
+    if (countEl) countEl.textContent = "";
+
+    const api = window.pywebview?.api;
+    if (!api?.browse_get_video_metadata) {
+      if (descEl) descEl.textContent = "(Metadata unavailable in browser-preview mode)";
+      return;
+    }
+    let res;
+    try {
+      res = await api.browse_get_video_metadata({
+        filepath: video.filepath || "",
+        video_id: video.video_id || "",
+        title:    video.title    || "",
+        channel:  video.channel  || "",
+      });
+    } catch (e) {
+      if (descEl) descEl.textContent = "(Failed to load metadata.)";
+      return;
+    }
+    if (!res?.ok || !res.meta) {
+      if (descEl) descEl.textContent =
+        "No metadata on disk for this video yet. Run 'Download metadata' on the channel to fetch it.";
+      return;
+    }
+    const meta = res.meta;
+    // Stats line
+    if (statsEl) {
+      const bits = [];
+      if (meta.view_count) bits.push(`${Number(meta.view_count).toLocaleString()} views`);
+      if (meta.like_count) bits.push(`${Number(meta.like_count).toLocaleString()} likes`);
+      if (meta.upload_date && String(meta.upload_date).length === 8) {
+        const d = meta.upload_date;
+        bits.push(`Uploaded ${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`);
+      }
+      statsEl.textContent = bits.join("  \u00b7  ");
+    }
+    // Description (plain text, preserve newlines)
+    if (descEl) {
+      descEl.textContent = (meta.description || "").trim()
+                         || "(No description.)";
+    }
+    // Comments — top N by likes
+    const comments = Array.isArray(meta.comments) ? meta.comments : [];
+    if (countEl) {
+      countEl.textContent = comments.length
+        ? `${comments.length} top comment${comments.length === 1 ? "" : "s"}`
+        : "No comments archived";
+    }
+    if (commentsEl) {
+      commentsEl.innerHTML = "";
+      const frag = document.createDocumentFragment();
+      for (const c of comments) {
+        const row = document.createElement("div");
+        row.className = "watch-comment";
+        const author = document.createElement("span");
+        author.className = "watch-comment-author";
+        author.textContent = c.author || "(anon)";
+        const likes = document.createElement("span");
+        likes.className = "watch-comment-likes";
+        if (c.likes) likes.textContent = `${Number(c.likes).toLocaleString()} \u25B2`;
+        const head = document.createElement("div");
+        head.className = "watch-comment-head";
+        head.append(author, likes);
+        const body = document.createElement("div");
+        body.className = "watch-comment-body";
+        body.textContent = c.text || "";
+        row.append(head, body);
+        frag.appendChild(row);
+      }
+      commentsEl.appendChild(frag);
+    }
+  }
+
+  // Expand/collapse toggle for the metadata drawer. Wired once on boot —
+  // survives across Watch-view renders.
+  function _initWatchMetaDrawerToggle() {
+    const head   = document.getElementById("watch-meta-head");
+    const body   = document.getElementById("watch-meta-body");
+    const arrow  = document.getElementById("watch-meta-arrow");
+    const drawer = document.getElementById("watch-meta-drawer");
+    if (!head || !body || !arrow || !drawer) return;
+    // Start collapsed — transcript should be the dominant surface.
+    drawer.classList.add("collapsed");
+    body.style.display = "none";
+    head.addEventListener("click", () => {
+      const collapsed = drawer.classList.toggle("collapsed");
+      body.style.display = collapsed ? "none" : "";
+      arrow.innerHTML = collapsed ? "\u25B8" : "\u25BE";
+    });
+  }
+  // Fire once when logs.js loads
+  if (document.readyState !== "loading") _initWatchMetaDrawerToggle();
+  else document.addEventListener("DOMContentLoaded", _initWatchMetaDrawerToggle);
+
+  async function _loadVideoSource(video, vEl, ph) {
+    if (!vEl) return;
+    const fp = video.filepath || "";
+    const api = window.pywebview?.api;
+    let url = null;
+    let errorDetail = "";
+    if (fp && api?.browse_video_url) {
+      try {
+        const r = await api.browse_video_url(fp);
+        if (r?.ok && r.url) url = r.url;
+        else if (r && !r.ok) errorDetail = r.error || "unknown error";
+      } catch (e) { errorDetail = String(e); }
+    } else if (!fp) {
+      errorDetail = "No video selected";
+    }
+    if (url) {
+      vEl.src = url;
+      vEl.style.display = "";
+      if (ph) ph.style.display = "none";
+      // Volume: default 20% (matches OLD YTArchiver). Persists across
+      // video switches via localStorage so the user's slider adjustment
+      // survives — re-applied on every new video load so the HTMLMediaElement
+      // doesn't reset to 100% on src change. Saves back on volume-change.
+      _applyPersistedVolume(vEl);
+      // Try autoplay (user has already clicked in the app, so this is allowed)
+      vEl.play().catch(() => { /* user can click play */ });
+    } else {
+      // No playback possible — show placeholder with actionable error.
+      // Scott reported clicking a "(1)" duplicate that had a stale DB
+      // entry (file missing from disk) — the old placeholder just said
+      // "Select a video to play" which was misleading when a video IS
+      // selected but the file is gone. Now it explains.
+      vEl.src = "";
+      vEl.style.display = "none";
+      if (ph) {
+        ph.style.display = "";
+        if (errorDetail && errorDetail !== "unknown error") {
+          const label = ph.querySelector(".placeholder-label") || ph;
+          // Escape minimally for safety since `fp` could contain
+          // anything; we only show the last path segment.
+          const leaf = fp ? fp.split(/[\\/]/).pop() : "";
+          label.innerHTML =
+            `<div style="font-size:13px;color:var(--c-log-red);margin-bottom:4px;">` +
+            `\u26a0 ${errorDetail}</div>` +
+            (leaf
+              ? `<div style="font-size:11px;color:var(--c-dim);">${leaf}</div>`
+              : "") +
+            `<div style="font-size:11px;color:var(--c-dim);margin-top:6px;">` +
+            `The index entry may be stale \u2014 try Rescan archive.</div>`;
+        }
+      }
+    }
+  }
+
+  // Read the saved volume (fallback to 0.2 = 20%) and apply it to the
+  // video element. Also wires a one-time `volumechange` listener so the
+  // user's slider moves get persisted — subsequent videos start at the
+  // last value, not 20% again. A flag on the element prevents
+  // double-wiring across re-binds.
+  function _applyPersistedVolume(vEl) {
+    let vol = 0.2;
+    try {
+      const saved = localStorage.getItem("ytarchiver_watch_volume");
+      if (saved !== null) {
+        const n = parseFloat(saved);
+        if (Number.isFinite(n) && n >= 0 && n <= 1) vol = n;
+      }
+    } catch (e) { /* localStorage unavailable */ }
+    try { vEl.volume = vol; } catch (e) { /* noop */ }
+    if (!vEl.dataset.volHooked) {
+      vEl.dataset.volHooked = "1";
+      vEl.addEventListener("volumechange", () => {
+        try { localStorage.setItem("ytarchiver_watch_volume", String(vEl.volume)); }
+        catch (e) { /* noop */ }
+      });
+    }
+  }
+
+  function _seekTo(vEl, seconds) {
+    if (!vEl || !vEl.duration) return;
+    try {
+      vEl.currentTime = Math.max(0, Number(seconds) || 0);
+      vEl.play().catch(() => {});
+    } catch { /* noop */ }
+  }
+
+  // ── Karaoke: bind a single timeupdate handler per video load ──
+
+  let _karaokeHandler = null;
+  function _unbindKaraoke(vEl) {
+    if (vEl && _karaokeHandler) {
+      vEl.removeEventListener("timeupdate", _karaokeHandler);
+    }
+    _karaokeHandler = null;
+  }
+
+  function _bindKaraoke(vEl, trWrap, segEls) {
+    _unbindKaraoke(vEl);
+    if (!vEl || !segEls.length) return;
+    let lastSegIdx = -1;
+    let lastWordEl = null;
+
+    _karaokeHandler = () => {
+      const t = vEl.currentTime;
+      if (t == null) return;
+      // Binary-search segments for the one containing t
+      const idx = _findSegIdx(segEls, t);
+      if (idx !== lastSegIdx) {
+        if (lastSegIdx >= 0 && segEls[lastSegIdx]) {
+          segEls[lastSegIdx].classList.remove("active");
+        }
+        if (idx >= 0 && segEls[idx]) {
+          segEls[idx].classList.add("active");
+          // Auto-scroll transcript if toggle is on
+          const follow = document.getElementById("watch-autofollow");
+          if (follow?.checked && trWrap) {
+            segEls[idx].scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }
+        lastSegIdx = idx;
+      }
+      // Word highlight within the active segment
+      if (idx >= 0 && segEls[idx]) {
+        const seg = segEls[idx];
+        const words = seg.querySelectorAll(".word");
+        let newWordEl = null;
+        for (const w of words) {
+          const s = parseFloat(w.dataset.s || "0");
+          const e = parseFloat(w.dataset.e || "0");
+          if (s <= t && t <= e) {
+            newWordEl = w;
+            break;
+          }
+          if (s > t) break;
+        }
+        if (newWordEl !== lastWordEl) {
+          if (lastWordEl) lastWordEl.classList.remove("active");
+          if (newWordEl) newWordEl.classList.add("active");
+          lastWordEl = newWordEl;
+        }
+      }
+    };
+    vEl.addEventListener("timeupdate", _karaokeHandler);
+  }
+
+  function _findSegIdx(segEls, t) {
+    // Binary search segments by (s, e) bounds
+    let lo = 0, hi = segEls.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const el = segEls[mid];
+      const s = parseFloat(el.dataset.s || "0");
+      const e = parseFloat(el.dataset.e || "0");
+      if (t < s) hi = mid - 1;
+      else if (t > e) lo = mid + 1;
+      else return mid;
+    }
+    // Fall-through: return the last segment we've crossed (for gaps)
+    let best = -1;
+    for (let i = 0; i < segEls.length; i++) {
+      const s = parseFloat(segEls[i].dataset.s || "0");
+      if (s <= t) best = i;
+      else break;
+    }
+    return best;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function escapeAttr(s) {
+    return escapeHtml(s);
+  }
+})();

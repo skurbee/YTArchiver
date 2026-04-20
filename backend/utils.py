@@ -1,0 +1,270 @@
+"""
+Shared utility helpers — direct ports from YTArchiver.py.
+
+This module collects the small, stateless helpers the rest of the backend
+previously inlined or skipped. Each function name is kept close to the
+original's so `git blame`-style searches across both codebases still work.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import time
+import unicodedata
+from typing import Optional
+
+
+# ── Single source of truth for year/month folder naming ───────────────
+# OLD YTArchiver's sync template writes channels into `{year}/{MM Month}/`
+# subfolders. All three of reorg/metadata/transcribe need to round-trip
+# against those same folder names, so they share this one dict.
+MONTH_FOLDERS = {
+    1:  "01 January",
+    2:  "02 February",
+    3:  "03 March",
+    4:  "04 April",
+    5:  "05 May",
+    6:  "06 June",
+    7:  "07 July",
+    8:  "08 August",
+    9:  "09 September",
+    10: "10 October",
+    11: "11 November",
+    12: "12 December",
+}
+
+
+# ── Format helpers (YTArchiver.py:2815 / 9299 / 9308) ──────────────────
+
+def format_bytes(n: int, dash_if_zero: bool = True) -> str:
+    """Pretty-print a byte count. 0 → '\u2014' when dash_if_zero."""
+    n = int(n or 0)
+    if n <= 0 and dash_if_zero:
+        return "\u2014"
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    i = 0
+    v = float(n)
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(v)} {units[i]}"
+    return f"{v:.{1 if i >= 2 else 0}f} {units[i]}"
+
+
+def format_duration_hms(secs: float) -> str:
+    """Format seconds as `H:MM:SS` or `MM:SS` (when under 1 hour)."""
+    try:
+        s = int(float(secs or 0))
+    except (TypeError, ValueError):
+        return "0:00"
+    if s < 0:
+        s = 0
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_enc_size(mb: float) -> str:
+    """Format a megabyte count for encode progress display (e.g. '1.23 GB')."""
+    try:
+        mb = float(mb)
+    except (TypeError, ValueError):
+        return "\u2014"
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
+
+
+def fmt_time_ago(ts: float) -> str:
+    """Human-friendly 'N min ago' style for Recent tab. ts is Unix epoch."""
+    try:
+        age = max(0.0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return ""
+    if age < 60:    return "just now"
+    if age < 3600:  return f"{int(age / 60)} min ago"
+    if age < 86400: return f"{int(age / 3600)} h ago"
+    if age < 86400 * 30: return f"{int(age / 86400)} d ago"
+    if age < 86400 * 365: return f"{int(age / 2592000)} mo ago"
+    return f"{int(age / 31536000)} yr ago"
+
+
+# ── Unicode title normalization (YTArchiver.py:7765) ───────────────────
+
+_NORM_ASCII_RE = re.compile(r'[^A-Za-z0-9]+')
+
+
+def norm_ascii(text: str) -> str:
+    """Return an ASCII-only, lower-case, punctuation-stripped form for matching.
+
+    Handles NFC/NFD Unicode forms so titles with combining marks (e.g.
+    caf\u00e9) still match titles written as `cafe`. Used for fuzzy title
+    matching in the file-date fixer + recent-file recovery.
+    """
+    if not text:
+        return ""
+    nfc = unicodedata.normalize("NFC", text)
+    nfkd = unicodedata.normalize("NFKD", nfc)
+    ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
+    return _NORM_ASCII_RE.sub(" ", ascii_only).strip().lower()
+
+
+# ── Disk pre-flight checks (YTArchiver.py:2314 / 2332) ─────────────────
+
+def check_directory_writable(path: str) -> bool:
+    """Can we create + delete a probe file inside `path`? True if yes."""
+    if not path:
+        return False
+    try:
+        if not os.path.isdir(path):
+            return False
+        probe = os.path.join(path, f".yta_probe_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        try: os.remove(probe)
+        except OSError: pass
+        return True
+    except OSError:
+        return False
+
+
+def check_disk_space(path: str, required_bytes: int) -> bool:
+    """True if `path`'s filesystem has at least `required_bytes` free."""
+    if not path or required_bytes <= 0:
+        return True
+    try:
+        free = shutil.disk_usage(path).free
+        return free >= int(required_bytes)
+    except (OSError, ValueError):
+        return True  # fail open — don't block on probe errors
+
+
+# ── Subprocess cleanup (YTArchiver.py:2243 / 9214 / 9262) ──────────────
+
+def kill_process(proc: Optional[subprocess.Popen], timeout: float = 2.0) -> None:
+    """Terminate then kill a child process, swallowing errors.
+
+    Sends SIGTERM, waits up to `timeout`, then SIGKILL. No-op if proc is
+    None or already exited.
+    """
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=float(timeout))
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# ── ffprobe: is the file already AV1/NVENC-compressed? ────────────────
+# (YTArchiver.py:9336 _ffprobe_is_compressed)
+
+def ffprobe_is_compressed(filepath: str) -> bool:
+    """Heuristic: True if the video was produced by this app's compress
+    pipeline. We stamp compressed files with `encoder=ytarchive_nvenc` in
+    the format metadata; ffprobe reads that tag.
+    """
+    if not filepath or not os.path.isfile(filepath):
+        return False
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format_tags=encoder",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             filepath],
+            capture_output=True, text=True, timeout=10,
+            creationflags=(0x08000000 if os.name == "nt" else 0),
+        )
+        tag = (r.stdout or "").strip().lower()
+        return "ytarchive_nvenc" in tag or "av1_nvenc" in tag
+    except Exception:
+        return False
+
+
+# ── Channel helpers ────────────────────────────────────────────────────
+
+def channel_has_transcripts(channel_folder: str) -> bool:
+    """True if any `.jsonl` sidecar exists anywhere in the folder tree."""
+    if not channel_folder or not os.path.isdir(channel_folder):
+        return False
+    for dp, _dns, fns in os.walk(channel_folder):
+        for fn in fns:
+            if fn.lower().endswith(".jsonl"):
+                return True
+    return False
+
+
+# ── Recent-file locator (YTArchiver.py:32900 / 32946 / 32966) ──────────
+
+_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
+
+
+def try_find_by_title(channel_folder: str, title: str,
+                      video_id: str = "") -> Optional[str]:
+    """Locate a file under `channel_folder` whose stem matches `title`
+    (case-insensitive, ignoring punctuation and year/month folder splits).
+
+    Tries an exact-stem match first, then a `[videoId]` token match, then
+    an ASCII-fuzzy match on the title. Returns the first hit or None.
+    """
+    if not channel_folder or not os.path.isdir(channel_folder):
+        return None
+    norm_title = norm_ascii(title)
+    vid_norm = (video_id or "").strip().lower()
+    first_ascii_match: Optional[str] = None
+    for dp, _dns, fns in os.walk(channel_folder):
+        for fn in fns:
+            low = fn.lower()
+            if not low.endswith(_VIDEO_EXTS):
+                continue
+            stem = os.path.splitext(fn)[0]
+            # 1. Exact stem match (after strip)
+            if stem.strip() == (title or "").strip():
+                return os.path.join(dp, fn)
+            # 2. Bracketed video-id match
+            if vid_norm and f"[{vid_norm}]" in low:
+                return os.path.join(dp, fn)
+            # 3. Fuzzy ASCII stem
+            if norm_title and not first_ascii_match:
+                if norm_ascii(stem) == norm_title:
+                    first_ascii_match = os.path.join(dp, fn)
+    return first_ascii_match
+
+
+def try_locate_moved_file(original_path: str, title: str,
+                          channel_folder: str,
+                          video_id: str = "") -> Optional[str]:
+    """Given a stored `original_path` that no longer resolves, try to find
+    the moved/renamed file. Checks the channel folder via `try_find_by_title`.
+    Returns the recovered absolute path or None.
+    """
+    if original_path and os.path.isfile(original_path):
+        return original_path
+    if channel_folder and os.path.isdir(channel_folder):
+        found = try_find_by_title(channel_folder, title, video_id)
+        if found:
+            return found
+    return None

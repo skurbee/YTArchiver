@@ -1,0 +1,5198 @@
+{
+ "activity": [
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "3:00pm, Apr 10",
+    "channel": "Alpha Tech Reviews",
+    "primary": "3 fetched",
+    "secondary": "3575 skipped",
+    "errors": "1 errors",
+    "took": "took 1m 7s",
+    "row_tag": "hist_pink"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "3:07pm, Apr 10",
+    "channel": "Beta Gaming",
+    "primary": "1 fetched",
+    "secondary": "1591 skipped",
+    "errors": "0 errors",
+    "took": "took 6s",
+    "row_tag": "hist_pink"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "4:14pm, Apr 10",
+    "channel": "Comet Labs",
+    "primary": "5 fetched",
+    "secondary": "3365 skipped",
+    "errors": "1 errors",
+    "took": "took 48s",
+    "row_tag": "hist_pink"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "5:28pm, Apr 10",
+    "channel": "Echo Podcast",
+    "primary": "8 fetched",
+    "secondary": "3016 skipped",
+    "errors": "4 errors",
+    "took": "took 1m 10s",
+    "row_tag": "hist_pink"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "5:35pm, Apr 10",
+    "channel": "Fable Documentary",
+    "primary": "2 refreshed",
+    "secondary": "2661 skipped",
+    "errors": "0 errors",
+    "took": "took 24s",
+    "row_tag": "hist_pink"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "6:42pm, Apr 10",
+    "channel": "Global Music Weekly",
+    "primary": "5 fetched",
+    "secondary": "4963 skipped",
+    "errors": "0 errors",
+    "took": "took 3s",
+    "row_tag": "hist_pink"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "6:49pm, Apr 10",
+    "channel": "History Hour",
+    "primary": "2 refreshed",
+    "secondary": "4647 skipped",
+    "errors": "0 errors",
+    "took": "took 1m 24s",
+    "row_tag": "hist_pink"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "7:56pm, Apr 10",
+    "channel": "Indoor Gardening",
+    "primary": "5 fetched",
+    "secondary": "1818 skipped",
+    "errors": "0 errors",
+    "took": "took 38s",
+    "row_tag": "hist_pink"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Metdta",
+    "time_date": "7:03pm, Apr 10",
+    "channel": "Jumpstart Science",
+    "primary": "5 fetched",
+    "secondary": "1428 skipped",
+    "errors": "1 errors",
+    "took": "took 34s",
+    "row_tag": "hist_pink"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Trnscr",
+    "time_date": "5:02pm, Apr 10",
+    "channel": "Comet Labs",
+    "primary": "14 transcribed",
+    "secondary": "",
+    "errors": "0 errors",
+    "took": "took 6m 45s",
+    "row_tag": "hist_blue"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Auto",
+    "time_date": "5:30pm, Apr 10",
+    "channel": "Echo Podcast",
+    "primary": "7 downloaded",
+    "secondary": "",
+    "errors": "0 errors",
+    "took": "took 4m 20s",
+    "row_tag": "hist_green"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Manual",
+    "time_date": "5:48pm, Apr 10",
+    "channel": "History Hour",
+    "primary": "2 downloaded",
+    "secondary": "",
+    "errors": "1 errors",
+    "took": "took 1m 8s",
+    "row_tag": "hist_green"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "ReDwnl",
+    "time_date": "6:00pm, Apr 10",
+    "channel": "Jumpstart Science",
+    "primary": "3 replaced",
+    "secondary": "",
+    "errors": "0 errors",
+    "took": "took 2m 10s",
+    "row_tag": "hist_redwnl"
+   },
+   "alt": false
+  },
+  {
+   "cells": {
+    "kind": "Cmprss",
+    "time_date": "6:12pm, Apr 10",
+    "channel": "Lima News 5",
+    "primary": "12 compressed",
+    "secondary": "",
+    "errors": "0 errors",
+    "took": "took 18m 4s",
+    "row_tag": "hist_compress"
+   },
+   "alt": true
+  },
+  {
+   "cells": {
+    "kind": "Reorg",
+    "time_date": "6:30pm, Apr 10",
+    "channel": "Novel Investigates",
+    "primary": "48 moved",
+    "secondary": "",
+    "errors": "0 errors",
+    "took": "took 12s",
+    "row_tag": "hist_reorg"
+   },
+   "alt": false
+  }
+ ],
+ "main": [
+  [
+   [
+    "=== Autorun: sync pass starting @ 3:12pm, Apr 10 ===\n",
+    "header"
+   ]
+  ],
+  [
+   [
+    "  13 channels queued, 6 workers, 1 GPU lane\n",
+    "summary"
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "720",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Bonus Content: Outtakes",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1566",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Bonus Content: Outtakes",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(9m 10s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 5sec, 32.1x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "722",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Interview: A Conversation",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1568",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Workshop Recording",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(6m 11s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 17sec, 43.8x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "724",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Season Finale Recap",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1570",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Creator Corner Ep. 47",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(5m 26s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 12sec, 33.7x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "726",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Mini-Series Part 1",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1572",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Lecture: Fundamentals",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(9m 40s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 14sec, 26.0x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "728",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Tech Made Simple",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1574",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Behind the Camera",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(11m 39s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 17sec, 31.6x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "730",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "The Morning Brief",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1576",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Weekly News Roundup",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(7m 35s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 19sec, 30.7x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "732",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Weekly News Roundup",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1578",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Field Notes from the Coast",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(6m 46s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 12sec, 25.7x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "734",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Community Spotlight",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1580",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Walk and Talk - Episode 3",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(4m 28s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 8sec, 38.3x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "736",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Weekly News Roundup",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1582",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Building a Better Inbox",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(10m 45s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 10sec, 39.7x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "738",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Live Q&A Session",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1584",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Sunday Long Form",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(11m 38s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 18sec, 26.3x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1601",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Season Finale Recap\", ",
+    "simpleline"
+   ],
+   [
+    "30%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "════════════════════════════════════════════════════════════════\n",
+    "update_sep"
+   ]
+  ],
+  [
+   [
+    "─── End of pass: 23 fetched · 11,065 skipped · 2 errors ───\n",
+    "header"
+   ]
+  ],
+  [
+   [
+    "Elapsed: ",
+    "dim"
+   ],
+   [
+    "4m 18s",
+    "summary"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "REDOWNLOAD MODE: ",
+    "simplestatus_redwnl"
+   ],
+   [
+    "FilmFan · 3 items\n",
+    "dl_white"
+   ]
+  ],
+  [
+   [
+    "[",
+    "redwnl_bracket"
+   ],
+   [
+    "1",
+    "dl_white"
+   ],
+   [
+    "/",
+    "redwnl_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "redwnl_bracket"
+   ],
+   [
+    "Redownloading ",
+    "simpleline_redwnl"
+   ],
+   [
+    "\"Creator Corner Ep. 47\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "redwnl_bracket"
+   ],
+   [
+    "2",
+    "dl_white"
+   ],
+   [
+    "/",
+    "redwnl_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "redwnl_bracket"
+   ],
+   [
+    "Redownloading ",
+    "simpleline_redwnl"
+   ],
+   [
+    "\"Interview: A Conversation\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "redwnl_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "/",
+    "redwnl_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "redwnl_bracket"
+   ],
+   [
+    "Redownloading ",
+    "simpleline_redwnl"
+   ],
+   [
+    "\"Interview: A Conversation\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "COMPRESS MODE: ",
+    "simplestatus_compress"
+   ],
+   [
+    "GameReviews · 12 items\n",
+    "dl_white"
+   ]
+  ],
+  [
+   [
+    "[",
+    "compress_bracket"
+   ],
+   [
+    "1",
+    "dl_white"
+   ],
+   [
+    "/",
+    "compress_bracket"
+   ],
+   [
+    "12",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "compress_bracket"
+   ],
+   [
+    "Encoding ",
+    "simpleline_compress"
+   ],
+   [
+    "\"Live Q&A Session\", ",
+    "encode_prefix"
+   ],
+   [
+    "20%",
+    "encode_pct"
+   ],
+   [
+    "...",
+    "encode_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "compress_bracket"
+   ],
+   [
+    "2",
+    "dl_white"
+   ],
+   [
+    "/",
+    "compress_bracket"
+   ],
+   [
+    "12",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "compress_bracket"
+   ],
+   [
+    "Encoding ",
+    "simpleline_compress"
+   ],
+   [
+    "\"Mini-Series Part 1\", ",
+    "encode_prefix"
+   ],
+   [
+    "40%",
+    "encode_pct"
+   ],
+   [
+    "...",
+    "encode_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "compress_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "/",
+    "compress_bracket"
+   ],
+   [
+    "12",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "compress_bracket"
+   ],
+   [
+    "Encoding ",
+    "simpleline_compress"
+   ],
+   [
+    "\"Unboxing the Latest\", ",
+    "encode_prefix"
+   ],
+   [
+    "60%",
+    "encode_pct"
+   ],
+   [
+    "...",
+    "encode_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "compress_bracket"
+   ],
+   [
+    "4",
+    "dl_white"
+   ],
+   [
+    "/",
+    "compress_bracket"
+   ],
+   [
+    "12",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "compress_bracket"
+   ],
+   [
+    "Encoding ",
+    "simpleline_compress"
+   ],
+   [
+    "\"Weekly News Roundup\", ",
+    "encode_prefix"
+   ],
+   [
+    "80%",
+    "encode_pct"
+   ],
+   [
+    "...",
+    "encode_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "REORG MODE: ",
+    "simplestatus_reorg"
+   ],
+   [
+    "TravelVlogs · 48 items\n",
+    "dl_white"
+   ]
+  ],
+  [
+   [
+    "[",
+    "reorg_bracket"
+   ],
+   [
+    "1",
+    "dl_white"
+   ],
+   [
+    "/",
+    "reorg_bracket"
+   ],
+   [
+    "48",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "reorg_bracket"
+   ],
+   [
+    "Moving ",
+    "simpleline_reorg"
+   ],
+   [
+    "\"Tech Made Simple\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "reorg_bracket"
+   ],
+   [
+    "2",
+    "dl_white"
+   ],
+   [
+    "/",
+    "reorg_bracket"
+   ],
+   [
+    "48",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "reorg_bracket"
+   ],
+   [
+    "Moving ",
+    "simpleline_reorg"
+   ],
+   [
+    "\"Tech Made Simple\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "reorg_bracket"
+   ],
+   [
+    "3",
+    "dl_white"
+   ],
+   [
+    "/",
+    "reorg_bracket"
+   ],
+   [
+    "48",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "reorg_bracket"
+   ],
+   [
+    "Moving ",
+    "simpleline_reorg"
+   ],
+   [
+    "\"Product Teardown: Model X\"",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "Error: ",
+    "red"
+   ],
+   [
+    "network timeout retrieving metadata for channel 'FilmFan' — retrying in 30s\n",
+    "red"
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "UPDATE AVAILABLE: ",
+    "update_head"
+   ],
+   [
+    "v42.3 — see Releases\n",
+    "update_sep"
+   ]
+  ],
+  [
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[Live] ",
+    "livestream"
+   ],
+   [
+    "Upcoming stream detected: NewsLive — \"Evening Briefing\" starts in 12 min\n",
+    "dl_white"
+   ]
+  ],
+  [
+   [
+    "[Skip] ",
+    "filterskip"
+   ],
+   [
+    "short video filtered (< 60s): \"ScienceWeekly short #4928\"\n",
+    "filterskip_dim"
+   ]
+  ]
+ ],
+ "stream": [
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "800",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Lecture: Fundamentals",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1701",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Season Finale Recap\", ",
+    "simpleline"
+   ],
+   [
+    "81%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1702",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Late Night Ramble",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(7m 51s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 10sec, 32.1x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "903",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"The Morning Brief\", ",
+    "simpleline"
+   ],
+   [
+    "77%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "804",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Bookshelf Review",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1705",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Workshop Recording\", ",
+    "simpleline"
+   ],
+   [
+    "22%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1706",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Deep Dive: Climate Models",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(8m 39s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 5sec, 26.6x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "907",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Sunday Long Form\", ",
+    "simpleline"
+   ],
+   [
+    "70%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "808",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Lecture: Fundamentals",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1709",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"The Art of Understanding\", ",
+    "simpleline"
+   ],
+   [
+    "91%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1710",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Late Night Ramble",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(8m 57s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 6sec, 35.0x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "911",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Kitchen Experiments\", ",
+    "simpleline"
+   ],
+   [
+    "16%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "812",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Lecture: Fundamentals",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1713",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Quick Take: Industry News\", ",
+    "simpleline"
+   ],
+   [
+    "34%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1714",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Season Finale Recap",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(2m 14s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 10sec, 30.6x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "915",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Bookshelf Review\", ",
+    "simpleline"
+   ],
+   [
+    "58%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "816",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "The Art of Understanding",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1717",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Community Spotlight\", ",
+    "simpleline"
+   ],
+   [
+    "30%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1718",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Walk and Talk - Episode 3",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(4m 32s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 23sec, 32.8x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "919",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Mini-Series Part 2\", ",
+    "simpleline"
+   ],
+   [
+    "74%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "820",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Tech Made Simple",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1721",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Unboxing the Latest\", ",
+    "simpleline"
+   ],
+   [
+    "73%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1722",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Deep Dive: Climate Models",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(12m 37s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 11sec, 42.2x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "923",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Community Spotlight\", ",
+    "simpleline"
+   ],
+   [
+    "93%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "824",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "The Essay Pilot",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1725",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Building a Better Inbox\", ",
+    "simpleline"
+   ],
+   [
+    "54%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1726",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Walk and Talk - Episode 3",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(5m 15s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 16sec, 26.9x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "927",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Building a Better Inbox\", ",
+    "simpleline"
+   ],
+   [
+    "79%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "828",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Workshop Recording",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1729",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Mini-Series Part 2\", ",
+    "simpleline"
+   ],
+   [
+    "72%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1730",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Live Q&A Session",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(11m 12s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 20sec, 41.0x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "931",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Building a Better Inbox\", ",
+    "simpleline"
+   ],
+   [
+    "91%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "832",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Interview: A Conversation",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1733",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Kitchen Experiments\", ",
+    "simpleline"
+   ],
+   [
+    "67%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1734",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Hot Take Tuesday",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(11m 46s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 9sec, 27.5x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "935",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Tabletop Tactics Ep. 12\", ",
+    "simpleline"
+   ],
+   [
+    "76%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "836",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Mini-Series Part 2",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1737",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Unboxing the Latest\", ",
+    "simpleline"
+   ],
+   [
+    "97%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1738",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "The Essay Pilot",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(4m 25s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 11sec, 35.1x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "939",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Field Notes from the Coast\", ",
+    "simpleline"
+   ],
+   [
+    "61%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "840",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Walk and Talk - Episode 3",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1741",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Deep Dive: Climate Models\", ",
+    "simpleline"
+   ],
+   [
+    "20%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1742",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Late Night Ramble",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(3m 33s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 7sec, 25.5x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "943",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Field Notes from the Coast\", ",
+    "simpleline"
+   ],
+   [
+    "35%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "844",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Community Spotlight",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1745",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Market Report - Q3\", ",
+    "simpleline"
+   ],
+   [
+    "18%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1746",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Market Report - Q3",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(5m 59s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 6sec, 39.1x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "947",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Behind the Camera\", ",
+    "simpleline"
+   ],
+   [
+    "63%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "848",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Live Q&A Session",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1749",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Walk and Talk - Episode 3\", ",
+    "simpleline"
+   ],
+   [
+    "64%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1750",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Late Night Ramble",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(4m 30s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 7sec, 33.2x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "951",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Behind the Camera\", ",
+    "simpleline"
+   ],
+   [
+    "72%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "852",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "Unboxing the Latest",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1753",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Unboxing the Latest\", ",
+    "simpleline"
+   ],
+   [
+    "51%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1754",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "The Art of Understanding",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(11m 47s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 15sec, 30.3x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "955",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Live Q&A Session\", ",
+    "simpleline"
+   ],
+   [
+    "54%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "meta_bracket"
+   ],
+   [
+    "856",
+    "dl_white"
+   ],
+   [
+    "/",
+    "meta_bracket"
+   ],
+   [
+    "11088",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "meta_bracket"
+   ],
+   [
+    "Metadata ",
+    "simpleline_pink"
+   ],
+   [
+    "- ",
+    "simpleline"
+   ],
+   [
+    "The Essay Pilot",
+    "simpleline"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1757",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Transcribing ",
+    "simpleline_blue"
+   ],
+   [
+    "\"Community Spotlight\", ",
+    "simpleline"
+   ],
+   [
+    "69%",
+    "whisper_pct"
+   ],
+   [
+    "...",
+    "whisper_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "trans_bracket"
+   ],
+   [
+    "1758",
+    "dl_white"
+   ],
+   [
+    "/",
+    "trans_bracket"
+   ],
+   [
+    "2523",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "trans_bracket"
+   ],
+   [
+    "Unboxing the Latest",
+    "simpleline"
+   ],
+   [
+    " — ",
+    "simpleline"
+   ],
+   [
+    "(3m 16s) ",
+    "simpleline"
+   ],
+   [
+    "— ",
+    "simpleline"
+   ],
+   [
+    "done ",
+    "simpleline_blue"
+   ],
+   [
+    "(Whisper, took 5sec, 38.3x realtime)",
+    "simpleline_blue"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ],
+  [
+   [
+    "[",
+    "sync_bracket"
+   ],
+   [
+    "959",
+    "dl_white"
+   ],
+   [
+    "/",
+    "sync_bracket"
+   ],
+   [
+    "4000",
+    "dl_white"
+   ],
+   [
+    "] ",
+    "sync_bracket"
+   ],
+   [
+    "Downloading ",
+    "simpleline_green"
+   ],
+   [
+    "\"Sunday Long Form\", ",
+    "simpleline"
+   ],
+   [
+    "34%",
+    "dlprogress_pct"
+   ],
+   [
+    "...",
+    "trans_dots"
+   ],
+   [
+    "\n",
+    null
+   ]
+  ]
+ ],
+ "subs": [
+  {
+   "folder": "Alpha Tech Reviews",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "420",
+   "size": "55.0 GB"
+  },
+  {
+   "folder": "Beta Gaming",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "910",
+   "size": "64.0 GB"
+  },
+  {
+   "folder": "Comet Labs",
+   "res": "best",
+   "min": "3m",
+   "max": "—",
+   "compress": "✓",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "110",
+   "size": "16.0 GB"
+  },
+  {
+   "folder": "Daily Explainer",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "500",
+   "size": "12.5 GB"
+  },
+  {
+   "folder": "Echo Podcast",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "500",
+   "size": "14.0 GB"
+  },
+  {
+   "folder": "Fable Documentary",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "80",
+   "size": "38.0 GB"
+  },
+  {
+   "folder": "Global Music Weekly",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "165",
+   "size": "50.0 GB"
+  },
+  {
+   "folder": "History Hour",
+   "res": "480p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "1,390",
+   "size": "25.0 GB"
+  },
+  {
+   "folder": "Indoor Gardening",
+   "res": "720p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "75",
+   "size": "6.0 GB"
+  },
+  {
+   "folder": "Jumpstart Science",
+   "res": "best",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "40",
+   "size": "9.0 GB"
+  },
+  {
+   "folder": "Kilo Retro Tech",
+   "res": "720p",
+   "min": "2m",
+   "max": "180m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "130",
+   "size": "59.0 GB"
+  },
+  {
+   "folder": "Lima News 5",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "140",
+   "size": "19.0 GB"
+  },
+  {
+   "folder": "Mike Bodycam",
+   "res": "720p",
+   "min": "—",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "395",
+   "size": "149.0 GB"
+  },
+  {
+   "folder": "Novel Investigates",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "395",
+   "size": "31.8 GB"
+  },
+  {
+   "folder": "Orbit Cold",
+   "res": "1080p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "505",
+   "size": "90.0 GB"
+  },
+  {
+   "folder": "Paper Company",
+   "res": "720p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "470",
+   "size": "28.0 GB"
+  },
+  {
+   "folder": "Quill Film Crew",
+   "res": "480p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "1,295",
+   "size": "68.0 GB"
+  },
+  {
+   "folder": "Radio Politics",
+   "res": "144p",
+   "min": "3m",
+   "max": "40m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "2,800",
+   "size": "30.0 GB"
+  },
+  {
+   "folder": "Sierra Decoder",
+   "res": "1080p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "55",
+   "size": "10.8 GB"
+  },
+  {
+   "folder": "Tango Detective",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "140",
+   "size": "45.8 GB"
+  },
+  {
+   "folder": "Uniform Perks",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "80",
+   "size": "42.0 GB"
+  },
+  {
+   "folder": "Victor Podcast",
+   "res": "1080p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "45",
+   "size": "21.9 GB"
+  },
+  {
+   "folder": "Whiskey MD",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "150",
+   "size": "27.0 GB"
+  },
+  {
+   "folder": "Xenon reads",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "215",
+   "size": "56.0 GB"
+  },
+  {
+   "folder": "Yankee Dashcam",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "600",
+   "size": "85.0 GB"
+  },
+  {
+   "folder": "Zulu Crime Story",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "85",
+   "size": "10.0 GB"
+  },
+  {
+   "folder": "Arctic Explorers",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "260",
+   "size": "48.0 GB"
+  },
+  {
+   "folder": "Bayou Songbook",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "115",
+   "size": "57.0 GB"
+  },
+  {
+   "folder": "Coastal Watch",
+   "res": "best",
+   "min": "—",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "165",
+   "size": "10.0 GB"
+  },
+  {
+   "folder": "Digital Frame",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "40",
+   "size": "21.0 GB"
+  },
+  {
+   "folder": "Element Review",
+   "res": "best",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "35",
+   "size": "12.0 GB"
+  },
+  {
+   "folder": "Fresh Work",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "50",
+   "size": "2.8 GB"
+  },
+  {
+   "folder": "Green Info",
+   "res": "1080p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "450",
+   "size": "74.5 GB"
+  },
+  {
+   "folder": "Hyper Discussion",
+   "res": "240p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "2,800",
+   "size": "110.0 GB"
+  },
+  {
+   "folder": "Indy Finance",
+   "res": "1080p",
+   "min": "—",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "105",
+   "size": "13.4 GB"
+  },
+  {
+   "folder": "Jade Horsing",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "60",
+   "size": "5.6 GB"
+  },
+  {
+   "folder": "Kiwi Econ",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "250",
+   "size": "15.3 GB"
+  },
+  {
+   "folder": "Loop Archive",
+   "res": "1080p",
+   "min": "—",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "43",
+   "size": "7.4 GB"
+  },
+  {
+   "folder": "Midnight Talkshow",
+   "res": "144p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "5,860",
+   "size": "70.0 GB"
+  },
+  {
+   "folder": "Nova Space Science",
+   "res": "480p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "635",
+   "size": "9.9 GB"
+  },
+  {
+   "folder": "Oak Weekly",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "690",
+   "size": "60.0 GB"
+  },
+  {
+   "folder": "Pine Reporting",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "205",
+   "size": "22.3 GB"
+  },
+  {
+   "folder": "Quant Legal",
+   "res": "360p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "630",
+   "size": "28.0 GB"
+  },
+  {
+   "folder": "Rose Shorts",
+   "res": "best",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "10",
+   "size": "2.0 GB"
+  },
+  {
+   "folder": "Sable",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "45",
+   "size": "12.0 GB"
+  },
+  {
+   "folder": "Tangent Answers",
+   "res": "720p",
+   "min": "3m",
+   "max": "—",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "1,020",
+   "size": "58.0 GB"
+  },
+  {
+   "folder": "Ursa Tech",
+   "res": "480p",
+   "min": "3m",
+   "max": "60m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "815",
+   "size": "25.0 GB"
+  },
+  {
+   "folder": "Vertex Aviation",
+   "res": "480p",
+   "min": "3m",
+   "max": "50m",
+   "compress": "—",
+   "transcribe": "✓",
+   "metadata": "✓",
+   "last_sync": "1d ago",
+   "n_vids": "460",
+   "size": "26.0 GB"
+  }
+ ],
+ "subs_total": "Total: 1.7 TB",
+ "recent": [
+  {
+   "title": "Season Finale Recap",
+   "channel": "Alpha Tech Reviews",
+   "time": "4m ago",
+   "duration": "11:42",
+   "size": "60 MB"
+  },
+  {
+   "title": "The Art of Understanding",
+   "channel": "Beta Gaming",
+   "time": "16m ago",
+   "duration": "4:18",
+   "size": "35 MB"
+  },
+  {
+   "title": "Weekly News Roundup",
+   "channel": "Comet Labs",
+   "time": "33m ago",
+   "duration": "31:45",
+   "size": "16 MB"
+  },
+  {
+   "title": "Product Teardown: Model X",
+   "channel": "Daily Explainer",
+   "time": "55m ago",
+   "duration": "4:30",
+   "size": "46 MB"
+  },
+  {
+   "title": "Behind the Camera",
+   "channel": "Echo Podcast",
+   "time": "1h ago",
+   "duration": "13:59",
+   "size": "56 MB"
+  },
+  {
+   "title": "Building a Better Inbox",
+   "channel": "Fable Documentary",
+   "time": "1h ago",
+   "duration": "12:11",
+   "size": "43 MB"
+  },
+  {
+   "title": "Market Report - Q3",
+   "channel": "Global Music Weekly",
+   "time": "1h ago",
+   "duration": "19:15",
+   "size": "85 MB"
+  },
+  {
+   "title": "Tabletop Tactics Ep. 12",
+   "channel": "History Hour",
+   "time": "1h ago",
+   "duration": "2:34",
+   "size": "76 MB"
+  },
+  {
+   "title": "Kitchen Experiments",
+   "channel": "Indoor Gardening",
+   "time": "1h ago",
+   "duration": "38:43",
+   "size": "21 MB"
+  },
+  {
+   "title": "Field Notes from the Coast",
+   "channel": "Jumpstart Science",
+   "time": "1h ago",
+   "duration": "30:03",
+   "size": "46 MB"
+  },
+  {
+   "title": "Unboxing the Latest",
+   "channel": "Kilo Retro Tech",
+   "time": "1h ago",
+   "duration": "14:59",
+   "size": "53 MB"
+  },
+  {
+   "title": "Deep Dive: Climate Models",
+   "channel": "Lima News 5",
+   "time": "1h ago",
+   "duration": "25:28",
+   "size": "7 MB"
+  },
+  {
+   "title": "Live Q&A Session",
+   "channel": "Alpha Tech Reviews",
+   "time": "2h ago",
+   "duration": "2:09",
+   "size": "35 MB"
+  },
+  {
+   "title": "Quick Take: Industry News",
+   "channel": "Beta Gaming",
+   "time": "2h ago",
+   "duration": "44:19",
+   "size": "37 MB"
+  },
+  {
+   "title": "The Morning Brief",
+   "channel": "Comet Labs",
+   "time": "2h ago",
+   "duration": "18:29",
+   "size": "16 MB"
+  },
+  {
+   "title": "Creator Corner Ep. 47",
+   "channel": "Daily Explainer",
+   "time": "1h ago",
+   "duration": "41:05",
+   "size": "43 MB"
+  },
+  {
+   "title": "Road Trip Diaries",
+   "channel": "Echo Podcast",
+   "time": "2h ago",
+   "duration": "3:33",
+   "size": "10 MB"
+  },
+  {
+   "title": "Sunday Long Form",
+   "channel": "Fable Documentary",
+   "time": "2h ago",
+   "duration": "7:10",
+   "size": "6 MB"
+  },
+  {
+   "title": "Tech Made Simple",
+   "channel": "Global Music Weekly",
+   "time": "2h ago",
+   "duration": "12:47",
+   "size": "35 MB"
+  },
+  {
+   "title": "Walk and Talk - Episode 3",
+   "channel": "History Hour",
+   "time": "2h ago",
+   "duration": "9:41",
+   "size": "36 MB"
+  },
+  {
+   "title": "Interview: A Conversation",
+   "channel": "Indoor Gardening",
+   "time": "2h ago",
+   "duration": "16:04",
+   "size": "46 MB"
+  },
+  {
+   "title": "Bookshelf Review",
+   "channel": "Jumpstart Science",
+   "time": "2h ago",
+   "duration": "21:54",
+   "size": "19 MB"
+  },
+  {
+   "title": "The Essay Pilot",
+   "channel": "Kilo Retro Tech",
+   "time": "3h ago",
+   "duration": "28:42",
+   "size": "26 MB"
+  },
+  {
+   "title": "Late Night Ramble",
+   "channel": "Lima News 5",
+   "time": "3h ago",
+   "duration": "3:21",
+   "size": "11 MB"
+  },
+  {
+   "title": "Mini-Series Part 1",
+   "channel": "Alpha Tech Reviews",
+   "time": "3h ago",
+   "duration": "1:55",
+   "size": "50 MB"
+  },
+  {
+   "title": "Mini-Series Part 2",
+   "channel": "Beta Gaming",
+   "time": "3h ago",
+   "duration": "26:32",
+   "size": "10 MB"
+  },
+  {
+   "title": "Community Spotlight",
+   "channel": "Comet Labs",
+   "time": "3h ago",
+   "duration": "30:04",
+   "size": "78 MB"
+  },
+  {
+   "title": "Hot Take Tuesday",
+   "channel": "Daily Explainer",
+   "time": "3h ago",
+   "duration": "42:05",
+   "size": "25 MB"
+  },
+  {
+   "title": "Lecture: Fundamentals",
+   "channel": "Echo Podcast",
+   "time": "3h ago",
+   "duration": "40:38",
+   "size": "77 MB"
+  },
+  {
+   "title": "Workshop Recording",
+   "channel": "Fable Documentary",
+   "time": "3h ago",
+   "duration": "17:11",
+   "size": "9 MB"
+  },
+  {
+   "title": "Bonus Content: Outtakes",
+   "channel": "Global Music Weekly",
+   "time": "3h ago",
+   "duration": "8:51",
+   "size": "76 MB"
+  },
+  {
+   "title": "Afterthoughts and Q&A",
+   "channel": "History Hour",
+   "time": "3h ago",
+   "duration": "13:04",
+   "size": "74 MB"
+  },
+  {
+   "title": "Season Finale Recap",
+   "channel": "Indoor Gardening",
+   "time": "4h ago",
+   "duration": "31:37",
+   "size": "69 MB"
+  },
+  {
+   "title": "The Art of Understanding",
+   "channel": "Jumpstart Science",
+   "time": "3h ago",
+   "duration": "9:31",
+   "size": "14 MB"
+  },
+  {
+   "title": "Weekly News Roundup",
+   "channel": "Kilo Retro Tech",
+   "time": "4h ago",
+   "duration": "8:23",
+   "size": "25 MB"
+  },
+  {
+   "title": "Product Teardown: Model X",
+   "channel": "Lima News 5",
+   "time": "4h ago",
+   "duration": "6:35",
+   "size": "52 MB"
+  },
+  {
+   "title": "Behind the Camera",
+   "channel": "Alpha Tech Reviews",
+   "time": "4h ago",
+   "duration": "6:49",
+   "size": "23 MB"
+  },
+  {
+   "title": "Building a Better Inbox",
+   "channel": "Beta Gaming",
+   "time": "4h ago",
+   "duration": "34:26",
+   "size": "33 MB"
+  },
+  {
+   "title": "Market Report - Q3",
+   "channel": "Comet Labs",
+   "time": "4h ago",
+   "duration": "35:50",
+   "size": "81 MB"
+  },
+  {
+   "title": "Tabletop Tactics Ep. 12",
+   "channel": "Daily Explainer",
+   "time": "4h ago",
+   "duration": "30:11",
+   "size": "22 MB"
+  },
+  {
+   "title": "Kitchen Experiments",
+   "channel": "Echo Podcast",
+   "time": "4h ago",
+   "duration": "8:36",
+   "size": "62 MB"
+  },
+  {
+   "title": "Field Notes from the Coast",
+   "channel": "Fable Documentary",
+   "time": "5h ago",
+   "duration": "4:05",
+   "size": "58 MB"
+  },
+  {
+   "title": "Unboxing the Latest",
+   "channel": "Global Music Weekly",
+   "time": "5h ago",
+   "duration": "25:52",
+   "size": "26 MB"
+  },
+  {
+   "title": "Deep Dive: Climate Models",
+   "channel": "History Hour",
+   "time": "5h ago",
+   "duration": "41:07",
+   "size": "61 MB"
+  },
+  {
+   "title": "Live Q&A Session",
+   "channel": "Indoor Gardening",
+   "time": "5h ago",
+   "duration": "2:21",
+   "size": "48 MB"
+  },
+  {
+   "title": "Quick Take: Industry News",
+   "channel": "Jumpstart Science",
+   "time": "5h ago",
+   "duration": "6:45",
+   "size": "83 MB"
+  },
+  {
+   "title": "The Morning Brief",
+   "channel": "Kilo Retro Tech",
+   "time": "5h ago",
+   "duration": "28:09",
+   "size": "59 MB"
+  },
+  {
+   "title": "Creator Corner Ep. 47",
+   "channel": "Lima News 5",
+   "time": "5h ago",
+   "duration": "23:49",
+   "size": "48 MB"
+  },
+  {
+   "title": "Road Trip Diaries",
+   "channel": "Alpha Tech Reviews",
+   "time": "6h ago",
+   "duration": "21:10",
+   "size": "57 MB"
+  },
+  {
+   "title": "Sunday Long Form",
+   "channel": "Beta Gaming",
+   "time": "5h ago",
+   "duration": "15:41",
+   "size": "11 MB"
+  }
+ ],
+ "queues": {
+  "sync": [
+   {
+    "name": "Downloading Alpha Tech Reviews",
+    "status": "running"
+   },
+   {
+    "name": "Metadata Daily Explainer",
+    "status": "queued"
+   },
+   {
+    "name": "Download History Hour",
+    "status": "queued"
+   },
+   {
+    "name": "Download Mike Bodycam",
+    "status": "queued"
+   }
+  ],
+  "gpu": [
+   {
+    "name": "Transcribing Season Finale Recap (25m 04s)",
+    "status": "running"
+   },
+   {
+    "name": "Transcribe Weekly News Roundup (18m 22s)",
+    "status": "queued"
+   },
+   {
+    "name": "Transcribe Product Teardown: Model X (9m 33s)",
+    "status": "queued"
+   }
+  ]
+ }
+}

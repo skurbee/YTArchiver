@@ -1,8 +1,5 @@
 # YTArchiver
 
-*Currently working on a complete overhaul to pywebview (HTML/CSS/JS) instead of a monolithic & sluggish tkinter app. 
-Will be out soon (hopefully)*
-
 Download, organize, transcribe, search, compress, and browse entire channels
 
 some specific features relating to taking over archives from 4kVD+, and 'fixing' them
@@ -35,9 +32,10 @@ some specific features relating to taking over archives from 4kVD+, and 'fixing'
 
 ### Browse Tab
 - **Searchable transcript database** — full-text search across all transcribed channels
-- **Embedded video player** — plays video inline with a synced, scrolling transcript (requires VLC)
+- **Embedded video player** — HTML5 video with a synced, scrolling transcript alongside
 - **Click-to-seek** — click any word in the transcript to jump the video to that moment
-- **Word frequency analysis** — frequency graphs and word cloud visualizations
+- **Word frequency analysis** — frequency graphs (Year / Month / Week buckets) and word cloud visualizations
+- **Recent downloads** — list or thumbnail-grid view of recently-archived videos, filterable
 
 ### Compression
 - **AV1 NVENC encoding** — compress archived videos using AV1 hardware encoding (NVIDIA GPU)
@@ -45,7 +43,8 @@ some specific features relating to taking over archives from 4kVD+, and 'fixing'
 - **HQ downscale** — download at a higher resolution, then downscale for better quality at lower resolutions
 
 ### UI & Workflow
-- **Four-tab layout** — Download, Subs, Recent, and Transcriptions tabs
+- **Four-tab layout** — Download, Subs, Browse, Settings (Recent now lives under Browse, Index under Settings)
+- **Settings categories** — General / Performance / Appearance / Tools / Index sub-tabs
 - **Simple / Verbose log modes** — toggle between a readable sync view and full yt-dlp output
 - **Pause / resume** — pause active downloads or transcriptions mid-session and resume without losing progress
 - **GPU task queue** — transcription and compression jobs run in their own reorderable queue, separate from downloads
@@ -58,9 +57,11 @@ some specific features relating to taking over archives from 4kVD+, and 'fixing'
 
 ## Tech Stack
 
-Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whisper) for GPU transcription, **VLC** for the embedded player, **matplotlib** for graphing, and **tkinter** for the UI.
+Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whisper) for GPU transcription, **SQLite FTS5** for the transcript index, **Chart.js** for graphing, and a **pywebview** shell rendering an HTML/CSS/JS frontend.
 
-EXE in releases has icon bundled. If you run the .py seperately, download the .ico and put it in the same /dir.
+> The previous tkinter-based build is archived as the **Tkinter legacy** release — same feature set, original UI. Use that if the new frontend isn't your thing.
+
+EXE in releases has everything bundled. If you run from source, you'll need Python 3.13 with `pywebview`, `pystray`, and `Pillow` installed (`pip install pywebview pystray pillow`). Whisper stays out-of-tree and is invoked via a Python 3.11 venv at runtime.
 
 
 Line by line, it's roughly 90% Claude-Code, 5% Copilot, 5% me :)

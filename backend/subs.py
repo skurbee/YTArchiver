@@ -9,9 +9,9 @@ Schema matches YTArchiver.py's CHANNEL_DEFAULTS (line 173):
         "name": "ExampleChannel",
         "url": "https://www.youtube.com/@ExampleChannel",
         "resolution": "720" | "1080" | "best" | "audio" | ...,
-        "mode": "full" | "new" | "fromdate",   # range radio
-        "min_duration": 3,                      # minutes
-        "max_duration": 0,                      # 0 = no cap
+        "mode": "full" | "new" | "fromdate", # range radio
+        "min_duration": 3, # minutes
+        "max_duration": 0, # 0 = no cap
         "split_years": False,
         "split_months": False,
         "auto_transcribe": False,
@@ -180,14 +180,14 @@ def _payload_to_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
         try: return max(0, int(v)) * 60
         except Exception: return 0
     ch = {
-        "name":             (payload.get("folder") or payload.get("name") or "").strip(),
-        "folder":           (payload.get("folder") or payload.get("name") or "").strip(),
-        "url":              normalize_channel_url(payload.get("url", "")),
-        "resolution":       str(payload.get("resolution", "720")),
-        "min_duration":     _mins_to_secs(payload.get("min_duration")),
-        "max_duration":     _mins_to_secs(payload.get("max_duration")),
-        "auto_transcribe":  bool(payload.get("auto_transcribe")),
-        "auto_metadata":    bool(payload.get("auto_metadata", True)),
+        "name": (payload.get("folder") or payload.get("name") or "").strip(),
+        "folder": (payload.get("folder") or payload.get("name") or "").strip(),
+        "url": normalize_channel_url(payload.get("url", "")),
+        "resolution": str(payload.get("resolution", "720")),
+        "min_duration": _mins_to_secs(payload.get("min_duration")),
+        "max_duration": _mins_to_secs(payload.get("max_duration")),
+        "auto_transcribe": bool(payload.get("auto_transcribe")),
+        "auto_metadata": bool(payload.get("auto_metadata", True)),
         "compress_enabled": bool(payload.get("compress_enabled")),
     }
     # Range mapping: subscribe (default, new uploads only) / all / fromdate
@@ -203,7 +203,7 @@ def _payload_to_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
         ch["from_date"] = ""
     # Folder org mapping: flat / years / months
     org = payload.get("folder_org", "years")
-    ch["split_years"]  = (org in ("years", "months"))
+    ch["split_years"] = (org in ("years", "months"))
     ch["split_months"] = (org == "months")
     # Compress details
     if ch["compress_enabled"]:
@@ -305,12 +305,12 @@ def add_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
             payload["resolution"] = cfg_defaults.get("default_resolution", "720")
         if "min_duration" not in payload or payload["min_duration"] in (None, "", 0):
             default_secs = int(cfg_defaults.get("min_duration", 180) or 180)
-            payload["min_duration"] = max(0, default_secs // 60)  # minutes
+            payload["min_duration"] = max(0, default_secs // 60) # minutes
         if "auto_metadata" not in payload:
             payload["auto_metadata"] = True
     except Exception:
         pass
-    # Strip-check (not just truthy) — whitespace-only values like "  " are
+    # Strip-check (not just truthy) — whitespace-only values like " " are
     # effectively blank after _payload_to_channel's .strip(). Without this,
     # " " passes the truthy guard, skips the auto-fetch, then gets stored
     # as "" downstream → sync_channel computes `sanitize_folder("") ==
@@ -323,7 +323,7 @@ def add_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
         fetched = fetch_channel_display_name(payload.get("url", ""))
         if fetched and fetched.strip():
             payload["folder"] = fetched.strip()
-            payload["name"]   = fetched.strip()
+            payload["name"] = fetched.strip()
         else:
             raise SubsError("Folder name is required (and auto-fetch from URL failed).")
     new_ch = _payload_to_channel(payload)
@@ -388,7 +388,7 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
                 except Exception:
                     pass
             elif k == "folder_org":
-                merged["split_years"]  = (v in ("years", "months"))
+                merged["split_years"] = (v in ("years", "months"))
                 merged["split_months"] = (v == "months")
             elif k == "range":
                 if v == "all": merged["mode"] = "full"

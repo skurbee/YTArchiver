@@ -18,13 +18,13 @@ from typing import Optional
 
 # Hosts to probe. Must be reliable, low-latency, worldwide.
 _PROBE_HOSTS = [
-    ("1.1.1.1", 443),       # Cloudflare DNS over HTTPS
-    ("8.8.8.8", 443),       # Google DNS
-    ("youtube.com", 443),   # The one we actually need
+    ("1.1.1.1", 443), # Cloudflare DNS over HTTPS
+    ("8.8.8.8", 443), # Google DNS
+    ("youtube.com", 443), # The one we actually need
 ]
 
 
-net_down = threading.Event()          # Set when network is confirmed offline
+net_down = threading.Event() # Set when network is confirmed offline
 _monitor_thread: Optional[threading.Thread] = None
 _poll_interval_sec = 30.0
 _probe_timeout_sec = 5.0
@@ -73,7 +73,7 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
     if not net_down.is_set():
         return True
     if stream:
-        stream.emit_text("  \u26a0 Network down \u2014 pausing until connection returns...", "red")
+        stream.emit_text(" \u26a0 Network down \u2014 pausing until connection returns...", "red")
     waited = 0
     while net_down.is_set():
         if check_cancel and check_cancel():
@@ -86,5 +86,5 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
                 net_down.clear()
                 break
     if stream:
-        stream.emit_text("  \u2713 Network back.", "simpleline_green")
+        stream.emit_text(" \u2713 Network back.", "simpleline_green")
     return True

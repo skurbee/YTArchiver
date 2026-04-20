@@ -7,9 +7,9 @@ becomes writable again, resume.
 
 This module exposes:
   DiskErrorMonitor(pause_event, log_stream)
-    .scan_line(text)         # inspect one log line; triggers handler if matched
-    .is_active()             # True while a disk error is being handled
-    .force_check()           # immediately check if disk is writable again
+    .scan_line(text) # inspect one log line; triggers handler if matched
+    .is_active() # True while a disk error is being handled
+    .force_check() # immediately check if disk is writable again
 """
 
 from __future__ import annotations
@@ -27,20 +27,20 @@ from .log_stream import LogStreamer
 _DISK_ERROR_PATTERNS = [
     r"No space left on device",
     r"disk (?:is )?full",
-    r"\[Errno 28\]",                        # ENOSPC
-    r"\[Errno 30\]",                        # EROFS (read-only filesystem)
+    r"\[Errno 28\]", # ENOSPC
+    r"\[Errno 30\]", # EROFS (read-only filesystem)
     r"Input/output error",
-    r"\[Errno 5\]",                         # EIO
-    r"The system cannot find the path",     # Windows: drive unmapped
-    r"The device is not ready",             # Windows: disk disconnected
+    r"\[Errno 5\]", # EIO
+    r"The system cannot find the path", # Windows: drive unmapped
+    r"The device is not ready", # Windows: disk disconnected
     r"\bOSError\b.*(?:writ|permission|access)",
     r"Unable to open .* for writing",
     r"Permission denied",
-    r"HTTP Error 5\d\d",                    # not a disk error but signals upstream trouble
+    r"HTTP Error 5\d\d", # not a disk error but signals upstream trouble
 ]
 _DISK_ERROR_RE = re.compile("|".join(_DISK_ERROR_PATTERNS), re.IGNORECASE)
 
-DISK_RETRY_MINUTES = 5  # mirrors YTArchiver._DISK_RETRY_MINUTES
+DISK_RETRY_MINUTES = 5 # mirrors YTArchiver._DISK_RETRY_MINUTES
 
 
 def _check_directory_writable(path: str) -> bool:
@@ -74,7 +74,7 @@ class DiskErrorMonitor:
                  on_resume: Callable[[], None],
                  get_output_dir: Callable[[], str]):
         self._stream = log_stream
-        self._lock   = threading.Lock()
+        self._lock = threading.Lock()
         self._active = False
         self._start_ts = 0.0
         self._path: Optional[str] = None
@@ -111,9 +111,9 @@ class DiskErrorMonitor:
         border = "\u2588" * 65
         self._stream.emit([
             ["\n" + border + "\n", "red"],
-            ["\u2588  DISK ERROR DETECTED \u2014 All tasks paused.\n", "red"],
-            ["\u2588  The output drive may be disconnected or full.\n", "red"],
-            [f"\u2588  Will retry in {DISK_RETRY_MINUTES} minutes\u2026\n", "red"],
+            ["\u2588 DISK ERROR DETECTED \u2014 All tasks paused.\n", "red"],
+            ["\u2588 The output drive may be disconnected or full.\n", "red"],
+            [f"\u2588 Will retry in {DISK_RETRY_MINUTES} minutes\u2026\n", "red"],
             [border + "\n\n", "red"],
         ])
         self._stream.flush()
@@ -142,7 +142,7 @@ class DiskErrorMonitor:
                 self._active = False
             self._stream.emit([
                 ["\n" + border + "\n", "simpleline_green"],
-                ["\u2588  \u2713 Disk is writable again \u2014 resuming all tasks.\n",
+                ["\u2588 \u2713 Disk is writable again \u2014 resuming all tasks.\n",
                  "simpleline_green"],
                 [border + "\n\n", "simpleline_green"],
             ])
@@ -151,7 +151,7 @@ class DiskErrorMonitor:
             except Exception: pass
         else:
             self._stream.emit([
-                [f"  \u26a0 Disk still unwritable \u2014 retrying in "
+                [f" \u26a0 Disk still unwritable \u2014 retrying in "
                  f"{DISK_RETRY_MINUTES} minutes\u2026\n", "red"],
             ])
             self._stream.flush()

@@ -79,12 +79,12 @@ def _find_cookie_source() -> List[str]:
     appdata = os.environ.get("APPDATA") or ""
     localdata = os.environ.get("LOCALAPPDATA") or ""
     known_paths = {
-        "firefox":  os.path.join(appdata, "Mozilla", "Firefox", "Profiles"),
-        "chrome":   os.path.join(localdata, "Google", "Chrome", "User Data"),
-        "brave":    os.path.join(localdata, "BraveSoftware", "Brave-Browser", "User Data"),
-        "edge":     os.path.join(localdata, "Microsoft", "Edge", "User Data"),
-        "vivaldi":  os.path.join(localdata, "Vivaldi", "User Data"),
-        "opera":    os.path.join(appdata, "Opera Software", "Opera Stable"),
+        "firefox": os.path.join(appdata, "Mozilla", "Firefox", "Profiles"),
+        "chrome": os.path.join(localdata, "Google", "Chrome", "User Data"),
+        "brave": os.path.join(localdata, "BraveSoftware", "Brave-Browser", "User Data"),
+        "edge": os.path.join(localdata, "Microsoft", "Edge", "User Data"),
+        "vivaldi": os.path.join(localdata, "Vivaldi", "User Data"),
+        "opera": os.path.join(appdata, "Opera Software", "Opera Stable"),
     }
     for browser in _COOKIE_BROWSERS:
         p = known_paths.get(browser)
@@ -189,7 +189,7 @@ def channel_folder_name(ch: Dict[str, Any]) -> str:
 
 # ── Progress parsing ───────────────────────────────────────────────────
 
-_PROG_RE  = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+_PROG_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _TITLE_RE = re.compile(r"\[download\]\s+Destination:\s+(.+)$")
 # Authoritative final path comes from the Merger / ffmpeg / FixupM3u8 log
 # line. Mirrors OLD YTArchiver.py:18625 — we want every flavor of yt-dlp's
@@ -202,7 +202,7 @@ _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format"
 # globally unique across the whole sync run (NOT per-channel), otherwise
 # channel B's first Downloading line would collide with channel A's last
 # "✓ done" line (both would be `dlrow_1`) and the new Downloading would
-# REPLACE the old Done in the DOM — making Scott's done lines disappear
+# REPLACE the old Done in the DOM — making done lines disappear
 # as soon as the next channel starts. Monotonic across all sync_channel
 # calls in a single process lifetime.
 _DLROW_COUNTER: int = 0
@@ -255,13 +255,13 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
                    name: str, summary: Optional[str] = None,
                    name_tag: str = "simpleline_green",
                    summary_tag: str = "simpleline") -> None:
-    """Emit a single `[N/total] Name   — summary` line that replaces in-
+    """Emit a single `[N/total] Name — summary` line that replaces in-
     place across re-emissions for the same channel index (one-line-per-
     channel OLD-style log). The first call per channel appends; the
     second call (with a `summary`) replaces the first.
 
     summary=None → "live" row (just `[N/total] Name`).
-    summary=str  → "done" row (appends `   — summary`). Pad with spaces
+    summary=str → "done" row (appends ` — summary`). Pad with spaces
                    so the em-dash column aligns roughly at col 34.
     """
     marker = f"sync_row_{idx}"
@@ -273,7 +273,7 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
         name_col = 34
         padded = name if len(name) >= name_col else name + " " * (name_col - len(name))
         segs.append([padded, [name_tag, marker]])
-        segs.append([f"  \u2014 {summary}\n", [summary_tag, marker]])
+        segs.append([f" \u2014 {summary}\n", [summary_tag, marker]])
     stream.emit(segs)
 
 
@@ -305,7 +305,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     If `pause_event` is given, the yt-dlp subprocess is terminated the
     moment the event is set — so pausing during a download actually
     stops the download instead of making the user wait for the current
-    channel to finish. Scott: "the only thing we can't stop right in
+    channel to finish. "the only thing we can't stop right in
     the middle of is Whisper transcriptions." Partial downloads are
     fine because yt-dlp's `--download-archive` + partial-file handling
     pick up where they left off on next run.
@@ -321,14 +321,14 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # Python flags the read in the DLTRACK `_done_kind` line as "name
     # used prior to global declaration".
     global _DLROW_COUNTER
-    name  = channel.get("name") or channel.get("folder") or "?"
-    url   = channel.get("url", "").strip()
+    name = channel.get("name") or channel.get("folder") or "?"
+    url = channel.get("url", "").strip()
     resolution = channel.get("resolution", "720")
     auto_tx = bool(channel.get("auto_transcribe"))
     # Mark the channel as "sync in progress" so the transcribe worker's
     # _flush_batch_stats skips it — sync_channel will emit the final
     # consolidated [Dwnld] row at its end with the transcribe count
-    # read synchronously from transcribe_mgr. See Scott's bug: fast
+    # read synchronously from transcribe_mgr. See a bug: fast
     # auto-captions finish before sync_channel ends, flush fired first
     # and emitted a duplicate [Trnscr] row.
     set_sync_active(name)
@@ -342,10 +342,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         min_dur = 60
     if 0 < max_dur < 60:
         max_dur = 60
-    mode    = (channel.get("mode") or "new").lower()  # "new" | "full" | "fromdate"
+    mode = (channel.get("mode") or "new").lower() # "new" | "full" | "fromdate"
     from_date = (channel.get("from_date") or "").strip()
     # Folder-org flags: matches YTArchiver.py:17257 split_years / split_months
-    split_years  = bool(channel.get("split_years"))
+    split_years = bool(channel.get("split_years"))
     split_months = bool(channel.get("split_months"))
 
     if not url:
@@ -404,7 +404,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                      [f"Cannot write to {ch_dir} \u2014 disk may be full, read-only, or disconnected.\n", "red"]])
         return SyncResult(ok=False, reason="write blocked", downloaded=0, errors=0)
     if not check_disk_space(str(ch_dir), 500 * 1024 * 1024):
-        stream.emit([["\u26a0  ", "red"],
+        stream.emit([["\u26a0 ", "red"],
                      [f"Less than 500 MB free at {ch_dir} \u2014 downloads may fail mid-stream.\n", "red"]])
         # warn but don't block — user may still want to try
 
@@ -430,12 +430,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     cmd = [
         yt,
         "--newline", "--no-quiet",
-        "--mtime",                   # file mtime = YT upload date (matches original)
+        "--mtime", # file mtime = YT upload date (matches original)
         "--trim-filenames", "200",
         "--format", fmt,
         "--merge-output-format", "mp4",
         "--ppa", "Merger:-c copy",
-        "--sleep-requests", "0.25",  # match original's throttle
+        "--sleep-requests", "0.25", # match original's throttle
         "--output", output_template,
         *_find_cookie_source(),
         "--ignore-errors",
@@ -516,9 +516,9 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
 
     t_start = time.time()
     # Per-channel [Sync] Starting / Done emits are gone — sync_start_all's
-    # loop now renders a single-line `[N/total] Name   \u2014 summary` row
+    # loop now renders a single-line `[N/total] Name \u2014 summary` row
     # that updates in-place. The URL still logs as a verbose-only trace.
-    stream.emit([[f"  URL: {url}\n", "dim"]])
+    stream.emit([[f" URL: {url}\n", "dim"]])
 
     # Pause if we know the network is down (don't waste yt-dlp on dead pipes)
     try:
@@ -555,7 +555,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # `_path_to_counter` stays local because it's only queried within
     # this channel's DLTRACK flow.
     _path_to_counter: Dict[str, int] = {}
-    downloaded_ids: List[str] = []  # fast-path metadata target list
+    downloaded_ids: List[str] = [] # fast-path metadata target list
     # title -> video_id, filled from DLTRACK::: emitted after each video.
     # Needed because filenames no longer carry the [id] suffix (drop-in mode).
     _title_to_id: Dict[str, str] = {}
@@ -569,9 +569,9 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # Design intent: "when a sync download kicks out a metadata
     # task, we shouldn't have to walk entire channels. We know the exact
     # video ID that we just downloaded. We should be able to 'snipe' that
-    # information."  And he wants the log to read like:
-    #     \u2014 \u2713 Title                    Channel  04.18.26  (26 MB)
-    #     \u2014 Metadata downloaded
+    # information." And he wants the log to read like:
+    # \u2014 \u2713 Title Channel 04.18.26 (26 MB)
+    # \u2014 Metadata downloaded
     # So we run a single-worker ThreadPoolExecutor per sync pass: each
     # DLTRACK submits a task that fetches metadata for JUST that video
     # (no channel walk). One-at-a-time keeps us from hammering yt-dlp.
@@ -633,7 +633,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # Simple mode. In Verbose mode the user sees it with
             # bracket-style colors (handled by the 'dim' CSS rule).
             stream.emit([
-                ["  [Streams] ", "dim"],
+                [" [Streams] ", "dim"],
                 [f"Checking {_target_url} for past livestreams...\n", "dim"],
             ])
         cmd_this = cmd + [_target_url]
@@ -665,10 +665,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                           downloaded=0, errors=0)
                     proc = None
                     break
-                stream.emit_dim(f"  Launch attempt {attempt+1} failed ({e}); retrying in 2s...")
+                stream.emit_dim(f" Launch attempt {attempt+1} failed ({e}); retrying in 2s...")
                 time.sleep(2)
         if proc is None:
-            continue  # streams pass launch failed — skip, main pass completed
+            continue # streams pass launch failed — skip, main pass completed
 
         # Manual line iteration on the bytes stream so we can apply our
         # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
@@ -679,7 +679,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     proc.terminate()
                 except Exception:
                     pass
-                stream.emit([["  \u26d4 Cancelled.\n", "red"]])
+                stream.emit([[" \u26d4 Cancelled.\n", "red"]])
                 break
 
             # Pause-immediate — terminate the yt-dlp subprocess the
@@ -694,7 +694,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     proc.terminate()
                 except Exception:
                     pass
-                stream.emit([["  \u23F8 Paused \u2014 stopping current download.\n",
+                stream.emit([[" \u23F8 Paused \u2014 stopping current download.\n",
                               "simpleline"]])
                 break
 
@@ -767,7 +767,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             except OSError:
                                 _size_bytes = 0
                             _size_str = _fmt_size(_size_bytes) if _size_bytes else ""
-                            _size_tag = f"  ({_size_str})" if _size_str else ""
+                            _size_tag = f" ({_size_str})" if _size_str else ""
                             # Duration pretty-format (mirrors OLD line 18476).
                             _dur_str = ""
                             try:
@@ -782,7 +782,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             _video_url = f"https://www.youtube.com/watch?v={vid}"
                             # Title line — always emit (OLD does this in both modes).
                             # simple mode: single dense line with title/channel/size
-                            #   "— ✓ <title>  —  <channel>  (NNN MB)"
+                            # "— ✓ <title> — <channel> (NNN MB)"
                             # verbose mode: same line + Path/URL/Duration subfields
                             # Inplace: reuse the `dlrow_<N>` kind that the
                             # Downloading emit used, so the ✓ done line
@@ -790,11 +790,11 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             # (matches OLD's single-line-per-download pattern).
                             _done_kind = f"dlrow_{_path_to_counter.get(final_path, _DLROW_COUNTER)}"
                             stream.emit([
-                                ["  ",                         ["dim",              _done_kind]],
-                                ["\u2014 \u2713 ",             ["simpleline_green", _done_kind]],
-                                [f"{_display}",                ["simpleline",       _done_kind]],
-                                [f"  \u2014  {name}",          ["simpleline",       _done_kind]],
-                                [f"{_size_tag}\n",             ["dim",              _done_kind]],
+                                [" ", ["dim", _done_kind]],
+                                ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],
+                                [f"{_display}", ["simpleline", _done_kind]],
+                                [f" \u2014 {name}", ["simpleline", _done_kind]],
+                                [f"{_size_tag}\n", ["dim", _done_kind]],
                             ])
                             # Path / URL / Duration — verbose-only sub-details
                             # (all `dim`, which `_line_is_verbose_only` drops
@@ -803,12 +803,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                 _rel_fp = os.path.relpath(final_path)
                             except ValueError:
                                 _rel_fp = final_path
-                            stream.emit([["    Path: ", "dim"],
+                            stream.emit([[" Path: ", "dim"],
                                          [f"{_rel_fp}\n", "dim"]])
-                            stream.emit([["    URL:  ", "dim"],
+                            stream.emit([[" URL: ", "dim"],
                                          [f"{_video_url}\n", "dim"]])
                             if _dur_str:
-                                stream.emit([["    Duration: ", "dim"],
+                                stream.emit([[" Duration: ", "dim"],
                                              [f"{_dur_str}\n", "dim"]])
                         try:
                             from . import index as _idx
@@ -828,8 +828,8 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                         if auto_tx and transcribe_mgr is not None:
                             cb = None
                             if channel.get("compress_enabled"):
-                                _comp_lvl  = channel.get("compress_level") or "Average"
-                                _comp_res  = str(channel.get("compress_output_res") or "720")
+                                _comp_lvl = channel.get("compress_level") or "Average"
+                                _comp_res = str(channel.get("compress_output_res") or "720")
                                 def _chain_compress(_result, _fp=final_path, _q=_comp_lvl,
                                                     _r=_comp_res, _s=stream, _ce=cancel_event):
                                     try:
@@ -843,7 +843,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                                     channel=name, on_complete=cb)
                         # If auto_transcribe is off but compress_enabled is on,
                         # route the compress task through the SHARED GPU queue
-                        # (Scott's rule: "every compress is a GPU task").
+                        # (rule: "every compress is a GPU task").
                         # Falls back to inline direct-fire if the transcribe
                         # manager isn't attached (e.g. tests).
                         elif channel.get("compress_enabled"):
@@ -876,7 +876,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 # Mirrors YTArchiver.py:18556.
                 merge_dest_path = ""
                 dest_path = ""
-                continue  # don't render this control line to the user
+                continue # don't render this control line to the user
 
             # "already been downloaded" — yt-dlp skipping existing file.
             # No counter bump, no transcribe enqueue, no metadata fetch.
@@ -885,7 +885,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 # line we announced on the Destination will stay, but we
                 # won't add any more noise. The pass summary "0 downloaded"
                 # is the authoritative count.
-                stream.emit([["  ", "dim"], [f"{s[:140]}\n", "dim"]])
+                stream.emit([[" ", "dim"], [f"{s[:140]}\n", "dim"]])
                 continue
 
             # "already been recorded in the archive" — yt-dlp hitting a
@@ -895,7 +895,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # yt-dlp to stop the walk logs this line. Pure noise for
             # the user — filter it as dim so Simple mode hides it.
             if "has already been recorded in the archive" in s:
-                stream.emit([["  ", "dim"], [f"{s[:140]}\n", "dim"]])
+                stream.emit([[" ", "dim"], [f"{s[:140]}\n", "dim"]])
                 continue
 
             # Destination line — stash the path so DLTRACK can reuse it,
@@ -912,7 +912,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 if final_path is None:
                     # Sidecar destination (.vtt / .description / .info.json
                     # / etc). Dim trace only.
-                    stream.emit([[f"  {s[:140]}\n", "dim"]])
+                    stream.emit([[f" {s[:140]}\n", "dim"]])
                     continue
                 current_title = os.path.basename(dest_path).rsplit(".", 1)[0]
                 display_title = re.sub(
@@ -945,9 +945,9 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     _path_to_counter[final_path] = _DLROW_COUNTER
                     _dl_kind = f"dlrow_{_DLROW_COUNTER}"
                     stream.emit([
-                        ["  ",                          ["dim",              _dl_kind]],
-                        ["\u2014 Downloading ",         ["simpleline_green", _dl_kind]],
-                        [f"{display_title}\n",          ["simpleline",       _dl_kind]],
+                        [" ", ["dim", _dl_kind]],
+                        ["\u2014 Downloading ", ["simpleline_green", _dl_kind]],
+                        [f"{display_title}\n", ["simpleline", _dl_kind]],
                     ])
                 continue
 
@@ -969,7 +969,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 # replace-in-place line.
                 _prog_kind = f"dlrow_{_DLROW_COUNTER}"
                 stream.emit([
-                    ["    ", ["dim", _prog_kind]],
+                    [" ", ["dim", _prog_kind]],
                     [f"{pct}%", ["dlprogress_pct", _prog_kind]],
                     [" ", ["dim", _prog_kind]],
                     [s[:120], ["dim", _prog_kind]],
@@ -985,11 +985,11 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     vid = id_m.group(1) if id_m else ""
                     if vid:
                         _ls.defer(vid, title=current_title, channel_url=url)
-                        stream.emit([["  [Live] ", "livestream"],
+                        stream.emit([[" [Live] ", "livestream"],
                                      [f"Deferred {vid}: ", "simpleline"],
                                      [s[:140] + "\n", "dim"]])
                     else:
-                        stream.emit([["  [Live] ", "livestream"],
+                        stream.emit([[" [Live] ", "livestream"],
                                      [s[:140] + "\n", "dim"]])
                     continue
             except Exception:
@@ -999,16 +999,16 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             low = s.lower()
             if "error" in low or "warning" in low:
                 # Benign non-errors that yt-dlp prints as ERROR lines:
-                #   "does not have a streams tab" — channel has no past
-                #     livestreams under /streams. Expected for most
-                #     non-livestreaming channels, not actually an error.
-                #   "does not have a shorts tab" — similar, harmless.
+                # "does not have a streams tab" — channel has no past
+                # livestreams under /streams. Expected for most
+                # non-livestreaming channels, not actually an error.
+                # "does not have a shorts tab" — similar, harmless.
                 # Silenced in Simple mode (dim), counter not bumped.
                 if ("does not have a streams tab" in low
                         or "does not have a shorts tab" in low):
-                    stream.emit([[f"  {s}\n", "dim"]])
+                    stream.emit([[f" {s}\n", "dim"]])
                     continue
-                stream.emit([[f"  {s}\n", "red" if "error" in low else "filterskip"]])
+                stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
                 if "error" in low:
                     errors += 1
                 # Rate-limit detection: 429 or HTTP 429 in the output → pause
@@ -1016,17 +1016,17 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 # want the log to show we're waiting rather than hammering.
                 if "429" in low or "too many requests" in low or "rate limit" in low:
                     stream.emit_text(
-                        "  \u23F8 Rate-limited by YouTube \u2014 backing off 30s...",
+                        " \u23F8 Rate-limited by YouTube \u2014 backing off 30s...",
                         "red")
                     for _ in range(30):
                         if cancel_event is not None and cancel_event.is_set():
                             break
                         time.sleep(1)
-                    stream.emit_text("  \u25B6 Resuming.", "simpleline_green")
+                    stream.emit_text(" \u25B6 Resuming.", "simpleline_green")
                 continue
 
             # Default: dim
-            stream.emit([[f"  {s}\n", "dim"]])
+            stream.emit([[f" {s}\n", "dim"]])
 
         try:
             proc.wait(timeout=10)
@@ -1039,7 +1039,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     took = _fmt_duration(elapsed)
 
     # Per-channel [Sync] Done line is now rendered by sync_start_all via
-    # _sync_row_emit — one compact `[N/total] Name   \u2014 summary` row that
+    # _sync_row_emit — one compact `[N/total] Name \u2014 summary` row that
     # replaces the live header in place. No duplicate line here.
 
     # TuneShine: push per-channel totals so the display shows live progress.
@@ -1068,7 +1068,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         except Exception:
             pass
 
-    # Consolidated activity-log row — Scott's request: replace the
+    # Consolidated activity-log row — request: replace the
     # historical 3 rows with ONE [Dwnld] row per channel per sync pass
     # showing "N downloaded \u00b7 N transcribed \u00b7 N metadata".
     # Emit synchronously here, reading transcribed count from the
@@ -1082,12 +1082,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     if downloaded > 0 or errors > 0:
         _meta_fetched = int(_meta_counts.get("fetched", 0) or 0)
         _tx_done = 0
-        _tx_err  = 0
+        _tx_err = 0
         if auto_tx and transcribe_mgr is not None:
             try:
                 _stats = transcribe_mgr.get_channel_batch_stats(name)
                 _tx_done = int(_stats.get("done", 0) or 0)
-                _tx_err  = int(_stats.get("err",  0) or 0)
+                _tx_err = int(_stats.get("err", 0) or 0)
                 # Mark consumed so _flush_batch_stats doesn't emit a
                 # duplicate standalone [Trnscr] row for the same work.
                 transcribe_mgr.consume_channel_batch_stats(name)
@@ -1157,10 +1157,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         try:
             _swept = _sweep_orphan_vtts(str(ch_dir))
             if _swept > 0:
-                stream.emit([["  ", "dim"],
+                stream.emit([[" ", "dim"],
                              [f"Swept {_swept} orphan caption file(s).\n", "dim"]])
         except Exception as _sve:
-            stream.emit_dim(f"  (vtt sweep skipped: {_sve})")
+            stream.emit_dim(f" (vtt sweep skipped: {_sve})")
 
     # Also refresh the channel's avatar/banner art. Internal 30-day
     # threshold on channel_art.fetch_channel_art means this is near-free
@@ -1169,7 +1169,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         from . import channel_art as _ca
         _ca.fetch_channel_art(url or "", str(ch_dir), force=False)
     except Exception as _ae:
-        stream.emit_dim(f"  (channel-art refresh skipped: {_ae})")
+        stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
 
     # Clear the sync-active flag — allow transcribe._flush_batch_stats to
     # emit standalone [Trnscr] rows for any transcriptions that slip in
@@ -1202,17 +1202,17 @@ def write_sync_progress(channel_name: str = "",
         # Accumulate session totals so TuneShine sees the same numbers
         # OLD shows in its own header. Totals are reset by clear_sync_progress.
         t = _SYNC_PROGRESS_STATE["totals"]
-        t["dl"]   += int(downloaded or 0)
+        t["dl"] += int(downloaded or 0)
         t["skip"] += int(skipped or 0)
-        t["err"]  += int(errors or 0)
+        t["err"] += int(errors or 0)
         data = {
             "running": True,
             "channel": channel_name or "",
-            "idx":   int(idx or 1),
+            "idx": int(idx or 1),
             "total": int(total or 1),
-            "dl":    t["dl"],
-            "skip":  t["skip"],
-            "err":   t["err"],
+            "dl": t["dl"],
+            "skip": t["skip"],
+            "err": t["err"],
         }
         path = _sync_progress_path()
         tmp = path + ".tmp"
@@ -1350,7 +1350,7 @@ def _fmt_duration(seconds: float) -> str:
 
 def _fmt_size(size_bytes) -> str:
     """Human-readable byte size. Mirrors YTArchiver.py — used in the
-    "— ✓ Title  —  Channel  (NN MB)" download confirmation line."""
+    "— ✓ Title — Channel (NN MB)" download confirmation line."""
     try:
         n = int(size_bytes)
     except (TypeError, ValueError):
@@ -1366,8 +1366,8 @@ def _fmt_size(size_bytes) -> str:
 
 # ── Sync all subscribed channels ───────────────────────────────────────
 
-_BATCH_LIMIT = 100000          # YTArchiver.py:17503
-_BATCH_COOLDOWN_HOURS = 72     # YTArchiver.py:17504
+_BATCH_LIMIT = 100000 # YTArchiver.py:17503
+_BATCH_COOLDOWN_HOURS = 72 # YTArchiver.py:17504
 
 
 def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
@@ -1546,7 +1546,7 @@ def set_recent_changed_hook(hook: Optional[Any]) -> None:
 # [Dwnld] row isn't ready to emit yet (sync_channel is still running).
 # Without this, the transcribe worker drains before sync_channel ends,
 # flush fires, and a standalone [Trnscr] row beats sync_channel to the
-# activity log. Scott: "a single line. [Dwnld]...". `set_sync_active`
+# activity log. "a single line. [Dwnld]...". `set_sync_active`
 # wraps sync_channel entry, `clear_sync_active` wraps exit.
 _active_sync_channels: set = set()
 _active_sync_lock = threading.Lock()
@@ -1569,13 +1569,13 @@ def is_sync_active(channel_name: str) -> bool:
 
 def _count_cell(n: int, label: str) -> str:
     """Render a count cell. If n == 1, return "\u2713 {label}" instead of
-    "1 {label}" — Scott's single-video polish for transcribed + metadata.
+    "1 {label}" — single-video polish for transcribed + metadata.
     For 0 we still show the numeric form so the user can see
     "0 transcribed" when a channel has auto_transcribe off. For >= 2
     we show the numeric count.
 
     NOTE: `downloaded` is ALWAYS rendered numerically (never \u2713) per
-    Scott's follow-up: "leave the downloaded part as a number. ... 1
+     follow-up: "leave the downloaded part as a number. ... 1
     downloaded (check) transcribed (check) metadata". Callers emit
     downloaded via f"{n} downloaded" directly.
     """
@@ -1595,9 +1595,9 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
     """Emit ONE combined activity-log row replacing the historical trio
     of [Auto] + [Trnscr] + [Metdta]. UI receives four count cells:
         [kind] [time,date] \u2014 [channel] \u2014
-        [primary=N downloaded]  [secondary=N transcribed]
-        [tertiary=N metadata]   [errors=N errors] [took=took X]
-    Per Scott: `downloaded` is ALWAYS numeric. `transcribed` and
+        [primary=N downloaded] [secondary=N transcribed]
+        [tertiary=N metadata] [errors=N errors] [took=took X]
+    Per `downloaded` is ALWAYS numeric. `transcribed` and
     `metadata` use a \u2713 check when their count is exactly 1.
     Persisted string body is 5 bullets:
         N downloaded \u00b7 <N|\u2713> transcribed \u00b7 <N|\u2713> metadata \u00b7 N errors \u00b7 took X
@@ -1607,19 +1607,19 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
                 else now.strftime("%I:%M%p").lstrip("0")).lower()
     date_str = now.strftime("%b %d").replace(" 0", " ")
     took = _fmt_duration(elapsed)
-    primary_s   = f"{int(downloaded or 0)} downloaded"
+    primary_s = f"{int(downloaded or 0)} downloaded"
     secondary_s = _count_cell(int(transcribed or 0), "transcribed")
-    tertiary_s  = _count_cell(int(metadata or 0), "metadata")
+    tertiary_s = _count_cell(int(metadata or 0), "metadata")
     stream.emit_activity({
-        "kind":      kind,
+        "kind": kind,
         "time_date": f"{time_str}, {date_str}",
-        "channel":   channel_name,
-        "primary":   primary_s,
+        "channel": channel_name,
+        "primary": primary_s,
         "secondary": secondary_s,
-        "tertiary":  tertiary_s,
-        "errors":    f"{errors} errors",
-        "took":      f"took {took}",
-        "row_tag":   "hist_green" if downloaded > 0 else "",
+        "tertiary": tertiary_s,
+        "errors": f"{errors} errors",
+        "took": f"took {took}",
+        "row_tag": "hist_green" if downloaded > 0 else "",
     })
     # Persist directly (bypassing format_history_entry so the checkmark
     # forms round-trip cleanly instead of being truncated to "0" by
@@ -1628,14 +1628,14 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
     try:
         from . import autorun as _ar
         kind_tag = f"[{kind.center(6)}]" if len(kind) < 6 else f"[{kind}]"
-        ts_date  = f"{time_str}, {date_str}".ljust(16)
-        ch_part  = f"  {channel_name}  \u2014" if channel_name else " " * 7
-        body     = (f"{primary_s:<14} \u00b7 "
+        ts_date = f"{time_str}, {date_str}".ljust(16)
+        ch_part = f" {channel_name} \u2014" if channel_name else " " * 7
+        body = (f"{primary_s:<14} \u00b7 "
                     f"{secondary_s:<15} \u00b7 "
                     f"{tertiary_s:<13} \u00b7 "
                     f"{int(errors or 0)} errors \u00b7 "
                     f"took {took}")
-        line = f"{kind_tag} {ts_date} \u2014{ch_part}  {body}"
+        line = f"{kind_tag} {ts_date} \u2014{ch_part} {body}"
         _ar.append_history_entry(line)
     except Exception:
         pass
@@ -1651,14 +1651,14 @@ def _record_recent_download(filepath: str, channel: str, title: str,
     without garbling the Recent tab columns.
 
     OLD schema (what we MUST write):
-      title        str
-      channel      str
-      date         str  "YYYYMMDD" — upload date, NOT formatted
-      size         str  raw bytes count as a string, e.g. "1234567"
-      duration     str  raw seconds as a string, e.g. "383"
-      filepath     str
-      video_url    str
-      download_ts  float  unix timestamp
+      title str
+      channel str
+      date str "YYYYMMDD" — upload date, NOT formatted
+      size str raw bytes count as a string, e.g. "1234567"
+      duration str raw seconds as a string, e.g. "383"
+      filepath str
+      video_url str
+      download_ts float unix timestamp
     """
     if not filepath:
         return
@@ -1707,15 +1707,15 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                    if e.get("filepath") != filepath
                    and not (e.get("title") == title and e.get("channel") == channel)]
         entries.insert(0, {
-            "title":       title or "",
-            "channel":     channel or "",
-            "date":        date_str,                    # YYYYMMDD — OLD shape
-            "size":        str(int(size_bytes)),        # raw bytes as string
-            "duration":    duration_s,                  # raw seconds as string
-            "filepath":    filepath,
-            "video_url":   (f"https://www.youtube.com/watch?v={video_id}"
+            "title": title or "",
+            "channel": channel or "",
+            "date": date_str, # YYYYMMDD — OLD shape
+            "size": str(int(size_bytes)), # raw bytes as string
+            "duration": duration_s, # raw seconds as string
+            "filepath": filepath,
+            "video_url": (f"https://www.youtube.com/watch?v={video_id}"
                             if video_id else ""),
-            "download_ts": time.time(),                 # unix float — OLD shape
+            "download_ts": time.time(), # unix float — OLD shape
         })
         cfg["recent_downloads"] = entries[:500]
         save_config(cfg)
@@ -1812,7 +1812,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     Sync every channel in config["channels"] sequentially.
 
     `pause_event`: while set, the loop blocks between channels (~0.5s poll).
-    `skip_event`:  if set mid-channel, the cancel_event is fired to kill the
+    `skip_event`: if set mid-channel, the cancel_event is fired to kill the
                    current yt-dlp subprocess; the outer loop then clears both
                    events and advances to the next channel. Total cancellation
                    still works via cancel_event directly.
@@ -1825,18 +1825,18 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         return {"ok": False, "reason": "no channels", "total": 0}
 
     # ENQUEUE DECISION:
-    #   - `add_downloads_from_config=True` (Sync Subbed) AND no
-    #     download tasks queued yet → add every subscribed channel as
-    #     a download task. `sync_enqueue` dedupes on (kind, url) so
-    #     pre-existing metadata tasks stay intact; downloads append
-    #     alongside.
-    #   - `add_downloads_from_config=False` (worker started just to
-    #     drain the queue, e.g. from `metadata_queue_all`) → never
-    #     touch the queue. Process whatever is there and stop.
-    #   - `add_downloads_from_config=True` BUT download tasks already
-    #     exist (paused-then-resumed Sync Subbed) → resume mode, keep
-    #     the existing queue as-is.
-    # Scott hit the bug where queuing 103 metadata tasks auto-fired the
+    # - `add_downloads_from_config=True` (Sync Subbed) AND no
+    # download tasks queued yet → add every subscribed channel as
+    # a download task. `sync_enqueue` dedupes on (kind, url) so
+    # pre-existing metadata tasks stay intact; downloads append
+    # alongside.
+    # - `add_downloads_from_config=False` (worker started just to
+    # drain the queue, e.g. from `metadata_queue_all`) → never
+    # touch the queue. Process whatever is there and stop.
+    # - `add_downloads_from_config=True` BUT download tasks already
+    # exist (paused-then-resumed Sync Subbed) → resume mode, keep
+    # the existing queue as-is.
+    # a user hit bug where queuing 103 metadata tasks auto-fired the
     # worker via sync_start_all, which in turn added 103 downloads —
     # "Sync pass starting (206 channels)" when he only asked for 103
     # metadata checks.
@@ -1941,7 +1941,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
 
     # QUEUE-DRIVEN LOOP (ports YTArchiver.py:19130-19144 exactly).
     # Pop from queues.sync until it's empty. No config iteration —
-    # that's the root-cause bug Scott hit where a resumed half-pass
+    # that's the root-cause bug hit where a resumed half-pass
     # would restart from A because the loop walked config instead of
     # the queue. `_processed` counts what we've done in THIS invocation;
     # `total` updates dynamically each iteration = processed + remaining.
@@ -2008,7 +2008,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # fetch_channel_metadata path. This is how metadata recheck
         # tasks become first-class queue citizens — visible in the
         # Sync Tasks popover, pausable, and cancellable via the same
-        # controls as downloads. Scott's rule: "every channel's
+        # controls as downloads. rule: "every channel's
         # metadata check should show as its own sync task."
         _ch_kind = (ch.get("kind") or "download").lower()
         if _ch_kind == "metadata":
@@ -2059,7 +2059,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # existing already saves.
         #
         # Gating mirrors YTArchiver.py:22984 exactly:
-        #   init_complete AND sync_complete AND mode == "full"
+        # init_complete AND sync_complete AND mode == "full"
         # The fast-path exists BECAUSE full-mode channels can't rely on
         # `--break-on-existing` doing the work alone after a bootstrap
         # (in case a mid-channel video is missing and needs backfill).
@@ -2089,9 +2089,9 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                            queues=queues, transcribe_mgr=transcribe_mgr,
                            pause_event=pause_event,
                            pass_idx=i, pass_total=total)
-        _dl  = int(res.get("downloaded", 0) or 0)
+        _dl = int(res.get("downloaded", 0) or 0)
         _err = int(res.get("errors", 0) or 0)
-        sum_dl  += _dl
+        sum_dl += _dl
         sum_err += _err
         # Detect "paused mid-download": pause_event set and the
         # readline loop bailed out. Put this channel back at the
@@ -2109,7 +2109,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                            summary="paused",
                            name_tag="simpleline", summary_tag="simpleline")
             _last_live["name"] = ""
-            _processed -= 1  # undo the count — will retry this one
+            _processed -= 1 # undo the count — will retry this one
             # Loop will hit _wait_if_paused() on next iter and block.
             continue
         # Replace the live row with a compact summary.

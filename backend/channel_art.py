@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 from .sync import find_yt_dlp, _find_cookie_source
 
 
-_CHANNEL_ART_REFRESH_DAYS = 30   # YTArchiver refreshes monthly
+_CHANNEL_ART_REFRESH_DAYS = 30 # YTArchiver refreshes monthly
 
 
 def _hide_folder_win(path: str) -> None:
@@ -228,7 +228,7 @@ def ensure_banner_thumb(folder_path: str, max_w: int = 640) -> Optional[str]:
     dst = os.path.join(folder_path, ".ChannelArt", "banner_small.jpg")
     if _make_thumb(src, dst, max_w):
         return dst
-    return src   # fall back to the original rather than breaking rendering
+    return src # fall back to the original rather than breaking rendering
 
 
 def ensure_avatar_thumb(folder_path: str, max_w: int = 128) -> Optional[str]:

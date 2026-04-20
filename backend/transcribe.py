@@ -8,9 +8,9 @@ Architecture (mirrors YTArchiver.py:9102 _start_whisper_process):
   - Progress + results stream via JSON on stdout
 
 Output file layout (must match YTArchiver.py for drop-in replacement):
-  {ch_name} Transcript.txt                     (no split)
-  {year}/{ch_name} {year} Transcript.txt        (year-split)
-  {year}/{MM Month}/{ch_name} {Month} {YY} Transcript.txt  (year+month split)
+  {ch_name} Transcript.txt (no split)
+  {year}/{ch_name} {year} Transcript.txt (year-split)
+  {year}/{MM Month}/{ch_name} {Month} {YY} Transcript.txt (year+month split)
 
   Entry format inside the .txt file (triple-newline separated):
     ===({title}), ({MM.DD.YYYY}), ({H:MM:SS}), ({SOURCE})===
@@ -62,7 +62,7 @@ def _hide_file_win(path: str) -> None:
     doesn't clutter Explorer views. Matches YTArchiver.py:8499."""
     if os.name == "nt":
         try:
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # FILE_ATTRIBUTE_HIDDEN
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02) # FILE_ATTRIBUTE_HIDDEN
         except Exception:
             pass
 
@@ -80,8 +80,8 @@ def _get_transcript_filename(ch_name: str, folder_path: str,
     if split_years and split_months and year and month:
         month_num = int(month) if isinstance(month, str) and str(month).isdigit() else month
         month_name_full = _MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown")
-        month_name = month_name_full.split(" ", 1)[1]   # "January"
-        yr_short = str(year)[-2:]                        # "24"
+        month_name = month_name_full.split(" ", 1)[1] # "January"
+        yr_short = str(year)[-2:] # "24"
         subfolder = os.path.join(folder_path, str(year), month_name_full)
         fname = f"{ch_name} {month_name} {yr_short} Transcript.txt"
         return (os.path.join(subfolder, fname), subfolder)
@@ -96,7 +96,7 @@ def _get_transcript_filename(ch_name: str, folder_path: str,
 
 def _get_jsonl_sidecar(txt_path: str) -> str:
     """Hidden JSONL sidecar next to a transcript .txt file.
-    Returns  .../.{ch_name} ... Transcript.jsonl  — matches YTArchiver.py:8490."""
+    Returns .../.{ch_name} ... Transcript.jsonl — matches YTArchiver.py:8490."""
     dirname = os.path.dirname(txt_path)
     basename = os.path.basename(txt_path)
     root_name, _ = os.path.splitext(basename)
@@ -119,7 +119,7 @@ def _format_duration_hms(secs: float) -> str:
     if total <= 0:
         return ""
     h, rem = divmod(total, 3600)
-    m, s   = divmod(rem, 60)
+    m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
@@ -161,15 +161,15 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
         for seg in segments:
             # Accept either short-form (s/e/t/w) or long-form (start/end/text/words)
             s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
-            e = seg.get("end")   if "end"   in seg else seg.get("e", 0.0)
-            t = seg.get("text")  if "text"  in seg else seg.get("t", "")
+            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
+            t = seg.get("text") if "text" in seg else seg.get("t", "")
             raw_words = seg.get("words") if "words" in seg else seg.get("w")
             entry = {
                 "video_id": video_id or "",
-                "title":    title,
-                "start":    round(float(s or 0), 2),
-                "end":      round(float(e or 0), 2),
-                "text":     t or "",
+                "title": title,
+                "start": round(float(s or 0), 2),
+                "end": round(float(e or 0), 2),
+                "text": t or "",
             }
             if raw_words:
                 # Normalize word records to long-form too (OLD uses "w"/"s"/"e" inside
@@ -229,9 +229,9 @@ def _write_transcript_entry(txt_path: str, title: str,
     try:
         os.makedirs(os.path.dirname(txt_path), exist_ok=True)
         date_fmt = _format_upload_date(upload_date or "")
-        dur_raw  = _format_duration_hms(duration_secs or 0) or ""
-        dur_fmt  = f"({dur_raw})" if dur_raw else "(Unknown length)"
-        src_fmt  = source_tag if source_tag.startswith("(") else f"({source_tag})"
+        dur_raw = _format_duration_hms(duration_secs or 0) or ""
+        dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
+        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
         entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
         with open(txt_path, "a", encoding="utf-8") as f:
             f.write(entry)
@@ -270,7 +270,7 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
     if os.name == "nt":
         try:
             _norm = os.path.normpath(jsonl_path)
-            ctypes.windll.kernel32.SetFileAttributesW(_norm, 0x80)  # NORMAL
+            ctypes.windll.kernel32.SetFileAttributesW(_norm, 0x80) # NORMAL
         except Exception:
             pass
         try:
@@ -288,8 +288,8 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
 
     kept: List[str] = []
     removed_titles: set = set()
-    vid_norm  = (video_id or "").strip()
-    tit_norm  = (title or "").strip()
+    vid_norm = (video_id or "").strip()
+    tit_norm = (title or "").strip()
     for line in old_lines:
         ls = line.strip()
         if not ls:
@@ -297,12 +297,12 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
         try:
             obj = json.loads(ls)
             seg_title = (obj.get("title") or "").strip()
-            seg_vid   = (obj.get("video_id") or "").strip()
+            seg_vid = (obj.get("video_id") or "").strip()
             if (seg_title and seg_title == tit_norm) or \
                (vid_norm and seg_vid == vid_norm):
                 if seg_title:
                     removed_titles.add(seg_title)
-                continue  # drop this line
+                continue # drop this line
         except Exception:
             pass
         kept.append(line if line.endswith("\n") else line + "\n")
@@ -361,7 +361,7 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
         new_content = content
         found_old = False
         date_fmt = "(Unknown date)"
-        dur_fmt  = "(Unknown length)"
+        dur_fmt = "(Unknown length)"
         captured = False
         for i in range(len(matches) - 1, -1, -1):
             m = matches[i]
@@ -372,7 +372,7 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
             if not captured:
                 # Matches group indices of _HEADER_RE: (title, date, dur, src)
                 date_fmt = m.group(2)
-                dur_fmt  = m.group(3)
+                dur_fmt = m.group(3)
                 captured = True
             new_content = new_content[:m.start()] + new_content[end:]
             found_old = True
@@ -458,7 +458,7 @@ def _resolve_transcript_paths(video_path: str, title: str,
     except Exception:
         folder_name = channel_name or ""
     # Base folder is the parent chain above the video
-    # (video is at  {base}/{folder}/.../ )
+    # (video is at {base}/{folder}/.../ )
     try:
         base_root = (ytarchiver_config_output_dir() or "").strip()
     except Exception:
@@ -479,7 +479,7 @@ def _resolve_transcript_paths(video_path: str, title: str,
             folder_path = os.path.dirname(os.path.dirname(os.path.abspath(video_path)))
     else:
         folder_path = os.path.join(base_root, folder_name)
-    split_years  = bool(ch.get("split_years"))
+    split_years = bool(ch.get("split_years"))
     split_months = bool(ch.get("split_months"))
     # mtime → upload date
     try:
@@ -491,9 +491,9 @@ def _resolve_transcript_paths(video_path: str, title: str,
         now = datetime.now()
         year, month = now.year, now.month
     # combined rule:
-    #   override True  → always combined
-    #   override False → always per-year
-    #   override None  → legacy default: combined iff not split_years
+    # override True → always combined
+    # override False → always per-year
+    # override None → legacy default: combined iff not split_years
     if combined_override is True:
         _combined = True
     elif combined_override is False:
@@ -565,9 +565,9 @@ def _bump_transcription_pending(channel_name: str, delta: int) -> None:
 # Videos longer than this are split with ffmpeg before sending to Whisper
 # so RAM doesn't blow up. 30s overlap between chunks avoids mid-sentence
 # truncation; duplicate segments in the overlap zone are dropped on merge.
-_CHUNK_DURATION_SECS = 7200    # 2 hours per chunk
-_CHUNK_OVERLAP_SECS  = 30
-_CHUNK_MIN_DURATION  = 7800    # below this, do a single-pass transcribe
+_CHUNK_DURATION_SECS = 7200 # 2 hours per chunk
+_CHUNK_OVERLAP_SECS = 30
+_CHUNK_MIN_DURATION = 7800 # below this, do a single-pass transcribe
 
 # Module-level counter for per-job unique inplace tags. Every
 # transcription run (auto-captions or Whisper) gets a fresh
@@ -632,7 +632,7 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
         except Exception:
             pass
     if not vid_id:
-        return None  # can't probe without a video ID
+        return None # can't probe without a video ID
 
     base = os.path.splitext(video_path)[0]
     temp_base = base + ".__cap_probe"
@@ -710,7 +710,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     `job_tag` is the per-job unique inplace kind (e.g. `whisper_job_7`)
     that stamps every emit from this transcription so progress/done
     lines replace EACH OTHER within the job but never stomp another
-    job's lines. Scott reported David Pakman's 2-video transcription
+    job's lines. reported a high-video-count channel's 2-video transcription
     lines disappearing entirely — root cause was all emits sharing
     the generic `whisper_*` kind, so video 2's "Loading punctuation…"
     replaced video 1's "— ✓ Transcription" done line.
@@ -742,7 +742,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     if not vtt:
         vtt = _fetch_captions_via_ytdlp(video_path, stream, _fetched_temp)
         if vtt:
-            candidates.append(vtt)  # let the downstream cleanup delete it
+            candidates.append(vtt) # let the downstream cleanup delete it
 
     if not vtt:
         return False
@@ -796,7 +796,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
 
     # Append formatted entry to the aggregated .txt + hidden .jsonl.
     full_text = " ".join(s["t"] for s in segs if s.get("t")).strip()
-    duration  = segs[-1]["e"] if segs else 0
+    duration = segs[-1]["e"] if segs else 0
 
     # Punctuation restoration — mirrors OLD YTArchiver.py:15437-15439.
     # YT auto-captions arrive as a run-on stream of lowercase words;
@@ -818,7 +818,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                 _tag_list.append(job_tag)
             else:
                 _tag_list.append("whisper_progress")
-            stream.emit([["  Adding punctuation...\n", _tag_list]])
+            stream.emit([[" Adding punctuation...\n", _tag_list]])
             punct_text = punct_mgr.punctuate(full_text)
             if punct_text and punct_text != full_text:
                 full_text = punct_text
@@ -836,7 +836,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                             pass
                 src_tag = "YT+PUNCTUATION"
         except Exception as _pe:
-            stream.emit_dim(f"  (punctuation skipped: {_pe})")
+            stream.emit_dim(f" (punctuation skipped: {_pe})")
 
     _write_transcript_entry(txt_path, title, upload_date, duration,
                             src_tag, full_text)
@@ -869,10 +869,10 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     _dim_tag = ["dim", job_tag] if job_tag else "dim"
     _lbl_tag = ["simpleline_blue", job_tag] if job_tag else "simpleline_blue"
     stream.emit([
-        ["  ",                 _dim_tag],
-        ["\u2014 \u2713 ",     _em_tag],
-        ["Transcription",      _lbl_tag],
-        [f"  (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _dim_tag],
+        [" ", _dim_tag],
+        ["\u2014 \u2713 ", _em_tag],
+        ["Transcription", _lbl_tag],
+        [f" (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _dim_tag],
     ])
     return True
 
@@ -912,7 +912,7 @@ def _parse_vtt(path: str) -> list:
         return []
 
     # ── Step 1: Parse raw cues (text + original raw lines for <c> extraction) ──
-    raw_cues = []  # (start, end, joined_text, [raw_content_lines])
+    raw_cues = [] # (start, end, joined_text, [raw_content_lines])
     lines = raw.split("\n")
     current_start = None
     current_end = None
@@ -1176,7 +1176,7 @@ class PunctuationManager:
             _tags = ["transcribe_using"]
             _tags.append(self._job_tag if self._job_tag else "whisper_progress")
             self._stream.emit([[
-                "  Loading punctuation model...\n", _tags]])
+                " Loading punctuation model...\n", _tags]])
             env = os.environ.copy()
             self._proc = subprocess.Popen(
                 [py, str(self._worker_script)],
@@ -1205,7 +1205,7 @@ class PunctuationManager:
                 self._stream.emit_error(f"Punct start: {info}")
                 self._stop()
                 return False
-            self._stream.emit_text(f"  \u2014 \u2713 Punctuation model loaded ({info.get('device', '?').upper()}).",
+            self._stream.emit_text(f" \u2014 \u2713 Punctuation model loaded ({info.get('device', '?').upper()}).",
                                     "simpleline_green")
             return True
         except Exception as e:
@@ -1246,7 +1246,7 @@ class PunctuationManager:
                 return resp.get("text", text) or text
             return text
         except Exception as e:
-            self._stream.emit_dim(f"  (punctuation skipped: {e})")
+            self._stream.emit_dim(f" (punctuation skipped: {e})")
             # Subprocess may be wedged — kill so next call restarts cleanly
             self._stop()
             return text
@@ -1302,7 +1302,7 @@ class TranscribeManager:
         # Config-driven Auto gate. When autorun_gpu=False, new jobs sit
         # in the queue without firing. Checked each worker iteration so
         # toggling the Auto checkbox mid-pass takes effect between jobs.
-        self._cfg_loader = None  # set via attach_queues
+        self._cfg_loader = None # set via attach_queues
 
     def attach_queues(self, queues, cfg_loader=None) -> None:
         """Connect this manager to the shared QueueState.
@@ -1321,7 +1321,7 @@ class TranscribeManager:
         """
         s = self._batch_stats.get(channel_name) or {}
         return {"done": int(s.get("done", 0) or 0),
-                "err":  int(s.get("err",  0) or 0)}
+                "err": int(s.get("err", 0) or 0)}
 
     def consume_channel_batch_stats(self, channel_name: str) -> None:
         """Mark this channel's batch stats as already consumed by a
@@ -1367,7 +1367,7 @@ class TranscribeManager:
         except Exception:
             pass
         self._stream.emit_text(
-            f"  \u2014 Whisper model queued to swap to '{new_model}' "
+            f" \u2014 Whisper model queued to swap to '{new_model}' "
             f"on next job.", "simpleline_blue")
         return True
 
@@ -1387,12 +1387,12 @@ class TranscribeManager:
                 return False
             m = model or self._model
             self._stream.emit_text(
-                f"  Transcribing — Loading Whisper model ({m}) on GPU...",
+                f" Transcribing — Loading Whisper model ({m}) on GPU...",
                 "transcribe_using")
 
             env = os.environ.copy()
-            env["WHISPER_MODEL"]   = m
-            env["WHISPER_DEVICE"]  = "cuda"
+            env["WHISPER_MODEL"] = m
+            env["WHISPER_DEVICE"] = "cuda"
             env["WHISPER_COMPUTE"] = "float16"
 
             self._proc = subprocess.Popen(
@@ -1410,7 +1410,7 @@ class TranscribeManager:
                     pass
             t = threading.Thread(target=_read_ready, daemon=True)
             t.start()
-            t.join(timeout=600)  # 10 min for model download + load
+            t.join(timeout=600) # 10 min for model download + load
             if t.is_alive():
                 self._stream.emit_error("Whisper timed out loading model.")
                 self._stop_subprocess()
@@ -1434,11 +1434,11 @@ class TranscribeManager:
 
             dev = info.get("device", "?").upper()
             self._stream.emit_text(
-                f"  — \u2713 Whisper model loaded ({m}, {dev}).",
+                f" — \u2713 Whisper model loaded ({m}, {dev}).",
                 "simpleline_green")
             if info.get("cuda_fallback_reason"):
                 self._stream.emit_dim(
-                    f"    [CUDA fallback] Fell back to CPU: {info['cuda_fallback_reason']}")
+                    f" [CUDA fallback] Fell back to CPU: {info['cuda_fallback_reason']}")
 
             # Start the stdout reader thread
             self._line_queue = queue.Queue()
@@ -1500,9 +1500,9 @@ class TranscribeManager:
         <base>/<channel>/<file>).
 
         `combined` overrides the channel's split_years-based output split:
-          - None   : follow ch.split_years (OLD-compatible default)
-          - True   : write to one channel-root transcript even if organized
-          - False  : write per-year even if the channel isn't organized
+          - None : follow ch.split_years (OLD-compatible default)
+          - True : write to one channel-root transcript even if organized
+          - False : write per-year even if the channel isn't organized
 
         Matches OLD's "Follow organization / Combined" first-time dialog
         (YTArchiver.py:5919). See `chan_transcribe_all` Api for the
@@ -1532,7 +1532,7 @@ class TranscribeManager:
                 "video_id": (video_id or "").strip(),
             })
         # Mirror the job into the shared GPU queue so the Tasks popover
-        # shows the pending work. Scott flagged this: auto-transcribe on
+        # shows the pending work. this was flagged: auto-transcribe on
         # a channel would write to our internal `_jobs` list but the
         # popover stayed empty, so there was no visible record of the
         # transcription being queued. `kind=transcribe` + `title`
@@ -1542,7 +1542,7 @@ class TranscribeManager:
                 self._queues.gpu_enqueue({
                     "kind": "transcribe",
                     "title": _job_title,
-                    "path":  path,
+                    "path": path,
                     "channel": channel,
                 })
             except Exception:
@@ -1562,7 +1562,7 @@ class TranscribeManager:
         """Queue a video for AV1 NVENC compression via the same GPU
         worker that handles transcription.
 
-        Scott's rule: "the GPU task list whole purpose, especially with
+        rule: "the GPU task list whole purpose, especially with
         the auto checkbox, is almost like permission to bog down my
         computer." Standalone compress (right-click → Compress, Subs
         batch Compress) used to bypass the queue entirely and fire ffmpeg
@@ -1580,21 +1580,21 @@ class TranscribeManager:
         _job_title = title or os.path.splitext(os.path.basename(path))[0]
         with self._jobs_lock:
             self._jobs.append({
-                "kind":       "compress",
-                "path":       path,
-                "title":      _job_title,
-                "channel":    channel,
-                "quality":    quality,
+                "kind": "compress",
+                "path": path,
+                "title": _job_title,
+                "channel": channel,
+                "quality": quality,
                 "output_res": str(output_res),
-                "cb":         on_complete,
-                "cancel":     threading.Event(),
+                "cb": on_complete,
+                "cancel": threading.Event(),
             })
         if self._queues is not None:
             try:
                 self._queues.gpu_enqueue({
-                    "kind":    "compress",
-                    "title":   _job_title,
-                    "path":    path,
+                    "kind": "compress",
+                    "title": _job_title,
+                    "path": path,
                     "channel": channel,
                 })
             except Exception:
@@ -1751,15 +1751,15 @@ class TranscribeManager:
 
         while not self._cancel_all.is_set():
             # Two gates at the top of the loop before popping a job:
-            #   1. `_paused` — set by queue_pause("gpu") or disk-watchdog.
-            #      Parks the worker thread without draining the queue,
-            #      so tasks stay visible in the popover with "paused"
-            #      status. Matches OLD's _wait_if_paused pattern.
-            #   2. Auto-checkbox — when `autorun_gpu` is False, incoming
-            #      jobs sit in the queue without firing. Scott's rule:
-            #      "if the GPU task list auto box is unchecked and a
-            #      transcription task gets kicked over there, it
-            #      doesn't fire." We poll both every 250ms.
+            # 1. `_paused` — set by queue_pause("gpu") or disk-watchdog.
+            # Parks the worker thread without draining the queue,
+            # so tasks stay visible in the popover with "paused"
+            # status. Matches OLD's _wait_if_paused pattern.
+            # 2. Auto-checkbox — when `autorun_gpu` is False, incoming
+            # jobs sit in the queue without firing. rule:
+            # "if the GPU task list auto box is unchecked and a
+            # transcription task gets kicked over there, it
+            # doesn't fire." We poll both every 250ms.
             while (not self._cancel_all.is_set() and
                    (self._paused.is_set() or not self._auto_enabled())):
                 time.sleep(0.25)
@@ -1782,7 +1782,7 @@ class TranscribeManager:
                     self._queues.set_current_gpu({
                         "kind": _job_kind,
                         "title": job.get("title", ""),
-                        "path":  job.get("path",  ""),
+                        "path": job.get("path", ""),
                         "channel": job.get("channel", ""),
                     })
                 except Exception:
@@ -1856,7 +1856,7 @@ class TranscribeManager:
         channels (right-click \u2192 Transcribe on a channel/video).
 
         Sync-originated channels are skipped two ways:
-          (a) Scott's bug: fast auto-captions finish BEFORE sync_channel
+          (a) a bug: fast auto-captions finish BEFORE sync_channel
               ends, so we check `sync.is_sync_active(name)` and leave
               those stats in place — sync_channel will read+emit them
               when it finishes.
@@ -1883,12 +1883,12 @@ class TranscribeManager:
         # stats stay put for sync_channel to consume at its end.
         for ch_name in list(self._batch_stats.keys()):
             if _sync is not None and _sync.is_sync_active(ch_name):
-                continue   # leave for sync_channel to emit as [Dwnld]
+                continue # leave for sync_channel to emit as [Dwnld]
             s = self._batch_stats.pop(ch_name, None) or {}
             done = int(s.get("done", 0))
-            err  = int(s.get("err", 0))
+            err = int(s.get("err", 0))
             if done == 0 and err == 0:
-                continue   # no work actually happened
+                continue # no work actually happened
             elapsed = time.time() - float(s.get("start", time.time()))
             primary = f"{done} transcribed"
             try:
@@ -1900,21 +1900,21 @@ class TranscribeManager:
                 pass
             try:
                 self._stream.emit_activity({
-                    "kind":      "Trnscr",
+                    "kind": "Trnscr",
                     "time_date": f"{time_str}, {date_str}",
-                    "channel":   "" if ch_name == "\u2014" else ch_name,
-                    "primary":   primary,
+                    "channel": "" if ch_name == "\u2014" else ch_name,
+                    "primary": primary,
                     "secondary": "",
-                    "errors":    f"{err} errors",
-                    "took":      f"took {int(elapsed)}s" if elapsed < 60
+                    "errors": f"{err} errors",
+                    "took": f"took {int(elapsed)}s" if elapsed < 60
                                  else f"took {int(elapsed)//60}m {int(elapsed)%60}s",
-                    "row_tag":   "hist_blue" if done > 0 else "",
+                    "row_tag": "hist_blue" if done > 0 else "",
                 })
             except Exception:
                 pass
 
     def _transcribe_one(self, job: Dict[str, Any]):
-        path  = job["path"]
+        path = job["path"]
         title = job["title"]
         if job["cancel"].is_set():
             return
@@ -1968,7 +1968,7 @@ class TranscribeManager:
 
         # Auto-captions path missed — either no .vtt available, yt-dlp
         # couldn't fetch captions for this video, or the VTT parse came
-        # back empty. Scott flagged the silent-failure case: NO log
+        # back empty. was flagged the silent-failure case: NO log
         # line at all between "Metadata downloaded" and the next
         # channel's header. Emit a visible fallback line so the user
         # sees Whisper take over instead of the transcription just
@@ -1976,7 +1976,7 @@ class TranscribeManager:
         # final "— ✓ Transcription" done line replaces this too.
         if not job.get("retranscribe"):
             self._stream.emit([[
-                "  No auto-captions available \u2014 using Whisper\u2026\n",
+                " No auto-captions available \u2014 using Whisper\u2026\n",
                 ["transcribe_using", job_tag],
             ]])
 
@@ -2007,7 +2007,7 @@ class TranscribeManager:
             return
 
         # Progress line — ports OLD YTArchiver.py:11340 exactly:
-        #   "[1/1] Transcribing "<title>", 0%..."
+        # "[1/1] Transcribing "<title>", 0%..."
         # The whole line carries the `whisper_progress` tag, which the
         # JS inplace detector treats as a single replace-in-place line
         # — each pct tick overwrites the previous one. The `[1/1]`
@@ -2015,23 +2015,23 @@ class TranscribeManager:
         # can swap in a real idx/total. Title truncated to match OLD's
         # _trunc_pad_title visual width (40 chars).
         _disp_title = title[:40].rstrip()
-        _t_start = time.time()  # for the "[1/1] … — done (Ns)" line below
+        _t_start = time.time() # for the "[1/1] … — done (Ns)" line below
         def _emit_progress(pct, suffix=""):
             # All segments carry the per-job tag so every tick
             # replaces the previous tick for THIS video, and the
             # final done line replaces the last tick without
             # touching any OTHER video's transcription lines.
             self._stream.emit([
-                ["[",                    ["whisper_bracket", job_tag]],
-                ["1",                    ["whisper_prefix",  job_tag]],
-                ["/",                    ["whisper_bracket", job_tag]],
-                ["1",                    ["whisper_prefix",  job_tag]],
-                ["] ",                   ["whisper_bracket", job_tag]],
-                ["Transcribing",         [job_tag]],
-                [f' "{_disp_title}"',    [job_tag]],
-                [", ",                   [job_tag]],
-                [f"{pct}%",              ["whisper_pct", job_tag]],
-                [f"{suffix}...\n",       [job_tag]],
+                ["[", ["whisper_bracket", job_tag]],
+                ["1", ["whisper_prefix", job_tag]],
+                ["/", ["whisper_bracket", job_tag]],
+                ["1", ["whisper_prefix", job_tag]],
+                ["] ", ["whisper_bracket", job_tag]],
+                ["Transcribing", [job_tag]],
+                [f' "{_disp_title}"', [job_tag]],
+                [", ", [job_tag]],
+                [f"{pct}%", ["whisper_pct", job_tag]],
+                [f"{suffix}...\n", [job_tag]],
             ])
         _emit_progress(0)
 
@@ -2050,7 +2050,7 @@ class TranscribeManager:
         result = None
         while True:
             if job["cancel"].is_set() or self._cancel_all.is_set():
-                self._stream.emit_text("  \u26d4 Transcription cancelled.", "red")
+                self._stream.emit_text(" \u26d4 Transcription cancelled.", "red")
                 self._stop_subprocess()
                 return
             try:
@@ -2084,7 +2084,7 @@ class TranscribeManager:
                 if ("cuda" in low and ("out of memory" in low or "oom" in low)) or "cublas" in low:
                     self._stream.emit_error(f"Whisper CUDA error: {err}")
                     self._stream.emit_text(
-                        "  \u21A9 Falling back to CPU mode for this session.",
+                        " \u21A9 Falling back to CPU mode for this session.",
                         "simpleline_blue")
                     self._stop_subprocess(force=True)
                     # Force CPU on next start
@@ -2119,7 +2119,7 @@ class TranscribeManager:
                                     if pt:
                                         seg["t"] = pt
                 except Exception as _pe:
-                    self._stream.emit_dim(f"  (punctuation pass skipped: {_pe})")
+                    self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
             self._write_outputs(path, result, title=title, channel=channel,
                                 combined_override=job.get("combined_override"),
                                 retranscribe=bool(job.get("retranscribe")),
@@ -2131,10 +2131,10 @@ class TranscribeManager:
             _time_str = (f"{_elapsed // 60}min {_elapsed % 60:02d}sec"
                           if _elapsed >= 60 else f"{_elapsed}sec")
             self._stream.emit([
-                ["  ",                         ["dim", job_tag]],
-                ["\u2014 \u2713 ",             ["whisper_bracket", job_tag]],
-                ["Transcription",              ["simpleline_blue", job_tag]],
-                [f"  (took {_time_str})\n",    ["dim", job_tag]],
+                [" ", ["dim", job_tag]],
+                ["\u2014 \u2713 ", ["whisper_bracket", job_tag]],
+                ["Transcription", ["simpleline_blue", job_tag]],
+                [f" (took {_time_str})\n", ["dim", job_tag]],
             ])
             if job.get("cb"):
                 try:
@@ -2150,7 +2150,7 @@ class TranscribeManager:
         with timestamps offset, dropping duplicates in the overlap zone.
         """
         import tempfile as _tf
-        path  = job["path"]
+        path = job["path"]
         title = job["title"]
         channel = job.get("channel", "")
         cancel = job["cancel"]
@@ -2167,7 +2167,7 @@ class TranscribeManager:
         ])
 
         all_text_parts: List[str] = []
-        all_segments:   List[Dict[str, Any]] = []
+        all_segments: List[Dict[str, Any]] = []
         chunk_dir = _tf.mkdtemp(prefix="yt_whisper_chunk_")
         try:
             for ci in range(n_chunks):
@@ -2207,7 +2207,7 @@ class TranscribeManager:
                     continue
 
                 # Hand the chunk to Whisper via the persistent subprocess.
-                section_prefix = f"      Section {ci+1}/{n_chunks},"
+                section_prefix = f" Section {ci+1}/{n_chunks},"
                 t_start = time.time()
                 result = self._transcribe_single_file(chunk_path, job,
                                                       _log_prefix=section_prefix)
@@ -2217,7 +2217,7 @@ class TranscribeManager:
 
                 if not result:
                     self._stream.emit([
-                        [f"      Section {ci+1}/{n_chunks} \u2014 no speech\n", "simpleline"],
+                        [f" Section {ci+1}/{n_chunks} \u2014 no speech\n", "simpleline"],
                     ])
                     continue
 
@@ -2227,7 +2227,7 @@ class TranscribeManager:
                 te_str = f"{te_m}min {te_s:02d}sec" if te_m else f"{te_s}sec"
                 rt = f"{chunk_dur / t_elapsed:.1f}x realtime" if t_elapsed > 0 else ""
                 self._stream.emit([
-                    [f"      Section {ci+1}/{n_chunks} done "
+                    [f" Section {ci+1}/{n_chunks} done "
                      f"({cd_m}m{cd_s:02d}s, {te_str}, {rt})\n", "simpleline_blue"],
                 ])
 
@@ -2283,10 +2283,10 @@ class TranscribeManager:
             _dim_tag = ["dim", _job_tag_ch] if _job_tag_ch else "dim"
             _lbl_tag = ["simpleline_blue", _job_tag_ch] if _job_tag_ch else "simpleline_blue"
             self._stream.emit([
-                ["  ",                               _dim_tag],
-                ["\u2014 \u2713 ",                   _em_tag],
-                ["Transcription",                    _lbl_tag],
-                [f"  (chunked, took {_time_str_c})\n", _dim_tag],
+                [" ", _dim_tag],
+                ["\u2014 \u2713 ", _em_tag],
+                ["Transcription", _lbl_tag],
+                [f" (chunked, took {_time_str_c})\n", _dim_tag],
             ])
             if job.get("cb"):
                 try: job["cb"](merged)
@@ -2365,7 +2365,7 @@ class TranscribeManager:
         if not channel:
             # Channel = parent folder name (or parent-of-parent when year-split)
             parent = os.path.basename(os.path.dirname(video_path))
-            grand  = os.path.basename(os.path.dirname(os.path.dirname(video_path)))
+            grand = os.path.basename(os.path.dirname(os.path.dirname(video_path)))
             # Heuristic: if parent is a year like "2024" or matches "01 January",
             # the real channel is one level higher.
             if parent.isdigit() or " " in parent and parent.split(" ", 1)[0].isdigit():
@@ -2379,7 +2379,7 @@ class TranscribeManager:
         if paths is None:
             # Fall back to per-video sidecar in the video's folder (degraded).
             base = os.path.splitext(video_path)[0]
-            txt_path   = base + ".txt"
+            txt_path = base + ".txt"
             jsonl_path = base + ".jsonl"
             upload_date = ""
         else:
@@ -2390,11 +2390,11 @@ class TranscribeManager:
 
         # Extract video id — OLD-compat filenames don't carry the `[id]`
         # suffix so we can't rely on the filename alone. Try in order:
-        #   0. caller-supplied hint (retranscribe flow passes the id from
-        #      the Browse/watch view where it's already known)
-        #   1. `[videoId]` suffix on filename (legacy + mixed archives)
-        #   2. FTS DB `videos` table keyed by filepath (populated by sync's
-        #      DLTRACK line — this is the reliable path for drop-in mode)
+        # 0. caller-supplied hint (retranscribe flow passes the id from
+        # the Browse/watch view where it's already known)
+        # 1. `[videoId]` suffix on filename (legacy + mixed archives)
+        # 2. FTS DB `videos` table keyed by filepath (populated by sync's
+        # DLTRACK line — this is the reliable path for drop-in mode)
         vid_id = (video_id_hint or "").strip()
         if not vid_id:
             stem = os.path.splitext(os.path.basename(video_path))[0]
@@ -2421,14 +2421,14 @@ class TranscribeManager:
         # whisper_worker.py's response dict doesn't include "model"
         # (which it doesn't — only status/text/segments come back).
         # Without this, the Watch view banner shows just "Whisper
-        # transcription" with no model name. Scott flagged this.
+        # transcription" with no model name. this was flagged
         model_name = (result.get("model") or self._model or "").strip()
         source_tag = f"(WHISPER:{model_name})" if model_name else "(WHISPER)"
         # Diagnostic — emit the tag we're about to write so we can
         # confirm it landed correctly. Visible in Verbose log mode.
         try:
             self._stream.emit_dim(
-                f"  (writing transcript source_tag={source_tag!r})")
+                f" (writing transcript source_tag={source_tag!r})")
         except Exception:
             pass
 
@@ -2469,7 +2469,7 @@ class TranscribeManager:
             _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
             _idx.mark_video_transcribed(video_path)
         except Exception as e:
-            self._stream.emit_dim(f"  (index ingest skipped: {e})")
+            self._stream.emit_dim(f" (index ingest skipped: {e})")
         # Decrement transcription_pending / set transcription_complete on 0.
         # Matches YTArchiver.py:14629-14630. Skip the decrement on
         # retranscribe — it wasn't incremented when the Re-transcribe

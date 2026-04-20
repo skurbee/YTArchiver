@@ -7,9 +7,9 @@ get moved into <channel>/<year>/ if split_years, and
 <channel>/<year>/<Month>/ if split_months.
 
 Three modes:
-  - reorg_none(channel_folder)          flatten back to one folder
-  - reorg_years(channel_folder)         split into yyyy/
-  - reorg_months(channel_folder)        split into yyyy/MonthName/
+  - reorg_none(channel_folder) flatten back to one folder
+  - reorg_years(channel_folder) split into yyyy/
+  - reorg_months(channel_folder) split into yyyy/MonthName/
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     dst = target_dir / video.name
     if dst.exists():
-        stream.emit_dim(f"  [skip] already exists at destination: {video.name}")
+        stream.emit_dim(f" [skip] already exists at destination: {video.name}")
         return False
     sidecars = _sidecars_for(video)
     try:
@@ -202,14 +202,14 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     if not root.is_dir():
         return {"ok": False, "error": "folder not found"}
 
-    stream.emit([["[Reorg]  ", "reorg_bracket"],
+    stream.emit([["[Reorg] ", "reorg_bracket"],
                  [f"{root.name} \u2014 ", "simpleline_reorg"],
                  [f"years={split_years} months={split_months}"
                   f"{' (recheck dates)' if recheck_dates else ''}\n", "simpleline"]])
 
     videos = _gather_video_files(root)
     if not videos:
-        stream.emit_dim("  (no video files found)")
+        stream.emit_dim(" (no video files found)")
         return {"ok": True, "moved": 0, "skipped": 0}
 
     moved = 0
@@ -220,7 +220,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
 
     for i, video in enumerate(videos, 1):
         if cancel_event is not None and cancel_event.is_set():
-            stream.emit_text("  \u26d4 Reorg cancelled.", "red")
+            stream.emit_text(" \u26d4 Reorg cancelled.", "red")
             break
         # Determine target dir based on split flags
         d = None
@@ -254,7 +254,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         if _move_video(video, target, stream):
             moved += 1
             if moved % 25 == 0:
-                stream.emit_dim(f"  \u2014 {moved} moved so far...")
+                stream.emit_dim(f" \u2014 {moved} moved so far...")
         else:
             errors += 1
 
@@ -265,7 +265,7 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     if recheck_dates:
         sec_bits.append(f"{redated} dates fixed")
     sec_bits.append(f"{errors} errors \u00b7 took {took:.1f}s")
-    stream.emit([["  \u2713 ", "simpleline_green"],
+    stream.emit([[" \u2713 ", "simpleline_green"],
                  [f"Reorg done: ", "simpleline"],
                  [" \u00b7 ".join(sec_bits) + "\n", "simpleline_reorg"]])
 

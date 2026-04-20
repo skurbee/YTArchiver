@@ -20,7 +20,7 @@
   // pattern where whisper_progress / encode_progress lines replace in-place.
   const INPLACE_TAGS = new Set([
     "whisper_progress", "whisper_pct", "whisper_dots",
-    "encode_progress",  "encode_pct",  "encode_dots",
+    "encode_progress", "encode_pct", "encode_dots",
     "startup_loading",
   ]);
 
@@ -36,7 +36,7 @@
     // and the done line (tagged `["dim", "whisper_job_7"]`) returns
     // "whisper_job_7" — different kinds, so the progress 99% line
     // never gets replaced by the "\u2713 Transcription" done line.
-    // Scott: "99% progress line stuck". Pass 1 scans every segment's
+    // "99% progress line stuck". Pass 1 scans every segment's
     // every tag for a per-job/per-row match; pass 2 falls back to the
     // prefix-family match if none found.
     const segs = segments || [];
@@ -47,9 +47,9 @@
       const tag = seg[1];
       const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
       for (const t of tags) {
-        if (t && t.startsWith("whisper_job_"))  return t;
-        if (t && t.startsWith("sync_row_"))     return t;
-        if (t && t.startsWith("dlrow_"))        return t;
+        if (t && t.startsWith("whisper_job_")) return t;
+        if (t && t.startsWith("sync_row_")) return t;
+        if (t && t.startsWith("dlrow_")) return t;
       }
     }
 
@@ -59,9 +59,9 @@
       const tag = seg[1];
       const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
       for (const t of tags) {
-        if (t && t.startsWith("whisper_"))      return "whisper";
-        if (t && t.startsWith("encode_"))       return "encode";
-        if (t && t.startsWith("startup_"))      return "startup";
+        if (t && t.startsWith("whisper_")) return "whisper";
+        if (t && t.startsWith("encode_")) return "encode";
+        if (t && t.startsWith("startup_")) return "startup";
       }
     }
     return null;
@@ -183,44 +183,44 @@
   // ─── Public API ──────────────────────────────────────────────────────
 
   /** Build one grid-aligned activity-log row.
-   *  Coloring rule (matches the real YTArchiver screenshot): ONLY the
-   *  [Kind] tag and the primary "N replaced / N fetched / N downloaded"
-   *  cell get the tag color. Time, channel, em-dashes, skipped, errors,
-   *  took all stay default. */
+   * Coloring rule (matches the real YTArchiver screenshot): ONLY the
+   * [Kind] tag and the primary "N replaced / N fetched / N downloaded"
+   * cell get the tag color. Time, channel, em-dashes, skipped, errors,
+   * took all stay default. */
   // Inline regex-highlight map for autorun history cells — mirrors
   // YTArchiver.py:22290-22369 _insert_hist_line inline-color rules:
-  //   "N downloaded"  → green
-  //   "N transcribed" → blue
-  //   "N replaced"    → chartreuse (redwnl)
-  //   "N compressed"  → purple
-  //   "N moved"       → orange (reorg)
-  //   "N fetched"     → pink
-  //   "N skipped"     → amber (uses c-log-sum)
-  //   "N errors?"     → red
+  // "N downloaded" → green
+  // "N transcribed" → blue
+  // "N replaced" → chartreuse (redwnl)
+  // "N compressed" → purple
+  // "N moved" → orange (reorg)
+  // "N fetched" → pink
+  // "N skipped" → amber (uses c-log-sum)
+  // "N errors?" → red
   // Only match non-zero counts — "0 skipped" / "0 errors" should stay dim
   // default color (matches YTArchiver.py _insert_hist_line behavior: tags
   // are only applied when the count is > 0).
   // Each pattern has a numeric form AND a checkmark form. The checkmark
-  // form fires when a cell represents exactly 1 of something (Scott's
+  // form fires when a cell represents exactly 1 of something (
   // polish: "if it's just one, can we change the numbers to checkmarks").
   // `\b` won't assert a word boundary before \u2713 (non-word char), so
   // the checkmark regex drops the leading boundary and relies on the
   // label's `\b` on the right side to bound the match.
   const _HIST_HILITE = [
-    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi,                "t-hist_green"],
-    [/(\u2713)\s+(downloaded|new)\b/gi,                    "t-hist_green"],
-    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi,         "t-hist_blue"],
-    [/(\u2713)\s+(transcribed|captions?)\b/gi,             "t-hist_blue"],
-    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi,               "t-hist_redwnl"],
-    [/(\u2713)\s+(replaced|remade)\b/gi,                   "t-hist_redwnl"],
-    [/\b([1-9]\d*)\s+(compressed)\b/gi,                    "t-hist_compress"],
-    [/(\u2713)\s+(compressed)\b/gi,                        "t-hist_compress"],
-    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi,                 "t-hist_reorg"],
-    [/(\u2713)\s+(moved|reorged)\b/gi,                     "t-hist_reorg"],
-    [/\b([1-9]\d*)\s+(fetched|refreshed|metadata)\b/gi,    "t-hist_pink"],
-    [/(\u2713)\s+(fetched|refreshed|metadata)\b/gi,        "t-hist_pink"],
-    [/\b([1-9]\d*)\s+skipped\b/gi,                         "t-hist_skipped"],
-    [/\b([1-9]\d*)\s+errors?\b/gi,                         "t-hist_error"],
+    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi, "t-hist_green"],
+    [/(\u2713)\s+(downloaded|new)\b/gi, "t-hist_green"],
+    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
+    [/(\u2713)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
+    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
+    [/(\u2713)\s+(replaced|remade)\b/gi, "t-hist_redwnl"],
+    [/\b([1-9]\d*)\s+(compressed)\b/gi, "t-hist_compress"],
+    [/(\u2713)\s+(compressed)\b/gi, "t-hist_compress"],
+    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
+    [/(\u2713)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
+    [/\b([1-9]\d*)\s+(fetched|refreshed|metadata)\b/gi, "t-hist_pink"],
+    [/(\u2713)\s+(fetched|refreshed|metadata)\b/gi, "t-hist_pink"],
+    [/\b([1-9]\d*)\s+skipped\b/gi, "t-hist_skipped"],
+    [/\b([1-9]\d*)\s+errors?\b/gi, "t-hist_error"],
   ];
 
   function _buildHistCell(text, extra, colored, tagCls) {
@@ -286,15 +286,15 @@
     // rows — `N metadata`. Classic rows (Trnscr, Metdta, etc.) leave it
     // empty so the grid just renders a blank cell there.
     line.appendChild(cell(`[${c.kind || ""}]`, "hist-col-kind", true));
-    line.appendChild(cell(c.time_date || "", "hist-col-time",    false));
-    line.appendChild(cell("\u2014",           "hist-col-dash",    false));
-    line.appendChild(cell(c.channel || "",    "hist-col-channel", false));
-    line.appendChild(cell("\u2014",           "hist-col-dash",    false));
-    line.appendChild(cell(c.primary || "",    "hist-col-num",     true));
+    line.appendChild(cell(c.time_date || "", "hist-col-time", false));
+    line.appendChild(cell("\u2014", "hist-col-dash", false));
+    line.appendChild(cell(c.channel || "", "hist-col-channel", false));
+    line.appendChild(cell("\u2014", "hist-col-dash", false));
+    line.appendChild(cell(c.primary || "", "hist-col-num", true));
     line.appendChild(_buildHistCell(c.secondary || "", "hist-col-num", false, tagCls));
-    line.appendChild(_buildHistCell(c.tertiary || "",  "hist-col-num", false, tagCls));
-    line.appendChild(_buildHistCell(c.errors   || "", "hist-col-num", false, tagCls));
-    line.appendChild(cell(c.took || "",       "hist-col-took",    false));
+    line.appendChild(_buildHistCell(c.tertiary || "", "hist-col-num", false, tagCls));
+    line.appendChild(_buildHistCell(c.errors || "", "hist-col-num", false, tagCls));
+    line.appendChild(cell(c.took || "", "hist-col-took", false));
     return line;
   }
 
@@ -328,13 +328,13 @@
 
   // ── Mini-log mirror ─────────────────────────────────────────────────
   // Project rule: "MINI LOGS SHOULD ALWAYS SHOW EXACTLY WHAT THE MAIN LOG
-  // SHOWS. NO DISCREPANCIES."  Instead of maintaining a parallel append
+  // SHOWS. NO DISCREPANCIES." Instead of maintaining a parallel append
   // buffer (which drifts when the main log removes lines in-place, e.g.
   // clearStartupLine, whisper_progress replacements), we snapshot the last
   // N lines of the main log into each mini after every mutation.
   const MINI_LOG_IDS = ["subs-mini-log", "browse-mini-log",
                         "recent-mini-log", "settings-mini-log"];
-  const MINI_LINES   = 5;
+  const MINI_LINES = 5;
 
   function mirrorMiniLogs() {
     const main = document.getElementById("main-log");
@@ -385,7 +385,7 @@
       // inline trim marker. Re-emits periodically if trimming continues.
       const existing = el.querySelector(".log-line.log-trim-warn");
       if (existing) existing.remove();
-      const warn = buildLine([["  \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
       warn.classList.add("log-trim-warn");
       el.insertBefore(warn, el.firstChild);
     }
@@ -394,7 +394,7 @@
   };
 
   /** Append to a mini log (by element id). NO-OP — kept for backward-compat.
-   *  Mini logs are now a pure mirror of the last 5 main-log lines. */
+   * Mini logs are now a pure mirror of the last 5 main-log lines. */
   window.appendMiniLog = function () {};
 
   /** Clear a log container. */
@@ -406,11 +406,11 @@
   };
 
   /** Batched log delivery from Python. Called by LogStreamer.
-   *  payload = { main: [ [segments], [segments], ... ],
-   *              activity: [ { cells, alt }, ... ] }
-   *  Special segment tags signal in-place replacement:
-   *   - "whisper_progress" or "encode_progress" → replace the previous
-   *     line carrying that same tag (so progress bar ticks in place). */
+   * payload = { main: [ [segments], [segments], ... ],
+   * activity: [ { cells, alt }, ... ] }
+   * Special segment tags signal in-place replacement:
+   * - "whisper_progress" or "encode_progress" → replace the previous
+   * line carrying that same tag (so progress bar ticks in place). */
   window._logBatch = function (payload) {
     if (!payload) return;
     if (Array.isArray(payload.main) && payload.main.length) {
@@ -463,7 +463,7 @@
           // Inline trim warning, same pattern as appendMainLog.
           const existing = el.querySelector(".log-line.log-trim-warn");
           if (existing) existing.remove();
-          const warn = buildLine([["  \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+          const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
           warn.classList.add("log-trim-warn");
           el.insertBefore(warn, el.firstChild);
         }
@@ -494,7 +494,7 @@
   window.renderSubsTable = function (rows, totalLabel) {
     const tbody = document.getElementById("subs-table-body");
     if (!tbody) return;
-    window._subsAllRows = rows;          // keep a copy for the filter
+    window._subsAllRows = rows; // keep a copy for the filter
     _renderSubsFiltered(rows);
     const totalEl = document.getElementById("subs-total-size");
     if (totalEl && totalLabel) totalEl.textContent = totalLabel;
@@ -552,9 +552,9 @@
   };
 
   /** Render the Recent tab downloads. Dispatches between the legacy
-   *  table ("list") and the thumbnail grid ("grid") based on the
-   *  user's setting (cached on window._recentViewMode, set by
-   *  window._applyRecentViewMode — default "list"). */
+   * table ("list") and the thumbnail grid ("grid") based on the
+   * user's setting (cached on window._recentViewMode, set by
+   * window._applyRecentViewMode — default "list"). */
   window.renderRecentTable = function (rows) {
     window._recentAllRows = rows || [];
     _dispatchRecent(window._recentAllRows);
@@ -604,7 +604,7 @@
     for (const r of rows) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="col-title"   title="${escapeAttr(r.title)}">${escapeHtml(r.title)}</td>
+        <td class="col-title" title="${escapeAttr(r.title)}">${escapeHtml(r.title)}</td>
         <td class="col-channel">${escapeHtml(r.channel)}</td>
         <td class="col-time">${escapeHtml(r.time)}</td>
         <td class="col-length right">${escapeHtml(r.duration)}</td>
@@ -612,16 +612,16 @@
       `;
       // Stash the full row data so handlers can reach filepath/video_id/etc.
       tr.dataset.filepath = r.filepath || "";
-      tr.dataset.videoId  = r.video_id || "";
-      tr.dataset.title    = r.title || "";
-      tr.dataset.channel  = r.channel || "";
+      tr.dataset.videoId = r.video_id || "";
+      tr.dataset.title = r.title || "";
+      tr.dataset.channel = r.channel || "";
       tr.title = "Double-click to play in Watch view";
       // Double-click opens the video in the embedded Watch view with transcript
       tr.addEventListener("dblclick", (e) => {
         e.preventDefault();
         const v = {
-          title:    tr.dataset.title,
-          channel:  tr.dataset.channel,
+          title: tr.dataset.title,
+          channel: tr.dataset.channel,
           filepath: tr.dataset.filepath,
           video_id: tr.dataset.videoId,
           duration: r.duration || "",
@@ -644,10 +644,10 @@
 
     // Show/hide Clear list + Delete File buttons based on rows
     const hasItems = allRows.length > 0;
-    const clearBtn  = document.getElementById("btn-clear-recent");
-    const delBtn    = document.getElementById("btn-delete-file");
+    const clearBtn = document.getElementById("btn-clear-recent");
+    const delBtn = document.getElementById("btn-delete-file");
     if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
-    if (delBtn)   delBtn.style.display   = "none"; // revealed when a row is selected
+    if (delBtn) delBtn.style.display = "none"; // revealed when a row is selected
 
     let lastClickedIdx = -1;
     allRows.forEach((tr, idx) => {
@@ -683,8 +683,8 @@
   // have it either; users who need bulk-delete can flip back to List.
   //
   // Click behavior mirrors the Browse grid:
-  //   - single-click → open in Watch view (embedded player + transcript)
-  //   - double-click → open in external player (VLC / system default)
+  // - single-click → open in Watch view (embedded player + transcript)
+  // - double-click → open in external player (VLC / system default)
   //
   // The Delete File button depends on selection and is therefore hidden
   // in this mode; Clear list remains functional.
@@ -695,20 +695,20 @@
     // _buildVideoCard was made public earlier in this file; fall back to
     // a plain-text row if somehow it's missing so the view isn't blank.
     const build = window._buildVideoCard;
-    const frag  = document.createDocumentFragment();
+    const frag = document.createDocumentFragment();
     for (const r of rows) {
       const v = {
-        title:         r.title || "",
-        channel:       r.channel || "",
-        filepath:      r.filepath || "",
-        video_id:      r.video_id || "",
-        duration:      r.duration || "",
-        uploaded:      r.uploaded || r.time || "",
-        size_bytes:    r.size_bytes || 0,
+        title: r.title || "",
+        channel: r.channel || "",
+        filepath: r.filepath || "",
+        video_id: r.video_id || "",
+        duration: r.duration || "",
+        uploaded: r.uploaded || r.time || "",
+        size_bytes: r.size_bytes || 0,
         thumbnail_url: r.thumbnail_url || "",
         // Recent is a cross-channel view — force the channel line on so
         // every card identifies its channel (Browse cards don't need it).
-        show_channel:  true,
+        show_channel: true,
       };
       if (!build) {
         const d = document.createElement("div");
@@ -732,19 +732,19 @@
 
     // Button visibility — Clear list follows "has items", Delete File is
     // hidden in grid mode since there's no card-selection UX.
-    const hasItems  = rows.length > 0;
-    const clearBtn  = document.getElementById("btn-clear-recent");
-    const delBtn    = document.getElementById("btn-delete-file");
+    const hasItems = rows.length > 0;
+    const clearBtn = document.getElementById("btn-clear-recent");
+    const delBtn = document.getElementById("btn-delete-file");
     if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
-    if (delBtn)   delBtn.style.display   = "none";
+    if (delBtn) delBtn.style.display = "none";
   }
 
   /** Render the queue popovers for Sync Tasks + GPU Tasks. */
   window.renderQueues = function (queues) {
     renderTaskList("sync-tasks-body", queues.sync, "No sync tasks queued.", "sync");
-    renderTaskList("gpu-tasks-body",  queues.gpu,  "No GPU tasks queued.",  "gpu");
+    renderTaskList("gpu-tasks-body", queues.gpu, "No GPU tasks queued.", "gpu");
     _updateBadge("badge-sync", (queues.sync || []).length);
-    _updateBadge("badge-gpu",  (queues.gpu  || []).length);
+    _updateBadge("badge-gpu", (queues.gpu || []).length);
   };
 
   function _updateBadge(id, n) {
@@ -766,7 +766,7 @@
   // Mirrors OLD's dynamic-label mutation (YTArchiver.py:5596 _chan_ctx_menu).
   window._queueStateSnapshot = () => ({
     sync: _queueState.sync.slice(),
-    gpu:  _queueState.gpu.slice(),
+    gpu: _queueState.gpu.slice(),
   });
   // Convenience: does `channelName` have a sync queued? (running or queued)
   window._queueHasSyncForChannel = (channelName) => {
@@ -778,7 +778,7 @@
     };
     for (const t of _queueState.sync) {
       const s = match(t);
-      if (s) return s;   // "running" | "queued"
+      if (s) return s; // "running" | "queued"
     }
     return null;
   };
@@ -816,13 +816,13 @@
 
       const stateGlyph =
         statusCls === "running" ? "\u25B6" :
-        statusCls === "paused"  ? "\u275A\u275A" :
+        statusCls === "paused" ? "\u275A\u275A" :
                                   "\u25CB";
 
       // Color the verb (Downloading/Transcribing/Metadata) in tag color
       const nameHtml = colorizeTaskName(t.name);
 
-      // Cycling dots after the active task's name ("..."/".. "/".  ") —
+      // Cycling dots after the active task's name ("..."/".. "/". ") —
       // pure CSS animation via ::after content keyframes. Matches
       // YTArchiver.py:20131 _active_label cycling dots.
       const dotsSpan = statusCls === "running" ? '<span class="queue-task-dots"></span>' : "";
@@ -875,7 +875,7 @@
                     "Cancel the current job and move to the next one in queue?")));
               if (!ok) return;
               if (queueKind === "sync") api?.sync_skip_current?.();
-              else                      api?.gpu_skip_current?.();
+              else api?.gpu_skip_current?.();
             }});
         }
         items.push(
@@ -895,7 +895,7 @@
             cls: "dim",
             action: async () => {
               const title = statusCls === "running" ? "Cancel task" : "Remove from queue";
-              const msg   = statusCls === "running"
+              const msg = statusCls === "running"
                 ? `Cancel "${taskLabel}"?\n\nThe current job will stop.`
                 : `Remove "${taskLabel}" from the queue?`;
               const ok = await (window.askConfirm
@@ -958,21 +958,21 @@
     // Both present-continuous (running) and plain-verb (queued) forms.
     // Longer verbs listed first so "Redownloading" isn't matched by "Download".
     const verbs = [
-      ["Redownloading",  "qv-redwnl"],    // chartreuse #c7e64f
-      ["Redownload",     "qv-redwnl"],
-      ["Downloading",    "qv-sync"],      // green  #3dd68c
-      ["Download",       "qv-sync"],
-      ["Transcribing",   "qv-trans"],     // blue   #6cb4ee
-      ["Transcribe",     "qv-trans"],
-      ["Metadata",       "qv-meta"],      // pink   #e87aac
-      ["Compressing",    "qv-compress"],  // purple #c084fc
-      ["Compress",       "qv-compress"],
-      ["Encoding",       "qv-compress"],
-      ["Encode",         "qv-compress"],
-      ["Moving",         "qv-reorg"],     // orange #ff8c42
-      ["Reorg",          "qv-reorg"],
-      ["Syncing",        "qv-sync"],
-      ["Sync",           "qv-sync"],
+      ["Redownloading", "qv-redwnl"], // chartreuse #c7e64f
+      ["Redownload", "qv-redwnl"],
+      ["Downloading", "qv-sync"], // green #3dd68c
+      ["Download", "qv-sync"],
+      ["Transcribing", "qv-trans"], // blue #6cb4ee
+      ["Transcribe", "qv-trans"],
+      ["Metadata", "qv-meta"], // pink #e87aac
+      ["Compressing", "qv-compress"], // purple #c084fc
+      ["Compress", "qv-compress"],
+      ["Encoding", "qv-compress"],
+      ["Encode", "qv-compress"],
+      ["Moving", "qv-reorg"], // orange #ff8c42
+      ["Reorg", "qv-reorg"],
+      ["Syncing", "qv-sync"],
+      ["Sync", "qv-sync"],
     ];
     for (const [verb, cls] of verbs) {
       if (name.startsWith(verb)) {
@@ -1001,10 +1001,10 @@
 
   /** Render the Channels grid (Browse tab landing view).
    *
-   *  YouTube-style: banner fills the card, circular PFP overlaps
-   *  bottom-left, name + stats in a dark-gradient overlay below.
-   *  Images use <img loading="lazy"> so 100+ channels don't fetch all
-   *  thumbnails on mount (fixes scroll lag the user reported).
+   * YouTube-style: banner fills the card, circular PFP overlaps
+   * bottom-left, name + stats in a dark-gradient overlay below.
+   * Images use <img loading="lazy"> so 100+ channels don't fetch all
+   * thumbnails on mount (fixes scroll lag the user reported).
    */
   window.renderChannelGrid = function (channels, onChannelClick) {
     const grid = document.getElementById("channel-grid");
@@ -1056,7 +1056,7 @@
       `;
       card.querySelector(".channel-card-name").textContent = name;
       card.querySelector(".channel-card-meta").textContent =
-        `${vids}${vids && vids !== "—" ? " videos" : ""}${size ? "  \u00b7  " + size : ""}`;
+        `${vids}${vids && vids !== "—" ? " videos" : ""}${size ? " \u00b7 " + size : ""}`;
 
       // Swap to gradient if the banner image fails to load.
       const bgEl = card.querySelector(".channel-card-bg");
@@ -1130,7 +1130,7 @@
         setTimeout(next, 100);
       }
     };
-    img.addEventListener("load",  done, { once: true });
+    img.addEventListener("load", done, { once: true });
     img.addEventListener("error", done, { once: true });
     img.src = url;
   }
@@ -1140,8 +1140,8 @@
     const card = document.createElement("div");
     card.className = "video-card";
     card.dataset.filepath = v.filepath || "";
-    card.dataset.videoId  = v.video_id || "";
-    card.dataset.title    = v.title || "";
+    card.dataset.videoId = v.video_id || "";
+    card.dataset.title = v.title || "";
     // Use a real <img> tag for thumbnails rather than CSS
     // `background: url(...)` — the image tag is far more forgiving of
     // http://127.0.0.1 URLs through pywebview's webview, and failed loads
@@ -1200,7 +1200,7 @@
     if (v.size_bytes) metaParts.push(_fmtBytes(v.size_bytes));
     if (v.views) metaParts.push(v.views + " views");
     if (v.tx_status === "transcribed") metaParts.push("transcribed");
-    card.querySelector(".video-card-meta").textContent = metaParts.join("  \u00b7  ");
+    card.querySelector(".video-card-meta").textContent = metaParts.join(" \u00b7 ");
     card.addEventListener("click", () => onVideoClick && onVideoClick(v));
 
     // Hover preview: after ~400ms on a thumbnail, pop a larger preview
@@ -1235,7 +1235,7 @@
           y = Math.max(10, window.innerHeight - targetH - 10);
         }
         overlay.style.left = x + "px";
-        overlay.style.top  = y + "px";
+        overlay.style.top = y + "px";
       };
       const cancel = () => {
         if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
@@ -1292,7 +1292,7 @@
     // IntersectionObserver sentinel.
     // Mirrors OLD `_grid_check_load_more` / `_grid_build_cards(reset=False)`.
     const BATCH = 60;
-    const LAZY_THRESHOLD = 120;  // only lazy-load when enough videos to matter
+    const LAZY_THRESHOLD = 120; // only lazy-load when enough videos to matter
     const useLazy = !useYear && videos.length > LAZY_THRESHOLD;
 
     if (useLazy) {
@@ -1330,8 +1330,8 @@
     }
 
     // Group in the order they arrive (caller already sorted).
-    const buckets = new Map();          // year -> array of videos
-    const order   = [];                 // year order of first occurrence
+    const buckets = new Map(); // year -> array of videos
+    const order = []; // year order of first occurrence
     const unknown = [];
     for (const v of videos) {
       const y = _yearOf(v);
@@ -1354,7 +1354,7 @@
       head.className = "video-grid-year-head";
       const arrow = document.createElement("span");
       arrow.className = "vgy-arrow";
-      arrow.textContent = "\u25BE";  // ▾
+      arrow.textContent = "\u25BE"; // ▾
       const label = document.createElement("span");
       label.className = "vgy-label";
       label.textContent = (y === "?" ? "Unknown" : String(y));
@@ -1371,7 +1371,7 @@
         // follows the caller's sort — videos arrive already sorted
         // so the first month we see is the newest (or oldest).
         const mBuckets = new Map();
-        const mOrder   = [];
+        const mOrder = [];
         const mUnknown = [];
         for (const v of vids) {
           const m = _monthOf(v);
@@ -1415,7 +1415,7 @@
 
       head.addEventListener("click", () => {
         const collapsed = section.classList.toggle("collapsed");
-        arrow.textContent = collapsed ? "\u25B8" : "\u25BE";  // ▸ : ▾
+        arrow.textContent = collapsed ? "\u25B8" : "\u25BE"; // ▸ : ▾
       });
 
       frag.appendChild(section);
@@ -1424,8 +1424,8 @@
   };
 
   const _MONTH_NAMES = {
-    1: "January", 2: "February", 3: "March",      4: "April",
-    5: "May",     6: "June",     7: "July",       8: "August",
+    1: "January", 2: "February", 3: "March", 4: "April",
+    5: "May", 6: "June", 7: "July", 8: "August",
     9: "September", 10: "October", 11: "November", 12: "December",
   };
 
@@ -1467,7 +1467,7 @@
     if (m) {
       const y = Number(m[1]);
       const mo = Number(m[2]);
-      const d  = Number(m[3]);
+      const d = Number(m[3]);
       if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
         return `${_MON_ABBR[mo - 1]} ${d}, ${y}`;
       }
@@ -1503,12 +1503,12 @@
   }
 
   /** Retranscribe completion hook — called by Python via evaluate_js
-   *  when a `transcribe_retranscribe` job finishes. If the completed
-   *  video is the one currently on screen, refetch the transcript and
-   *  re-render the Watch view (this flips the source banner from
-   *  "auto-captions — approximate" to "Whisper transcription"). Mirrors
-   *  ArchivePlayer `_ytStartProgressPoll`'s post-finish refresh at
-   *  static/app.js:1209-1221. */
+   * when a `transcribe_retranscribe` job finishes. If the completed
+   * video is the one currently on screen, refetch the transcript and
+   * re-render the Watch view (this flips the source banner from
+   * "auto-captions — approximate" to "Whisper transcription"). Mirrors
+   * ArchivePlayer `_ytStartProgressPoll`'s post-finish refresh at
+   * static/app.js:1209-1221. */
   window._onRetranscribeComplete = async function (payload) {
     try {
       const { video_id, filepath } = payload || {};
@@ -1518,7 +1518,7 @@
       if (!cur) return;
       // Normalize filepaths — Python sends os.path.normpath() output which
       // uses backslashes on Windows, the video obj's `filepath` field may
-      // carry whatever separator the source set. Scott reported the Watch
+      // carry whatever separator the source set. reported the Watch
       // view not refreshing after retranscribe; Python-side logs showed
       // the event fired but filepath comparison missed due to slash
       // direction. Compare forward-slashed + lowercased on both sides.
@@ -1531,7 +1531,7 @@
       if (!api?.browse_get_transcript) return;
       const res = await api.browse_get_transcript({
         video_id: cur.video_id || undefined,
-        title:    cur.title || "",
+        title: cur.title || "",
       });
       let segments = [];
       let sourceInfo = null;
@@ -1549,7 +1549,7 @@
       // source reload + metadata drawer refresh. `skipVideoReload:true`
       // leaves the <video> element's src and playhead alone, so the
       // video keeps playing from wherever it was without the restart
-      // Scott saw in earlier versions.
+      // saw in earlier versions.
       window.renderWatchView(cur, transcript, sourceInfo,
                              { skipVideoReload: true });
       window._showToast?.("Re-transcription complete \u2014 transcript updated.", "ok");
@@ -1557,24 +1557,24 @@
   };
 
   /** Render the Watch view: loads the real video file into <video> and
-   *  builds per-word transcript spans with (s, e) timestamps for karaoke.
+   * builds per-word transcript spans with (s, e) timestamps for karaoke.
    *
-   *  transcript items: { s, e, t, w:[{w,s,e},...], ts } — s/e in seconds.
-   *  source: { source: "whisper"|"yt_captions_punct"|"yt_captions_raw"|"unknown", raw: "..." }
-   *  `video.filepath` is used to request a file:// URL from the backend.
+   * transcript items: { s, e, t, w:[{w,s,e},...], ts } — s/e in seconds.
+   * source: { source: "whisper"|"yt_captions_punct"|"yt_captions_raw"|"unknown", raw: "..." }
+   * `video.filepath` is used to request a file:// URL from the backend.
    *
-   *  Render mode: single continuous flowing body (no per-segment divs,
-   *  no [timestamp] inline prefixes) — matches ArchivePlayer. A source
-   *  banner above the body tells the user whether the transcript came
-   *  from Whisper or YouTube auto-captions, and for auto-captions offers
-   *  an inline "Re-transcribe with Whisper" link for better accuracy.
+   * Render mode: single continuous flowing body (no per-segment divs,
+   * no [timestamp] inline prefixes) — matches ArchivePlayer. A source
+   * banner above the body tells the user whether the transcript came
+   * from Whisper or YouTube auto-captions, and for auto-captions offers
+   * an inline "Re-transcribe with Whisper" link for better accuracy.
    */
   window.renderWatchView = function (video, transcript, sourceInfo, opts) {
     const title = document.getElementById("watch-title");
-    const meta  = document.getElementById("watch-meta");
-    const tr    = document.getElementById("watch-transcript");
-    const vEl   = document.getElementById("watch-video");
-    const ph    = document.getElementById("watch-video-placeholder");
+    const meta = document.getElementById("watch-meta");
+    const tr = document.getElementById("watch-transcript");
+    const vEl = document.getElementById("watch-video");
+    const ph = document.getElementById("watch-video-placeholder");
     if (!title || !meta || !tr) return;
 
     // `opts.skipVideoReload`: set by _onRetranscribeComplete so the
@@ -1585,11 +1585,11 @@
 
     title.textContent = video.title || "Video Title";
     const parts = [];
-    if (video.channel)   parts.push(video.channel);
-    if (video.uploaded)  parts.push(video.uploaded);
-    if (video.duration)  parts.push(video.duration);
-    if (video.views)     parts.push(video.views + " views");
-    meta.textContent = parts.join("  \u00b7  ");
+    if (video.channel) parts.push(video.channel);
+    if (video.uploaded) parts.push(video.uploaded);
+    if (video.duration) parts.push(video.duration);
+    if (video.views) parts.push(video.views + " views");
+    meta.textContent = parts.join(" \u00b7 ");
 
     // Stash for `_onRetranscribeComplete` — when the Python side finishes
     // a retranscribe, it pushes an event; the handler checks this ref
@@ -1658,11 +1658,11 @@
   };
 
   /** Build the source-banner div for the Watch view transcript panel.
-   *  Returns a DOM element or null. Mirrors ArchivePlayer's
-   *  `_ytSourceBannerHTML` (static/app.js:1106) EXACTLY — same text,
-   *  same four cases, same link wording. The "unknown, no raw" case
-   *  returns null so no banner appears at all (ArchivePlayer returns
-   *  the empty string for that case). */
+   * Returns a DOM element or null. Mirrors ArchivePlayer's
+   * `_ytSourceBannerHTML` (static/app.js:1106) EXACTLY — same text,
+   * same four cases, same link wording. The "unknown, no raw" case
+   * returns null so no banner appears at all (ArchivePlayer returns
+   * the empty string for that case). */
   function _buildSourceBanner(sourceInfo, video) {
     const src = (sourceInfo && sourceInfo.source) || "unknown";
     const raw = (sourceInfo && sourceInfo.raw) || "";
@@ -1736,10 +1736,10 @@
   async function _loadWatchMetadataDrawer(video) {
     const drawer = document.getElementById("watch-meta-drawer");
     if (!drawer) return;
-    const statsEl    = document.getElementById("watch-meta-stats");
-    const descEl     = document.getElementById("watch-meta-description");
+    const statsEl = document.getElementById("watch-meta-stats");
+    const descEl = document.getElementById("watch-meta-description");
     const commentsEl = document.getElementById("watch-meta-comments");
-    const countEl    = document.getElementById("watch-meta-comments-count");
+    const countEl = document.getElementById("watch-meta-comments-count");
     // Reset state immediately so a slow fetch doesn't bleed previous video's data
     if (statsEl) statsEl.textContent = "";
     if (descEl) descEl.textContent = "Loading\u2026";
@@ -1756,8 +1756,8 @@
       res = await api.browse_get_video_metadata({
         filepath: video.filepath || "",
         video_id: video.video_id || "",
-        title:    video.title    || "",
-        channel:  video.channel  || "",
+        title: video.title || "",
+        channel: video.channel || "",
       });
     } catch (e) {
       if (descEl) descEl.textContent = "(Failed to load metadata.)";
@@ -1778,12 +1778,12 @@
         const d = meta.upload_date;
         bits.push(`Uploaded ${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`);
       }
-      statsEl.textContent = bits.join("  \u00b7  ");
+      statsEl.textContent = bits.join(" \u00b7 ");
     }
     // Description — scan for YouTube-style timestamps (M:SS, MM:SS,
     // H:MM:SS) and render each as a clickable span that seeks the
     // <video> element to that time. Matches YouTube's own
-    // description-timestamp behavior. Scott: "timestamps in descriptions
+    // description-timestamp behavior. "timestamps in descriptions
     // are supposed to be clickable, just like youtube itself".
     if (descEl) {
       _renderDescriptionWithTimestamps(
@@ -1885,9 +1885,9 @@
   // Expand/collapse toggle for the metadata drawer. Wired once on boot —
   // survives across Watch-view renders.
   function _initWatchMetaDrawerToggle() {
-    const head   = document.getElementById("watch-meta-head");
-    const body   = document.getElementById("watch-meta-body");
-    const arrow  = document.getElementById("watch-meta-arrow");
+    const head = document.getElementById("watch-meta-head");
+    const body = document.getElementById("watch-meta-body");
+    const arrow = document.getElementById("watch-meta-arrow");
     const drawer = document.getElementById("watch-meta-drawer");
     if (!head || !body || !arrow || !drawer) return;
     // Start collapsed — transcript should be the dominant surface.
@@ -1931,7 +1931,7 @@
       vEl.play().catch(() => { /* user can click play */ });
     } else {
       // No playback possible — show placeholder with actionable error.
-      // Scott reported clicking a "(1)" duplicate that had a stale DB
+      // reported clicking a "(1)" duplicate that had a stale DB
       // entry (file missing from disk) — the old placeholder just said
       // "Select a video to play" which was misleading when a video IS
       // selected but the file is gone. Now it explains.
@@ -1991,7 +1991,7 @@
 
   // Scroll an element (a .seg or word) into view WITHIN its transcript
   // container only — DOES NOT scroll any ancestor scroll container.
-  // Scott: plain `scrollIntoView` walks up the parent chain and also
+  // plain `scrollIntoView` walks up the parent chain and also
   // scrolls the outer .browse-view, which pushed the video out of
   // frame as karaoke followed along. This helper sets the container's
   // scrollTop directly using getBoundingClientRect deltas so the
@@ -2044,7 +2044,7 @@
           // container-local scrollTop rather than `scrollIntoView` —
           // scrollIntoView walks up the parent chain and also scrolls
           // the outer `.browse-view` container, which pushes the video
-          // off-screen as the karaoke follows along. Scott: "scrolls
+          // off-screen as the karaoke follows along. "scrolls
           // the whole page down so you can't see the video ... we need
           // to scroll the transcription up to where the video is".
           // Compute the element's offset relative to the scrollable

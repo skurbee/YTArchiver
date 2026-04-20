@@ -130,7 +130,7 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
         proc = subprocess.Popen(
             enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
-            creationflags=(0x08000000 if os.name == "nt" else 0),  # CREATE_NO_WINDOW
+            creationflags=(0x08000000 if os.name == "nt" else 0), # CREATE_NO_WINDOW
             env=_utf8_env(),
         )
     except Exception as e:
@@ -228,7 +228,7 @@ def _ffprobe_height(filepath: str) -> Optional[int]:
 def _already_at_target(filepath: str, new_res: str) -> bool:
     """True if the file's height already meets the target resolution."""
     if new_res == "best":
-        return False  # "best" means upgrade — always re-fetch
+        return False # "best" means upgrade — always re-fetch
     try:
         target = int(new_res)
     except Exception:
@@ -328,7 +328,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         except OSError:
             pass
     if not os.path.isfile(dl_path):
-        return dest  # Fall back to whatever yt-dlp reported
+        return dest # Fall back to whatever yt-dlp reported
     return dl_path
 
 

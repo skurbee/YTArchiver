@@ -44,7 +44,7 @@ def _is_partial(fn: str) -> bool:
     multi-track downloads and normally deleted after the merge, but a
     crashed / force-killed merge leaves them behind. Without this filter
     they show up in the Browse grid with broken titles like
-    "Intel just did an AMD.f140-7" — Scott reported this. Also covers
+    "Intel just did an AMD.f140-7" — this was reported Also covers
     our own `_TEMP_COMPRESS` suffix from aborted compress jobs.
     """
     fn_l = fn.lower()
@@ -114,8 +114,8 @@ def update_disk_cache_for_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
     url = channel.get("url", "").strip()
     if url:
         cache[url] = {
-            "num_vids":     int(n_vids),
-            "size_bytes":   int(total_bytes),
+            "num_vids": int(n_vids),
+            "size_bytes": int(total_bytes),
             "last_updated": time.time(),
         }
         save_disk_cache(cache)
@@ -183,7 +183,7 @@ def archive_totals(cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not isinstance(rec, dict):
             continue
         n_channels += 1
-        total_vids  += int(rec.get("num_vids", 0))
+        total_vids += int(rec.get("num_vids", 0))
         total_bytes += int(rec.get("size_bytes", 0))
     return {
         "channels": n_channels,
@@ -294,19 +294,19 @@ def index_summary() -> Dict[str, Any]:
     for ch in channels:
         st = stats_for_channel(ch, cache)
         per_channel.append({
-            "folder":   ch.get("name") or ch.get("folder", ""),
-            "n_vids":   st["n_vids"],
-            "size_gb":  st["size_gb"],
-            "size":     _fmt_size(st["size_bytes"]),
+            "folder": ch.get("name") or ch.get("folder", ""),
+            "n_vids": st["n_vids"],
+            "size_gb": st["size_gb"],
+            "size": _fmt_size(st["size_bytes"]),
             "auto_transcribe": bool(ch.get("auto_transcribe")),
         })
     per_channel.sort(key=lambda r: (-r["size_gb"], (r["folder"] or "").lower()))
     return {
         "cards": {
-            "channels":    len(channels),
-            "videos":      tot["videos"],
-            "size_gb":     tot["size_gb"],
-            "size_label":  _fmt_size(tot["size_bytes"]),
+            "channels": len(channels),
+            "videos": tot["videos"],
+            "size_gb": tot["size_gb"],
+            "size_label": _fmt_size(tot["size_bytes"]),
             "transcribed_channels": transcribed_channels,
             "transcribed_pct_channels":
                 (transcribed_channels * 100.0 / len(channels)) if channels else 0.0,

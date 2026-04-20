@@ -246,7 +246,7 @@ def format_history_entry(kind: str, channel: str,
                          errors: int = 0, took_sec: float = 0) -> str:
     """Render a history line exactly like YTArchiver.py:22559-22562.
 
-    Format:  "[  Auto] 3:16pm, Apr 10   —  Channel  —    3 downloaded   · 0 skipped · 0 errors · took 36s"
+    Format: "[ Auto] 3:16pm, Apr 10 — Channel — 3 downloaded · 0 skipped · 0 errors · took 36s"
 
     The `primary` argument is "<N> <label>" (e.g. "3 downloaded",
     "14 transcribed", "5 fetched", "2 compressed"). OLD has a separate
@@ -311,9 +311,9 @@ def format_history_entry(kind: str, channel: str,
     # Assemble with OLD's exact spacing
     ts_date = f"{time_part}, {date_part}".ljust(16)
     kind_tag = f"[{kind.center(6)}]" if len(kind) < 6 else f"[{kind}]"
-    ch_part = f"  {channel}  \u2014" if channel else " " * 7
+    ch_part = f" {channel} \u2014" if channel else " " * 7
     line = (f"{kind_tag} {ts_date} \u2014{ch_part}"
-            f"  {dl:>4} {primary_label:<11} \u00b7 "
+            f" {dl:>4} {primary_label:<11} \u00b7 "
             f"{skipped:>4} {secondary_label} \u00b7 {err:>1} errors \u00b7 took {took}")
     return line
 

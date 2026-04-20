@@ -36,10 +36,10 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
     # responses are recognized by WebView2 / Chromium video elements.
     # Without this, the <video> tag couldn't seek — browser would request
     # a byte range, the server would ignore it, and the playhead would
-    # snap back to currentTime. Scott reported exactly that.
+    # snap back to currentTime. this was reported
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, format, *args):  # noqa: A002 — stdlib signature
+    def log_message(self, format, *args): # noqa: A002 — stdlib signature
         # Silence access log chatter; pywebview traffic is a constant stream
         pass
 
@@ -118,14 +118,14 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self._resolve_path()
         if path is None:
-            return  # ping reply or error was already sent
+            return # ping reply or error was already sent
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         try: size = os.path.getsize(path)
         except OSError: self.send_error(500); return
 
         parsed = self._parse_range(size)
         if parsed is None:
-            return  # 416 already sent
+            return # 416 already sent
         start, end, is_range = parsed
         content_length = end - start + 1
 

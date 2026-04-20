@@ -8,12 +8,12 @@
   // ─── Dark askquestion dialog (replaces browser confirm/alert) ────────
   //
   // Usage:
-  //    const ok = await askQuestion({
-  //      title: "Remove channel",
-  //      message: "Are you sure?\n\nFiles on disk are not deleted.",
-  //      confirm: "Remove", cancel: "Cancel",
-  //      danger: true,
-  //    });
+  // const ok = await askQuestion({
+  // title: "Remove channel",
+  // message: "Are you sure?\n\nFiles on disk are not deleted.",
+  // confirm: "Remove", cancel: "Cancel",
+  // danger: true,
+  // });
   window.askQuestion = function (opts) {
     return new Promise((resolve) => {
       const cfg = Object.assign({
@@ -97,16 +97,16 @@
 
   // ─── Multi-choice dialog (e.g. Metadata Already Downloaded) ──────────
   // Usage:
-  //   const choice = await askChoice({
-  //     title: "Metadata Already Downloaded",
-  //     message: "X already has metadata on disk. What do you want to do?",
-  //     choices: [
-  //       { label: "Skip existing",  value: "skip",      primary: true },
-  //       { label: "Overwrite",      value: "overwrite" },
-  //       { label: "Append new only",value: "append" },
-  //     ],
-  //   });
-  //   → returns the chosen `value` or null if cancelled.
+  // const choice = await askChoice({
+  // title: "Metadata Already Downloaded",
+  // message: "X already has metadata on disk. What do you want to do?",
+  // choices: [
+  // { label: "Skip existing", value: "skip", primary: true },
+  // { label: "Overwrite", value: "overwrite" },
+  // { label: "Append new only",value: "append" },
+  // ],
+  // });
+  // → returns the chosen `value` or null if cancelled.
   // ─── Remove-channel two-step helper ─────────────────────────────────
   // Shared so every call site (edit-panel Remove button, Delete-key on
   // Subs row, channel-card right-click "Remove channel") gets the same
@@ -130,11 +130,11 @@
                "metadata, and thumbnails from disk? This cannot be undone.",
       choices: [
         { label: "Delete files", value: "yes", kind: "danger" },
-        { label: "Keep files",   value: "no",  kind: "primary" },
+        { label: "Keep files", value: "no", kind: "primary" },
       ],
       cancel: "Back",
     });
-    if (wantDelete === null) return null;   // user cancelled
+    if (wantDelete === null) return null; // user cancelled
     const deleteFiles = wantDelete === "yes";
     let res;
     try {
@@ -169,11 +169,11 @@
         title: "Choose",
         message: "",
         choices: [],
-        buttons: null,  // alias for `choices` so callers can use either name
+        buttons: null, // alias for `choices` so callers can use either name
         cancel: "Cancel",
         cancelPlacement: "left", // "left" (default) or "right"
-        countdownSecs: 0,     // >0 → auto-pick primary after this many seconds
-        countdownLabel: "",   // optional prefix for the "...in Ns" line
+        countdownSecs: 0, // >0 → auto-pick primary after this many seconds
+        countdownLabel: "", // optional prefix for the "...in Ns" line
       }, opts || {});
       // Accept `buttons` as an alias for `choices` (older callers pass buttons)
       const choices = (cfg.buttons && cfg.buttons.length) ? cfg.buttons : (cfg.choices || []);
@@ -183,7 +183,7 @@
         // Support both `kind: "primary"|"danger"|"ghost"` AND `primary: bool` / `danger: bool`
         const kind = c.kind || (c.primary ? "primary" : c.danger ? "danger" : "ghost");
         const cls = kind === "primary" ? "btn btn-primary"
-                  : kind === "danger"  ? "btn btn-danger"
+                  : kind === "danger" ? "btn btn-danger"
                                        : "btn btn-ghost";
         return `<button class="${cls}" data-value="${escapeHtml(c.value)}">${escapeHtml(c.label)}</button>`;
       }).join("");
@@ -255,16 +255,16 @@
 
   // ─── Text input modal (for bookmark notes, rename prompts, etc.) ────
   // Usage:
-  //   const txt = await askTextInput({
-  //     title: "Add bookmark",
-  //     message: "At 2:45:",
-  //     placeholder: "Add a note (optional)",
-  //     confirm: "Save",
-  //     cancel: "Cancel",
-  //     initial: "",
-  //     allowEmpty: true,
-  //   });
-  //   Returns the entered string, or null if cancelled.
+  // const txt = await askTextInput({
+  // title: "Add bookmark",
+  // message: "At 2:45:",
+  // placeholder: "Add a note (optional)",
+  // confirm: "Save",
+  // cancel: "Cancel",
+  // initial: "",
+  // allowEmpty: true,
+  // });
+  // Returns the entered string, or null if cancelled.
   window.askTextInput = function (opts) {
     return new Promise((resolve) => {
       const cfg = Object.assign({
@@ -324,9 +324,9 @@
 
   // Expose so backend can trigger via window.evaluate_js(...)
   // Mirrors YTArchiver.py:26669 _metadata_choice_dialog — same three semantics:
-  //   "new"     → Check for New  (only fetch IDs not already on disk; fast)
-  //   "refresh" → Refresh Counts (re-hit every video to update view counts; slow)
-  //   "cancel"  → Cancel         (do nothing)
+  // "new" → Check for New (only fetch IDs not already on disk; fast)
+  // "refresh" → Refresh Counts (re-hit every video to update view counts; slow)
+  // "cancel" → Cancel (do nothing)
   //
   // The backend (`prompt_metadata_already_downloaded` in main.py) accepts
   // the string values "skip" / "overwrite" / "append" for back-compat, so we
@@ -338,14 +338,14 @@
                `Check for New: only fetch IDs we haven't seen yet (fast).\n` +
                `Refresh Counts: re-hit every existing video to update view counts (slow).`,
       buttons: [
-        { label: "Check for New",  value: "new",     kind: "primary" },
-        { label: "Refresh Counts", value: "refresh", kind: "ghost"   },
-        { label: "Cancel",         value: "cancel",  kind: "ghost"   },
+        { label: "Check for New", value: "new", kind: "primary" },
+        { label: "Refresh Counts", value: "refresh", kind: "ghost" },
+        { label: "Cancel", value: "cancel", kind: "ghost" },
       ],
     });
     // Map OLD-app returns back to the back-compat strings the existing
     // Python sync pipeline expects.
-    if (choice === "new")     return "append";
+    if (choice === "new") return "append";
     if (choice === "refresh") return "overwrite";
     return "skip";
   };
@@ -394,7 +394,7 @@
         // is playing, PAUSE it (don't unload) — `display:none` on the
         // panel doesn't stop HTML5 audio on its own. Returning to
         // Browse should resume the user right where they left off
-        // with the same video still loaded. Scott: "if the user
+        // with the same video still loaded. "if the user
         // switches tabs while it's playing, pause playback" — but
         // the video needs to still be up when they come back, not
         // torn down into an empty placeholder.
@@ -456,9 +456,9 @@
   // Sub-modes (left sidebar): Channels / Search / Graph / Bookmarks / Index
   // Within "Channels": channel grid \u2192 video grid \u2192 watch view
   const _browseState = {
-    submode: "channels",        // current sidebar mode
-    view: "channels",            // within Channels: channels|videos|watch
-    channels: [],                // source data
+    submode: "channels", // current sidebar mode
+    view: "channels", // within Channels: channels|videos|watch
+    channels: [], // source data
     currentChannel: null,
     videos: [],
     currentVideo: null,
@@ -486,7 +486,7 @@
     // bookmark), we record `_browseState.watchReturnTo` at entry time
     // and return there. Without that, Back from Recent → Watch would
     // `showView("videos")` with no `currentChannel` set, landing the
-    // user on a blank video grid — Scott reported exactly that.
+    // user on a blank video grid — this was reported
     window._browseGoBack = () => {
       if (_browseState.view === "watch") {
         const returnTo = _browseState.watchReturnTo;
@@ -524,7 +524,7 @@
     document.getElementById("browse-back-btn")?.addEventListener("click", window._browseGoBack);
 
     // Mouse button 4 (back) / 5 (forward) — browser-style navigation
-    // across the Browse tab. Scott uses a 5-button mouse and expected
+    // across the Browse tab. the user uses a 5-button mouse and expected
     // these to work like in a browser. `mouseup` event's `.button`
     // gives us 3 for back, 4 for forward on Windows; we listen on
     // `auxclick` which fires for non-primary buttons. `preventDefault`
@@ -580,7 +580,7 @@
     const mode = _browseState.submode;
     // Leaving Watch via a submode click — pause the <video> element
     // before we hide it. `display:none` does NOT pause HTML5 media
-    // on its own (Scott's bug: mouse back from Watch kept audio
+    // on its own (a bug: mouse back from Watch kept audio
     // playing in the background). `showView` does this too but only
     // when called through its own path; submode clicks bypass
     // showView for the non-channels modes.
@@ -602,14 +602,14 @@
       showView("channels");
     } else if (mode === "recent") {
       // Recent was moved from a top-level tab into a Browse submode
-      // (Scott wanted all library navigation in one place). Reuses
+      // (users wanted all library navigation in one place). Reuses
       // the same #recent-table / #recent-table-body ids as before so
       // the existing render + click wiring keeps working.
       document.getElementById("view-recent").style.display = "";
       title.textContent = "Recent downloads";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
-      if (filter) filter.style.display = "none";  // recent has its own filter
+      if (filter) filter.style.display = "none"; // recent has its own filter
       _browseState.view = "recent";
     } else if (mode === "search") {
       document.getElementById("view-search").style.display = "";
@@ -683,7 +683,7 @@
   // Pause + unload the Watch view's <video> element. Called whenever
   // the user navigates away from the Watch view — without this the
   // element keeps playing in the background because `display:none` does
-  // NOT pause HTML5 media. Scott hit this: clicked Back, video kept
+  // NOT pause HTML5 media. users hit this: clicked Back, video kept
   // playing audio with no UI to stop it. Clearing `src` + calling
   // `load()` cuts the stream so the browser releases the file handle
   // too (matters for the local_fileserver 206-range requests).
@@ -709,7 +709,7 @@
     // Soft pause — used when the user navigates AWAY from Browse to
     // a different top-level tab while a video is loaded. Keeps src +
     // playhead intact so returning to Browse resumes right where they
-    // left off. Scott: "pausing a video, going to a different tab,
+    // left off. "pausing a video, going to a different tab,
     // then back to browse, closes the video ... it should still be
     // up (but if the user switches tabs while it's playing, pause)".
     const vEl = document.getElementById("watch-video");
@@ -721,7 +721,7 @@
   function showView(viewName) {
     // Save scroll of outgoing view before swapping
     if (_browseState.view === "channels") _saveScroll("channel-grid");
-    if (_browseState.view === "videos")   _saveScroll("video-grid");
+    if (_browseState.view === "videos") _saveScroll("video-grid");
     // Leaving the Watch view — stop the backgrounded <video> element
     // so audio doesn't keep playing after Back / tab swap. Must happen
     // BEFORE we mutate _browseState.view so the "was in watch?" check
@@ -731,10 +731,10 @@
     }
     _browseState.view = viewName;
     document.querySelectorAll(".browse-view").forEach(v => v.style.display = "none");
-    const title   = document.getElementById("browse-main-title");
+    const title = document.getElementById("browse-main-title");
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
-    const filter  = document.getElementById("browse-filter");
+    const filter = document.getElementById("browse-filter");
 
     if (viewName === "channels") {
       document.getElementById("view-channels").style.display = "";
@@ -772,11 +772,11 @@
   };
 
   async function _loadSearchViewer(resultRow, query) {
-    const body    = document.getElementById("search-viewer-body");
+    const body = document.getElementById("search-viewer-body");
     const titleEl = document.getElementById("search-viewer-title");
-    const metaEl  = document.getElementById("search-viewer-meta");
-    const bEarly  = document.getElementById("search-viewer-earlier");
-    const bLater  = document.getElementById("search-viewer-later");
+    const metaEl = document.getElementById("search-viewer-meta");
+    const bEarly = document.getElementById("search-viewer-earlier");
+    const bLater = document.getElementById("search-viewer-later");
     if (!body || !titleEl) return;
     const api = window.pywebview?.api;
     if (!api?.browse_search_context) {
@@ -785,9 +785,9 @@
     }
     _searchViewerState.segmentId = resultRow.segment_id;
     _searchViewerState.before = 30;
-    _searchViewerState.after  = 30;
-    _searchViewerState.query  = query || "";
-    _searchViewerState.title  = resultRow.title || "";
+    _searchViewerState.after = 30;
+    _searchViewerState.query = query || "";
+    _searchViewerState.title = resultRow.title || "";
     _searchViewerState._videoId = resultRow.video_id || "";
     _searchViewerState._jsonlPath = resultRow.jsonl_path || "";
     _searchViewerState._channel = resultRow.channel || "";
@@ -801,8 +801,8 @@
       ctx = await api.browse_search_context({
         segment_id: resultRow.segment_id,
         before: _searchViewerState.before,
-        after:  _searchViewerState.after,
-        query:  _searchViewerState.query,
+        after: _searchViewerState.after,
+        query: _searchViewerState.query,
       });
     } catch (e) {
       body.innerHTML = `<div class="browse-empty">Error: ${escapeHtml(String(e))}</div>`;
@@ -892,13 +892,13 @@
       const ctx = await api.browse_search_context({
         segment_id: _searchViewerState.segmentId,
         before: _searchViewerState.before,
-        after:  _searchViewerState.after,
-        query:  _searchViewerState.query,
+        after: _searchViewerState.after,
+        query: _searchViewerState.query,
       });
       if (ctx?.ok) {
         _renderSearchViewer(ctx, _searchViewerState.segmentId);
         document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-        document.getElementById("search-viewer-later").hidden   = !ctx.after_more;
+        document.getElementById("search-viewer-later").hidden = !ctx.after_more;
       }
     });
     document.getElementById("search-viewer-later")?.addEventListener("click", async () => {
@@ -907,13 +907,13 @@
       const ctx = await api.browse_search_context({
         segment_id: _searchViewerState.segmentId,
         before: _searchViewerState.before,
-        after:  _searchViewerState.after,
-        query:  _searchViewerState.query,
+        after: _searchViewerState.after,
+        query: _searchViewerState.query,
       });
       if (ctx?.ok) {
         _renderSearchViewer(ctx, _searchViewerState.segmentId);
         document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-        document.getElementById("search-viewer-later").hidden   = !ctx.after_more;
+        document.getElementById("search-viewer-later").hidden = !ctx.after_more;
       }
     });
   }
@@ -932,10 +932,10 @@
     const show = n > 0;
     for (const pair of [
       ["search-unindexed-warning", "search-unindexed-text"],
-      ["graph-unindexed-warning",  "graph-unindexed-text"],
+      ["graph-unindexed-warning", "graph-unindexed-text"],
     ]) {
       const banner = document.getElementById(pair[0]);
-      const txt    = document.getElementById(pair[1]);
+      const txt = document.getElementById(pair[1]);
       if (!banner) continue;
       banner.hidden = !show;
       if (txt) {
@@ -992,7 +992,7 @@
 
     const input = document.getElementById("search-query");
     const scope = document.getElementById("search-scope");
-    const btn   = document.getElementById("btn-search-run");
+    const btn = document.getElementById("btn-search-run");
     const results = document.getElementById("search-results");
     const counter = document.getElementById("search-count");
     const doSearch = async () => {
@@ -1124,7 +1124,7 @@
         if (!input) return;
         const op = opBtn.dataset.op || "";
         const start = input.selectionStart ?? input.value.length;
-        const end   = input.selectionEnd   ?? input.value.length;
+        const end = input.selectionEnd ?? input.value.length;
         const before = input.value.slice(0, start);
         const selected = input.value.slice(start, end);
         const after = input.value.slice(end);
@@ -1159,7 +1159,7 @@
   // ─── Auto-sync dropdown + countdown ──────────────────────────────────
   function initAutorun() {
     const sel = document.getElementById("auto-sync-select");
-    const cd  = document.getElementById("autorun-countdown");
+    const cd = document.getElementById("autorun-countdown");
     if (!sel) return;
     // Restore saved interval + push countdown
     const tick = async () => {
@@ -1171,9 +1171,9 @@
         if (sel.value !== st.label) sel.value = st.label;
         if (cd) {
           // Three states, matching classic's _tick_countdown:
-          //   - Sync running → "waiting for queue..." (countdown paused)
-          //   - Countdown active → "next in Xm Ys"
-          //   - Off / idle → empty
+          // - Sync running → "waiting for queue..." (countdown paused)
+          // - Countdown active → "next in Xm Ys"
+          // - Off / idle → empty
           if (st.mins > 0 && st.waiting_for_sync) {
             cd.textContent = "waiting for queue\u2026";
           } else if (st.mins > 0 && st.seconds_remaining != null) {
@@ -1300,20 +1300,20 @@
     // Wire resize handles immediately — these don't need the API.
     // Since HTML tables don't natively support col drag-resize, add a
     // simple mousedown-on-th-border handler that updates <col> width.
-    _wireColResize(".subs-table",   "subs");
+    _wireColResize(".subs-table", "subs");
     _wireColResize(".recent-table", "recent");
 
     // Apply saved widths — needs pywebview.api, which may not be ready
     // at DOMContentLoaded. Retry on `pywebviewready` + poll fallback to
     // cover the case where the event already fired before we listened.
     // Without this, saved widths were silently dropped on every boot
-    // (Scott reported: Subs column widths don't persist across restart).
+    // (reported: Subs column widths don't persist across restart).
     const applySaved = () => {
       const api = window.pywebview?.api;
       if (!api?.window_state_load) return false;
       api.window_state_load().then((st) => {
         if (!st || !st.col_widths) return;
-        _applyColWidths(".subs-table",   st.col_widths.subs);
+        _applyColWidths(".subs-table", st.col_widths.subs);
         _applyColWidths(".recent-table", st.col_widths.recent);
       }).catch(() => {});
       return true;
@@ -1359,7 +1359,7 @@
           e.preventDefault();
           table._resizeState.suppressNextSortClick = false;
         }
-      }, true);  // capture phase so we win before sort's bubble-phase handler
+      }, true); // capture phase so we win before sort's bubble-phase handler
     }
 
     ths.forEach((th, i) => {
@@ -1384,7 +1384,7 @@
         // Seed from the current rendered widths so dragging feels accurate
         // even if this is the first time the user touches the divider.
         const ths2 = table.querySelectorAll("thead th");
-        startW     = ths2[i]    ?.getBoundingClientRect().width || 100;
+        startW = ths2[i] ?.getBoundingClientRect().width || 100;
         startNextW = ths2[i + 1]?.getBoundingClientRect().width || 100;
         document.body.style.cursor = "col-resize";
         table._resizeState.suppressNextSortClick = true;
@@ -1433,8 +1433,8 @@
   // Bar, Word Cloud), per-1000-segments Normalize toggle, click-graph-to-
   // drill-into-search, and CSV export of the plot data.
   let _graphChart = null;
-  let _graphLastData = null;   // last-rendered { labels, values | series, bucket, word, channel }
-  let _graphType = "line";     // current chart type
+  let _graphLastData = null; // last-rendered { labels, values | series, bucket, word, channel }
+  let _graphType = "line"; // current chart type
 
   function initGraphView() {
     const btn = document.getElementById("btn-graph-run");
@@ -1468,11 +1468,11 @@
   }
 
   async function drawGraph() {
-    const wordEl   = document.getElementById("graph-word");
-    const chanEl   = document.getElementById("graph-channel");
+    const wordEl = document.getElementById("graph-word");
+    const chanEl = document.getElementById("graph-channel");
     const bucketEl = document.getElementById("graph-bucket");
-    const emptyEl  = document.getElementById("graph-empty");
-    const canvas   = document.getElementById("graph-canvas");
+    const emptyEl = document.getElementById("graph-empty");
+    const canvas = document.getElementById("graph-canvas");
     if (!canvas || !wordEl) return;
 
     const word = (wordEl.value || "").trim();
@@ -1590,7 +1590,7 @@
         maintainAspectRatio: false,
         // Deferred resize prevents Chart.js from getting stuck at
         // height=0 when the browser throttles layout during window
-        // drag. Scott: graph "collapses and never recovers" when the
+        // drag. graph "collapses and never recovers" when the
         // window is squished narrow.
         resizeDelay: 50,
         animation: { duration: 300 },
@@ -1767,7 +1767,7 @@
     if (api?.save_text_to_file) {
       const res = await api.save_text_to_file(fname, csv);
       if (res?.ok) window._showToast?.("CSV saved.", "ok");
-      else         window._showToast?.(res?.error || "Save failed.", "error");
+      else window._showToast?.(res?.error || "Save failed.", "error");
     } else {
       // Browser preview fallback
       const blob = new Blob([csv], { type: "text/csv" });
@@ -1946,7 +1946,7 @@
 
   // Push-event handler: backend calls this when archive_rescan finishes
   // so the currently-open Browse grid refreshes to reflect pruned /
-  // newly-registered rows. Scott: "I click Rescan, wait 5 minutes,
+  // newly-registered rows. "I click Rescan, wait 5 minutes,
   // nothing changes in the program."
   window._onArchiveRescanComplete = function () {
     try {
@@ -2038,10 +2038,10 @@
         });
         noteEl.addEventListener("blur", async () => {
           const t = noteEl.textContent.trim();
-          if (t === (b.note || "")) return;  // no change
+          if (t === (b.note || "")) return; // no change
           const res = await api.bookmark_update_note?.(b.id, t);
           if (res?.ok) {
-            b.note = t;  // reflect in local data so Escape-revert is accurate
+            b.note = t; // reflect in local data so Escape-revert is accurate
             noteEl.classList.add("bookmark-note-saved");
             setTimeout(() => noteEl.classList.remove("bookmark-note-saved"), 1200);
           } else {
@@ -2080,7 +2080,7 @@
                 title: title,
                 channel: b.channel || "",
                 video_id: vid || r.video_id || "",
-                _seek_to: start,  // Watch view uses this for initial seek
+                _seek_to: start, // Watch view uses this for initial seek
               };
               if (typeof window._openVideoInWatch === "function") {
                 window._openVideoInWatch(videoObj);
@@ -2150,14 +2150,14 @@
       const nv = res.new_videos || 0;
       const nc = res.new_channels || 0;
       const tc = res.total_channels || 0;
-      document.getElementById("bsb-new-videos").textContent   = String(nv);
+      document.getElementById("bsb-new-videos").textContent = String(nv);
       document.getElementById("bsb-new-channels").textContent = String(nc);
       document.getElementById("bsb-total-channels").textContent = String(tc);
       bar.hidden = false;
       if (Array.isArray(res.channel_list) && res.channel_list.length) {
-        bar.title = "Channels with new videos this week:\n  " +
-          res.channel_list.slice(0, 20).join("\n  ") +
-          (res.channel_list.length > 20 ? `\n  \u2026 (+${res.channel_list.length - 20} more)` : "");
+        bar.title = "Channels with new videos this week:\n " +
+          res.channel_list.slice(0, 20).join("\n ") +
+          (res.channel_list.length > 20 ? `\n \u2026 (+${res.channel_list.length - 20} more)` : "");
       } else {
         bar.title = "";
       }
@@ -2206,9 +2206,9 @@
       if (s?.whisper_model) currentDefault = String(s.whisper_model);
     } catch (_e) {}
     const models = [
-      { name: "tiny",     blurb: "fastest, lowest quality" },
-      { name: "small",    blurb: "balanced (default)" },
-      { name: "medium",   blurb: "higher quality, slower" },
+      { name: "tiny", blurb: "fastest, lowest quality" },
+      { name: "small", blurb: "balanced (default)" },
+      { name: "medium", blurb: "higher quality, slower" },
       { name: "large-v3", blurb: "best quality, slowest" },
     ];
     const choices = models.map((m) => ({
@@ -2231,7 +2231,7 @@
     // persist to config. The Settings > Whisper model dropdown is the
     // authoritative place for the default; a one-off manual pick for a
     // single retranscribe shouldn't mutate it. Second arg `false` =
-    // don't persist. Scott: "manual retranscriptions have nothing to
+    // don't persist. "manual retranscriptions have nothing to
     // do with that [settings default]".
     try {
       await api?.transcribe_swap_model?.(pick, false);
@@ -2251,7 +2251,7 @@
     // Follow-org/Combined dialog resolves.
     if (combined === undefined) {
       const model = await _askWhisperModel(`"${channelName}"`);
-      if (model === null) return;  // user cancelled
+      if (model === null) return; // user cancelled
     }
     const res = await api.chan_transcribe_all(channelName, combined);
     if (res?.ok === false) {
@@ -2275,7 +2275,7 @@
         countdownSecs: 60,
         countdownLabel: "Auto-selecting Follow organization in",
       });
-      if (pick === null) return;   // user cancelled
+      if (pick === null) return; // user cancelled
       // Recurse with the resolved choice.
       return _askTranscribeChannel(channelName, pick === "combined");
     }
@@ -2298,7 +2298,7 @@
     // ("recent" / "search" / "bookmarks" / "graph"). The
     // `_browseGoBack` handler dispatches off this. Without this,
     // Back from Recent → Watch landed on a blank #video-grid
-    // because no currentChannel was ever set — Scott's bug report.
+    // because no currentChannel was ever set — a bug report.
     _browseState.watchReturnTo = _browseState.view || null;
     _browseState.currentVideo = video;
     showView("watch");
@@ -2309,7 +2309,7 @@
       try {
         const res = await api.browse_get_transcript({
           video_id: video.video_id || undefined,
-          title:    video.title || "",
+          title: video.title || "",
         });
         // New return shape: {ok, segments, source}. Back-compat: if the
         // result is a plain array, treat it as old-style segment list.
@@ -2406,7 +2406,7 @@
     if (api && api.browse_list_videos) {
       try {
         const rows = await api.browse_list_videos(name, sort, 50000);
-        if (myLoadSeq !== loadVideosFor._seq) return;  // stale, user clicked another channel
+        if (myLoadSeq !== loadVideosFor._seq) return; // stale, user clicked another channel
         if (Array.isArray(rows) && rows.length > 0) {
           _browseState.videos = rows.map(r => {
             // Prefer the YouTube upload time (file mtime — yt-dlp --mtime)
@@ -2414,20 +2414,20 @@
             // file is missing (e.g. moved offline).
             const epoch = r.upload_ts || r.added_ts || 0;
             return {
-              title:     r.title || "",
-              channel:   r.channel || name,
-              filepath:  r.filepath || "",
-              video_id:  r.video_id || "",
-              uploaded:  _formatAddedTs(epoch),
-              duration:  "",
-              views:     "",
+              title: r.title || "",
+              channel: r.channel || name,
+              filepath: r.filepath || "",
+              video_id: r.video_id || "",
+              uploaded: _formatAddedTs(epoch),
+              duration: "",
+              views: "",
               upload_ts: epoch * 1000,
               view_count: 0,
               size_bytes: r.size_bytes || 0,
               tx_status: r.tx_status || "pending",
               year: r.year, month: r.month,
               // Thumbnail sidecar (file:// URL from .Thumbnails/ or next-to-video)
-              thumbnail:     r.thumbnail || "",
+              thumbnail: r.thumbnail || "",
               thumbnail_url: r.thumbnail_url || "",
             };
           });
@@ -2442,7 +2442,7 @@
     const vids = [];
     for (let i = 0; i < count; i++) {
       const minutes = (i * 37 + 3) % 58 + 2;
-      const secs    = (i * 17) % 60;
+      const secs = (i * 17) % 60;
       vids.push({
         title: `${name || "Video"}: sample episode #${i + 1}`,
         channel: name,
@@ -2461,10 +2461,10 @@
     if (!ts) return "";
     const now = Date.now() / 1000;
     const age = now - ts;
-    if (age < 60)        return "just now";
-    if (age < 3600)      return Math.floor(age / 60) + "m ago";
-    if (age < 86400)     return Math.floor(age / 3600) + "h ago";
-    if (age < 86400*30)  return Math.floor(age / 86400) + "d ago";
+    if (age < 60) return "just now";
+    if (age < 3600) return Math.floor(age / 60) + "m ago";
+    if (age < 86400) return Math.floor(age / 3600) + "h ago";
+    if (age < 86400*30) return Math.floor(age / 86400) + "d ago";
     if (age < 86400*365) return Math.floor(age / (86400*30)) + "mo ago";
     const years = Math.floor(age / (86400*365));
     return years + (years === 1 ? "y ago" : "y ago");
@@ -2472,7 +2472,7 @@
 
   function sortCurrentVideos(sortBy) {
     const vids = _browseState.videos.slice();
-    if (sortBy === "newest")      vids.sort((a, b) => b.upload_ts - a.upload_ts);
+    if (sortBy === "newest") vids.sort((a, b) => b.upload_ts - a.upload_ts);
     else if (sortBy === "oldest") vids.sort((a, b) => a.upload_ts - b.upload_ts);
     else if (sortBy === "most_viewed") vids.sort((a, b) => b.view_count - a.view_count);
     const groupByYear = !!document.getElementById("browse-group-year")?.checked;
@@ -2492,7 +2492,7 @@
         try {
           const res = await api.browse_get_transcript({
             video_id: v.video_id || undefined,
-            title:    v.title,
+            title: v.title,
           });
           if (Array.isArray(res)) transcript = res;
           else if (res && res.segments) {
@@ -2506,7 +2506,7 @@
       } else {
         // Convert DB schema (s/e/t/w) to renderer schema (ts/text)
         transcript = transcript.map(seg => ({
-          ts:   _formatTs(seg.s),
+          ts: _formatTs(seg.s),
           text: seg.t,
           words: seg.w,
           s: seg.s, e: seg.e,
@@ -2680,11 +2680,11 @@
         return;
       }
       const video = {
-        title:     res.title || hit.title || "",
-        channel:   res.channel || hit.channel || "",
-        filepath:  res.filepath,
-        video_id:  res.video_id || hit.video_id || "",
-        start_at:  Number(hit.start_time) || 0,
+        title: res.title || hit.title || "",
+        channel: res.channel || hit.channel || "",
+        filepath: res.filepath,
+        video_id: res.video_id || hit.video_id || "",
+        start_at: Number(hit.start_time) || 0,
       };
       _browseState.currentVideo = video;
       showView("watch");
@@ -2816,15 +2816,15 @@
     if (!idx) return;
     const c = idx.cards || {};
     const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
-    setText("idx-channels",    (c.channels   ?? "\u2014").toLocaleString?.() ?? c.channels);
-    setText("idx-videos",      (c.videos     ?? "\u2014").toLocaleString?.() ?? c.videos);
-    setText("idx-size",        c.size_label || "\u2014");
+    setText("idx-channels", (c.channels ?? "\u2014").toLocaleString?.() ?? c.channels);
+    setText("idx-videos", (c.videos ?? "\u2014").toLocaleString?.() ?? c.videos);
+    setText("idx-size", c.size_label || "\u2014");
     setText("idx-transcribed", c.transcribed_pct_channels != null
                                ? c.transcribed_pct_channels.toFixed(1) + "%"
                                : "\u2014");
     // Sidebar stats as well
     setText("stat-channels", (c.channels ?? "").toLocaleString?.() ?? "");
-    setText("stat-videos",   (c.videos   ?? "").toLocaleString?.() ?? "");
+    setText("stat-videos", (c.videos ?? "").toLocaleString?.() ?? "");
 
     // Per-channel table
     if (Array.isArray(idx.per_channel)) {
@@ -2847,13 +2847,13 @@
   // autorun_gpu config keys. State is persisted to config via the backend.
   function initQueueAutoCheckboxes() {
     const syncCB = document.getElementById("sync-auto-checkbox");
-    const gpuCB  = document.getElementById("gpu-auto-checkbox");
+    const gpuCB = document.getElementById("gpu-auto-checkbox");
 
     // Restore saved state on load. `window.pywebview.api` isn't injected
     // until AFTER DOMContentLoaded (pywebview fires a `pywebviewready`
     // event when it's ready, but boot() runs on DOMContentLoaded), so
     // the first api lookup usually returns undefined and the original
-    // restore silently no-op'd — Scott reported: toggle Auto, restart,
+    // restore silently no-op'd — reported: toggle Auto, restart,
     // Auto is back to default. Fix: re-resolve the api when pywebview
     // signals ready, with a 600ms fallback poll in case the event was
     // missed or we're racing boot.
@@ -2863,7 +2863,7 @@
       api.queue_auto_get().then((st) => {
         if (!st) return;
         if (syncCB) syncCB.checked = !!st.sync;
-        if (gpuCB)  gpuCB.checked  = !!st.gpu;
+        if (gpuCB) gpuCB.checked = !!st.gpu;
       }).catch(() => {});
       return true;
     };
@@ -2902,11 +2902,11 @@
   // window.
   function initIndexControls() {
     const getApi = () => window.pywebview?.api;
-    const bBuild    = document.getElementById("btn-idx-build");
-    const bRebuild  = document.getElementById("btn-idx-rebuild");
-    const statsEl   = document.getElementById("index-stats-text");
-    const progEl    = document.getElementById("idx-progress");
-    const logEl     = document.getElementById("index-log");
+    const bBuild = document.getElementById("btn-idx-build");
+    const bRebuild = document.getElementById("btn-idx-rebuild");
+    const statsEl = document.getElementById("index-stats-text");
+    const progEl = document.getElementById("idx-progress");
+    const logEl = document.getElementById("index-log");
 
     const appendLog = (line) => {
       if (!logEl) return;
@@ -2924,7 +2924,7 @@
         // Preview / pre-ready state. Don't overwrite existing numbers once
         // we've already painted them (avoids a "flash of offline").
         if (!statsEl.dataset.populated) {
-          statsEl.textContent = "\u2014  (loading\u2026)";
+          statsEl.textContent = "\u2014 (loading\u2026)";
         }
         return;
       }
@@ -2937,12 +2937,12 @@
           ? c.transcribed_pct_channels.toFixed(1) + "%"
           : "\u2014";
         const lines = [
-          `Channels:        ${fmt(c.channels)}`,
-          `Videos:          ${fmt(c.videos)}`,
-          `Segments:        ${fmt(c.segments)}`,
-          `Transcribed:     ${pct}`,
-          `Total size:      ${c.size_label || "\u2014"}`,
-          `Hours of video:  ${fmt(c.hours)}`,
+          `Channels: ${fmt(c.channels)}`,
+          `Videos: ${fmt(c.videos)}`,
+          `Segments: ${fmt(c.segments)}`,
+          `Transcribed: ${pct}`,
+          `Total size: ${c.size_label || "\u2014"}`,
+          `Hours of video: ${fmt(c.hours)}`,
         ];
         statsEl.textContent = lines.join("\n");
         statsEl.dataset.populated = "1";
@@ -3019,11 +3019,11 @@
   function initSettingsSubTabs() {
     const buttons = document.querySelectorAll(".settings-subnav-btn");
     const views = {
-      general:     document.getElementById("settings-view-general"),
+      general: document.getElementById("settings-view-general"),
       performance: document.getElementById("settings-view-performance"),
-      appearance:  document.getElementById("settings-view-appearance"),
-      tools:       document.getElementById("settings-view-tools"),
-      index:       document.getElementById("settings-view-index"),
+      appearance: document.getElementById("settings-view-appearance"),
+      tools: document.getElementById("settings-view-tools"),
+      index: document.getElementById("settings-view-index"),
     };
     const saveFooter = document.getElementById("settings-actions-footer");
     if (!buttons.length) return;
@@ -3053,10 +3053,10 @@
   function initSettingsArchiveRoots() {
     const getApi = () => window.pywebview?.api;
     const rootsList = document.getElementById("settings-roots-list");
-    const bAdd      = document.getElementById("btn-settings-add-root");
-    const bRemove   = document.getElementById("btn-settings-remove-root");
-    const autoCB    = document.getElementById("settings-auto-index-enabled");
-    const autoThr   = document.getElementById("settings-auto-index-threshold");
+    const bAdd = document.getElementById("btn-settings-add-root");
+    const bRemove = document.getElementById("btn-settings-remove-root");
+    const autoCB = document.getElementById("settings-auto-index-enabled");
+    const autoThr = document.getElementById("settings-auto-index-threshold");
     if (!rootsList && !autoCB) return;
 
     let _selectedRoot = null;
@@ -3082,8 +3082,8 @@
       const ok1 = await window.askDanger(
         "Delete all transcriptions?",
         `This will permanently delete ALL transcript files under:\n\n${folder}\n\n` +
-        `  \u2022  ${txt_count.toLocaleString()} transcript .txt file(s)\n` +
-        `  \u2022  ${jsonl_count.toLocaleString()} hidden .jsonl file(s)\n\n` +
+        ` \u2022 ${txt_count.toLocaleString()} transcript .txt file(s)\n` +
+        ` \u2022 ${jsonl_count.toLocaleString()} hidden .jsonl file(s)\n\n` +
         `Total: ${total.toLocaleString()} file(s), ${mb} MB\n\n` +
         "This cannot be undone. Are you sure?",
         "Continue");
@@ -3135,7 +3135,7 @@
           _selectedRoot = e.path;
           if (window.showContextMenu) {
             window.showContextMenu(ev.clientX, ev.clientY, [
-              { label: "\u{1F5D1}  Delete All Transcriptions",
+              { label: "\u{1F5D1} Delete All Transcriptions",
                 cls: "danger",
                 action: () => _confirmDeleteAllTranscriptions(e.path) },
             ]);
@@ -3200,7 +3200,7 @@
       if (autoThr) autoThr.value = String(n);
       try {
         await api.settings_save({
-          auto_index_enabled:  enabled,
+          auto_index_enabled: enabled,
           auto_index_threshold: n,
         });
       } catch (_e) {}
@@ -3209,14 +3209,14 @@
       try {
         const s = await getApi()?.settings_load?.();
         if (s) {
-          if (autoCB)  autoCB.checked = !!s.auto_index_enabled;
-          if (autoThr) autoThr.value  = String(s.auto_index_threshold || 10);
+          if (autoCB) autoCB.checked = !!s.auto_index_enabled;
+          if (autoThr) autoThr.value = String(s.auto_index_threshold || 10);
         }
       } catch (_e) {}
     };
     loadSavedAuto();
     autoCB?.addEventListener("change", persistAuto);
-    autoThr?.addEventListener("blur",   persistAuto);
+    autoThr?.addEventListener("blur", persistAuto);
     autoThr?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") { e.preventDefault(); persistAuto(); }
     });
@@ -3249,7 +3249,7 @@
           if (el) el.textContent = txt;
         };
         setText("stat-channels", (c.channels ?? "").toLocaleString?.() ?? "");
-        setText("stat-videos",   (c.videos   ?? "").toLocaleString?.() ?? "");
+        setText("stat-videos", (c.videos ?? "").toLocaleString?.() ?? "");
       } catch (_e) {}
       if (typeof orig === "function") try { orig(idx); } catch (_e) {}
     };
@@ -3334,7 +3334,7 @@
       // Expand when there's text in either the name or URL field, or when
       // we're currently editing an existing channel (_editingIdentity set).
       const nameVal = (document.getElementById("edit-folder")?.value || "").trim();
-      const urlVal  = (document.getElementById("edit-url")?.value || "").trim();
+      const urlVal = (document.getElementById("edit-url")?.value || "").trim();
       const editing = !!_editingIdentity;
       const shouldShow = Boolean(nameVal || urlVal || editing);
       box.classList.toggle("collapsed", !shouldShow);
@@ -3346,7 +3346,7 @@
     // a video URL here (instead of the Download tab), show a handoff
     // button. Mirrors classic's _video_nudge_frame (YTArchiver.py:5017).
     const _editUrlVideoNudge = document.getElementById("edit-url-video-nudge");
-    const _editUrlField      = document.getElementById("edit-url");
+    const _editUrlField = document.getElementById("edit-url");
     const _updateEditUrlNudge = () => {
       if (!_editUrlVideoNudge || !_editUrlField) return;
       const t = (_editUrlField.value || "").trim();
@@ -3414,7 +3414,7 @@
                          : (channel.split_years ? "years" : "flat")),
           from_date: channel.from_date || channel.date_after || "",
           auto_transcribe: !!channel.auto_transcribe,
-          auto_metadata:   !!channel.auto_metadata,
+          auto_metadata: !!channel.auto_metadata,
           compress_enabled: !!channel.compress_enabled,
         };
         document.getElementById("edit-resolution").value = String(channel.resolution || "720").replace("p", "");
@@ -3472,7 +3472,7 @@
           const subsRow = (window._subsAllRows || [])
             .find(r => (r.folder || "").toLowerCase() === (channel.folder || "").toLowerCase());
           document.getElementById("ds-videos").textContent = subsRow?.n_vids ?? "\u2014";
-          document.getElementById("ds-size").textContent   = subsRow?.size   ?? "\u2014";
+          document.getElementById("ds-size").textContent = subsRow?.size ?? "\u2014";
           document.getElementById("ds-last-sync").textContent = subsRow?.last_sync ?? "\u2014";
           // Hide transcribed stats until async lookup lands
           const txSep = document.getElementById("ds-tx-sep");
@@ -3487,13 +3487,13 @@
             api.channel_transcription_stats(channel.folder || channel.name || "")
               .then((res) => {
                 if (!res?.ok) return;
-                if (!res.total) return;  // no DB entries yet — keep hidden
+                if (!res.total) return; // no DB entries yet — keep hidden
                 if (txSep) txSep.hidden = false;
                 if (txLbl) txLbl.hidden = false;
                 if (txVal) {
                   txVal.hidden = false;
                   const pct = res.total ? Math.round(100 * res.transcribed / res.total) : 0;
-                  txVal.textContent = `${res.transcribed} / ${res.total}  (${pct}%)`;
+                  txVal.textContent = `${res.transcribed} / ${res.total} (${pct}%)`;
                   txVal.title = `Pending: ${res.pending}, Failed: ${res.failed}`;
                 }
               })
@@ -3508,7 +3508,7 @@
         remove.style.display = "none";
         if (ds) ds.hidden = true;
         _updateCollapsed();
-        window._editOriginalSnapshot = null;   // add mode — no snapshot
+        window._editOriginalSnapshot = null; // add mode — no snapshot
       }
       // Only scroll the panel into view when we're opening in Edit mode —
       // unwanted scroll on every boot if Add mode auto-scrolls.
@@ -3567,17 +3567,17 @@
         (document.getElementById("edit-date-day")?.value || "").trim(),
       ].filter(Boolean).join("");
       const cur = {
-        folder:         _folderCur,
-        url:            (document.getElementById("edit-url")?.value || "").trim(),
-        resolution:     String(document.getElementById("edit-resolution")?.value || "720").replace("p",""),
-        min_duration:   parseInt(document.getElementById("edit-min-dur")?.value, 10) || 0,
-        max_duration:   parseInt(document.getElementById("edit-max-dur")?.value, 10) || 0,
-        mode:           _rangeCur === "all" ? "full"
+        folder: _folderCur,
+        url: (document.getElementById("edit-url")?.value || "").trim(),
+        resolution: String(document.getElementById("edit-resolution")?.value || "720").replace("p",""),
+        min_duration: parseInt(document.getElementById("edit-min-dur")?.value, 10) || 0,
+        max_duration: parseInt(document.getElementById("edit-max-dur")?.value, 10) || 0,
+        mode: _rangeCur === "all" ? "full"
                          : (_rangeCur === "fromdate" ? "date" : "new"),
-        folder_org:     (document.getElementById("edit-folder-org")?.value || "flat"),
-        from_date:      _dateCur,
+        folder_org: (document.getElementById("edit-folder-org")?.value || "flat"),
+        from_date: _dateCur,
         auto_transcribe:!!document.getElementById("edit-transcribe")?.checked,
-        auto_metadata:  !!document.getElementById("edit-metadata")?.checked,
+        auto_metadata: !!document.getElementById("edit-metadata")?.checked,
         compress_enabled:!!document.getElementById("edit-compress")?.checked,
       };
       const dirty = Object.keys(snap).some(k => String(snap[k]) !== String(cur[k]));
@@ -3636,7 +3636,7 @@
       }
       const r = await api.chan_redownload(name, res);
       if (r?.ok) window._showToast?.("Redownload resumed.", "ok");
-      else       window._showToast?.(r?.error || "Resume failed.", "error");
+      else window._showToast?.(r?.error || "Resume failed.", "error");
     });
 
     // "\u2713 Recheck resolution" — scans the channel folder with ffprobe
@@ -3664,7 +3664,7 @@
           return;
         }
         const mismatch = res.mismatch || 0;
-        const total    = res.total || 0;
+        const total = res.total || 0;
         if (mismatch === 0) {
           window._showToast?.(`All ${total} video(s) already at ${target}p or higher.`, "ok");
           return;
@@ -3680,7 +3680,7 @@
         if (!ok) return;
         const r2 = await api.chan_redownload(name, target);
         if (r2?.ok) window._showToast?.(`Redownload started (${label}).`, "ok");
-        else        window._showToast?.(r2?.error || "Redownload failed.", "error");
+        else window._showToast?.(r2?.error || "Redownload failed.", "error");
       } catch (e) {
         window._showToast?.("Error: " + e, "error");
       }
@@ -3715,8 +3715,8 @@
             // Ask before overwriting a user-typed name.
             const replace = await askConfirm(
               "Channel name mismatch",
-              `YouTube says this channel is named:\n\n    ${probed}\n\n` +
-              `Your Name field currently has:\n\n    ${current}\n\n` +
+              `YouTube says this channel is named:\n\n ${probed}\n\n` +
+              `Your Name field currently has:\n\n ${current}\n\n` +
               `Use the probed name? (Renames the on-disk folder if this is Edit mode.)`,
               { confirm: "Use probed name" });
             if (replace) {
@@ -3751,9 +3751,9 @@
     // Collect form state into a payload
     const collectPayload = () => {
       const range = document.querySelector('input[name="edit-range"]:checked')?.value || "subscribe";
-      const fromYear  = document.getElementById("edit-date-year")?.value || "";
+      const fromYear = document.getElementById("edit-date-year")?.value || "";
       const fromMonth = document.getElementById("edit-date-month")?.value || "";
-      const fromDay   = document.getElementById("edit-date-day")?.value || "";
+      const fromDay = document.getElementById("edit-date-day")?.value || "";
       const from_date = fromYear ? `${fromYear.padStart(4, "0")}-${(fromMonth || "01").padStart(2, "0")}-${(fromDay || "01").padStart(2, "0")}` : "";
       // Single "Folder Name" input → write to BOTH folder and
       // folder_override so OLD YTArchiver's `channel_folder_name()` (which
@@ -3761,17 +3761,17 @@
       // Matches OLD behavior — see YTArchiver.py:5432 in _set_edit_mode.
       const _folderVal = document.getElementById("edit-folder").value.trim();
       return {
-        folder:            _folderVal,
-        url:               document.getElementById("edit-url").value.trim(),
-        folder_override:   _folderVal,
-        resolution:        document.getElementById("edit-resolution").value,
-        min_duration:      parseInt(document.getElementById("edit-min-dur").value) || 0,
-        max_duration:      parseInt(document.getElementById("edit-max-dur").value) || 0,
-        folder_org:        document.getElementById("edit-folder-org").value,
-        auto_transcribe:   document.getElementById("edit-transcribe").checked,
-        auto_metadata:     document.getElementById("edit-metadata").checked,
-        compress_enabled:  document.getElementById("edit-compress").checked,
-        compress_level:    document.getElementById("edit-compress-quality")?.value || "Generous",
+        folder: _folderVal,
+        url: document.getElementById("edit-url").value.trim(),
+        folder_override: _folderVal,
+        resolution: document.getElementById("edit-resolution").value,
+        min_duration: parseInt(document.getElementById("edit-min-dur").value) || 0,
+        max_duration: parseInt(document.getElementById("edit-max-dur").value) || 0,
+        folder_org: document.getElementById("edit-folder-org").value,
+        auto_transcribe: document.getElementById("edit-transcribe").checked,
+        auto_metadata: document.getElementById("edit-metadata").checked,
+        compress_enabled: document.getElementById("edit-compress").checked,
+        compress_level: document.getElementById("edit-compress-quality")?.value || "Generous",
         compress_output_res: document.getElementById("edit-compress-res")?.value || "720",
         range,
         from_date,
@@ -3820,7 +3820,7 @@
     update.addEventListener("click", async () => {
       const payload = collectPayload();
       if (!payload.folder) { flashError("Folder name is required."); return; }
-      if (!payload.url)    { flashError("Channel URL is required."); return; }
+      if (!payload.url) { flashError("Channel URL is required."); return; }
       const api = window.pywebview?.api;
       if (!api) { flashError("Not running in native mode \u2014 writes disabled."); return; }
 
@@ -3830,8 +3830,8 @@
           const dup = await api.subs_check_duplicate(payload.url, payload.folder);
           if (dup?.ok && (dup.dup_url || dup.dup_folder)) {
             const parts = [];
-            if (dup.dup_url)    parts.push(`\u2022 URL already used by:\n    ${dup.dup_url}`);
-            if (dup.dup_folder) parts.push(`\u2022 Folder name already taken by:\n    ${dup.dup_folder}`);
+            if (dup.dup_url) parts.push(`\u2022 URL already used by:\n ${dup.dup_url}`);
+            if (dup.dup_folder) parts.push(`\u2022 Folder name already taken by:\n ${dup.dup_folder}`);
             const proceed = await askDanger(
               "Duplicate channel",
               "This would clash with an existing subscription:\n\n" +
@@ -3884,7 +3884,7 @@
 
     // ── Conditional group visibility toggles ──
     // Compress: show Res/Quality/Batch only when checkbox is checked
-    const compressBox   = document.getElementById("edit-compress");
+    const compressBox = document.getElementById("edit-compress");
     const compressGroup = document.getElementById("edit-compress-group");
     const syncCompressVis = () => {
       if (compressGroup) compressGroup.hidden = !compressBox?.checked;
@@ -3910,9 +3910,9 @@
 
     // Auto-advance between YYYY/MM/DD as user types digits
     const dateParts = [
-      ["edit-date-year",  4, "edit-date-month"],
+      ["edit-date-year", 4, "edit-date-month"],
       ["edit-date-month", 2, "edit-date-day"],
-      ["edit-date-day",   2, null],
+      ["edit-date-day", 2, null],
     ];
     for (const [id, maxLen, nextId] of dateParts) {
       const el = document.getElementById(id);
@@ -3950,7 +3950,7 @@
     // Matches YTArchiver.py:32306 _header_deselect_browse.
     const thead = tbody.parentElement?.querySelector("thead");
     thead?.addEventListener("click", (e) => {
-      if (e.target.closest(".col-resizer")) return;  // don't deselect on resize
+      if (e.target.closest(".col-resizer")) return; // don't deselect on resize
       tbody.querySelectorAll("tr.row-selected").forEach(r => r.classList.remove("row-selected"));
     });
 
@@ -4005,7 +4005,7 @@
       }
       const selected = [...tbody.querySelectorAll("tr.row-selected")];
       const n = selected.length;
-      const title   = tr.querySelector(".col-title")?.textContent || "";
+      const title = tr.querySelector(".col-title")?.textContent || "";
       const channel = tr.querySelector(".col-channel")?.textContent || "";
       const items = n > 1 ? [
         { label: `Delete ${n} files`, cls: "dim",
@@ -4024,7 +4024,7 @@
       ] : [
         // "Play video" opens the Browse Watch view (embedded HTML5 <video>
         // + karaoke transcript), NOT a separate VLC window.
-        { label: "Play video",            action: async () => {
+        { label: "Play video", action: async () => {
           const api = window.pywebview?.api;
           // Resolve filepath + video_id via the recent lookup, then hand off
           // to the shared Watch-view opener used by the Browse grid.
@@ -4042,8 +4042,8 @@
           });
         }},
         { label: "Play in external player", action: () => window.pywebview?.api?.recent_play?.(title, channel) },
-        { label: "Show in Explorer",        action: () => window.pywebview?.api?.recent_show_in_explorer?.(title, channel) },
-        { label: "Open video on YouTube",   action: () => window.pywebview?.api?.recent_open_youtube?.(title, channel) },
+        { label: "Show in Explorer", action: () => window.pywebview?.api?.recent_show_in_explorer?.(title, channel) },
+        { label: "Open video on YouTube", action: () => window.pywebview?.api?.recent_open_youtube?.(title, channel) },
         { sep: true },
         // Re-queue download — fetches this video's URL from recent_downloads
         // and re-drives the single-video flow. Mirrors OLD's Recent menu
@@ -4093,35 +4093,35 @@
           ? `Recheck metadata (${_pendMeta} pending)`
           : "Recheck metadata";
         showContextMenu(e.clientX, e.clientY, [
-          { label: "Open videos",            action: () => card.click() },
-          { label: "Show in Explorer",       action: () => api?.chan_open_folder?.(name) },
+          { label: "Open videos", action: () => card.click() },
+          { label: "Show in Explorer", action: () => api?.chan_open_folder?.(name) },
           { label: "Open channel on YouTube", action: () => api?.chan_open_url?.(name) },
           { sep: true },
-          { label: "Sync now",               action: () => api?.sync_one_channel?.({ name }) },
-          { label: _metaLabel,               action: () => api?.metadata_recheck_channel?.({ name }) },
-          { label: _txLabel,                 action: () => _askTranscribeChannel(name) },
+          { label: "Sync now", action: () => api?.sync_one_channel?.({ name }) },
+          { label: _metaLabel, action: () => api?.metadata_recheck_channel?.({ name }) },
+          { label: _txLabel, action: () => _askTranscribeChannel(name) },
           { sep: true },
           { label: "Reorg folder",
             submenu: [
-              { label: "Flat (no split)",       action: () => api?.reorg_channel_folder?.({ name }, false, false, false) },
-              { label: "Split by year",         action: () => api?.reorg_channel_folder?.({ name }, true,  false, false) },
-              { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name }, true,  true,  false) },
+              { label: "Flat (no split)", action: () => api?.reorg_channel_folder?.({ name }, false, false, false) },
+              { label: "Split by year", action: () => api?.reorg_channel_folder?.({ name }, true, false, false) },
+              { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name }, true, true, false) },
               { label: "Re-check dates + year/month", action: () => api?.reorg_channel_folder?.({ name }, true, true, true) },
-              { label: "Fix file dates only",   action: () => api?.chan_fix_file_dates?.({ name }) },
+              { label: "Fix file dates only", action: () => api?.chan_fix_file_dates?.({ name }) },
             ]},
           // "Fetch channel art" removed — now bundled with the metadata sweep.
           { label: "Redownload at\u2026",
             submenu: [
               { label: "Best available", action: () => _askRedownload(name, "best") },
-              { label: "2160p (4K)",     action: () => _askRedownload(name, "2160") },
-              { label: "1440p",          action: () => _askRedownload(name, "1440") },
-              { label: "1080p",          action: () => _askRedownload(name, "1080") },
-              { label: "720p",           action: () => _askRedownload(name, "720")  },
-              { label: "480p",           action: () => _askRedownload(name, "480")  },
-              { label: "360p",           action: () => _askRedownload(name, "360")  },
+              { label: "2160p (4K)", action: () => _askRedownload(name, "2160") },
+              { label: "1440p", action: () => _askRedownload(name, "1440") },
+              { label: "1080p", action: () => _askRedownload(name, "1080") },
+              { label: "720p", action: () => _askRedownload(name, "720") },
+              { label: "480p", action: () => _askRedownload(name, "480") },
+              { label: "360p", action: () => _askRedownload(name, "360") },
             ]},
           { sep: true },
-          { label: "Edit settings",          action: () => window._editChannelFromContext?.(name) },
+          { label: "Edit settings", action: () => window._editChannelFromContext?.(name) },
         ]);
       });
     }
@@ -4157,11 +4157,11 @@
                 { label: "1080p",
                   action: () => api?.chan_redownload?.({ name: chan }, "1080", _scope) },
                 { label: "720p",
-                  action: () => api?.chan_redownload?.({ name: chan }, "720",  _scope) },
+                  action: () => api?.chan_redownload?.({ name: chan }, "720", _scope) },
                 { label: "480p",
-                  action: () => api?.chan_redownload?.({ name: chan }, "480",  _scope) },
+                  action: () => api?.chan_redownload?.({ name: chan }, "480", _scope) },
                 { label: "360p",
-                  action: () => api?.chan_redownload?.({ name: chan }, "360",  _scope) },
+                  action: () => api?.chan_redownload?.({ name: chan }, "360", _scope) },
               ]},
           ]);
           return;
@@ -4170,28 +4170,28 @@
         if (!card) return;
         e.preventDefault();
         const filepath = card.dataset.filepath || "";
-        const videoId  = card.dataset.videoId || "";
-        const title    = card.dataset.title || "";
-        const ytUrl    = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
+        const videoId = card.dataset.videoId || "";
+        const title = card.dataset.title || "";
+        const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
         const api = window.pywebview?.api;
         showContextMenu(e.clientX, e.clientY, [
-          { label: "Play video",         action: () => {
+          { label: "Play video", action: () => {
             if (filepath && api?.browse_open_video) api.browse_open_video(filepath);
           }},
-          { label: "Open on YouTube",    action: () => {
+          { label: "Open on YouTube", action: () => {
             if (ytUrl) window.open(ytUrl, "_blank");
           }},
-          { label: "Copy YouTube URL",   action: () => {
+          { label: "Copy YouTube URL", action: () => {
             if (ytUrl) {
               navigator.clipboard?.writeText(ytUrl);
               window._showToast?.("URL copied.", "ok");
             }
           }},
-          { label: "Show in Explorer",   action: () => {
+          { label: "Show in Explorer", action: () => {
             if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
           }},
           { sep: true },
-          { label: "Transcribe now",     action: async () => {
+          { label: "Transcribe now", action: async () => {
             if (filepath && api?.transcribe_enqueue) {
               // Manual → Whisper model picker (60s countdown auto-picks default).
               const model = await (window._askWhisperModel?.(`"${title}"`));
@@ -4212,9 +4212,9 @@
               `Queued ${model} re-transcription.`, "ok");
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
-          { label: "Redownload\u2026",   action: () => bridgeCall("video_redownload", videoId, title) },
+          { label: "Redownload\u2026", action: () => bridgeCall("video_redownload", videoId, title) },
           { sep: true },
-          { label: "Delete file",        cls: "dim",
+          { label: "Delete file", cls: "dim",
             action: () => bridgeCall("video_delete_file", filepath) },
         ]);
       });
@@ -4232,7 +4232,7 @@
         const api = window.pywebview?.api;
         const v = _browseState.currentVideo || {};
         showContextMenu(e.clientX, e.clientY, [
-          { label: `Copy segment`,         action: () => navigator.clipboard?.writeText(text) },
+          { label: `Copy segment`, action: () => navigator.clipboard?.writeText(text) },
           { label: `Copy timestamp + text`, action: () => navigator.clipboard?.writeText(`${ts} ${text}`) },
           { sep: true },
           { label: "Bookmark this moment\u2026", action: async () => {
@@ -4247,7 +4247,7 @@
               cancel: "Cancel",
               allowEmpty: true,
             }) ?? "";
-            if (note === null) return;  // user cancelled
+            if (note === null) return; // user cancelled
             const res = await api.bookmark_add({
               video_id: v.video_id || "",
               title: v.title || "",
@@ -4257,7 +4257,7 @@
               note: note || "",
             });
             if (res?.ok) window._showToast?.("Bookmarked.", "ok");
-            else         window._showToast?.(res?.error || "Bookmark failed.", "error");
+            else window._showToast?.(res?.error || "Bookmark failed.", "error");
           }},
         ]);
       });
@@ -4279,7 +4279,7 @@
   // ─── Parent Folder native picker (Subs tab) ──────────────────────────
   function initParentFolderPicker() {
     const input = document.getElementById("parent-folder-input");
-    const btn   = document.getElementById("btn-browse-parent");
+    const btn = document.getElementById("btn-browse-parent");
     if (!btn) return;
     btn.addEventListener("click", async () => {
       const api = window.pywebview?.api;
@@ -4446,13 +4446,13 @@
       // mutation (YTArchiver.py:5596 — "Add to Sync List" → "Already in
       // Sync List" → "Channel Transcribing...").
       const _syncState = window._queueHasSyncForChannel?.(chan);
-      const _gpuState  = window._queueHasGpuForChannel?.(chan);
+      const _gpuState = window._queueHasGpuForChannel?.(chan);
       const _syncLabel = _syncState === "running" ? "Syncing now \u2026 (already running)"
-                       : _syncState === "queued"  ? "Already in Sync queue"
+                       : _syncState === "queued" ? "Already in Sync queue"
                                                   : "Sync now";
       const _syncDisabled = Boolean(_syncState);
       const _txLabel = _gpuState === "running" ? "Channel transcribing \u2026"
-                     : _gpuState === "queued"  ? "Already queued for transcribe"
+                     : _gpuState === "queued" ? "Already queued for transcribe"
                                                : "Transcribe channel";
       const _txDisabled = Boolean(_gpuState);
       // Match YTArchiver.py _chan_ctx_menu (line 5596-6180): 15-item menu
@@ -4460,16 +4460,16 @@
       showContextMenu(e.clientX, e.clientY, [
         { label: _syncLabel, cls: _syncDisabled ? "dim" : "",
           action: () => { if (!_syncDisabled) api?.sync_one_channel?.({ name: chan }); }},
-        { label: "Edit settings",           action: () => window._editChannelFromContext?.(chan) },
+        { label: "Edit settings", action: () => window._editChannelFromContext?.(chan) },
         { label: "Open folder in Explorer", action: () => api?.chan_open_folder?.(chan) },
-        { label: "Open URL in browser",     action: () => api?.chan_open_url?.(chan) },
+        { label: "Open URL in browser", action: () => api?.chan_open_url?.(chan) },
         { sep: true },
         { label: "Reorg folder",
           submenu: [
-            { label: "Flat (no split)",       action: () => api?.reorg_channel_folder?.({ name: chan }, false, false, false) },
-            { label: "Split by year",         action: () => api?.reorg_channel_folder?.({ name: chan }, true,  false, false) },
-            { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name: chan }, true,  true,  false) },
-            { label: "Re-apply organization", action: () => api?.reorg_channel_folder?.({ name: chan }, null,  null,  false) },
+            { label: "Flat (no split)", action: () => api?.reorg_channel_folder?.({ name: chan }, false, false, false) },
+            { label: "Split by year", action: () => api?.reorg_channel_folder?.({ name: chan }, true, false, false) },
+            { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name: chan }, true, true, false) },
+            { label: "Re-apply organization", action: () => api?.reorg_channel_folder?.({ name: chan }, null, null, false) },
             // Recheck-dates + fix-file-dates are long operations — OLD app
             // shows an all-caps warning dialog. YTArchiver.py:5721-5742.
             { label: "Re-check dates + year/month", action: async () => {
@@ -4496,20 +4496,20 @@
         { sep: true },
         { label: _txLabel, cls: _txDisabled ? "dim" : "",
           action: () => { if (!_txDisabled) _askTranscribeChannel(chan); }},
-        { label: "Download metadata",       action: () => api?.metadata_recheck_channel?.({ name: chan }) },
+        { label: "Download metadata", action: () => api?.metadata_recheck_channel?.({ name: chan }) },
         { sep: true },
         { label: "Redownload at\u2026",
           submenu: [
             { label: "Best available", action: () => _askRedownload(chan, "best") },
-            { label: "2160p (4K)",     action: () => _askRedownload(chan, "2160") },
-            { label: "1440p",          action: () => _askRedownload(chan, "1440") },
-            { label: "1080p",          action: () => _askRedownload(chan, "1080") },
-            { label: "720p",           action: () => _askRedownload(chan, "720")  },
-            { label: "480p",           action: () => _askRedownload(chan, "480")  },
-            { label: "360p",           action: () => _askRedownload(chan, "360")  },
+            { label: "2160p (4K)", action: () => _askRedownload(chan, "2160") },
+            { label: "1440p", action: () => _askRedownload(chan, "1440") },
+            { label: "1080p", action: () => _askRedownload(chan, "1080") },
+            { label: "720p", action: () => _askRedownload(chan, "720") },
+            { label: "480p", action: () => _askRedownload(chan, "480") },
+            { label: "360p", action: () => _askRedownload(chan, "360") },
           ]},
         { sep: true },
-        { label: "Remove channel",         cls: "dim", action: async () => {
+        { label: "Remove channel", cls: "dim", action: async () => {
           // Two-step (subscription → optional disk delete) via shared helper.
           const res = await window._removeChannelWithPrompt(chan);
           if (!res || !res.ok) return;
@@ -4604,11 +4604,11 @@
     root.appendChild(menu);
     // Clamp to viewport
     const r = menu.getBoundingClientRect();
-    if (r.right > window.innerWidth)  menu.style.left = (window.innerWidth - r.width - 4) + "px";
-    if (r.bottom > window.innerHeight) menu.style.top  = (window.innerHeight - r.height - 4) + "px";
+    if (r.right > window.innerWidth) menu.style.left = (window.innerWidth - r.width - 4) + "px";
+    if (r.bottom > window.innerHeight) menu.style.top = (window.innerHeight - r.height - 4) + "px";
     // Close on outside click / Escape
     setTimeout(() => {
-      document.addEventListener("click",   closeContextMenu, { once: true });
+      document.addEventListener("click", closeContextMenu, { once: true });
       document.addEventListener("keydown", onCtxKey);
     }, 0);
   }
@@ -4624,11 +4624,11 @@
   // ─── Log right-click menu (Copy / Copy all / Clear / Save to file) ──
   function initLogContextMenu() {
     const handlers = [
-      { el: document.getElementById("main-log"),     label: "Main log" },
+      { el: document.getElementById("main-log"), label: "Main log" },
       { el: document.getElementById("activity-log"), label: "Activity log" },
-      { el: document.getElementById("subs-mini-log"),    label: "Mini log" },
-      { el: document.getElementById("recent-mini-log"),  label: "Mini log" },
-      { el: document.getElementById("browse-mini-log"),  label: "Mini log" },
+      { el: document.getElementById("subs-mini-log"), label: "Mini log" },
+      { el: document.getElementById("recent-mini-log"), label: "Mini log" },
+      { el: document.getElementById("browse-mini-log"), label: "Mini log" },
       { el: document.getElementById("settings-mini-log"), label: "Mini log" },
     ];
     for (const { el, label } of handlers) {
@@ -4655,7 +4655,7 @@
             if (window.pywebview?.api?.save_text_to_file) {
               const res = await window.pywebview.api.save_text_to_file("ytarchiver_log.txt", text);
               if (res?.ok) window._showToast?.("Log saved.", "ok");
-              else         window._showToast?.(res?.error || "Save failed.", "error");
+              else window._showToast?.(res?.error || "Save failed.", "error");
             } else {
               // Fallback: blob download (works in browser preview)
               const blob = new Blob([text], { type: "text/plain" });
@@ -4683,10 +4683,10 @@
   // ─── URL field + Download button ────────────────────────────────────
   //
   // Behavior matches YTArchiver.py:19706-19708 + _validate_download_btn:
-  //   - Field is empty      → "▶ Download" hidden, Sync Subbed is the main action
-  //   - YouTube URL typed   → "▶ Download" appears next to the URL field
-  //   - Click Download OR press Enter → calls archive_single_video + clears input
-  //   - Escape clears the field
+  // - Field is empty → "▶ Download" hidden, Sync Subbed is the main action
+  // - YouTube URL typed → "▶ Download" appears next to the URL field
+  // - Click Download OR press Enter → calls archive_single_video + clears input
+  // - Escape clears the field
   //
   // The old "Paste & archive" button is gone — pasting a URL just shows the
   // Download button, which is more discoverable and matches the original.
@@ -4694,8 +4694,8 @@
 
   function initUrlField() {
     const input = document.getElementById("url-input");
-    const btn   = document.getElementById("btn-download-single");
-    const errRow  = document.getElementById("url-error-row");
+    const btn = document.getElementById("btn-download-single");
+    const errRow = document.getElementById("url-error-row");
     const errText = document.getElementById("url-error-text");
     const voPanel = document.getElementById("video-opts-panel");
     const nudgePanel = document.getElementById("channel-nudge-panel");
@@ -4712,7 +4712,7 @@
     const setErr = (msg) => {
       if (!errRow || !errText) return;
       if (msg) { errText.textContent = msg; errRow.hidden = false; }
-      else     { errText.textContent = ""; errRow.hidden = true;  }
+      else { errText.textContent = ""; errRow.hidden = true; }
     };
     const refreshErr = () => {
       const t = (input.value || "").trim();
@@ -4741,10 +4741,10 @@
 
     // Read the Video-options panel into a plain dict to send to the backend.
     const readVideoOptions = () => {
-      const saveTo  = document.getElementById("vo-save-to")?.value?.trim() || "";
-      const res     = document.getElementById("vo-resolution")?.value || "1080";
+      const saveTo = document.getElementById("vo-save-to")?.value?.trim() || "";
+      const res = document.getElementById("vo-resolution")?.value || "1080";
       const dateFile = !!document.getElementById("vo-date-file")?.checked;
-      const addDate  = !!document.getElementById("vo-add-date")?.checked;
+      const addDate = !!document.getElementById("vo-add-date")?.checked;
       const useYtTitle = !!document.getElementById("vo-use-yt-title")?.checked;
       const customName = document.getElementById("vo-custom-name")?.value?.trim() || "";
       return {
@@ -5072,12 +5072,12 @@
         // `best`) — reads left-to-right as "what size do I want?"
         // rather than reverse-descending. Best stays primary (default).
         choices: [
-          { label: "360p",           value: "360"  },
-          { label: "480p",           value: "480"  },
-          { label: "720p",           value: "720"  },
-          { label: "1080p",          value: "1080" },
-          { label: "1440p",          value: "1440" },
-          { label: "2160p (4K)",     value: "2160" },
+          { label: "360p", value: "360" },
+          { label: "480p", value: "480" },
+          { label: "720p", value: "720" },
+          { label: "1080p", value: "1080" },
+          { label: "1440p", value: "1440" },
+          { label: "2160p (4K)", value: "2160" },
           { label: "Best available", value: "best", primary: true },
         ],
       }) : null);
@@ -5101,7 +5101,7 @@
         return;
       }
       const model = await (window._askWhisperModel?.(`"${v.title}"`));
-      if (!model) return;  // user cancelled
+      if (!model) return; // user cancelled
       const res = await api.transcribe_retranscribe(
         v.filepath, v.title || "", v.video_id || "");
       if (res?.ok) {
@@ -5128,22 +5128,22 @@
       }
       const res = await window.pywebview.api.bookmark_add({
         video_id: v.video_id || "",
-        title:    v.title || "",
-        channel:  v.channel || "",
+        title: v.title || "",
+        channel: v.channel || "",
         start_time: t,
         text: text.slice(0, 200),
       });
       if (res?.ok) window._showToast?.("Bookmarked @ " + _formatTs(t), "ok");
-      else         window._showToast?.(res?.error || "Bookmark failed.", "error");
+      else window._showToast?.(res?.error || "Bookmark failed.", "error");
     });
 
     // Watch-find: cycle through ALL matches. Matches YTArchiver.py:29682
     // Ctrl+F → Enter loops through matches with persistent highlight +
     // running "3 of 11" count.
-    const watchFind      = document.getElementById("watch-find");
+    const watchFind = document.getElementById("watch-find");
     const watchFindCount = document.getElementById("watch-find-count");
-    const watchFindNext  = document.getElementById("watch-find-next");
-    const watchFindPrev  = document.getElementById("watch-find-prev");
+    const watchFindNext = document.getElementById("watch-find-next");
+    const watchFindPrev = document.getElementById("watch-find-prev");
     const findState = { matches: [], idx: -1, q: "" };
 
     function _rebuildFindMatches() {
@@ -5228,7 +5228,7 @@
   // activity-log-frame so users don't see an empty 3-row blank above
   // the main log.
   function syncActivityLogVisibility() {
-    const el    = document.getElementById("activity-log");
+    const el = document.getElementById("activity-log");
     const frame = document.querySelector(".activity-log-frame");
     const splitter = document.getElementById("paned-splitter");
     if (!el || !frame) return;
@@ -5243,7 +5243,7 @@
   // when there's actually something to clear. Otherwise they're clutter.
   function syncClearButtonsVisibility() {
     const mainLog = document.getElementById("main-log");
-    const actLog  = document.getElementById("activity-log");
+    const actLog = document.getElementById("activity-log");
     const clearLogBtn = document.getElementById("btn-clear-log");
     const clearActBtn = document.getElementById("btn-clear");
     if (clearLogBtn) {
@@ -5257,7 +5257,7 @@
 
   // Watch for additions to the activity + main log via MutationObserver
   function observeActivityLog() {
-    const act  = document.getElementById("activity-log");
+    const act = document.getElementById("activity-log");
     const main = document.getElementById("main-log");
     if (act) {
       const obs = new MutationObserver(() => {
@@ -5311,23 +5311,23 @@
     // inside the Sync Tasks / GPU Tasks popover.
     pauseBtn?.addEventListener("click", async () => {
       // Three click paths:
-      //   1. Worker thread alive + not paused → pause (both queues)
-      //   2. Worker thread alive + paused     → resume (both queues)
-      //   3. Worker thread dead + items queued + paused →
-      //      start a fresh sync thread. sync_start_all clears every
-      //      pause flag AND spawns the worker, so the restored queue
-      //      gets processed. Click-triggered only; never automatic —
-      //      matches Project rule: "launching with items in queue
-      //      must never auto-start" (main.py:168).
+      // 1. Worker thread alive + not paused → pause (both queues)
+      // 2. Worker thread alive + paused → resume (both queues)
+      // 3. Worker thread dead + items queued + paused →
+      // start a fresh sync thread. sync_start_all clears every
+      // pause flag AND spawns the worker, so the restored queue
+      // gets processed. Click-triggered only; never automatic —
+      // matches Project rule: "launching with items in queue
+      // must never auto-start" (main.py:168).
       const api = window.pywebview?.api;
       if (!api) return;
       const s = _blinkState.sync;
       const g = _blinkState.gpu;
       const syncActivelyPaused = s.running && s.paused;
-      const gpuActivelyPaused  = g.running && g.paused;
-      const anyActivelyPaused  = syncActivelyPaused || gpuActivelyPaused;
+      const gpuActivelyPaused = g.running && g.paused;
+      const anyActivelyPaused = syncActivelyPaused || gpuActivelyPaused;
       const syncDeadPausedWithItems = !s.running && s.paused && s.count > 0;
-      const gpuDeadPausedWithItems  = !g.running && g.paused && g.count > 0;
+      const gpuDeadPausedWithItems = !g.running && g.paused && g.count > 0;
       const deadPausedWithItems =
         syncDeadPausedWithItems || gpuDeadPausedWithItems;
       try {
@@ -5397,7 +5397,7 @@
             message: "Pause keeps the queue. Clear Queue empties it — the " +
                      "current channel finishes either way.",
             buttons: [
-              { label: "Pause",       value: "pause", kind: "primary" },
+              { label: "Pause", value: "pause", kind: "primary" },
               { label: "Clear Queue", value: "clear", kind: "danger" },
             ],
             cancel: "Cancel",
@@ -5439,7 +5439,7 @@
             message: "Pause keeps the queue. Clear Queue empties it and " +
                      "cancels the current job.",
             buttons: [
-              { label: "Pause",       value: "pause", kind: "primary" },
+              { label: "Pause", value: "pause", kind: "primary" },
               { label: "Clear Queue", value: "clear", kind: "danger" },
             ],
             cancel: "Cancel",
@@ -5472,7 +5472,7 @@
     // items are queued-but-paused-without-a-live-thread (the state after
     // a cold launch when QueueState.load() restored persisted items).
     sync: { running: false, paused: false, count: 0 },
-    gpu:  { running: false, paused: false, count: 0 },
+    gpu: { running: false, paused: false, count: 0 },
   };
   // Expose for logs.js's renderQueues so it can mirror queue counts
   // into _blinkState the moment a fresh payload arrives.
@@ -5482,10 +5482,10 @@
 
   function initQueueBlink() {
     // Backend drives blink state via:
-    //   window.setQueueState({ sync: {running, paused}, gpu: {running, paused} })
+    // window.setQueueState({ sync: {running, paused}, gpu: {running, paused} })
     window.setQueueState = (state) => {
       if (state.sync) Object.assign(_blinkState.sync, state.sync);
-      if (state.gpu)  Object.assign(_blinkState.gpu,  state.gpu);
+      if (state.gpu) Object.assign(_blinkState.gpu, state.gpu);
       ensureBlinkRunning();
       paintBlinkState();
     };
@@ -5515,8 +5515,8 @@
     if (typeof origRenderQueues === "function") {
       window.renderQueues = (queues) => {
         origRenderQueues(queues);
-        _blinkState.sync.count  = (queues?.sync || []).length;
-        _blinkState.gpu.count   = (queues?.gpu  || []).length;
+        _blinkState.sync.count = (queues?.sync || []).length;
+        _blinkState.gpu.count = (queues?.gpu || []).length;
         // Paused flags may be missing on partial payloads (e.g. a
         // legacy caller that only passes {sync, gpu}) — only overwrite
         // when the key is present so we don't reset the state that
@@ -5525,7 +5525,7 @@
           _blinkState.sync.paused = !!queues.sync_paused;
         }
         if (queues && "gpu_paused" in queues) {
-          _blinkState.gpu.paused  = !!queues.gpu_paused;
+          _blinkState.gpu.paused = !!queues.gpu_paused;
         }
         _syncPauseButtonState();
         paintBlinkState();
@@ -5535,14 +5535,14 @@
 
   function _syncPauseButtonState() {
     // Three states:
-    //   1. Worker thread alive (running OR parked in _wait_if_paused) →
-    //      enabled. Click pauses/resumes an in-progress pass.
-    //   2. Thread dead BUT items are queued AND queue is paused →
-    //      enabled. Click starts a new sync thread that will process
-    //      the restored queue. This covers the cold-launch case where
-    //      the user quit mid-pass and reopens with 99+ items pending.
-    //   3. Thread dead AND (no items OR not paused) → disabled.
-    //      User clicks Sync Subbed to start fresh.
+    // 1. Worker thread alive (running OR parked in _wait_if_paused) →
+    // enabled. Click pauses/resumes an in-progress pass.
+    // 2. Thread dead BUT items are queued AND queue is paused →
+    // enabled. Click starts a new sync thread that will process
+    // the restored queue. This covers the cold-launch case where
+    // the user quit mid-pass and reopens with 99+ items pending.
+    // 3. Thread dead AND (no items OR not paused) → disabled.
+    // User clicks Sync Subbed to start fresh.
     const s = _blinkState.sync;
     const g = _blinkState.gpu;
     const anyAlive = s.running || g.running;
@@ -5565,7 +5565,7 @@
       clearInterval(_blinkState.timer);
       _blinkState.timer = null;
       _blinkState.clockOn = false;
-      paintBlinkState();  // final solid paint
+      paintBlinkState(); // final solid paint
     }
   }
 
@@ -5576,48 +5576,48 @@
 
   function paintBlinkState() {
     // Three visual states, per user rule:
-    //   idle     → grey (nothing running, nothing paused mid-pass)
-    //   running  → green/red blink at clockOn cadence
-    //   paused   → solid green/red when the worker thread is alive AND
-    //              paused. "Running" in _blinkState reflects "worker
-    //              thread is alive" (set by main.py _on_queue_changed),
-    //              so it stays true during pause-between-channels —
-    //              which means this cleanly distinguishes "actively
-    //              paused mid-pass" (solid) from "persisted paused flag
-    //              at idle" (grey).
+    // idle → grey (nothing running, nothing paused mid-pass)
+    // running → green/red blink at clockOn cadence
+    // paused → solid green/red when the worker thread is alive AND
+    // paused. "Running" in _blinkState reflects "worker
+    // thread is alive" (set by main.py _on_queue_changed),
+    // so it stays true during pause-between-channels —
+    // which means this cleanly distinguishes "actively
+    // paused mid-pass" (solid) from "persisted paused flag
+    // at idle" (grey).
     const syncBtn = document.getElementById("btn-sync-tasks");
-    const gpuBtn  = document.getElementById("btn-gpu-tasks");
+    const gpuBtn = document.getElementById("btn-gpu-tasks");
     if (syncBtn) {
       const s = _blinkState.sync;
       let state = "idle";
-      if (s.running && s.paused)  state = "paused";
-      else if (s.running)         state = _blinkState.clockOn ? "on" : "off";
+      if (s.running && s.paused) state = "paused";
+      else if (s.running) state = _blinkState.clockOn ? "on" : "off";
       syncBtn.dataset.blinkState = state;
     }
     if (gpuBtn) {
       const g = _blinkState.gpu;
       let state = "idle";
-      if (g.running && g.paused)  state = "paused";
-      else if (g.running)         state = _blinkState.clockOn ? "on" : "off";
+      if (g.running && g.paused) state = "paused";
+      else if (g.running) state = _blinkState.clockOn ? "on" : "off";
       gpuBtn.dataset.blinkState = state;
     }
     // Global Pause button (Download tab). Three visual states:
-    //   running (ghost, pause icon)  — a worker thread is alive,
-    //           nothing paused. Click pauses.
-    //   paused  (solid, resume icon) — worker alive AND paused,
-    //           OR worker dead AND queue has items AND queue paused
-    //           (persisted-paused-at-launch). Click resumes — if the
-    //           thread is dead, the click handler starts a fresh one
-    //           that processes the restored queue.
-    //   disabled is set by _syncPauseButtonState when nothing to do.
+    // running (ghost, pause icon) — a worker thread is alive,
+    // nothing paused. Click pauses.
+    // paused (solid, resume icon) — worker alive AND paused,
+    // OR worker dead AND queue has items AND queue paused
+    // (persisted-paused-at-launch). Click resumes — if the
+    // thread is dead, the click handler starts a fresh one
+    // that processes the restored queue.
+    // disabled is set by _syncPauseButtonState when nothing to do.
     const pauseBtn = document.getElementById("btn-pause");
     if (pauseBtn) {
       const s = _blinkState.sync;
       const g = _blinkState.gpu;
       const syncActive = s.running && s.paused;
-      const gpuActive  = g.running  && g.paused;
+      const gpuActive = g.running && g.paused;
       const syncPausedWithItems = !s.running && s.paused && s.count > 0;
-      const gpuPausedWithItems  = !g.running && g.paused && g.count > 0;
+      const gpuPausedWithItems = !g.running && g.paused && g.count > 0;
       const anyPaused = syncActive || gpuActive ||
                         syncPausedWithItems || gpuPausedWithItems;
       pauseBtn.dataset.pauseState = anyPaused ? "paused" : "running";
@@ -5646,7 +5646,7 @@
     _paintPopoverPauseBtn("btn-pause-sync-queue",
                            _blinkState.sync, "Sync");
     _paintPopoverPauseBtn("btn-pause-gpu-queue",
-                           _blinkState.gpu,  "GPU");
+                           _blinkState.gpu, "GPU");
     // Sync popover: no sibling buttons in the footer — hide the entire
     // footer when there's nothing to act on so we don't show an empty
     // bar with just the border-top.
@@ -5706,14 +5706,14 @@
   // always in sync with what's on disk.
   function initSettingsTab() {
     const panel = document.getElementById("panel-settings");
-    const save       = document.getElementById("settings-save");
-    const browseOut  = document.getElementById("settings-browse-output");
-    const browseVid  = document.getElementById("settings-browse-video");
-    const ytdlpBtn   = document.getElementById("btn-ytdlp-update");
-    const expBtn     = document.getElementById("btn-export-channels");
-    const impBtn     = document.getElementById("btn-import-channels");
-    const bkExpBtn   = document.getElementById("btn-export-backup");
-    const bkImpBtn   = document.getElementById("btn-import-backup");
+    const save = document.getElementById("settings-save");
+    const browseOut = document.getElementById("settings-browse-output");
+    const browseVid = document.getElementById("settings-browse-video");
+    const ytdlpBtn = document.getElementById("btn-ytdlp-update");
+    const expBtn = document.getElementById("btn-export-channels");
+    const impBtn = document.getElementById("btn-import-channels");
+    const bkExpBtn = document.getElementById("btn-export-backup");
+    const bkImpBtn = document.getElementById("btn-import-backup");
     if (!panel) return;
 
     // RAM estimate: each cached video row is ~1 KB of Python objects
@@ -5731,15 +5731,15 @@
         let nCh = 0, nVids = 0;
         if (api?.get_index_summary) {
           const idx = await api.get_index_summary();
-          nCh   = idx?.cards?.channels ?? 0;
-          nVids = idx?.cards?.videos   ?? 0;
+          nCh = idx?.cards?.channels ?? 0;
+          nVids = idx?.cards?.videos ?? 0;
         }
-        const allEl  = document.getElementById("settings-preload-all");
-        const hintB  = document.getElementById("settings-preload-all-hint");
+        const allEl = document.getElementById("settings-preload-all");
+        const hintB = document.getElementById("settings-preload-all-hint");
         if (!hintB) return;
         // Context-aware warning — show the user what the trade-off
         // actually is depending on which way the toggle is set, per
-        // Scott's request: "On warning: longer load time on launch.
+        // request: "On warning: longer load time on launch.
         // Off warning: longer load time on first browse tab load."
         if (allEl?.checked) {
           const est = nVids * BYTES_PER_ROW;
@@ -5763,7 +5763,7 @@
       try {
         const s = await api.settings_load();
         document.getElementById("settings-output-dir").value = s.output_dir || "";
-        document.getElementById("settings-video-dir").value  = s.video_out_dir || "";
+        document.getElementById("settings-video-dir").value = s.video_out_dir || "";
         document.getElementById("settings-whisper-model").value = s.whisper_model || "large-v3";
         document.getElementById("settings-default-res").value = s.default_resolution || "720";
         document.getElementById("settings-default-min").value = s.default_min_duration ?? 3;
@@ -5826,7 +5826,7 @@
     // in Browse — YTArchiver.py:24840). Both prompt for confirmation because
     // they queue N*K yt-dlp jobs.
     const metaQueueAll = document.getElementById("btn-metadata-queue-all");
-    const metaRefresh  = document.getElementById("btn-metadata-refresh-all");
+    const metaRefresh = document.getElementById("btn-metadata-refresh-all");
     metaQueueAll?.addEventListener("click", async () => {
       const api = window.pywebview?.api;
       if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
@@ -5857,12 +5857,12 @@
     save?.addEventListener("click", async () => {
       const api = window.pywebview?.api;
       const payload = {
-        output_dir:           document.getElementById("settings-output-dir").value,
-        video_out_dir:        document.getElementById("settings-video-dir").value,
-        whisper_model:        document.getElementById("settings-whisper-model").value,
-        default_resolution:   document.getElementById("settings-default-res").value,
+        output_dir: document.getElementById("settings-output-dir").value,
+        video_out_dir: document.getElementById("settings-video-dir").value,
+        whisper_model: document.getElementById("settings-whisper-model").value,
+        default_resolution: document.getElementById("settings-default-res").value,
         default_min_duration: parseInt(document.getElementById("settings-default-min").value) || 3,
-        log_mode:             document.getElementById("settings-log-mode").value,
+        log_mode: document.getElementById("settings-log-mode").value,
         // Startup knobs
         disk_scan_staleness_hours:
           Math.max(0, parseInt(document.getElementById("settings-disk-staleness")?.value, 10) || 0),
@@ -6038,9 +6038,9 @@
   // ─── Manual Transcribe dialog ────────────────────────────────────────
   function initManualTranscribe() {
     const backdrop = document.getElementById("manual-tx-backdrop");
-    const pathEl   = document.getElementById("manual-tx-path");
-    const modelEl  = document.getElementById("manual-tx-model");
-    const openBtn  = document.getElementById("btn-manual-transcribe");
+    const pathEl = document.getElementById("manual-tx-path");
+    const modelEl = document.getElementById("manual-tx-model");
+    const openBtn = document.getElementById("btn-manual-transcribe");
     const browseBtn = document.getElementById("manual-tx-browse");
     const cancelBtn = document.getElementById("manual-tx-cancel");
     const confirmBtn = document.getElementById("manual-tx-confirm");
@@ -6115,7 +6115,7 @@
   function initQueueModals() {
     const pairs = [
       ["btn-sync-tasks", "popover-sync-tasks"],
-      ["btn-gpu-tasks",  "popover-gpu-tasks"],
+      ["btn-gpu-tasks", "popover-gpu-tasks"],
     ];
     for (const [btnId, popId] of pairs) {
       const btn = document.getElementById(btnId);
@@ -6177,7 +6177,7 @@
         const prev = swap.dataset.prev || swap.value;
         const ok = await askConfirm("Swap whisper model",
           `The current transcribe job (if any) will finish on the old model. ` +
-          `The next job will use:\n\n    ${swap.value}\n\nContinue?`,
+          `The next job will use:\n\n ${swap.value}\n\nContinue?`,
           { confirm: "Swap" });
         if (!ok) {
           swap.value = prev;
@@ -6207,7 +6207,7 @@
     pop.style.display = "";
     pop.style.visibility = "";
 
-    let top  = br.bottom + 6;
+    let top = br.bottom + 6;
     let left = br.right - pr.width;
     if (left < 8) left = 8;
     if (left + pr.width > window.innerWidth - 8) {
@@ -6217,15 +6217,15 @@
       top = br.top - pr.height - 6;
       if (top < 8) top = 8;
     }
-    pop.style.top  = top + "px";
+    pop.style.top = top + "px";
     pop.style.left = left + "px";
   }
 
   // ─── Seed logs with test data ────────────────────────────────────────
   //
   // Dual mode:
-  //   - pywebview (desktop app)  → Python bridge via window.pywebview.api
-  //   - browser preview          → fetch sample.json (same data, static)
+  // - pywebview (desktop app) → Python bridge via window.pywebview.api
+  // - browser preview → fetch sample.json (same data, static)
   async function seedLogs() {
     // Give pywebview a brief window to register its API before falling back.
     const pywebviewReady = () =>
@@ -6393,13 +6393,13 @@
       const choice = await askChoice?.(
         `"${ch.name}" — folder missing`,
         `This channel is subscribed but its folder is gone:\n\n` +
-        `    ${ch.expected}\n\n` +
+        ` ${ch.expected}\n\n` +
         "Locate the folder if you moved it, Remove the subscription if it's " +
         "no longer needed, or Skip to decide later.",
         [
-          { label: "Locate\u2026", value: "locate",  kind: "primary" },
-          { label: "Remove",       value: "remove",  kind: "danger"  },
-          { label: "Skip",         value: "skip",    kind: "ghost"   },
+          { label: "Locate\u2026", value: "locate", kind: "primary" },
+          { label: "Remove", value: "remove", kind: "danger" },
+          { label: "Skip", value: "skip", kind: "ghost" },
         ]);
       if (choice === "locate") {
         const pick = await api.subs_browse_for_channel_folder?.(ch.name);
@@ -6438,7 +6438,7 @@
       b.className = "custom-tooltip";
       b.textContent = text;
       b.style.left = x + "px";
-      b.style.top  = y + "px";
+      b.style.top = y + "px";
       document.body.appendChild(b);
       return b;
     };
@@ -6485,7 +6485,7 @@
     document.addEventListener("mouseout", (e) => {
       if (!currentEl) return;
       const to = e.relatedTarget;
-      if (to && currentEl.contains(to)) return;   // still inside
+      if (to && currentEl.contains(to)) return; // still inside
       hide();
     });
     // Also hide when the user starts clicking / typing
@@ -6638,7 +6638,7 @@
         if (res?.ok) {
           const parts = [];
           if (res.transcribe_queued) parts.push(`${res.transcribe_queued} for transcribe`);
-          if (res.metadata_queued)   parts.push(`${res.metadata_queued} for metadata`);
+          if (res.metadata_queued) parts.push(`${res.metadata_queued} for metadata`);
           window._showToast?.(parts.length
             ? `Queued ${parts.join(", ")}.`
             : "No pending channels.", parts.length ? "ok" : "warn");

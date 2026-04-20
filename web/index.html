@@ -14,11 +14,11 @@
   <!-- Header strip -->
   <div class="header-strip">
     <span class="header-title">YT ARCHIVER</span>
-    <span class="header-version" id="header-version">v47.0 - 4.20.26 3:06pm</span>
+    <span class="header-version" id="header-version">v47.1 - 4.20.26 3:16pm</span>
   </div>
 
   <!-- Tab row. Recent was previously a top-level tab (hangover from an
-       earlier draft) but Scott wanted it moved under Browse alongside
+       earlier draft) but users wanted it moved under Browse alongside
        Channels / Search / Graph / Bookmarks so all "library navigation"
        lives in one place. See the `panel-browse` sidebar below for the
        new location. -->
@@ -353,7 +353,7 @@
                via `.edit-gl-row-start` so it lands on its own row — the
                radio group is `grid-column: 2/-1`, which forces a wrap
                anyway; without this the label would end up in col 3 of
-               the Duration row (bug Scott caught: blank cell 4 + radios
+               the Duration row (bug caught: blank cell 4 + radios
                on a new row starting at col 2 looked like an orphan
                label). -->
           <label class="edit-gl edit-gl-row-start">Range</label>
@@ -371,11 +371,11 @@
               <span class="radio-circle"></span>From date
             </label>
             <div class="edit-date-group" id="edit-date-group" hidden>
-              <input type="text" class="ctl-input edit-date-part" id="edit-date-year"  placeholder="YYYY" maxlength="4" inputmode="numeric" />
+              <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
               <span class="edit-dim">/</span>
               <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
               <span class="edit-dim">/</span>
-              <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day"   placeholder="DD" maxlength="2" inputmode="numeric" />
+              <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
             </div>
           </div>
 
@@ -482,11 +482,11 @@
        inside panel-browse below.) -->
 
   <!-- Settings tab: left-sidebar layout, multiple sub-views.
-       [General]     — paths, defaults, log mode, whisper model
+       [General] — paths, defaults, log mode, whisper model
        [Performance] — startup tuning (disk scan, browse preload)
-       [Appearance]  — UI preferences (subs table, recent view)
-       [Tools]       — yt-dlp, channel/backup export-import, bulk metadata
-       [Index]       — archive index management (Stats, Build/Update,
+       [Appearance] — UI preferences (subs table, recent view)
+       [Tools] — yt-dlp, channel/backup export-import, bulk metadata
+       [Index] — archive index management (Stats, Build/Update,
                        Rebuild, Archive roots, Auto-update, Log)
        the user wanted everything index-related in one place, not spread
        between Browse and Settings. All sub-views share one Save button
@@ -952,7 +952,7 @@
               <div class="search-viewer" id="search-viewer">
                 <div class="search-viewer-head">
                   <span class="search-viewer-title" id="search-viewer-title">Select a result to read</span>
-                  <span class="search-viewer-meta"  id="search-viewer-meta"></span>
+                  <span class="search-viewer-meta" id="search-viewer-meta"></span>
                 </div>
                 <button class="btn btn-ghost btn-thin search-viewer-loadmore"
                         id="search-viewer-earlier" hidden

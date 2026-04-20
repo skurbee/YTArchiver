@@ -10,16 +10,16 @@ without testing end-to-end — this file talks a specific JSON protocol
 that transcribe.py depends on.
 
 Environment inputs:
-    WHISPER_MODEL    (default "large-v3")
-    WHISPER_DEVICE   (default "cuda")
-    WHISPER_COMPUTE  (default "float16")
+    WHISPER_MODEL (default "large-v3")
+    WHISPER_DEVICE (default "cuda")
+    WHISPER_COMPUTE (default "float16")
 
 Protocol:
-    → stdin:  { "path": "/full/path.mp4", "duration": 123.4 }
+    → stdin: { "path": "/full/path.mp4", "duration": 123.4 }
     ← stdout: { "status": "starting" }
               { "status": "progress", "pct": 42 }
               { "status": "ok", "text": "full text...", "segments": [...] }
-              or  { "status": "error", "text": "reason" }
+              or { "status": "error", "text": "reason" }
 """
 
 import sys, json, os, io
@@ -33,8 +33,8 @@ sys.stderr = io.StringIO()
 from faster_whisper import WhisperModel
 
 _model_name = os.environ.get("WHISPER_MODEL", "large-v3")
-_device     = os.environ.get("WHISPER_DEVICE", "cuda")
-_compute    = os.environ.get("WHISPER_COMPUTE", "float16")
+_device = os.environ.get("WHISPER_DEVICE", "cuda")
+_compute = os.environ.get("WHISPER_COMPUTE", "float16")
 
 _cuda_fallback_reason = None
 try:

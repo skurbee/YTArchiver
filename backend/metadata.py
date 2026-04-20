@@ -3,9 +3,9 @@ Metadata fetcher — writes OLD YTArchiver's aggregated format.
 
 Output layout (must match YTArchiver.py exactly for drop-in replacement):
 
-  .{ch_name} Metadata.jsonl                      (no split)
-  {year}/.{ch_name} {year} Metadata.jsonl         (year-split)
-  {year}/{MM Month}/.{ch_name} {Month} {YY} Metadata.jsonl   (year+month)
+  .{ch_name} Metadata.jsonl (no split)
+  {year}/.{ch_name} {year} Metadata.jsonl (year-split)
+  {year}/{MM Month}/.{ch_name} {Month} {YY} Metadata.jsonl (year+month)
 
   Each file is a hidden (Windows HIDDEN attr) JSONL. One JSON per line,
   keyed by `video_id`. Dict schema per entry:
@@ -62,7 +62,7 @@ def _unhide_file_win(path: str) -> None:
     truncate/rewrite without tripping Explorer's locked-file behavior)."""
     if os.name == "nt":
         try:
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)  # NORMAL
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80) # NORMAL
         except Exception:
             pass
 
@@ -207,7 +207,7 @@ def _download_thumbnail(url: str, thumb_dir: str,
         with open(fpath, "wb") as f:
             f.write(img_data)
     except Exception:
-        pass  # non-fatal
+        pass # non-fatal
 
 
 def _fetch_video_metadata(yt: str, video_id: str,
@@ -260,23 +260,23 @@ def _fetch_video_metadata(yt: str, video_id: str,
     for c in (data.get("comments") or [])[:50]:
         comments.append({
             "author": c.get("author", ""),
-            "text":   c.get("text", ""),
-            "likes":  c.get("like_count", 0),
-            "time":   c.get("timestamp") or c.get("time_text", ""),
+            "text": c.get("text", ""),
+            "likes": c.get("like_count", 0),
+            "time": c.get("timestamp") or c.get("time_text", ""),
         })
 
     return {
-        "video_id":      video_id,
-        "title":         data.get("title", title_hint),
-        "description":   data.get("description", ""),
-        "view_count":    data.get("view_count", 0),
-        "like_count":    data.get("like_count", 0),
+        "video_id": video_id,
+        "title": data.get("title", title_hint),
+        "description": data.get("description", ""),
+        "view_count": data.get("view_count", 0),
+        "like_count": data.get("like_count", 0),
         "comment_count": data.get("comment_count", 0),
-        "upload_date":   data.get("upload_date", ""),
-        "duration":      data.get("duration", 0),
+        "upload_date": data.get("upload_date", ""),
+        "duration": data.get("duration", 0),
         "thumbnail_url": data.get("thumbnail", ""),
-        "comments":      comments,
-        "fetched_at":    datetime.now().isoformat(),
+        "comments": comments,
+        "fetched_at": datetime.now().isoformat(),
     }
 
 
@@ -294,7 +294,7 @@ def _scan_channel_videos(folder: Path) -> List[Tuple[str, str, Optional[int], Op
       1. Trailing `[id]` bracket in filename (legacy naming).
       2. Index DB's `videos` table via filepath (current + OLD's actual
          naming — `%(title)s.%(ext)s` with NO id bracket, so the DB is
-         the only mapping). Scott hit this: the metadata recheck saw
+         the only mapping). users hit this: the metadata recheck saw
          all 642 playlist IDs as "not on disk" because this function
          returned vid_id="" for every file (no bracket to parse), so
          the `by_id` map was empty, the caller treated every ID as
@@ -308,13 +308,13 @@ def _scan_channel_videos(folder: Path) -> List[Tuple[str, str, Optional[int], Op
         return out
     # Match a YouTube video_id bracket at the END of the stem. A
     # separate post-filter rejects matches that are pure letters —
-    # Scott's ColdFusion archive has 13 files with the filename
-    # suffix `[ColdFustion]` (the channel name), which is exactly
+    # a user's channel archive has 13 files with the filename
+    # suffix `[a-user-channel]` (the channel name), which is exactly
     # 11 letters and matches the `[A-Za-z0-9_-]{11}` pattern. Real
     # YouTube video_ids are random 11-char picks from that set and
     # statistically always include at least one digit/_/-.
     bracket_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
-    _vid_looks_fake = lambda s: s.isalpha()  # all-letters → not a YT id
+    _vid_looks_fake = lambda s: s.isalpha() # all-letters → not a YT id
     # Pre-load videos-table rows for this channel folder so we can
     # fill in missing video_ids without N queries.
     fp_to_id: Dict[str, str] = {}
@@ -348,7 +348,7 @@ def _scan_channel_videos(folder: Path) -> List[Tuple[str, str, Optional[int], Op
             if not vid_id:
                 vid_id = fp_to_id.get(os.path.normpath(fp).lower(), "")
             # Strip the trailing `[...]` suffix from the title even
-            # if it was a fake one (ColdFustion) — we still don't
+            # if it was a fake one (a-user-channel) — we still don't
             # want it in the title display.
             title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
             try:
@@ -392,11 +392,11 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
     already know its file path and mtime, so we compute year/month from
     that and write straight to the correct aggregated JSONL.
 
-    Emits one log line by default — "  \u2014 Metadata downloaded" — in
+    Emits one log line by default — " \u2014 Metadata downloaded" — in
     pink, matching the format the user asked for:
         [Sync] ...
           Downloading Title...
-          \u2014 \u2713 Title                Channel   04.18.26    (26 MB)
+          \u2014 \u2713 Title Channel 04.18.26 (26 MB)
           \u2014 Metadata downloaded
 
     Called from sync.py's DLTRACK handler (dispatched to a background
@@ -416,7 +416,7 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
-    split_years  = bool(channel.get("split_years"))
+    split_years = bool(channel.get("split_years"))
     split_months = bool(channel.get("split_months"))
 
     # Compute year/month from file mtime — yt-dlp --mtime sets mtime to
@@ -443,7 +443,7 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
     if entry is None:
         if emit_inline_log:
             stream.emit([
-                ["  \u2014 ", "dim"],
+                [" \u2014 ", "dim"],
                 ["Metadata fetch failed\n", "red"],
             ])
         return {"ok": False, "error": "yt-dlp dump-json failed"}
@@ -463,15 +463,15 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
 
     if emit_inline_log:
         # Per-video metadata done line. Matches the three-line simple-mode
-        # summary spec Scott locked in:
-        #     — ✓ <title>  —  <channel>  (size)        [download done,  green]
-        #     — ✓ Transcription  (details)              [transcription done, blue]
-        #     — ✓ Metadata downloaded                   [metadata done,  pink]
+        # summary spec locked in:
+        # — ✓ <title> — <channel> (size) [download done, green]
+        # — ✓ Transcription (details) [transcription done, blue]
+        # — ✓ Metadata downloaded [metadata done, pink]
         # Pink em-dash + checkmark + "Metadata downloaded".
         stream.emit([
-            ["  ",                     "dim"],
-            ["\u2014 \u2713 ",         "meta_bracket"],
-            ["Metadata downloaded\n",  "simpleline_pink"],
+            [" ", "dim"],
+            ["\u2014 \u2713 ", "meta_bracket"],
+            ["Metadata downloaded\n", "simpleline_pink"],
         ])
     return {"ok": True, "fetched": True}
 
@@ -508,7 +508,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
-    split_years  = bool(channel.get("split_years"))
+    split_years = bool(channel.get("split_years"))
     split_months = bool(channel.get("split_months"))
 
     # Walk the folder to find videos on disk matching these IDs — we need
@@ -526,8 +526,8 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
 
     stream.emit([
         ["[Metdta] ", "meta_bracket"],
-        [f"{name} ",                    "simpleline"],
-        ["\u2014 ",                     "meta_bracket"],
+        [f"{name} ", "simpleline"],
+        ["\u2014 ", "meta_bracket"],
         [f"fast-fetch {len(ids)} id(s)\n", "simpleline"],
     ])
 
@@ -544,7 +544,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
         # results are fine; re-running later picks up from where we
         # left off (via skip-existing).
         if pause_event is not None and pause_event.is_set():
-            stream.emit([["  \u23F8 Paused \u2014 stopping metadata walk.\n",
+            stream.emit([[" \u23F8 Paused \u2014 stopping metadata walk.\n",
                           "simpleline"]])
             break
         existing = _read_metadata_jsonl(jp)
@@ -553,7 +553,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
 
         def _has_thumbnail_for(vid: str) -> bool:
             """Check if any thumbnail file in this group's .Thumbnails
-            folder matches `[vid]`. Scott's case: 2 videos had metadata
+            folder matches `[vid]`. a case: 2 videos had metadata
             but no thumbnail — the old skip-if-in-existing check treated
             those as "complete" and never re-downloaded the thumbnail."""
             if not vid or not os.path.isdir(thumb_dir):
@@ -591,15 +591,15 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             # Color discipline: only the pink parts are the ones that
             # identify the task source (brackets, em-dash, tag label).
             # Numbers and titles render in the default color so they
-            # read clearly. Scott's rule.
+            # read clearly. rule.
             stream.emit([
-                ["  [",            "meta_bracket"],
-                [str(idx),         "simpleline"],
-                ["/",              "meta_bracket"],
-                [str(total),       "simpleline"],
-                ["] ",             "meta_bracket"],
-                [_reason,          "simpleline_pink"],
-                [" \u2014 ",       "meta_bracket"],
+                [" [", "meta_bracket"],
+                [str(idx), "simpleline"],
+                ["/", "meta_bracket"],
+                [str(total), "simpleline"],
+                ["] ", "meta_bracket"],
+                [_reason, "simpleline_pink"],
+                [" \u2014 ", "meta_bracket"],
                 [f"{title[:90]}\n", "simpleline"],
             ])
             entry = _fetch_video_metadata(yt, vid_id, title)
@@ -625,11 +625,11 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             if is_refresh_hit:
                 # Merge: update counts + comments, keep other fields
                 old = existing[vid_id]
-                old["view_count"]    = entry.get("view_count", old.get("view_count", 0))
-                old["like_count"]    = entry.get("like_count", old.get("like_count", 0))
+                old["view_count"] = entry.get("view_count", old.get("view_count", 0))
+                old["like_count"] = entry.get("like_count", old.get("like_count", 0))
                 old["comment_count"] = entry.get("comment_count", old.get("comment_count", 0))
-                old["comments"]      = entry.get("comments", old.get("comments", []))
-                old["fetched_at"]    = entry.get("fetched_at", "")
+                old["comments"] = entry.get("comments", old.get("comments", []))
+                old["fetched_at"] = entry.get("fetched_at", "")
                 if entry.get("thumbnail_url"):
                     old["thumbnail_url"] = entry["thumbnail_url"]
                 refreshed += 1
@@ -655,13 +655,13 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
 
     elapsed = time.time() - t0
     summary_parts = []
-    if fetched:   summary_parts.append(f"{fetched} fetched")
+    if fetched: summary_parts.append(f"{fetched} fetched")
     if refreshed: summary_parts.append(f"{refreshed} refreshed")
-    if skipped:   summary_parts.append(f"{skipped} skipped")
-    if errors:    summary_parts.append(f"{errors} errors")
+    if skipped: summary_parts.append(f"{skipped} skipped")
+    if errors: summary_parts.append(f"{errors} errors")
     summary = " \u00b7 ".join(summary_parts) or "nothing to do"
     stream.emit([
-        ["  \u2013 ", "dim"],
+        [" \u2013 ", "dim"],
         [f"Metadata {name} \u2014 ", "simpleline"],
         [summary, "dim"],
         [f" \u00b7 took {elapsed:.1f}s\n", "dim"],
@@ -695,7 +695,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             row_tag = "hist_pink" if (fetched or refreshed) else ""
             # Use the same `Xm Ys` helper as the rest of the activity
             # log so a 215-second run reads as "took 3m 35s" rather
-            # than "took 215.6s" (Scott's request — matches OLD
+            # than "took 215.6s" (request — matches OLD
             # YTArchiver's compact duration format).
             _el_int = int(elapsed or 0)
             if _el_int < 60:
@@ -705,14 +705,14 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             else:
                 _took_str = f"{_el_int // 3600}h {(_el_int % 3600) // 60}m"
             stream.emit_activity({
-                "kind":      "Metdta",
+                "kind": "Metdta",
                 "time_date": f"{time_str}, {date_str}",
-                "channel":   name,
-                "primary":   primary_ui,
+                "channel": name,
+                "primary": primary_ui,
                 "secondary": f"{skipped} existing",
-                "errors":    f"{errors} errors",
-                "took":      f"took {_took_str}",
-                "row_tag":   row_tag,
+                "errors": f"{errors} errors",
+                "took": f"took {_took_str}",
+                "row_tag": row_tag,
             })
         except Exception:
             pass
@@ -780,7 +780,7 @@ def _resolve_ids_by_title(yt: str, url: str,
         try: proc.terminate()
         except Exception: pass
     # Also group unmatched files by normalized title so we never
-    # assign the same id to multiple files. Scott's Apple Explained
+    # assign the same id to multiple files. a user's channel
     # case: `History of the iPhone (1).mp4`, `(2).mp4`, etc. — if we
     # stripped the `(N)` suffix they'd all collide onto one
     # playlist id and we'd silently duplicate. We don't strip, and
@@ -845,8 +845,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         index-DB filepath lookup). Compare against existing JSONL IDs.
         Fetch only the missing handful. NO playlist walk — because the
         playlist would include ~hundreds of channel-videos that aren't
-        downloaded, all of which are irrelevant for this job. Scott:
-        "I scrolled through the entire channel, there's only two
+        downloaded, all of which are irrelevant for this job. "I scrolled through the entire channel, there's only two
         videos that are missing thumbnails. How did you even come up
         with 176?" — the 176 were undownloaded playlist entries my
         old code was pointlessly hitting.
@@ -870,9 +869,9 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                  [f"Rechecking {name}...\n", "simpleline"]])
 
     # 1. Enumerate videos ON DISK. `_scan_channel_videos` returns
-    #    (video_id, title, year, month, filepath) — video_id is
-    #    filled in either from filename `[id]` bracket or from the
-    #    index DB (filepath → video_id lookup).
+    # (video_id, title, year, month, filepath) — video_id is
+    # filled in either from filename `[id]` bracket or from the
+    # index DB (filepath → video_id lookup).
     on_disk = _scan_channel_videos(folder)
     on_disk_ids = [v[0] for v in on_disk if v[0]]
     # Previously-failed fetches + previously-failed id-resolves —
@@ -926,13 +925,13 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                 jsonl_count += 1
                 have_meta.update(_read_metadata_jsonl(os.path.join(dp, fn)).keys())
 
-    # 3. Enumerate existing THUMBNAILS. Scott's case: 2 videos had
-    #    metadata JSONL entries but no thumbnail file on disk — the
-    #    earlier logic only checked metadata so those 2 showed as
-    #    "complete" and weren't re-fetched. Thumbnails are stored as
-    #    `<safe_title> [<video_id>].<ext>` inside `.Thumbnails/`
-    #    subfolders (one per year/month split). We extract the
-    #    bracketed video_id from each filename.
+    # 3. Enumerate existing THUMBNAILS. a case: 2 videos had
+    # metadata JSONL entries but no thumbnail file on disk — the
+    # earlier logic only checked metadata so those 2 showed as
+    # "complete" and weren't re-fetched. Thumbnails are stored as
+    # `<safe_title> [<video_id>].<ext>` inside `.Thumbnails/`
+    # subfolders (one per year/month split). We extract the
+    # bracketed video_id from each filename.
     have_thumb: set = set()
     thumb_file_count = 0
     _thumb_id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
@@ -951,14 +950,14 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                 have_thumb.add(m.group(1))
 
     # 4. Compute targets: missing metadata OR missing thumbnail.
-    #    Dedupe via dict (preserves insertion order) so a video whose
-    #    id accidentally appears multiple times in `on_disk_ids`
-    #    (historical bug: 13 ColdFusion files all got assigned the
-    #    fake id "ColdFustion" from filename-suffix parsing)
-    #    doesn't produce 13 identical fetch attempts.
-    #    Skip videos whose metadata fetch previously failed (deleted /
-    #    private / region-locked) — `_failed_fetch` set comes from
-    #    the DB and gets cleared on refresh=True.
+    # Dedupe via dict (preserves insertion order) so a video whose
+    # id accidentally appears multiple times in `on_disk_ids`
+    # (historical bug: 13 a user's channel files all got assigned the
+    # fake id "a-user-channel" from filename-suffix parsing)
+    # doesn't produce 13 identical fetch attempts.
+    # Skip videos whose metadata fetch previously failed (deleted /
+    # private / region-locked) — `_failed_fetch` set comes from
+    # the DB and gets cleared on refresh=True.
     seen: set = set()
     deduped_ids: list = []
     for _vid in on_disk_ids:
@@ -976,7 +975,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
     # (metadata coverage vs thumbnail coverage are now reported
     # separately). Only the em-dash prefix is pink — title/number
     # content stays default (simpleline) so it reads clearly against
-    # the dark background. Scott's rule: "colored em dash indicating
+    # the dark background. rule: "colored em dash indicating
     # what task it is from. Any brackets or anything should be pink.
     # The actual metadata tag should be pink but no actual title or
     # numbers or anything should be pink."
@@ -994,12 +993,12 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         _parts.append(f"{_perm_failed:,} previously failed (skipped)")
     _parts.append(f"{len(targets):,} need fetching")
     stream.emit([
-        ["  \u2014 ", "meta_bracket"],
+        [" \u2014 ", "meta_bracket"],
         [" \u00b7 ".join(_parts) + "\n", "simpleline"],
     ])
     if n_without_id:
         # Some on-disk files couldn't be matched to a video_id via the
-        # filename-bracket path or the index DB. Scott's case: 2 recent
+        # filename-bracket path or the index DB. a case: 2 recent
         # videos were manually dropped into the 2026/ folder with
         # bracket-less filenames AND no corresponding DB row got
         # populated with an id. They show up with no thumbnail in the
@@ -1011,7 +1010,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         # the index DB so this fallback doesn't need to run on next
         # recheck.
         stream.emit([
-            ["  \u26A0 ", "meta_bracket"],
+            [" \u26A0 ", "meta_bracket"],
             [f"{n_without_id:,} on-disk video(s) couldn't be matched "
              f"to a video_id \u2014 checking channel playlist for id "
              f"match by title...\n", "simpleline"],
@@ -1088,7 +1087,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                 pass
             if n_duplicates_flagged:
                 stream.emit([
-                    ["  \u26A0 ", "meta_bracket"],
+                    [" \u26A0 ", "meta_bracket"],
                     [f"{n_duplicates_flagged:,} duplicate download(s) "
                      f"detected \u2014 hidden from grid (files still on "
                      f"disk).\n", "simpleline"],
@@ -1103,7 +1102,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                 except Exception:
                     pass
             stream.emit([
-                ["  \u2713 ", "simpleline_green"],
+                [" \u2713 ", "simpleline_green"],
                 [f"Matched {len(resolved):,} of {n_without_id:,} "
                  f"by title \u2014 backfilled into index.\n",
                  "simpleline"],
@@ -1137,7 +1136,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
             except Exception:
                 pass
             stream.emit([
-                ["  \u2014 ", "meta_bracket"],
+                [" \u2014 ", "meta_bracket"],
                 [f"{len(still_unmatched):,} file(s) couldn't be matched "
                  f"even by playlist title (deleted? re-uploaded with "
                  f"new id? filename edited?). Marked as permanent skip.\n",
@@ -1145,17 +1144,17 @@ def fetch_channel_metadata(channel: Dict[str, Any],
             ])
             for _fp in still_unmatched[:5]:
                 stream.emit([
-                    ["      \u2022 ", "meta_bracket"],
+                    [" \u2022 ", "meta_bracket"],
                     [f"{os.path.basename(_fp)}\n", "simpleline"],
                 ])
             if len(still_unmatched) > 5:
                 stream.emit([
-                    ["      ", "dim"],
+                    [" ", "dim"],
                     [f"\u2026 and {len(still_unmatched) - 5:,} more\n", "dim"],
                 ])
     if n_perm_no_id:
         stream.emit([
-            ["  \u2014 ", "meta_bracket"],
+            [" \u2014 ", "meta_bracket"],
             [f"{n_perm_no_id:,} file(s) previously marked as "
              f"unresolvable \u2014 skipping (use Refresh to retry).\n",
              "simpleline"],
@@ -1169,7 +1168,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                        if vid not in have_meta or vid not in have_thumb]
 
     if not targets:
-        stream.emit([["  \u2713 ", "simpleline_green"],
+        stream.emit([[" \u2713 ", "simpleline_green"],
                      ["All metadata + thumbnails up to date.\n", "simpleline"]])
         return {"ok": True, "fetched": 0, "skipped": len(on_disk_ids),
                 "errors": 0}

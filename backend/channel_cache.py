@@ -37,7 +37,7 @@ _lock = threading.Lock()
 _cache: Dict[str, dict] = {}
 _loaded = False
 
-STALE_AFTER_SEC = 6 * 3600    # 6 hours
+STALE_AFTER_SEC = 6 * 3600 # 6 hours
 
 
 def _load_locked():

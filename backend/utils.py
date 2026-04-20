@@ -40,7 +40,7 @@ def utf8_subprocess_env() -> Dict[str, str]:
     # LC_ALL = C.UTF-8 covers tools that read POSIX locale rather than
     # PYTHONIOENCODING (e.g. some yt-dlp helpers, ffmpeg).
     env["LC_ALL"] = "C.UTF-8"
-    env["LANG"]   = "C.UTF-8"
+    env["LANG"] = "C.UTF-8"
     return env
 
 
@@ -53,8 +53,7 @@ def decode_subprocess_line(line_bytes: bytes) -> str:
     cp1252 so characters like U+2019 (\u2019, curly apostrophe) round-
     trip cleanly instead of becoming U+FFFD replacement chars.
 
-    Belt-and-suspenders companion to `utf8_subprocess_env()` — Scott
-    reported replacement chars in titles even after the env var fix,
+    Belt-and-suspenders companion to `utf8_subprocess_env()` — reported replacement chars in titles even after the env var fix,
     suggesting yt-dlp.exe isn't consistently respecting the setting.
     """
     if not line_bytes:
@@ -74,15 +73,15 @@ def decode_subprocess_line(line_bytes: bytes) -> str:
 # subfolders. All three of reorg/metadata/transcribe need to round-trip
 # against those same folder names, so they share this one dict.
 MONTH_FOLDERS = {
-    1:  "01 January",
-    2:  "02 February",
-    3:  "03 March",
-    4:  "04 April",
-    5:  "05 May",
-    6:  "06 June",
-    7:  "07 July",
-    8:  "08 August",
-    9:  "09 September",
+    1: "01 January",
+    2: "02 February",
+    3: "03 March",
+    4: "04 April",
+    5: "05 May",
+    6: "06 June",
+    7: "07 July",
+    8: "08 August",
+    9: "09 September",
     10: "10 October",
     11: "11 November",
     12: "12 December",
@@ -139,8 +138,8 @@ def fmt_time_ago(ts: float) -> str:
         age = max(0.0, time.time() - float(ts))
     except (TypeError, ValueError):
         return ""
-    if age < 60:    return "just now"
-    if age < 3600:  return f"{int(age / 60)} min ago"
+    if age < 60: return "just now"
+    if age < 3600: return f"{int(age / 60)} min ago"
     if age < 86400: return f"{int(age / 3600)} h ago"
     if age < 86400 * 30: return f"{int(age / 86400)} d ago"
     if age < 86400 * 365: return f"{int(age / 2592000)} mo ago"
@@ -194,7 +193,7 @@ def check_disk_space(path: str, required_bytes: int) -> bool:
         free = shutil.disk_usage(path).free
         return free >= int(required_bytes)
     except (OSError, ValueError):
-        return True  # fail open — don't block on probe errors
+        return True # fail open — don't block on probe errors
 
 
 # ── Subprocess cleanup (YTArchiver.py:2243 / 9214 / 9262) ──────────────

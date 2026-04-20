@@ -5,45 +5,45 @@
 
 :root {
   /* Surfaces */
-  --c-bg:        #0f1012;
-  --c-surface:   #161719;
-  --c-raised:    #1c1e21;
-  --c-input:     #101214;
-  --c-border:    #2a2c30;
+  --c-bg: #0f1012;
+  --c-surface: #161719;
+  --c-raised: #1c1e21;
+  --c-input: #101214;
+  --c-border: #2a2c30;
 
   /* Text */
-  --c-text:      #dde1e8;
-  --c-dim:       #4a4f5a;
-  --c-accent:    #a0aabb;
+  --c-text: #dde1e8;
+  --c-dim: #4a4f5a;
+  --c-accent: #a0aabb;
 
   /* Buttons */
-  --c-btn:       #252729;
-  --c-primary:   #3a3d42;
-  --c-sync:      #145c40;
-  --c-cancel:    #6b1a1a;
-  --c-warn:      #6b3a10;
+  --c-btn: #252729;
+  --c-primary: #3a3d42;
+  --c-sync: #145c40;
+  --c-cancel: #6b1a1a;
+  --c-warn: #6b3a10;
 
   /* Log */
-  --c-log-bg:        #0a0b0d;
-  --c-log-txt:       #7a8494;
-  --c-log-green:     #3dd68c;
-  --c-log-blue:      #6cb4ee;
-  --c-log-dim:       #272a2f;
-  --c-log-red:       #ff6b6b;
-  --c-log-head:      #a0aabb;
-  --c-log-sum:       #f5a623;
-  --c-log-pink:      #e87aac;
-  --c-log-update:    #38d9e0;
-  --c-log-redwnl:    #c7e64f;
-  --c-log-compress:  #c084fc;
-  --c-log-reorg:     #ff8c42;
+  --c-log-bg: #0a0b0d;
+  --c-log-txt: #7a8494;
+  --c-log-green: #3dd68c;
+  --c-log-blue: #6cb4ee;
+  --c-log-dim: #272a2f;
+  --c-log-red: #ff6b6b;
+  --c-log-head: #a0aabb;
+  --c-log-sum: #f5a623;
+  --c-log-pink: #e87aac;
+  --c-log-update: #38d9e0;
+  --c-log-redwnl: #c7e64f;
+  --c-log-compress: #c084fc;
+  --c-log-reorg: #ff8c42;
 
-  --c-log-row-alt:   #101520;
+  --c-log-row-alt: #101520;
   --c-log-filterskip-dim: #4a5060;
-  --c-livestream:    #f5a023;
+  --c-livestream: #f5a023;
 
   /* Fonts */
-  --font-ui:  "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-log: "Consolas", "Cascadia Mono", "Courier New", monospace;
 }
 
@@ -389,7 +389,7 @@ body {
   font-size: 11px;
   min-width: 68px;
 }
-.co-sep  { color: var(--c-dim); }
+.co-sep { color: var(--c-dim); }
 .co-hint { color: var(--c-dim); font-size: 11px; font-style: italic; }
 .co-mode-text { color: var(--c-text); font-size: 12px; }
 
@@ -436,7 +436,7 @@ body {
   animation: edit-autofill-flash 1.8s ease-out;
 }
 @keyframes edit-autofill-flash {
-  0%   { background: rgba(58, 138, 86, 0.35); border-color: #3a8a56; }
+  0% { background: rgba(58, 138, 86, 0.35); border-color: #3a8a56; }
   100% { background: var(--c-input); border-color: var(--c-border); }
 }
 
@@ -548,9 +548,9 @@ body {
 .icon-btn-gpu:hover { background: var(--c-primary); }
 
 /* Blink states — driven by window.setQueueState() from backend */
-.icon-btn-sync[data-blink-state="on"]     { background: #3a5a3a; border-color: #4a6a4a; }
+.icon-btn-sync[data-blink-state="on"] { background: #3a5a3a; border-color: #4a6a4a; }
 .icon-btn-sync[data-blink-state="paused"] { background: #3a5a3a; border-color: #4a6a4a; }
-.icon-btn-gpu[data-blink-state="on"]     { background: #6b1a1a; border-color: #8a2a2a; }
+.icon-btn-gpu[data-blink-state="on"] { background: #6b1a1a; border-color: #8a2a2a; }
 .icon-btn-gpu[data-blink-state="paused"] { background: #6b1a1a; border-color: #8a2a2a; }
 .icon-badge {
   position: absolute;
@@ -700,8 +700,8 @@ body {
    LOG AREAS — THE CROWN JEWEL
    Faithful translation of YTArchiver's log widgets:
    - activity log = autorun_history_text (bg C_INPUT, 8 hist tags, row alt)
-   - main log     = log_box             (bg C_LOG_BG, 40+ tags)
-   - mini log     = subs_mini_log etc.  (shares tags with main log)
+   - main log = log_box (bg C_LOG_BG, 40+ tags)
+   - mini log = subs_mini_log etc. (shares tags with main log)
    ═══════════════════════════════════════════════════════════════════════ */
 
 .log-paned {
@@ -713,7 +713,7 @@ body {
   overflow: hidden;
 }
 .activity-log-frame {
-  flex: 0 0 56px;           /* ~3 rows at 18px line-height + padding */
+  flex: 0 0 56px; /* ~3 rows at 18px line-height + padding */
   background: var(--c-input);
   overflow: hidden;
   border: 1px solid var(--c-border);
@@ -749,7 +749,7 @@ body {
   min-height: 60px;
   display: flex;
   flex-direction: column;
-  position: relative;  /* anchor for .log-jump-latest */
+  position: relative; /* anchor for .log-jump-latest */
 }
 
 /* Floating "↓ Latest" affordance shown while the log is scrolled up.
@@ -782,7 +782,7 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-log);
-  font-size: 12px;            /* Consolas 9 pt ≈ 12px at 96dpi */
+  font-size: 12px; /* Consolas 9 pt ≈ 12px at 96dpi */
   line-height: 16px;
   color: var(--c-log-txt);
   white-space: nowrap;
@@ -808,7 +808,7 @@ body {
 }
 
 /* Activity log uses a grid so columns align vertically and adapt to width.
-   Columns: [Kind]  time  —  channel(flex)  —  primary  secondary  tertiary  errors  took
+   Columns: [Kind] time — channel(flex) — primary secondary tertiary errors took
 
    `tertiary` is the 3rd count cell (e.g. "N metadata") added for
    consolidated [Dwnld] rows. Classic single-count rows (Trnscr,
@@ -820,22 +820,21 @@ body {
      window size, `fr` portions let the row stretch up to `max-width`
      below. Channel column gets the biggest share (3fr) since names
      are the most variable-length field. `max-width` caps the row so
-     ultrawide monitors don't render absurdly-spaced cells. Scott:
-     "there's supposed to be a maximum width though, so it doesn't
+     ultrawide monitors don't render absurdly-spaced cells. "there's supposed to be a maximum width though, so it doesn't
      start looking stupid at large widths." Bumped from 1400px \u2192 1800px
      when adding the new `tertiary` count column so each count cell
      has enough room for "1 transcribed" / "1 metadata" without ellipsis. */
   grid-template-columns:
-    minmax(60px,  auto)     /* [Kind]   */
-    minmax(96px,  auto)     /* time,date */
-    10px                    /* em-dash */
-    minmax(140px, 2.5fr)    /* channel — biggest flex */
-    10px                    /* em-dash */
-    minmax(120px, 1fr)      /* primary  (N downloaded) */
-    minmax(120px, 1fr)      /* secondary (N transcribed) */
-    minmax(120px, 1fr)      /* tertiary (N metadata)  [new] */
-    minmax(72px,  0.8fr)    /* errors */
-    minmax(88px,  1fr);     /* took */
+    minmax(60px, auto) /* [Kind] */
+    minmax(96px, auto) /* time,date */
+    10px /* em-dash */
+    minmax(140px, 2.5fr) /* channel — biggest flex */
+    10px /* em-dash */
+    minmax(120px, 1fr) /* primary (N downloaded) */
+    minmax(120px, 1fr) /* secondary (N transcribed) */
+    minmax(120px, 1fr) /* tertiary (N metadata) [new] */
+    minmax(72px, 0.8fr) /* errors */
+    minmax(88px, 1fr); /* took */
   max-width: 1800px;
   justify-content: stretch;
   align-items: center;
@@ -858,9 +857,9 @@ body {
   display: inline-block;
   text-align: center;
 }
-.activity-log .log-line > span.hist-col-num     { font-variant-numeric: tabular-nums; }
-.activity-log .log-line > span.hist-col-dash    { color: var(--c-dim); }
-.activity-log .log-line > span.hist-col-took    { color: var(--c-dim); }
+.activity-log .log-line > span.hist-col-num { font-variant-numeric: tabular-nums; }
+.activity-log .log-line > span.hist-col-dash { color: var(--c-dim); }
+.activity-log .log-line > span.hist-col-took { color: var(--c-dim); }
 
 /* Custom scrollbar — dark, slim, with auto-hide feel.
    Matches YTArchiver.py:4533 _auto_scrollbar: invisible by default,
@@ -868,7 +867,7 @@ body {
    so layout doesn't reflow. */
 .activity-log,
 .main-log {
-  scrollbar-width: thin;        /* Firefox */
+  scrollbar-width: thin; /* Firefox */
   scrollbar-color: transparent transparent;
 }
 .activity-log:hover,
@@ -903,46 +902,46 @@ body {
 /* ═══ Tag classes (matching tkinter tag_configure definitions) ═══ */
 
 /* Activity log tags */
-.t-hist_blue      { color: var(--c-log-blue); }
-.t-hist_green     { color: var(--c-log-green); }
-.t-hist_amber     { color: var(--c-log-sum); }
-.t-hist_pink      { color: var(--c-log-pink); }
-.t-hist_redwnl    { color: var(--c-log-redwnl); }
-.t-hist_compress  { color: var(--c-log-compress); }
-.t-hist_reorg     { color: var(--c-log-reorg); }
-.t-hist_skipped   { color: var(--c-log-sum, #e8c157); }   /* amber */
-.t-hist_error     { color: var(--c-log-red); }
+.t-hist_blue { color: var(--c-log-blue); }
+.t-hist_green { color: var(--c-log-green); }
+.t-hist_amber { color: var(--c-log-sum); }
+.t-hist_pink { color: var(--c-log-pink); }
+.t-hist_redwnl { color: var(--c-log-redwnl); }
+.t-hist_compress { color: var(--c-log-compress); }
+.t-hist_reorg { color: var(--c-log-reorg); }
+.t-hist_skipped { color: var(--c-log-sum, #e8c157); } /* amber */
+.t-hist_error { color: var(--c-log-red); }
 
 /* Main log base colors */
-.t-green          { color: var(--c-log-green); }
-.t-dim            { color: var(--c-log-dim); }
-.t-red            { color: var(--c-log-red); }
+.t-green { color: var(--c-log-green); }
+.t-dim { color: var(--c-log-dim); }
+.t-red { color: var(--c-log-red); }
 
 /* Main log headers (bold) */
-.t-header         { color: var(--c-log-head); font-weight: 700; }
-.t-tx_sep         { color: #ffffff; font-weight: 700; }
-.t-tx_head        { color: var(--c-log-blue); font-weight: 700; }
-.t-update_sep     { color: var(--c-log-update); font-weight: 700; }
-.t-update_head    { color: var(--c-log-update); font-weight: 700; }
+.t-header { color: var(--c-log-head); font-weight: 700; }
+.t-tx_sep { color: #ffffff; font-weight: 700; }
+.t-tx_head { color: var(--c-log-blue); font-weight: 700; }
+.t-update_sep { color: var(--c-log-update); font-weight: 700; }
+.t-update_head { color: var(--c-log-update); font-weight: 700; }
 
-.t-summary        { color: var(--c-log-sum); font-style: italic; }
-.t-livestream     { color: var(--c-livestream); font-weight: 700; }
+.t-summary { color: var(--c-log-sum); font-style: italic; }
+.t-livestream { color: var(--c-livestream); font-weight: 700; }
 
-.t-filterskip     { color: var(--c-log-sum); }
+.t-filterskip { color: var(--c-log-sum); }
 .t-filterskip_dim { color: var(--c-log-filterskip-dim); }
 
-.t-scanline       { color: var(--c-text); }
-.t-dlprogress     { color: var(--c-text); }
+.t-scanline { color: var(--c-text); }
+.t-dlprogress { color: var(--c-text); }
 .t-dlprogress_pct { color: var(--c-log-green); }
 
-.t-simplestatus            { color: var(--c-log-head); font-weight: 700; }
-.t-simplestatus_green      { color: var(--c-log-green); font-weight: 700; }
-.t-simplestatus_white      { color: var(--c-text); font-weight: 700; }
-.t-simplestatus_redwnl     { color: var(--c-log-redwnl); font-weight: 700; }
-.t-simplestatus_compress   { color: var(--c-log-compress); font-weight: 700; }
-.t-simplestatus_reorg      { color: var(--c-log-reorg); font-weight: 700; }
+.t-simplestatus { color: var(--c-log-head); font-weight: 700; }
+.t-simplestatus_green { color: var(--c-log-green); font-weight: 700; }
+.t-simplestatus_white { color: var(--c-text); font-weight: 700; }
+.t-simplestatus_redwnl { color: var(--c-log-redwnl); font-weight: 700; }
+.t-simplestatus_compress { color: var(--c-log-compress); font-weight: 700; }
+.t-simplestatus_reorg { color: var(--c-log-reorg); font-weight: 700; }
 
-.t-simpleline              { color: var(--c-text); }
+.t-simpleline { color: var(--c-text); }
 /* In-place "Loading· " status line during startup sweep. Rendered dim so
    it reads as a transient status, not archived log output. Ticks via
    backend timer in main.py _run_startup_sequence. */
@@ -950,47 +949,47 @@ body {
   color: var(--c-dim);
   font-style: italic;
 }
-.t-simpleline_green        { color: var(--c-log-green); }
-.t-simpleline_blue         { color: var(--c-log-blue); }
-.t-simpleline_pink         { color: var(--c-log-pink); }
-.t-simpleline_redwnl       { color: var(--c-log-redwnl); }
-.t-simpleline_compress     { color: var(--c-log-compress); }
-.t-simpleline_reorg        { color: var(--c-log-reorg); }
+.t-simpleline_green { color: var(--c-log-green); }
+.t-simpleline_blue { color: var(--c-log-blue); }
+.t-simpleline_pink { color: var(--c-log-pink); }
+.t-simpleline_redwnl { color: var(--c-log-redwnl); }
+.t-simpleline_compress { color: var(--c-log-compress); }
+.t-simpleline_reorg { color: var(--c-log-reorg); }
 
-.t-transcribe_using        { color: var(--c-log-blue); }
-.t-metadata_using          { color: var(--c-text); }
-.t-simpledownload          { color: var(--c-log-green); }
-.t-pauselog                { color: var(--c-log-head); }
-.t-pausestatus             { color: var(--c-log-head); }
+.t-transcribe_using { color: var(--c-log-blue); }
+.t-metadata_using { color: var(--c-text); }
+.t-simpledownload { color: var(--c-log-green); }
+.t-pauselog { color: var(--c-log-head); }
+.t-pausestatus { color: var(--c-log-head); }
 
 /* Whisper progress */
-.t-whisper_progress        { color: var(--c-log-blue); }
-.t-whisper_pct             { color: var(--c-log-green); font-weight: 700; }
-.t-whisper_dots            { color: var(--c-log-blue); }
-.t-whisper_prefix          { color: var(--c-text); }
-.t-whisper_bracket         { color: var(--c-log-blue); }
-.t-whisper_title           { color: var(--c-text); }
+.t-whisper_progress { color: var(--c-log-blue); }
+.t-whisper_pct { color: var(--c-log-green); font-weight: 700; }
+.t-whisper_dots { color: var(--c-log-blue); }
+.t-whisper_prefix { color: var(--c-text); }
+.t-whisper_bracket { color: var(--c-log-blue); }
+.t-whisper_title { color: var(--c-text); }
 
 /* Transcribe / encode tags */
-.t-transcribe_prefix       { color: var(--c-text); }
-.t-transcribe_title        { color: var(--c-text); }
-.t-encode_progress         { color: var(--c-log-blue); }
-.t-encode_prefix           { color: var(--c-text); }
-.t-encode_title            { color: var(--c-text); }
-.t-encode_pct              { color: var(--c-log-green); font-weight: 700; }
-.t-encode_dots             { color: var(--c-log-blue); }
-.t-encode_suffix           { color: var(--c-log-blue); }
+.t-transcribe_prefix { color: var(--c-text); }
+.t-transcribe_title { color: var(--c-text); }
+.t-encode_progress { color: var(--c-log-blue); }
+.t-encode_prefix { color: var(--c-text); }
+.t-encode_title { color: var(--c-text); }
+.t-encode_pct { color: var(--c-log-green); font-weight: 700; }
+.t-encode_dots { color: var(--c-log-blue); }
+.t-encode_suffix { color: var(--c-log-blue); }
 
 /* Bracket overlays for [N/N] prefixes */
-.t-sync_bracket            { color: var(--c-log-green); }
-.t-trans_bracket           { color: var(--c-log-blue); }
-.t-meta_bracket            { color: var(--c-log-pink); }
-.t-redwnl_bracket          { color: var(--c-log-redwnl); }
-.t-compress_bracket        { color: var(--c-log-compress); }
-.t-reorg_bracket           { color: var(--c-log-reorg); }
-.t-trans_dots              { color: var(--c-log-blue); }
+.t-sync_bracket { color: var(--c-log-green); }
+.t-trans_bracket { color: var(--c-log-blue); }
+.t-meta_bracket { color: var(--c-log-pink); }
+.t-redwnl_bracket { color: var(--c-log-redwnl); }
+.t-compress_bracket { color: var(--c-log-compress); }
+.t-reorg_bracket { color: var(--c-log-reorg); }
+.t-trans_dots { color: var(--c-log-blue); }
 
-.t-dl_white                { color: #ffffff; }
+.t-dl_white { color: #ffffff; }
 
 /* ═══ Subs tab ═══ */
 .subs-area {
@@ -1019,7 +1018,7 @@ body {
   border: 1px solid var(--c-border);
   border-radius: 2px;
   overflow-y: auto;
-  overflow-x: hidden;   /* the user: no horizontal scrollbar on subs list.
+  overflow-x: hidden; /* the user: no horizontal scrollbar on subs list.
                           Folder-name column ellipsises instead. */
 }
 .subs-table {
@@ -1042,7 +1041,7 @@ body {
   left: 0; right: 0; bottom: 0;
   height: 1px;
   background: var(--c-border);
-  pointer-events: none;  /* don't eat clicks on col-resizer handle */
+  pointer-events: none; /* don't eat clicks on col-resizer handle */
 }
 .subs-table th {
   text-align: right;
@@ -1082,7 +1081,7 @@ body {
   color: var(--c-text);
   /* Ellipsis long folder names so the table never widens past its frame. */
   text-overflow: ellipsis;
-  max-width: 0;   /* table-layout:fixed + max-width:0 = proper ellipsis in a td */
+  max-width: 0; /* table-layout:fixed + max-width:0 = proper ellipsis in a td */
 }
 /* Alternating row colors — matches YTArchiver.py:4958 odd/even tag pattern.
    Use :nth-child(even) on tbody so hover + selection overrides still work. */
@@ -1094,9 +1093,9 @@ body {
   color: var(--c-accent);
 }
 .subs-table col.col-folder { width: 28%; }
-.subs-table col.col-num    { width: 6%; }
-.subs-table col.col-mark   { width: 9%; }
-.subs-table col.col-date   { width: 10%; }
+.subs-table col.col-num { width: 6%; }
+.subs-table col.col-mark { width: 9%; }
+.subs-table col.col-date { width: 10%; }
 .subs-table tbody tr:hover td {
   background: rgba(255, 255, 255, 0.025);
 }
@@ -1176,7 +1175,7 @@ body {
 
 /* Progressive disclosure: in Add mode with no input yet, hide everything
    except the Folder Name + Channel URL row (matches YTArchiver.py:16903
-   _set_add_details_visible). `collapsed` flips off when the user types.  */
+   _set_add_details_visible). `collapsed` flips off when the user types. */
 .edit-channel-box.collapsed .edit-grid > *:nth-child(n+5),
 .edit-channel-box.collapsed .edit-diskstats,
 .edit-channel-box.collapsed .edit-actions,
@@ -1214,7 +1213,7 @@ body {
   padding: 3px 4px !important;
 }
 .edit-date-group > #edit-date-year { width: 56px; }
-.edit-date-group .edit-date-mm     { width: 36px; }
+.edit-date-group .edit-date-mm { width: 36px; }
 
 /* Compress expansion: Res / Quality / Batch dropdowns shown when checked */
 .edit-compress-group {
@@ -1393,12 +1392,12 @@ body {
   text-overflow: ellipsis;
 }
 .recent-table td.right { text-align: right; }
-.recent-table col.col-title   { width: auto; }
+.recent-table col.col-title { width: auto; }
 .recent-table col.col-channel { width: 160px; }
-.recent-table col.col-time    { width: 100px; }
-.recent-table col.col-length  { width: 72px; }
-.recent-table col.col-size    { width: 72px; }
-.recent-table tbody tr:nth-child(odd) td  { background: #0c0f14; }
+.recent-table col.col-time { width: 100px; }
+.recent-table col.col-length { width: 72px; }
+.recent-table col.col-size { width: 72px; }
+.recent-table tbody tr:nth-child(odd) td { background: #0c0f14; }
 .recent-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
 .recent-table tbody tr:hover td { background: rgba(255,255,255,0.04); }
 .recent-table tbody tr.row-selected td { background: rgba(96,160,255,0.12); }
@@ -1607,9 +1606,9 @@ body {
    three content values so there's no JS timer churn. Matches
    YTArchiver.py:20131 _active_label dot cycle. */
 @keyframes queue-dots-kf {
-  0%, 33%  { content: "\00B7 \00B7 \00B7"; }
-  34%, 66% { content: "\00B7 \00B7   "; }
-  67%, 100% { content: "\00B7       "; }
+  0%, 33% { content: "\00B7 \00B7 \00B7"; }
+  34%, 66% { content: "\00B7 \00B7 "; }
+  67%, 100% { content: "\00B7 "; }
 }
 .queue-task-dots {
   display: inline-block;
@@ -1637,12 +1636,12 @@ body {
 .queue-task-name.metadata em { color: var(--c-log-pink); }
 
 /* Queue-verb colour tokens (match activity-log tag palette) */
-.queue-task-name .qv-sync     { color: var(--c-log-green);   font-weight: 500; }
-.queue-task-name .qv-trans    { color: var(--c-log-blue);    font-weight: 500; }
-.queue-task-name .qv-meta     { color: var(--c-log-pink);    font-weight: 500; }
-.queue-task-name .qv-redwnl   { color: var(--c-log-redwnl);  font-weight: 500; }
+.queue-task-name .qv-sync { color: var(--c-log-green); font-weight: 500; }
+.queue-task-name .qv-trans { color: var(--c-log-blue); font-weight: 500; }
+.queue-task-name .qv-meta { color: var(--c-log-pink); font-weight: 500; }
+.queue-task-name .qv-redwnl { color: var(--c-log-redwnl); font-weight: 500; }
 .queue-task-name .qv-compress { color: var(--c-log-compress);font-weight: 500; }
-.queue-task-name .qv-reorg    { color: var(--c-log-reorg);   font-weight: 500; }
+.queue-task-name .qv-reorg { color: var(--c-log-reorg); font-weight: 500; }
 .queue-task-close {
   background: transparent;
   border: none;
@@ -1830,7 +1829,7 @@ body {
   background: var(--c-dim);
   display: inline-block;
 }
-.diag-row.diag-ok   .diag-dot { background: #3a8a56; }
+.diag-row.diag-ok .diag-dot { background: #3a8a56; }
 .diag-row.diag-fail .diag-dot { background: #c04848; }
 .diag-row .diag-name {
   color: var(--c-text);
@@ -1954,7 +1953,7 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  padding: 28px 14px 10px 78px;  /* left pad makes room for the avatar */
+  padding: 28px 14px 10px 78px; /* left pad makes room for the avatar */
   background: linear-gradient(180deg,
     rgba(0,0,0,0) 0%,
     rgba(0,0,0,0.55) 45%,
@@ -2167,7 +2166,7 @@ body {
 }
 
 /* Watch view — layout must fit in the .browse-view area (no overall
-   page scroll). Scott's requirement: "the spoken word ALWAYS needs to
+   page scroll). requirement: "the spoken word ALWAYS needs to
    be on the first page without the user having to scroll down ...
    the transcript needs to scroll UP". To achieve that we need to
    constrain the whole Watch layout to the viewport height and let
@@ -2521,8 +2520,8 @@ body {
   margin-bottom: 4px;
 }
 .bookmark-title { color: var(--c-text); font-weight: 600; }
-.bookmark-meta  { color: var(--c-dim); font-size: 11px; margin-left: auto; }
-.bookmark-text  { color: var(--c-log-txt); margin-bottom: 4px; }
+.bookmark-meta { color: var(--c-dim); font-size: 11px; margin-left: auto; }
+.bookmark-text { color: var(--c-log-txt); margin-bottom: 4px; }
 .bookmark-note {
   color: var(--c-accent);
   font-size: 11.5px;
@@ -2552,7 +2551,7 @@ body {
   animation: bookmark-note-save-flash 1.2s ease-out;
 }
 @keyframes bookmark-note-save-flash {
-  0%   { background: rgba(58, 138, 86, 0.35); border-color: #3a8a56; }
+  0% { background: rgba(58, 138, 86, 0.35); border-color: #3a8a56; }
   100% { background: var(--c-input); border-color: var(--c-border); }
 }
 
@@ -2622,7 +2621,7 @@ body {
      grow back cleanly. Without this, once Chart.js sets canvas height
      to a small value under a squished window, the flex algorithm uses
      that as a floor and the graph never recovers when the window
-     expands — Scott: "graph collapses and never recovers". The
+     expands — "graph collapses and never recovers". The
      `min-height:120` (not 0) keeps a usable target when the window is
      very short so Chart.js's responsive calc has something non-zero
      to size to. */
@@ -2670,7 +2669,7 @@ body {
   border-radius: 2px;
   background: var(--c-log-bg);
 }
-.index-table tbody tr:nth-child(odd) td  { background: #0c0f14; }
+.index-table tbody tr:nth-child(odd) td { background: #0c0f14; }
 .index-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
 
 .browse-tree-pane {
@@ -2915,8 +2914,8 @@ body {
 
 /* ═══ Browse back-button flash: gentle pulse on the card we came from ═══ */
 @keyframes flash-hit-kf {
-  0%   { box-shadow: 0 0 0 0 rgba(108, 180, 238, 0.9); }
-  40%  { box-shadow: 0 0 0 8px rgba(108, 180, 238, 0.55); }
+  0% { box-shadow: 0 0 0 0 rgba(108, 180, 238, 0.9); }
+  40% { box-shadow: 0 0 0 8px rgba(108, 180, 238, 0.55); }
   100% { box-shadow: 0 0 0 0 rgba(108, 180, 238, 0); }
 }
 .flash-hit {
@@ -2945,7 +2944,7 @@ body {
 }
 @keyframes tt-fade-in {
   from { opacity: 0; }
-  to   { opacity: 1; }
+  to { opacity: 1; }
 }
 
 /* Queue Pending badge — live count of channels with pending work */
@@ -2983,7 +2982,7 @@ body {
 }
 @keyframes video-hover-in {
   from { opacity: 0; transform: scale(0.96); }
-  to   { opacity: 1; transform: scale(1); }
+  to { opacity: 1; transform: scale(1); }
 }
 .video-hover-preview img {
   width: 100%;
@@ -3017,15 +3016,15 @@ body {
   border-radius: 4px;
   font-size: 12px;
 }
-.meta-nudge-icon  { font-size: 16px; }
-.meta-nudge-text  { color: var(--c-text); flex: 1 1 auto; line-height: 1.4; }
+.meta-nudge-icon { font-size: 16px; }
+.meta-nudge-text { color: var(--c-text); flex: 1 1 auto; line-height: 1.4; }
 .meta-nudge-text b { color: var(--c-log-pink, #e87aac); }
 
 /* ═══ Indeterminate progress stripe — shown during FTS search ═══
    Matches YTArchiver.py:29593 self._search_progress =
    ttk.Progressbar(mode="indeterminate"). Pure CSS, no JS animation. */
 @keyframes search-progress-kf {
-  0%   { background-position:   0% 0; }
+  0% { background-position: 0% 0; }
   100% { background-position: 200% 0; }
 }
 .search-progress-bar {
@@ -3221,7 +3220,7 @@ body {
   pointer-events: none;
 }
 .mini-log {
-  padding: 8px 8px 12px;  /* extra bottom pad guarantees clearance */
+  padding: 8px 8px 12px; /* extra bottom pad guarantees clearance */
   height: 100%;
   box-sizing: border-box;
   overflow: hidden;
@@ -3298,7 +3297,7 @@ body {
   padding: 10px 14px;
   display: flex;
   justify-content: flex-end;
-  flex-wrap: wrap;       /* wrap onto a new row when too many choices */
+  flex-wrap: wrap; /* wrap onto a new row when too many choices */
   row-gap: 6px;
   gap: 6px;
   border-top: 1px solid var(--c-border);
@@ -3327,7 +3326,7 @@ body {
 }
 @keyframes askq-scale {
   from { transform: scale(0.96); opacity: 0; }
-  to   { transform: scale(1);    opacity: 1; }
+  to { transform: scale(1); opacity: 1; }
 }
 
 /* Read-only disk stats row in Edit channel panel */
@@ -3341,9 +3340,9 @@ body {
   font-family: var(--font-log);
 }
 .edit-diskstats .ds-label { color: var(--c-accent); }
-.edit-diskstats .ds-val   { color: var(--c-text); font-weight: 600; }
-.edit-diskstats .ds-unit  { color: var(--c-dim); margin-right: 2px; }
-.edit-diskstats .ds-sep   { color: var(--c-border); }
+.edit-diskstats .ds-val { color: var(--c-text); font-weight: 600; }
+.edit-diskstats .ds-unit { color: var(--c-dim); margin-right: 2px; }
+.edit-diskstats .ds-sep { color: var(--c-border); }
 
 /* Subs header filter input */
 .subs-filter-wrap {
@@ -3405,7 +3404,7 @@ body {
   color: var(--c-log-sum);
 }
 .deferred-label { font-weight: 600; }
-.deferred-hint  { color: var(--c-dim); font-size: 11px; }
+.deferred-hint { color: var(--c-dim); font-size: 11px; }
 .deferred-list {
   display: flex;
   flex-wrap: wrap;
@@ -3442,7 +3441,7 @@ body {
    change their width". Widens + brightens on hover. */
 .col-resizer {
   position: absolute;
-  right: -4px;           /* sticks 4px into neighbor for easier grab */
+  right: -4px; /* sticks 4px into neighbor for easier grab */
   top: 4px;
   bottom: 4px;
   width: 8px;
@@ -3502,10 +3501,10 @@ body {
   max-width: 380px;
   animation: toast-in 0.18s ease-out;
 }
-.toast.ok    { border-left-color: var(--c-log-green); }
+.toast.ok { border-left-color: var(--c-log-green); }
 .toast.error { border-left-color: var(--c-log-red); }
-.toast.warn  { border-left-color: var(--c-log-sum); }
+.toast.warn { border-left-color: var(--c-log-sum); }
 @keyframes toast-in {
   from { transform: translateX(20px); opacity: 0; }
-  to   { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(0); opacity: 1; }
 }

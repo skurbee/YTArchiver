@@ -9,10 +9,10 @@ Runs under Python 3.11 with CUDA PyTorch + transformers (same venv
 whisper uses). Verbatim port of YTArchiver.py:8835 _PUNCT_SCRIPT.
 
 Protocol:
-    → stdin:  { "text": "raw whisper text no punctuation here" }
-    ← stdout: { "status": "ready", "device": "cuda" }  (once at startup)
+    → stdin: { "text": "raw whisper text no punctuation here" }
+    ← stdout: { "status": "ready", "device": "cuda" } (once at startup)
               { "status": "ok", "text": "Punctuated. Sentences here." }
-              or  { "status": "error", "text": "reason" }
+              or { "status": "error", "text": "reason" }
 """
 
 import sys, json, io, re, os, logging

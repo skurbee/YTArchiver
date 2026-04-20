@@ -41,7 +41,7 @@ def _sync_row(time_str: str, date_str: str, channel: str,
               tag: str) -> List[Segment]:
     """Format: [Sync] 5:30pm, Apr 10 — ChannelName — N downloaded · N errors · took 1m 20s"""
     return [
-        ["[Sync]   ", tag],
+        ["[Sync] ", tag],
         [f"{time_str}, {date_str} ", tag],
         ["\u2014 ", tag],
         [f"{channel} ", tag],
@@ -63,14 +63,14 @@ def _kind_cells(kind: str, time_str: str, date_str: str, channel: str,
     program width (channel column is the flex cell).
     """
     return {
-        "kind":      kind,
+        "kind": kind,
         "time_date": f"{time_str}, {date_str}",
-        "channel":   channel,
-        "primary":   primary,
+        "channel": channel,
+        "primary": primary,
         "secondary": secondary,
-        "errors":    errors,
-        "took":      took,
-        "row_tag":   row_tag or "",   # "" = default color
+        "errors": errors,
+        "took": took,
+        "row_tag": row_tag or "", # "" = default color
     }
 
 
@@ -82,10 +82,10 @@ def generate_activity_log_history() -> List[dict]:
       Trnscr → hist_blue if transcribed > 0
       Metdta → hist_pink if fetched > 0 or refreshed > 0
       Manual → hist_green if downloaded > 0
-      Auto   → hist_green if downloaded > 0
+      Auto → hist_green if downloaded > 0
       ReDwnl → hist_redwnl if replaced > 0 or "running..." in body
       Cmprss → hist_compress if compressed > 0
-      Reorg  → hist_reorg if moved/reorganized > 0
+      Reorg → hist_reorg if moved/reorganized > 0
 
     Each entry = { segments: [...], alt: bool }
     """
@@ -138,7 +138,7 @@ def generate_activity_log_history() -> List[dict]:
          False, "hist_blue")
 
     # Auto / Manual — sync (hist_green when downloaded > 0)
-    emit("Auto",   "5:30pm", "Apr 10", channels[4],
+    emit("Auto", "5:30pm", "Apr 10", channels[4],
          "7 downloaded", "", "0 errors", "took 4m 20s",
          True, "hist_green")
     emit("Manual", "5:48pm", "Apr 10", channels[7],
@@ -156,7 +156,7 @@ def generate_activity_log_history() -> List[dict]:
          True, "hist_compress")
 
     # Reorg (hist_reorg when moved > 0)
-    emit("Reorg",  "6:30pm", "Apr 10", channels[13],
+    emit("Reorg", "6:30pm", "Apr 10", channels[13],
          "48 moved", "", "0 errors", "took 12s",
          True, "hist_reorg")
 
@@ -201,9 +201,9 @@ def generate_queues():
     channels = [c[0] for c in SAMPLE_CHANNELS]
     sync = [
         {"name": f"Downloading {channels[0]}", "status": "running"},
-        {"name": f"Metadata {channels[3]}",    "status": "queued"},
-        {"name": f"Download {channels[7]}",    "status": "queued"},
-        {"name": f"Download {channels[12]}",   "status": "queued"},
+        {"name": f"Metadata {channels[3]}", "status": "queued"},
+        {"name": f"Download {channels[7]}", "status": "queued"},
+        {"name": f"Download {channels[12]}", "status": "queued"},
     ]
     gpu = [
         {"name": f"Transcribing Season Finale Recap (25m 04s)",
@@ -318,54 +318,54 @@ def _update_sep() -> List[Segment]:
 # data. Replaced at runtime by `subs_load_channels()` from the real config.
 SAMPLE_CHANNELS = [
     # (folder, res, min, max, compress, transcribe, metadata, last_sync, n_vids, size_gb)
-    ("Alpha Tech Reviews",    "720p",  "3m", "—",   False, True,  True, "1d ago",  420,  55.0),
-    ("Beta Gaming",           "720p",  "3m", "—",   False, True,  True, "1d ago",  910,  64.0),
-    ("Comet Labs",            "best",  "3m", "—",   True,  True,  True, "1d ago",  110,  16.0),
-    ("Daily Explainer",       "720p",  "3m", "—",   False, True,  True, "1d ago",  500,  12.5),
-    ("Echo Podcast",          "720p",  "3m", "—",   False, True,  True, "1d ago",  500,  14.0),
-    ("Fable Documentary",     "720p",  "3m", "—",   False, True,  True, "1d ago",   80,  38.0),
-    ("Global Music Weekly",   "720p",  "3m", "—",   False, True,  True, "1d ago",  165,  50.0),
-    ("History Hour",          "480p",  "3m", "60m", False, True,  True, "1d ago", 1390,  25.0),
-    ("Indoor Gardening",      "720p",  "3m", "60m", False, True,  True, "1d ago",   75,   6.0),
-    ("Jumpstart Science",     "best",  "3m", "—",   False, True,  True, "1d ago",   40,   9.0),
-    ("Kilo Retro Tech",       "720p",  "2m", "180m",False, True,  True, "1d ago",  130,  59.0),
-    ("Lima News 5",           "720p",  "3m", "—",   False, True,  True, "1d ago",  140,  19.0),
-    ("Mike Bodycam",          "720p",  "—",  "—",   False, True,  True, "1d ago",  395, 149.0),
-    ("Novel Investigates",    "720p",  "3m", "—",   False, True,  True, "1d ago",  395,  31.8),
-    ("Orbit Cold",            "1080p", "3m", "60m", False, True,  True, "1d ago",  505,  90.0),
-    ("Paper Company",         "720p",  "3m", "60m", False, True,  True, "1d ago",  470,  28.0),
-    ("Quill Film Crew",       "480p",  "3m", "60m", False, True,  True, "1d ago", 1295,  68.0),
-    ("Radio Politics",        "144p",  "3m", "40m", False, True,  True, "1d ago", 2800,  30.0),
-    ("Sierra Decoder",        "1080p", "3m", "—",   False, True,  True, "1d ago",   55,  10.8),
-    ("Tango Detective",       "720p",  "3m", "—",   False, True,  True, "1d ago",  140,  45.8),
-    ("Uniform Perks",         "720p",  "3m", "—",   False, True,  True, "1d ago",   80,  42.0),
-    ("Victor Podcast",        "1080p", "3m", "—",   False, True,  True, "1d ago",   45,  21.9),
-    ("Whiskey MD",            "720p",  "3m", "—",   False, True,  True, "1d ago",  150,  27.0),
-    ("Xenon reads",           "720p",  "3m", "—",   False, True,  True, "1d ago",  215,  56.0),
-    ("Yankee Dashcam",        "720p",  "3m", "—",   False, True,  True, "1d ago",  600,  85.0),
-    ("Zulu Crime Story",      "720p",  "3m", "—",   False, True,  True, "1d ago",   85,  10.0),
-    ("Arctic Explorers",      "720p",  "3m", "—",   False, True,  True, "1d ago",  260,  48.0),
-    ("Bayou Songbook",        "720p",  "3m", "—",   False, True,  True, "1d ago",  115,  57.0),
-    ("Coastal Watch",         "best",  "—",  "—",   False, True,  True, "1d ago",  165,  10.0),
-    ("Digital Frame",         "720p",  "3m", "—",   False, True,  True, "1d ago",   40,  21.0),
-    ("Element Review",        "best",  "3m", "60m", False, True,  True, "1d ago",   35,  12.0),
-    ("Fresh Work",            "720p",  "3m", "—",   False, True,  True, "1d ago",   50,   2.8),
-    ("Green Info",            "1080p", "3m", "60m", False, True,  True, "1d ago",  450,  74.5),
-    ("Hyper Discussion",      "240p",  "3m", "—",   False, True,  True, "1d ago", 2800, 110.0),
-    ("Indy Finance",          "1080p", "—",  "—",   False, True,  True, "1d ago",  105,  13.4),
-    ("Jade Horsing",          "720p",  "3m", "—",   False, True,  True, "1d ago",   60,   5.6),
-    ("Kiwi Econ",             "720p",  "3m", "—",   False, True,  True, "1d ago",  250,  15.3),
-    ("Loop Archive",          "1080p", "—",  "—",   False, True,  True, "1d ago",   43,   7.4),
-    ("Midnight Talkshow",     "144p",  "3m", "—",   False, True,  True, "1d ago", 5860,  70.0),
-    ("Nova Space Science",    "480p",  "3m", "—",   False, True,  True, "1d ago",  635,   9.9),
-    ("Oak Weekly",            "720p",  "3m", "—",   False, True,  True, "1d ago",  690,  60.0),
-    ("Pine Reporting",        "720p",  "3m", "—",   False, True,  True, "1d ago",  205,  22.3),
-    ("Quant Legal",           "360p",  "3m", "—",   False, True,  True, "1d ago",  630,  28.0),
-    ("Rose Shorts",           "best",  "3m", "—",   False, True,  True, "1d ago",   10,   2.0),
-    ("Sable",                 "720p",  "3m", "—",   False, True,  True, "1d ago",   45,  12.0),
-    ("Tangent Answers",       "720p",  "3m", "—",   False, True,  True, "1d ago", 1020,  58.0),
-    ("Ursa Tech",             "480p",  "3m", "60m", False, True,  True, "1d ago",  815,  25.0),
-    ("Vertex Aviation",       "480p",  "3m", "50m", False, True,  True, "1d ago",  460,  26.0),
+    ("Alpha Tech Reviews", "720p", "3m", "—", False, True, True, "1d ago", 420, 55.0),
+    ("Beta Gaming", "720p", "3m", "—", False, True, True, "1d ago", 910, 64.0),
+    ("Comet Labs", "best", "3m", "—", True, True, True, "1d ago", 110, 16.0),
+    ("Daily Explainer", "720p", "3m", "—", False, True, True, "1d ago", 500, 12.5),
+    ("Echo Podcast", "720p", "3m", "—", False, True, True, "1d ago", 500, 14.0),
+    ("Fable Documentary", "720p", "3m", "—", False, True, True, "1d ago", 80, 38.0),
+    ("Global Music Weekly", "720p", "3m", "—", False, True, True, "1d ago", 165, 50.0),
+    ("History Hour", "480p", "3m", "60m", False, True, True, "1d ago", 1390, 25.0),
+    ("Indoor Gardening", "720p", "3m", "60m", False, True, True, "1d ago", 75, 6.0),
+    ("Jumpstart Science", "best", "3m", "—", False, True, True, "1d ago", 40, 9.0),
+    ("Kilo Retro Tech", "720p", "2m", "180m",False, True, True, "1d ago", 130, 59.0),
+    ("Lima News 5", "720p", "3m", "—", False, True, True, "1d ago", 140, 19.0),
+    ("Mike Bodycam", "720p", "—", "—", False, True, True, "1d ago", 395, 149.0),
+    ("Novel Investigates", "720p", "3m", "—", False, True, True, "1d ago", 395, 31.8),
+    ("Orbit Cold", "1080p", "3m", "60m", False, True, True, "1d ago", 505, 90.0),
+    ("Paper Company", "720p", "3m", "60m", False, True, True, "1d ago", 470, 28.0),
+    ("Quill Film Crew", "480p", "3m", "60m", False, True, True, "1d ago", 1295, 68.0),
+    ("Radio Politics", "144p", "3m", "40m", False, True, True, "1d ago", 2800, 30.0),
+    ("Sierra Decoder", "1080p", "3m", "—", False, True, True, "1d ago", 55, 10.8),
+    ("Tango Detective", "720p", "3m", "—", False, True, True, "1d ago", 140, 45.8),
+    ("Uniform Perks", "720p", "3m", "—", False, True, True, "1d ago", 80, 42.0),
+    ("Victor Podcast", "1080p", "3m", "—", False, True, True, "1d ago", 45, 21.9),
+    ("Whiskey MD", "720p", "3m", "—", False, True, True, "1d ago", 150, 27.0),
+    ("Xenon reads", "720p", "3m", "—", False, True, True, "1d ago", 215, 56.0),
+    ("Yankee Dashcam", "720p", "3m", "—", False, True, True, "1d ago", 600, 85.0),
+    ("Zulu Crime Story", "720p", "3m", "—", False, True, True, "1d ago", 85, 10.0),
+    ("Arctic Explorers", "720p", "3m", "—", False, True, True, "1d ago", 260, 48.0),
+    ("Bayou Songbook", "720p", "3m", "—", False, True, True, "1d ago", 115, 57.0),
+    ("Coastal Watch", "best", "—", "—", False, True, True, "1d ago", 165, 10.0),
+    ("Digital Frame", "720p", "3m", "—", False, True, True, "1d ago", 40, 21.0),
+    ("Element Review", "best", "3m", "60m", False, True, True, "1d ago", 35, 12.0),
+    ("Fresh Work", "720p", "3m", "—", False, True, True, "1d ago", 50, 2.8),
+    ("Green Info", "1080p", "3m", "60m", False, True, True, "1d ago", 450, 74.5),
+    ("Hyper Discussion", "240p", "3m", "—", False, True, True, "1d ago", 2800, 110.0),
+    ("Indy Finance", "1080p", "—", "—", False, True, True, "1d ago", 105, 13.4),
+    ("Jade Horsing", "720p", "3m", "—", False, True, True, "1d ago", 60, 5.6),
+    ("Kiwi Econ", "720p", "3m", "—", False, True, True, "1d ago", 250, 15.3),
+    ("Loop Archive", "1080p", "—", "—", False, True, True, "1d ago", 43, 7.4),
+    ("Midnight Talkshow", "144p", "3m", "—", False, True, True, "1d ago", 5860, 70.0),
+    ("Nova Space Science", "480p", "3m", "—", False, True, True, "1d ago", 635, 9.9),
+    ("Oak Weekly", "720p", "3m", "—", False, True, True, "1d ago", 690, 60.0),
+    ("Pine Reporting", "720p", "3m", "—", False, True, True, "1d ago", 205, 22.3),
+    ("Quant Legal", "360p", "3m", "—", False, True, True, "1d ago", 630, 28.0),
+    ("Rose Shorts", "best", "3m", "—", False, True, True, "1d ago", 10, 2.0),
+    ("Sable", "720p", "3m", "—", False, True, True, "1d ago", 45, 12.0),
+    ("Tangent Answers", "720p", "3m", "—", False, True, True, "1d ago", 1020, 58.0),
+    ("Ursa Tech", "480p", "3m", "60m", False, True, True, "1d ago", 815, 25.0),
+    ("Vertex Aviation", "480p", "3m", "50m", False, True, True, "1d ago", 460, 26.0),
 ]
 
 
@@ -432,7 +432,7 @@ def stream_main_log_sample(initial: bool = True) -> List[List[Segment]]:
     """
     Returns a list of lines. Each line is a list of segments.
 
-    initial=True  → big bulk for first paint
+    initial=True → big bulk for first paint
     initial=False → smaller stream (simulates live output)
     """
     lines: List[List[Segment]] = []
@@ -440,7 +440,7 @@ def stream_main_log_sample(initial: bool = True) -> List[List[Segment]]:
     if initial:
         # Header
         lines.append(_header_line("=== Autorun: sync pass starting @ 3:12pm, Apr 10 ==="))
-        lines.append(_summary_line("  13 channels queued, 6 workers, 1 GPU lane"))
+        lines.append(_summary_line(" 13 channels queued, 6 workers, 1 GPU lane"))
         lines.append([["\n", None]])
 
         # Interleave metadata fetches + transcription done lines (matches screenshot 09)

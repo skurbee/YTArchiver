@@ -4,8 +4,8 @@ ArchiveBrowserWithYTTest viewers talk to.
 
 Mirrors YTArchiver.py:34400-34960 _start_cmd_server + _CmdHandler. Scope:
 
-  GET  /cmd/ping         → liveness probe; returns app version + gpu depth
-  GET  /cmd/gpu-status   → queue counts
+  GET /cmd/ping → liveness probe; returns app version + gpu depth
+  GET /cmd/gpu-status → queue counts
   POST /cmd/retranscribe → queue a re-transcribe (body: {video_id | filepath, title, channel})
 
 Additional endpoints the live app has (repair-orphans, repair-duplicates,
@@ -137,7 +137,7 @@ def start_server(app_version: str = "",
     # Register built-in handlers (ping + gpu-status). Callers can add more.
     register_handler("get", "/cmd/ping", lambda _b: {
         "version": _STATE.get("app_version", ""),
-        "gpu_depth": 0,  # overridden if main.py registers a richer handler
+        "gpu_depth": 0, # overridden if main.py registers a richer handler
     })
     try:
         srv = _http_server.ThreadingHTTPServer(

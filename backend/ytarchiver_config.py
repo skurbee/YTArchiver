@@ -2,8 +2,8 @@
 Read/write YTArchiver's real config file for drop-in compatibility.
 
 Uses the same JSON file the legacy tkinter app uses:
-    %APPDATA%\\YTArchiver\\ytarchiver_config.json  (Windows)
-    ~/.config/YTArchiver/ytarchiver_config.json    (Unix)
+    %APPDATA%\\YTArchiver\\ytarchiver_config.json (Windows)
+    ~/.config/YTArchiver/ytarchiver_config.json (Unix)
 
 That way saved channels, autorun history, log_mode, recent_downloads, and
 every other preference carry over with zero migration.
@@ -61,8 +61,8 @@ DEFAULT_CONFIG = {
     "downloads_since_last_index": 0,
     "last_sync": "",
     "whisper_model": "small",
-    "tp_archive_roots": [],  # extra index-only roots (transcription parser)
-    "url_history": [],       # recent archive URLs (single-video downloads)
+    "tp_archive_roots": [], # extra index-only roots (transcription parser)
+    "url_history": [], # recent archive URLs (single-video downloads)
     # Disk-scan staleness: skip the 20-40s boot walk if the cache was
     # written within this many hours. 0 = always walk (OLD behavior).
     "disk_scan_staleness_hours": 24,
@@ -70,7 +70,7 @@ DEFAULT_CONFIG = {
     # instant. Higher = more RAM, more boot time. the user's large
     # archive at 150 ≈ ~17 MB; at "all" ≈ ~110 MB. Default 150.
     "browse_preload_limit": 150,
-    "browse_preload_all":   False,  # override limit and preload every row
+    "browse_preload_all": False, # override limit and preload every row
     # Timestamp of the last completed disk walk — compared against
     # disk_scan_staleness_hours to decide whether to skip on next boot.
     "last_disk_scan_ts": 0.0,
@@ -81,32 +81,32 @@ _config_lock = threading.Lock()
 # Per-channel defaults (matches YTArchiver.py CHANNEL_DEFAULTS at line 173,
 # extended with the full set of fields actually stored).
 CHANNEL_DEFAULTS_ALL = {
-    "name":             "",
-    "folder":           "",
-    "folder_override":  "",     # set when on-disk folder differs from name
-    "url":              "",
-    "resolution":       "720",
-    "mode":             "new",
-    "min_duration":     0,
-    "max_duration":     0,
-    "split_years":      False,
-    "split_months":     False,
-    "auto_transcribe":  False,
-    "auto_metadata":    True,
+    "name": "",
+    "folder": "",
+    "folder_override": "", # set when on-disk folder differs from name
+    "url": "",
+    "resolution": "720",
+    "mode": "new",
+    "min_duration": 0,
+    "max_duration": 0,
+    "split_years": False,
+    "split_months": False,
+    "auto_transcribe": False,
+    "auto_metadata": True,
     "compress_enabled": False,
-    "compress_level":   "",
-    "compress_output_res":    "",
-    "compress_batch_size":    20,
-    "last_sync":              "",
-    "from_date":              "",
-    "date_after":             "",  # YYYY-MM-DD lower bound for sync
-    "initialized":            False,  # set after first sync completes
-    "init_complete":          False,  # full-bootstrap done (all pages walked)
-    "init_batch_after":       "",     # ISO timestamp — batch cooldown end
-    "batch_resume_index":     0,      # resume index for large-channel batch walks
+    "compress_level": "",
+    "compress_output_res": "",
+    "compress_batch_size": 20,
+    "last_sync": "",
+    "from_date": "",
+    "date_after": "", # YYYY-MM-DD lower bound for sync
+    "initialized": False, # set after first sync completes
+    "init_complete": False, # full-bootstrap done (all pages walked)
+    "init_batch_after": "", # ISO timestamp — batch cooldown end
+    "batch_resume_index": 0, # resume index for large-channel batch walks
     "transcription_complete": False,
-    "transcription_pending":  0,
-    "metadata_pending":       0,
+    "transcription_pending": 0,
+    "metadata_pending": 0,
 }
 
 
@@ -227,12 +227,12 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
     total_gb = 0.0
     for ch in channels:
         folder = ch.get("name", "") or ch.get("folder", "")
-        res    = (ch.get("resolution", "") or "").strip() or "—"
-        mode   = ch.get("mode", "")
+        res = (ch.get("resolution", "") or "").strip() or "—"
+        mode = ch.get("mode", "")
         # YTArchiver stores min/max as SECONDS on disk (180 = 3 minutes).
         # Display in minutes to match the original UI + user expectation.
-        min_d  = int(ch.get("min_duration", 0) or 0)
-        max_d  = int(ch.get("max_duration", 0) or 0)
+        min_d = int(ch.get("min_duration", 0) or 0)
+        max_d = int(ch.get("max_duration", 0) or 0)
         min_mins = max(0, min_d // 60)
         max_mins = max(0, max_d // 60)
         # Last-sync shown as relative ("10hr ago") to match YTArchiver.py:5307
@@ -261,8 +261,8 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         # prefixing "A " to the checkmark when the auto_* flag is set.
         def _mark(auto_key: str, enabled: bool) -> str:
             is_auto = bool(ch.get(auto_key))
-            if enabled and is_auto:  return "A \u2713"
-            if enabled:              return "\u2713"
+            if enabled and is_auto: return "A \u2713"
+            if enabled: return "\u2713"
             return "\u2014"
         # Average video size = total size ÷ number of videos. the user wants a
         # quick way to eyeball which channels are shipping big files vs
@@ -282,23 +282,23 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
             avg_str = "\u2014"
 
         rows.append({
-            "folder":     folder,
-            "res":        res + ("p" if res.isdigit() else ""),
-            "min":        f"{min_mins}m" if min_mins else "—",
-            "max":        f"{max_mins}m" if max_mins else "—",
-            "compress":   "\u2713" if ch.get("compress_enabled") else "\u2014",
+            "folder": folder,
+            "res": res + ("p" if res.isdigit() else ""),
+            "min": f"{min_mins}m" if min_mins else "—",
+            "max": f"{max_mins}m" if max_mins else "—",
+            "compress": "\u2713" if ch.get("compress_enabled") else "\u2014",
             # Transcribe / Metadata treat the auto flag itself as "enabled".
             "transcribe": _mark("auto_transcribe", bool(ch.get("auto_transcribe"))),
-            "metadata":   _mark("auto_metadata",   bool(ch.get("auto_metadata"))),
-            "last_sync":  ls_str,
-            "n_vids":     f"{ch.get('n_vids', 0):,}" if ch.get("n_vids") else "—",
-            "size":       f"{ch.get('size_gb', 0):.1f} GB" if ch.get("size_gb") else "—",
-            "avg_size":   avg_str,
+            "metadata": _mark("auto_metadata", bool(ch.get("auto_metadata"))),
+            "last_sync": ls_str,
+            "n_vids": f"{ch.get('n_vids', 0):,}" if ch.get("n_vids") else "—",
+            "size": f"{ch.get('size_gb', 0):.1f} GB" if ch.get("size_gb") else "—",
+            "avg_size": avg_str,
             # Pending counters for the "Queue Pending" badge in the subs header.
             # `transcription_pending` is incremented by sync when videos land
             # on auto_transcribe channels; `metadata_pending` similarly for
             # channels with auto_metadata on.
-            "_pending_tx":   int(ch.get("transcription_pending", 0) or 0),
+            "_pending_tx": int(ch.get("transcription_pending", 0) or 0),
             "_pending_meta": int(ch.get("metadata_pending", 0) or 0),
         })
         total_gb += ch.get("size_gb", 0) or 0
@@ -308,7 +308,7 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
     elif total_gb > 0:
         total_label = f"Total: {total_gb:.1f} GB"
     else:
-        total_label = f"Total: \u2014  ({len(rows)} channels)"
+        total_label = f"Total: \u2014 ({len(rows)} channels)"
     return rows, total_label
 
 
@@ -318,10 +318,10 @@ def _fmt_time_ago(ts) -> str:
         diff = time.time() - float(ts or 0)
     except (TypeError, ValueError):
         return ""
-    if diff <= 0:       return ""
-    if diff < 60:       return "just now"
-    if diff < 3600:     return f"{int(diff // 60)}m ago"
-    if diff < 86400:    return f"{int(diff // 3600)}h ago"
+    if diff <= 0: return ""
+    if diff < 60: return "just now"
+    if diff < 3600: return f"{int(diff // 60)}m ago"
+    if diff < 86400: return f"{int(diff // 3600)}h ago"
     return f"{int(diff // 86400)}d ago"
 
 
@@ -332,8 +332,8 @@ def _fmt_size(raw) -> str:
     except (TypeError, ValueError):
         return ""
     if b >= 1_073_741_824: return f"{b / 1_073_741_824:.1f} GB"
-    if b >= 1_048_576:     return f"{b / 1_048_576:.0f} MB"
-    if b >= 1_024:         return f"{b / 1_024:.0f} KB"
+    if b >= 1_048_576: return f"{b / 1_048_576:.0f} MB"
+    if b >= 1_024: return f"{b / 1_024:.0f} KB"
     return f"{b} B"
 
 
@@ -377,7 +377,7 @@ def recent_for_ui(cfg: Dict[str, Any]):
         from .index import find_thumbnail as _find_thumb, _file_url as _thumb_url
     except Exception:
         _find_thumb = None
-        _thumb_url  = None
+        _thumb_url = None
 
     out = []
     for r in cfg.get("recent_downloads", [])[:200]:
@@ -385,11 +385,11 @@ def recent_for_ui(cfg: Dict[str, Any]):
         # already-formatted `time` field an older config might carry.
         t = _fmt_time_ago(r.get("download_ts")) or r.get("time", "") or ""
         # Size / duration are raw — format them like the original did.
-        size_raw  = r.get("size", "")
+        size_raw = r.get("size", "")
         size_disp = _fmt_size(size_raw)
-        dur_disp  = _fmt_dur(r.get("duration", ""))
-        fp        = r.get("filepath", "")
-        vid       = r.get("video_id") or _extract_video_id(r.get("video_url", ""))
+        dur_disp = _fmt_dur(r.get("duration", ""))
+        fp = r.get("filepath", "")
+        vid = r.get("video_id") or _extract_video_id(r.get("video_url", ""))
 
         # Thumbnail resolution for the grid-card view. Best-effort — if the
         # sidecar isn't on disk the grid falls back to its gradient placeholder.
@@ -404,7 +404,7 @@ def recent_for_ui(cfg: Dict[str, Any]):
 
         # size_bytes — raw int for the grid meta line (also used by the JS
         # `_fmtBytes` helper if it wants to re-format).
-        try:    size_bytes = int(size_raw) if size_raw not in ("", None) else 0
+        try: size_bytes = int(size_raw) if size_raw not in ("", None) else 0
         except Exception: size_bytes = 0
 
         # uploaded — prefer explicit `date` (YYYYMMDD) on the entry, fall
@@ -422,20 +422,20 @@ def recent_for_ui(cfg: Dict[str, Any]):
                 uploaded_disp = ""
 
         out.append({
-            "title":    r.get("title", ""),
-            "channel":  r.get("channel", ""),
-            "time":     t,
+            "title": r.get("title", ""),
+            "channel": r.get("channel", ""),
+            "time": t,
             "duration": dur_disp,
-            "size":     size_disp,
+            "size": size_disp,
             # Pass through identifiers so the UI can double-click to open
             # in Watch view with the real video file.
             "filepath": fp,
             "video_id": vid,
             # Grid-card extras (ignored by the list view).
             "thumbnail_url": thumbnail_url,
-            "size_bytes":    size_bytes,
-            "uploaded":      uploaded_disp,
-            "download_ts":   r.get("download_ts") or 0,
+            "size_bytes": size_bytes,
+            "uploaded": uploaded_disp,
+            "download_ts": r.get("download_ts") or 0,
         })
     return out
 
@@ -446,7 +446,7 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
     activity-log renderer.
 
     Real YTArchiver stores each entry as one string like:
-        "[Metdta] 3:16pm, Apr 10  \u2014  ExampleChannel  \u2014  5 fetched \u00b7 2800 skipped \u00b7 0 errors \u00b7 took 36s"
+        "[Metdta] 3:16pm, Apr 10 \u2014 ExampleChannel \u2014 5 fetched \u00b7 2800 skipped \u00b7 0 errors \u00b7 took 36s"
 
     We split it by em-dashes into (kind, time/date, channel, body), then split
     the body on bullet-dots into primary/secondary/errors/took.
@@ -473,24 +473,24 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
         # Split by em-dash surrounded by whitespace
         parts = [p.strip() for p in re.split(r"\s+\u2014\s+", rest)]
         time_date = parts[0] if len(parts) > 0 else ""
-        channel   = parts[1] if len(parts) > 1 else ""
-        body      = parts[2] if len(parts) > 2 else ""
+        channel = parts[1] if len(parts) > 1 else ""
+        body = parts[2] if len(parts) > 2 else ""
 
         # Split body on middle-dot "·"
         bparts = [p.strip() for p in body.split("\u00b7")]
-        primary   = bparts[0] if len(bparts) > 0 else ""
+        primary = bparts[0] if len(bparts) > 0 else ""
         secondary = ""
-        tertiary  = ""
-        errors    = ""
-        took      = ""
+        tertiary = ""
+        errors = ""
+        took = ""
         if len(bparts) >= 5:
-            # Consolidated [Dwnld] shape (Scott's merged row):
-            #   primary · transcribed · metadata · errors · took
+            # Consolidated [Dwnld] shape ( merged row):
+            # primary · transcribed · metadata · errors · took
             # Each count gets its own grid cell in the UI so a wider
             # window uses its horizontal space cleanly (vs. cramming
             # two counts into one cell with internal ellipsis).
             secondary = bparts[1]
-            tertiary  = bparts[2]
+            tertiary = bparts[2]
             errors, took = bparts[3], bparts[4]
         elif len(bparts) == 4:
             # Metdta shape: primary, skipped/refreshed, errors, took
@@ -523,7 +523,7 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
 def _hist_tag_for_kind(kind: str, rest: str):
     """Pick the row_tag color for a kind. Each match family accepts
     either a non-zero integer OR a single \u2713 checkmark — the latter
-    represents "exactly 1 of this" per Scott's single-video polish.
+    represents "exactly 1 of this" per single-video polish.
     """
     import re
     # Either "\u2713 foo" or "N foo" (N >= 1) counts as "work happened".

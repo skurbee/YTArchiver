@@ -2,17 +2,17 @@
 # PyInstaller spec for YTArchiver (pywebview build).
 #
 # Build with:
-#     "C:/Users/Scott/AppData/Local/Programs/Python/Python313/python.exe" -m PyInstaller YTArchiver.spec
+# py -3.13 -m PyInstaller YTArchiver.spec
 #
 # IMPORTANT: Must build with Python 3.13 (same reason as ArchivePlayer —
 # pywebview ships for 3.13 but not for the PATH's 3.11).
 #
 # Deps bundled next to the exe at runtime:
-#   - yt-dlp.exe         (sync downloads)
-#   - ffmpeg.exe         (compress + reorg)
-#   - icon.ico           (window + tray icon)
-#   - web/               (HTML/CSS/JS shell)
-#   - backend/whisper_worker.py  (runs under bundled/system Python 3.11)
+# - yt-dlp.exe (sync downloads)
+# - ffmpeg.exe (compress + reorg)
+# - icon.ico (window + tray icon)
+# - web/ (HTML/CSS/JS shell)
+# - backend/whisper_worker.py (runs under bundled/system Python 3.11)
 #
 # Whisper itself stays out-of-tree: we invoke Python 3.11's venv at runtime
 # (find_python311 in transcribe.py) so we don't re-bundle CUDA + CTranslate2.
@@ -26,7 +26,7 @@ PROJECT_ROOT = Path(os.path.abspath(SPECPATH))
 
 # Collect static data files shipped alongside the exe
 datas = [
-    (str(PROJECT_ROOT / 'web'),                'web'),
+    (str(PROJECT_ROOT / 'web'), 'web'),
     (str(PROJECT_ROOT / 'backend' / 'whisper_worker.py'), 'backend'),
 ]
 # Optional: icon.ico (only if present)

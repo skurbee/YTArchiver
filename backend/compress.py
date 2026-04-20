@@ -8,12 +8,12 @@ checks + rollback on unexpectedly-larger output).
 Presets (from YTArchiver.py:179 _COMPRESS_PRESETS):
     resolution × tier → MB per hour of video
 
-    1080: Generous=1200  Average=700   Below Average=300
-    720:  Generous=800   Average=475   Below Average=200
-    480:  Generous=500   Average=300   Below Average=130
-    360:  Generous=375   Average=225   Below Average=100
-    240:  Generous=250   Average=150   Below Average=65
-    144:  Generous=150   Average=90    Below Average=40
+    1080: Generous=1200 Average=700 Below Average=300
+    720: Generous=800 Average=475 Below Average=200
+    480: Generous=500 Average=300 Below Average=130
+    360: Generous=375 Average=225 Below Average=100
+    240: Generous=250 Average=150 Below Average=65
+    144: Generous=150 Average=90 Below Average=40
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ from .log_stream import LogStreamer
 
 
 _COMPRESS_PRESETS = {
-    "1080": {"Generous": 1200, "Average": 700,  "Below Average": 300},
-    "720":  {"Generous": 800,  "Average": 475,  "Below Average": 200},
-    "480":  {"Generous": 500,  "Average": 300,  "Below Average": 130},
-    "360":  {"Generous": 375,  "Average": 225,  "Below Average": 100},
-    "240":  {"Generous": 250,  "Average": 150,  "Below Average": 65},
-    "144":  {"Generous": 150,  "Average": 90,   "Below Average": 40},
+    "1080": {"Generous": 1200, "Average": 700, "Below Average": 300},
+    "720": {"Generous": 800, "Average": 475, "Below Average": 200},
+    "480": {"Generous": 500, "Average": 300, "Below Average": 130},
+    "360": {"Generous": 375, "Average": 225, "Below Average": 100},
+    "240": {"Generous": 250, "Average": 150, "Below Average": 65},
+    "144": {"Generous": 150, "Average": 90, "Below Average": 40},
 }
 
 _FFMPEG_TIME_RE = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
@@ -165,7 +165,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                 os.remove(temp_path)
             except OSError:
                 pass
-            stream.emit_text("  \u26d4 Encode cancelled.", "red")
+            stream.emit_text(" \u26d4 Encode cancelled.", "red")
             return {"ok": False, "reason": "cancelled"}
 
         m = _FFMPEG_TIME_RE.search(line)
@@ -175,7 +175,7 @@ def compress_video(input_path: str, stream: LogStreamer,
             if pct != last_pct and pct % 5 == 0:
                 last_pct = pct
                 stream.emit([
-                    ["  ", None],
+                    [" ", None],
                     ["\u2588" * (pct // 5), "encode_progress"],
                     ["\u2591" * (20 - pct // 5), "dim"],
                     [f" {pct}%", "encode_pct"], ["\n", None],
@@ -197,7 +197,7 @@ def compress_video(input_path: str, stream: LogStreamer,
     # Safety: if output is larger than input, skip the replace
     if new_size >= orig_size:
         stream.emit([
-            ["  ", None],
+            [" ", None],
             ["\u26a0 ", "red"],
             [f"Output larger than original ({orig_size:,} \u2192 {new_size:,}), skipping replace.\n",
              "simpleline"],
@@ -220,7 +220,7 @@ def compress_video(input_path: str, stream: LogStreamer,
             return {"ok": False, "error": str(e)}
 
     stream.emit([
-        ["  \u2713 ", "simpleline_green"],
+        [" \u2713 ", "simpleline_green"],
         [f"{display} ", "simpleline"],
         [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ", "dim"],
         [f"(\u2212{saved_pct:.0f}%) ", "simpleline_compress"],
@@ -272,11 +272,11 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 cancel_event=cancel_event, redo_on_larger=redo_on_larger,
                 batch_size=0, batch_num=i + 1, batch_total=n_splits,
             )
-            agg["done"]     += r.get("done", 0)
-            agg["grew"]     += r.get("grew", 0)
-            agg["errors"]   += r.get("errors", 0)
+            agg["done"] += r.get("done", 0)
+            agg["grew"] += r.get("grew", 0)
+            agg["errors"] += r.get("errors", 0)
             agg["sum_orig"] += r.get("sum_orig", 0)
-            agg["sum_new"]  += r.get("sum_new", 0)
+            agg["sum_new"] += r.get("sum_new", 0)
             if r.get("cancelled"):
                 agg["cancelled"] = True
                 break
@@ -295,7 +295,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
     sum_new = 0
     for i, path in enumerate(paths, 1):
         if cancel_event is not None and cancel_event.is_set():
-            stream.emit_text("  \u26d4 Batch cancelled.", "red")
+            stream.emit_text(" \u26d4 Batch cancelled.", "red")
             break
         stream.emit([
             [f"[{i}/{len(paths)}] ", "compress_bracket"],
@@ -307,7 +307,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
         if res.get("ok"):
             n_done += 1
             sum_orig += res.get("orig_bytes", 0)
-            sum_new  += res.get("new_bytes", 0)
+            sum_new += res.get("new_bytes", 0)
         elif res.get("reason") == "grew" and redo_on_larger:
             # Step down one tier and retry
             n_grew += 1
@@ -318,7 +318,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
             if idx + 1 < len(_QUALITY_LADDER):
                 retry_q = _QUALITY_LADDER[idx + 1]
                 stream.emit([
-                    ["  ", None], ["\u21A9 ", "simpleline_compress"],
+                    [" ", None], ["\u21A9 ", "simpleline_compress"],
                     [f"Retrying at {retry_q}\n", "dim"],
                 ])
                 res2 = compress_video(path, stream, quality=retry_q,
@@ -327,7 +327,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 if res2.get("ok"):
                     n_done += 1
                     sum_orig += res2.get("orig_bytes", 0)
-                    sum_new  += res2.get("new_bytes", 0)
+                    sum_new += res2.get("new_bytes", 0)
                 else:
                     n_err += 1
             else:
@@ -338,7 +338,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
 
     saved = (1 - sum_new / sum_orig) * 100.0 if sum_orig else 0.0
     stream.emit([
-        ["  \u2713 Batch done: ", "simpleline_green"],
+        [" \u2713 Batch done: ", "simpleline_green"],
         [f"{n_done}/{len(paths)} compressed \u00b7 {n_grew} redone \u00b7 "
          f"{n_err} errors \u00b7 saved {saved:.1f}%\n", "simpleline_compress"],
     ])
@@ -363,14 +363,14 @@ def compress_videos_batch(paths, stream: LogStreamer,
             took = (f"took {int(elapsed)}s" if elapsed < 60
                     else f"took {int(elapsed)//60}m {int(elapsed)%60}s")
             stream.emit_activity({
-                "kind":      "Cmprss",
+                "kind": "Cmprss",
                 "time_date": f"{time_str}, {date_str}",
-                "channel":   channel_name or "",
-                "primary":   primary,
+                "channel": channel_name or "",
+                "primary": primary,
                 "secondary": "",
-                "errors":    f"{n_err} errors",
-                "took":      took,
-                "row_tag":   "hist_compress" if n_done > 0 else "",
+                "errors": f"{n_err} errors",
+                "took": took,
+                "row_tag": "hist_compress" if n_done > 0 else "",
             })
         except Exception:
             pass

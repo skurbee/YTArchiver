@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 3:06pm ───────────────────────
+# ── Version header — last updated 4.20.26 3:16pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
-# Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
+# Every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v47.0"
-APP_VERSION_DATE = "4.20.26 3:06pm"
+APP_VERSION      = "v47.1"
+APP_VERSION_DATE = "4.20.26 3:16pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -28,7 +28,7 @@ _INSTANCE_MUTEX = None
 if os.name == "nt":
     _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(
         None, False, "Local\\YTArchiver_SingleInstance")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    if ctypes.windll.kernel32.GetLastError() == 183: # ERROR_ALREADY_EXISTS
         # Another instance is running — focus its window and exit.
         import ctypes.wintypes as _wt
         _WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, _wt.HWND, _wt.LPARAM)
@@ -38,7 +38,7 @@ if os.name == "nt":
                 _buf = ctypes.create_unicode_buffer(_n + 1)
                 ctypes.windll.user32.GetWindowTextW(hwnd, _buf, _n + 1)
                 if "YT Archiver" in _buf.value:
-                    ctypes.windll.user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+                    ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
                     return False
             return True
@@ -56,7 +56,7 @@ except ImportError:
             None,
             "YTArchiver requires pywebview.\n\n"
             "Install with Python 3.13:\n"
-            "  Python313\\python.exe -m pip install pywebview",
+            " Python313\\python.exe -m pip install pywebview",
             "YTArchiver", 0x10,
         )
     except Exception:
@@ -118,8 +118,8 @@ class Api:
         self._log_stream = LogStreamer(None)
         self._sync_thread = None
         self._sync_cancel = threading.Event()
-        self._sync_pause  = threading.Event()   # set == paused; worker blocks
-        self._sync_skip   = threading.Event()   # set == skip current item
+        self._sync_pause = threading.Event() # set == paused; worker blocks
+        self._sync_skip = threading.Event() # set == skip current item
         # Pull whisper model from config so Settings changes actually take
         # effect on next launch. Without this the TranscribeManager defaults
         # to "large-v3" regardless of what the user picked in Settings.
@@ -164,7 +164,7 @@ class Api:
         # Connect the transcribe manager to the shared GPU queue so
         # enqueued jobs show up in the Tasks popover + the Auto
         # checkbox actually gates firing. Without this the manager's
-        # internal `_jobs` list is invisible to the UI (Scott's bug:
+        # internal `_jobs` list is invisible to the UI (a bug:
         # auto-transcribe on a channel, no task appeared in GPU Tasks).
         self._transcribe.attach_queues(self._queues, cfg_loader=load_config)
         # Project rule: launching with items already in the queue must never
@@ -174,7 +174,7 @@ class Api:
         # pause. Forcing the Event ensures the autorun scheduler or any stray
         # trigger can't kick the worker while pre-existing work is pending.
         _had_sync_items = self._queues.has_sync_pipeline_items()
-        _had_gpu_items  = self._queues.has_gpu_items()
+        _had_gpu_items = self._queues.has_gpu_items()
         # Only keep the paused flag if there's actual work to be paused.
         # A stale flag with no queued items is leftover bookkeeping that
         # would otherwise make the global Pause button show "Resume"
@@ -239,16 +239,16 @@ class Api:
                 def _emit_blank_warn():
                     try:
                         self._log_stream.emit([
-                            ["\u26a0  ", "red"],
+                            ["\u26a0 ", "red"],
                             [f"{len(_blanks)} channel(s) have a blank name. "
                              "Syncs will be refused until you rename them in "
                              "the Subs tab:\n", "red"],
                         ])
                         for _u in _blanks[:10]:
-                            self._log_stream.emit([["    ", None], [f"{_u}\n", "dim"]])
+                            self._log_stream.emit([[" ", None], [f"{_u}\n", "dim"]])
                         if len(_blanks) > 10:
                             self._log_stream.emit(
-                                [[f"    ... and {len(_blanks) - 10} more\n", "dim"]])
+                                [[f" ... and {len(_blanks) - 10} more\n", "dim"]])
                         self._log_stream.flush()
                     except Exception:
                         pass
@@ -270,7 +270,7 @@ class Api:
             # Tray + tooltip uses "actively-working" semantics: is a channel
             # or GPU job currently being processed right now?
             sync_working = bool(payload['sync']) and payload['sync'][0]['status'] == 'running'
-            gpu_working  = bool(payload['gpu'])  and payload['gpu'][0]['status']  == 'running'
+            gpu_working = bool(payload['gpu']) and payload['gpu'][0]['status'] == 'running'
             # UI blink state uses "thread-alive" semantics: is the worker
             # thread running (including parked in _wait_if_paused between
             # channels or paused between chunks)? Without this, the icon
@@ -285,11 +285,11 @@ class Api:
             except Exception:
                 gpu_alive = gpu_working
             sync_running = sync_alive or sync_working
-            gpu_running  = gpu_alive or gpu_working
+            gpu_running = gpu_alive or gpu_working
             js = (
                 f"if (window.renderQueues) window.renderQueues({_json.dumps(payload)});"
                 f"if (window.setQueueState) window.setQueueState("
-                f"  {{sync: {{running: {str(sync_running).lower()}, "
+                f" {{sync: {{running: {str(sync_running).lower()}, "
                 f"paused: {str(payload['sync_paused']).lower()}}},"
                 f" gpu: {{running: {str(gpu_running).lower()}, "
                 f"paused: {str(payload['gpu_paused']).lower()}}}}});"
@@ -335,10 +335,10 @@ class Api:
         if config_file_exists():
             self._config = load_config()
             print(f"[config] loaded real config from {CONFIG_FILE}")
-            print(f"  channels: {len(self._config.get('channels', []))}")
-            print(f"  recent:   {len(self._config.get('recent_downloads', []))}")
-            print(f"  log_mode: {self._config.get('log_mode', 'Simple')}")
-            print(f"  autorun_history: {len(self._config.get('autorun_history', []))}")
+            print(f" channels: {len(self._config.get('channels', []))}")
+            print(f" recent: {len(self._config.get('recent_downloads', []))}")
+            print(f" log_mode: {self._config.get('log_mode', 'Simple')}")
+            print(f" autorun_history: {len(self._config.get('autorun_history', []))}")
             # Push saved autorun interval into the scheduler
             try:
                 self._autorun.set_interval_mins(int(self._config.get("autorun_interval", 0) or 0))
@@ -446,7 +446,7 @@ class Api:
         """Re-fetch recent_downloads and push to the UI's Recent grid/list.
 
         Called from backend.sync._record_recent_download every time a new
-        video lands, so the Recent tab updates live (Scott: "does the
+        video lands, so the Recent tab updates live ("does the
         Recents tab not auto update/refresh when a download happens?").
         Safe no-op when the window isn't ready yet.
         """
@@ -483,7 +483,7 @@ class Api:
         cfg = self._config or load_config()
         return {
             "sync": bool(cfg.get("autorun_sync", False)),
-            "gpu":  bool(cfg.get("autorun_gpu",  False)),
+            "gpu": bool(cfg.get("autorun_gpu", False)),
         }
 
     def queue_auto_set(self, kind, enabled):
@@ -492,7 +492,7 @@ class Api:
         For GPU, also wake the transcribe worker when toggled ON so
         any queued-but-parked jobs actually fire (the worker was
         sleeping on the `_auto_enabled()` gate — it needs a nudge to
-        re-check). Matches Scott's rule: unchecking Auto keeps incoming
+        re-check). Matches rule: unchecking Auto keeps incoming
         tasks parked; re-checking releases them.
         """
         if kind not in ("sync", "gpu"):
@@ -797,14 +797,14 @@ class Api:
         # cfg["min_duration"] is SECONDS (180 = 3 min) per YTArchiver's schema
         raw_min_secs = int(cfg.get("min_duration", 180) or 0)
         return {
-            "resolution":     cfg.get("default_resolution", "720"),
-            "min_duration":   max(0, raw_min_secs // 60),
-            "max_duration":   0,
-            "auto_metadata":  True,
+            "resolution": cfg.get("default_resolution", "720"),
+            "min_duration": max(0, raw_min_secs // 60),
+            "max_duration": 0,
+            "auto_metadata": True,
             "auto_transcribe": False,
             "compress_enabled": False,
-            "mode":           "new",
-            "folder_org":     "years",
+            "mode": "new",
+            "folder_org": "years",
         }
 
     # ─── Sync ───────────────────────────────────────────────────────────
@@ -822,13 +822,13 @@ class Api:
     def _run_startup_sequence(self):
         """Three-stage startup log matching YTArchiver's OLD timing:
 
-            Stage 1  (< 2s)   --- Startup checks complete, ready to download ---
+            Stage 1 (< 2s) --- Startup checks complete, ready to download ---
                               → Sync Subbed + related buttons enable here
-            Stage 2  (20-40s) --- Disk scan complete (N ch \u00b7 M vids \u00b7 X TB) ---
+            Stage 2 (20-40s) --- Disk scan complete (N ch \u00b7 M vids \u00b7 X TB) ---
                               → staleness-gated: if cache is newer than
                                 `disk_scan_staleness_hours`, skip the walk
                                 and just report from the cache (instant)
-            Stage 3  (mins)   --- Browse tab preload complete (N \u00b7 M cached) ---
+            Stage 3 (mins) --- Browse tab preload complete (N \u00b7 M cached) ---
                               → sweep + per-channel video-list cache warm
 
         Each stage runs on its own thread and emits its milestone the
@@ -847,22 +847,22 @@ class Api:
             # In-place status line (replace-in-place via `startup_loading`).
             # Filtered from simple mode — user sees only the green milestones.
             try:
-                s.emit([[f"  {msg}\n", "startup_loading"]])
+                s.emit([[f" {msg}\n", "startup_loading"]])
                 _flush_now()
             except Exception: pass
 
-        _loading("Loading\u00b7  ")
+        _loading("Loading\u00b7 ")
 
         # Pending-transcribe journal restore (fast, runs before any milestone).
         try:
             n = self._transcribe.load_pending()
             if n > 0:
                 s.emit_text(
-                    f"  \u2014 Restored {n} pending transcription job(s) from last session.",
+                    f" \u2014 Restored {n} pending transcription job(s) from last session.",
                     "simpleline_blue")
                 _flush_now()
         except Exception as _pe:
-            s.emit_dim(f"  (pending-journal restore skipped: {_pe})")
+            s.emit_dim(f" (pending-journal restore skipped: {_pe})")
             _flush_now()
 
         cfg = self._config or load_config()
@@ -873,8 +873,8 @@ class Api:
         # Animator iterates both and emits whichever are populated.
         dots_state = {
             "i": 0,
-            "sweep":   {"phase": "Starting up", "detail": ""},
-            "preload": {"phase": "",            "detail": ""},
+            "sweep": {"phase": "Starting up", "detail": ""},
+            "preload": {"phase": "", "detail": ""},
         }
         stage3_done = threading.Event()
 
@@ -900,18 +900,18 @@ class Api:
         def _animate_dots():
             """Cycle dots on each active slot (sweep / preload). When a
             slot's `phase` is empty, its UI indicator is hidden; when
-            populated, we emit `{phase}{dots}  {detail}`. Both can be
+            populated, we emit `{phase}{dots} {detail}`. Both can be
             active simultaneously (parallel Stage 3)."""
             while not stage3_done.is_set():
                 dots_state["i"] = (dots_state["i"] + 1) % 3
-                d = ["\u00b7  ", "\u00b7\u00b7 ", "\u00b7\u00b7\u00b7"][dots_state["i"]]
+                d = ["\u00b7 ", "\u00b7\u00b7 ", "\u00b7\u00b7\u00b7"][dots_state["i"]]
                 log_parts = []
                 for slot in ("sweep", "preload"):
                     state = dots_state[slot]
                     phase = state.get("phase") or ""
                     detail = state.get("detail") or ""
                     if phase:
-                        line = (f"{phase}{d}  {detail}" if detail
+                        line = (f"{phase}{d} {detail}" if detail
                                 else f"{phase}{d}")
                         _push_indicator(slot, line.strip())
                         log_parts.append(line.strip())
@@ -921,7 +921,7 @@ class Api:
                 # the verbose log still has a single representative
                 # "Loading" line even with two concurrent phases.
                 if log_parts:
-                    _loading("   \u00b7   ".join(log_parts))
+                    _loading(" \u00b7 ".join(log_parts))
                 _time.sleep(0.4)
             # Hide both slots once startup is fully done.
             _push_indicator("sweep", None)
@@ -982,7 +982,7 @@ class Api:
                         save_disk_cache(walked)
                         # Persist the timestamp so next boot can decide
                         # staleness. Previously the exception handler
-                        # silently swallowed failures — Scott reported
+                        # silently swallowed failures — reported
                         # disk scan running every launch, which means
                         # this save wasn't sticking. Now we surface
                         # the outcome so a silent failure (write-gate
@@ -1012,7 +1012,7 @@ class Api:
                     age_str = (f"{age_hours:.1f}h" if age_hours < 72
                                else f"{age_hours/24:.1f}d")
                     s.emit_dim(
-                        f"  Disk scan skipped \u2014 last run was {age_str} ago, "
+                        f" Disk scan skipped \u2014 last run was {age_str} ago, "
                         f"staleness threshold is {stale_hours}h.")
                     _flush_now()
                 # Emit the milestone from the freshly-walked (or still-cached) totals.
@@ -1095,7 +1095,7 @@ class Api:
                     dots_state["preload"]["detail"] = ""
 
             # Spawn both on their own threads and wait for both.
-            t_sweep   = threading.Thread(target=_run_sweep,   daemon=True)
+            t_sweep = threading.Thread(target=_run_sweep, daemon=True)
             t_preload = threading.Thread(target=_run_preload, daemon=True)
             t_sweep.start()
             t_preload.start()
@@ -1106,8 +1106,8 @@ class Api:
             try:
                 from backend import archive_scan as _as
                 idx = _as.index_summary()
-                n_ch   = idx["cards"].get("channels", 0) if idx else 0
-                n_vids = idx["cards"].get("videos",   0) if idx else 0
+                n_ch = idx["cards"].get("channels", 0) if idx else 0
+                n_vids = idx["cards"].get("videos", 0) if idx else 0
                 s.emit_text(
                     f"--- Browse tab preload complete ({n_ch} channels \u00b7 "
                     f"{n_vids:,} videos cached) ---",
@@ -1123,13 +1123,13 @@ class Api:
             sweep_walked = sweep_result.get("walked", 0)
             if sweep_reg > 0 or sweep_ing > 0:
                 s.emit_text(
-                    f"  \u2014 Background sweep: +{sweep_reg} new videos registered, "
+                    f" \u2014 Background sweep: +{sweep_reg} new videos registered, "
                     f"+{sweep_ing} jsonl ingested.",
                     "simpleline_blue")
                 _flush_now()
             if sweep_skip:
                 s.emit_dim(
-                    f"  Sweep: {sweep_skip} channel(s) skipped (folder "
+                    f" Sweep: {sweep_skip} channel(s) skipped (folder "
                     f"unchanged since last sweep), {sweep_walked} walked.")
                 _flush_now()
 
@@ -1157,7 +1157,7 @@ class Api:
                 pass
 
             stage3_done.set()
-            _time.sleep(0.05)  # let the animator notice
+            _time.sleep(0.05) # let the animator notice
             _clear_loading()
 
         # Sequential stages on one background thread — each milestone
@@ -1180,7 +1180,7 @@ class Api:
         `add_downloads_from_config=False`: spawn the worker but don't
         add anything to the queue. Used by metadata/compress auto-fire
         paths that just need to drain whatever's already queued.
-        Scott's bug: metadata_queue_all was calling sync_start_all
+        a bug: metadata_queue_all was calling sync_start_all
         (which always added 103 downloads) instead of just starting
         the worker \u2014 so "Queued metadata for 103 channels" turned
         into "Sync pass starting (206 channels)."
@@ -1190,14 +1190,14 @@ class Api:
         if not sync_backend.find_yt_dlp():
             return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
         # Clear every event that could have been left set by a previous pass:
-        #   cancel — fired by "Clear Queue" or the Cancel button
-        #   skip   — fired by "Skip current"
-        #   pause  — fired by the Pause dialog, and NEVER auto-cleared before
-        #            this fix. Without this clear, starting a new pass after
-        #            a paused-and-cancelled pass would immediately re-enter
-        #            the "\u23F8 Sync paused at ..." wait loop with no way
-        #            to resume via the UI because the dialog-Pause button
-        #            is meant for mid-pass pausing, not from a cold start.
+        # cancel — fired by "Clear Queue" or the Cancel button
+        # skip — fired by "Skip current"
+        # pause — fired by the Pause dialog, and NEVER auto-cleared before
+        # this fix. Without this clear, starting a new pass after
+        # a paused-and-cancelled pass would immediately re-enter
+        # the "\u23F8 Sync paused at ..." wait loop with no way
+        # to resume via the UI because the dialog-Pause button
+        # is meant for mid-pass pausing, not from a cold start.
         self._sync_cancel.clear()
         self._sync_skip.clear()
         self._sync_pause.clear()
@@ -1268,7 +1268,7 @@ class Api:
                 # runs while we're still inside _run, so
                 # `self._sync_thread.is_alive()` reads True and the
                 # Sync Tasks icon keeps blinking after the queue
-                # finishes. Scott reported this. The Timer fires
+                # finishes. this was reported The Timer fires
                 # 500ms later when the thread has definitely exited.
                 try: threading.Timer(0.5, self._on_queue_changed).start()
                 except Exception: pass
@@ -1360,7 +1360,7 @@ class Api:
         if which in ("sync", "both"):
             self._sync_pause.set()
             self._queues.set_sync_paused(True)
-            self._transcribe.pause()  # covers mixed queues via TranscribeManager
+            self._transcribe.pause() # covers mixed queues via TranscribeManager
         if which in ("gpu", "both"):
             self._queues.set_gpu_paused(True)
             self._transcribe.pause()
@@ -1383,7 +1383,7 @@ class Api:
         """Return current paused state for each queue."""
         return {
             "sync": bool(self._queues.sync_paused),
-            "gpu":  bool(self._queues.gpu_paused),
+            "gpu": bool(self._queues.gpu_paused),
         }
 
     def sync_skip_current(self):
@@ -1400,7 +1400,7 @@ class Api:
             # the skip flag and clears the cancel event before the next one.
             self._sync_cancel.set()
             self._log_stream.emit([
-                ["[Sync]  ", "sync_bracket"],
+                ["[Sync] ", "sync_bracket"],
                 ["Skip current channel \u2014 moving on\n", "simpleline"],
             ])
             self._log_stream.flush()
@@ -1415,7 +1415,7 @@ class Api:
         try:
             self._transcribe.skip_current()
             self._log_stream.emit([
-                ["[GPU]   ", "trans_bracket"],
+                ["[GPU] ", "trans_bracket"],
                 ["Skip current GPU job \u2014 moving on\n", "simpleline"],
             ])
             self._log_stream.flush()
@@ -1464,7 +1464,7 @@ class Api:
                     self._transcribe.enqueue(video, title)
                     queued += 1
             self._log_stream.emit([
-                ["[GPU]   ", "trans_bracket"],
+                ["[GPU] ", "trans_bracket"],
                 [f"Transcribe folder \u2014 {os.path.basename(folder)}: ", "simpleline_blue"],
                 [f"{queued} queued, {skipped} already done\n", "simpleline"],
             ])
@@ -1499,10 +1499,10 @@ class Api:
         # The replace helpers use it to catch title-drifted stale entries
         # that a title-only match would miss. Lookup order mirrors
         # `_write_outputs`:
-        #   hint → `[videoId]` suffix on filename → FTS videos table.
+        # hint → `[videoId]` suffix on filename → FTS videos table.
         # Also look up the channel name from the index DB so the
         # [Trnscr] activity-log row shows the channel instead of
-        # em-dash. Scott: "no channel name?"
+        # em-dash. "no channel name?"
         vid_id = (video_id or "").strip()
         channel_name = ""
         if not vid_id:
@@ -1533,7 +1533,7 @@ class Api:
         # Whisper banner). Mirrors ArchivePlayer's `_ytStartProgressPoll`
         # transition-detection pattern but reactive instead of polled.
         _self = self
-        _vid  = vid_id
+        _vid = vid_id
         _path = os.path.normpath(path)
         def _on_done(_result):
             try:
@@ -1581,7 +1581,7 @@ class Api:
 
         `persist=False` (used by the one-off re-transcribe model picker
         modal): only swaps the runtime model — doesn't touch the
-        Settings default. Scott: "manual retranscriptions have nothing
+        Settings default. "manual retranscriptions have nothing
         to do with that [settings default] and should have no influence
         on that setting."
         """
@@ -1656,7 +1656,7 @@ class Api:
                 # Pending counters for live-count context-menu labels.
                 # Mirrors OLD YTArchiver.py:26322 folder-menu labels.
                 "transcription_pending": int(ch.get("transcription_pending") or 0),
-                "metadata_pending":      int(ch.get("metadata_pending") or 0),
+                "metadata_pending": int(ch.get("metadata_pending") or 0),
             })
         out.sort(key=lambda c: (c["name"] or "").lower())
         return out
@@ -1674,10 +1674,10 @@ class Api:
             recent = index_backend.new_videos_in_last_n_days(int(days or 7))
             return {
                 "ok": True,
-                "new_videos":     recent.get("videos", 0),
-                "new_channels":   recent.get("channels", 0),
+                "new_videos": recent.get("videos", 0),
+                "new_channels": recent.get("channels", 0),
                 "total_channels": total_channels,
-                "channel_list":   recent.get("channel_list", []),
+                "channel_list": recent.get("channel_list", []),
             }
         except Exception as e:
             return {"ok": False, "error": str(e),
@@ -1734,7 +1734,7 @@ class Api:
                         row = conn.execute(
                             "SELECT s.jsonl_path, v.filepath "
                             "FROM videos v LEFT JOIN segments s "
-                            "  ON s.video_id = v.video_id "
+                            " ON s.video_id = v.video_id "
                             "WHERE v.video_id=? LIMIT 1",
                             (video_id,)).fetchone()
                     if row:
@@ -1816,7 +1816,7 @@ class Api:
         # find a bare "WHISPER" tag (no whitespace or colon followed by
         # more text) substitute the user's current default model so the
         # banner has something to show instead of just "Whisper
-        # transcription" with no model qualifier. Scott: "we should
+        # transcription" with no model qualifier. "we should
         # NEVER just see 'whisper'. we should know what model was used."
         # Caveat: this is a best-effort guess — the real model used at
         # the time wasn't recorded. Accurate only if the user hasn't
@@ -1847,8 +1847,8 @@ class Api:
         try:
             seg_id = int((payload or {}).get("segment_id") or 0)
             before = int((payload or {}).get("before") or 30)
-            after  = int((payload or {}).get("after")  or 30)
-            query  = (payload or {}).get("query") or ""
+            after = int((payload or {}).get("after") or 30)
+            query = (payload or {}).get("query") or ""
             return index_backend.get_segment_context(seg_id, before, after, query)
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1865,8 +1865,8 @@ class Api:
         try:
             filepath = (payload or {}).get("filepath") or ""
             video_id = (payload or {}).get("video_id") or ""
-            title    = (payload or {}).get("title") or ""
-            channel  = (payload or {}).get("channel") or ""
+            title = (payload or {}).get("title") or ""
+            channel = (payload or {}).get("channel") or ""
             if not video_id:
                 import re as _re
                 m = _re.search(r"\[([A-Za-z0-9_-]{11})\]",
@@ -2198,7 +2198,7 @@ class Api:
                         os.remove(fp)
                         deleted += 1
                         if deleted % 100 == 0:
-                            self._log_stream.emit_dim(f"  deleted {deleted}\u2026")
+                            self._log_stream.emit_dim(f" deleted {deleted}\u2026")
                             self._log_stream.flush()
                     except Exception:
                         errors += 1
@@ -2300,8 +2300,7 @@ class Api:
                     return
                 # Step 1: prune DB entries for files no longer on disk
                 # / 0-byte phantoms / duplicate-id rows. Emit before and
-                # after so the user sees it's doing something — Scott:
-                # "I click Rescan, nothing happens, then 5 min later
+                # after so the user sees it's doing something — # "I click Rescan, nothing happens, then 5 min later
                 # nothing changed."
                 self._log_stream.emit_text(
                     "Rescan: pruning stale DB entries...",
@@ -2322,11 +2321,11 @@ class Api:
                         _parts.append(
                             f"{pruned['fake_id_cleared']} fake video_id(s) cleared")
                     self._log_stream.emit_text(
-                        "  \u2014 Pruned: " + ", ".join(_parts) + ".",
+                        " \u2014 Pruned: " + ", ".join(_parts) + ".",
                         "simpleline_green")
                 else:
                     self._log_stream.emit_text(
-                        "  \u2014 No stale entries to prune.", "dim")
+                        " \u2014 No stale entries to prune.", "dim")
                 self._log_stream.flush()
                 # Step 2: sweep for new files.
                 channels = cfg.get("channels", [])
@@ -2343,7 +2342,7 @@ class Api:
                 # Push a refresh signal to the frontend so the Browse
                 # grid re-queries — the backend-side cache is already
                 # invalidated but the currently-rendered grid is still
-                # HTML from the last fetch. Scott: "the videos are
+                # HTML from the last fetch. "the videos are
                 # still there after rescan."
                 if self._window is not None:
                     try:
@@ -2367,7 +2366,7 @@ class Api:
         Enqueues a `kind: "metadata"` item on the sync queue so the
         Tasks popover shows it and the Sync pause/cancel buttons can
         pause or clear it. The sync worker loop dispatches metadata
-        items to `fetch_channel_metadata`. Matches Scott's rule:
+        items to `fetch_channel_metadata`. Matches rule:
         "every channel's metadata check should show as its own sync
         task." If the sync thread isn't already running and Sync Auto
         is on, sync_start_all kicks it off; otherwise the item sits
@@ -2414,7 +2413,7 @@ class Api:
             # Kick the sync worker to drain the queue item we just
             # added. Pass `add_downloads_from_config=False` so the
             # worker does NOT enqueue 103 download tasks on top of our
-            # metadata task \u2014 Scott's rule: "everything should be in
+            # metadata task \u2014 rule: "everything should be in
             # the task list; don't add things the user didn't ask for."
             try:
                 cfg = load_config() or {}
@@ -2431,7 +2430,7 @@ class Api:
                     ch_name, existing_count) or {}).get("choice", "skip")
                 if choice in ("skip", "cancel"):
                     self._log_stream.emit_text(
-                        f"  \u2014 Metadata for {ch_name}: cancelled.",
+                        f" \u2014 Metadata for {ch_name}: cancelled.",
                         "simpleline_pink")
                     self._log_stream.flush()
                     return
@@ -2446,7 +2445,7 @@ class Api:
     def metadata_queue_all(self, refresh=False):
         """Enqueue every saved channel as a `kind: "metadata"` sync
         task — each one becomes its own row in the Sync Tasks popover
-        so the user can see, pause, and cancel. Matches Scott's rule
+        so the user can see, pause, and cancel. Matches rule
         that background work must always be represented in a task
         list. `refresh=True` triggers the refresh variant (re-hits
         every video) instead of skip-existing.
@@ -2473,7 +2472,7 @@ class Api:
         self._on_queue_changed()
         label = "refresh" if refresh else "download"
         self._log_stream.emit_text(
-            f"  \u2014 Queued metadata {label} for {queued} channel(s) "
+            f" \u2014 Queued metadata {label} for {queued} channel(s) "
             f"on Sync Tasks.", "simpleline_pink")
         self._log_stream.flush()
         # Auto-fire the worker to drain the queued metadata tasks. Do
@@ -2645,11 +2644,11 @@ class Api:
         if tx_added: parts.append(f"{tx_added} for transcription")
         if mt_added: parts.append(f"{mt_added} for metadata")
         if parts:
-            self._log_stream.emit([["[Subs]  ", "sync_bracket"],
+            self._log_stream.emit([["[Subs] ", "sync_bracket"],
                                     [f"\u21ba Queued {', '.join(parts)}.\n",
                                      "simpleline_green"]])
         else:
-            self._log_stream.emit([["[Subs]  ", "sync_bracket"],
+            self._log_stream.emit([["[Subs] ", "sync_bracket"],
                                     ["No channels with pending transcriptions or metadata.\n",
                                      "dim"]])
         self._log_stream.flush()
@@ -2670,7 +2669,7 @@ class Api:
             r = self.chan_transcribe_all(name)
             if r and r.get("ok") and r.get("queued", 0) > 0:
                 queued += 1
-        self._log_stream.emit([["[Subs]  ", "sync_bracket"],
+        self._log_stream.emit([["[Subs] ", "sync_bracket"],
                                 [f"\u21ba Queued all: {queued} channels\n",
                                  "simpleline_green"]])
         self._log_stream.flush()
@@ -2713,7 +2712,7 @@ class Api:
                 self._transcribe.enqueue(video, title, channel=name)
                 queued += 1
         self._log_stream.emit([
-            ["[GPU]   ", "trans_bracket"],
+            ["[GPU] ", "trans_bracket"],
             [f"Queue pending for {name}: ", "simpleline_blue"],
             [f"{queued} queued, {skipped} already done "
              f"(config hint: {pending})\n", "simpleline"],
@@ -2726,9 +2725,9 @@ class Api:
         """Walk the channel folder for videos without .jsonl sidecars and queue each for whisper.
 
         `combined` controls per-year output:
-          - None   : decide from existing transcripts (first-time → may need UI choice)
-          - True   : write one combined `{ch} Transcript.txt` at the channel root
-          - False  : follow organization (per-year files)
+          - None : decide from existing transcripts (first-time → may need UI choice)
+          - True : write one combined `{ch} Transcript.txt` at the channel root
+          - False : follow organization (per-year files)
 
         If this is the first-time transcribing an organized channel (split_years=True)
         AND `combined` is unspecified, returns `{ok: True, needs_choice: True,
@@ -2747,7 +2746,7 @@ class Api:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name
         folder = os.path.join(base, channel_folder_name(ch))
-        split_years  = bool(ch.get("split_years"))
+        split_years = bool(ch.get("split_years"))
         split_months = bool(ch.get("split_months"))
 
         # First-time-choice logic: for organized channels with no existing
@@ -2768,7 +2767,7 @@ class Api:
             # Has existing transcripts → follow whatever org they picked last time
             combined = False
         elif combined is None:
-            combined = True  # unorganized channels always combine
+            combined = True # unorganized channels always combine
 
         # Build a set of already-transcribed titles from the AGGREGATED
         # `{ch_name} ... Transcript.txt` files. the user reported that the old
@@ -2809,7 +2808,7 @@ class Api:
                                          combined=bool(combined))
                 queued += 1
         self._log_stream.emit([
-            ["[GPU]   ", "trans_bracket"],
+            ["[GPU] ", "trans_bracket"],
             [f"Transcribe all for {name}: ", "simpleline_blue"],
             [f"{queued} queued, {skipped} already transcribed"
              + (" (combined)" if combined and split_years else ""),
@@ -2847,7 +2846,7 @@ class Api:
                 with open(pp, "r", encoding="utf-8") as f:
                     data = _j.load(f)
                 done_n = len(data.get("done_ids") or [])
-                res    = data.get("resolution") or ""
+                res = data.get("resolution") or ""
                 return {"ok": True, "pending": True,
                         "resolution": res, "done": done_n}
             except Exception:
@@ -2929,9 +2928,9 @@ class Api:
         cancelled run can resume. Respects pause + cancel events.
 
         `scope` (optional dict):
-          None              - whole channel (default, matches OLD's tree-view root right-click)
-          {year: 2024}      - only that year subfolder  (split_years channels)
-          {year: 2024, month: 5}  - only that year+month subfolder
+          None - whole channel (default, matches OLD's tree-view root right-click)
+          {year: 2024} - only that year subfolder (split_years channels)
+          {year: 2024, month: 5} - only that year+month subfolder
         Mirrors OLD's per-year / per-month tree-view right-click
         (YTArchiver.py:26498 _browse_redownload_folder).
         """
@@ -3002,7 +3001,7 @@ class Api:
             _scope_text = f" [{scope_label}]" if scope_label else ""
             try:
                 self._log_stream.emit([
-                    ["[Sync]  ", "sync_bracket"],
+                    ["[Sync] ", "sync_bracket"],
                     [f"Redownload {ch.get('name','?')}{_scope_text} \u2192 ",
                      "simpleline_green"],
                     [("Best\n" if new_res == "best" else f"{new_res}p\n"),
@@ -3237,35 +3236,35 @@ class Api:
         # The UI displays + accepts minutes, so convert here and on save.
         raw_min_secs = int(cfg.get("min_duration", 180) or 0)
         return {
-            "output_dir":       cfg.get("output_dir", ""),
-            "video_out_dir":    cfg.get("video_out_dir", ""),
-            "whisper_model":    cfg.get("whisper_model", "large-v3"),
+            "output_dir": cfg.get("output_dir", ""),
+            "video_out_dir": cfg.get("video_out_dir", ""),
+            "whisper_model": cfg.get("whisper_model", "large-v3"),
             "default_resolution": cfg.get("default_resolution", "720"),
-            "default_min_duration": max(0, raw_min_secs // 60),  # seconds -> minutes
-            "log_mode":         cfg.get("log_mode", "Simple"),
+            "default_min_duration": max(0, raw_min_secs // 60), # seconds -> minutes
+            "log_mode": cfg.get("log_mode", "Simple"),
             # Index tab surfaces these directly — must round-trip.
-            "tp_archive_roots":      list(cfg.get("tp_archive_roots") or []),
-            "auto_index_enabled":    bool(cfg.get("auto_index_enabled", False)),
-            "auto_index_threshold":  int(cfg.get("auto_index_threshold", 10) or 10),
+            "tp_archive_roots": list(cfg.get("tp_archive_roots") or []),
+            "auto_index_enabled": bool(cfg.get("auto_index_enabled", False)),
+            "auto_index_threshold": int(cfg.get("auto_index_threshold", 10) or 10),
             # Startup knobs (Settings > General surfaces these too).
             "disk_scan_staleness_hours": int(cfg.get("disk_scan_staleness_hours", 24) or 0),
-            "browse_preload_limit":      int(cfg.get("browse_preload_limit",      150) or 150),
-            "browse_preload_all":        bool(cfg.get("browse_preload_all", False)),
-            "last_disk_scan_ts":         float(cfg.get("last_disk_scan_ts", 0) or 0),
+            "browse_preload_limit": int(cfg.get("browse_preload_limit", 150) or 150),
+            "browse_preload_all": bool(cfg.get("browse_preload_all", False)),
+            "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
             # Subs table column visibility toggles. Default True so the
             # column appears on fresh installs / upgrades (current behavior).
-            "show_avg_size":             bool(cfg.get("show_avg_size", True)),
+            "show_avg_size": bool(cfg.get("show_avg_size", True)),
             # Recent tab view mode — "list" (legacy) or "grid" (thumbnail cards).
-            "recent_view_mode":          (cfg.get("recent_view_mode") or "list"),
+            "recent_view_mode": (cfg.get("recent_view_mode") or "list"),
         }
 
     def settings_save(self, data):
         if not config_is_writable():
             return {"ok": False, "error": "Write-gate off"}
         cfg = load_config()
-        if data.get("output_dir"):      cfg["output_dir"] = os.path.normpath(data["output_dir"])
-        if data.get("video_out_dir"):   cfg["video_out_dir"] = os.path.normpath(data["video_out_dir"])
-        if data.get("whisper_model"):   cfg["whisper_model"] = data["whisper_model"]
+        if data.get("output_dir"): cfg["output_dir"] = os.path.normpath(data["output_dir"])
+        if data.get("video_out_dir"): cfg["video_out_dir"] = os.path.normpath(data["video_out_dir"])
+        if data.get("whisper_model"): cfg["whisper_model"] = data["whisper_model"]
         if data.get("default_resolution"): cfg["default_resolution"] = data["default_resolution"]
         if data.get("default_min_duration") is not None:
             try:
@@ -3343,7 +3342,7 @@ class Api:
                                   encoding="utf-8", errors="replace", bufsize=1,
                                   startupinfo=sync_backend._startupinfo)
                 for line in proc.stdout:
-                    self._log_stream.emit_dim("  " + line.rstrip())
+                    self._log_stream.emit_dim(" " + line.rstrip())
                 proc.wait()
                 self._log_stream.emit([["[Update] ", "update_head"],
                                         ["yt-dlp update complete.\n", "update_sep"]])
@@ -3429,13 +3428,13 @@ class Api:
         except Exception:
             pass
         return {
-            "app_name":        "YTArchiver",
-            "app_version":     APP_VERSION,
-            "channels":        len(cfg.get("channels", [])),
-            "config_path":     str(CONFIG_FILE),
-            "output_dir":      cfg.get("output_dir", ""),
-            "ytdlp_version":   yt_ver,
-            "python_version":  sys.version.split()[0],
+            "app_name": "YTArchiver",
+            "app_version": APP_VERSION,
+            "channels": len(cfg.get("channels", [])),
+            "config_path": str(CONFIG_FILE),
+            "output_dir": cfg.get("output_dir", ""),
+            "ytdlp_version": yt_ver,
+            "python_version": sys.version.split()[0],
         }
 
     def check_dependencies(self):
@@ -3449,18 +3448,18 @@ class Api:
         rows = []
         # Python bits
         try:
-            import pystray  # noqa: F401
-            rows.append({"name": "pystray",   "ok": True,  "detail": ""})
+            import pystray # noqa: F401
+            rows.append({"name": "pystray", "ok": True, "detail": ""})
         except ImportError:
-            rows.append({"name": "pystray",   "ok": False, "detail": "pip install pystray"})
+            rows.append({"name": "pystray", "ok": False, "detail": "pip install pystray"})
         try:
-            from PIL import Image  # noqa: F401
-            rows.append({"name": "Pillow",    "ok": True,  "detail": ""})
+            from PIL import Image # noqa: F401
+            rows.append({"name": "Pillow", "ok": True, "detail": ""})
         except ImportError:
-            rows.append({"name": "Pillow",    "ok": False, "detail": "pip install Pillow"})
+            rows.append({"name": "Pillow", "ok": False, "detail": "pip install Pillow"})
         try:
-            import webview  # noqa: F401
-            rows.append({"name": "pywebview", "ok": True,  "detail": ""})
+            import webview # noqa: F401
+            rows.append({"name": "pywebview", "ok": True, "detail": ""})
         except ImportError:
             rows.append({"name": "pywebview", "ok": False, "detail": "pip install pywebview"})
         # Executables
@@ -3482,7 +3481,7 @@ class Api:
         missing = [r for r in rows if not r["ok"]]
         if missing:
             self._log_stream.emit([
-                ["[Deps]  ", "sync_bracket"],
+                ["[Deps] ", "sync_bracket"],
                 [f"{len(missing)} missing: ", "red"],
                 [", ".join(r["name"] for r in missing) + "\n", "dim"],
             ])
@@ -3542,10 +3541,10 @@ class Api:
             picked = os.path.normpath(picked)
             if os.path.dirname(picked) != os.path.normpath(base):
                 return {"ok": False,
-                        "error": f"Pick a subfolder of:\n  {base}"}
+                        "error": f"Pick a subfolder of:\n {base}"}
             return {"ok": True,
                     "folder_name": os.path.basename(picked),
-                    "full_path":   picked}
+                    "full_path": picked}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -3568,13 +3567,13 @@ class Api:
             expected = os.path.join(base, _cfn(ch))
             if not os.path.isdir(expected):
                 missing.append({
-                    "name":     ch.get("name") or ch.get("folder") or "",
-                    "url":      ch.get("url", ""),
+                    "name": ch.get("name") or ch.get("folder") or "",
+                    "url": ch.get("url", ""),
                     "expected": expected,
                 })
         if missing:
             self._log_stream.emit([
-                ["[Subs]  ", "sync_bracket"],
+                ["[Subs] ", "sync_bracket"],
                 [f"{len(missing)} channel folder(s) missing \u2014 ", "red"],
                 ["see Subs tab for reconcile\n", "dim"],
             ])
@@ -3615,14 +3614,14 @@ class Api:
                     sep = "=" * 54
                     self._log_stream.emit([[f"\n{sep}\n", "update_sep"]])
                     self._log_stream.emit([
-                        [f"  \u2b06  Update available: {latest} ", "update_head"],
+                        [f" \u2b06 Update available: {latest} ", "update_head"],
                         [f"(you have {current})\n", "update_head"],
                     ])
-                    self._log_stream.emit([[f"  Download: {rel_url}\n", "update_head"]])
+                    self._log_stream.emit([[f" Download: {rel_url}\n", "update_head"]])
                     self._log_stream.emit([[f"{sep}\n\n", "update_sep"]])
                     self._log_stream.flush()
             except Exception:
-                pass  # no network, rate-limited, etc.
+                pass # no network, rate-limited, etc.
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
@@ -3669,10 +3668,10 @@ class Api:
                 sz = TRANSCRIPTION_DB.stat().st_size
                 gb = sz / (1024 ** 3)
                 _row("Transcript DB", True,
-                     f"{TRANSCRIPTION_DB}  ({gb:.2f} GB)")
+                     f"{TRANSCRIPTION_DB} ({gb:.2f} GB)")
             else:
                 _row("Transcript DB", True,
-                     f"{TRANSCRIPTION_DB}  (will be created on first use)")
+                     f"{TRANSCRIPTION_DB} (will be created on first use)")
         except Exception as e:
             _row("Transcript DB", False, str(e))
 
@@ -3697,14 +3696,14 @@ class Api:
             if not base:
                 _row("Archive root", False, "Not configured (Settings > Archive root)")
             elif not os.path.isdir(base):
-                _row("Archive root", False, f"{base}  (missing)")
+                _row("Archive root", False, f"{base} (missing)")
             else:
                 import shutil
                 total, used, free = shutil.disk_usage(base)
                 free_gb = free / (1024 ** 3)
                 pct = (used / total * 100) if total else 0.0
                 _row("Archive root", True,
-                     f"{base}  \u2014 {free_gb:.0f} GB free ({pct:.0f}% full)")
+                     f"{base} \u2014 {free_gb:.0f} GB free ({pct:.0f}% full)")
         except Exception as e:
             _row("Archive root", False, str(e))
 
@@ -3774,7 +3773,7 @@ class Api:
 
     def compress_video_file(self, filepath, quality="Average", output_res="720"):
         """Queue an AV1 NVENC compression task onto the shared GPU
-        queue. Scott's rule: the GPU task list is the user's "permission
+        queue. rule: the GPU task list is the user's "permission
         to bog down my computer" — so standalone compress must NOT
         fire immediately off a bare thread. It enqueues, then the
         TranscribeManager worker picks it up when Auto is on (or when
@@ -3890,8 +3889,8 @@ class Api:
             # Create a one-shot global callback the JS side writes into
             js = (
                 "(async () => {"
-                f"  const c = await window.askMetadataAlreadyDownloaded({_json.dumps(channel_name)}, {int(count)});"
-                f"  window.pywebview.api._metadata_choice_resolve({_json.dumps(id(result))}, c);"
+                f" const c = await window.askMetadataAlreadyDownloaded({_json.dumps(channel_name)}, {int(count)});"
+                f" window.pywebview.api._metadata_choice_resolve({_json.dumps(id(result))}, c);"
                 "})()"
             )
             # Register a one-shot resolver
@@ -3986,7 +3985,7 @@ class Api:
                 # Running as PyInstaller exe — relaunch the .exe itself.
                 subprocess.Popen([sys.executable],
                                  close_fds=True,
-                                 creationflags=0x00000008)  # DETACHED_PROCESS
+                                 creationflags=0x00000008) # DETACHED_PROCESS
             else:
                 subprocess.Popen([sys.executable, *sys.argv],
                                  close_fds=True,
@@ -4064,8 +4063,8 @@ class Api:
         # (download date), NOT the upload date — matches YTArchiver.py:17316.
         dl_date = datetime.now().strftime("%m.%d.%y")
         use_yt_title = opts.get("use_yt_title", True)
-        add_date     = bool(opts.get("add_date", False))
-        custom_name  = (opts.get("custom_name") or "").strip()
+        add_date = bool(opts.get("add_date", False))
+        custom_name = (opts.get("custom_name") or "").strip()
         if not use_yt_title and custom_name:
             safe = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", custom_name).strip().rstrip(".")
             if add_date:
@@ -4108,7 +4107,7 @@ class Api:
                 self._log_stream.emit_error(f"Launch failed: {e}")
                 return
             for line in proc.stdout:
-                self._log_stream.emit_dim("  " + line.rstrip())
+                self._log_stream.emit_dim(" " + line.rstrip())
             proc.wait()
             self._log_stream.emit([["[Archive] ", "simpleline_green"],
                                     ["done.\n", "simpleline"]])
@@ -4474,7 +4473,7 @@ def main():
                 q = api._queues.to_ui_payload() or {}
                 return {"version": APP_VERSION,
                         "sync": len(q.get("sync", [])),
-                        "gpu":  len(q.get("gpu",  [])),
+                        "gpu": len(q.get("gpu", [])),
                         "paused": q.get("gpu_paused", False)}
             except Exception as e:
                 return {"error": str(e)}
@@ -4494,14 +4493,14 @@ def main():
                 .jsonl entries get SURGICALLY SWAPPED, not duplicated.
                 Without this, every ArchivePlayer re-transcribe would
                 append a second entry to the aggregated files instead
-                of replacing the stale one — bug Scott flagged earlier.
+                of replacing the stale one — bug was flagged earlier.
             """
             b = body or {}
             filepath = b.get("filepath") or ""
             video_id = (b.get("video_id") or "").strip()
-            title    = b.get("title") or ""
-            channel  = b.get("channel") or ""
-            model    = (b.get("model") or "").strip()
+            title = b.get("title") or ""
+            channel = b.get("channel") or ""
+            model = (b.get("model") or "").strip()
             _valid_models = {"tiny", "small", "medium", "large-v3"}
             if model and model not in _valid_models:
                 return {"ok": False, "error": f"unknown model: {model}"}
@@ -4524,8 +4523,8 @@ def main():
                                     (video_id,)).fetchone()
                         if row:
                             filepath = filepath or row[0] or ""
-                            title    = title    or row[1] or ""
-                            channel  = channel  or row[2] or ""
+                            title = title or row[1] or ""
+                            channel = channel or row[2] or ""
                 except Exception:
                     pass
             if not filepath or not os.path.isfile(filepath):
@@ -4552,10 +4551,10 @@ def main():
                         "error": (res or {}).get("error") or "enqueue failed"}
             except Exception as e:
                 return {"ok": False, "error": str(e)}
-        _cmd.register_handler("get",  "/cmd/ping",        _handle_ping)
-        _cmd.register_handler("get",  "/cmd/gpu-status",  _handle_gpu_status)
+        _cmd.register_handler("get", "/cmd/ping", _handle_ping)
+        _cmd.register_handler("get", "/cmd/gpu-status", _handle_gpu_status)
         _cmd.register_handler("post", "/cmd/retranscribe", _handle_retranscribe)
-        _cmd.register_handler("post", "/cmd/ping",        _handle_ping)
+        _cmd.register_handler("post", "/cmd/ping", _handle_ping)
         _cmd.start_server(APP_VERSION, on_log=_cmd_log)
     except Exception as _ce:
         print(f"[cmd] failed to start: {_ce}")
@@ -4647,7 +4646,7 @@ def main():
             _shutdown_cleanup()
         except Exception:
             pass
-        return True  # always allow close
+        return True # always allow close
 
     def _shutdown_cleanup():
         """Flush disk writes + kill child processes on real shutdown.
@@ -4690,11 +4689,11 @@ def main():
             pass
 
     try:
-        window.events.resized  += _on_resized
-        window.events.moved    += _on_moved
+        window.events.resized += _on_resized
+        window.events.moved += _on_moved
         window.events.maximized += _on_maximized
         window.events.restored += _on_restored
-        window.events.closing  += _on_closing
+        window.events.closing += _on_closing
     except Exception:
         # pywebview may not expose all of these on every platform/version
         pass

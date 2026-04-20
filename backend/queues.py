@@ -43,13 +43,13 @@ class QueueState:
         self.redownload: List[Dict[str, Any]] = []
         self.metadata: List[Dict[str, Any]] = []
         self.gpu: List[Dict[str, Any]] = []
-        self.order: List[list] = []           # [[kind, id], ...]
+        self.order: List[list] = [] # [[kind, id], ...]
         self.gpu_paused: bool = False
         self.sync_paused: bool = False
 
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: Optional[Dict[str, Any]] = None
-        self.current_gpu:  Optional[Dict[str, Any]] = None
+        self.current_gpu: Optional[Dict[str, Any]] = None
         self.current_redownload: Optional[Dict[str, Any]] = None
         self.current_metadata: Optional[Dict[str, Any]] = None
 
@@ -110,15 +110,15 @@ class QueueState:
                 except OSError: pass
             return False
         with self._lock:
-            self.sync       = list(data.get("sync", []))
-            self.reorg      = list(data.get("reorg", []))
-            self.video      = list(data.get("video", []))
+            self.sync = list(data.get("sync", []))
+            self.reorg = list(data.get("reorg", []))
+            self.video = list(data.get("video", []))
             self.transcribe = list(data.get("transcribe", []))
             self.redownload = list(data.get("redownload", []))
-            self.metadata   = list(data.get("metadata", []))
-            self.gpu        = list(data.get("gpu", []))
-            self.order      = list(data.get("order", []))
-            self.gpu_paused  = bool(data.get("gpu_paused", False))
+            self.metadata = list(data.get("metadata", []))
+            self.gpu = list(data.get("gpu", []))
+            self.order = list(data.get("order", []))
+            self.gpu_paused = bool(data.get("gpu_paused", False))
             self.sync_paused = bool(data.get("sync_paused", False))
         self._notify()
         return True
@@ -129,15 +129,15 @@ class QueueState:
             return False
         with self._lock:
             payload = {
-                "sync":        copy.deepcopy(self.sync),
-                "reorg":       copy.deepcopy(self.reorg),
-                "video":       copy.deepcopy(self.video),
-                "transcribe":  copy.deepcopy(self.transcribe),
-                "redownload":  copy.deepcopy(self.redownload),
-                "metadata":    copy.deepcopy(self.metadata),
-                "gpu":         copy.deepcopy(self.gpu),
-                "order":       copy.deepcopy(self.order),
-                "gpu_paused":  self.gpu_paused,
+                "sync": copy.deepcopy(self.sync),
+                "reorg": copy.deepcopy(self.reorg),
+                "video": copy.deepcopy(self.video),
+                "transcribe": copy.deepcopy(self.transcribe),
+                "redownload": copy.deepcopy(self.redownload),
+                "metadata": copy.deepcopy(self.metadata),
+                "gpu": copy.deepcopy(self.gpu),
+                "order": copy.deepcopy(self.order),
+                "gpu_paused": self.gpu_paused,
                 "sync_paused": self.sync_paused,
             }
             # Include in-flight items so they survive restart
@@ -362,7 +362,7 @@ class QueueState:
                 })
             return {
                 "sync": sync_list,
-                "gpu":  gpu_list,
+                "gpu": gpu_list,
                 "gpu_paused": self.gpu_paused,
                 "sync_paused": self.sync_paused,
             }
@@ -380,7 +380,7 @@ class QueueState:
         kind = (ch.get("kind") or "download").lower()
         if kind == "metadata":
             # Keep "Metadata" as the leading word so `colorizeTaskName`
-            # in logs.js picks the pink `qv-meta` class. Scott: "the
+            # in logs.js picks the pink `qv-meta` class. "the
             # check metadata part of these tasks in queue are supposed
             # to be colored pink LIKE THEY WERE IN PREVIOUS VERSION."
             return f"Metadata check \u2014 {name}"
@@ -420,11 +420,11 @@ class QueueState:
     def counts(self) -> Dict[str, int]:
         with self._lock:
             return {
-                "sync":       len(self.sync) + (1 if self.current_sync else 0),
-                "gpu":        len(self.gpu)  + (1 if self.current_gpu  else 0),
+                "sync": len(self.sync) + (1 if self.current_sync else 0),
+                "gpu": len(self.gpu) + (1 if self.current_gpu else 0),
                 "redownload": len(self.redownload),
-                "metadata":   len(self.metadata),
-                "reorg":      len(self.reorg),
+                "metadata": len(self.metadata),
+                "reorg": len(self.reorg),
             }
 
     # ── restore-on-launch helpers ───────────────────────────────────

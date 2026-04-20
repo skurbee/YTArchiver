@@ -46,15 +46,15 @@ def _open() -> Optional[sqlite3.Connection]:
             _conn.execute("PRAGMA synchronous=NORMAL")
             # Schema matches YTArchiver.py:23448 verbatim
             _conn.execute("""CREATE TABLE IF NOT EXISTS segments (
-                id         INTEGER PRIMARY KEY,
-                video_id   TEXT NOT NULL,
-                title      TEXT NOT NULL,
-                channel    TEXT NOT NULL,
-                year       INTEGER,
-                month      INTEGER,
+                id INTEGER PRIMARY KEY,
+                video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                year INTEGER,
+                month INTEGER,
                 start_time REAL,
-                end_time   REAL,
-                text       TEXT NOT NULL,
+                end_time REAL,
+                text TEXT NOT NULL,
                 jsonl_path TEXT
             )""")
             _conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
@@ -63,48 +63,48 @@ def _open() -> Optional[sqlite3.Connection]:
                 content_rowid=id
             )""")
             _conn.execute("""CREATE TABLE IF NOT EXISTS indexed_files (
-                path  TEXT PRIMARY KEY,
+                path TEXT PRIMARY KEY,
                 mtime REAL,
                 segment_count INTEGER
             )""")
             _conn.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
-                id         INTEGER PRIMARY KEY,
+                id INTEGER PRIMARY KEY,
                 segment_id INTEGER,
-                video_id   TEXT,
-                title      TEXT,
-                channel    TEXT,
+                video_id TEXT,
+                title TEXT,
+                channel TEXT,
                 start_time REAL,
-                text       TEXT,
-                note       TEXT DEFAULT '',
-                created    REAL DEFAULT (strftime('%s','now')),
+                text TEXT,
+                note TEXT DEFAULT '',
+                created REAL DEFAULT (strftime('%s','now')),
                 FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE SET NULL
             )""")
             _conn.execute("""CREATE TABLE IF NOT EXISTS videos (
-                id         INTEGER PRIMARY KEY,
-                title      TEXT NOT NULL,
-                channel    TEXT NOT NULL,
-                year       INTEGER,
-                month      INTEGER,
-                filepath   TEXT UNIQUE COLLATE NOCASE,
-                video_id   TEXT,
-                video_url  TEXT,
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                year INTEGER,
+                month INTEGER,
+                filepath TEXT UNIQUE COLLATE NOCASE,
+                video_id TEXT,
+                video_url TEXT,
                 duration_s REAL,
                 size_bytes INTEGER,
-                tx_status  TEXT DEFAULT 'pending',
-                added_ts   REAL
+                tx_status TEXT DEFAULT 'pending',
+                added_ts REAL
             )""")
             # Migrations — idempotent ALTER statements for columns
             # added after initial schema. OLD-YTArchiver compatible:
-            #   search_failed_ts         — set when title-search fails
-            #   id_resolve_failed_ts     — set when playlist-walk
-            #                              fallback can't match this
-            #                              file to any channel video
-            #   metadata_fetch_failed_ts — set when yt-dlp --dump-json
-            #                              returns nothing (deleted /
-            #                              private / region-locked)
+            # search_failed_ts — set when title-search fails
+            # id_resolve_failed_ts — set when playlist-walk
+            # fallback can't match this
+            # file to any channel video
+            # metadata_fetch_failed_ts — set when yt-dlp --dump-json
+            # returns nothing (deleted /
+            # private / region-locked)
             # These columns let us skip previously-failed videos on
             # subsequent metadata rechecks instead of retrying every
-            # run — Scott: "OLD would skip videos that didn't have the
+            # run — "OLD would skip videos that didn't have the
             # information we needed or that failed every single fetch
             # we tried. It was working great."
             for stmt in (
@@ -125,7 +125,7 @@ def _open() -> Optional[sqlite3.Connection]:
                 # Upload timestamp (unix epoch). Populated from the
                 # video file's mtime, which YTArchiver sets to the
                 # YouTube upload date via `--mtime` during download
-                # (confirmed by Scott's memory: "file dates = upload
+                # (confirmed by memory: "file dates = upload
                 # dates"). Used by the Graph tab's Week bucket —
                 # segments only carry year+month so bucketing weeks
                 # requires joining videos for full-date resolution.
@@ -207,8 +207,8 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         m = _ID_RE_IN_NAME.search(os.path.basename(fp))
         if m:
             _cand = m.group(1)
-            # Reject all-alphabetic matches — ColdFusion's archive has
-            # files with suffix `[ColdFustion]` (11 letters, no digit)
+            # Reject all-alphabetic matches — a user's channel's archive has
+            # files with suffix `[a-user-channel]` (11 letters, no digit)
             # that match the `[A-Za-z0-9_-]{11}` pattern but aren't
             # real YouTube ids. Real ids are random picks so they
             # essentially always include at least one digit/_/-.
@@ -333,11 +333,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 # long-form JSONLs (they match now) AS WELL AS any stale
                 # short-form JSONLs left from earlier builds.
                 s_val = seg.get("start") if "start" in seg else seg.get("s", 0)
-                e_val = seg.get("end")   if "end"   in seg else seg.get("e", 0)
-                t_val = seg.get("text")  if "text"  in seg else seg.get("t", "")
+                e_val = seg.get("end") if "end" in seg else seg.get("e", 0)
+                t_val = seg.get("text") if "text" in seg else seg.get("t", "")
                 w_val = seg.get("words") if "words" in seg else seg.get("w", [])
                 # Also prefer per-entry video_id/title if the JSONL carries
-                # them (OLD-compat long-form).  Falls back to path-derived.
+                # them (OLD-compat long-form). Falls back to path-derived.
                 seg_vid = (seg.get("video_id") or vid_id or "").strip()
                 seg_title = (seg.get("title") or title or "").strip() or title
                 rows.append((
@@ -498,7 +498,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         # Fallback: look for any cached entry with the same (channel,
         # sort, include_thumbs) but a larger limit — a 100k-limit
         # preload satisfies any smaller runtime request. Without
-        # this, Scott's "preload every video" setting didn't deliver
+        # this, "preload every video" setting didn't deliver
         # the promised instant-click behavior because preload keyed
         # on 100_000 while the frontend requested 50_000.
         for (c_ch, c_sort, c_lim, c_thumbs), rows in _browse_videos_cache.items():
@@ -511,17 +511,17 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         return []
     # Use year/month as the primary sort (stable proxy for upload_ts
     # / file mtime), with added_ts as the per-month tiebreaker. This
-    # is important for large channels (David Pakman: 27k videos) where
+    # is important for large channels (a high-video-count channel: 27k videos) where
     # a `added_ts DESC LIMIT 500` would return only whatever 500 rows
     # happened to be indexed most recently — that's often a random
     # year distribution if a bootstrap / reorg touched added_ts
     # out-of-upload-order. Sorting by year first guarantees the grid
     # covers the newest years contiguously.
     order = {
-        "newest":  "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC",
-        "oldest":  "COALESCE(year, 99999) ASC, COALESCE(month, 99) ASC, COALESCE(added_ts, 0) ASC",
+        "newest": "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC",
+        "oldest": "COALESCE(year, 99999) ASC, COALESCE(month, 99) ASC, COALESCE(added_ts, 0) ASC",
         "largest": "COALESCE(size_bytes, 0) DESC",
-        "title":   "title COLLATE NOCASE ASC",
+        "title": "title COLLATE NOCASE ASC",
     }.get(sort, "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC")
     with _db_lock:
         cur = conn.execute(
@@ -599,11 +599,11 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         vid_id = (row.get("video_id") or "").strip()
 
         # Upload timestamp — source priority:
-        #   1. Aggregated metadata `upload_date` (authoritative YouTube
-        #      upload date, unaffected by filesystem operations)
-        #   2. File mtime (yt-dlp --mtime sets this at download time)
-        #   3. added_ts (DB registration — last resort, shows "1mo ago"
-        #      for a whole channel if the sweep ran a month ago)
+        # 1. Aggregated metadata `upload_date` (authoritative YouTube
+        # upload date, unaffected by filesystem operations)
+        # 2. File mtime (yt-dlp --mtime sets this at download time)
+        # 3. added_ts (DB registration — last resort, shows "1mo ago"
+        # for a whole channel if the sweep ran a month ago)
         #
         # The user reported every video showing "1mo ago" because recent
         # reorg / bulk-copy operations stomped all the mtimes to the
@@ -733,10 +733,10 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
             (channel,),
         ).fetchone()
         if row:
-            out["total"]       = int(row[0] or 0)
+            out["total"] = int(row[0] or 0)
             out["transcribed"] = int(row[1] or 0)
-            out["pending"]     = int(row[2] or 0)
-            out["failed"]      = int(row[3] or 0)
+            out["pending"] = int(row[2] or 0)
+            out["failed"] = int(row[3] or 0)
     except Exception:
         pass
     return out
@@ -892,7 +892,7 @@ def get_segment_context(segment_id: int, before: int = 30,
             more_before = 0
             more_after = 0
             if rows_before:
-                before_edge = rows_before[-1][1]  # earliest start_time in window
+                before_edge = rows_before[-1][1] # earliest start_time in window
                 more_before = conn.execute(
                     "SELECT COUNT(*) FROM segments "
                     "WHERE jsonl_path=? AND start_time < ?",
@@ -936,7 +936,7 @@ def get_segment_context(segment_id: int, before: int = 30,
             "video_id": vid_id, "jsonl_path": jsonl_path,
             "segments": segments,
             "before_more": bool(more_before),
-            "after_more":  bool(more_after),
+            "after_more": bool(more_after),
         }
     except sqlite3.Error as e:
         return {"ok": False, "error": str(e)}
@@ -954,7 +954,7 @@ def bucket_totals(bucket: str = "month",
         return {}
     group_col = "year || '-' || printf('%02d', month)" if bucket == "month" else "year"
     sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-           "  FROM segments")
+           " FROM segments")
     args: List[Any] = []
     if channel:
         sql += " WHERE channel=?"
@@ -1082,9 +1082,9 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
 
     bucket ∈ {"year", "month", "week"}. Returns {labels, values}.
 
-    - "year"  → group by segments.year
+    - "year" → group by segments.year
     - "month" → group by "YYYY-MM" from segments.year + segments.month
-    - "week"  → group by ISO-week key "YYYY-Www" from videos.upload_ts
+    - "week" → group by ISO-week key "YYYY-Www" from videos.upload_ts
                 (segments only store year+month, so weekly granularity
                 requires joining videos + using the file mtime which
                 yt-dlp set to the upload date via --mtime). Videos whose
@@ -1103,12 +1103,12 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
         # query returns whatever subset has upload_ts already.
         sql = (
             "SELECT strftime('%Y-W%W', datetime(v.upload_ts, 'unixepoch')) AS bucket, "
-            "       COUNT(*) "
-            "  FROM segments_fts fts "
-            "  JOIN segments s ON s.id = fts.rowid "
-            "  JOIN videos v   ON v.video_id = s.video_id "
+            " COUNT(*) "
+            " FROM segments_fts fts "
+            " JOIN segments s ON s.id = fts.rowid "
+            " JOIN videos v ON v.video_id = s.video_id "
             " WHERE fts.text MATCH ? "
-            "   AND v.upload_ts IS NOT NULL"
+            " AND v.upload_ts IS NOT NULL"
         )
         args: List[Any] = [word]
         if channel:
@@ -1120,8 +1120,8 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
         group_col = ("year || '-' || printf('%02d', month)"
                      if bucket == "month" else "year")
         sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-               f"  FROM segments_fts fts "
-               f"  JOIN segments s ON s.id = fts.rowid "
+               f" FROM segments_fts fts "
+               f" JOIN segments s ON s.id = fts.rowid "
                f" WHERE fts.text MATCH ?")
         args = [word]
         if channel:
@@ -1259,8 +1259,8 @@ def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,
     if conn is None or not query.strip():
         return []
     q = ("SELECT s.id, s.video_id, s.title, s.channel, s.start_time, s.text, "
-         "       s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip "
-         "  FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
+         " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip "
+         " FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
          " WHERE segments_fts MATCH ?")
     args_suffix: List[Any] = []
     suffix = ""
@@ -1361,10 +1361,10 @@ def summary() -> Dict[str, Any]:
     if conn is None:
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
     with _db_lock:
-        seg  = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-        vid  = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        ch   = conn.execute("SELECT COUNT(DISTINCT channel) FROM videos").fetchone()[0]
-        bm   = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]
+        seg = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+        vid = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        ch = conn.execute("SELECT COUNT(DISTINCT channel) FROM videos").fetchone()[0]
+        bm = conn.execute("SELECT COUNT(*) FROM bookmarks").fetchone()[0]
     return {"segments": seg, "videos": vid, "channels": ch, "bookmarks": bm}
 
 
@@ -1410,7 +1410,7 @@ def sweep_new_videos(output_dir: str, channels: list,
     # folder tree hasn't been touched since the last successful sweep.
     # Matters because the enumeration itself (scandir of 100k entries
     # across Z:\ DrivePool) is the slow part; even the stat-free walk
-    # takes minutes on Scott's archive. Fingerprint = recursive mtime
+    # takes minutes on archive. Fingerprint = recursive mtime
     # max across the channel root + all subdirectories (year, month).
     # Windows updates a folder's mtime when its entries change, so if
     # a new download landed anywhere in the tree, at least one
@@ -1580,11 +1580,11 @@ def sweep_new_videos(output_dir: str, channels: list,
 def prune_missing_videos() -> Dict[str, int]:
     """Delete stale/phantom video rows from the DB. Cleanup categories:
 
-      1. `missing`  — filepath no longer exists on disk. Dead
+      1. `missing` — filepath no longer exists on disk. Dead
                       `(1)` duplicates, deleted files, etc.
       2. `zero_byte` — file exists but is 0 bytes. Phantom
-                       placeholders from failed downloads (Scott's
-                       2kliksphilip "Intel just did an AMD" 0-byte
+                       placeholders from failed downloads (
+                       a user's channel "Intel just did an AMD" 0-byte
                        file that my title-matcher then mis-assigned
                        the real video's id to, producing duplicate
                        grid rows with shared thumbnails).
@@ -1607,8 +1607,8 @@ def prune_missing_videos() -> Dict[str, int]:
     try:
         with _db_lock:
             # Category 0: null out all-alphabetic video_ids. These are
-            # filename-suffix parse errors (ColdFusion files ending in
-            # `[ColdFustion]` that matched `[A-Za-z0-9_-]{11}` but
+            # filename-suffix parse errors (a user's channel files ending in
+            # `[a-user-channel]` that matched `[A-Za-z0-9_-]{11}` but
             # aren't real YT ids). The row stays — it's a real file
             # on disk — but its video_id field gets cleared so the
             # next metadata recheck will title-resolve it properly

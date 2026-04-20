@@ -6,7 +6,7 @@ If pystray/PIL aren't installed, the app just runs without a tray icon.
 
 Usage:
     tray = TrayController(on_show=..., on_quit=...)
-    tray.start()   # background thread
+    tray.start() # background thread
     ...
     tray.stop()
 """
@@ -37,8 +37,8 @@ def _find_icon() -> Optional[Path]:
 # force the menu dark we opt the process into dark-mode-aware popup
 # menus via `uxtheme.dll`'s undocumented ordinals 135 + 136:
 #
-#   SetPreferredAppMode(ForceDark)  — ordinal 135, Win10 1903+
-#   FlushMenuThemes()               — ordinal 136, reapplies to existing
+# SetPreferredAppMode(ForceDark) — ordinal 135, Win10 1903+
+# FlushMenuThemes() — ordinal 136, reapplies to existing
 #
 # These are undocumented Microsoft APIs used by Explorer, Notepad,
 # VS Code, Chrome, etc. Ordinal-based calls are brittle across OS
@@ -62,17 +62,17 @@ def _apply_dark_menu_theme() -> bool:
         # less than 65536 as MAKEINTRESOURCE(ordinal), so passing it via
         # c_void_p works without manually building a MAKEINTRESOURCE.
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetProcAddress.restype  = ctypes.c_void_p
+        kernel32.GetProcAddress.restype = ctypes.c_void_p
         kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
         hmod = ctypes.c_void_p(uxtheme._handle)
         set_preferred_addr = kernel32.GetProcAddress(hmod, 135)
-        flush_menu_addr    = kernel32.GetProcAddress(hmod, 136)
+        flush_menu_addr = kernel32.GetProcAddress(hmod, 136)
         if not set_preferred_addr or not flush_menu_addr:
             return False
         # SetPreferredAppMode(int mode) — 2 == ForceDark
         SetPreferredAppMode = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_int)(set_preferred_addr)
-        FlushMenuThemes     = ctypes.WINFUNCTYPE(None)(flush_menu_addr)
-        SetPreferredAppMode(2)  # ForceDark
+        FlushMenuThemes = ctypes.WINFUNCTYPE(None)(flush_menu_addr)
+        SetPreferredAppMode(2) # ForceDark
         FlushMenuThemes()
         return True
     except Exception:
@@ -93,9 +93,9 @@ class TrayController:
         self._on_top_toggle = None
         self._always_on_top = False
         # Auto-Sync submenu — None until wired via set_autorun_menu(...)
-        self._autorun_labels = None       # list[str] of interval labels
-        self._autorun_get_label = None    # callable -> current label
-        self._autorun_set_label = None    # callable(label) -> None
+        self._autorun_labels = None # list[str] of interval labels
+        self._autorun_get_label = None # callable -> current label
+        self._autorun_set_label = None # callable(label) -> None
         self._tooltip = tooltip
         self._icon = None
         self._thread: Optional[threading.Thread] = None
@@ -163,9 +163,9 @@ class TrayController:
     def set_autorun_menu(self, labels, get_label, set_label):
         """Wire the Auto-Sync submenu. Must be set BEFORE start().
 
-        labels     : list[str] — e.g. ["Off", "30 min", "1 hr", ...]
-        get_label  : () -> str  — returns currently active label
-        set_label  : (str) -> None — fired when user clicks an interval
+        labels : list[str] — e.g. ["Off", "30 min", "1 hr", ...]
+        get_label : () -> str — returns currently active label
+        set_label : (str) -> None — fired when user clicks an interval
         """
         self._autorun_labels = list(labels or [])
         self._autorun_get_label = get_label
@@ -248,7 +248,7 @@ class TrayController:
         # spins faster to signal GPU work is active. Mirrors YTArchiver.py:3481.
         self._spin_interval = 0.12 if color == "red" else 0.18
         if self._spin_thread is not None:
-            return  # already spinning
+            return # already spinning
         self._spin_stop.clear()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()

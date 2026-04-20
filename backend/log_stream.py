@@ -22,8 +22,8 @@ import time
 from typing import Any, List, Optional
 
 
-Segment = List[Any]           # [text, tag?]
-SegmentList = List[Segment]   # one log line
+Segment = List[Any] # [text, tag?]
+SegmentList = List[Segment] # one log line
 
 
 # Tags we want to filter out in Simple mode. These are the "noisy"

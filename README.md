@@ -59,7 +59,7 @@ some specific features relating to taking over archives from 4kVD+, and 'fixing'
 
 Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whisper) for GPU transcription, **SQLite FTS5** for the transcript index, **Chart.js** for graphing, and a **pywebview** shell rendering an HTML/CSS/JS frontend.
 
-> The previous tkinter-based build is archived as the **Tkinter legacy** release — same feature set, original UI. Use that if the new frontend isn't your thing.
+> The previous tkinter-based build is archived as the **Tkinter legacy** release
 
 EXE in releases has everything bundled. If you run from source, you'll need Python 3.13 with `pywebview`, `pystray`, and `Pillow` installed (`pip install pywebview pystray pillow`). Whisper stays out-of-tree and is invoked via a Python 3.11 venv at runtime.
 

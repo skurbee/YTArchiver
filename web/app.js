@@ -3945,6 +3945,10 @@
         }
       } catch (e) { console.warn("refresh failed", e); }
     }
+    // Expose so the Queue Pending click handler (in a different scope)
+    // can re-fetch after the backend resets stale counters, so the
+    // "Queue Pending 1" badge doesn't stay on a cached value forever.
+    window.refreshSubsTable = refreshSubsTable;
 
     // ── Conditional group visibility toggles ──
     // Compress: show Res/Quality/Batch only when checkbox is checked
@@ -6707,6 +6711,11 @@
             ? `Queued ${parts.join(", ")}.`
             : "No pending channels.", parts.length ? "ok" : "warn");
         }
+        // Re-fetch channel rows so the badge reflects backend counter
+        // resets. Without this, chan_transcribe_pending can zero a
+        // channel's counter and the button badge happily keeps showing
+        // the pre-click count because the row cache never refreshed.
+        try { await window.refreshSubsTable?.(); } catch (_e) {}
         setTimeout(updateBadge, 500);
       });
       qpBtn.addEventListener("contextmenu", async (e) => {

@@ -30,6 +30,7 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
 from .ytarchiver_config import load_config
 from .net import block_if_down
 from .log_stream import LogStreamer
+from .utils import utf8_subprocess_env as _utf8_env
 
 
 _YT_ID_RE = re.compile(r'\b([A-Za-z0-9_-]{11})\b')
@@ -130,6 +131,7 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             enum_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),  # CREATE_NO_WINDOW
+            env=_utf8_env(),
         )
     except Exception as e:
         stream.emit([["[Redwnl]", "redwnl_bracket"],
@@ -291,6 +293,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
+            env=_utf8_env(),
         )
     except Exception as e:
         stream.emit([["[Redwnl]", "redwnl_bracket"],

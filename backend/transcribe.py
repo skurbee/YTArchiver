@@ -1312,6 +1312,26 @@ class TranscribeManager:
         self._queues = queues
         self._cfg_loader = cfg_loader
 
+    def get_channel_batch_stats(self, channel_name: str) -> Dict[str, int]:
+        """Synchronous snapshot of this channel's transcription batch
+        stats. Used by sync_channel at end-of-pass to fold transcribed
+        counts into the consolidated activity-log [Dwnld] row — auto-
+        captions typically complete during the download so the count
+        is accurate by sync_channel's exit. Whisper may still be running.
+        """
+        s = self._batch_stats.get(channel_name) or {}
+        return {"done": int(s.get("done", 0) or 0),
+                "err":  int(s.get("err",  0) or 0)}
+
+    def consume_channel_batch_stats(self, channel_name: str) -> None:
+        """Mark this channel's batch stats as already consumed by a
+        sync-originated [Dwnld] row emission. Subsequent calls to
+        _flush_batch_stats will skip it so the user doesn't see a
+        duplicate [Trnscr] row for the same transcriptions.
+        """
+        try: self._batch_stats.pop(channel_name, None)
+        except Exception: pass
+
     def _auto_enabled(self) -> bool:
         """True if the GPU Auto checkbox says "go". When False, the
         worker parks without popping the next job — tasks sit visible
@@ -1832,9 +1852,17 @@ class TranscribeManager:
             except Exception: pass
 
     def _flush_batch_stats(self):
-        """Emit [Trnscr] autorun_history rows for each channel this worker
-        pass handled, then reset. Mirrors OLD YTArchiver.py:22575
-        _record_transcription's per-channel logging."""
+        """Emit [Trnscr] autorun_history rows for MANUAL transcribe-only
+        channels (right-click \u2192 Transcribe on a channel/video).
+
+        Sync-originated channels are skipped two ways:
+          (a) Scott's bug: fast auto-captions finish BEFORE sync_channel
+              ends, so we check `sync.is_sync_active(name)` and leave
+              those stats in place — sync_channel will read+emit them
+              when it finishes.
+          (b) Normal case: sync_channel already called
+              `consume_channel_batch_stats()` and the entry is gone.
+        """
         if not self._batch_stats:
             return
         try:
@@ -1842,18 +1870,27 @@ class TranscribeManager:
         except Exception:
             self._batch_stats.clear()
             return
+        try:
+            from . import sync as _sync
+        except Exception:
+            _sync = None
         from datetime import datetime as _dt
         now = _dt.now()
         time_str = now.strftime("%I:%M%p").lstrip("0").lower()
         date_str = now.strftime("%b %d").replace(" 0", " ")
-        for ch_name, s in self._batch_stats.items():
+        # Iterate over a snapshot of keys — we selectively pop emitted
+        # channels instead of clearing wholesale, so sync-active channels'
+        # stats stay put for sync_channel to consume at its end.
+        for ch_name in list(self._batch_stats.keys()):
+            if _sync is not None and _sync.is_sync_active(ch_name):
+                continue   # leave for sync_channel to emit as [Dwnld]
+            s = self._batch_stats.pop(ch_name, None) or {}
             done = int(s.get("done", 0))
             err  = int(s.get("err", 0))
             if done == 0 and err == 0:
                 continue   # no work actually happened
             elapsed = time.time() - float(s.get("start", time.time()))
             primary = f"{done} transcribed"
-            # Persist string row for post-restart history display
             try:
                 _ar.append_history_entry(
                     _ar.format_history_entry("Trnscr", ch_name,
@@ -1861,7 +1898,6 @@ class TranscribeManager:
                                              errors=err, took_sec=elapsed))
             except Exception:
                 pass
-            # Live activity-log row (blue tag when done > 0)
             try:
                 self._stream.emit_activity({
                     "kind":      "Trnscr",
@@ -1876,7 +1912,6 @@ class TranscribeManager:
                 })
             except Exception:
                 pass
-        self._batch_stats.clear()
 
     def _transcribe_one(self, job: Dict[str, Any]):
         path  = job["path"]

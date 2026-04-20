@@ -191,15 +191,27 @@
   // Only match non-zero counts — "0 skipped" / "0 errors" should stay dim
   // default color (matches YTArchiver.py _insert_hist_line behavior: tags
   // are only applied when the count is > 0).
+  // Each pattern has a numeric form AND a checkmark form. The checkmark
+  // form fires when a cell represents exactly 1 of something (Scott's
+  // polish: "if it's just one, can we change the numbers to checkmarks").
+  // `\b` won't assert a word boundary before \u2713 (non-word char), so
+  // the checkmark regex drops the leading boundary and relies on the
+  // label's `\b` on the right side to bound the match.
   const _HIST_HILITE = [
-    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi,       "t-hist_green"],
-    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi, "t-hist_blue"],
-    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi,      "t-hist_redwnl"],
-    [/\b([1-9]\d*)\s+(compressed)\b/gi,           "t-hist_compress"],
-    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi,        "t-hist_reorg"],
-    [/\b([1-9]\d*)\s+(fetched|refreshed)\b/gi,    "t-hist_pink"],
-    [/\b([1-9]\d*)\s+skipped\b/gi,                "t-hist_skipped"],
-    [/\b([1-9]\d*)\s+errors?\b/gi,                "t-hist_error"],
+    [/\b([1-9]\d*)\s+(downloaded|new)\b/gi,                "t-hist_green"],
+    [/(\u2713)\s+(downloaded|new)\b/gi,                    "t-hist_green"],
+    [/\b([1-9]\d*)\s+(transcribed|captions?)\b/gi,         "t-hist_blue"],
+    [/(\u2713)\s+(transcribed|captions?)\b/gi,             "t-hist_blue"],
+    [/\b([1-9]\d*)\s+(replaced|remade)\b/gi,               "t-hist_redwnl"],
+    [/(\u2713)\s+(replaced|remade)\b/gi,                   "t-hist_redwnl"],
+    [/\b([1-9]\d*)\s+(compressed)\b/gi,                    "t-hist_compress"],
+    [/(\u2713)\s+(compressed)\b/gi,                        "t-hist_compress"],
+    [/\b([1-9]\d*)\s+(moved|reorged)\b/gi,                 "t-hist_reorg"],
+    [/(\u2713)\s+(moved|reorged)\b/gi,                     "t-hist_reorg"],
+    [/\b([1-9]\d*)\s+(fetched|refreshed|metadata)\b/gi,    "t-hist_pink"],
+    [/(\u2713)\s+(fetched|refreshed|metadata)\b/gi,        "t-hist_pink"],
+    [/\b([1-9]\d*)\s+skipped\b/gi,                         "t-hist_skipped"],
+    [/\b([1-9]\d*)\s+errors?\b/gi,                         "t-hist_error"],
   ];
 
   function _buildHistCell(text, extra, colored, tagCls) {
@@ -260,7 +272,10 @@
       return s;
     };
     // ONLY kind + primary take the row tag color.
-    // Secondary / errors cells get inline-regex highlighting instead.
+    // Secondary / tertiary / errors cells get inline-regex highlighting instead.
+    // `tertiary` is the new 3rd count cell added for consolidated [Dwnld]
+    // rows — `N metadata`. Classic rows (Trnscr, Metdta, etc.) leave it
+    // empty so the grid just renders a blank cell there.
     line.appendChild(cell(`[${c.kind || ""}]`, "hist-col-kind", true));
     line.appendChild(cell(c.time_date || "", "hist-col-time",    false));
     line.appendChild(cell("\u2014",           "hist-col-dash",    false));
@@ -268,6 +283,7 @@
     line.appendChild(cell("\u2014",           "hist-col-dash",    false));
     line.appendChild(cell(c.primary || "",    "hist-col-num",     true));
     line.appendChild(_buildHistCell(c.secondary || "", "hist-col-num", false, tagCls));
+    line.appendChild(_buildHistCell(c.tertiary || "",  "hist-col-num", false, tagCls));
     line.appendChild(_buildHistCell(c.errors   || "", "hist-col-num", false, tagCls));
     line.appendChild(cell(c.took || "",       "hist-col-took",    false));
     return line;

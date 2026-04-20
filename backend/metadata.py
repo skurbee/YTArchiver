@@ -43,7 +43,7 @@ from .sync import find_yt_dlp, sanitize_folder, _startupinfo, _find_cookie_sourc
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 
 # Shared with transcribe.py + reorg.py — see backend.utils.MONTH_FOLDERS.
-from .utils import MONTH_FOLDERS as _MONTH_NAMES
+from .utils import MONTH_FOLDERS as _MONTH_NAMES, utf8_subprocess_env as _utf8_env
 
 
 # ── OLD-compat helpers ──────────────────────────────────────────────────
@@ -231,6 +231,7 @@ def _fetch_video_metadata(yt: str, video_id: str,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             encoding="utf-8", errors="replace",
             startupinfo=_startupinfo,
+            env=_utf8_env(),
         )
     except OSError:
         return None
@@ -747,6 +748,7 @@ def _resolve_ids_by_title(yt: str, url: str,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             encoding="utf-8", errors="replace",
             bufsize=1, startupinfo=_startupinfo,
+            env=_utf8_env(),
         )
     except OSError:
         return {}

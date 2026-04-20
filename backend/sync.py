@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .ytarchiver_config import load_config, save_config, ARCHIVE_FILE, config_is_writable
 from .log_stream import LogStreamer
+from . import utils as _utils
 
 
 # YouTube ID regex — 11 chars of [A-Za-z0-9_-] surrounded by brackets
@@ -324,6 +325,13 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     url   = channel.get("url", "").strip()
     resolution = channel.get("resolution", "720")
     auto_tx = bool(channel.get("auto_transcribe"))
+    # Mark the channel as "sync in progress" so the transcribe worker's
+    # _flush_batch_stats skips it — sync_channel will emit the final
+    # consolidated [Dwnld] row at its end with the transcribe count
+    # read synchronously from transcribe_mgr. See Scott's bug: fast
+    # auto-captions finish before sync_channel ends, flush fired first
+    # and emitted a duplicate [Trnscr] row.
+    set_sync_active(name)
     # YTArchiver stores min/max as SECONDS on disk (e.g. 180 = 3 minutes).
     # UI shows/accepts minutes; conversion happens in subs.py / main.py.
     # Migration: values < 60 are legacy raw seconds from the v1 schema, bump
@@ -600,6 +608,15 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     _meta_counts["errors"] += 1
             except Exception:
                 _meta_counts["errors"] += 1
+            # Now that metadata + thumbnail are on disk, re-push the
+            # Recent tab so the grid-card view picks up the new
+            # thumbnail. Without this, recent_for_ui runs its
+            # find_thumbnail() scan BEFORE the jpg is written and the
+            # card renders with an empty gradient placeholder forever.
+            # Best-effort — hook is only set in app runtime.
+            if _on_recent_changed_hook is not None:
+                try: _on_recent_changed_hook()
+                except Exception: pass
 
         try:
             _meta_exec.submit(_task)
@@ -628,11 +645,15 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 return SyncResult(ok=False, reason="cancelled",
                                   downloaded=downloaded, errors=errors)
             try:
+                # Binary mode (no `encoding=`) so we can decode each line
+                # ourselves — yt-dlp.exe (frozen) doesn't always respect
+                # PYTHONIOENCODING, so we try UTF-8 first and fall back
+                # to cp1252 via `_utils.decode_subprocess_line` below.
                 proc = subprocess.Popen(
                     cmd_this, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    encoding="utf-8", errors="replace",
                     bufsize=1, startupinfo=_startupinfo,
+                    env=_utils.utf8_subprocess_env(),
                 )
                 break
             except OSError as e:
@@ -649,7 +670,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         if proc is None:
             continue  # streams pass launch failed — skip, main pass completed
 
-        for line in proc.stdout:
+        # Manual line iteration on the bytes stream so we can apply our
+        # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
+        for _line_bytes in iter(proc.stdout.readline, b""):
+            line = _utils.decode_subprocess_line(_line_bytes)
             if cancel_event is not None and cancel_event.is_set():
                 try:
                     proc.terminate()
@@ -1014,36 +1038,6 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     elapsed = time.time() - t_start
     took = _fmt_duration(elapsed)
 
-    # Activity log row (live UI) — Project rule: only emit when something
-    # actually happened. Suppress rows where nothing was downloaded AND no
-    # errors. This keeps the activity log a true "history of work done"
-    # instead of a noisy "every channel was checked" feed.
-    if downloaded > 0 or errors > 0:
-        now = datetime.now()
-        time_str = now.strftime("%-I:%M%p") if os.name != "nt" else now.strftime("%I:%M%p").lstrip("0")
-        time_str = time_str.lower()
-        date_str = now.strftime("%b %d").replace(" 0", " ")
-        kind = "Auto"  # could be "Manual" if triggered manually
-        stream.emit_activity({
-            "kind":      kind,
-            "time_date": f"{time_str}, {date_str}",
-            "channel":   name,
-            "primary":   f"{downloaded} downloaded",
-            "secondary": "",
-            "errors":    f"{errors} errors",
-            "took":      f"took {took}",
-            "row_tag":   "hist_green" if downloaded > 0 else "",
-        })
-        # Persist the same entry into config["autorun_history"] so it survives restart
-        try:
-            from . import autorun as _ar
-            _ar.append_history_entry(
-                _ar.format_history_entry(kind, name,
-                                         f"{downloaded} downloaded",
-                                         errors=errors, took_sec=elapsed))
-        except Exception:
-            pass
-
     # Per-channel [Sync] Done line is now rendered by sync_start_all via
     # _sync_row_emit — one compact `[N/total] Name   \u2014 summary` row that
     # replaces the live header in place. No duplicate line here.
@@ -1073,36 +1067,40 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             _meta_exec.shutdown(wait=True)
         except Exception:
             pass
-        # Emit one activity-log row summarizing the metadata work for this
-        # sync pass — matches OLD's [Metdta] row style.
-        _mfetched = _meta_counts.get("fetched", 0)
-        _mskipped = _meta_counts.get("skipped", 0)
-        _merrors  = _meta_counts.get("errors", 0)
-        if _mfetched or _merrors:
+
+    # Consolidated activity-log row — Scott's request: replace the
+    # historical 3 rows with ONE [Dwnld] row per channel per sync pass
+    # showing "N downloaded \u00b7 N transcribed \u00b7 N metadata".
+    # Emit synchronously here, reading transcribed count from the
+    # transcribe manager's current batch_stats. Auto-captions finish
+    # during the download (parallel with yt-dlp) so by this point the
+    # count is accurate. Whisper may still be running — emit what we
+    # have; standalone [Trnscr] won't follow because we also consume
+    # the transcribe manager's batch entry for this channel below.
+    # Only emit when something actually happened (downloaded > 0 OR
+    # errors) so idle sync passes don't spam the activity log.
+    if downloaded > 0 or errors > 0:
+        _meta_fetched = int(_meta_counts.get("fetched", 0) or 0)
+        _tx_done = 0
+        _tx_err  = 0
+        if auto_tx and transcribe_mgr is not None:
             try:
-                from . import autorun as _ar
-                _ar.append_history_entry(
-                    _ar.format_history_entry(
-                        "Metdta", name, f"{_mfetched} fetched",
-                        secondary=f"{_mskipped} existing",
-                        errors=_merrors, took_sec=elapsed))
+                _stats = transcribe_mgr.get_channel_batch_stats(name)
+                _tx_done = int(_stats.get("done", 0) or 0)
+                _tx_err  = int(_stats.get("err",  0) or 0)
+                # Mark consumed so _flush_batch_stats doesn't emit a
+                # duplicate standalone [Trnscr] row for the same work.
+                transcribe_mgr.consume_channel_batch_stats(name)
             except Exception:
                 pass
-            try:
-                time_str = now.strftime("%I:%M%p").lstrip("0").lower()
-                date_str = now.strftime("%b %d").replace(" 0", " ")
-                stream.emit_activity({
-                    "kind":      "Metdta",
-                    "time_date": f"{time_str}, {date_str}",
-                    "channel":   name,
-                    "primary":   f"{_mfetched} fetched",
-                    "secondary": f"{_mskipped} existing",
-                    "errors":    f"{_merrors} errors",
-                    "took":      f"took {took}",
-                    "row_tag":   "hist_pink" if _mfetched else "",
-                })
-            except Exception:
-                pass
+        emit_consolidated_auto_row(
+            stream, name,
+            downloaded=int(downloaded or 0),
+            transcribed=_tx_done,
+            metadata=_meta_fetched,
+            errors=int(errors or 0) + _tx_err,
+            elapsed=float(elapsed),
+            kind="Dwnld")
 
     # Remember the fresh IDs in the channel cache for the next sync pass
     # (lets the quick-check-new-uploads fast path skip enumeration).
@@ -1172,6 +1170,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         _ca.fetch_channel_art(url or "", str(ch_dir), force=False)
     except Exception as _ae:
         stream.emit_dim(f"  (channel-art refresh skipped: {_ae})")
+
+    # Clear the sync-active flag — allow transcribe._flush_batch_stats to
+    # emit standalone [Trnscr] rows for any transcriptions that slip in
+    # after this point (shouldn't happen for sync-originated jobs since
+    # we already consumed + emitted, but harmless if it does).
+    clear_sync_active(name)
 
     return SyncResult(ok=True, downloaded=downloaded, errors=errors,
                       took=took, exit=proc.returncode)
@@ -1391,6 +1395,7 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
+            env=_utils.utf8_subprocess_env(),
         )
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1469,6 +1474,7 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),
             encoding="utf-8", errors="replace",
             creationflags=(0x08000000 if os.name == "nt" else 0),
+            env=_utils.utf8_subprocess_env(),
         )
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1520,6 +1526,119 @@ def _should_batch_limit(ch: Dict[str, Any], ch_total: int) -> bool:
         return ch_total > _BATCH_LIMIT
     # Count unavailable — batch limit if channel isn't initialized yet
     return not ch.get("initialized", False)
+
+
+# UI push hook — main.py registers a callable here so the Recent tab
+# refreshes live whenever a download lands. No-op if unset (unit tests).
+_on_recent_changed_hook: Optional[Any] = None
+
+
+def set_recent_changed_hook(hook: Optional[Any]) -> None:
+    """Main.py wires this in __init__ so the Recent tab auto-refreshes
+    when a download completes. Hook gets no args — caller re-fetches the
+    current recent_downloads list and pushes to the UI."""
+    global _on_recent_changed_hook
+    _on_recent_changed_hook = hook
+
+
+# Channels with an in-flight `sync_channel` call. Used by
+# transcribe._flush_batch_stats to skip channels whose consolidated
+# [Dwnld] row isn't ready to emit yet (sync_channel is still running).
+# Without this, the transcribe worker drains before sync_channel ends,
+# flush fires, and a standalone [Trnscr] row beats sync_channel to the
+# activity log. Scott: "a single line. [Dwnld]...". `set_sync_active`
+# wraps sync_channel entry, `clear_sync_active` wraps exit.
+_active_sync_channels: set = set()
+_active_sync_lock = threading.Lock()
+
+
+def set_sync_active(channel_name: str) -> None:
+    with _active_sync_lock:
+        _active_sync_channels.add(channel_name)
+
+
+def clear_sync_active(channel_name: str) -> None:
+    with _active_sync_lock:
+        _active_sync_channels.discard(channel_name)
+
+
+def is_sync_active(channel_name: str) -> bool:
+    with _active_sync_lock:
+        return channel_name in _active_sync_channels
+
+
+def _count_cell(n: int, label: str) -> str:
+    """Render a count cell. If n == 1, return "\u2713 {label}" instead of
+    "1 {label}" — Scott's single-video polish for transcribed + metadata.
+    For 0 we still show the numeric form so the user can see
+    "0 transcribed" when a channel has auto_transcribe off. For >= 2
+    we show the numeric count.
+
+    NOTE: `downloaded` is ALWAYS rendered numerically (never \u2713) per
+    Scott's follow-up: "leave the downloaded part as a number. ... 1
+    downloaded (check) transcribed (check) metadata". Callers emit
+    downloaded via f"{n} downloaded" directly.
+    """
+    if n == 1:
+        return f"\u2713 {label}"
+    return f"{n} {label}"
+
+
+def emit_consolidated_auto_row(stream: "LogStreamer",
+                                channel_name: str,
+                                downloaded: int,
+                                transcribed: int,
+                                metadata: int,
+                                errors: int,
+                                elapsed: float,
+                                kind: str = "Dwnld") -> None:
+    """Emit ONE combined activity-log row replacing the historical trio
+    of [Auto] + [Trnscr] + [Metdta]. UI receives four count cells:
+        [kind] [time,date] \u2014 [channel] \u2014
+        [primary=N downloaded]  [secondary=N transcribed]
+        [tertiary=N metadata]   [errors=N errors] [took=took X]
+    Per Scott: `downloaded` is ALWAYS numeric. `transcribed` and
+    `metadata` use a \u2713 check when their count is exactly 1.
+    Persisted string body is 5 bullets:
+        N downloaded \u00b7 <N|\u2713> transcribed \u00b7 <N|\u2713> metadata \u00b7 N errors \u00b7 took X
+    """
+    now = datetime.now()
+    time_str = (now.strftime("%-I:%M%p") if os.name != "nt"
+                else now.strftime("%I:%M%p").lstrip("0")).lower()
+    date_str = now.strftime("%b %d").replace(" 0", " ")
+    took = _fmt_duration(elapsed)
+    primary_s   = f"{int(downloaded or 0)} downloaded"
+    secondary_s = _count_cell(int(transcribed or 0), "transcribed")
+    tertiary_s  = _count_cell(int(metadata or 0), "metadata")
+    stream.emit_activity({
+        "kind":      kind,
+        "time_date": f"{time_str}, {date_str}",
+        "channel":   channel_name,
+        "primary":   primary_s,
+        "secondary": secondary_s,
+        "tertiary":  tertiary_s,
+        "errors":    f"{errors} errors",
+        "took":      f"took {took}",
+        "row_tag":   "hist_green" if downloaded > 0 else "",
+    })
+    # Persist directly (bypassing format_history_entry so the checkmark
+    # forms round-trip cleanly instead of being truncated to "0" by
+    # the count-extraction logic). Use ljust/rjust padding so rendered
+    # rows in activity-log history view line up visually.
+    try:
+        from . import autorun as _ar
+        kind_tag = f"[{kind.center(6)}]" if len(kind) < 6 else f"[{kind}]"
+        ts_date  = f"{time_str}, {date_str}".ljust(16)
+        ch_part  = f"  {channel_name}  \u2014" if channel_name else " " * 7
+        body     = (f"{primary_s:<14} \u00b7 "
+                    f"{secondary_s:<15} \u00b7 "
+                    f"{tertiary_s:<13} \u00b7 "
+                    f"{int(errors or 0)} errors \u00b7 "
+                    f"took {took}")
+        line = f"{kind_tag} {ts_date} \u2014{ch_part}  {body}"
+        _ar.append_history_entry(line)
+    except Exception:
+        pass
 
 
 def _record_recent_download(filepath: str, channel: str, title: str,
@@ -1600,6 +1719,13 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         })
         cfg["recent_downloads"] = entries[:500]
         save_config(cfg)
+
+        # Push a live refresh to the Recent tab so a download shows up
+        # immediately without needing a restart. Hook is set by main.py's
+        # Api.__init__; safe no-op when unset (unit tests).
+        if _on_recent_changed_hook is not None:
+            try: _on_recent_changed_hook()
+            except Exception: pass
 
         # Auto-index trigger: after every Nth download, kick off a background
         # FTS ingest of any new .jsonl files on disk. Mirrors YTArchiver.py

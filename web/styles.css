@@ -808,7 +808,12 @@ body {
 }
 
 /* Activity log uses a grid so columns align vertically and adapt to width.
-   Columns: [Kind]  time  —  channel(flex)  —  primary  secondary  errors  took */
+   Columns: [Kind]  time  —  channel(flex)  —  primary  secondary  tertiary  errors  took
+
+   `tertiary` is the 3rd count cell (e.g. "N metadata") added for
+   consolidated [Dwnld] rows. Classic single-count rows (Trnscr,
+   Metdta, Manual, etc.) leave it empty and the grid just renders a
+   blank slot there. */
 .activity-log .log-line {
   display: grid;
   /* Flexible widths: fixed minimums keep short values readable at any
@@ -817,18 +822,21 @@ body {
      are the most variable-length field. `max-width` caps the row so
      ultrawide monitors don't render absurdly-spaced cells. Scott:
      "there's supposed to be a maximum width though, so it doesn't
-     start looking stupid at large widths." */
+     start looking stupid at large widths." Bumped from 1400px \u2192 1800px
+     when adding the new `tertiary` count column so each count cell
+     has enough room for "1 transcribed" / "1 metadata" without ellipsis. */
   grid-template-columns:
-    minmax(56px,  auto)     /* [Kind]   */
-    minmax(92px,  auto)     /* time,date */
+    minmax(60px,  auto)     /* [Kind]   */
+    minmax(96px,  auto)     /* time,date */
     10px                    /* em-dash */
-    minmax(140px, 3fr)      /* channel — biggest flex */
+    minmax(140px, 2.5fr)    /* channel — biggest flex */
     10px                    /* em-dash */
-    minmax(100px, 1fr)      /* primary (fetched/downloaded/replaced/...) */
-    minmax(100px, 1fr)      /* secondary (skipped) */
+    minmax(120px, 1fr)      /* primary  (N downloaded) */
+    minmax(120px, 1fr)      /* secondary (N transcribed) */
+    minmax(120px, 1fr)      /* tertiary (N metadata)  [new] */
     minmax(72px,  0.8fr)    /* errors */
     minmax(88px,  1fr);     /* took */
-  max-width: 1400px;
+  max-width: 1800px;
   justify-content: stretch;
   align-items: center;
   column-gap: 6px;

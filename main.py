@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 12:51am ──────────────────────
+# ── Version header — last updated 4.20.26 12:44pm ──────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v45.4"
-APP_VERSION_DATE = "4.20.26 12:51am"
+APP_VERSION      = "v46.0"
+APP_VERSION_DATE = "4.20.26 12:44pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -205,6 +205,12 @@ class Api:
                     pass
             threading.Timer(0.5, _emit_restore_notice).start()
         self._queues.add_listener(self._on_queue_changed)
+        # Recent-tab live refresh — every download triggers this via
+        # sync._record_recent_download so the Recent grid/list updates
+        # without needing an app restart.
+        try:
+            sync_backend.set_recent_changed_hook(self._push_recent_refresh)
+        except Exception: pass
         # Autorun scheduler — trigger kicks sync_start_all on the scheduled thread.
         # Passing `sync_busy_fn` so the scheduler can (a) postpone a fire
         # when sync is already running and (b) hold the countdown visible
@@ -435,6 +441,30 @@ class Api:
         """
         cfg = self._config if self._config is not None else load_config()
         return recent_for_ui(cfg)
+
+    def _push_recent_refresh(self):
+        """Re-fetch recent_downloads and push to the UI's Recent grid/list.
+
+        Called from backend.sync._record_recent_download every time a new
+        video lands, so the Recent tab updates live (Scott: "does the
+        Recents tab not auto update/refresh when a download happens?").
+        Safe no-op when the window isn't ready yet.
+        """
+        if self._window is None:
+            return
+        try:
+            import json as _json
+            # Reload config fresh since _record_recent_download just wrote
+            # to disk; self._config may be stale.
+            try: self._reload_config()
+            except Exception: pass
+            rows = self.get_recent_downloads() or []
+            js = f"window.renderRecentTable && window.renderRecentTable({_json.dumps(rows)});"
+            self._window.evaluate_js(js)
+        except Exception as e:
+            # Best-effort — never let a UI push crash the download pipeline.
+            try: self._log_stream.emit_dim(f"(recent refresh push failed: {e})")
+            except Exception: pass
 
     def get_queues(self):
         """Return the real live queue state — empty list when nothing's queued.

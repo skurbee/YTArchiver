@@ -14,7 +14,59 @@ import shutil
 import subprocess
 import time
 import unicodedata
-from typing import Optional
+from typing import Dict, Optional
+
+
+def utf8_subprocess_env() -> Dict[str, str]:
+    """Return a copy of os.environ with PYTHONIOENCODING forced to utf-8.
+
+    On Windows, Python subprocess stdout defaults to the console's code
+    page (typically cp1252), which mangles non-ASCII characters yt-dlp
+    emits in video titles (curly apostrophes, em-dashes, etc.). Reading
+    those bytes back with `encoding="utf-8", errors="replace"` produces
+    U+FFFD replacement chars like "World\u2019s" -> "World\ufffds".
+
+    Forcing PYTHONIOENCODING=utf-8 in the subprocess env tells the
+    child Python runtime (including frozen yt-dlp.exe builds) to
+    reconfigure sys.stdout to UTF-8 so our reader sees valid UTF-8.
+
+    Use via: `subprocess.Popen(..., env=utf8_subprocess_env())`.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    # Best-effort belt-and-suspenders for yt-dlp: its own re-encoding
+    # layer checks this too (yt_dlp/utils/_utils.py:preferredencoding).
+    env["PYTHONUTF8"] = "1"
+    # LC_ALL = C.UTF-8 covers tools that read POSIX locale rather than
+    # PYTHONIOENCODING (e.g. some yt-dlp helpers, ffmpeg).
+    env["LC_ALL"] = "C.UTF-8"
+    env["LANG"]   = "C.UTF-8"
+    return env
+
+
+def decode_subprocess_line(line_bytes: bytes) -> str:
+    """Decode a single line from yt-dlp / ffmpeg stdout.
+
+    Tries UTF-8 first (which is what yt-dlp emits when PYTHONIOENCODING
+    is set correctly). If that fails because the frozen yt-dlp.exe
+    bootstrap ignored the env var and fell back to cp1252, decode as
+    cp1252 so characters like U+2019 (\u2019, curly apostrophe) round-
+    trip cleanly instead of becoming U+FFFD replacement chars.
+
+    Belt-and-suspenders companion to `utf8_subprocess_env()` — Scott
+    reported replacement chars in titles even after the env var fix,
+    suggesting yt-dlp.exe isn't consistently respecting the setting.
+    """
+    if not line_bytes:
+        return ""
+    try:
+        return line_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # cp1252 has no "unmapped" bytes in 0x80-0x9F for \x81, \x8D, \x8F,
+    # \x90, \x9D — those raise UnicodeDecodeError without `errors`.
+    # errors="replace" replaces ONLY those rare bytes, not the whole line.
+    return line_bytes.decode("cp1252", errors="replace")
 
 
 # ── Single source of truth for year/month folder naming ───────────────

@@ -480,9 +480,19 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
         bparts = [p.strip() for p in body.split("\u00b7")]
         primary   = bparts[0] if len(bparts) > 0 else ""
         secondary = ""
+        tertiary  = ""
         errors    = ""
         took      = ""
-        if len(bparts) == 4:
+        if len(bparts) >= 5:
+            # Consolidated [Dwnld] shape (Scott's merged row):
+            #   primary · transcribed · metadata · errors · took
+            # Each count gets its own grid cell in the UI so a wider
+            # window uses its horizontal space cleanly (vs. cramming
+            # two counts into one cell with internal ellipsis).
+            secondary = bparts[1]
+            tertiary  = bparts[2]
+            errors, took = bparts[3], bparts[4]
+        elif len(bparts) == 4:
             # Metdta shape: primary, skipped/refreshed, errors, took
             secondary, errors, took = bparts[1], bparts[2], bparts[3]
         elif len(bparts) == 3:
@@ -499,6 +509,7 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
                 "channel": channel,
                 "primary": primary,
                 "secondary": secondary,
+                "tertiary": tertiary,
                 "errors": errors,
                 "took": took,
                 "row_tag": tag,
@@ -510,30 +521,35 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
 
 
 def _hist_tag_for_kind(kind: str, rest: str):
+    """Pick the row_tag color for a kind. Each match family accepts
+    either a non-zero integer OR a single \u2713 checkmark — the latter
+    represents "exactly 1 of this" per Scott's single-video polish.
+    """
     import re
+    # Either "\u2713 foo" or "N foo" (N >= 1) counts as "work happened".
+    def _done(pattern: str) -> bool:
+        check = re.search(r"\u2713\s+(?:" + pattern + r")\b", rest)
+        if check:
+            return True
+        m = re.search(r"\b(\d+)\s+(?:" + pattern + r")\b", rest)
+        return bool(m and int(m.group(1)) > 0)
+
     if kind == "Trnscr":
-        m = re.search(r"\b(\d+) transcribed\b", rest)
-        if m and int(m.group(1)) > 0:
+        if _done("transcribed"):
             return "hist_blue"
     elif kind == "Metdta":
-        f = re.search(r"\b(\d+) fetched\b", rest)
-        r = re.search(r"\b(\d+) refreshed\b", rest)
-        if (f and int(f.group(1)) > 0) or (r and int(r.group(1)) > 0):
+        if _done("fetched") or _done("refreshed"):
             return "hist_pink"
-    elif kind in ("Manual", "Auto"):
-        m = re.search(r"\b(\d+) downloaded\b", rest)
-        if m and int(m.group(1)) > 0:
+    elif kind in ("Manual", "Auto", "Dwnld"):
+        if _done("downloaded"):
             return "hist_green"
     elif kind == "ReDwnl":
-        m = re.search(r"\b(\d+) replaced\b", rest)
-        if (m and int(m.group(1)) > 0) or "running..." in rest:
+        if _done("replaced") or "running..." in rest:
             return "hist_redwnl"
     elif kind == "Cmprss":
-        m = re.search(r"\b(\d+) compressed\b", rest)
-        if m and int(m.group(1)) > 0:
+        if _done("compressed"):
             return "hist_compress"
     elif kind == "Reorg":
-        m = re.search(r"\b(\d+) (?:moved|reorganized)\b", rest)
-        if m and int(m.group(1)) > 0:
+        if _done("moved|reorganized"):
             return "hist_reorg"
     return None

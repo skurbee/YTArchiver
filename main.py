@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v48.8"
-APP_VERSION_DATE = "4.20.26 5:44pm"
+APP_VERSION      = "v48.9"
+APP_VERSION_DATE = "4.20.26 6:34pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -4499,6 +4499,7 @@ class Api:
         if not sync_backend.find_yt_dlp():
             return {"ok": False, "error": "yt-dlp not found"}
         self._sync_cancel.clear()
+        self._sync_pause.clear()
         ch_name = ch.get("name") or ch.get("folder", "")
         try:
             if getattr(self, "_tray", None):
@@ -4507,10 +4508,41 @@ class Api:
         except Exception:
             pass
         def _run():
+            # Mirror sync_start_all's visual framing for single-channel
+            # syncs: start-of-pass header, [1/1] live row, sync_channel
+            # call, [1/1] done row, end-of-pass footer. Without this the
+            # manual "Sync now" flow silently ran and the user never saw
+            # the usual "[1/1] Name — no new videos" line they expected.
+            import time as _t
+            from backend.sync import (_sync_row_emit, _short_summary,
+                                       _fmt_duration)
+            t0 = _t.time()
             try:
-                sync_backend.sync_channel(ch, self._log_stream, self._sync_cancel,
-                                          queues=self._queues,
-                                          transcribe_mgr=self._transcribe)
+                self._log_stream.emit([
+                    ["=== Sync pass starting ", "header"],
+                    ["(1 channel) ===\n", "header"],
+                ])
+                _sync_row_emit(self._log_stream, 1, 1, ch_name)
+                res = sync_backend.sync_channel(
+                    ch, self._log_stream, self._sync_cancel,
+                    queues=self._queues,
+                    transcribe_mgr=self._transcribe,
+                    pause_event=self._sync_pause,
+                    pass_idx=1, pass_total=1,
+                ) or {}
+                _dl = int(res.get("downloaded", 0) or 0)
+                _err = int(res.get("errors", 0) or 0)
+                _sync_row_emit(
+                    self._log_stream, 1, 1, ch_name,
+                    summary=_short_summary(_dl, _err),
+                    name_tag="simpleline_green" if _dl > 0 else "simpleline",
+                    summary_tag="simpleline_green" if _dl > 0 else "dim",
+                )
+                self._log_stream.emit([
+                    ["\n=== Pass complete: ", "header"],
+                    [f"{_dl} downloaded \u00b7 {_err} errors \u00b7 took "
+                     f"{_fmt_duration(_t.time() - t0)} ===\n", "header"],
+                ])
             except Exception as e:
                 self._log_stream.emit_error(f"Sync crashed: {e}")
             finally:

@@ -2424,6 +2424,13 @@ class TranscribeManager:
         # transcription" with no model name. Scott flagged this.
         model_name = (result.get("model") or self._model or "").strip()
         source_tag = f"(WHISPER:{model_name})" if model_name else "(WHISPER)"
+        # Diagnostic — emit the tag we're about to write so we can
+        # confirm it landed correctly. Visible in Verbose log mode.
+        try:
+            self._stream.emit_dim(
+                f"  (writing transcript source_tag={source_tag!r})")
+        except Exception:
+            pass
 
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0
 

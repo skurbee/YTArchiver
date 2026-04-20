@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 2:48pm ───────────────────────
+# ── Version header — last updated 4.20.26 3:06pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v46.7"
-APP_VERSION_DATE = "4.20.26 2:48pm"
+APP_VERSION      = "v47.0"
+APP_VERSION_DATE = "4.20.26 3:06pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -1809,6 +1809,27 @@ class Api:
             kind = "yt_captions_raw"
         else:
             kind = "unknown"
+        # Retroactive model-name fill: transcripts written by the buggy
+        # v46.0-v46.5 pywebview builds stored just "(WHISPER)" without
+        # the model name. Classic YTArchiver always wrote e.g.
+        # "(WHISPER SMALL)"; v46.6+ writes "(WHISPER:large-v3)". When we
+        # find a bare "WHISPER" tag (no whitespace or colon followed by
+        # more text) substitute the user's current default model so the
+        # banner has something to show instead of just "Whisper
+        # transcription" with no model qualifier. Scott: "we should
+        # NEVER just see 'whisper'. we should know what model was used."
+        # Caveat: this is a best-effort guess — the real model used at
+        # the time wasn't recorded. Accurate only if the user hasn't
+        # changed their default since. Re-transcribe on v46.6+ to
+        # restore the true tag in the file.
+        if kind == "whisper" and raw_tag.strip().upper() == "WHISPER":
+            try:
+                cfg = self._config if self._config is not None else load_config()
+                default_model = (cfg or {}).get("whisper_model", "")
+                if default_model:
+                    raw_tag = f"WHISPER:{default_model}"
+            except Exception:
+                pass
         return {"source": kind, "raw": raw_tag}
 
     def browse_search_context(self, payload):

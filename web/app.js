@@ -391,13 +391,18 @@
     tabs.forEach(t => {
       t.addEventListener("click", () => {
         // If we're switching AWAY from Browse and a Watch-view <video>
-        // is playing, pause it — `display:none` on the panel doesn't
-        // stop HTML5 audio on its own.
+        // is playing, PAUSE it (don't unload) — `display:none` on the
+        // panel doesn't stop HTML5 audio on its own. Returning to
+        // Browse should resume the user right where they left off
+        // with the same video still loaded. Scott: "if the user
+        // switches tabs while it's playing, pause playback" — but
+        // the video needs to still be up when they come back, not
+        // torn down into an empty placeholder.
         const currentlyActive = document.querySelector(".tab.active")?.dataset.tab;
         const target = t.dataset.tab;
         if (currentlyActive === "browse" && target !== "browse" &&
-            typeof window._stopWatchVideo === "function") {
-          window._stopWatchVideo();
+            typeof window._pauseWatchVideo === "function") {
+          window._pauseWatchVideo();
         }
         tabs.forEach(x => x.classList.remove("active"));
         t.classList.add("active");
@@ -683,6 +688,10 @@
   // `load()` cuts the stream so the browser releases the file handle
   // too (matters for the local_fileserver 206-range requests).
   function _stopWatchVideo() {
+    // Full teardown — used when the user is DONE watching (Back
+    // button, Library sidebar click). Pauses + unloads the media
+    // resource. After this, returning to the Watch view shows the
+    // empty placeholder and the video needs to be re-opened.
     const vEl = document.getElementById("watch-video");
     if (!vEl) return;
     try { vEl.pause(); } catch (e) { /* noop */ }
@@ -695,6 +704,19 @@
     } catch (e) { /* noop */ }
   }
   window._stopWatchVideo = _stopWatchVideo;
+
+  function _pauseWatchVideo() {
+    // Soft pause — used when the user navigates AWAY from Browse to
+    // a different top-level tab while a video is loaded. Keeps src +
+    // playhead intact so returning to Browse resumes right where they
+    // left off. Scott: "pausing a video, going to a different tab,
+    // then back to browse, closes the video ... it should still be
+    // up (but if the user switches tabs while it's playing, pause)".
+    const vEl = document.getElementById("watch-video");
+    if (!vEl) return;
+    try { vEl.pause(); } catch (e) { /* noop */ }
+  }
+  window._pauseWatchVideo = _pauseWatchVideo;
 
   function showView(viewName) {
     // Save scroll of outgoing view before swapping

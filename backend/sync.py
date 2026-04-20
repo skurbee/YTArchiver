@@ -824,6 +824,18 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             pass
                         # Inline metadata fetch — no channel walk.
                         _submit_inline_metadata(vid, t, final_path)
+                        # If auto_transcribe is OFF, remember the video ID on
+                        # the channel so Queue Pending can later snipe the
+                        # exact file without folder-scanning. Spec: the
+                        # Queue Pending ticker counts up when a channel
+                        # without auto transcription enabled downloads a
+                        # video.
+                        if not auto_tx:
+                            try:
+                                from . import ytarchiver_config as _cfg
+                                _cfg.append_pending_tx_id(name, vid)
+                            except Exception:
+                                pass
                         # Auto-transcribe: queue the completed video for whisper
                         if auto_tx and transcribe_mgr is not None:
                             cb = None

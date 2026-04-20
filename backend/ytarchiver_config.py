@@ -107,7 +107,105 @@ CHANNEL_DEFAULTS_ALL = {
     "transcription_complete": False,
     "transcription_pending": 0,
     "metadata_pending": 0,
+    # Authoritative pending list: video IDs that downloaded onto this
+    # channel without entering the auto-transcribe path (channel had
+    # auto_transcribe=False at download time). Queue Pending reads
+    # this list directly instead of folder-scanning. Drained by
+    # `remove_pending_tx_id` when a transcribe completes for the id.
+    "pending_tx_ids": [],
 }
+
+
+def _migrate_pending_tx_ids(cfg: Dict[str, Any]) -> None:
+    """First-launch-after-v47.7 migration.
+
+    For every channel, if `pending_tx_ids` is missing we add it as an
+    empty list AND zero `transcription_pending` so a drifted legacy
+    counter (e.g. 730) doesn't light up the Subs "-X" indicator for a
+    channel that's actually fully transcribed. Fresh downloads after
+    launch populate the list naturally via the sync-download hook.
+
+    Idempotent: runs on every load() but only mutates channels that
+    don't already have the field.
+    """
+    for ch in cfg.get("channels", []) or []:
+        if not isinstance(ch, dict):
+            continue
+        if "pending_tx_ids" not in ch or not isinstance(
+                ch.get("pending_tx_ids"), list):
+            ch["pending_tx_ids"] = []
+            # Drifted legacy counter → drop to 0 now that the ID list
+            # is the source of truth. complete=True so the Subs cell
+            # reads "A ✓" cleanly instead of stale "-730".
+            ch["transcription_pending"] = 0
+            ch["transcription_complete"] = True
+
+
+def append_pending_tx_id(channel_name: str, video_id: str) -> None:
+    """Record a downloaded video as pending-transcription for its
+    channel. Called from sync.py when a video lands AND the channel
+    has auto_transcribe=False. No-op if the ID is already in the list
+    (idempotent — repeated sync passes can't double-count).
+
+    Silent on any error: the counter is user-visible but not
+    load-bearing, so we never raise into the sync pipeline."""
+    if not channel_name or not video_id:
+        return
+    try:
+        if not config_is_writable():
+            return
+        cfg = load_config()
+        changed = False
+        for ch in cfg.get("channels", []) or []:
+            if (ch.get("name") or "") != channel_name:
+                continue
+            ids = ch.get("pending_tx_ids")
+            if not isinstance(ids, list):
+                ids = []
+                ch["pending_tx_ids"] = ids
+            if video_id in ids:
+                return
+            ids.append(video_id)
+            ch["transcription_pending"] = len(ids)
+            ch["transcription_complete"] = False
+            changed = True
+            break
+        if changed:
+            save_config(cfg)
+    except Exception:
+        pass
+
+
+def remove_pending_tx_id(video_id: str) -> bool:
+    """Drop a completed transcription's video ID from whichever
+    channel's pending list it's in. Called from the transcribe
+    worker's completion path.
+
+    Returns True if any list actually changed (useful for telemetry).
+    Silent on error; never raises.
+    """
+    if not video_id:
+        return False
+    try:
+        if not config_is_writable():
+            return False
+        cfg = load_config()
+        changed = False
+        for ch in cfg.get("channels", []) or []:
+            ids = ch.get("pending_tx_ids")
+            if not isinstance(ids, list):
+                continue
+            if video_id in ids:
+                ids.remove(video_id)
+                ch["transcription_pending"] = len(ids)
+                if not ids:
+                    ch["transcription_complete"] = True
+                changed = True
+        if changed:
+            save_config(cfg)
+        return changed
+    except Exception:
+        return False
 
 
 def load_config() -> Dict[str, Any]:
@@ -124,6 +222,7 @@ def load_config() -> Dict[str, Any]:
                 data = json.load(f)
         merged = dict(DEFAULT_CONFIG)
         merged.update(data)
+        _migrate_pending_tx_ids(merged)
         return merged
     except (json.JSONDecodeError, OSError) as e:
         print(f"[config] WARNING: failed to load {CONFIG_FILE}: {e}")
@@ -259,10 +358,20 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         # and the <X>-enabled flag is also on (e.g. `auto_transcribe=True` AND
         # the channel's been transcribed at least once). Match that here by
         # prefixing "A " to the checkmark when the auto_* flag is set.
-        def _mark(auto_key: str, enabled: bool) -> str:
+        # Pending deltas for "A ✓ -X" display: when a channel with
+        # auto_transcribe=True has new videos that escaped the auto
+        # path (sync downloaded them with the flag momentarily off,
+        # or a pipeline hiccup), the Subs cell shows how far behind
+        # we are.
+        _pending_tx_list = ch.get("pending_tx_ids") or []
+        _pending_tx_n = len(_pending_tx_list) if isinstance(_pending_tx_list, list) else 0
+
+        def _mark(auto_key: str, enabled: bool, behind: int = 0) -> str:
             is_auto = bool(ch.get(auto_key))
-            if enabled and is_auto: return "A \u2713"
-            if enabled: return "\u2713"
+            delta = f" -{behind}" if behind > 0 else ""
+            if enabled and is_auto: return f"A \u2713{delta}"
+            if enabled: return f"\u2713{delta}"
+            if behind > 0: return f"\u2014 -{behind}"
             return "\u2014"
         # Average video size = total size ÷ number of videos. the user wants a
         # quick way to eyeball which channels are shipping big files vs
@@ -288,17 +397,20 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
             "max": f"{max_mins}m" if max_mins else "—",
             "compress": "\u2713" if ch.get("compress_enabled") else "\u2014",
             # Transcribe / Metadata treat the auto flag itself as "enabled".
-            "transcribe": _mark("auto_transcribe", bool(ch.get("auto_transcribe"))),
+            # `_pending_tx_n` is the length of pending_tx_ids: videos that
+            # downloaded while auto_transcribe was off (the -X indicator).
+            "transcribe": _mark("auto_transcribe",
+                                 bool(ch.get("auto_transcribe")),
+                                 behind=_pending_tx_n),
             "metadata": _mark("auto_metadata", bool(ch.get("auto_metadata"))),
             "last_sync": ls_str,
             "n_vids": f"{ch.get('n_vids', 0):,}" if ch.get("n_vids") else "—",
             "size": f"{ch.get('size_gb', 0):.1f} GB" if ch.get("size_gb") else "—",
             "avg_size": avg_str,
-            # Pending counters for the "Queue Pending" badge in the subs header.
-            # `transcription_pending` is incremented by sync when videos land
-            # on auto_transcribe channels; `metadata_pending` similarly for
-            # channels with auto_metadata on.
-            "_pending_tx": int(ch.get("transcription_pending", 0) or 0),
+            # Queue-Pending badge derives from the authoritative ID lists.
+            # `transcription_pending` is kept as a back-compat mirror but
+            # is no longer the source of truth — the IDs are.
+            "_pending_tx": _pending_tx_n,
             "_pending_meta": int(ch.get("metadata_pending", 0) or 0),
         })
         total_gb += ch.get("size_gb", 0) or 0

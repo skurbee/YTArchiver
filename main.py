@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 4:27pm ───────────────────────
+# ── Version header — last updated 4.20.26 4:36pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v47.6"
-APP_VERSION_DATE = "4.20.26 4:27pm"
+APP_VERSION      = "v47.7"
+APP_VERSION_DATE = "4.20.26 4:36pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2605,12 +2605,12 @@ class Api:
             if not ch_name:
                 continue
             folder = os.path.join(base, _cfn(ch))
-            # Pending transcribe: delegate the whole check to
-            # `chan_transcribe_pending`. It self-verifies against the
-            # aggregate transcripts + DB, so a stale counter won't cause
-            # phantom queue entries. If queued=0 it also resets the counter.
-            pending = int(ch.get("transcription_pending") or 0)
-            if pending > 0:
+            # Pending transcribe list is authoritative (see sync hook at
+            # `append_pending_tx_id` and transcribe-complete hook at
+            # `remove_pending_tx_id`). Iterate only channels with a
+            # non-empty ID list — stale integer counters don't matter.
+            pending_ids = ch.get("pending_tx_ids") or []
+            if isinstance(pending_ids, list) and len(pending_ids) > 0:
                 r = self.chan_transcribe_pending(ch_name)
                 if r and r.get("ok") and r.get("queued", 0) > 0:
                     tx_added += 1
@@ -2680,79 +2680,36 @@ class Api:
         return {"ok": True, "queued": queued}
 
     def chan_transcribe_pending(self, folder_or_name):
-        """Queue only the `pending` transcriptions for this channel.
+        """Queue every video in this channel's `pending_tx_ids` list.
 
-        A video is considered transcribed if ANY of:
-          - It has a per-video `.jsonl` sidecar (legacy format).
-          - Its title appears in an aggregate `{ch} Transcript.txt` under
-            the channel folder.
-          - The index DB records `tx_status IN ('transcribed','done')`.
+        Authoritative source: `channel.pending_tx_ids` — populated by
+        sync.py when a video downloads onto a channel whose
+        auto_transcribe flag was off at that moment. No folder scan, no
+        title matching, no heuristics. Every ID in that list corresponds
+        to a real, concrete file the sync pipeline knows about; we
+        resolve filepath via the FTS index and enqueue.
 
-        Only videos that fail all three checks are enqueued. Also corrects
-        the stale `transcription_pending` counter when the real count is 0,
-        so the Subs-tab badge stops lying after external transcribes.
-
-        Mirrors YTArchiver.py:5808 _queue_pending_transcriptions.
+        Matches the v47.7 design spec: "Keep a log of the video IDs
+        that are skipped, and have the queue pending button DIRECTLY
+        snipe the info we need."
         """
         name = folder_or_name if isinstance(folder_or_name, str) else (
             folder_or_name.get("name") or folder_or_name.get("folder", ""))
         ch = subs_backend.get_channel({"name": name})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
-        cfg = load_config()
-        base = (cfg.get("output_dir") or "").strip()
-        if not base:
-            return {"ok": False, "error": "output_dir not set"}
-        from backend.sync import channel_folder_name as _cfn
-        from backend.transcribe import (_scan_existing_transcript_titles,
-                                         _norm_title)
-        import re as _re
-        folder = os.path.join(base, _cfn(ch))
-        pending_hint = int(ch.get("transcription_pending", 0) or 0)
+        pending_ids = list(ch.get("pending_tx_ids") or [])
+        if not pending_ids:
+            self._log_stream.emit([
+                ["[GPU] ", "trans_bracket"],
+                [f"Queue pending for {name}: ", "simpleline_blue"],
+                ["nothing pending.\n", "simpleline"],
+            ])
+            self._log_stream.flush()
+            return {"ok": True, "queued": 0, "skipped": 0}
 
-        # Pull already-transcribed titles + video IDs from every
-        # aggregate `*Transcript.txt` file. Dict is keyed by NORMALIZED
-        # title so trailing-whitespace / case / unicode differences
-        # between filename and stored title stop causing false
-        # "needs transcribing" hits.
-        already = _scan_existing_transcript_titles(folder, name)
-        done_vids = {vid for (_raw, vid) in already.values() if vid}
-
-        # Per-video .jsonl sidecar OR .vtt sidecar (either one means
-        # transcription machinery already handled this file).
-        def _sidecar_exists(base_path: str) -> bool:
-            return (os.path.isfile(base_path + ".jsonl")
-                    or os.path.isfile(base_path + ".en.vtt")
-                    or os.path.isfile(base_path + ".en-US.vtt"))
-
-        # FTS index: any filepath already marked transcribed / done.
-        # We match BY NORMALIZED FILEPATH, not title, because the DB's
-        # filepath is authoritative for the machine-local file.
-        db_done_paths = set()
-        db_done_titles = set()
-        try:
-            from backend.index import _open as _idx_open
-            conn = _idx_open()
-            if conn is not None:
-                rows = conn.execute(
-                    """SELECT filepath, title FROM videos
-                       WHERE channel = ? COLLATE NOCASE
-                         AND tx_status IN ('transcribed', 'done')""",
-                    (name,),
-                ).fetchall()
-                for r in rows:
-                    fp = (r[0] or "").strip()
-                    if fp:
-                        db_done_paths.add(os.path.normpath(fp).lower())
-                    t = (r[1] or "").strip()
-                    if t:
-                        db_done_titles.add(_norm_title(t))
-        except Exception:
-            pass
-
-        # Snapshot what's already queued/running so rapid double-clicks
-        # don't re-queue the same video while the first pass hasn't
-        # landed its completion callback yet.
+        # Skip IDs whose file is already queued / running so rapid
+        # double-clicks don't stack duplicates.
         queued_paths = set()
         try:
             with self._transcribe._jobs_lock:
@@ -2768,106 +2725,89 @@ class Api:
         except Exception:
             pass
 
-        skipped = 0
-        bulk = []  # (video_path, plain_title)
-        missed_preview: list = []  # first 3 titles that looked pending
-        for dp, _dns, fns in os.walk(folder):
-            for fn in fns:
-                low = fn.lower()
-                if not low.endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
-                    continue
-                video = os.path.join(dp, fn)
-                base_path = os.path.splitext(video)[0]
-                title = os.path.splitext(fn)[0]
-                plain_title = _re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$",
-                                      "", title) or title
-                vid_m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", title)
-                vid_id = vid_m.group(1) if vid_m else ""
-
-                # 0. Already queued or running — skip immediately
-                if os.path.normpath(video).lower() in queued_paths:
-                    skipped += 1
-                    continue
-
-                # 1. Per-video .jsonl / .en.vtt sidecar
-                if _sidecar_exists(base_path):
-                    skipped += 1
-                    continue
-                # 2. DB filepath match
-                if os.path.normpath(video).lower() in db_done_paths:
-                    skipped += 1
-                    continue
-                # 3. Aggregate title match (normalized, either with or
-                #    without `[videoId]` tail)
-                nt_plain = _norm_title(plain_title)
-                nt_full = _norm_title(title)
-                if nt_plain in already or nt_full in already:
-                    skipped += 1
-                    continue
-                # 4. Video-ID match against any aggregate-stored ID
-                if vid_id and vid_id in done_vids:
-                    skipped += 1
-                    continue
-                # 5. DB title match (fallback)
-                if nt_plain in db_done_titles or nt_full in db_done_titles:
-                    skipped += 1
-                    continue
-                if len(missed_preview) < 3:
-                    missed_preview.append(plain_title)
-                bulk.append((video, plain_title))
-
-        # Zero the counter BEFORE enqueuing. `enqueue()` calls
-        # `_bump_transcription_pending(+1)` per video, so after N enqueues
-        # the counter = 0 + N = N. When the worker completes each job it
-        # calls `_bump(-1)`, bringing the counter back down to 0. Without
-        # this pre-zero, the stale drift (e.g. 730) compounds instead of
-        # being replaced: end state would be 730 + N → 730 forever.
+        # Resolve each ID → filepath via the FTS index, in one shot.
+        id_to_path: dict = {}
+        unresolved: list = []
         try:
-            cfg2 = load_config()
-            for _ch in cfg2.get("channels", []):
-                _n = _ch.get("name") or ""
-                _f = _ch.get("folder") or _ch.get("folder_override") or ""
-                if _n == name or _f == name:
-                    _ch["transcription_pending"] = 0
-                    _ch["transcription_complete"] = True
-                    break
-            from backend.ytarchiver_config import save_config as _sc
-            _sc(cfg2)
+            from backend.index import _open as _idx_open
+            conn = _idx_open()
+            if conn is not None:
+                placeholders = ",".join(["?"] * len(pending_ids))
+                rows = conn.execute(
+                    f"SELECT video_id, filepath, title FROM videos "
+                    f"WHERE video_id IN ({placeholders})",
+                    pending_ids,
+                ).fetchall()
+                for r in rows:
+                    vid, fp, title = r[0], (r[1] or ""), (r[2] or "")
+                    if vid and fp:
+                        id_to_path[vid] = (fp, title)
         except Exception:
             pass
 
         queued = 0
+        skipped = 0
+        bulk = []  # (video_path, title)
+        for vid in pending_ids:
+            info = id_to_path.get(vid)
+            if not info:
+                unresolved.append(vid)
+                continue
+            fp, title = info
+            if not fp or not os.path.isfile(fp):
+                unresolved.append(vid)
+                continue
+            if os.path.normpath(fp).lower() in queued_paths:
+                skipped += 1
+                continue
+            bulk.append((fp, title or os.path.splitext(os.path.basename(fp))[0]))
+
         if bulk:
-            # Tag every enqueue with the same bulk_id so the queue popover
-            # can coalesce them into a single "Transcribing {ch} (X videos)"
-            # row instead of spamming N rows. (See queues._task_label_gpu.)
             import uuid as _uuid
             bulk_id = _uuid.uuid4().hex[:12]
             bulk_total = len(bulk)
-            for idx, (video, plain_title) in enumerate(bulk):
-                self._transcribe.enqueue(video, plain_title, channel=name,
+            for idx, (video, title) in enumerate(bulk):
+                self._transcribe.enqueue(video, title, channel=name,
                                          bulk_id=bulk_id, bulk_total=bulk_total,
                                          bulk_index=idx)
                 queued += 1
 
-        # Log preview of what the scan flagged as pending so the user can
-        # see exactly which titles failed every check — helpful when the
-        # drift is the result of title-format mismatches we still miss.
-        segs = [
+        self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
             [f"Queue pending for {name}: ", "simpleline_blue"],
-            [f"{queued} queued, {skipped} already done "
-             f"(counter was {pending_hint})\n", "simpleline"],
-        ]
-        self._log_stream.emit(segs)
-        for mt in missed_preview:
-            self._log_stream.emit([
-                ["[GPU] ", "trans_bracket"],
-                [f"  \u2014 flagged pending: {mt}\n", "dim"],
-            ])
+            [f"{queued} queued"
+             + (f", {skipped} already in queue" if skipped else "")
+             + (f", {len(unresolved)} unresolved" if unresolved else "")
+             + "\n", "simpleline"],
+        ])
+        # Log unresolved IDs so the user can see what's dangling — a
+        # deleted-since-download video, or an FTS index gap. Dropping
+        # those from the list keeps the counter honest.
+        if unresolved:
+            for u in unresolved:
+                self._log_stream.emit([
+                    ["[GPU] ", "trans_bracket"],
+                    [f"  \u2014 dropping unresolved id: {u}\n", "dim"],
+                ])
+            try:
+                cfg2 = load_config()
+                for _ch in cfg2.get("channels", []):
+                    if (_ch.get("name") or "") != name:
+                        continue
+                    ids = _ch.get("pending_tx_ids") or []
+                    ids = [x for x in ids if x not in unresolved]
+                    _ch["pending_tx_ids"] = ids
+                    _ch["transcription_pending"] = len(ids)
+                    if not ids:
+                        _ch["transcription_complete"] = True
+                    break
+                from backend.ytarchiver_config import save_config as _sc
+                _sc(cfg2)
+            except Exception:
+                pass
         self._log_stream.flush()
         return {"ok": True, "queued": queued, "skipped": skipped,
-                "hint": pending_hint}
+                "unresolved": len(unresolved)}
 
     def chan_transcribe_all(self, folder_or_name, combined=None):
         """Walk the channel folder for videos without .jsonl sidecars and queue each for whisper.

@@ -901,6 +901,15 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         pass
     # Decrement transcription_pending / set transcription_complete on 0.
     _bump_transcription_pending(channel, -1)
+    # Drop this video's ID from the authoritative pending list so the
+    # Subs "-X" indicator shrinks. `vid_id` was extracted earlier in
+    # this function for jsonl + FTS writes.
+    if vid_id:
+        try:
+            from . import ytarchiver_config as _cfg
+            _cfg.remove_pending_tx_id(vid_id)
+        except Exception:
+            pass
 
     took = time.time() - t0
     realtime = f"{duration/took:.1f}x" if took > 0 and duration > 0 else ""
@@ -2546,3 +2555,10 @@ class TranscribeManager:
         # button was clicked (unlike a normal sync-triggered transcribe).
         if not retranscribe:
             _bump_transcription_pending(channel, -1)
+            # Drain the authoritative pending-ID list too.
+            if vid_id:
+                try:
+                    from . import ytarchiver_config as _cfg
+                    _cfg.remove_pending_tx_id(vid_id)
+                except Exception:
+                    pass

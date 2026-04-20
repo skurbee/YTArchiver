@@ -233,11 +233,27 @@ body {
   justify-content: flex-end;
 }
 .settings-index-grid {
-  padding: 8px 24px 16px;
-  max-width: 900px;
+  padding: 10px 24px 20px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* Settings form fields use the window's full available width instead
+   of the old 900px cap — on an ultrawide, the cap left ~80% of the
+   page empty. Inputs keep reasonable per-field caps (resolution /
+   log-mode are 140px; Whisper model 240px) so single-choice selects
+   don't stretch to absurd widths, but the free-form text paths
+   (Archive root, Video downloads) happily expand to fill.
+   Stops at 1800px so fields don't feel lost on 4K+ monitors. */
+.settings-view .edit-grid {
+  max-width: 1800px;
+}
+.settings-view .ctl-input:not(.edit-num) {
+  min-width: 0;
+}
+.settings-view .edit-gv-inline {
+  min-width: 0;
 }
 .index-section-hint {
   color: var(--c-dim);

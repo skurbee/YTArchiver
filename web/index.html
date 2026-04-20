@@ -512,24 +512,25 @@
 
         <!-- General settings — core config everyone sets once -->
         <div class="settings-view" id="settings-view-general">
-          <label class="subs-section-label" style="display:block;padding:10px 16px 4px;">General</label>
-          <div class="edit-grid" style="grid-template-columns: max-content 1fr; gap: 12px 18px; padding: 10px 24px 20px;">
+          <label class="subs-section-label">General</label>
+          <div class="edit-grid">
             <label class="edit-gl">Archive root</label>
-            <div class="edit-gv-inline" style="gap:4px;">
-              <input type="text" class="ctl-input" id="settings-output-dir" readonly style="flex:1;" />
+            <div class="edit-gv-inline">
+              <input type="text" class="ctl-input" id="settings-output-dir" readonly />
               <button class="btn btn-ghost btn-thin" id="settings-browse-output">Browse&hellip;</button>
             </div>
 
             <label class="edit-gl">Video downloads</label>
-            <div class="edit-gv-inline" style="gap:4px;">
-              <input type="text" class="ctl-input" id="settings-video-dir" readonly style="flex:1;" />
+            <div class="edit-gv-inline">
+              <input type="text" class="ctl-input" id="settings-video-dir" readonly />
               <button class="btn btn-ghost btn-thin" id="settings-browse-video">Browse&hellip;</button>
             </div>
 
             <label class="edit-gl">Default resolution</label>
-            <select class="ctl-select" id="settings-default-res" style="max-width:140px;">
+            <select class="ctl-select" id="settings-default-res">
               <option>audio</option><option>144</option><option>240</option>
-              <option>360</option><option>480</option><option>720</option>
+              <option>360</option><option>480</option>
+              <option value="720" selected>720</option>
               <option>1080</option><option>1440</option><option>2160</option><option>best</option>
             </select>
 
@@ -540,16 +541,16 @@
             </div>
 
             <label class="edit-gl">Whisper model</label>
-            <select class="ctl-select" id="settings-whisper-model" style="max-width:240px;">
+            <select class="ctl-select" id="settings-whisper-model">
               <option value="tiny">tiny (fastest)</option>
-              <option value="small">small</option>
+              <option value="small" selected>small</option>
               <option value="medium">medium</option>
-              <option value="large-v3" selected>large-v3 (best)</option>
+              <option value="large-v3">large-v3 (best)</option>
             </select>
 
             <label class="edit-gl">Log mode</label>
-            <select class="ctl-select" id="settings-log-mode" style="max-width:140px;">
-              <option value="Simple">Simple</option>
+            <select class="ctl-select" id="settings-log-mode">
+              <option value="Simple" selected>Simple</option>
               <option value="Verbose">Verbose</option>
             </select>
           </div>
@@ -557,8 +558,8 @@
 
         <!-- Performance — startup tuning -->
         <div class="settings-view" id="settings-view-performance" style="display:none;">
-          <label class="subs-section-label" style="display:block;padding:10px 16px 4px;">Performance</label>
-          <div class="edit-grid" style="grid-template-columns: max-content 1fr; gap: 12px 18px; padding: 10px 24px 20px;">
+          <label class="subs-section-label">Performance</label>
+          <div class="edit-grid">
             <!-- Disk-scan staleness: re-walk the archive to refresh sizes
                  only if the cached folder stats are older than this many
                  hours. 0 = walk every launch (old behavior, safest).
@@ -589,8 +590,8 @@
 
         <!-- Appearance — UI preferences -->
         <div class="settings-view" id="settings-view-appearance" style="display:none;">
-          <label class="subs-section-label" style="display:block;padding:10px 16px 4px;">Appearance</label>
-          <div class="edit-grid" style="grid-template-columns: max-content 1fr; gap: 12px 18px; padding: 10px 24px 20px;">
+          <label class="subs-section-label">Appearance</label>
+          <div class="edit-grid">
             <!-- Subs tab Avg column visibility toggle. The Avg column
                  (total size / # videos) is a derived stat some users
                  find noisy; hide it without losing the underlying data. -->
@@ -621,8 +622,8 @@
 
         <!-- Tools — yt-dlp, import/export, bulk metadata -->
         <div class="settings-view" id="settings-view-tools" style="display:none;">
-          <label class="subs-section-label" style="display:block;padding:10px 16px 4px;">Tools</label>
-          <div class="edit-grid" style="grid-template-columns: max-content 1fr; gap: 12px 18px; padding: 10px 24px 20px;">
+          <label class="subs-section-label">Tools</label>
+          <div class="edit-grid">
             <label class="edit-gl">yt-dlp</label>
             <div class="edit-gv-inline" style="gap:8px;">
               <span class="edit-dim" id="settings-ytdlp-version">checking&hellip;</span>
@@ -658,7 +659,7 @@
 
         <!-- Index management -->
         <div class="settings-view" id="settings-view-index" style="display:none;">
-          <label class="subs-section-label" style="display:block;padding:10px 16px 4px;">Index</label>
+          <label class="subs-section-label">Index</label>
           <div class="settings-index-grid">
 
             <!-- Explainer — short note on what Index is so Settings
@@ -1296,6 +1297,6 @@
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally — no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
   <script src="logs.js?v=18"></script>
-  <script src="app.js?v=47"></script>
+  <script src="app.js?v=48"></script>
 </body>
 </html>

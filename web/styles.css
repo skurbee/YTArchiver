@@ -239,22 +239,314 @@ body {
   gap: 12px;
 }
 
-/* Settings form fields use the window's full available width instead
-   of the old 900px cap — on an ultrawide, the cap left ~80% of the
-   page empty. Inputs keep reasonable per-field caps (resolution /
-   log-mode are 140px; Whisper model 240px) so single-choice selects
-   don't stretch to absurd widths, but the free-form text paths
-   (Archive root, Video downloads) happily expand to fill.
-   Stops at 1800px so fields don't feel lost on 4K+ monitors. */
+/* ═══════════════════════════════════════════════════════════════════
+   Settings page — modern app style.
+
+   Layout goals:
+   - Centered content column, caps at ~1100px so a 4K ultrawide
+     doesn't stretch labels half a meter from their controls.
+   - Each setting is its own row with a subtle divider below it
+     (think VS Code / Discord settings).
+   - Labels bold + medium-large, control right-aligned on the row,
+     lots of vertical breathing room.
+   - Adaptive: on narrow windows the label/control stack (container
+     query-ish via % min widths), on wide windows they sit beside.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Section title ("General", "Performance", ...) — LEFT-aligned, part
+   of the content column flow, not centered. Matches card width. */
+.settings-view > .subs-section-label {
+  display: block !important;
+  padding: 28px 28px 6px !important;
+  font-size: 22px !important;
+  font-weight: 600 !important;
+  color: var(--c-text) !important;
+  text-transform: none !important;
+  letter-spacing: 0;
+  max-width: 920px;
+  margin: 0 auto !important;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Override the global `.edit-grid { display: contents }` with a real
+   grid. Use card-on-card approach: the grid itself is a bordered
+   rounded container with rows inside, like macOS / iOS settings. */
 .settings-view .edit-grid {
-  max-width: 1800px;
+  display: grid !important;
+  /* Labels column: max-content so it never truncates. Value column:
+     1fr with min 0 so it's the one that shrinks when the window
+     narrows — the path inputs ellipsis/scroll instead of labels
+     getting clipped. */
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 24px;
+  row-gap: 0;
+  align-items: center;
+  /* width: 100% is CRITICAL — without it the grid sizes to content
+     only and leaves enormous empty gutters when the main area is
+     wider than the grid's intrinsic width. max-width then caps the
+     growth on ultrawide monitors. */
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 0 !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-sizing: border-box;
 }
-.settings-view .ctl-input:not(.edit-num) {
+
+/* Each grid cell gets vertical padding so rows have consistent height.
+   The label cell is padded on the left, the value cell on the right,
+   so the content sits inside the card's interior margins. */
+.settings-view .edit-grid > .edit-gl {
+  padding: 16px 0 16px 22px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--c-text);
+  text-align: left;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+.settings-view .edit-grid > .edit-gv-inline,
+.settings-view .edit-grid > .edit-gv-stack,
+.settings-view .edit-grid > select,
+.settings-view .edit-grid > input {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-right: 22px;
   min-width: 0;
 }
+
+/* Thin horizontal dividers between rows. The label and value cells
+   sit in the same row, so applying border-top to ALL cells except
+   the first row gives a continuous line across both columns. */
+.settings-view .edit-grid > .edit-gl ~ .edit-gl,
+.settings-view .edit-grid > .edit-gl ~ .edit-gl + *,
+.settings-view .edit-grid > *:nth-child(n+3) {
+  border-top: 1px solid var(--c-border);
+}
+
+/* Value column — horizontal flex for inline groups (input + Browse,
+   input + unit-label, etc.), vertical stack for multi-row groups
+   (checkbox + hint under it). */
 .settings-view .edit-gv-inline {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+.settings-view .edit-gv-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: center;
+  align-items: flex-end;
+}
+/* Nested inline groups inside a stack (e.g. checkbox + label as one
+   inline, hint as another inline) each keep their own layout without
+   the parent stack flattening them. */
+.settings-view .edit-gv-stack > .edit-gv-inline {
+  width: 100%;
+  justify-content: flex-end;
+}
+
+/* Standalone <select> / <input> / custom dropdowns in the grid:
+   right-align at natural width instead of stretching the whole 1fr
+   value column. The path inputs (wrapped in .edit-gv-inline) still
+   fill the column; only single-control rows snap to the right. */
+.settings-view .edit-grid > select,
+.settings-view .edit-grid > input,
+.settings-view .edit-grid > .yt-dd {
+  justify-self: end;
+}
+.settings-view .edit-grid > .yt-dd {
+  min-width: 180px;
+  max-width: 280px;
+}
+
+/* Inputs — modern sizing with full content space (no vertical padding
+   clipping). */
+.settings-view .ctl-input {
+  font-size: 13.5px;
+  padding: 8px 12px;
+  height: 36px;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  box-sizing: border-box;
+  line-height: 1.4;
+}
+/* Native <select> elements in settings are HIDDEN. They remain in the
+   DOM for state/value so the existing save handlers still work, but
+   we render a custom div-based dropdown in their place because
+   Chromium in pywebview refuses to render the selected-value text
+   once any `appearance: none` or non-trivial padding is applied. */
+.settings-view .ctl-select {
+  display: none !important;
+}
+
+/* Custom dropdown widget — pure divs/spans, guaranteed to render.
+   `min-width: 0` on `.yt-dd` inside `.settings-view` lets the widget
+   shrink when the surrounding grid's value column is narrow. */
+.yt-dd {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 140px;
+  height: 36px;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  font-size: 13.5px;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+}
+.yt-dd:hover { border-color: #3a3e44; }
+.yt-dd.open { border-color: var(--c-accent); }
+.yt-dd-trigger {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  height: 100%;
   min-width: 0;
 }
+.yt-dd-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--c-text);
+}
+.yt-dd-caret {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  color: var(--c-accent);
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.15s;
+}
+.yt-dd.open .yt-dd-caret {
+  transform: rotate(180deg);
+}
+.yt-dd-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  z-index: 100;
+  max-height: 280px;
+  overflow-y: auto;
+  min-width: 160px;
+}
+.yt-dd-menu[hidden] { display: none; }
+.yt-dd-option {
+  padding: 7px 12px;
+  font-size: 13.5px;
+  color: var(--c-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.yt-dd-option:hover { background: rgba(255, 255, 255, 0.05); }
+.yt-dd-option.selected {
+  background: rgba(160, 170, 187, 0.1);
+  color: var(--c-text);
+  font-weight: 500;
+}
+.settings-view .ctl-input:focus,
+.settings-view .ctl-select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 2px rgba(160, 170, 187, 0.15);
+}
+
+/* Text-path inputs (archive / video paths) — fill the value cell
+   but be the first thing to shrink when the window narrows.
+   min-width:0 is critical; without it the flex child refuses to
+   go below its content width and the whole grid overflows. */
+.settings-view .edit-gv-inline > .ctl-input:not(.edit-num) {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.settings-view .edit-num {
+  width: 64px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+
+/* Browse / secondary buttons inside rows */
+.settings-view .btn.btn-ghost.btn-thin {
+  padding: 6px 14px;
+  min-height: 34px;
+  font-size: 12.5px;
+  flex: 0 0 auto;
+  border-radius: 5px;
+}
+.settings-view .edit-dim {
+  font-size: 12.5px;
+  color: var(--c-dim);
+  flex: 0 0 auto;
+}
+
+/* Save-button footer aligns with the card's right edge */
+.settings-actions {
+  padding: 20px 0 28px;
+  max-width: 920px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+.settings-actions .btn {
+  padding: 9px 22px;
+  font-size: 13px;
+  min-height: 36px;
+}
+
+/* Sidebar: modern width + padding */
+.settings-sidebar {
+  min-width: 190px;
+  padding: 24px 0 20px !important;
+}
+.settings-subnav-label {
+  padding: 0 22px 10px !important;
+  font-size: 11px !important;
+  letter-spacing: 1.2px;
+}
+.settings-subnav-btn {
+  padding: 10px 22px !important;
+  font-size: 13.5px !important;
+  border-radius: 0;
+  transition: background 0.12s;
+}
+.settings-subnav-btn.active {
+  padding-left: 20px !important;
+}
+
+/* Single-column views (Index) — match the card-container treatment */
+.settings-view .settings-index-grid {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 22px !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  box-sizing: border-box;
+}
+
 .index-section-hint {
   color: var(--c-dim);
   font-size: 12px;

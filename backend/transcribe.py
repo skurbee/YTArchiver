@@ -1491,7 +1491,10 @@ class TranscribeManager:
                 combined: Optional[bool] = None,
                 on_complete: Optional[Callable] = None,
                 retranscribe: bool = False,
-                video_id: str = "") -> bool:
+                video_id: str = "",
+                bulk_id: str = "",
+                bulk_total: int = 0,
+                bulk_index: int = 0) -> bool:
         """Queue a video for transcription.
 
         `channel` is optional; if provided it's stored on the job so the
@@ -1530,6 +1533,9 @@ class TranscribeManager:
                 "cancel": threading.Event(),
                 "retranscribe": bool(retranscribe),
                 "video_id": (video_id or "").strip(),
+                "bulk_id": bulk_id or "",
+                "bulk_total": int(bulk_total or 0),
+                "bulk_index": int(bulk_index or 0),
             })
         # Mirror the job into the shared GPU queue so the Tasks popover
         # shows the pending work. this was flagged: auto-transcribe on
@@ -1537,6 +1543,11 @@ class TranscribeManager:
         # popover stayed empty, so there was no visible record of the
         # transcription being queued. `kind=transcribe` + `title`
         # matches the shape `_task_label_gpu` reads.
+        #
+        # `bulk_id`/`bulk_total` carry a coalesce hint — when N videos from
+        # the same channel are queued in one "Queue Pending" / "Transcribe
+        # All" click, they all share a bulk_id and the popover collapses
+        # them into a single "Transcribing {ch} (X videos)" row.
         if self._queues is not None:
             try:
                 self._queues.gpu_enqueue({
@@ -1544,6 +1555,9 @@ class TranscribeManager:
                     "title": _job_title,
                     "path": path,
                     "channel": channel,
+                    "bulk_id": bulk_id,
+                    "bulk_total": int(bulk_total or 0),
+                    "bulk_index": int(bulk_index or 0),
                 })
             except Exception:
                 pass

@@ -14,7 +14,7 @@
   <!-- Header strip -->
   <div class="header-strip">
     <span class="header-title">YT ARCHIVER</span>
-    <span class="header-version" id="header-version">v47.1 - 4.20.26 3:16pm</span>
+    <span class="header-version" id="header-version">v47.3 - 4.20.26 3:45pm</span>
   </div>
 
   <!-- Tab row. Recent was previously a top-level tab (hangover from an
@@ -285,130 +285,132 @@
       <div class="edit-channel-box" id="edit-channel-box">
         <label class="subs-section-label" id="edit-channel-label">Add channel</label>
 
-        <div class="edit-grid">
+        <!-- Flex-row layout (replaces the CSS grid). Each field carries
+             its own label+value as a self-contained unit, so flex rows
+             pair fields without risk of grid-cell misalignment. Hidden
+             panels (nudge, compress expansion) just `display:none` cleanly
+             without shoving subsequent labels into the wrong cell. -->
+        <div class="edit-form">
 
-          <!-- Row: Folder Name + Channel URL (spans 4 grid cols via sub-flex) -->
-          <label class="edit-gl">Folder Name</label>
-          <input type="text" class="ctl-input" id="edit-folder" placeholder="Target folder name" />
-          <label class="edit-gl">Channel URL</label>
-          <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
-          <!-- Reverse nudge: if the user pastes a VIDEO URL into the channel
-               URL field, offer a one-click handoff to the Download tab.
-               Mirrors classic's _video_nudge_frame (YTArchiver.py:5017). -->
-          <div class="edit-gl-spacer"></div>
-          <div class="edit-gv-inline video-nudge-panel" id="edit-url-video-nudge" hidden
-               style="gap:8px; padding:6px 10px; background:var(--c-surface); border:1px solid var(--c-border); border-radius:3px; font-size:12px;">
+          <!-- Row 1: Folder Name + Channel URL side-by-side -->
+          <div class="edit-row">
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder" placeholder="Target folder name" />
+            </div>
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Channel URL</label>
+              <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+            </div>
+          </div>
+
+          <!-- Reverse nudge: pasted-video-URL handoff. Full-width banner,
+               hidden by default. Doesn't take grid space while hidden. -->
+          <div class="edit-nudge-row video-nudge-panel" id="edit-url-video-nudge" hidden>
             <span>&#x1F3AC; Video URL detected.</span>
             <button class="btn btn-primary btn-thin" id="btn-edit-url-to-download" type="button">&#8594; Send to Download tab</button>
           </div>
 
-          <!-- Folder override is NOT a separate UI field: OLD YTArchiver
-               surfaces ONE folder name per channel (see YTArchiver.py:5432
-               `new_name_var.set(ch.get("folder_override", ch["name"]))`).
-               The on-disk folder is decided by
-               `channel_folder_name(ch) = folder_override OR name`
-               (backend/sync.py:185). So the single "Folder Name" input
-               above writes to BOTH `folder` and `folder_override` on save,
-               keeping OLD-compat without bloating the Edit panel with a
-               redundant second input. The save-path JS mirrors the value;
-               no DOM element needed. -->
+          <!-- Folder override: NOT a separate UI field — OLD YTArchiver
+               stores ONE folder name per channel (YTArchiver.py:5432).
+               The "Folder Name" input writes both `folder` +
+               `folder_override` on save. -->
 
-          <!-- Row: Resolution + Duration -->
-          <label class="edit-gl">Resolution</label>
-          <div class="edit-gv-inline">
-            <select class="ctl-select edit-res" id="edit-resolution">
-              <option value="audio">audio</option>
-              <option value="144">144</option>
-              <option value="240">240</option>
-              <option value="360">360</option>
-              <option value="480">480</option>
-              <option value="720" selected>720</option>
-              <option value="1080">1080</option>
-              <option value="1440">1440</option>
-              <option value="2160">2160</option>
-              <option value="best">best</option>
-            </select>
-            <button class="icon-btn-slim" title="Reset resolution to default" id="edit-res-reset">&#8635;</button>
-            <!-- Scan the channel folder with ffprobe to count videos that
-                 don't already match the selected resolution, then prompt
-                 to queue those for redownload. Matches YTArchiver.py:5155
-                 res_check_btn. -->
-            <button class="icon-btn-slim" title="Scan archive + queue redownload for videos below target resolution"
-                    id="edit-res-recheck" type="button">&#x2713;</button>
-            <!-- Continue Redownload — visible only when a progress file
-                 exists. Matches YTArchiver.py:5473 _has_pending_redownload. -->
-            <button class="btn btn-primary btn-thin" id="edit-res-continue"
-                    type="button" hidden
-                    title="Resume the in-progress redownload for this channel">&#x21BB; Continue</button>
-          </div>
-          <label class="edit-gl">Duration</label>
-          <div class="edit-gv-inline">
-            <input type="text" class="ctl-input edit-num" id="edit-min-dur" value="3" placeholder="Min" />
-            <span class="edit-dim">&ndash;</span>
-            <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
-            <span class="edit-dim">min</span>
-          </div>
-
-          <!-- Row: Range (3-option radio group). Label pinned to col 1
-               via `.edit-gl-row-start` so it lands on its own row — the
-               radio group is `grid-column: 2/-1`, which forces a wrap
-               anyway; without this the label would end up in col 3 of
-               the Duration row (bug caught: blank cell 4 + radios
-               on a new row starting at col 2 looked like an orphan
-               label). -->
-          <label class="edit-gl edit-gl-row-start">Range</label>
-          <div class="edit-gv-inline edit-gv-span" id="edit-range-group">
-            <label class="radio-label-inline">
-              <input type="radio" name="edit-range" value="subscribe" checked />
-              <span class="radio-circle"></span>Subscribe only
-            </label>
-            <label class="radio-label-inline">
-              <input type="radio" name="edit-range" value="all" />
-              <span class="radio-circle"></span>Entire channel
-            </label>
-            <label class="radio-label-inline">
-              <input type="radio" name="edit-range" value="fromdate" />
-              <span class="radio-circle"></span>From date
-            </label>
-            <div class="edit-date-group" id="edit-date-group" hidden>
-              <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
-              <span class="edit-dim">/</span>
-              <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
-              <span class="edit-dim">/</span>
-              <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
+          <!-- Row 2: Resolution (+ reset/recheck/continue) + Duration -->
+          <div class="edit-row">
+            <div class="edit-field">
+              <label class="edit-gl">Resolution</label>
+              <select class="ctl-select edit-res" id="edit-resolution">
+                <option value="audio">audio</option>
+                <option value="144">144</option>
+                <option value="240">240</option>
+                <option value="360">360</option>
+                <option value="480">480</option>
+                <option value="720" selected>720</option>
+                <option value="1080">1080</option>
+                <option value="1440">1440</option>
+                <option value="2160">2160</option>
+                <option value="best">best</option>
+              </select>
+              <button class="icon-btn-slim" title="Reset resolution to default" id="edit-res-reset">&#8635;</button>
+              <!-- Scan channel folder with ffprobe + queue redownload for
+                   below-target videos. YTArchiver.py:5155. -->
+              <button class="icon-btn-slim" title="Scan archive + queue redownload for videos below target resolution"
+                      id="edit-res-recheck" type="button">&#x2713;</button>
+              <!-- Continue Redownload — visible only when a progress file
+                   exists. YTArchiver.py:5473 _has_pending_redownload. -->
+              <button class="btn btn-primary btn-thin" id="edit-res-continue"
+                      type="button" hidden
+                      title="Resume the in-progress redownload for this channel">&#x21BB; Continue</button>
+            </div>
+            <div class="edit-field">
+              <label class="edit-gl">Duration</label>
+              <input type="text" class="ctl-input edit-num" id="edit-min-dur" value="3" placeholder="Min" />
+              <span class="edit-dim">&ndash;</span>
+              <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
+              <span class="edit-dim">min</span>
             </div>
           </div>
 
-          <!-- Row: Folder Org — labels match YTArchiver.py:5454-5460
-               exactly so config round-trips without surprise. -->
-          <label class="edit-gl">Folder Org</label>
-          <div class="edit-gv-inline">
-            <select class="ctl-select edit-res" id="edit-folder-org">
-              <option value="flat">None (flat)</option>
-              <option value="years" selected>Years</option>
-              <option value="months">Years/Months</option>
-            </select>
+          <!-- Row 3: Range (full width — 3 radios + optional date) -->
+          <div class="edit-row">
+            <div class="edit-field edit-field-full" id="edit-range-group">
+              <label class="edit-gl">Range</label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="subscribe" checked />
+                <span class="radio-circle"></span>Subscribe only
+              </label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="all" />
+                <span class="radio-circle"></span>Entire channel
+              </label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="fromdate" />
+                <span class="radio-circle"></span>From date
+              </label>
+              <div class="edit-date-group" id="edit-date-group" hidden>
+                <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
+                <span class="edit-dim">/</span>
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
+                <span class="edit-dim">/</span>
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
+              </div>
+            </div>
           </div>
-          <div class="edit-gl-spacer"></div>
-          <div class="edit-gv-inline"></div>
 
-          <!-- Row: Options (all checkboxes consolidated) -->
-          <label class="edit-gl">Options</label>
-          <div class="edit-gv-inline edit-gv-span edit-options">
-            <label class="checkbox-label">
-              <input type="checkbox" id="edit-metadata" checked />
-              <span>Auto-download metadata</span>
-            </label>
-            <label class="checkbox-label">
-              <input type="checkbox" id="edit-transcribe" />
-              <span>Auto-transcribe</span>
-            </label>
-            <label class="checkbox-label">
-              <input type="checkbox" id="edit-compress" />
-              <span>Compress after download</span>
-            </label>
-            <!-- Compress expansion: Res / Quality / Batch (appears when checked) -->
-            <div class="edit-compress-group" id="edit-compress-group" hidden>
+          <!-- Row 4: Folder Org + Options. Folder Org is compact
+               (single dropdown), Options is a row of 3 checkboxes.
+               The Options field grows to fill remaining space. -->
+          <div class="edit-row">
+            <div class="edit-field">
+              <label class="edit-gl">Folder Org</label>
+              <select class="ctl-select edit-res" id="edit-folder-org">
+                <option value="flat">None (flat)</option>
+                <option value="years" selected>Years</option>
+                <option value="months">Years/Months</option>
+              </select>
+            </div>
+            <div class="edit-field edit-field-grow edit-options">
+              <label class="edit-gl">Options</label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-metadata" checked />
+                <span>Auto metadata</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-transcribe" />
+                <span>Auto transcribe</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-compress" />
+                <span>Compress</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Compress expansion — only visible when "Compress" checked.
+               Full-width row so the dropdowns don't crowd the main row. -->
+          <div class="edit-row edit-compress-group" id="edit-compress-group" hidden>
+            <div class="edit-field">
               <label class="edit-dim">Res</label>
               <select class="ctl-select edit-res" id="edit-compress-res">
                 <option value="original">Original</option>
@@ -419,12 +421,16 @@
                 <option value="240">240p</option>
                 <option value="144">144p</option>
               </select>
+            </div>
+            <div class="edit-field">
               <label class="edit-dim">Quality</label>
               <select class="ctl-select edit-res" id="edit-compress-quality">
                 <option value="Generous" selected>Generous</option>
                 <option value="Average">Average</option>
                 <option value="Below Average">Below Average</option>
               </select>
+            </div>
+            <div class="edit-field">
               <label class="edit-dim">Batch</label>
               <select class="ctl-select edit-batch" id="edit-compress-batch">
                 <option>5</option>
@@ -457,8 +463,6 @@
         <div class="edit-actions">
           <button class="btn btn-primary btn-thin" id="btn-edit-update" disabled>Update channel</button>
           <button class="btn btn-ghost btn-thin" id="btn-edit-cancel">Cancel</button>
-          <button class="btn btn-ghost btn-thin" id="btn-edit-test"
-                  title="Verify the channel URL resolves (yt-dlp probe)">Test URL</button>
           <button class="btn btn-ghost btn-thin" id="btn-edit-restore"
                   title="Reset this panel to your configured defaults">Restore defaults</button>
           <div class="spacer"></div>
@@ -1250,9 +1254,48 @@
   <!-- Toast notifications mount -->
   <div id="toast-root"></div>
 
+  <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
+       listens for the `yt-control` event (kind=redownload_sample) and
+       fills/shows it. Buttons call api.redownload_sample_confirm(). -->
+  <div id="redwnl-sample-modal" class="yt-modal" hidden>
+    <div class="yt-modal-backdrop"></div>
+    <div class="yt-modal-body">
+      <div class="yt-modal-title">Sample Complete</div>
+      <div class="yt-modal-sub" id="redwnl-sample-sub"></div>
+      <div class="yt-modal-stats" id="redwnl-sample-stats"></div>
+      <div class="yt-modal-countdown" id="redwnl-sample-countdown"></div>
+      <div class="yt-modal-buttons">
+        <button class="yt-modal-btn primary"
+                id="redwnl-sample-continue">Continue</button>
+        <button class="yt-modal-btn"
+                id="redwnl-sample-change">Change Resolution&hellip;</button>
+        <button class="yt-modal-btn danger"
+                id="redwnl-sample-cancel">Cancel</button>
+      </div>
+      <div class="yt-modal-res-picker" id="redwnl-sample-res-picker" hidden>
+        <div class="yt-modal-sub">Pick a new target:</div>
+        <div class="yt-modal-res-options">
+          <label><input type="radio" name="redwnl-sample-res" value="best"> Best</label>
+          <label><input type="radio" name="redwnl-sample-res" value="2160"> 2160p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="1440"> 1440p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="1080"> 1080p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="720"> 720p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="480"> 480p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="360"> 360p</label>
+        </div>
+        <div class="yt-modal-buttons">
+          <button class="yt-modal-btn primary"
+                  id="redwnl-sample-res-ok">Apply</button>
+          <button class="yt-modal-btn"
+                  id="redwnl-sample-res-back">Back</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally — no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
-  <script src="logs.js?v=17"></script>
-  <script src="app.js?v=45"></script>
+  <script src="logs.js?v=18"></script>
+  <script src="app.js?v=46"></script>
 </body>
 </html>

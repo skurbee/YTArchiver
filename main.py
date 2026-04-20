@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 3:16pm ───────────────────────
+# ── Version header — last updated 4.20.26 4:08pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v47.1"
-APP_VERSION_DATE = "4.20.26 3:16pm"
+APP_VERSION      = "v47.4"
+APP_VERSION_DATE = "4.20.26 4:08pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2587,7 +2587,11 @@ class Api:
 
         Walks every subscribed channel; for any with `transcription_pending > 0`
         (or that have new videos without `.jsonl` sidecars), queues a bulk
-        transcribe. Matches YTArchiver.py:5808 _queue_pending_transcriptions.
+        transcribe. `chan_transcribe_pending` is real-state aware — it
+        scans aggregate transcripts + DB, skips channels already fully
+        transcribed, and resets stale counters so the badge self-heals.
+
+        Matches YTArchiver.py:5808 _queue_pending_transcriptions.
         """
         cfg = self._config or load_config()
         base = (cfg.get("output_dir") or "").strip()
@@ -2601,12 +2605,12 @@ class Api:
             if not ch_name:
                 continue
             folder = os.path.join(base, _cfn(ch))
-            # Pending transcribe: either the counter is set, or we see mp4
-            # files without a .jsonl sidecar — latter handles older archives
-            # that never had the counter populated.
+            # Pending transcribe: delegate the whole check to
+            # `chan_transcribe_pending`. It self-verifies against the
+            # aggregate transcripts + DB, so a stale counter won't cause
+            # phantom queue entries. If queued=0 it also resets the counter.
             pending = int(ch.get("transcription_pending") or 0)
-            complete = bool(ch.get("transcription_complete"))
-            if (complete and pending > 0) or (pending > 0):
+            if pending > 0:
                 r = self.chan_transcribe_pending(ch_name)
                 if r and r.get("ok") and r.get("queued", 0) > 0:
                     tx_added += 1
@@ -2678,9 +2682,15 @@ class Api:
     def chan_transcribe_pending(self, folder_or_name):
         """Queue only the `pending` transcriptions for this channel.
 
-        Fast-path: if `channel.transcription_pending > 0` on the config,
-        walks the channel folder and enqueues just the videos that don't
-        already have a `.jsonl` sidecar AND aren't already in the queue.
+        A video is considered transcribed if ANY of:
+          - It has a per-video `.jsonl` sidecar (legacy format).
+          - Its title appears in an aggregate `{ch} Transcript.txt` under
+            the channel folder.
+          - The index DB records `tx_status IN ('transcribed','done')`.
+
+        Only videos that fail all three checks are enqueued. Also corrects
+        the stale `transcription_pending` counter when the real count is 0,
+        so the Subs-tab badge stops lying after external transcribes.
 
         Mirrors YTArchiver.py:5808 _queue_pending_transcriptions.
         """
@@ -2694,32 +2704,97 @@ class Api:
         if not base:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name as _cfn
+        from backend.transcribe import _scan_existing_transcript_titles
+        import re as _re
         folder = os.path.join(base, _cfn(ch))
-        pending = int(ch.get("transcription_pending", 0) or 0)
-        # Walk anyway — the counter can be stale; use it only as a hint
+        pending_hint = int(ch.get("transcription_pending", 0) or 0)
+
+        # Pull already-transcribed titles from aggregate `{ch} Transcript.txt`
+        already_titles = _scan_existing_transcript_titles(folder, name)
+        # And from the FTS index (tx_status='transcribed'|'done').
+        db_done_titles = set()
+        try:
+            from backend.index import _open as _idx_open
+            conn = _idx_open()
+            if conn is not None:
+                rows = conn.execute(
+                    """SELECT title FROM videos
+                       WHERE channel = ? COLLATE NOCASE
+                         AND tx_status IN ('transcribed', 'done')""",
+                    (name,),
+                ).fetchall()
+                for r in rows:
+                    t = (r[0] or "").strip()
+                    if t:
+                        db_done_titles.add(t)
+        except Exception:
+            pass
+
         queued = 0
         skipped = 0
+        bulk = []  # (video_path, plain_title)
         for dp, _dns, fns in os.walk(folder):
             for fn in fns:
                 if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
                     continue
                 video = os.path.join(dp, fn)
                 base_path = os.path.splitext(video)[0]
+                title = os.path.splitext(fn)[0]
+                plain_title = _re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$",
+                                      "", title) or title
+                # Per-video legacy sidecar
                 if os.path.isfile(base_path + ".jsonl"):
                     skipped += 1
                     continue
-                title = os.path.splitext(fn)[0]
-                self._transcribe.enqueue(video, title, channel=name)
+                # Aggregate `{ch} Transcript.txt` contains this title
+                if plain_title in already_titles:
+                    skipped += 1
+                    continue
+                # Index DB says it's done
+                if plain_title in db_done_titles or title in db_done_titles:
+                    skipped += 1
+                    continue
+                bulk.append((video, plain_title))
+
+        if bulk:
+            # Tag every enqueue with the same bulk_id so the queue popover
+            # can coalesce them into a single "Transcribing {ch} (X videos)"
+            # row instead of spamming N rows. (See queues._task_label_gpu.)
+            import uuid as _uuid
+            bulk_id = _uuid.uuid4().hex[:12]
+            bulk_total = len(bulk)
+            for idx, (video, plain_title) in enumerate(bulk):
+                self._transcribe.enqueue(video, plain_title, channel=name,
+                                         bulk_id=bulk_id, bulk_total=bulk_total,
+                                         bulk_index=idx)
                 queued += 1
+
+        # If actual pending is 0 but counter said >0, reset the counter so
+        # the badge updates. Also flip transcription_complete=True.
+        if queued == 0 and pending_hint > 0:
+            try:
+                cfg2 = load_config()
+                for _ch in cfg2.get("channels", []):
+                    _n = _ch.get("name") or ""
+                    _f = _ch.get("folder") or _ch.get("folder_override") or ""
+                    if _n == name or _f == name:
+                        _ch["transcription_pending"] = 0
+                        _ch["transcription_complete"] = True
+                        break
+                from backend.ytarchiver_config import save_config as _sc
+                _sc(cfg2)
+            except Exception:
+                pass
+
         self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
             [f"Queue pending for {name}: ", "simpleline_blue"],
             [f"{queued} queued, {skipped} already done "
-             f"(config hint: {pending})\n", "simpleline"],
+             f"(counter was {pending_hint})\n", "simpleline"],
         ])
         self._log_stream.flush()
         return {"ok": True, "queued": queued, "skipped": skipped,
-                "hint": pending}
+                "hint": pending_hint}
 
     def chan_transcribe_all(self, folder_or_name, combined=None):
         """Walk the channel folder for videos without .jsonl sidecars and queue each for whisper.
@@ -2778,8 +2853,9 @@ class Api:
         from backend.transcribe import _scan_existing_transcript_titles
         already_titles = _scan_existing_transcript_titles(folder, name)
 
-        queued = 0
         skipped = 0
+        bulk = []  # (video_path, plain_title)
+        import re as _re
         for dp, _dns, fns in os.walk(folder):
             for fn in fns:
                 if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a")):
@@ -2790,7 +2866,6 @@ class Api:
                 # Strip any trailing [videoId] from the title — OLD-format
                 # files still carry it; the aggregated scan stores plain
                 # titles without the bracket.
-                import re as _re
                 plain_title = _re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$",
                                       "", title) or title
                 # Per-video legacy .jsonl sidecar (OLD format)
@@ -2801,11 +2876,22 @@ class Api:
                 if plain_title in already_titles:
                     skipped += 1
                     continue
+                bulk.append((video, plain_title))
+
+        queued = 0
+        if bulk:
+            import uuid as _uuid
+            bulk_id = _uuid.uuid4().hex[:12]
+            bulk_total = len(bulk)
+            for idx, (video, plain_title) in enumerate(bulk):
                 # Pass combined flag through so the transcribe worker writes
                 # to the right aggregated file. Respects the user's choice
                 # even when it conflicts with the channel's split_years flag.
+                # bulk_id coalesces the popover display.
                 self._transcribe.enqueue(video, plain_title, channel=name,
-                                         combined=bool(combined))
+                                         combined=bool(combined),
+                                         bulk_id=bulk_id, bulk_total=bulk_total,
+                                         bulk_index=idx)
                 queued += 1
         self._log_stream.emit([
             ["[GPU] ", "trans_bracket"],
@@ -3008,11 +3094,49 @@ class Api:
                      "simpleline_green"],
                 ])
                 self._log_stream.flush()
+                # Install the 10-sample confirm bridge. The pipeline calls
+                # this callback inline on the worker thread; we park the
+                # thread on a threading.Event until the UI calls
+                # `redownload_sample_confirm(choice)`. Matches OLD's
+                # `_show_sample_popup` behavior at YTArchiver.py:10711.
+                def _confirm(avg_pct, direction, res_label, sample_n):
+                    ev = threading.Event()
+                    self._redwnl_sample = {
+                        "avg_pct": float(avg_pct),
+                        "direction": str(direction),
+                        "res_label": str(res_label),
+                        "sample_n": int(sample_n),
+                        "event": ev,
+                        "choice": "continue",
+                    }
+                    # Fire an event the HTML layer listens for via the log
+                    # stream — a zero-width tag payload keeps it out of
+                    # the visible log body.
+                    try:
+                        import json as _json
+                        _payload = _json.dumps({
+                            "kind": "redownload_sample",
+                            "avg_pct": float(avg_pct),
+                            "direction": str(direction),
+                            "res_label": str(res_label),
+                            "sample_n": int(sample_n),
+                        })
+                        self._log_stream.emit([
+                            [_payload, "__control__"],
+                        ])
+                        self._log_stream.flush()
+                    except Exception:
+                        pass
+                    # 5-minute auto-continue safety (OLD auto-continues too)
+                    ev.wait(timeout=300)
+                    return self._redwnl_sample.get("choice", "continue")
+
                 _rd.redownload_channel(
                     ch.get("name", ""), ch.get("url", ""), folder, new_res,
                     stream=self._log_stream,
                     cancel_ev=self._sync_cancel,
                     pause_ev=self._sync_pause,
+                    confirm_cb=_confirm,
                 )
             except Exception as e:
                 self._log_stream.emit_error(f"Redownload crashed: {e}")
@@ -3039,6 +3163,34 @@ class Api:
         self._sync_thread.start()
         self._on_queue_changed()
         return {"ok": True, "started": True, "resolution": new_res}
+
+    def redownload_sample_confirm(self, choice):
+        """UI → Python bridge for the "check 10 then re-ask" popup.
+
+        Called from app.js when the user clicks Continue / Cancel / picks
+        a new resolution in the sample-confirm modal. Releases the
+        worker thread that's parked on `_redwnl_sample["event"]`.
+
+        `choice`:
+          - "continue" → keep going at the current resolution
+          - "cancel"   → stop the redownload
+          - "best" / "2160" / "1440" / "1080" / "720" / "480" / "360"
+            / "240" / "144" → switch to that resolution and resample
+        """
+        pending = getattr(self, "_redwnl_sample", None)
+        if not pending:
+            return {"ok": False, "error": "no pending sample-confirm"}
+        c = str(choice or "continue").strip().lower()
+        if c not in ("continue", "cancel",
+                     "best", "2160", "1440", "1080", "720",
+                     "480", "360", "240", "144"):
+            return {"ok": False, "error": f"invalid choice: {c}"}
+        pending["choice"] = c
+        ev = pending.get("event")
+        if ev is not None:
+            try: ev.set()
+            except Exception: pass
+        return {"ok": True, "choice": c}
 
     def queue_pending_check(self):
         """Count channels that likely have new videos by comparing archive

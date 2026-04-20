@@ -332,14 +332,41 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     return dl_path
 
 
+_SAMPLE_SIZE = 10
+
+
+def _fmt_mb(size_bytes: float) -> str:
+    """Compact MB/GB pretty-print. Mirrors OLD `_fmt_enc_size`."""
+    mb = float(size_bytes) / (1024.0 * 1024.0)
+    if mb >= 1024:
+        return f"{mb / 1024.0:.2f} GB"
+    if mb >= 100:
+        return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB"
+
+
 def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        stream: LogStreamer,
                        cancel_ev: threading.Event,
                        pause_ev: Optional[threading.Event] = None,
+                       confirm_cb: Optional[Callable[[float, str, str, int],
+                                                     str]] = None,
                        ) -> Dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
     Caller is responsible for threading + queue bookkeeping.
+
+    `confirm_cb` — optional "check 10 then re-ask" hook. After the first
+    10 successful replacements, the pipeline pauses and calls
+    `confirm_cb(avg_pct, direction, res_label, sample_n)` where direction
+    is "larger" or "smaller". Return value controls the continuation:
+      - "continue"  → keep going at the current resolution
+      - "cancel"    → stop the redownload cleanly (cancel flag is set)
+      - a numeric resolution string like "1080" or "best" → switch
+        resolution and re-sample (another 10-video check at the new target)
+    If `confirm_cb` is None the sample-check is skipped entirely (matches
+    the behavior for resumed runs or runs smaller than the sample size).
+    Mirrors OLD's `_show_sample_popup` at YTArchiver.py:10711.
     """
     res_label = "Best" if new_res == "best" else f"{new_res}p"
     stream.emit([["=== Resolution Redownload: ", "header"],
@@ -390,11 +417,27 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                      [f" Resuming \u2014 {len(done)} already redownloaded.\n",
                       "simpleline_redwnl"]])
 
+    total_to_do = max(0, len(matched) - len(done))
+    # Sample-and-confirm: only meaningful if the caller provided the cb AND
+    # we're not resuming AND the job is big enough that "first 10" is a
+    # useful preview. Matches OLD at YTArchiver.py:10683-10692.
+    sample_done = bool(done) or total_to_do <= _SAMPLE_SIZE or confirm_cb is None
+    sample_results: List[Any] = []  # list of (orig_size, new_size) tuples
+    if not sample_done:
+        stream.emit([["[Redwnl]", "redwnl_bracket"],
+                     [f" Matched {total_to_do} file(s). Checking the "
+                      f"first {_SAMPLE_SIZE} at {res_label}\u2026\n",
+                      "simpleline_redwnl"]])
+
     # 5. Per-file redownload
     n_done = 0
     n_skipped = 0
     n_err = 0
-    for item in matched:
+    # Use a mutable list for current target so the sample-confirm branch
+    # can rewrite it mid-loop without breaking the closure.
+    cur_res = [new_res]
+    cur_res_label = [res_label]
+    for idx, item in enumerate(matched):
         if cancel_ev.is_set():
             break
         # Pause loop
@@ -406,41 +449,121 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             n_skipped += 1
             continue
         fp = item["filepath"]
-        if _already_at_target(fp, new_res):
+        if _already_at_target(fp, cur_res[0]):
             stream.emit([["[Redwnl]", "redwnl_bracket"],
-                         [f" {item['title']} already at {res_label} \u2014 skip.\n",
-                          "simpleline_redwnl"]])
+                         [f" {item['title']} already at {cur_res_label[0]} "
+                          f"\u2014 skip.\n", "simpleline_redwnl"]])
             done.add(vid)
-            _save_progress(folder, ch_url, new_res, done)
+            _save_progress(folder, ch_url, cur_res[0], done)
             n_skipped += 1
             continue
         stream.emit([["[Redwnl]", "redwnl_bracket"],
-                     [f" {item['title']} \u2192 {res_label}\u2026\n",
+                     [f" {item['title']} \u2192 {cur_res_label[0]}\u2026\n",
                       "simpleline_redwnl"]])
+        orig_size = 0
+        try:
+            orig_size = os.path.getsize(fp)
+        except OSError:
+            pass
         out_dir = os.path.dirname(fp) or folder
-        new_fp = _download_one(vid, new_res, out_dir, stream, cancel_ev)
+        new_fp = _download_one(vid, cur_res[0], out_dir, stream, cancel_ev)
         if not new_fp or not os.path.isfile(new_fp):
             n_err += 1
             continue
         # Preserve the ORIGINAL filename — OLD does `os.replace(temp, fp)`.
-        # This way OLD's sync + title-based scans never see a rename even
-        # if YouTube changed the video's title since our local copy.
         try:
-            # If the new file extension differs (e.g. original was .mkv, new
-            # is .mp4), adjust the target filename to match the new extension
-            # so we don't leave both files on disk.
+            new_size = 0
+            try:
+                new_size = os.path.getsize(new_fp)
+            except OSError:
+                pass
             new_ext = os.path.splitext(new_fp)[1].lower()
             orig_ext = os.path.splitext(fp)[1].lower()
             target_fp = fp
             if new_ext and new_ext != orig_ext:
                 target_fp = os.path.splitext(fp)[0] + new_ext
-                # Remove the old-extension file so we don't leave a duplicate.
                 try: os.remove(fp)
                 except OSError: pass
             os.replace(new_fp, target_fp)
             done.add(vid)
-            _save_progress(folder, ch_url, new_res, done)
+            _save_progress(folder, ch_url, cur_res[0], done)
             n_done += 1
+            # Per-file size-change log line (OLD YTArchiver.py:11067).
+            if orig_size > 0 and new_size > 0:
+                sz_ratio = (new_size / orig_size - 1) * 100
+                sz_dir = "larger" if sz_ratio >= 0 else "smaller"
+                stream.emit([
+                    ["[Redwnl]", "redwnl_bracket"],
+                    [f" \u2014 \u2713 {_fmt_mb(orig_size)} \u2192 "
+                     f"{_fmt_mb(new_size)} "
+                     f"({abs(sz_ratio):.0f}% {sz_dir})\n",
+                     "simpleline_redwnl"],
+                ])
+            elif new_size > 0:
+                stream.emit([
+                    ["[Redwnl]", "redwnl_bracket"],
+                    [f" \u2014 \u2713 {_fmt_mb(new_size)} "
+                     f"(replaced at {cur_res_label[0]})\n",
+                     "simpleline_redwnl"],
+                ])
+            # Track sample stats (only successful replacements with a
+            # known orig size). Once we hit _SAMPLE_SIZE we fire the cb.
+            if not sample_done and orig_size > 0 and new_size > 0:
+                sample_results.append((orig_size, new_size))
+                if (len(sample_results) >= _SAMPLE_SIZE
+                        and (idx + 1) < len(matched)
+                        and not cancel_ev.is_set()
+                        and confirm_cb is not None):
+                    avg_pct = (sum((n / o - 1) * 100
+                                   for o, n in sample_results)
+                               / len(sample_results))
+                    direction = "larger" if avg_pct >= 0 else "smaller"
+                    stream.emit([
+                        ["[Redwnl]", "redwnl_bracket"],
+                        [f" Sample of {len(sample_results)} files complete. "
+                         f"Average size: {abs(avg_pct):.0f}% {direction}. "
+                         f"Awaiting confirmation\u2026\n",
+                         "simpleline_redwnl"],
+                    ])
+                    try:
+                        choice = confirm_cb(float(avg_pct), direction,
+                                            cur_res_label[0],
+                                            len(sample_results))
+                    except Exception as e:
+                        stream.emit([
+                            ["[Redwnl]", "redwnl_bracket"],
+                            [f" sample-confirm callback errored: {e}. "
+                             f"Continuing.\n", "red"],
+                        ])
+                        choice = "continue"
+                    if choice == "cancel":
+                        stream.emit([
+                            ["[Redwnl]", "redwnl_bracket"],
+                            [" \u26d4 Redownload cancelled by user "
+                             "after sample.\n", "red"],
+                        ])
+                        cancel_ev.set()
+                        break
+                    elif choice == "continue":
+                        stream.emit([
+                            ["[Redwnl]", "redwnl_bracket"],
+                            [f" \u25B6 Continuing redownload at "
+                             f"{cur_res_label[0]}.\n", "simpleline_redwnl"],
+                        ])
+                        sample_done = True
+                    else:
+                        # Numeric resolution switch ("1080", "best", etc.)
+                        new_target = str(choice).strip().lower()
+                        cur_res[0] = new_target
+                        cur_res_label[0] = ("Best" if new_target == "best"
+                                            else f"{new_target}p")
+                        stream.emit([
+                            ["[Redwnl]", "redwnl_bracket"],
+                            [f" \u21bb Switching to {cur_res_label[0]}. "
+                             f"Re-sampling\u2026\n", "simpleline_redwnl"],
+                        ])
+                        sample_results = []
+                        # sample_done stays False so we re-check at new res
         except Exception as e:
             stream.emit([["[Redwnl]", "redwnl_bracket"],
                          [f" replace failed: {e}\n", "red"]])

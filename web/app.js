@@ -95,6 +95,106 @@
     try { window._setReady(false); } catch (_e) {}
   });
 
+  // ─── Redownload 10-sample confirm modal wiring ─────────────────────
+  // The Python worker emits a `__control__`-tagged log payload that
+  // logs.js intercepts and re-dispatches as a `yt-control` CustomEvent.
+  // We listen for kind=redownload_sample, fill the modal, and call
+  // api.redownload_sample_confirm() with the user's pick.
+  (function wireRedownloadSampleModal() {
+    const modal = () => document.getElementById("redwnl-sample-modal");
+    const sub = () => document.getElementById("redwnl-sample-sub");
+    const stats = () => document.getElementById("redwnl-sample-stats");
+    const countdown = () => document.getElementById("redwnl-sample-countdown");
+    const picker = () => document.getElementById("redwnl-sample-res-picker");
+
+    let tickHandle = null;
+    let remaining = 300;
+
+    function stopTick() {
+      if (tickHandle) { clearInterval(tickHandle); tickHandle = null; }
+    }
+    function startTick() {
+      remaining = 300;
+      const paint = () => {
+        const m = Math.floor(remaining / 60);
+        const s = String(remaining % 60).padStart(2, "0");
+        const el = countdown();
+        if (el) el.textContent = `Auto-continuing in ${m}:${s}\u2026`;
+      };
+      paint();
+      tickHandle = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+          stopTick();
+          answer("continue");
+          return;
+        }
+        paint();
+      }, 1000);
+    }
+
+    function answer(choice) {
+      stopTick();
+      const m = modal();
+      if (m) m.hidden = true;
+      if (!window.api || !window.api.redownload_sample_confirm) return;
+      try { window.api.redownload_sample_confirm(choice); }
+      catch (e) { console.error("redownload_sample_confirm failed:", e); }
+    }
+
+    function showPicker(show) {
+      const p = picker();
+      if (p) p.hidden = !show;
+    }
+
+    window.addEventListener("yt-control", (ev) => {
+      const d = ev && ev.detail;
+      if (!d || d.kind !== "redownload_sample") return;
+      const m = modal();
+      if (!m) return;
+      // Fill
+      if (sub()) {
+        sub().textContent =
+          `${d.sample_n || 10} files redownloaded at ${d.res_label || ""}`;
+      }
+      if (stats()) {
+        const dir = d.direction || "smaller";
+        const pct = Math.round(Math.abs(d.avg_pct || 0));
+        stats().textContent = `Average size change:  ${pct}% ${dir}`;
+        stats().classList.toggle("larger", dir === "larger");
+      }
+      showPicker(false);
+      m.hidden = false;
+      startTick();
+    });
+
+    // Button bindings — defer until DOM is ready since this IIFE runs
+    // at script load.
+    document.addEventListener("DOMContentLoaded", () => {
+      const btnC = document.getElementById("redwnl-sample-continue");
+      const btnX = document.getElementById("redwnl-sample-cancel");
+      const btnR = document.getElementById("redwnl-sample-change");
+      const btnResOk = document.getElementById("redwnl-sample-res-ok");
+      const btnResBack = document.getElementById("redwnl-sample-res-back");
+      if (btnC) btnC.addEventListener("click", () => answer("continue"));
+      if (btnX) btnX.addEventListener("click", () => answer("cancel"));
+      if (btnR) btnR.addEventListener("click", () => {
+        // Swap to res-picker; keep the countdown ticking though so an
+        // unattended run still auto-continues if the user walked away.
+        showPicker(true);
+      });
+      if (btnResOk) btnResOk.addEventListener("click", () => {
+        const picked = document.querySelector(
+          'input[name="redwnl-sample-res"]:checked');
+        if (!picked) return;
+        answer(picked.value);
+      });
+      if (btnResBack) btnResBack.addEventListener("click", () => {
+        showPicker(false);
+      });
+    });
+  })();
+
   // ─── Multi-choice dialog (e.g. Metadata Already Downloaded) ──────────
   // Usage:
   // const choice = await askChoice({
@@ -3690,46 +3790,10 @@
     // Folder Name field from the canonical channel name probe, so a
     // separate preview button was redundant.)
 
-    // Test URL button — probe via yt-dlp and show the canonical name + count
-    document.getElementById("btn-edit-test")?.addEventListener("click", async () => {
-      const urlInput = document.getElementById("edit-url");
-      const folderInput = document.getElementById("edit-folder");
-      const url = urlInput?.value.trim();
-      if (!url) { window._showToast?.("Enter a URL first.", "warn"); return; }
-      window._showToast?.("Probing\u2026", "ok");
-      const res = await window.pywebview?.api?.subs_test_url?.(url);
-      if (!res) { window._showToast?.("Native mode required.", "warn"); return; }
-      if (res.ok) {
-        window._showToast?.(`\u2713 ${res.name}${res.total ? " ("+res.total.toLocaleString()+" videos)" : ""}`, "ok");
-        if (res.url && res.url !== url) urlInput.value = res.url;
-
-        // Prefill/update the Name field from the canonical probe result.
-        const probed = (res.name || "").trim();
-        const current = (folderInput.value || "").trim();
-        if (probed) {
-          if (!current) {
-            folderInput.value = probed;
-            folderInput.classList.add("edit-autofilled");
-            setTimeout(() => folderInput.classList.remove("edit-autofilled"), 1800);
-          } else if (current.toLowerCase() !== probed.toLowerCase()) {
-            // Ask before overwriting a user-typed name.
-            const replace = await askConfirm(
-              "Channel name mismatch",
-              `YouTube says this channel is named:\n\n ${probed}\n\n` +
-              `Your Name field currently has:\n\n ${current}\n\n` +
-              `Use the probed name? (Renames the on-disk folder if this is Edit mode.)`,
-              { confirm: "Use probed name" });
-            if (replace) {
-              folderInput.value = probed;
-              folderInput.classList.add("edit-autofilled");
-              setTimeout(() => folderInput.classList.remove("edit-autofilled"), 1800);
-            }
-          }
-        }
-      } else {
-        window._showToast?.(res.error || "Probe failed.", "error");
-      }
-    });
+    // (Test URL button removed — folder-name autofill already happens on
+    // save via the canonical name probe. If an explicit "probe the URL
+    // before saving" action comes back, we'll add it in a menu rather
+    // than a footer button.)
 
     // Restore defaults button — pulls from settings and applies
     document.getElementById("btn-edit-restore")?.addEventListener("click", async () => {

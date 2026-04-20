@@ -413,6 +413,30 @@
    * line carrying that same tag (so progress bar ticks in place). */
   window._logBatch = function (payload) {
     if (!payload) return;
+    // Scan for control-channel segments before anything renders. These are
+    // one-shot bridges from the Python side (e.g. redownload sample-confirm
+    // popup). Emit a CustomEvent and DROP the segment so it never
+    // contaminates the visible log body.
+    if (Array.isArray(payload.main) && payload.main.length) {
+      payload.main = payload.main.filter((segs) => {
+        if (!Array.isArray(segs) || segs.length === 0) return true;
+        // A "control" line has exactly one segment tagged "__control__"
+        // and a JSON payload in position 0.
+        if (segs.length === 1 && Array.isArray(segs[0])
+            && segs[0][1] === "__control__") {
+          try {
+            const data = JSON.parse(segs[0][0] || "{}");
+            window.dispatchEvent(new CustomEvent("yt-control", {
+              detail: data,
+            }));
+          } catch (e) {
+            console.error("control payload parse failed:", e);
+          }
+          return false; // drop from visible log
+        }
+        return true;
+      });
+    }
     if (Array.isArray(payload.main) && payload.main.length) {
       const el = document.getElementById("main-log");
       if (el) {

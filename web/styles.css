@@ -1142,44 +1142,80 @@ body {
   color: var(--c-accent);
 }
 
-/* The core 4-column form grid:
-   [label-1] [value-1] [label-2] [value-2]
-   Rows that need full width (Range, Options) have their value cell
-   span columns 2..4 via .edit-gv-span. */
-.edit-grid {
-  display: grid;
-  grid-template-columns: auto 1fr auto 1fr;
-  column-gap: 14px;
-  row-gap: 6px;
+/* Flex-row Edit-channel form.
+   Layout model: `.edit-form` stacks `.edit-row`s vertically; each row
+   holds one or more `.edit-field`s side-by-side. Every `.edit-field`
+   carries its own label AND value inline (label left, value right)
+   so labels can NEVER drift from their values — no grid-cell tricks.
+
+   Hidden panels (video-nudge, compress-group) are standalone rows
+   that `display:none` cleanly without reshuffling any other field. */
+.edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.edit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
   align-items: center;
+}
+.edit-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.edit-field-grow {
+  flex: 1 1 240px;          /* input + label grows; 240 is the wrap point */
+}
+.edit-field-grow > input.ctl-input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.edit-field-full {
+  flex: 1 1 100%;
 }
 .edit-gl {
   color: var(--c-accent);
   font-size: 11.5px;
-  text-align: right;
   white-space: nowrap;
+  text-align: left;
 }
-.edit-gl-spacer { visibility: hidden; }
-.edit-gv-inline {
+.edit-nudge-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  font-size: 12px;
+}
+.edit-nudge-row[hidden] { display: none !important; }
+
+/* Legacy grid selectors — kept as no-ops so residual markup /
+   class-references elsewhere don't trip on missing rules. */
+.edit-grid { display: contents; }
+.edit-gl-spacer, .edit-gv-inline, .edit-gv-span, .edit-gl-row-start {
+  /* Fall back to flex container behavior if anything still uses them. */
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-.edit-gv-span { grid-column: 2 / -1; flex-wrap: wrap; }
-
-/* Pin a label to col 1 so it starts a new grid row — used for Range so
-   the label doesn't stack into col 3 of the Duration row leaving a blank
-   col 4 next to it. Pair with `.edit-gv-span` on the value cell. */
-.edit-gl-row-start { grid-column: 1; }
 
 /* Progressive disclosure: in Add mode with no input yet, hide everything
-   except the Folder Name + Channel URL row (matches YTArchiver.py:16903
-   _set_add_details_visible). `collapsed` flips off when the user types. */
-.edit-channel-box.collapsed .edit-grid > *:nth-child(n+5),
+   except the first row (Folder Name + Channel URL). The `.edit-form` is
+   flex-column with 1st child = row 1, so children 2+ are the hidable
+   rows (nudge, resolution+duration, range, folder-org+options,
+   compress-group). Flips off when the user types.
+   Matches YTArchiver.py:16903 _set_add_details_visible. */
+.edit-channel-box.collapsed .edit-form > *:nth-child(n+2),
 .edit-channel-box.collapsed .edit-diskstats,
 .edit-channel-box.collapsed .edit-actions,
-.edit-channel-box.collapsed #edit-range-group,
 .edit-channel-box.collapsed .edit-compress-group {
   display: none;
 }
@@ -3507,4 +3543,76 @@ body {
 @keyframes toast-in {
   from { transform: translateX(20px); opacity: 0; }
   to { transform: translateX(0); opacity: 1; }
+}
+
+/* ── Dark modal used for redownload "10-sample" confirm popup ── */
+.yt-modal {
+  position: fixed; inset: 0; z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+}
+.yt-modal[hidden] { display: none; }
+.yt-modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.55);
+}
+.yt-modal-body {
+  position: relative;
+  background: var(--c-raised);
+  color: var(--c-text);
+  border: 1px solid #2a2d32;
+  border-radius: 8px;
+  padding: 22px 26px;
+  min-width: 380px;
+  max-width: 500px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+.yt-modal-title {
+  font-size: 16px; font-weight: 600; margin-bottom: 4px;
+}
+.yt-modal-sub {
+  font-size: 12px; color: var(--c-accent); margin-bottom: 14px;
+}
+.yt-modal-stats {
+  font-size: 15px; font-weight: 600;
+  color: var(--c-log-green);
+  text-align: center;
+  padding: 10px 0;
+  margin-bottom: 12px;
+}
+.yt-modal-stats.larger { color: #e0c048; }
+.yt-modal-countdown {
+  font-size: 11px; color: var(--c-accent);
+  text-align: center; margin-bottom: 14px;
+}
+.yt-modal-buttons {
+  display: flex; gap: 8px; justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.yt-modal-btn {
+  background: #26292d; color: var(--c-text);
+  border: 1px solid #33363a;
+  border-radius: 5px;
+  padding: 7px 14px; font-size: 12px;
+  cursor: pointer;
+}
+.yt-modal-btn:hover { background: #30343a; }
+.yt-modal-btn.primary {
+  background: #2e5a3c; border-color: #3b7049;
+}
+.yt-modal-btn.primary:hover { background: #37684a; }
+.yt-modal-btn.danger {
+  background: #5a2e2e; border-color: #703b3b;
+}
+.yt-modal-btn.danger:hover { background: #6a3838; }
+.yt-modal-res-picker {
+  margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid #2a2d32;
+}
+.yt-modal-res-options {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 8px 14px; margin: 10px 0 14px;
+  font-size: 12px;
+}
+.yt-modal-res-options label {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
 }

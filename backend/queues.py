@@ -350,16 +350,56 @@ class QueueState:
                 })
 
             gpu_list = []
+            # Track which bulk_ids are being represented by the running
+            # item so the still-queued remainder from that bulk collapses
+            # into a single "Transcribe {ch} (N more)" row.
+            running_bulk_id = ""
             if self.current_gpu:
+                running_bulk_id = str(self.current_gpu.get("bulk_id") or "")
                 gpu_list.append({
-                    "name": self._task_label_gpu(self.current_gpu, running=True),
+                    "name": self._task_label_gpu(self.current_gpu, running=True,
+                                                 bulk_context=None),
                     "status": "running",
                 })
+            # Coalesce queued items by bulk_id. First pass: count items per
+            # bulk_id. Second pass: emit one row per bulk (or per-item if
+            # no bulk_id).
+            bulk_counts: Dict[str, int] = {}
+            bulk_channels: Dict[str, str] = {}
             for t in self.gpu:
-                gpu_list.append({
-                    "name": self._task_label_gpu(t, running=False),
-                    "status": "queued",
-                })
+                bid = str(t.get("bulk_id") or "")
+                if bid:
+                    bulk_counts[bid] = bulk_counts.get(bid, 0) + 1
+                    if bid not in bulk_channels:
+                        bulk_channels[bid] = (t.get("channel") or "").strip()
+            seen_bulks: set = set()
+            for t in self.gpu:
+                bid = str(t.get("bulk_id") or "")
+                if bid and bid in seen_bulks:
+                    continue
+                if bid and bulk_counts.get(bid, 0) > 1:
+                    # Emit one condensed row for the whole bulk.
+                    ch_name = bulk_channels.get(bid) or (t.get("channel") or "?")
+                    remaining = bulk_counts[bid]
+                    # If part of this bulk is already the "running" slot,
+                    # the queued remainder is one short of bulk_total.
+                    if bid == running_bulk_id:
+                        label = f"Transcribe {ch_name} ({remaining} more)"
+                    else:
+                        label = f"Transcribe {ch_name} ({remaining} videos)"
+                    gpu_list.append({
+                        "name": label,
+                        "status": "queued",
+                        "bulk_id": bid,
+                        "bulk_count": remaining,
+                    })
+                    seen_bulks.add(bid)
+                else:
+                    gpu_list.append({
+                        "name": self._task_label_gpu(t, running=False,
+                                                     bulk_context=None),
+                        "status": "queued",
+                    })
             return {
                 "sync": sync_list,
                 "gpu": gpu_list,
@@ -388,7 +428,10 @@ class QueueState:
         return f"{verb} {name}"
 
     @staticmethod
-    def _task_label_gpu(t: Dict[str, Any], running: bool) -> str:
+    def _task_label_gpu(t: Dict[str, Any], running: bool,
+                        bulk_context: Optional[Dict[str, Any]] = None) -> str:
+        # `bulk_context` is reserved for future coalesce-label overrides
+        # from to_ui_payload (per-video label remains the same for now).
         title = t.get("title") or os.path.basename(t.get("path", "?")).rsplit(".", 1)[0]
         raw_kind = (t.get("kind") or "transcribe").lower()
         if raw_kind == "transcribe":
@@ -399,6 +442,13 @@ class QueueState:
             verb = "Compressing" if running else "Compress"
         else:
             verb = raw_kind.capitalize()
+        # When the job is part of a bulk and is currently running, decorate
+        # it with "(X/total)" so the user can see progress through the batch.
+        if running:
+            bi = int(t.get("bulk_index") or 0)
+            bt = int(t.get("bulk_total") or 0)
+            if bt > 1:
+                return f"{verb} {title} ({bi + 1}/{bt})"
         return f"{verb} {title}"
 
     # ── pause state ─────────────────────────────────────────────────

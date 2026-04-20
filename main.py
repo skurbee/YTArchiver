@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 1:08pm ───────────────────────
+# ── Version header — last updated 4.20.26 2:17pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v46.2"
-APP_VERSION_DATE = "4.20.26 1:08pm"
+APP_VERSION      = "v46.3"
+APP_VERSION_DATE = "4.20.26 2:17pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────

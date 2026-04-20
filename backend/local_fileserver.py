@@ -32,60 +32,129 @@ _lock = threading.Lock()
 
 
 class _FileRequestHandler(BaseHTTPRequestHandler):
+    # Advertise HTTP/1.1 so `Accept-Ranges: bytes` + 206 Partial Content
+    # responses are recognized by WebView2 / Chromium video elements.
+    # Without this, the <video> tag couldn't seek — browser would request
+    # a byte range, the server would ignore it, and the playhead would
+    # snap back to currentTime. Scott reported exactly that.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format, *args):  # noqa: A002 — stdlib signature
         # Silence access log chatter; pywebview traffic is a constant stream
         pass
 
-    def do_GET(self):
+    def _resolve_path(self):
+        """Shared GET/HEAD path resolver. Returns the absolute path or None
+        (None means an error response was already sent)."""
         if self.path in ("/", "/ping"):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
             self.end_headers()
-            self.wfile.write(b"ok")
-            return
-        # /file/<url-encoded-abspath>
+            try: self.wfile.write(b"ok")
+            except (OSError, ConnectionError): pass
+            return None
         if not self.path.startswith("/file/"):
-            self.send_error(404)
-            return
+            self.send_error(404); return None
         raw = self.path[len("/file/"):]
-        # Strip query string if any
         q = raw.find("?")
         if q >= 0:
             raw = raw[:q]
         try:
             path = urllib.parse.unquote(raw)
         except Exception:
-            self.send_error(400)
-            return
-        # Normalize + basic safety: require absolute path, must exist,
-        # must be a file (not a dir), no funky traversal.
+            self.send_error(400); return None
         if not path or ".." in path.replace("\\", "/").split("/"):
-            self.send_error(400); return
+            self.send_error(400); return None
         if not os.path.isabs(path):
-            self.send_error(400); return
+            self.send_error(400); return None
         if not os.path.isfile(path):
-            self.send_error(404); return
-        ctype, _ = mimetypes.guess_type(path)
-        if not ctype:
-            ctype = "application/octet-stream"
+            self.send_error(404); return None
+        return path
+
+    def _parse_range(self, size: int):
+        """Parse the incoming `Range: bytes=START-END` header.
+
+        Returns (start, end, is_range). If the header is absent, returns
+        (0, size-1, False). If malformed or out of bounds, sends a 416
+        response and returns None so the caller knows to bail.
+        """
+        rng = self.headers.get("Range", "")
+        if not rng or not rng.startswith("bytes="):
+            return 0, size - 1, False
         try:
-            size = os.path.getsize(path)
-        except OSError:
-            self.send_error(500); return
+            spec = rng[len("bytes="):].split(",")[0].strip()
+            a, b = spec.split("-", 1)
+            start = int(a) if a else 0
+            end = int(b) if b else (size - 1)
+            # Suffix-range "bytes=-500" = last 500 bytes
+            if not a and b:
+                start = max(0, size - int(b))
+                end = size - 1
+            if start < 0 or end >= size or start > end:
+                raise ValueError
+        except Exception:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        return start, end, True
+
+    def do_HEAD(self):
+        path = self._resolve_path()
+        if path is None:
+            return
+        try: size = os.path.getsize(path)
+        except OSError: self.send_error(500); return
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self._resolve_path()
+        if path is None:
+            return  # ping reply or error was already sent
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        try: size = os.path.getsize(path)
+        except OSError: self.send_error(500); return
+
+        parsed = self._parse_range(size)
+        if parsed is None:
+            return  # 416 already sent
+        start, end, is_range = parsed
+        content_length = end - start + 1
+
+        if is_range:
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(content_length))
+        # Accept-Ranges: bytes tells the browser this resource is seekable.
+        # Without it, <video> won't even try range requests and falls back
+        # to sequential-only playback, which breaks scrubbing.
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         try:
             with open(path, "rb") as f:
-                # Stream in chunks for big video thumbnails etc.
-                while True:
-                    chunk = f.read(64 * 1024)
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
+                    remaining -= len(chunk)
         except (OSError, ConnectionError):
+            # Client closed the connection (common on seek — browser
+            # aborts the in-flight range to issue a new one). Silent.
             pass
 
 

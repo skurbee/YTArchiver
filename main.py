@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 4:53pm ───────────────────────
+# ── Version header — last updated 4.20.26 5:11pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v47.9"
-APP_VERSION_DATE = "4.20.26 4:53pm"
+APP_VERSION      = "v48.0"
+APP_VERSION_DATE = "4.20.26 5:11pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -384,6 +384,13 @@ class Api:
 
     def ping(self):
         return "pong"
+
+    def get_header_version(self):
+        """Live version string for the HTML header strip. JS calls this
+        on DOMContentLoaded and overwrites #header-version so the label
+        can never drift from APP_VERSION — the index.html hardcoded
+        placeholder is cosmetic fallback only."""
+        return {"version": APP_VERSION, "date": APP_VERSION_DATE}
 
     def get_activity_log_history(self):
         """

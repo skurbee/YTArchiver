@@ -95,6 +95,35 @@
     try { window._setReady(false); } catch (_e) {}
   });
 
+  // ─── Header version label — pull live from backend ─────────────────
+  // Previously the `#header-version` span held a hardcoded string
+  // ("v47.3 - 4.20.26 3:45pm") that no one ever updated, so every new
+  // build still rendered the old placeholder no matter what APP_VERSION
+  // in main.py said. This hook calls `api.get_header_version()` as soon
+  // as pywebview is live and writes the real values in place.
+  function _updateHeaderVersion() {
+    const el = document.getElementById("header-version");
+    if (!el) return;
+    const api = window.pywebview?.api;
+    if (!api || !api.get_header_version) {
+      // Retry shortly — pywebview may not have bound the api yet.
+      setTimeout(_updateHeaderVersion, 200);
+      return;
+    }
+    api.get_header_version().then((r) => {
+      if (!r) return;
+      const v = r.version || "";
+      const d = r.date || "";
+      el.textContent = d ? `${v} - ${d}` : v;
+    }).catch((e) => {
+      console.warn("get_header_version failed:", e);
+    });
+  }
+  window.addEventListener("pywebviewready", _updateHeaderVersion);
+  // Belt-and-suspenders: also try on DOMContentLoaded in case pywebview
+  // fired its ready event before our listener attached.
+  document.addEventListener("DOMContentLoaded", _updateHeaderVersion);
+
   // ─── Redownload 10-sample confirm modal wiring ─────────────────────
   // The Python worker emits a `__control__`-tagged log payload that
   // logs.js intercepts and re-dispatches as a `yt-control` CustomEvent.

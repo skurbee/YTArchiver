@@ -289,7 +289,7 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
     kept: List[str] = []
     removed_titles: set = set()
     vid_norm = (video_id or "").strip()
-    tit_norm = (title or "").strip()
+    tit_key = _norm_title(title)
     for line in old_lines:
         ls = line.strip()
         if not ls:
@@ -298,7 +298,10 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
             obj = json.loads(ls)
             seg_title = (obj.get("title") or "").strip()
             seg_vid = (obj.get("video_id") or "").strip()
-            if (seg_title and seg_title == tit_norm) or \
+            # Match by normalized title (punctuation-insensitive) OR by
+            # video_id. Either signal means this segment belongs to the
+            # video being re-transcribed and should be swapped out.
+            if (seg_title and _norm_title(seg_title) == tit_key) or \
                (vid_norm and seg_vid == vid_norm):
                 if seg_title:
                     removed_titles.add(seg_title)
@@ -349,8 +352,13 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
         except FileNotFoundError:
             content = ""
 
-        purge = {(t or "").strip() for t in (extra_titles_to_remove or ())}
-        purge.add(title.strip())
+        # Build purge set as NORMALIZED keys (NFC + lowercase +
+        # whitespace-collapsed + trailing-punct stripped). Without this
+        # the check below misses "Title." vs "Title" variants that the
+        # retranscribe flow legitimately needs to swap out — which is
+        # what caused the triple-block duplication in v47.6 and older.
+        purge = {_norm_title(t) for t in (extra_titles_to_remove or ())}
+        purge.add(_norm_title(title))
         purge.discard("")
 
         # Remove each matching entry (header line through the next header
@@ -365,8 +373,8 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
         captured = False
         for i in range(len(matches) - 1, -1, -1):
             m = matches[i]
-            entry_title = m.group(1).strip()
-            if entry_title not in purge:
+            entry_key = _norm_title(m.group(1))
+            if entry_key not in purge:
                 continue
             end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
             if not captured:
@@ -395,16 +403,23 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
 
 def _norm_title(s: str) -> str:
     """Normalize a title for comparison: NFC unicode, strip, collapse
-    internal whitespace, lowercase. Call before comparing titles pulled
-    from filenames vs aggregate transcripts — small differences (trailing
-    spaces, combining marks, case) shouldn't produce false-positive
-    "needs transcribing" matches."""
+    internal whitespace, lowercase, strip trailing `.?!` punctuation.
+
+    The trailing-punctuation strip is critical for the retranscribe
+    path: Whisper's stored title is "title." with a period while
+    YouTube captions wrote the same video as "title" without one, so
+    `_replace_txt_entry` / `_replace_jsonl_entry` failed their exact-
+    match check and appended duplicate blocks instead of surgically
+    swapping. This normalization brings both sides to the same key.
+    """
     import unicodedata as _ud
     if not s:
         return ""
     t = _ud.normalize("NFC", s).strip().lower()
     # Collapse internal whitespace to single spaces.
     t = re.sub(r"\s+", " ", t)
+    # Strip trailing . ? ! punctuation (possibly stacked).
+    t = re.sub(r"[.?!]+$", "", t).rstrip()
     return t
 
 

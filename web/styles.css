@@ -2166,13 +2166,38 @@ body {
   font-size: 11px;
 }
 
-/* Watch view */
+/* Watch view — layout must fit in the .browse-view area (no overall
+   page scroll). Scott's requirement: "the spoken word ALWAYS needs to
+   be on the first page without the user having to scroll down ...
+   the transcript needs to scroll UP". To achieve that we need to
+   constrain the whole Watch layout to the viewport height and let
+   only the transcript pane scroll internally.
+
+   Chain explained:
+   - `#view-watch` (sibling of view-channels etc.) gets `height:100%`
+     and `overflow:hidden` so it exactly fills `.browse-view` instead
+     of growing with content. When this view isn't active, its inline
+     `style="display:none"` wins and none of the below applies.
+   - `.watch-layout` uses `height:100%` (was `min-height:100%`) so the
+     grid never exceeds its container. `grid-template-rows: 1fr` pins
+     the single row to the available height.
+   - `min-height:0` on the grid items is the standard fix that lets
+     a grid cell shrink below its intrinsic content height so its
+     child's `overflow:auto` kicks in.
+*/
+#view-watch {
+  height: 100%;
+  overflow: hidden;
+}
 .watch-layout {
   display: grid;
   grid-template-columns: 2fr 1fr;
+  grid-template-rows: 1fr;
   gap: 14px;
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
 }
+.watch-layout > * { min-height: 0; }
 @media (max-width: 900px) {
   .watch-layout { grid-template-columns: 1fr; }
 }
@@ -2180,6 +2205,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Allow internal scroll when the metadata drawer expands beyond
+     the grid cell height (videos with long descriptions + 50+
+     comments). Without this, the expanded drawer would push the
+     column taller than its grid cell and the overflow:hidden on
+     #view-watch would clip the bottom comments. The video + title +
+     buttons stay pinned at the top; only the drawer scrolls. */
+  overflow-y: auto;
+  min-height: 0;
 }
 .watch-video-placeholder {
   aspect-ratio: 16 / 9;
@@ -3087,6 +3120,15 @@ body {
   padding: 8px 0;
   border-bottom: 1px dashed var(--c-border);
 }
+/* Clickable timestamps inside descriptions + comments — seek the
+   <video> element to that moment. Styled like a link (blue, hand
+   cursor, hover underline) to match YouTube's own behavior. */
+.desc-ts {
+  color: var(--c-log-blue, #6cb4ee);
+  cursor: pointer;
+  user-select: none;
+}
+.desc-ts:hover { text-decoration: underline; }
 .watch-meta-comments-header {
   color: var(--c-accent);
   font-size: 12px;

@@ -2416,9 +2416,13 @@ class TranscribeManager:
                 except Exception:
                     pass
 
-        # Source tag: the whisper result should carry model info; fall back
-        # to generic WHISPER tag. Old app uses e.g. "(WHISPER:large-v3)".
-        model_name = (result.get("model") or "").strip()
+        # Source tag: use the manager's active model so the Transcript.txt
+        # header carries the right "(WHISPER:<model>)" tag even when
+        # whisper_worker.py's response dict doesn't include "model"
+        # (which it doesn't — only status/text/segments come back).
+        # Without this, the Watch view banner shows just "Whisper
+        # transcription" with no model name. Scott flagged this.
+        model_name = (result.get("model") or self._model or "").strip()
         source_tag = f"(WHISPER:{model_name})" if model_name else "(WHISPER)"
 
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0

@@ -1056,7 +1056,10 @@
                 if (vEl.readyState >= 1) seek();
                 else vEl.addEventListener("loadedmetadata", seek, { once: true });
               }
-              // Scroll transcript to the clicked segment
+              // Scroll transcript to the clicked segment. Uses the
+              // container-local scroll helper so we don't also scroll
+              // the outer .browse-view (which would push the video
+              // out of frame).
               setTimeout(() => {
                 const tr = document.getElementById("watch-transcript");
                 if (!tr) return;
@@ -1064,7 +1067,7 @@
                 for (const s of segs) {
                   const ts = s.querySelector(".timestamp")?.textContent || "";
                   if (ts && ts.includes(_formatTs(r.start_time))) {
-                    s.scrollIntoView({ behavior: "smooth", block: "center" });
+                    window._scrollTranscriptTo?.(tr, s);
                     s.classList.add("search-hit");
                     break;
                   }
@@ -2202,9 +2205,14 @@
       countdownLabel: `Auto-selecting ${currentDefault} in`,
     });
     if (pick === null) return null;
-    // Persist + swap the running whisper process so the next job uses this.
+    // Swap the running whisper process for the next job ONLY — do NOT
+    // persist to config. The Settings > Whisper model dropdown is the
+    // authoritative place for the default; a one-off manual pick for a
+    // single retranscribe shouldn't mutate it. Second arg `false` =
+    // don't persist. Scott: "manual retranscriptions have nothing to
+    // do with that [settings default]".
     try {
-      await api?.transcribe_swap_model?.(pick);
+      await api?.transcribe_swap_model?.(pick, false);
     } catch (_e) {}
     return pick;
   }
@@ -5160,7 +5168,14 @@
       const el = findState.matches[idx];
       if (el) {
         el.classList.add("find-hit-active");
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        // Container-local scroll — scrollIntoView would also scroll
+        // the outer .browse-view and push the video out of frame.
+        const tr = document.getElementById("watch-transcript");
+        if (tr && window._scrollTranscriptTo) {
+          window._scrollTranscriptTo(tr, el);
+        } else {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
       }
       if (watchFindCount) {
         watchFindCount.textContent = `${idx + 1} of ${n}`;

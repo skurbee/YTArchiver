@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 2:17pm ───────────────────────
+# ── Version header — last updated 4.20.26 2:48pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v46.3"
-APP_VERSION_DATE = "4.20.26 2:17pm"
+APP_VERSION      = "v46.7"
+APP_VERSION_DATE = "4.20.26 2:48pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -1571,23 +1571,34 @@ class Api:
             "worker_script_exists": self._transcribe._worker_script.exists(),
         }
 
-    def transcribe_swap_model(self, new_model):
+    def transcribe_swap_model(self, new_model, persist=True):
         """Swap the whisper model mid-queue. Current job finishes; next job
-        picks up the new model."""
+        picks up the new model.
+
+        `persist=True` (default, used by the GPU popover's "set default"
+        dropdown): also saves the new model as `whisper_model` in config
+        so future launches use it by default.
+
+        `persist=False` (used by the one-off re-transcribe model picker
+        modal): only swaps the runtime model — doesn't touch the
+        Settings default. Scott: "manual retranscriptions have nothing
+        to do with that [settings default] and should have no influence
+        on that setting."
+        """
         if not new_model or new_model not in ("tiny", "small", "medium", "large-v3"):
             return {"ok": False, "error": "Unsupported model"}
         ok = self._transcribe.swap_model(new_model)
-        if ok and self._config is not None:
-            self._config["whisper_model"] = new_model
-        # Persist to config if write-gate on
-        try:
-            from backend.ytarchiver_config import save_config as _sc
-            cfg = load_config()
-            cfg["whisper_model"] = new_model
-            _sc(cfg)
-        except Exception:
-            pass
-        return {"ok": ok, "model": new_model}
+        if ok and persist:
+            if self._config is not None:
+                self._config["whisper_model"] = new_model
+            try:
+                from backend.ytarchiver_config import save_config as _sc
+                cfg = load_config()
+                cfg["whisper_model"] = new_model
+                _sc(cfg)
+            except Exception:
+                pass
+        return {"ok": ok, "model": new_model, "persisted": bool(ok and persist)}
 
     def transcribe_current_model(self):
         """Return the model the transcribe manager will use for the next job."""

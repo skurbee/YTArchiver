@@ -1545,26 +1545,13 @@
         ts: (window._formatTs ? window._formatTs(seg.s) : ""),
         text: seg.t, words: seg.w, s: seg.s, e: seg.e,
       }));
-      // Re-render in place — same API signature as the initial open.
-      // Snapshot the current playhead so playback resumes where it was
-      // instead of jumping back to 0. The source swap (auto-captions
-      // banner \u2192 Whisper banner) shouldn't interrupt the user.
-      const vEl = document.getElementById("watch-video");
-      const resumeAt = (vEl && !isNaN(vEl.currentTime)) ? vEl.currentTime : 0;
-      const wasPaused = vEl ? vEl.paused : true;
-      window.renderWatchView(cur, transcript, sourceInfo);
-      // Restore playback position after the new transcript DOM lands.
-      try {
-        const vEl2 = document.getElementById("watch-video");
-        if (vEl2 && resumeAt > 0) {
-          const resume = () => {
-            try { vEl2.currentTime = resumeAt; } catch {}
-            if (!wasPaused) { try { vEl2.play(); } catch {} }
-          };
-          if (vEl2.readyState >= 1) resume();
-          else vEl2.addEventListener("loadedmetadata", resume, { once: true });
-        }
-      } catch {}
+      // Re-render transcript + source banner ONLY — skip the video
+      // source reload + metadata drawer refresh. `skipVideoReload:true`
+      // leaves the <video> element's src and playhead alone, so the
+      // video keeps playing from wherever it was without the restart
+      // Scott saw in earlier versions.
+      window.renderWatchView(cur, transcript, sourceInfo,
+                             { skipVideoReload: true });
       window._showToast?.("Re-transcription complete \u2014 transcript updated.", "ok");
     } catch (e) { /* ignore */ }
   };
@@ -1582,13 +1569,19 @@
    *  from Whisper or YouTube auto-captions, and for auto-captions offers
    *  an inline "Re-transcribe with Whisper" link for better accuracy.
    */
-  window.renderWatchView = function (video, transcript, sourceInfo) {
+  window.renderWatchView = function (video, transcript, sourceInfo, opts) {
     const title = document.getElementById("watch-title");
     const meta  = document.getElementById("watch-meta");
     const tr    = document.getElementById("watch-transcript");
     const vEl   = document.getElementById("watch-video");
     const ph    = document.getElementById("watch-video-placeholder");
     if (!title || !meta || !tr) return;
+
+    // `opts.skipVideoReload`: set by _onRetranscribeComplete so the
+    // <video> element isn't re-sourced (which would restart playback
+    // from 0). We only need to refresh the transcript + source banner
+    // when the retranscribe for the currently-playing video finishes.
+    const skipVideoReload = !!(opts && opts.skipVideoReload);
 
     title.textContent = video.title || "Video Title";
     const parts = [];
@@ -1603,8 +1596,10 @@
     // to decide whether the completed job matches what's on screen.
     window._watchCurrentVideo = video;
 
-    _loadVideoSource(video, vEl, ph);
-    _loadWatchMetadataDrawer(video);
+    if (!skipVideoReload) {
+      _loadVideoSource(video, vEl, ph);
+      _loadWatchMetadataDrawer(video);
+    }
 
     tr.innerHTML = "";
     if (!transcript || transcript.length === 0) {
@@ -1785,10 +1780,15 @@
       }
       statsEl.textContent = bits.join("  \u00b7  ");
     }
-    // Description (plain text, preserve newlines)
+    // Description — scan for YouTube-style timestamps (M:SS, MM:SS,
+    // H:MM:SS) and render each as a clickable span that seeks the
+    // <video> element to that time. Matches YouTube's own
+    // description-timestamp behavior. Scott: "timestamps in descriptions
+    // are supposed to be clickable, just like youtube itself".
     if (descEl) {
-      descEl.textContent = (meta.description || "").trim()
-                         || "(No description.)";
+      _renderDescriptionWithTimestamps(
+        descEl,
+        (meta.description || "").trim() || "(No description.)");
     }
     // Comments — top N by likes
     const comments = Array.isArray(meta.comments) ? meta.comments : [];
@@ -1814,11 +1814,71 @@
         head.append(author, likes);
         const body = document.createElement("div");
         body.className = "watch-comment-body";
-        body.textContent = c.text || "";
+        // Render comment body with clickable timestamps (same helper
+        // as the description). Lots of YT comments carry "at 4:51 ..."
+        // style timestamps the viewer expects to click.
+        _renderDescriptionWithTimestamps(body, c.text || "");
         row.append(head, body);
         frag.appendChild(row);
       }
       commentsEl.appendChild(frag);
+    }
+  }
+
+  // Render a description string with any YouTube-style timestamps
+  // (M:SS, MM:SS, H:MM:SS, HH:MM:SS) converted to clickable seek
+  // links. The click handler sets `#watch-video`.currentTime to the
+  // parsed seconds and plays from there.
+  //
+  // Regex accepts any run of digits in the minute/hour positions so
+  // jumpy descriptions like "1:22:07" and "7:03" both match. The
+  // `(?<![\d:])` lookbehind prevents matches inside "3:14:15 PM" or
+  // "ratio 2:30" when they sit next to another digit or colon.
+  function _renderDescriptionWithTimestamps(el, text) {
+    el.innerHTML = "";
+    if (!text) return;
+    // Split on newlines, render timestamps per line so line breaks
+    // survive. textContent on a <span> inside a div preserves \n if
+    // we use `white-space: pre-wrap` (which .watch-meta-description
+    // already has) — but building paragraph nodes is cleaner.
+    // Instead we use a single container and insert `\n` literally
+    // between match-split fragments; CSS preserves the newlines.
+    const RX = /(?<![\d:])(\d{1,3}):(\d{2})(?::(\d{2}))?\b/g;
+    let lastIdx = 0;
+    let m;
+    while ((m = RX.exec(text)) !== null) {
+      // Pre-match text
+      if (m.index > lastIdx) {
+        el.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+      }
+      const h = m[3] ? Number(m[1]) : 0;
+      const mn = m[3] ? Number(m[2]) : Number(m[1]);
+      const s = m[3] ? Number(m[3]) : Number(m[2]);
+      // Sanity — "1:64" isn't a valid timestamp; skip it.
+      if (mn > 59 || s > 59) {
+        el.appendChild(document.createTextNode(m[0]));
+      } else {
+        const secs = h * 3600 + mn * 60 + s;
+        const span = document.createElement("span");
+        span.className = "desc-ts";
+        span.dataset.t = String(secs);
+        span.textContent = m[0];
+        span.addEventListener("click", (e) => {
+          e.preventDefault();
+          const vEl = document.getElementById("watch-video");
+          if (!vEl) return;
+          try {
+            vEl.currentTime = secs;
+            vEl.play().catch(() => {});
+          } catch {}
+        });
+        el.appendChild(span);
+      }
+      lastIdx = m.index + m[0].length;
+    }
+    // Trailing text
+    if (lastIdx < text.length) {
+      el.appendChild(document.createTextNode(text.slice(lastIdx)));
     }
   }
 
@@ -1929,6 +1989,30 @@
     } catch { /* noop */ }
   }
 
+  // Scroll an element (a .seg or word) into view WITHIN its transcript
+  // container only — DOES NOT scroll any ancestor scroll container.
+  // Scott: plain `scrollIntoView` walks up the parent chain and also
+  // scrolls the outer .browse-view, which pushed the video out of
+  // frame as karaoke followed along. This helper sets the container's
+  // scrollTop directly using getBoundingClientRect deltas so the
+  // calculation is offsetParent-independent.
+  window._scrollTranscriptTo = function (container, target) {
+    if (!container || !target) return;
+    try {
+      const cRect = container.getBoundingClientRect();
+      const tRect = target.getBoundingClientRect();
+      const topInScrollable =
+        (tRect.top - cRect.top) + container.scrollTop;
+      const y = topInScrollable
+              - (container.clientHeight / 2)
+              + (tRect.height / 2);
+      container.scrollTo({
+        top: Math.max(0, y),
+        behavior: "smooth",
+      });
+    } catch (_e) { /* fallback: skip, don't throw */ }
+  };
+
   // ── Karaoke: bind a single timeupdate handler per video load ──
 
   let _karaokeHandler = null;
@@ -1956,10 +2040,19 @@
         }
         if (idx >= 0 && segEls[idx]) {
           segEls[idx].classList.add("active");
-          // Auto-scroll transcript if toggle is on
+          // Auto-scroll transcript if toggle is on. CRITICAL: use
+          // container-local scrollTop rather than `scrollIntoView` —
+          // scrollIntoView walks up the parent chain and also scrolls
+          // the outer `.browse-view` container, which pushes the video
+          // off-screen as the karaoke follows along. Scott: "scrolls
+          // the whole page down so you can't see the video ... we need
+          // to scroll the transcription up to where the video is".
+          // Compute the element's offset relative to the scrollable
+          // transcript pane and set scrollTop directly so no ancestor
+          // containers move.
           const follow = document.getElementById("watch-autofollow");
           if (follow?.checked && trWrap) {
-            segEls[idx].scrollIntoView({ behavior: "smooth", block: "center" });
+            window._scrollTranscriptTo(trWrap, segEls[idx]);
           }
         }
         lastSegIdx = idx;

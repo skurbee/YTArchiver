@@ -14,7 +14,7 @@
   <!-- Header strip -->
   <div class="header-strip">
     <span class="header-title">YT ARCHIVER</span>
-    <span class="header-version" id="header-version">v46.3 - 4.20.26 2:17pm</span>
+    <span class="header-version" id="header-version">v46.7 - 4.20.26 2:48pm</span>
   </div>
 
   <!-- Tab row. Recent was previously a top-level tab (hangover from an
@@ -855,6 +855,26 @@
                   <span>Follow playback</span>
                 </label>
               </div>
+              <!-- Metadata drawer — description + views/likes/comments.
+                   Mirrors YTArchiver.py:31164 _player_drawer_frame. Lives
+                   inside the video column so the 2-col grid can cap at
+                   100% height without clipping it. Collapsed by default
+                   so the transcript stays prominent; click the header
+                   to expand. -->
+              <div class="watch-meta-drawer" id="watch-meta-drawer">
+                <div class="watch-meta-head" id="watch-meta-head">
+                  <span class="watch-meta-arrow" id="watch-meta-arrow">&#x25B8;</span>
+                  <span class="watch-meta-title">Description &amp; comments</span>
+                  <span class="watch-meta-stats" id="watch-meta-stats"></span>
+                </div>
+                <div class="watch-meta-body" id="watch-meta-body">
+                  <div class="watch-meta-description" id="watch-meta-description"></div>
+                  <div class="watch-meta-comments-header">
+                    <span id="watch-meta-comments-count"></span>
+                  </div>
+                  <div class="watch-meta-comments" id="watch-meta-comments"></div>
+                </div>
+              </div>
             </div>
             <div class="watch-transcript-wrap">
               <div class="watch-transcript-header">
@@ -874,24 +894,6 @@
                         title="Next match (Enter)" tabindex="-1">&#x25BC;</button>
               </div>
               <div class="watch-transcript" id="watch-transcript"></div>
-            </div>
-            <!-- Metadata drawer — description + views/likes/comments.
-                 Mirrors YTArchiver.py:31164 _player_drawer_frame. Collapsed
-                 by default so the transcript stays prominent; click the
-                 header to expand. -->
-            <div class="watch-meta-drawer" id="watch-meta-drawer">
-              <div class="watch-meta-head" id="watch-meta-head">
-                <span class="watch-meta-arrow" id="watch-meta-arrow">&#x25B8;</span>
-                <span class="watch-meta-title">Description &amp; comments</span>
-                <span class="watch-meta-stats" id="watch-meta-stats"></span>
-              </div>
-              <div class="watch-meta-body" id="watch-meta-body">
-                <div class="watch-meta-description" id="watch-meta-description"></div>
-                <div class="watch-meta-comments-header">
-                  <span id="watch-meta-comments-count"></span>
-                </div>
-                <div class="watch-meta-comments" id="watch-meta-comments"></div>
-              </div>
             </div>
           </div>
         </div>

@@ -29,30 +29,39 @@
     // is a known progress family; the log-batch renderer replaces the
     // previous line of the same kind instead of appending a new one.
     //
-    // sync_row_N tags are per-channel: the live header emit and the
-    // done-summary emit for channel N both carry `sync_row_12` (or
-    // whatever index). That way channel 12's summary replaces channel
-    // 12's header — but channel 13's live emit appends a new row
-    // because its kind ("sync_row_13") has no prior match.
-    for (const seg of segments || []) {
+    // TWO-PASS scan: per-job / per-row tags (e.g. "whisper_job_7",
+    // "sync_row_12", "dlrow_5") MUST win over the generic "whisper_"
+    // prefix, otherwise a segment tagged `["whisper_bracket",
+    // "whisper_job_7"]` returns "whisper" (generic) on first iteration
+    // and the done line (tagged `["dim", "whisper_job_7"]`) returns
+    // "whisper_job_7" — different kinds, so the progress 99% line
+    // never gets replaced by the "\u2713 Transcription" done line.
+    // Scott: "99% progress line stuck". Pass 1 scans every segment's
+    // every tag for a per-job/per-row match; pass 2 falls back to the
+    // prefix-family match if none found.
+    const segs = segments || [];
+
+    // Pass 1 — per-job / per-row unique kinds
+    for (const seg of segs) {
       if (!seg) continue;
       const tag = seg[1];
       const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
       for (const t of tags) {
-        // Per-job unique kinds MUST come before the prefix-only
-        // matches — without the per-job check, two transcriptions
-        // in the same channel would both classify as "whisper" and
-        // the second video's "Loading punctuation..." would stomp
-        // the first video's "— ✓ Transcription" done line out of
-        // the log. Scott reported exactly that: David Pakman had
-        // 2 downloads + 2 transcriptions per the activity row,
-        // but the main log showed zero transcription lines.
         if (t && t.startsWith("whisper_job_"))  return t;
+        if (t && t.startsWith("sync_row_"))     return t;
+        if (t && t.startsWith("dlrow_"))        return t;
+      }
+    }
+
+    // Pass 2 — prefix-family matches (shared in-place families)
+    for (const seg of segs) {
+      if (!seg) continue;
+      const tag = seg[1];
+      const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
+      for (const t of tags) {
         if (t && t.startsWith("whisper_"))      return "whisper";
         if (t && t.startsWith("encode_"))       return "encode";
         if (t && t.startsWith("startup_"))      return "startup";
-        if (t && t.startsWith("sync_row_"))     return t;  // per-channel unique kind
-        if (t && t.startsWith("dlrow_"))        return t;  // per-video unique kind
       }
     }
     return null;
@@ -1507,9 +1516,16 @@
       if (!wv || wv.style.display === "none") return;
       const cur = window._watchCurrentVideo || null;
       if (!cur) return;
+      // Normalize filepaths — Python sends os.path.normpath() output which
+      // uses backslashes on Windows, the video obj's `filepath` field may
+      // carry whatever separator the source set. Scott reported the Watch
+      // view not refreshing after retranscribe; Python-side logs showed
+      // the event fired but filepath comparison missed due to slash
+      // direction. Compare forward-slashed + lowercased on both sides.
+      const _norm = (s) => String(s || "").replace(/\\/g, "/").toLowerCase();
       const match = (video_id && cur.video_id && video_id === cur.video_id)
                  || (filepath && cur.filepath &&
-                     String(filepath).toLowerCase() === String(cur.filepath).toLowerCase());
+                     _norm(filepath) === _norm(cur.filepath));
       if (!match) return;
       const api = window.pywebview?.api;
       if (!api?.browse_get_transcript) return;
@@ -1530,7 +1546,25 @@
         text: seg.t, words: seg.w, s: seg.s, e: seg.e,
       }));
       // Re-render in place — same API signature as the initial open.
+      // Snapshot the current playhead so playback resumes where it was
+      // instead of jumping back to 0. The source swap (auto-captions
+      // banner \u2192 Whisper banner) shouldn't interrupt the user.
+      const vEl = document.getElementById("watch-video");
+      const resumeAt = (vEl && !isNaN(vEl.currentTime)) ? vEl.currentTime : 0;
+      const wasPaused = vEl ? vEl.paused : true;
       window.renderWatchView(cur, transcript, sourceInfo);
+      // Restore playback position after the new transcript DOM lands.
+      try {
+        const vEl2 = document.getElementById("watch-video");
+        if (vEl2 && resumeAt > 0) {
+          const resume = () => {
+            try { vEl2.currentTime = resumeAt; } catch {}
+            if (!wasPaused) { try { vEl2.play(); } catch {} }
+          };
+          if (vEl2.readyState >= 1) resume();
+          else vEl2.addEventListener("loadedmetadata", resume, { once: true });
+        }
+      } catch {}
       window._showToast?.("Re-transcription complete \u2014 transcript updated.", "ok");
     } catch (e) { /* ignore */ }
   };

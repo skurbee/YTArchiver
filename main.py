@@ -13,12 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-# ── Version header — last updated 4.20.26 12:44pm ──────────────────────
+# ── Version header — last updated 4.20.26 1:08pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Classic rule: every git push increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v46.0"
-APP_VERSION_DATE = "4.20.26 12:44pm"
+APP_VERSION      = "v46.2"
+APP_VERSION_DATE = "4.20.26 1:08pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -1500,27 +1500,33 @@ class Api:
         # that a title-only match would miss. Lookup order mirrors
         # `_write_outputs`:
         #   hint → `[videoId]` suffix on filename → FTS videos table.
+        # Also look up the channel name from the index DB so the
+        # [Trnscr] activity-log row shows the channel instead of
+        # em-dash. Scott: "no channel name?"
         vid_id = (video_id or "").strip()
+        channel_name = ""
         if not vid_id:
             import re as _re
             stem = os.path.splitext(os.path.basename(path))[0]
             m = _re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$", stem)
             if m:
                 vid_id = m.group(1)
-            else:
-                try:
-                    from backend.index import _open, _db_lock
-                    conn = _open()
-                    if conn is not None:
-                        with _db_lock:
-                            row = conn.execute(
-                                "SELECT video_id FROM videos WHERE filepath=? "
-                                "COLLATE NOCASE LIMIT 1",
-                                (os.path.normpath(path),)).fetchone()
-                        if row and row[0]:
-                            vid_id = row[0]
-                except Exception:
-                    pass
+        try:
+            from backend.index import _open, _db_lock
+            conn = _open()
+            if conn is not None:
+                with _db_lock:
+                    row = conn.execute(
+                        "SELECT video_id, channel FROM videos WHERE filepath=? "
+                        "COLLATE NOCASE LIMIT 1",
+                        (os.path.normpath(path),)).fetchone()
+                if row:
+                    if not vid_id and row[0]:
+                        vid_id = row[0]
+                    if row[1]:
+                        channel_name = row[1]
+        except Exception:
+            pass
         # Completion hook: push a JS event when the job finishes so the
         # Watch view can refetch the transcript + re-render its source
         # banner (replacing the "approximate" warning with the new
@@ -1543,6 +1549,7 @@ class Api:
         ok = self._transcribe.enqueue(
             path,
             title or os.path.basename(os.path.splitext(path)[0]),
+            channel=channel_name,
             retranscribe=True,
             video_id=vid_id,
             on_complete=_on_done,

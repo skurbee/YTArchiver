@@ -1804,6 +1804,11 @@ body {
 }
 .ctx-menu-item:hover { background: var(--c-btn); }
 .ctx-menu-item.dim { color: var(--c-dim); }
+.ctx-menu-item.danger { color: var(--c-log-red, #d36e6e); }
+.ctx-menu-item.danger:hover {
+  background: rgba(211, 110, 110, 0.12);
+  color: var(--c-log-red, #d36e6e);
+}
 .ctx-menu-item.disabled { color: var(--c-dim); cursor: default; }
 .ctx-menu-item.disabled:hover { background: transparent; }
 .ctx-menu-sep {

@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v49.5"
-APP_VERSION_DATE = "4.20.26 9:21pm"
+APP_VERSION      = "v49.6"
+APP_VERSION_DATE = "4.20.26 9:44pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -557,15 +557,53 @@ class Api:
     # ─── Queue mutations (right-click menu) ────────────────────────────
 
     def queues_sync_remove(self, identifier):
-        """Remove a pending sync item by URL or name."""
-        ok = self._queues.sync_remove(str(identifier or ""))
+        """Remove a pending sync item by URL (primary) or channel name.
+        `sync_remove` matches on `url` field; if the identifier doesn't
+        look like a URL, fall through to a second pass that matches on
+        `name` / `folder` to handle payloads where the URL was empty."""
+        ident = str(identifier or "").strip()
+        ok = self._queues.sync_remove(ident)
+        if not ok and ident:
+            # Try name / folder fallback — loop through and match by
+            # the channel's visible label instead of URL.
+            with self._queues._lock:
+                before = len(self._queues.sync)
+                self._queues.sync = [
+                    c for c in self._queues.sync
+                    if (c.get("name") or c.get("folder") or "") != ident
+                ]
+                ok = before != len(self._queues.sync)
+            if ok:
+                self._queues._notify()
+                self._queues.save_debounced()
         self._on_queue_changed()
         return {"ok": ok}
 
     def queues_gpu_remove(self, identifier):
-        ok = self._queues.gpu_remove(str(identifier or ""))
+        """Remove a pending GPU job by path (preferred) or bulk_id.
+        If the identifier starts with a recognizable bulk-id prefix
+        (hex tokens from `chan_transcribe_pending`), fall through to
+        `gpu_remove_bulk` to drop every sibling in that bulk at once —
+        otherwise the coalesced "Transcribe {ch} (N videos)" row only
+        removes a single underlying job per click."""
+        ident = str(identifier or "").strip()
+        if not ident:
+            return {"ok": False}
+        ok = self._queues.gpu_remove(ident)
+        if not ok:
+            # Fallback: treat as bulk_id.
+            dropped = self._queues.gpu_remove_bulk(ident)
+            ok = dropped > 0
         self._on_queue_changed()
         return {"ok": ok}
+
+    def queues_gpu_remove_bulk(self, bulk_id):
+        """Drop every GPU job with a matching `bulk_id` (coalesced row
+        removal). Called from the queue-popover context menu when the
+        user removes a "Transcribe {ch} (N videos)" row."""
+        dropped = self._queues.gpu_remove_bulk(str(bulk_id or ""))
+        self._on_queue_changed()
+        return {"ok": dropped > 0, "dropped": dropped}
 
     def queues_sync_reorder(self, identifier, new_index):
         ok = self._queues.sync_reorder(str(identifier or ""), int(new_index or 0))

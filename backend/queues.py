@@ -291,6 +291,23 @@ class QueueState:
             self.save_debounced()
         return changed
 
+    def gpu_remove_bulk(self, bulk_id: str) -> int:
+        """Remove every GPU queue item sharing a `bulk_id`. Returns the
+        number dropped. Used when the coalesced "Transcribe {ch} (N
+        videos)" row is removed from the context menu — one click should
+        drop all N videos, not just the top one."""
+        if not bulk_id:
+            return 0
+        with self._lock:
+            before = len(self.gpu)
+            self.gpu = [i for i in self.gpu
+                        if str(i.get("bulk_id") or "") != bulk_id]
+            dropped = before - len(self.gpu)
+        if dropped:
+            self._notify()
+            self.save_debounced()
+        return dropped
+
     def gpu_reorder(self, task_id: str, new_index: int) -> bool:
         with self._lock:
             idx = next((i for i, t in enumerate(self.gpu)
@@ -342,11 +359,22 @@ class QueueState:
                 sync_list.append({
                     "name": label,
                     "status": "running",
+                    # Identifiers used by the right-click "Remove from
+                    # queue" context menu → api.queues_sync_remove.
+                    # Without these the JS fell back to the display name
+                    # which didn't match the backend's URL-keyed removal.
+                    "url": (self.current_sync.get("url") or "").strip(),
+                    "channel_name": (self.current_sync.get("name")
+                                      or self.current_sync.get("folder")
+                                      or "").strip(),
                 })
             for ch in self.sync:
                 sync_list.append({
                     "name": self._task_label_sync(ch, running=False),
                     "status": "queued",
+                    "url": (ch.get("url") or "").strip(),
+                    "channel_name": (ch.get("name")
+                                      or ch.get("folder") or "").strip(),
                 })
 
             gpu_list = []
@@ -360,6 +388,8 @@ class QueueState:
                     "name": self._task_label_gpu(self.current_gpu, running=True,
                                                  bulk_context=None),
                     "status": "running",
+                    "path": (self.current_gpu.get("path") or "").strip(),
+                    "bulk_id": running_bulk_id,
                 })
             # Coalesce queued items by bulk_id. First pass: count items per
             # bulk_id. Second pass: emit one row per bulk (or per-item if
@@ -399,6 +429,8 @@ class QueueState:
                         "name": self._task_label_gpu(t, running=False,
                                                      bulk_context=None),
                         "status": "queued",
+                        "path": (t.get("path") or "").strip(),
+                        "bulk_id": str(t.get("bulk_id") or ""),
                     })
             return {
                 "sync": sync_list,

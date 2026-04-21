@@ -891,12 +891,24 @@
         const removed = _queueState[queueKind][idx];
         _queueState[queueKind].splice(idx, 1);
         paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
-        // Notify backend (best-effort; no-op in preview mode)
-        if (window.pywebview?.api) {
-          if (queueKind === "sync" && window.pywebview.api.queues_sync_remove) {
-            window.pywebview.api.queues_sync_remove(removed?.url || removed?.name || "");
-          } else if (queueKind === "gpu" && window.pywebview.api.queues_gpu_remove) {
-            window.pywebview.api.queues_gpu_remove(removed?.id || removed?.path || removed?.name || "");
+        // Notify backend. The payload now carries `url` / `channel_name`
+        // for sync rows and `path` / `bulk_id` for gpu rows (see
+        // queues.to_ui_payload), so the backend removal API actually
+        // finds the right item instead of missing on a display-label
+        // mismatch. For coalesced "Transcribe {ch} (N videos)" rows,
+        // fire the bulk-remove endpoint so all siblings drop together.
+        if (!window.pywebview?.api || !removed) return;
+        const api = window.pywebview.api;
+        if (queueKind === "sync" && api.queues_sync_remove) {
+          api.queues_sync_remove(removed.url || removed.channel_name
+                                  || removed.name || "");
+        } else if (queueKind === "gpu") {
+          const isBulk = !!removed.bulk_id && (removed.bulk_count || 0) > 1;
+          if (isBulk && api.queues_gpu_remove_bulk) {
+            api.queues_gpu_remove_bulk(removed.bulk_id);
+          } else if (api.queues_gpu_remove) {
+            api.queues_gpu_remove(removed.path || removed.bulk_id
+                                   || removed.id || removed.name || "");
           }
         }
       });
@@ -942,7 +954,7 @@
             }},
           // Old app: messagebox.askyesno("Remove from Queue", ...) line 20382
           { label: statusCls === "running" ? "Cancel task" : "Remove from queue",
-            cls: "dim",
+            cls: "danger",
             action: async () => {
               const title = statusCls === "running" ? "Cancel task" : "Remove from queue";
               const msg = statusCls === "running"

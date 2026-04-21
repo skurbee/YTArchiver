@@ -1265,53 +1265,9 @@
     card.querySelector(".video-card-meta").textContent = metaParts.join(" \u00b7 ");
     card.addEventListener("click", () => onVideoClick && onVideoClick(v));
 
-    // Hover preview: after ~400ms on a thumbnail, pop a larger preview
-    // overlay anchored to the card. Mirrors YTArchiver.py:26834
-    // _show_browse_thumbnail. Canceled on mouse-leave. Does not fire on
-    // cards that have no thumbnail.
-    if (v.thumbnail_url) {
-      let hoverTimer = null;
-      let overlay = null;
-      const showOverlay = () => {
-        if (overlay) return;
-        overlay = document.createElement("div");
-        overlay.className = "video-hover-preview";
-        const img = document.createElement("img");
-        img.src = v.thumbnail_url;
-        img.alt = "";
-        overlay.appendChild(img);
-        const cap = document.createElement("div");
-        cap.className = "video-hover-preview-caption";
-        cap.textContent = v.title || "";
-        overlay.appendChild(cap);
-        document.body.appendChild(overlay);
-        // Position to the right of the card (clamped to viewport)
-        const rect = card.getBoundingClientRect();
-        const targetW = 420, targetH = 236;
-        let x = rect.right + 10;
-        let y = rect.top;
-        if (x + targetW > window.innerWidth - 10) {
-          x = Math.max(10, rect.left - targetW - 10);
-        }
-        if (y + targetH > window.innerHeight - 10) {
-          y = Math.max(10, window.innerHeight - targetH - 10);
-        }
-        overlay.style.left = x + "px";
-        overlay.style.top = y + "px";
-      };
-      const cancel = () => {
-        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
-        if (overlay) {
-          overlay.remove();
-          overlay = null;
-        }
-      };
-      card.addEventListener("mouseenter", () => {
-        hoverTimer = setTimeout(showOverlay, 400);
-      });
-      card.addEventListener("mouseleave", cancel);
-      card.addEventListener("mousedown", cancel);
-    }
+    // (Hover-enlarge preview removed in v49.7 — intrusive on a dense
+    // grid; covered the adjacent cards and interrupted normal browsing
+    // flow without adding real information.)
 
     card.addEventListener("dblclick", (e) => {
       e.preventDefault();

@@ -1070,6 +1070,26 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                         or "does not have a shorts tab" in low):
                     stream.emit([[f" {s}\n", "dim"]])
                     continue
+                # Members-only content — not an error, just a skip.
+                # Matches OLD YTArchiver.py:18770. Auto-archive the id
+                # so next sync skips it instantly instead of re-trying.
+                if "members-only content" in low or "get access to members" in low:
+                    _vid_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
+                    _vid_id = _vid_m.group(1) if _vid_m else ""
+                    _title = current_title or (_vid_id or "video")
+                    stream.emit([
+                        ["[SKIP]", "filterskip"],
+                        [f" {_title} \u2014 Members-only content.\n",
+                         "filterskip_dim"],
+                    ])
+                    if _vid_id:
+                        try:
+                            with open(ARCHIVE_FILE, "a",
+                                      encoding="utf-8") as _af:
+                                _af.write(f"youtube {_vid_id}\n")
+                        except OSError:
+                            pass
+                    continue
                 stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
                 if "error" in low:
                     errors += 1

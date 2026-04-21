@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v49.6"
-APP_VERSION_DATE = "4.20.26 9:44pm"
+APP_VERSION      = "v50.0"
+APP_VERSION_DATE = "4.21.26 12:04pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────

@@ -2121,13 +2121,10 @@
       if (e.key === "Escape" && backdrop.style.display === "flex") hide();
     });
 
-    // Trigger: long-press Clear button in the activity-log row header, OR
-    // right-click on the activity log → "View full history"
-    document.getElementById("btn-clear")?.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      show();
-    });
-    // Also expose a global so tray / other triggers can open it
+    // Autorun-history viewer kept wired up for any remaining callers
+    // (tray menu, etc.) but no longer reachable from the Clear button
+    // menu per 2026-04-21 request — only the two clear actions in
+    // the dropdown, no "view full history" entry.
     window._openAutorunHistory = show;
 
     exportBtn?.addEventListener("click", async () => {
@@ -5183,52 +5180,80 @@
     });
   }
 
-  // ─── Clear log button wiring ─────────────────────────────────────────
+  // ─── Clear button wiring (consolidated dropdown) ─────────────────────
   function initClearLog() {
-    // "Clear log" button (next to Sync Subbed) — clears ONLY the main log,
-    // matching original YTArchiver behavior. Activity log has its own
-    // separate Clear button below it.
-    const btn = document.getElementById("btn-clear-log");
-    if (btn) {
-      btn.addEventListener("click", async () => {
-        const ok = await askConfirm("Clear log",
-          "Clear the main log?\n\nThis only clears the visible log \u2014 no files are affected.",
-          { confirm: "Clear", danger: true });
-        if (!ok) return;
-        window.clearLog?.("main-log");
-      });
+    // Single "Clear ▾" button (next to the Pause button in the main
+    // controls row). Click opens a context menu with two options:
+    //   - Clear log       (wipe the visible main log)
+    //   - Clear activity  (wipe + persist the activity-log history)
+    // Replaces the two separate buttons (main "Clear log" + autorun-
+    // row "Clear") that used to take up space in different places.
+    const btn = document.getElementById("btn-clear-menu");
+    if (!btn) return;
+
+    async function doClearMainLog() {
+      const ok = await askConfirm(
+        "Clear log",
+        "Clear the main log?\n\nThis only clears the visible log \u2014 no files are affected.",
+        { confirm: "Clear", danger: true });
+      if (!ok) return;
+      window.clearLog?.("main-log");
     }
 
-    // "Clear" button in the activity-log bar — empties the activity log
-    // history (the top strip showing Trnscr / Metdta / Sync rows) AND
-    // persists the clear to config so relaunch doesn't restore it.
-    const actBtn = document.getElementById("btn-clear");
-    if (actBtn) {
-      actBtn.addEventListener("click", async () => {
-        const ok = await askConfirm("Clear activity log",
-          "Permanently clear the activity-log history? This cannot be undone.",
-          { confirm: "Clear", danger: true });
-        if (!ok) return;
-        // Persist the clear BEFORE wiping the UI — if the backend fails,
-        // the UI still shows the stale entries so the user knows.
-        const api = window.pywebview?.api;
-        if (api?.autorun_history_clear) {
-          try {
-            const res = await api.autorun_history_clear();
-            if (!res?.ok) {
-              window._showToast?.(res?.error || "Clear failed.", "error");
-              return;
-            }
-          } catch (e) {
-            window._showToast?.("Clear failed: " + e, "error");
+    async function doClearActivity() {
+      const ok = await askConfirm(
+        "Clear activity log",
+        "Permanently clear the activity-log history? This cannot be undone.",
+        { confirm: "Clear", danger: true });
+      if (!ok) return;
+      const api = window.pywebview?.api;
+      if (api?.autorun_history_clear) {
+        try {
+          const res = await api.autorun_history_clear();
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Clear failed.", "error");
             return;
           }
+        } catch (e) {
+          window._showToast?.("Clear failed: " + e, "error");
+          return;
         }
-        window.clearLog?.("activity-log");
-        syncActivityLogVisibility();
-        window._showToast?.("Activity log cleared.", "ok");
-      });
+      }
+      window.clearLog?.("activity-log");
+      try { syncActivityLogVisibility(); } catch (_e) {}
+      window._showToast?.("Activity log cleared.", "ok");
     }
+
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      // Only surface the options that correspond to logs with actual
+      // content. If the main log is empty, no "Clear log" item. If the
+      // activity log is empty, no "Clear activity" item. If both are
+      // empty, `syncClearButtonsVisibility` has already hidden the
+      // button itself, so this code path doesn't run — but we guard
+      // against an empty menu just in case.
+      const mainLog = document.getElementById("main-log");
+      const actLog = document.getElementById("activity-log");
+      const hasMain = !!(mainLog && mainLog.childElementCount > 0);
+      const hasAct = !!(actLog && actLog.childElementCount > 0);
+      // Order: Clear activity on top, Clear log on bottom — the
+      // activity row sits above the main log in the UI layout, so
+      // the menu order mirrors that vertical arrangement.
+      const items = [];
+      if (hasAct) {
+        items.push({ label: "Clear activity",
+                     action: () => { doClearActivity(); } });
+      }
+      if (hasMain) {
+        items.push({ label: "Clear log",
+                     action: () => { doClearMainLog(); } });
+      }
+      if (!items.length) return;
+      const rect = btn.getBoundingClientRect();
+      if (window.showContextMenu) {
+        window.showContextMenu(rect.left, rect.bottom + 2, items);
+      }
+    });
   }
 
   // ─── Watch view action buttons ───────────────────────────────────────
@@ -5461,18 +5486,17 @@
   window._syncActivityLogVisibility = syncActivityLogVisibility;
 
   // ─── Clear buttons auto-hide when the log they clear is empty ────────
-  // "Clear log" (main log) and "Clear" (activity log) should only appear
-  // when there's actually something to clear. Otherwise they're clutter.
+  // Single "Clear ▾" button — hide it only when BOTH main log and
+  // activity log are empty (nothing to clear). Otherwise always show
+  // it so the dropdown is reachable whichever log has content.
   function syncClearButtonsVisibility() {
     const mainLog = document.getElementById("main-log");
     const actLog = document.getElementById("activity-log");
-    const clearLogBtn = document.getElementById("btn-clear-log");
-    const clearActBtn = document.getElementById("btn-clear");
-    if (clearLogBtn) {
-      clearLogBtn.hidden = !mainLog || mainLog.childElementCount === 0;
-    }
-    if (clearActBtn) {
-      clearActBtn.hidden = !actLog || actLog.childElementCount === 0;
+    const btn = document.getElementById("btn-clear-menu");
+    if (btn) {
+      const anyContent = (mainLog && mainLog.childElementCount > 0)
+                         || (actLog && actLog.childElementCount > 0);
+      btn.hidden = !anyContent;
     }
   }
   window._syncClearButtonsVisibility = syncClearButtonsVisibility;

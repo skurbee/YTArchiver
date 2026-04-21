@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v48.9"
-APP_VERSION_DATE = "4.20.26 6:34pm"
+APP_VERSION      = "v49.0"
+APP_VERSION_DATE = "4.20.26 7:07pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -372,12 +372,12 @@ class Api:
             # Subs-table column visibility toggle — piggybacked on runtime
             # info so the JS can apply the class BEFORE the first
             # renderSubsTable call and avoid a flash of the hidden column.
-            "show_avg_size": bool(cfg.get("show_avg_size", True)),
+            "show_avg_size": bool(cfg.get("show_avg_size", False)),
             # Recent tab view mode — "list" (legacy table) or "grid"
             # (thumbnail cards). Piggybacked here so the JS can set the
             # initial visibility of either view before the first render
             # and avoid a flash of the wrong view.
-            "recent_view_mode": (cfg.get("recent_view_mode") or "list"),
+            "recent_view_mode": (cfg.get("recent_view_mode") or "grid"),
         }
 
     # ─── Phase 0: log seeding ────────────────────────────────────────────
@@ -3411,15 +3411,11 @@ class Api:
 
     def settings_load(self):
         cfg = self._config or load_config()
-        # YTArchiver stores min_duration as seconds (180 = 3 minutes).
-        # The UI displays + accepts minutes, so convert here and on save.
-        raw_min_secs = int(cfg.get("min_duration", 180) or 0)
         return {
             "output_dir": cfg.get("output_dir", ""),
             "video_out_dir": cfg.get("video_out_dir", ""),
-            "whisper_model": cfg.get("whisper_model", "large-v3"),
+            "whisper_model": cfg.get("whisper_model", "small"),
             "default_resolution": cfg.get("default_resolution", "720"),
-            "default_min_duration": max(0, raw_min_secs // 60), # seconds -> minutes
             "log_mode": cfg.get("log_mode", "Simple"),
             # Index tab surfaces these directly — must round-trip.
             "tp_archive_roots": list(cfg.get("tp_archive_roots") or []),
@@ -3430,11 +3426,13 @@ class Api:
             "browse_preload_limit": int(cfg.get("browse_preload_limit", 150) or 150),
             "browse_preload_all": bool(cfg.get("browse_preload_all", False)),
             "last_disk_scan_ts": float(cfg.get("last_disk_scan_ts", 0) or 0),
-            # Subs table column visibility toggles. Default True so the
-            # column appears on fresh installs / upgrades (current behavior).
-            "show_avg_size": bool(cfg.get("show_avg_size", True)),
-            # Recent tab view mode — "list" (legacy) or "grid" (thumbnail cards).
-            "recent_view_mode": (cfg.get("recent_view_mode") or "list"),
+            # Subs table column visibility toggles. Default False for
+            # new users — the column is optional polish, not core info.
+            "show_avg_size": bool(cfg.get("show_avg_size", False)),
+            # Recent tab view mode — "list" (legacy) or "grid" (thumbnail
+            # cards). Default "grid" for new users — the thumbnail view
+            # reads more naturally at a glance.
+            "recent_view_mode": (cfg.get("recent_view_mode") or "grid"),
         }
 
     def settings_save(self, data):
@@ -3445,11 +3443,6 @@ class Api:
         if data.get("video_out_dir"): cfg["video_out_dir"] = os.path.normpath(data["video_out_dir"])
         if data.get("whisper_model"): cfg["whisper_model"] = data["whisper_model"]
         if data.get("default_resolution"): cfg["default_resolution"] = data["default_resolution"]
-        if data.get("default_min_duration") is not None:
-            try:
-                # UI sends minutes; YTArchiver's on-disk format is seconds.
-                cfg["min_duration"] = max(0, int(data["default_min_duration"])) * 60
-            except Exception: pass
         if data.get("log_mode") in ("Simple", "Verbose"):
             cfg["log_mode"] = data["log_mode"]
         # Index-tab persistence: archive roots + auto-index toggle + threshold.

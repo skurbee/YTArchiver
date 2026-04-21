@@ -5986,9 +5986,8 @@
         const s = await api.settings_load();
         document.getElementById("settings-output-dir").value = s.output_dir || "";
         document.getElementById("settings-video-dir").value = s.video_out_dir || "";
-        document.getElementById("settings-whisper-model").value = s.whisper_model || "large-v3";
+        document.getElementById("settings-whisper-model").value = s.whisper_model || "small";
         document.getElementById("settings-default-res").value = s.default_resolution || "720";
-        document.getElementById("settings-default-min").value = s.default_min_duration ?? 3;
         document.getElementById("settings-log-mode").value = s.log_mode || "Simple";
         // Startup knobs
         const stEl = document.getElementById("settings-disk-staleness");
@@ -6083,7 +6082,6 @@
         video_out_dir: document.getElementById("settings-video-dir").value,
         whisper_model: document.getElementById("settings-whisper-model").value,
         default_resolution: document.getElementById("settings-default-res").value,
-        default_min_duration: parseInt(document.getElementById("settings-default-min").value) || 3,
         log_mode: document.getElementById("settings-log-mode").value,
         // Startup knobs
         disk_scan_staleness_hours:

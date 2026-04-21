@@ -679,6 +679,16 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     for _pass_idx, _target_url in enumerate(_urls_to_run):
         if cancel_event is not None and cancel_event.is_set():
             break
+        # If the user paused during the main pass (yt-dlp's stdout
+        # loop broke out after emitting its "Paused — stopping
+        # current download" line), do NOT proceed to /streams.
+        # Otherwise /streams launches a fresh yt-dlp which hits
+        # the pause check on its very first stdout iteration and
+        # emits a second "Paused — stopping current download" line
+        # that the user never asked for. Reported: 2x "Paused
+        # stopping current download" + 1x "Sync paused at H:MMpm".
+        if pause_event is not None and pause_event.is_set():
+            break
         if _pass_idx > 0:
             # /streams header is verbose-only diagnostic. All segments
             # tagged 'dim' so `_line_is_verbose_only` drops the line in
@@ -740,14 +750,16 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # gate at the top of each iteration), so pressing pause
             # mid-download made the user wait for the current channel
             # to finish all of its videos. yt-dlp's `--continue`
-            # handles the partial on next run.
+            # handles the partial on next run. Pause is surfaced to
+            # the user by `_wait_if_paused()` which emits the
+            # "Sync paused at H:MMpm — click Resume." line once the
+            # outer loop advances — no need for a noisy "Paused —
+            # stopping current download" line here.
             if pause_event is not None and pause_event.is_set():
                 try:
                     proc.terminate()
                 except Exception:
                     pass
-                stream.emit([[" \u23F8 Paused \u2014 stopping current download.\n",
-                              "simpleline"]])
                 break
 
             s = line.rstrip()
@@ -882,7 +894,37 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             # Downloading emit used, so the ✓ done line
                             # REPLACES the Downloading line in simple mode
                             # (matches OLD's single-line-per-download pattern).
-                            _done_kind = f"dlrow_{_path_to_counter.get(final_path, _DLROW_COUNTER)}"
+                            #
+                            # Path-match robustness — literal key lookup
+                            # can miss when the Merger/DLTRACK path differs
+                            # from the Destination path by slash style,
+                            # casing, or an abs-vs-rel flip. Fall back to
+                            # a basename match across all announced paths.
+                            # If STILL no match, we must NOT fall through
+                            # to `_DLROW_COUNTER` — by the time this
+                            # DLTRACK fires, yt-dlp may have already
+                            # started extracting the NEXT video (its
+                            # Destination bumped the counter), so the
+                            # current counter no longer points to this
+                            # video's row. Lucy observed: video 1's
+                            # done line replaced video 2's progress row,
+                            # orphaning video 1's progress row as a
+                            # stuck "Downloading 100%". A fresh unique
+                            # marker is strictly safer — worst case the
+                            # done line appears at the log bottom,
+                            # leaving the old progress line in place
+                            # (tolerable, much better than cross-wiring).
+                            _dlrow_n = _path_to_counter.get(final_path)
+                            if _dlrow_n is None:
+                                _bn = os.path.basename(final_path).lower()
+                                for _k, _v in _path_to_counter.items():
+                                    if os.path.basename(_k).lower() == _bn:
+                                        _dlrow_n = _v
+                                        break
+                            if _dlrow_n is None:
+                                _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
+                            else:
+                                _done_kind = f"dlrow_{_dlrow_n}"
                             stream.emit([
                                 [" ", ["dim", _done_kind]],
                                 ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],

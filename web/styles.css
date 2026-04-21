@@ -1149,22 +1149,27 @@ body {
      start looking stupid at large widths." Bumped from 1400px \u2192 1800px
      when adding the new `tertiary` count column so each count cell
      has enough room for "1 transcribed" / "1 metadata" without ellipsis. */
+  /* Column minimums tuned tight to the actual text width at 12px font
+     so the row can compress further before losing trailing columns.
+     Before: counts at 120px mins totalled ~910px for the row.
+     Now: counts at 86px and took at 66px shave ~120px off, letting
+     the log stay intact down to ~790px window width. */
   grid-template-columns:
-    minmax(60px, auto) /* [Kind] */
-    minmax(96px, auto) /* time,date */
-    10px /* em-dash */
-    minmax(140px, 2.5fr) /* channel — biggest flex */
-    10px /* em-dash */
-    minmax(120px, 1fr) /* primary (N downloaded) */
-    minmax(120px, 1fr) /* secondary (N transcribed) */
-    minmax(120px, 1fr) /* tertiary (N metadata) [new] */
-    minmax(72px, 0.8fr) /* errors */
-    minmax(88px, 1fr); /* took */
+    minmax(58px, auto) /* [Kind] */
+    minmax(92px, auto) /* time,date */
+    8px /* em-dash */
+    minmax(110px, 2.5fr) /* channel — biggest flex */
+    8px /* em-dash */
+    minmax(98px, 1fr) /* primary (N downloaded) */
+    minmax(98px, 1fr) /* secondary (N transcribed — ✓ variant a bit wider than digits) */
+    minmax(98px, 1fr) /* tertiary (N metadata) */
+    minmax(60px, 0.8fr) /* errors */
+    minmax(66px, 1fr); /* took */
   max-width: 1800px;
   justify-content: stretch;
   align-items: center;
-  column-gap: 6px;
-  padding: 0 10px;
+  column-gap: 4px;
+  padding: 0 8px;
   height: 18px;
   line-height: 18px;
   white-space: nowrap;

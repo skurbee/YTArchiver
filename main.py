@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v50.0"
-APP_VERSION_DATE = "4.21.26 12:04pm"
+APP_VERSION      = "v51.1"
+APP_VERSION_DATE = "4.21.26 2:11pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -285,8 +285,22 @@ class Api:
                 gpu_alive = bool(self._transcribe.is_active())
             except Exception:
                 gpu_alive = gpu_working
-            sync_running = sync_alive or sync_working
-            gpu_running = gpu_alive or gpu_working
+            # Blink gate: "alive" state (worker thread running / job
+            # queued-and-pending) only counts when that queue's Auto
+            # is ON. Otherwise queued-but-parked items would make the
+            # button blink even though nothing's actually working.
+            # `_working` (= status=="running" on the head item) is
+            # NEVER gated — if a job IS running, we blink regardless
+            # of auto state (e.g., user clicked Start manually on a
+            # parked queue).
+            try:
+                _cfg = self._config or load_config()
+            except Exception:
+                _cfg = self._config or {}
+            _sync_auto = bool(_cfg.get("autorun_sync", False))
+            _gpu_auto = bool(_cfg.get("autorun_gpu", False))
+            sync_running = sync_working or (_sync_auto and sync_alive)
+            gpu_running = gpu_working or (_gpu_auto and gpu_alive)
             js = (
                 f"if (window.renderQueues) window.renderQueues({_json.dumps(payload)});"
                 f"if (window.setQueueState) window.setQueueState("
@@ -518,6 +532,19 @@ class Api:
                 # gate AND there are jobs sitting in the internal list.
                 try: self._transcribe._ensure_worker()
                 except Exception: pass
+            elif kind == "sync" and enabled:
+                # Symmetric with GPU: if the user toggles Auto ON and
+                # the sync queue has items (e.g., they clicked Sync
+                # Subbed with Auto off, then changed their mind),
+                # spin up the worker so the queue actually drains.
+                # Without this, the enqueued tasks would sit idle
+                # until the user clicked Start in the popover.
+                try:
+                    has_items = bool(self._queues.sync)
+                    if has_items and not self.sync_is_running():
+                        self.sync_start_all(add_downloads_from_config=False)
+                except Exception:
+                    pass
             return {"ok": True, "enabled": bool(enabled)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1235,6 +1262,35 @@ class Api:
             return {"ok": False, "error": "Sync already running"}
         if not sync_backend.find_yt_dlp():
             return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
+        # Auto-off + fresh "Sync Subbed" click: enqueue every channel
+        # but DON'T spawn the worker. User must manually click Start in
+        # the Sync Tasks popover (or toggle Auto on). Matches classic
+        # behavior where Auto-off means the queue is a shopping list,
+        # not a spin-up. The internal metadata/compress path uses
+        # add_downloads_from_config=False — those paths already have
+        # items queued and just need the worker drained, so they
+        # bypass this gate.
+        if add_downloads_from_config:
+            try:
+                cfg = self._config or load_config()
+                if not bool(cfg.get("autorun_sync", False)):
+                    # Don't double-queue if a prior Sync Subbed already
+                    # staged all the download tasks.
+                    existing_dl = any(
+                        (c.get("kind") or "download").lower() == "download"
+                        for c in self._queues.sync)
+                    queued = 0
+                    if not existing_dl:
+                        for ch in cfg.get("channels", []):
+                            if self._queues.sync_enqueue(ch):
+                                queued += 1
+                    self._on_queue_changed()
+                    return {"ok": True, "started": False, "queued": queued}
+            except Exception:
+                # If anything goes wrong here, fall through to the
+                # old behavior (start the worker). Better to over-fire
+                # than to silently drop the user's action.
+                pass
         # Clear every event that could have been left set by a previous pass:
         # cancel — fired by "Clear Queue" or the Cancel button
         # skip — fired by "Skip current"
@@ -3151,6 +3207,19 @@ class Api:
         def _run():
             from backend import redownload as _rd
             _scope_text = f" [{scope_label}]" if scope_label else ""
+            # Register the redownload as the active sync task so the
+            # Sync Tasks popover shows a `Redownloading {channel}
+            # ({res}p)` row with Pause/Resume/Cancel controls — matches
+            # the classic visualization (per screenshot reference).
+            # `kind=redownload` + `redownload_res` are read by
+            # `_task_label_sync` to produce the label.
+            _rd_task = dict(ch)
+            _rd_task["kind"] = "redownload"
+            _rd_task["redownload_res"] = new_res
+            try:
+                self._queues.set_current_sync(_rd_task)
+            except Exception:
+                pass
             try:
                 self._log_stream.emit([
                     ["[Sync] ", "sync_bracket"],
@@ -3207,6 +3276,9 @@ class Api:
             except Exception as e:
                 self._log_stream.emit_error(f"Redownload crashed: {e}")
             finally:
+                # Drop the redownload row from the Sync Tasks popover.
+                try: self._queues.set_current_sync(None)
+                except Exception: pass
                 self._log_stream.flush()
                 # Invalidate disk cache so Subs table re-scans sizes.
                 try:

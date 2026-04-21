@@ -721,10 +721,16 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
         conn = _open()
         if conn is None:
             return out
+        # `mark_video_transcribed` writes tx_status='transcribed' (see
+        # register/UPDATE at line 274), so the coverage count must match
+        # that string. Earlier this query tested 'done' — a mismatch
+        # that made fully-transcribed channels read as "0 / N" in the
+        # Edit-channel disk-stats footer.
         row = conn.execute(
             """SELECT
                  COUNT(*) AS total,
-                 SUM(CASE WHEN tx_status='done' THEN 1 ELSE 0 END) AS done,
+                 SUM(CASE WHEN tx_status IN ('transcribed', 'done')
+                          THEN 1 ELSE 0 END) AS done,
                  SUM(CASE WHEN tx_status='pending' OR tx_status IS NULL
                           THEN 1 ELSE 0 END) AS pending,
                  SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed

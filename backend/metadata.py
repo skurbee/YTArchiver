@@ -471,7 +471,7 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         stream.emit([
             [" ", "dim"],
             ["\u2014 \u2713 ", "meta_bracket"],
-            ["Metadata downloaded\n", "simpleline_pink"],
+            ["Metadata downloaded\n", "simpleline"],
         ])
     return {"ok": True, "fetched": True}
 
@@ -525,7 +525,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                                      split_years, split_months, wanted)
 
     stream.emit([
-        ["[Metdta] ", "meta_bracket"],
+        ["  \u2014 ", "meta_bracket"],
         [f"{name} ", "simpleline"],
         ["\u2014 ", "meta_bracket"],
         [f"fast-fetch {len(ids)} id(s)\n", "simpleline"],
@@ -535,6 +535,32 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
     t0 = time.time()
     fetched = skipped = errors = refreshed = 0
     idx = 0
+
+    # Sticky active status line pinned at the bottom of the log while
+    # the metadata fetch runs — mirrors classic YTArchiver.py:14207
+    # `_start_simple_anim(ch_name, 1, _fetch_total, mode="metadata")`.
+    # Each per-video update fires a `clear_line` control to drop the
+    # old active line and re-emits a fresh one at the current DOM
+    # bottom via the `metadata_active` marker.
+    import json as _json
+    def _emit_active(_i: int, _n: int):
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "metadata_active"}),
+             "__control__"],
+        ])
+        stream.emit([
+            [f"[{_i}/{_n}] ", ["meta_bracket", "metadata_active"]],
+            [f"Fetching Metadata: {name}\u2026\n",
+             ["meta_bracket", "metadata_active"]],
+        ])
+
+    def _clear_active():
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "metadata_active"}),
+             "__control__"],
+        ])
 
     for jp, g in groups.items():
         if cancel_event is not None and cancel_event.is_set():
@@ -602,6 +628,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                 [" \u2014 ", "meta_bracket"],
                 [f"{title[:90]}\n", "simpleline"],
             ])
+            _emit_active(idx, total)
             entry = _fetch_video_metadata(yt, vid_id, title)
             if entry is None:
                 errors += 1
@@ -652,6 +679,11 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                 _write_metadata_jsonl(jp, existing)
             except Exception as e:
                 stream.emit_error(f"Could not write {jp}: {e}")
+
+    # Drop the sticky active line before the summary so the "Metadata
+    # X — N fetched ..." footer doesn't sit below a phantom "Fetching
+    # Metadata: X..." line that's no longer accurate.
+    _clear_active()
 
     elapsed = time.time() - t0
     summary_parts = []
@@ -865,7 +897,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
-    stream.emit([["[Metdta] ", "meta_bracket"],
+    stream.emit([["  \u2014 ", "meta_bracket"],
                  [f"Rechecking {name}...\n", "simpleline"]])
 
     # 1. Enumerate videos ON DISK. `_scan_channel_videos` returns

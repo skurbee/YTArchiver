@@ -1247,6 +1247,35 @@
   <!-- Toast notifications mount -->
   <div id="toast-root"></div>
 
+  <!-- First-launch archive-root picker. Non-dismissable: the user
+       MUST choose a folder before the app becomes usable. -->
+  <div id="welcome-modal" class="yt-modal" hidden>
+    <div class="yt-modal-backdrop"></div>
+    <div class="yt-modal-body" style="min-width:460px; max-width:560px;">
+      <div class="yt-modal-title">Pick an archive folder</div>
+      <div class="yt-modal-sub">
+        YTArchiver saves each subscribed channel as
+        <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
+        thumbnails, and transcripts are stored alongside the videos.
+      </div>
+      <div class="yt-modal-sub" style="margin-top:10px;">
+        Choose an empty folder (or an existing YTArchiver archive).
+        You can change it later in Settings.
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;
+                  margin-top:18px; margin-bottom:14px;">
+        <input type="text" id="welcome-path" class="ctl-input"
+               readonly placeholder="No folder selected"
+               style="flex:1 1 auto; min-width:0;" />
+        <button class="yt-modal-btn" id="welcome-browse">Browse&hellip;</button>
+      </div>
+      <div class="yt-modal-buttons">
+        <button class="yt-modal-btn primary" id="welcome-continue"
+                disabled>Continue</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
        listens for the `yt-control` event (kind=redownload_sample) and
        fills/shows it. Buttons call api.redownload_sample_confirm(). -->
@@ -1288,7 +1317,7 @@
 
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally — no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
-  <script src="logs.js?v=21"></script>
-  <script src="app.js?v=53"></script>
+  <script src="logs.js?v=26"></script>
+  <script src="app.js?v=58"></script>
 </body>
 </html>

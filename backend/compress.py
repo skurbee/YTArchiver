@@ -137,8 +137,12 @@ def compress_video(input_path: str, stream: LogStreamer,
 
     name = os.path.basename(input_path)
     display = name if len(name) <= 60 else name[:57] + "..."
+    # Em-dash prefix (compress-color) + white body, matching classic
+    # simpleline_compress painter output (brackets/em-dashes colored,
+    # body text default).
     stream.emit([
-        ["Encoding ", "simpleline_compress"],
+        ["  \u2014 ", "simpleline_compress"],
+        ["Encoding ", "simpleline"],
         [f'"{display}"', "encode_title"],
         [f" \u2014 {quality} / {output_res}p\n", "dim"],
     ])
@@ -219,12 +223,15 @@ def compress_video(input_path: str, stream: LogStreamer,
             stream.emit_error(f"Could not replace original: {e}")
             return {"ok": False, "error": str(e)}
 
+    # Per-file done line. Green checkmark + white filename + dim size
+    # delta, with the saved-percent in compress color to match the
+    # classic painter emphasis (only the highlight bits colored).
     stream.emit([
         [" \u2713 ", "simpleline_green"],
         [f"{display} ", "simpleline"],
         [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ", "dim"],
-        [f"(\u2212{saved_pct:.0f}%) ", "simpleline_compress"],
-        [f"in {took:.0f}s\n", "dim"],
+        [f"(\u2212{saved_pct:.0f}%)", "simpleline_compress"],
+        [f" in {took:.0f}s\n", "dim"],
     ])
     return {"ok": True, "orig_bytes": orig_size, "new_bytes": new_size,
             "saved_pct": saved_pct, "took": took}
@@ -293,6 +300,32 @@ def compress_videos_batch(paths, stream: LogStreamer,
     n_err = 0
     sum_orig = 0
     sum_new = 0
+
+    # Sticky active status line pinned at the bottom during the batch
+    # compress pass — mirrors classic's `mode="compress"` anim
+    # (YTArchiver.py:1976 _ANIM_MODES). `clear_line` control drops the
+    # old line so each update lands at the current DOM bottom.
+    import json as _json
+    _batch_label = f"Compressing batch {batch_num}/{batch_total}" if batch_total > 1 else "Compressing"
+    def _emit_active(_i: int, _n: int, _fname: str):
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "compress_active"}),
+             "__control__"],
+        ])
+        stream.emit([
+            [f"[{_i}/{_n}] ", ["compress_bracket", "compress_active"]],
+            [f"{_batch_label}: {_fname}\u2026\n",
+             ["compress_bracket", "compress_active"]],
+        ])
+
+    def _clear_active():
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "compress_active"}),
+             "__control__"],
+        ])
+
     for i, path in enumerate(paths, 1):
         if cancel_event is not None and cancel_event.is_set():
             stream.emit_text(" \u26d4 Batch cancelled.", "red")
@@ -301,6 +334,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
             [f"[{i}/{len(paths)}] ", "compress_bracket"],
             [f"{os.path.basename(path)}\n", "simpleline"],
         ])
+        _emit_active(i, len(paths), os.path.basename(path))
         res = compress_video(path, stream, quality=quality,
                               output_res=output_res,
                               cancel_event=cancel_event)
@@ -336,11 +370,19 @@ def compress_videos_batch(paths, stream: LogStreamer,
         else:
             n_err += 1
 
+    # Drop the sticky active-status line before the done-summary so
+    # the "Batch done" footer doesn't sit below a phantom
+    # "Compressing..." line that's no longer accurate.
+    _clear_active()
+
     saved = (1 - sum_new / sum_orig) * 100.0 if sum_orig else 0.0
+    # Done summary — green checkmark + white body (body was
+    # fully-compress-colored before; matches classic painter rule now).
     stream.emit([
-        [" \u2713 Batch done: ", "simpleline_green"],
+        [" \u2713 ", "simpleline_green"],
+        ["Batch done: ", "simpleline"],
         [f"{n_done}/{len(paths)} compressed \u00b7 {n_grew} redone \u00b7 "
-         f"{n_err} errors \u00b7 saved {saved:.1f}%\n", "simpleline_compress"],
+         f"{n_err} errors \u00b7 saved {saved:.1f}%\n", "simpleline"],
     ])
 
     # autorun_history [Cmprss] row — matches YTArchiver.py:22602

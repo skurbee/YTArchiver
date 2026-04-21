@@ -41,8 +41,13 @@ CHANNEL_ID_CACHE = APP_DATA_DIR / "ytarchiver_channel_ids.json"
 
 # Matches YTArchiver.py DEFAULT_CONFIG at line 149
 DEFAULT_CONFIG = {
-    "output_dir": str(Path.home() / "Channel Archives"),
-    "video_out_dir": str(Path.home() / "Video Downloads"),
+    # No archive-root default. First-launch flow forces the user to
+    # pick a folder via the welcome modal before the app is usable.
+    # Previously we assumed `~/Channel Archives` which silently got
+    # baked into config on first load, leaving the app half-configured
+    # if the user dismissed the welcome prompt.
+    "output_dir": "",
+    "video_out_dir": "",
     "vid_date_file": True,
     "vid_add_date": False,
     "min_duration": 0,
@@ -322,6 +327,14 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         cfg.get("channels", []),
         key=lambda c: c.get("name", "").lower(),
     )
+    # Pre-derive the archive root once — we need it to check for
+    # `_redownload_progress.json` in each channel's folder so the
+    # Subs table can flag channels with unfinished redownloads.
+    _base_dir = (cfg.get("output_dir") or "").strip()
+    try:
+        from .sync import channel_folder_name as _cfn_for_redwnl
+    except Exception:
+        _cfn_for_redwnl = None
     rows = []
     total_gb = 0.0
     for ch in channels:
@@ -390,6 +403,36 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         else:
             avg_str = "\u2014"
 
+        # Pending-redownload probe: the redownload pipeline persists a
+        # `_redownload_progress.json` next to the channel's videos while
+        # a pass is in flight. When that file is present the Subs table
+        # paints a small chartreuse dot next to the channel name so the
+        # user sees at a glance which channels still have unfinished
+        # resolution upgrades. We ALSO parse the file to extract the
+        # target resolution so the right-click menu can show "Continue
+        # Redownload at 480p" instead of the generic "Redownload at..."
+        # submenu when this channel has pending work.
+        _pending_redwnl = False
+        _pending_redwnl_res = ""
+        if _base_dir and _cfn_for_redwnl is not None:
+            try:
+                import os as _os
+                _ch_folder = _os.path.join(_base_dir, _cfn_for_redwnl(ch))
+                _pp = _os.path.join(_ch_folder,
+                                     "_redownload_progress.json")
+                if _os.path.isfile(_pp):
+                    _pending_redwnl = True
+                    try:
+                        import json as _j
+                        with open(_pp, "r", encoding="utf-8") as _f:
+                            _data = _j.load(_f)
+                        _pending_redwnl_res = (
+                            _data.get("resolution") or "").strip()
+                    except Exception:
+                        pass
+            except Exception:
+                _pending_redwnl = False
+
         rows.append({
             "folder": folder,
             "res": res + ("p" if res.isdigit() else ""),
@@ -412,6 +455,13 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
             # is no longer the source of truth — the IDs are.
             "_pending_tx": _pending_tx_n,
             "_pending_meta": int(ch.get("metadata_pending", 0) or 0),
+            # Chartreuse dot indicator in the Subs folder cell — True
+            # when `_redownload_progress.json` exists for this channel.
+            "_pending_redownload": _pending_redwnl,
+            # Saved target resolution so the right-click menu can show
+            # "Continue Redownload at 480p" instead of the generic
+            # "Redownload at..." submenu when there's pending work.
+            "_redownload_res": _pending_redwnl_res,
         })
         total_gb += ch.get("size_gb", 0) or 0
 

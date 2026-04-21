@@ -134,7 +134,7 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             env=_utf8_env(),
         )
     except Exception as e:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
+        stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" yt-dlp spawn failed: {e}\n", "red"]])
         return {}
     result: Dict[str, str] = {}
@@ -157,9 +157,9 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
                     pg = int(pm.group(1))
                     if pg >= last_page + 10:
                         last_page = pg
-                        stream.emit([["[Redwnl]", "redwnl_bracket"],
+                        stream.emit([["  \u2014", "simpleline_redwnl"],
                                      [f" Scanning catalog (page {pg})\u2026\n",
-                                      "simpleline_redwnl"]])
+                                      "simpleline"]])
     finally:
         try:
             proc.wait(timeout=300)
@@ -205,11 +205,39 @@ def _match_files_to_ids(local_files: Dict[str, str],
     return matched
 
 
+def _find_ffprobe() -> str:
+    """Locate ffprobe the same way compress.find_ffmpeg locates ffmpeg:
+    PATH first, then the app dir + cwd. Returns "ffprobe" as a
+    last-resort string so `subprocess.run` fails cleanly (rather than
+    silently No-op'ing) when truly absent.
+
+    Before this fix, `_ffprobe_height` hard-coded the bare string
+    "ffprobe" which only worked when the exe was on PATH. For users
+    running the bundled build without ffmpeg installed system-wide,
+    every height probe failed → `_already_at_target` returned False →
+    redownload re-fetched every file even when it was already at the
+    target resolution, producing "0% smaller" noise (file content
+    byte-identical to the original).
+    """
+    import shutil as _sh
+    p = _sh.which("ffprobe") or _sh.which("ffprobe.exe")
+    if p:
+        return p
+    from pathlib import Path as _P
+    for c in [
+        _P.cwd() / "ffprobe.exe",
+        _P(__file__).resolve().parent.parent / "ffprobe.exe",
+    ]:
+        if c.exists():
+            return str(c)
+    return "ffprobe"
+
+
 def _ffprobe_height(filepath: str) -> Optional[int]:
     """Return the video stream's height, or None if ffprobe isn't usable."""
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error",
+            [_find_ffprobe(), "-v", "error",
              "-select_streams", "v:0",
              "-show_entries", "stream=height",
              "-of", "default=noprint_wrappers=1:nokey=1",
@@ -296,7 +324,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             env=_utf8_env(),
         )
     except Exception as e:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
+        stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" spawn failed for {video_id}: {e}\n", "red"]])
         return None
     dest: Optional[str] = None
@@ -372,21 +400,28 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     stream.emit([["=== Resolution Redownload: ", "header"],
                  [f"{ch_name} ({res_label}) ===\n", "header"]])
 
-    # Pause-on-entry — makes the ✓Resume from a restored pause clean.
+    # Pause-on-entry — makes the Resume from a restored pause clean.
     if pause_ev is not None and pause_ev.is_set() and not cancel_ev.is_set():
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
-                     [" Paused \u2014 click Resume.\n", "pauselog"]])
+        stream.emit([
+            [f"  \u23F8 ", "pauselog"],
+            ["Redownload paused \u2014 click Resume.\n", "pauselog"],
+        ])
         while pause_ev.is_set() and not cancel_ev.is_set():
             time.sleep(0.25)
+        if not cancel_ev.is_set():
+            stream.emit([
+                [f"  \u25B6 ", "simpleline_redwnl"],
+                ["Redownload resumed.\n", "simpleline"],
+            ])
 
     # 1. Local scan
     local = _scan_local_files(folder)
     if not local:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
-                     [" No video files found.\n", "simpleline_redwnl"]])
+        stream.emit([["  \u2014", "simpleline_redwnl"],
+                     [" No video files found.\n", "simpleline"]])
         return {"ok": True, "done": 0, "skipped": 0, "errors": 0, "total": 0}
-    stream.emit([["[Redwnl]", "redwnl_bracket"],
-                 [f" Found {len(local)} local file(s).\n", "simpleline_redwnl"]])
+    stream.emit([["  \u2014", "simpleline_redwnl"],
+                 [f" Found {len(local)} local file(s).\n", "simpleline"]])
 
     if cancel_ev.is_set():
         return {"ok": False, "cancelled": True}
@@ -394,28 +429,28 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # 2. Fetch YouTube catalog (with internet-block protection)
     if not block_if_down(cancel_ev):
         return {"ok": False, "cancelled": True}
-    stream.emit([["[Redwnl]", "redwnl_bracket"],
-                 [" Fetching YouTube video list\u2026\n", "simpleline_redwnl"]])
+    stream.emit([["  \u2014", "simpleline_redwnl"],
+                 [" Fetching YouTube video list\u2026\n", "simpleline"]])
     yt_titles = _fetch_yt_catalog(ch_url, cancel_ev, pause_ev, stream)
     if cancel_ev.is_set():
         return {"ok": False, "cancelled": True}
     if not yt_titles:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
+        stream.emit([["  \u2014", "simpleline_redwnl"],
                      [" YouTube catalog fetch failed.\n", "red"]])
         return {"ok": False, "done": 0, "errors": 1, "total": 0}
 
     # 3. Match
     matched = _match_files_to_ids(local, yt_titles)
-    stream.emit([["[Redwnl]", "redwnl_bracket"],
+    stream.emit([["  \u2014", "simpleline_redwnl"],
                  [f" Matched {len(matched)}/{len(local)} files to YouTube IDs.\n",
-                  "simpleline_redwnl"]])
+                  "simpleline"]])
 
     # 4. Resume support
     done = _load_progress(folder, ch_url, new_res)
     if done:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
+        stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Resuming \u2014 {len(done)} already redownloaded.\n",
-                      "simpleline_redwnl"]])
+                      "simpleline"]])
 
     total_to_do = max(0, len(matched) - len(done))
     # Sample-and-confirm: only meaningful if the caller provided the cb AND
@@ -424,10 +459,10 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     sample_done = bool(done) or total_to_do <= _SAMPLE_SIZE or confirm_cb is None
     sample_results: List[Any] = []  # list of (orig_size, new_size) tuples
     if not sample_done:
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
+        stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Matched {total_to_do} file(s). Checking the "
                       f"first {_SAMPLE_SIZE} at {res_label}\u2026\n",
-                      "simpleline_redwnl"]])
+                      "simpleline"]])
 
     # 5. Per-file redownload
     n_done = 0
@@ -437,29 +472,87 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # can rewrite it mid-loop without breaking the closure.
     cur_res = [new_res]
     cur_res_label = [res_label]
+    # Active status line — the sticky `[N/total] Redownloading: Ch...`
+    # that classic YTArchiver pins at the bottom of the log during a
+    # redownload pass (YTArchiver.py:10696 _start_simple_anim).
+    # Implementation: emit a line tagged `redwnl_active` (data-inplace
+    # marker); before each update we fire a `clear_line` control so
+    # the OLD line is REMOVED from the DOM, and the new line appends
+    # at the current bottom (below any completed entries emitted since
+    # the last active update). Result: the active row always stays
+    # at the visual bottom without covering completed entries above.
+    import json as _json
+    def _emit_active(current_idx: int, total: int):
+        # Clear the previous active line first so the new one lands
+        # at the current bottom instead of in-place-replacing up-log.
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "redwnl_active"}),
+             "__control__"],
+        ])
+        stream.emit([
+            [f"[{current_idx}/{total}] ",
+             ["simpleline_redwnl", "redwnl_active"]],
+            [f"Redownloading: {ch_name}\u2026\n",
+             ["simpleline_redwnl", "redwnl_active"]],
+        ])
+
+    def _clear_active():
+        """Drop the active line when the pass ends (before the
+        === Redownload complete === footer)."""
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "redwnl_active"}),
+             "__control__"],
+        ])
+
+    _live_total = len(matched)
     for idx, item in enumerate(matched):
         if cancel_ev.is_set():
             break
-        # Pause loop
-        if pause_ev is not None:
+        # Pause loop — emit a one-time "Paused — click Resume" notice
+        # when the user hits Pause between files so the log mirrors
+        # classic's behavior (YTArchiver.py:8111). The `_was_paused`
+        # flag prevents the notice from re-emitting on every 250ms
+        # poll; a matching "Resumed" line fires when pause clears.
+        if pause_ev is not None and pause_ev.is_set() and not cancel_ev.is_set():
+            # Also drop the sticky active-status line so the pause
+            # notice isn't sandwiched between "Redownloading..." and
+            # later entries.
+            _clear_active()
+            stream.emit([
+                [f"  \u23F8 ", "pauselog"],
+                ["Redownload paused \u2014 click Resume.\n", "pauselog"],
+            ])
             while pause_ev.is_set() and not cancel_ev.is_set():
                 time.sleep(0.25)
+            if not cancel_ev.is_set():
+                stream.emit([
+                    [f"  \u25B6 ", "simpleline_redwnl"],
+                    ["Redownload resumed.\n", "simpleline"],
+                ])
         vid = item["video_id"]
         if vid in done:
             n_skipped += 1
             continue
         fp = item["filepath"]
+        file_num = idx + 1
         if _already_at_target(fp, cur_res[0]):
-            stream.emit([["[Redwnl]", "redwnl_bracket"],
-                         [f" {item['title']} already at {cur_res_label[0]} "
-                          f"\u2014 skip.\n", "simpleline_redwnl"]])
+            # File already at target resolution — skip it. Emit a
+            # completed-style `[N/total] filename — already at Xp. skip.`
+            # line that STAYS in the log (not marker-tagged), then
+            # move on.
+            stream.emit([
+                [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                [f"{item['title']} already at {cur_res_label[0]} \u2014 skip.\n",
+                 "simpleline"],
+            ])
             done.add(vid)
             _save_progress(folder, ch_url, cur_res[0], done)
             n_skipped += 1
             continue
-        stream.emit([["[Redwnl]", "redwnl_bracket"],
-                     [f" {item['title']} \u2192 {cur_res_label[0]}\u2026\n",
-                      "simpleline_redwnl"]])
+        # Emit / update the sticky active line for this video.
+        _emit_active(file_num, _live_total)
         orig_size = 0
         try:
             orig_size = os.path.getsize(fp)
@@ -477,6 +570,45 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 new_size = os.path.getsize(new_fp)
             except OSError:
                 pass
+            # Belt-and-suspenders for the `already-at-target` path: if
+            # ffprobe missed (returned None and we downloaded anyway) but
+            # the resulting file is byte-identical to the original, the
+            # video was already at this resolution. Discard the temp
+            # file, emit the same "skip" line `_already_at_target` would
+            # have, and count it as skipped rather than logging a bogus
+            # "0% smaller" re-download entry.
+            if (orig_size > 0 and new_size == orig_size
+                    and os.path.isfile(fp)):
+                _ident = False
+                try:
+                    # Chunked compare so a 10GB file doesn't try to
+                    # live in RAM twice. 256KB chunks is enough that
+                    # modern SSDs saturate well before buffer size
+                    # becomes the bottleneck.
+                    _ident = True
+                    with open(fp, "rb") as _a, open(new_fp, "rb") as _b:
+                        while True:
+                            _ca = _a.read(256 * 1024)
+                            _cb = _b.read(256 * 1024)
+                            if _ca != _cb:
+                                _ident = False
+                                break
+                            if not _ca:
+                                break
+                except OSError:
+                    _ident = False
+                if _ident:
+                    try: os.remove(new_fp)
+                    except OSError: pass
+                    stream.emit([
+                        [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                        [f"{item['title']} already at {cur_res_label[0]} "
+                         f"\u2014 skip.\n", "simpleline"],
+                    ])
+                    done.add(vid)
+                    _save_progress(folder, ch_url, cur_res[0], done)
+                    n_skipped += 1
+                    continue
             new_ext = os.path.splitext(new_fp)[1].lower()
             orig_ext = os.path.splitext(fp)[1].lower()
             target_fp = fp
@@ -488,23 +620,36 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             done.add(vid)
             _save_progress(folder, ch_url, cur_res[0], done)
             n_done += 1
-            # Per-file size-change log line (OLD YTArchiver.py:11067).
+            # Completed entry — TWO lines that stack above the active
+            # status line. Format mirrors classic YTArchiver.py:10723+11067:
+            #   [N/total] filename.mp4
+            #       — ✓ 11.4 MB → 42.7 MB (273% larger)
+            # The `[N/total]` + filename line has no inplace marker so it
+            # accumulates. The `redwnl_active` line on the iteration's
+            # next pass replaces itself via its marker; the completed
+            # line stays above because its markerless line was appended
+            # BEFORE the new active line emit.
+            _fname = os.path.basename(target_fp)
+            stream.emit([
+                [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                [f"{_fname}\n", "simpleline"],
+            ])
             if orig_size > 0 and new_size > 0:
                 sz_ratio = (new_size / orig_size - 1) * 100
                 sz_dir = "larger" if sz_ratio >= 0 else "smaller"
                 stream.emit([
-                    ["[Redwnl]", "redwnl_bracket"],
-                    [f" \u2014 \u2713 {_fmt_mb(orig_size)} \u2192 "
+                    ["    \u2014 \u2713 ", "simpleline_redwnl"],
+                    [f"{_fmt_mb(orig_size)} \u2192 "
                      f"{_fmt_mb(new_size)} "
                      f"({abs(sz_ratio):.0f}% {sz_dir})\n",
-                     "simpleline_redwnl"],
+                     "simpleline"],
                 ])
             elif new_size > 0:
                 stream.emit([
-                    ["[Redwnl]", "redwnl_bracket"],
-                    [f" \u2014 \u2713 {_fmt_mb(new_size)} "
+                    ["    \u2014 \u2713 ", "simpleline_redwnl"],
+                    [f"{_fmt_mb(new_size)} "
                      f"(replaced at {cur_res_label[0]})\n",
-                     "simpleline_redwnl"],
+                     "simpleline"],
                 ])
             # Track sample stats (only successful replacements with a
             # known orig size). Once we hit _SAMPLE_SIZE we fire the cb.
@@ -519,11 +664,11 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                                / len(sample_results))
                     direction = "larger" if avg_pct >= 0 else "smaller"
                     stream.emit([
-                        ["[Redwnl]", "redwnl_bracket"],
+                        ["  \u2014", "simpleline_redwnl"],
                         [f" Sample of {len(sample_results)} files complete. "
                          f"Average size: {abs(avg_pct):.0f}% {direction}. "
                          f"Awaiting confirmation\u2026\n",
-                         "simpleline_redwnl"],
+                         "simpleline"],
                     ])
                     try:
                         choice = confirm_cb(float(avg_pct), direction,
@@ -531,14 +676,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                                             len(sample_results))
                     except Exception as e:
                         stream.emit([
-                            ["[Redwnl]", "redwnl_bracket"],
+                            ["  \u2014", "simpleline_redwnl"],
                             [f" sample-confirm callback errored: {e}. "
                              f"Continuing.\n", "red"],
                         ])
                         choice = "continue"
                     if choice == "cancel":
                         stream.emit([
-                            ["[Redwnl]", "redwnl_bracket"],
+                            ["  \u2014", "simpleline_redwnl"],
                             [" \u26d4 Redownload cancelled by user "
                              "after sample.\n", "red"],
                         ])
@@ -546,9 +691,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                         break
                     elif choice == "continue":
                         stream.emit([
-                            ["[Redwnl]", "redwnl_bracket"],
+                            ["  \u2014", "simpleline_redwnl"],
                             [f" \u25B6 Continuing redownload at "
-                             f"{cur_res_label[0]}.\n", "simpleline_redwnl"],
+                             f"{cur_res_label[0]}.\n", "simpleline"],
                         ])
                         sample_done = True
                     else:
@@ -558,14 +703,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                         cur_res_label[0] = ("Best" if new_target == "best"
                                             else f"{new_target}p")
                         stream.emit([
-                            ["[Redwnl]", "redwnl_bracket"],
+                            ["  \u2014", "simpleline_redwnl"],
                             [f" \u21bb Switching to {cur_res_label[0]}. "
-                             f"Re-sampling\u2026\n", "simpleline_redwnl"],
+                             f"Re-sampling\u2026\n", "simpleline"],
                         ])
                         sample_results = []
                         # sample_done stays False so we re-check at new res
         except Exception as e:
-            stream.emit([["[Redwnl]", "redwnl_bracket"],
+            stream.emit([["  \u2014", "simpleline_redwnl"],
                          [f" replace failed: {e}\n", "red"]])
             n_err += 1
     # Remove the temp dir if empty (redownload complete or cancelled clean).
@@ -579,6 +724,11 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # 6. Clear progress only if a full pass completed without cancel
     if not cancel_ev.is_set():
         _clear_progress(folder)
+
+    # Drop the sticky redwnl_active line so the === Redownload
+    # complete === footer doesn't sit below a phantom "Redownloading"
+    # line that's no longer accurate.
+    _clear_active()
 
     stream.emit([["=== Redownload complete: ", "header"],
                  [f"{n_done} done \u00b7 {n_skipped} skipped \u00b7 {n_err} errors ===\n",

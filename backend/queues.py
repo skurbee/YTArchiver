@@ -456,6 +456,17 @@ class QueueState:
             # check metadata part of these tasks in queue are supposed
             # to be colored pink LIKE THEY WERE IN PREVIOUS VERSION."
             return f"Metadata check \u2014 {name}"
+        if kind == "redownload":
+            # Classic showed active redownload as "Redownload
+            # ChannelName (480p)" with a Pause/Resume state.
+            # Leading word must be recognized by colorizeTaskName
+            # so the row picks up the redownload (chartreuse) color.
+            res = str(ch.get("redownload_res") or "").strip()
+            res_label = ""
+            if res:
+                res_label = f" ({'Best' if res == 'best' else res + 'p'})"
+            verb = "Redownloading" if running else "Redownload"
+            return f"{verb} {name}{res_label}"
         verb = "Downloading" if running else "Download"
         return f"{verb} {name}"
 

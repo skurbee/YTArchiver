@@ -55,6 +55,15 @@
         if (t && t.startsWith("whisper_job_")) return t;
         if (t && t.startsWith("sync_row_")) return t;
         if (t && t.startsWith("dlrow_")) return t;
+        // Per-workflow "sticky at bottom" active-status lines. Each
+        // module emits a `clear_line` control first so the old line
+        // is removed, then emits a new line with the marker — which
+        // lands at the current DOM bottom instead of being replaced
+        // in place at its original position.
+        if (t === "redwnl_active") return t;
+        if (t === "metadata_active") return t;
+        if (t === "compress_active") return t;
+        if (t === "reorg_active") return t;
       }
     }
 
@@ -438,6 +447,22 @@
             && segs[0][1] === "__control__") {
           try {
             const data = JSON.parse(segs[0][0] || "{}");
+            // Built-in control handlers. Currently supports:
+            //   { kind: "clear_line", marker: "redwnl_active" }
+            //   — removes every `.log-line[data-inplace="<marker>"]`
+            //     from the main log so a subsequent emit with the same
+            //     marker appends at the current bottom instead of
+            //     getting replaced at the original position. Used by
+            //     the redownload active-status line so it migrates to
+            //     the bottom after each completed video.
+            if (data.kind === "clear_line" && data.marker) {
+              const el = document.getElementById("main-log");
+              if (el) {
+                el.querySelectorAll(
+                  `.log-line[data-inplace="${data.marker}"]`
+                ).forEach((n) => n.remove());
+              }
+            }
             window.dispatchEvent(new CustomEvent("yt-control", {
               detail: data,
             }));
@@ -564,8 +589,26 @@
       const tr = document.createElement("tr");
       // Per-channel "Sync now" is accessed via right-click → Sync now
       // (matches the original tkinter version). No inline hover button.
+      // A chartreuse dot after the channel name flags an unfinished
+      // resolution redownload (`_redownload_progress.json` present).
+      const dot = r._pending_redownload
+        ? ' <span class="sub-redwnl-dot" title="Unfinished redownload">\u25CF</span>'
+        : "";
+      // Stash pending-redownload metadata on the TR so the right-click
+      // menu in app.js can switch "Redownload at..." to "Continue
+      // Redownload at 480p" without a backend roundtrip. ALSO stash
+      // the clean channel name because `.col-folder` now contains
+      // the name PLUS the dot indicator span, so `.textContent`
+      // reads "Channel Name ●" instead of just "Channel Name",
+      // which made `chan_redownload({name: "Channel Name ●"}, ...)`
+      // fail the name lookup silently.
+      tr.dataset.channelName = r.folder || "";
+      if (r._pending_redownload) {
+        tr.dataset.pendingRedownload = "1";
+        if (r._redownload_res) tr.dataset.redownloadRes = r._redownload_res;
+      }
       tr.innerHTML = `
-        <td class="col-folder">${escapeHtml(r.folder)}</td>
+        <td class="col-folder">${escapeHtml(r.folder)}${dot}</td>
         <td>${escapeHtml(r.res)}</td>
         <td>${escapeHtml(r.min)}</td>
         <td>${escapeHtml(r.max)}</td>

@@ -147,7 +147,9 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
     if not root.is_dir():
         return {"ok": False, "error": f"Folder not found: {channel_folder}"}
 
-    stream.emit([["[Reorg] ", "reorg_bracket"],
+    # Em-dash prefix (reorg color) + white body — matches classic
+    # simpleline_reorg painter output. No "[Reorg]" bracket tag.
+    stream.emit([["  \u2014 ", "simpleline_reorg"],
                  [f"Recheck file dates for {root.name}\u2026\n", "simpleline"]])
 
     updated = 0
@@ -175,10 +177,10 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
         except OSError:
             missing += 1
 
-    stream.emit([["[Reorg] ", "reorg_bracket"],
+    stream.emit([["  \u2014 \u2713 ", "simpleline_green"],
                  [f"Date fix complete: {updated} updated \u00b7 "
                   f"{skipped} already correct \u00b7 {missing} missing info\n",
-                  "simpleline_green"]])
+                  "simpleline"]])
     return {"ok": True, "updated": updated, "skipped": skipped, "missing": missing}
 
 
@@ -202,8 +204,9 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     if not root.is_dir():
         return {"ok": False, "error": "folder not found"}
 
-    stream.emit([["[Reorg] ", "reorg_bracket"],
-                 [f"{root.name} \u2014 ", "simpleline_reorg"],
+    stream.emit([["  \u2014 ", "simpleline_reorg"],
+                 [f"{root.name} ", "simpleline"],
+                 ["\u2014 ", "simpleline_reorg"],
                  [f"years={split_years} months={split_months}"
                   f"{' (recheck dates)' if recheck_dates else ''}\n", "simpleline"]])
 
@@ -217,11 +220,40 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     errors = 0
     redated = 0
     t0 = time.time()
+    _ch_name = root.name
+
+    # Sticky active status line — `[i/n] Reorganizing: ChannelName...`
+    # pinned at the log's bottom. Mirrors classic's `mode="reorg"`
+    # anim (YTArchiver.py:1977 _ANIM_MODES). `clear_line` control
+    # drops the old line so each update lands at the current DOM
+    # bottom instead of being replaced at the original position.
+    import json as _json
+    _total_videos = len(videos)
+    def _emit_active(_i: int):
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "reorg_active"}),
+             "__control__"],
+        ])
+        stream.emit([
+            [f"[{_i}/{_total_videos}] ",
+             ["reorg_bracket", "reorg_active"]],
+            [f"Reorganizing: {_ch_name}\u2026\n",
+             ["reorg_bracket", "reorg_active"]],
+        ])
+
+    def _clear_active():
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "reorg_active"}),
+             "__control__"],
+        ])
 
     for i, video in enumerate(videos, 1):
         if cancel_event is not None and cancel_event.is_set():
             stream.emit_text(" \u26d4 Reorg cancelled.", "red")
             break
+        _emit_active(i)
         # Determine target dir based on split flags
         d = None
         if recheck_dates:
@@ -260,14 +292,17 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
 
     _cleanup_empty_dirs(root)
 
+    # Drop the sticky active-status line before the done-summary.
+    _clear_active()
+
     took = time.time() - t0
     sec_bits = [f"{moved} moved \u00b7 {skipped} already in place"]
     if recheck_dates:
         sec_bits.append(f"{redated} dates fixed")
     sec_bits.append(f"{errors} errors \u00b7 took {took:.1f}s")
-    stream.emit([[" \u2713 ", "simpleline_green"],
-                 [f"Reorg done: ", "simpleline"],
-                 [" \u00b7 ".join(sec_bits) + "\n", "simpleline_reorg"]])
+    stream.emit([["  \u2014 \u2713 ", "simpleline_green"],
+                 ["Reorg done: ", "simpleline"],
+                 [" \u00b7 ".join(sec_bits) + "\n", "simpleline"]])
 
     return {"ok": True, "moved": moved, "skipped": skipped, "errors": errors,
             "redated": redated, "took": took}

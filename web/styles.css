@@ -1413,6 +1413,15 @@ body {
   text-overflow: ellipsis;
   max-width: 0; /* table-layout:fixed + max-width:0 = proper ellipsis in a td */
 }
+/* Redownload-pending dot: chartreuse circle trailing the channel
+   name when `_redownload_progress.json` exists for that channel. */
+.sub-redwnl-dot {
+  color: var(--c-log-redwnl);
+  font-size: 9px;
+  vertical-align: middle;
+  margin-left: 4px;
+  line-height: 1;
+}
 /* Alternating row colors — matches YTArchiver.py:4958 odd/even tag pattern.
    Use :nth-child(even) on tbody so hover + selection overrides still work. */
 .subs-table tbody tr:nth-child(even) td {
@@ -3915,4 +3924,19 @@ body {
 }
 .yt-modal-res-options label {
   display: flex; align-items: center; gap: 6px; cursor: pointer;
+}
+/* Inline code style for the welcome modal's path example. */
+.yt-modal-body code {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  color: var(--c-text);
+}
+.yt-modal-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.yt-modal-btn:disabled:hover {
+  background: #26292d;
 }

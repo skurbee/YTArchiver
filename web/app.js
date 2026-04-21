@@ -4026,7 +4026,11 @@
       _subsTbody.addEventListener("dblclick", (e) => {
         const tr = e.target.closest("tr");
         if (!tr) return;
-        const folder = tr.querySelector(".col-folder")?.textContent;
+        // Prefer clean data-attr channel name (col-folder textContent
+        // may include trailing dot indicator span). See tbody
+        // context-menu handler below for the same pattern.
+        const folder = tr.dataset.channelName
+          || (tr.querySelector(".col-folder")?.textContent || "").trim();
         if (folder) window._editChannelFromContext(folder);
       });
     }
@@ -4630,7 +4634,8 @@
     tbody.addEventListener("keydown", async (e) => {
       const selected = tbody.querySelector("tr.row-selected");
       if (!selected) return;
-      const folder = selected.querySelector(".col-folder")?.textContent;
+      const folder = selected.dataset.channelName
+        || (selected.querySelector(".col-folder")?.textContent || "").trim();
       if (!folder) return;
       if (e.key === "Enter" || e.key === "F2") {
         e.preventDefault();
@@ -4657,7 +4662,12 @@
       // Visual select
       tbody.querySelectorAll("tr.row-selected").forEach(x => x.classList.remove("row-selected"));
       tr.classList.add("row-selected");
-      const chan = tr.querySelector(".col-folder")?.textContent || "";
+      // Prefer the clean `data-channel-name` stashed by the renderer.
+      // Fall back to `.col-folder`'s textContent ONLY if the data attr
+      // is missing — the cell now may contain a trailing dot span so
+      // the textContent path is polluted (e.g. "Channel Name ●").
+      const chan = tr.dataset.channelName
+        || (tr.querySelector(".col-folder")?.textContent || "").trim();
 
       const api = window.pywebview?.api;
       // Dynamic-label helpers — peek at live queue state so menu items
@@ -4717,16 +4727,35 @@
           action: () => { if (!_txDisabled) _askTranscribeChannel(chan); }},
         { label: "Download metadata", action: () => api?.metadata_recheck_channel?.({ name: chan }) },
         { sep: true },
-        { label: "Redownload at\u2026",
-          submenu: [
-            { label: "Best available", action: () => _askRedownload(chan, "best") },
-            { label: "2160p (4K)", action: () => _askRedownload(chan, "2160") },
-            { label: "1440p", action: () => _askRedownload(chan, "1440") },
-            { label: "1080p", action: () => _askRedownload(chan, "1080") },
-            { label: "720p", action: () => _askRedownload(chan, "720") },
-            { label: "480p", action: () => _askRedownload(chan, "480") },
-            { label: "360p", action: () => _askRedownload(chan, "360") },
-          ]},
+        // Pending-redownload swap: when `_redownload_progress.json` is
+        // present for this channel (flagged by the backend via
+        // `tr.dataset.pendingRedownload`), replace the "Redownload
+        // at..." submenu with a single "Continue Redownload at X"
+        // action that just fires chan_redownload with the stored
+        // resolution — no submenu, no confirm prompt.
+        ...(tr.dataset.pendingRedownload ? [
+          { label: `Continue Redownload at ${(() => {
+              const r = tr.dataset.redownloadRes || "";
+              return r === "best" ? "Best available"
+                   : r ? `${r}p` : "target resolution";
+            })()}`,
+            action: () => {
+              const res = tr.dataset.redownloadRes || "";
+              if (!res) return;
+              api?.chan_redownload?.({ name: chan }, res);
+            }},
+        ] : [
+          { label: "Redownload at\u2026",
+            submenu: [
+              { label: "Best available", action: () => _askRedownload(chan, "best") },
+              { label: "2160p (4K)", action: () => _askRedownload(chan, "2160") },
+              { label: "1440p", action: () => _askRedownload(chan, "1440") },
+              { label: "1080p", action: () => _askRedownload(chan, "1080") },
+              { label: "720p", action: () => _askRedownload(chan, "720") },
+              { label: "480p", action: () => _askRedownload(chan, "480") },
+              { label: "360p", action: () => _askRedownload(chan, "360") },
+            ]},
+        ]),
         { sep: true },
         { label: "Remove channel", cls: "dim", action: async () => {
           // Two-step (subscription → optional disk delete) via shared helper.
@@ -5226,6 +5255,15 @@
 
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      // Toggle: if the menu is already open, a second button click
+      // should close it instead of popping another on top. Detect via
+      // the shared `ctx-menu-root` container the context-menu helper
+      // appends into.
+      const ctxRoot = document.getElementById("ctx-menu-root");
+      if (ctxRoot && ctxRoot.childElementCount > 0) {
+        ctxRoot.innerHTML = "";
+        return;
+      }
       // Only surface the options that correspond to logs with actual
       // content. If the main log is empty, no "Clear log" item. If the
       // activity log is empty, no "Clear activity" item. If both are
@@ -5538,7 +5576,20 @@
           window._showToast?.(res.error || "Sync failed to start", "error");
           return;
         }
-        window._showToast?.("Sync started.", "ok");
+        // Branch on `started`: backend sets started=false when Auto is
+        // off, meaning it queued channels but didn't spawn the worker.
+        // Tell the user so they know the Start button in the popover
+        // (or toggling Auto on) will fire the queue.
+        if (res.started === false) {
+          const n = typeof res.queued === "number" ? res.queued : 0;
+          const head = n > 0
+            ? `Queued ${n} channel${n === 1 ? "" : "s"}.`
+            : "Already queued.";
+          window._showToast?.(
+            `${head} Start manually or enable Auto.`, "warn");
+        } else {
+          window._showToast?.("Sync started.", "ok");
+        }
       } catch (e) {
         window._showToast?.("Error: " + e, "error");
       }
@@ -6515,25 +6566,61 @@
           // renderRecentTable step renders into the correct view and
           // the alternate frame is hidden before first paint.
           window._applyRecentViewMode?.(info.recent_view_mode || "list");
-          // First-run wizard: no output_dir set → prompt for archive folder
+          // First-launch archive-root picker. Blocking modal — no
+          // Cancel button, no ESC dismissal, no outside-click close.
+          // The user MUST pick a folder before the app does anything
+          // useful. Replaces the old two-step confirm+picker flow
+          // which let users silently leave the app in a half-
+          // configured state (default `~/Channel Archives` baked in).
           if (info.has_real_config === false || !info.output_dir) {
-            try {
-              const ok = await askConfirm(
-                "Welcome to YT Archiver",
-                "Looks like this is your first time (no archive folder configured yet).\n\nPick a folder where your YouTube downloads will be saved — this becomes the root of your archive.",
-                { confirm: "Choose folder\u2026" });
-              if (ok) {
-                const picked = await api.pick_folder("Choose archive root");
-                if (picked?.ok && picked.path) {
-                  const saved = await api.set_parent_folder(picked.path);
-                  if (saved?.ok) {
-                    window._showToast?.("Archive root saved: " + picked.path, "ok");
-                  } else if (saved?.write_blocked) {
-                    window._showToast?.("Folder picked but write-gate off.", "warn");
-                  }
-                }
+            await new Promise((resolve) => {
+              const modal = document.getElementById("welcome-modal");
+              const pathEl = document.getElementById("welcome-path");
+              const browseBtn = document.getElementById("welcome-browse");
+              const continueBtn = document.getElementById("welcome-continue");
+              if (!modal || !pathEl || !browseBtn || !continueBtn) {
+                resolve(); return;
               }
-            } catch (e) { console.warn("first-run prompt:", e); }
+              let pickedPath = "";
+              modal.hidden = false;
+              // Block ESC from closing while this modal is up. The
+              // existing askq/context-menu ESC handlers only fire on
+              // elements they own, so this listener just makes sure
+              // nothing else hijacks ESC to close the modal.
+              const escBlock = (e) => {
+                if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); }
+              };
+              document.addEventListener("keydown", escBlock, true);
+
+              browseBtn.addEventListener("click", async () => {
+                try {
+                  const picked = await api.pick_folder("Choose archive root");
+                  if (picked?.ok && picked.path) {
+                    pickedPath = picked.path;
+                    pathEl.value = pickedPath;
+                    continueBtn.disabled = false;
+                  }
+                } catch (_e) {}
+              });
+              continueBtn.addEventListener("click", async () => {
+                if (!pickedPath) return;
+                try {
+                  const saved = await api.set_parent_folder(pickedPath);
+                  if (saved?.ok) {
+                    modal.hidden = true;
+                    document.removeEventListener("keydown", escBlock, true);
+                    window._showToast?.(
+                      "Archive root saved: " + pickedPath, "ok");
+                    resolve();
+                  } else {
+                    window._showToast?.(
+                      saved?.error || "Could not save folder.", "error");
+                  }
+                } catch (e) {
+                  window._showToast?.(String(e), "error");
+                }
+              });
+            });
           }
         });
 

@@ -208,6 +208,17 @@ _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format"
 _DLROW_COUNTER: int = 0
 
 
+# Firefox / cookie-browser signed-out alert — emit ONCE per sync pass
+# so a failing first channel doesn't spam the log with the same red
+# block for every subsequent channel. Reset in `sync_all` at pass
+# start. reported: classic YTArchiver would emit
+#   ▌ PLEASE INSTALL FIREFOX, SIGN IN TO YOUTUBE, AND TRY AGAIN.
+# when yt-dlp returned a cookie-extract / sign-in error. Overhaul was
+# silent — user's browser cookies could go stale for weeks with no
+# log feedback.
+_COOKIE_ALERT_FIRED: bool = False
+
+
 # ── Startup info for Windows (hide console window) ─────────────────────
 
 _startupinfo = None
@@ -588,6 +599,14 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # `_path_to_counter` stays local because it's only queried within
     # this channel's DLTRACK flow.
     _path_to_counter: Dict[str, int] = {}
+    # Display title per-path, stashed by the Destination branch so the
+    # Progress branch can rebuild the full "— Downloading <title> NN%"
+    # line. Without this the progress tick has no access to the title
+    # (current_title has the [id] suffix still attached, and display_title
+    # is a local inside the Destination `if` block). A small dict, one
+    # entry per merged .mp4, cleared at channel end with the other
+    # per-channel state.
+    _path_to_display_title: Dict[str, str] = {}
     downloaded_ids: List[str] = [] # fast-path metadata target list
     # title -> video_id, filled from DLTRACK::: emitted after each video.
     # Needed because filenames no longer carry the [id] suffix (drop-in mode).
@@ -734,6 +753,48 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             s = line.rstrip()
             if not s:
                 continue
+
+            # ── Cookie / sign-in error detection ───────────────────────
+            # yt-dlp surfaces stale-cookie / signed-out-of-YouTube
+            # failures in a few ways, all caught here:
+            # "ERROR: [youtube] <id>: Sign in to confirm you're not a bot"
+            # "ERROR: unable to extract cookies from firefox"
+            # "WARNING: cookies are missing/invalid"
+            # Classic YTArchiver flagged these with a big red block
+            # telling the user to sign back in; overhaul was silent,
+            # so the user could run stale-cookie syncs for days with
+            # no visible feedback. Fires ONCE per sync pass
+            # (`_COOKIE_ALERT_FIRED`) — subsequent channels don't
+            # re-emit the same banner. Does NOT set cancel_event:
+            # public videos still download without auth, so letting
+            # the pass continue is strictly better than aborting.
+            global _COOKIE_ALERT_FIRED
+            if not _COOKIE_ALERT_FIRED:
+                _sl = s.lower()
+                if (("sign in to confirm" in _sl)
+                    or ("cookies are missing" in _sl)
+                    or ("cookies are invalid" in _sl)
+                    or ("failed to extract any player response" in _sl
+                        and "sign in" in _sl)
+                    or ("error:" in _sl and "cookie" in _sl
+                        and ("extract" in _sl or "sign in" in _sl))):
+                    _COOKIE_ALERT_FIRED = True
+                    _bar = "\u2588" * 65
+                    stream.emit([["\n" + _bar + "\n", "red"]])
+                    stream.emit([["\u2588  ", "red"],
+                                 ["Browser is signed out of YouTube.",
+                                  "red"],
+                                 ["\n", "red"]])
+                    stream.emit([["\u2588  ", "red"],
+                                 ["Sign in to YouTube in Firefox (or your "
+                                  "default browser) so yt-dlp can", "red"],
+                                 ["\n", "red"]])
+                    stream.emit([["\u2588  ", "red"],
+                                 ["reuse the session cookie. Public "
+                                  "videos still download without auth.",
+                                  "red"],
+                                 ["\n", "red"]])
+                    stream.emit([[_bar + "\n\n", "red"]])
 
             # DLTRACK:::Title:::Uploader:::YYYYMMDD:::bytes:::secs:::videoID
             # Emitted by yt-dlp's --print after_video:... directive ONLY
@@ -1005,6 +1066,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     # branch) both resolve to the module-level name.
                     _DLROW_COUNTER += 1
                     _path_to_counter[final_path] = _DLROW_COUNTER
+                    _path_to_display_title[final_path] = display_title
                     _dl_kind = f"dlrow_{_DLROW_COUNTER}"
                     stream.emit([
                         [" ", ["dim", _dl_kind]],
@@ -1013,29 +1075,50 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     ])
                 continue
 
-            # Progress line — verbose-only, and in-place replaced. Each
-            # progress tick REPLACES the previous tick's line (data-inplace
-            # keyed on per-video `_DLROW_COUNTER`) so the log doesn't fill
-            # with 500 lines for a 10-minute video. Matches OLD YTArchiver's
-            # log_dl_progress behavior where the progress bar updates a
-            # single widget line in-place.
+            # Progress line — emits the SAME 3-segment shape as the
+            # Destination "Downloading <title>" line with a green pct
+            # suffix appended to the title segment. Uses the same
+            # `dlrow_<N>` inplace marker so each tick replaces the
+            # previous line at a single DOM position, and the final
+            # ✓ done line (also tagged `dlrow_<N>`) cleanly replaces
+            # the last tick.
+            #
+            # Critical: the emit MUST NO-OP if `_path_to_counter` has
+            # no entry matching the current `_DLROW_COUNTER`. This
+            # guards against a yt-dlp progress line arriving BEFORE
+            # the Destination branch bumped the counter for this
+            # video (e.g. after a sidecar-only Destination, or at
+            # channel boundaries where `_DLROW_COUNTER` points to
+            # the PREVIOUS channel's already-done video). Without
+            # this guard, the emit would tag with a stale `dlrow_<N>`
+            # and IN-PLACE REPLACE some earlier channel's done line
+            # way up in the log. reported two symptoms:
+            # - "Downloading 100%" with no title (stale counter,
+            #   _path_to_counter miss → empty title fallback)
+            # - Lines appearing in wrong places (stale counter
+            #   caused inplace to replace the wrong DOM node).
+            # Dropping the emit entirely when we can't resolve the
+            # title is strictly safer — better to skip a progress
+            # tick than corrupt the log.
             m = _PROG_RE.search(s)
             if m:
                 pct = m.group(1)
-                # `dlrow_<N>` not `dlprogress_<N>` — the styling tag
-                # `dlprogress_pct` shares the `dlprogress_` prefix, which
-                # the JS inplace detector uses for per-video matching. If
-                # we named the inplace kind `dlprogress_0` it would
-                # collide with `dlprogress_pct` and every pct segment
-                # across every video would get lumped into one
-                # replace-in-place line.
                 _prog_kind = f"dlrow_{_DLROW_COUNTER}"
+                # Resolve display_title for the current in-flight
+                # video by looking up which final_path was assigned
+                # this _DLROW_COUNTER value. If nothing matches, skip.
+                _disp = None
+                for _fp, _ctr in _path_to_counter.items():
+                    if _ctr == _DLROW_COUNTER:
+                        _disp = _path_to_display_title.get(_fp)
+                        break
+                if not _disp:
+                    continue
                 stream.emit([
                     [" ", ["dim", _prog_kind]],
-                    [f"{pct}%", ["dlprogress_pct", _prog_kind]],
-                    [" ", ["dim", _prog_kind]],
-                    [s[:120], ["dim", _prog_kind]],
-                    ["\n", ["dim", _prog_kind]],
+                    ["\u2014 Downloading ", ["simpleline_green", _prog_kind]],
+                    [f"{_disp} ", ["simpleline", _prog_kind]],
+                    [f"{pct}%\n", ["dlprogress_pct", _prog_kind]],
                 ])
                 continue
 
@@ -2030,6 +2113,13 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     # `sync_row_1` collided across passes; a fresh id per pass fixes
     # it cleanly. Cleared in the `finally` at the bottom of this func.
     _ROW_EMIT_PASS_ID.id = _new_pass_id()
+
+    # Reset the cookie-sign-out alert flag so this pass can emit the
+    # red banner once if yt-dlp surfaces a sign-in / cookie-extract
+    # error. Without resetting, a fix-then-resync wouldn't show the
+    # all-clear path — the flag stays True from the prior pass.
+    global _COOKIE_ALERT_FIRED
+    _COOKIE_ALERT_FIRED = False
 
     # Start-of-pass header — show total remaining work, not len(config).
     # In resume mode that's the restored queue size; fresh mode it's the

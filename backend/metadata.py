@@ -466,12 +466,15 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         # summary spec locked in:
         # — ✓ <title> — <channel> (size) [download done, green]
         # — ✓ Transcription (details) [transcription done, blue]
-        # — ✓ Metadata downloaded [metadata done, pink]
-        # Pink em-dash + checkmark + "Metadata downloaded".
+        # — ✓ Metadata downloaded [metadata done, pink + white]
+        # Pink em-dash + checkmark + pink "Metadata", then white
+        # "downloaded". user spec: color the subject, not the
+        # verb — "(pink)— (pink)Metadata (white)downloaded".
         stream.emit([
             [" ", "dim"],
             ["\u2014 \u2713 ", "meta_bracket"],
-            ["Metadata downloaded\n", "simpleline"],
+            ["Metadata ", "simpleline_pink"],
+            ["downloaded\n", "simpleline"],
         ])
     return {"ok": True, "fetched": True}
 

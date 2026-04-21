@@ -41,12 +41,17 @@
     // prefix-family match if none found.
     const segs = segments || [];
 
-    // Pass 1 — per-job / per-row unique kinds
+    // Pass 1 — per-job / per-row unique kinds.
+    // `tx_done_` must win over `whisper_job_` so the final done-line
+    // tagged `["dim", whisper_job_N, tx_done_<vid>]` lands at the
+    // placeholder we emitted under the channel block (via tx_done_)
+    // rather than at the progress-tick at the bottom of the log.
     for (const seg of segs) {
       if (!seg) continue;
       const tag = seg[1];
       const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
       for (const t of tags) {
+        if (t && t.startsWith("tx_done_")) return t;
         if (t && t.startsWith("whisper_job_")) return t;
         if (t && t.startsWith("sync_row_")) return t;
         if (t && t.startsWith("dlrow_")) return t;
@@ -273,6 +278,13 @@
     const tagCls = tag ? "t-" + tag : "";
     const line = document.createElement("div");
     line.className = "log-line" + (entry.alt ? " hist_row_alt" : "");
+    // `row_id` lets the backend retroactively update a previously-
+    // emitted row (e.g. a [Dwnld] row that fired with `0 transcribed`
+    // while Whisper was still running — the transcribe-complete hook
+    // re-emits with the same row_id and the merged counts). When set,
+    // `_logBatch` finds any existing `[data-row-id="..."]` element in
+    // the activity log and swaps it in place instead of appending.
+    if (c.row_id) line.dataset.rowId = c.row_id;
     const cell = (text, extra, colored) => {
       const s = document.createElement("span");
       const cls = ((colored ? tagCls : "") + " " + (extra || "")).trim();
@@ -506,7 +518,21 @@
         // log would auto-snap on every batch.
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
-        for (const entry of payload.activity) frag.appendChild(buildActivityRow(entry));
+        for (const entry of payload.activity) {
+          const row = buildActivityRow(entry);
+          const rid = row.dataset.rowId;
+          if (rid) {
+            // In-place replacement: if a prior row with this id is
+            // already in the DOM, swap it rather than appending a
+            // duplicate. Used by the [Dwnld] retroactive update when
+            // a slow transcribe finishes after the row first emitted
+            // with `0 transcribed`.
+            const existing = el.querySelector(
+              `.log-line[data-row-id="${CSS.escape(rid)}"]`);
+            if (existing) { existing.replaceWith(row); continue; }
+          }
+          frag.appendChild(row);
+        }
         el.appendChild(frag);
         const st = scrollState.get(el) || {};
         if (!st.userScrolled) el.scrollTop = el.scrollHeight;

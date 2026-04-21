@@ -931,11 +931,14 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # Per-video done line. Stamp every segment with the per-job
     # `job_tag` (unique per video) so this line REPLACES this
     # video's in-progress lines AND gets left alone by other
-    # videos' transcriptions. Fallback to no inplace kind when
-    # job_tag is empty (old call sites) so the line still appends.
-    _em_tag = ["whisper_bracket", job_tag] if job_tag else "whisper_bracket"
-    _dim_tag = ["dim", job_tag] if job_tag else "dim"
-    _lbl_tag = ["simpleline_blue", job_tag] if job_tag else "simpleline_blue"
+    # videos' transcriptions. ALSO stamp with `tx_done_<vid>` so the
+    # done line lands at the placeholder sync.py reserved under the
+    # channel's block rather than at the bottom of the log.
+    # `_inplaceKind` prioritizes `tx_done_` over `whisper_job_`.
+    _tx_tag = f"tx_done_{vid_id}" if vid_id else ""
+    _em_tag = [t for t in ("whisper_bracket", job_tag, _tx_tag) if t]
+    _dim_tag = [t for t in ("dim", job_tag, _tx_tag) if t]
+    _lbl_tag = [t for t in ("simpleline_blue", job_tag, _tx_tag) if t]
     stream.emit([
         [" ", _dim_tag],
         ["\u2014 \u2713 ", _em_tag],
@@ -1501,9 +1504,12 @@ class TranscribeManager:
                 return False
 
             dev = info.get("device", "?").upper()
-            self._stream.emit_text(
-                f" — \u2713 Whisper model loaded ({m}, {dev}).",
-                "simpleline_green")
+            # Green em-dash + checkmark, white body text (request: "make
+            # this line white except for the checkmark").
+            self._stream.emit([
+                [" \u2014 \u2713 ", "simpleline_green"],
+                [f"Whisper model loaded ({m}, {dev}).\n", "simpleline"],
+            ])
             if info.get("cuda_fallback_reason"):
                 self._stream.emit_dim(
                     f" [CUDA fallback] Fell back to CPU: {info['cuda_fallback_reason']}")
@@ -1984,6 +1990,44 @@ class TranscribeManager:
             if done == 0 and err == 0:
                 continue # no work actually happened
             elapsed = time.time() - float(s.get("start", time.time()))
+
+            # If sync just emitted a [Dwnld] row for this channel and
+            # the transcribe count was 0 at the time (Whisper still
+            # running), patch that same row in place by re-emitting
+            # with the registered row_id instead of appending a
+            # separate [Trnscr]. The UI's `data-row-id` lookup swaps
+            # the row contents. Result: one consolidated row with the
+            # final counts, no duplicate.
+            pending = None
+            if _sync is not None:
+                try:
+                    pending = _sync.pop_pending_dwnld_row(ch_name)
+                except Exception:
+                    pending = None
+            if pending is not None:
+                try:
+                    # Total elapsed = time since sync_channel started
+                    # (NOT just the transcribe portion) so the "took"
+                    # cell reflects the whole channel's pass duration.
+                    _total_elapsed = time.time() - float(
+                        pending.get("elapsed_start", time.time()))
+                    _sync.emit_consolidated_auto_row(
+                        self._stream, ch_name,
+                        downloaded=int(pending.get("downloaded", 0)),
+                        transcribed=done,
+                        metadata=int(pending.get("metadata", 0)),
+                        errors=int(pending.get("errors", 0)) + err,
+                        elapsed=float(_total_elapsed),
+                        kind="Dwnld",
+                        row_id=str(pending.get("row_id") or ""),
+                    )
+                except Exception:
+                    pass
+                continue
+
+            # No recent [Dwnld] row for this channel — emit a
+            # standalone [Trnscr] as before (manual transcribe flow,
+            # etc.).
             primary = f"{done} transcribed"
             try:
                 _ar.append_history_entry(
@@ -2218,17 +2262,26 @@ class TranscribeManager:
                                 combined_override=job.get("combined_override"),
                                 retranscribe=bool(job.get("retranscribe")),
                                 video_id_hint=job.get("video_id", ""))
-            # Done line — REPLACES the final progress tick via the
-            # per-job tag, leaving a permanent "— ✓ Transcription"
-            # line in the log that won't be stomped by later jobs.
+            # Done line — in-place replaces the sync.py-reserved
+            # `tx_done_<vid>` placeholder under the channel's block
+            # (`_inplaceKind` prioritizes `tx_done_` over `whisper_job_`),
+            # so the final line lands at the right scroll position
+            # instead of wherever the GPU worker happened to finish.
+            # The `whisper_job_<N>` tag is retained for in-batch
+            # progress-tick replacement.
             _elapsed = max(1, int(time.time() - _t_start))
             _time_str = (f"{_elapsed // 60}min {_elapsed % 60:02d}sec"
                           if _elapsed >= 60 else f"{_elapsed}sec")
+            _vid_for_marker = (job.get("video_id") or "").strip()
+            _tx_tag = f"tx_done_{_vid_for_marker}" if _vid_for_marker else ""
+            _dim_tags = [t for t in ("dim", job_tag, _tx_tag) if t]
+            _em_tags = [t for t in ("whisper_bracket", job_tag, _tx_tag) if t]
+            _lbl_tags = [t for t in ("simpleline_blue", job_tag, _tx_tag) if t]
             self._stream.emit([
-                [" ", ["dim", job_tag]],
-                ["\u2014 \u2713 ", ["whisper_bracket", job_tag]],
-                ["Transcription", ["simpleline_blue", job_tag]],
-                [f" (took {_time_str})\n", ["dim", job_tag]],
+                [" ", _dim_tags],
+                ["\u2014 \u2713 ", _em_tags],
+                ["Transcription", _lbl_tags],
+                [f" (took {_time_str})\n", _dim_tags],
             ])
             if job.get("cb"):
                 try:

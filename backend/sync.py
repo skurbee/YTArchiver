@@ -884,8 +884,25 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                     except Exception as _e:
                                         _s.emit_error(f"Auto-compress failed: {_e}")
                                 cb = _chain_compress
+                            # Reserve a slot in the log for the transcription
+                            # completion line so it renders under THIS channel's
+                            # block when the async GPU job finishes — not
+                            # interleaved with later channels' "no new videos"
+                            # rows or orphaned at the bottom of the log.
+                            # `_inplaceKind` prioritizes `tx_done_` so when the
+                            # done line emits with `["dim", whisper_job_N,
+                            # f"tx_done_{vid}"]` it finds this placeholder and
+                            # replaces it in place.
+                            _tx_marker = f"tx_done_{vid}"
+                            stream.emit([
+                                [" \u2014 \u23F3 ", ["dim", _tx_marker]],
+                                ["Transcription queued\u2026\n",
+                                 ["dim", _tx_marker]],
+                            ])
                             transcribe_mgr.enqueue(final_path, t,
-                                                    channel=name, on_complete=cb)
+                                                    channel=name,
+                                                    on_complete=cb,
+                                                    video_id=vid)
                         # If auto_transcribe is off but compress_enabled is on,
                         # route the compress task through the SHARED GPU queue
                         # (rule: "every compress is a GPU task").
@@ -1133,12 +1150,22 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 _stats = transcribe_mgr.get_channel_batch_stats(name)
                 _tx_done = int(_stats.get("done", 0) or 0)
                 _tx_err = int(_stats.get("err", 0) or 0)
-                # Mark consumed so _flush_batch_stats doesn't emit a
-                # duplicate standalone [Trnscr] row for the same work.
-                transcribe_mgr.consume_channel_batch_stats(name)
+                # DON'T consume here — if Whisper is still running for
+                # videos from this channel, _flush_batch_stats will
+                # later update this same row with the final transcribed
+                # count. If we consume now, we lose the updated stats
+                # and the row sticks at "0 transcribed" forever.
+                # Consume only when auto_tx is off OR the transcribe
+                # manager is idle by the time this row emits.
+                try:
+                    _is_idle = not bool(transcribe_mgr.is_active())
+                except Exception:
+                    _is_idle = False
+                if _is_idle:
+                    transcribe_mgr.consume_channel_batch_stats(name)
             except Exception:
                 pass
-        emit_consolidated_auto_row(
+        _row_id = emit_consolidated_auto_row(
             stream, name,
             downloaded=int(downloaded or 0),
             transcribed=_tx_done,
@@ -1146,6 +1173,18 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             errors=int(errors or 0) + _tx_err,
             elapsed=float(elapsed),
             kind="Dwnld")
+        # Stash this row so a late transcribe-complete can patch it
+        # in place (retroactive update of the transcribed cell).
+        if auto_tx and transcribe_mgr is not None:
+            try:
+                register_pending_dwnld_row(
+                    name, _row_id,
+                    downloaded=int(downloaded or 0),
+                    metadata=_meta_fetched,
+                    errors=int(errors or 0),
+                    elapsed_start=t_start)
+            except Exception:
+                pass
 
     # Remember the fresh IDs in the channel cache for the next sync pass
     # (lets the quick-check-new-uploads fast path skip enumeration).
@@ -1636,7 +1675,8 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
                                 metadata: int,
                                 errors: int,
                                 elapsed: float,
-                                kind: str = "Dwnld") -> None:
+                                kind: str = "Dwnld",
+                                row_id: Optional[str] = None) -> str:
     """Emit ONE combined activity-log row replacing the historical trio
     of [Auto] + [Trnscr] + [Metdta]. UI receives four count cells:
         [kind] [time,date] \u2014 [channel] \u2014
@@ -1646,6 +1686,13 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
     `metadata` use a \u2713 check when their count is exactly 1.
     Persisted string body is 5 bullets:
         N downloaded \u00b7 <N|\u2713> transcribed \u00b7 <N|\u2713> metadata \u00b7 N errors \u00b7 took X
+
+    If `row_id` is provided (or generated), the UI tags the row with
+    `data-row-id=<row_id>` so a later call with the same id replaces
+    that row in place — used by the transcribe-complete hook to
+    retroactively update a row that fired while Whisper was still
+    running. Returns the row_id (existing or newly generated) so the
+    caller can stash it for later updates.
     """
     now = datetime.now()
     time_str = (now.strftime("%-I:%M%p") if os.name != "nt"
@@ -1655,6 +1702,11 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
     primary_s = f"{int(downloaded or 0)} downloaded"
     secondary_s = _count_cell(int(transcribed or 0), "transcribed")
     tertiary_s = _count_cell(int(metadata or 0), "metadata")
+    if not row_id:
+        # Channel + start-of-pass timestamp — two calls within the same
+        # sync pass for the same channel share an id, but a fresh pass
+        # minutes later gets a new one.
+        row_id = f"dwnld_{channel_name}_{int(time.time())}"
     stream.emit_activity({
         "kind": kind,
         "time_date": f"{time_str}, {date_str}",
@@ -1665,6 +1717,7 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
         "errors": f"{errors} errors",
         "took": f"took {took}",
         "row_tag": "hist_green" if downloaded > 0 else "",
+        "row_id": row_id,
     })
     # Persist directly (bypassing format_history_entry so the checkmark
     # forms round-trip cleanly instead of being truncated to "0" by
@@ -1684,6 +1737,53 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
         _ar.append_history_entry(line)
     except Exception:
         pass
+    return row_id
+
+
+# Registry: channel_name -> (row_id, downloaded, metadata, errors,
+# start_time). Populated by sync_channel after it emits a [Dwnld] row
+# whose transcribed-count may be incomplete (Whisper still running).
+# `_flush_batch_stats` in transcribe.py checks this and re-emits the
+# [Dwnld] row with the updated transcribed count using the same
+# row_id, so the UI updates the existing row in place instead of
+# appending a separate [Trnscr].
+_RECENT_DWNLD_ROWS: Dict[str, Dict[str, Any]] = {}
+_RECENT_DWNLD_LOCK = threading.Lock()
+
+
+def register_pending_dwnld_row(channel_name: str, row_id: str,
+                                 downloaded: int, metadata: int,
+                                 errors: int, elapsed_start: float) -> None:
+    """Called by sync_channel right after emit_consolidated_auto_row so
+    a subsequent transcribe-complete update can find the row and patch
+    its transcribed cell instead of emitting a separate [Trnscr]."""
+    with _RECENT_DWNLD_LOCK:
+        _RECENT_DWNLD_ROWS[channel_name] = {
+            "row_id": row_id,
+            "downloaded": int(downloaded or 0),
+            "metadata": int(metadata or 0),
+            "errors": int(errors or 0),
+            "elapsed_start": float(elapsed_start or time.time()),
+            "registered_at": time.time(),
+        }
+
+
+def pop_pending_dwnld_row(channel_name: str,
+                          max_age_sec: float = 1800.0
+                          ) -> Optional[Dict[str, Any]]:
+    """Fetch + clear this channel's pending [Dwnld] registry entry if
+    it exists and is fresher than `max_age_sec` (30 min default).
+    Returns None when there's no recent row to update (transcribe
+    completion should fall back to emitting a standalone [Trnscr])."""
+    with _RECENT_DWNLD_LOCK:
+        entry = _RECENT_DWNLD_ROWS.get(channel_name)
+        if entry is None:
+            return None
+        if time.time() - entry.get("registered_at", 0) > max_age_sec:
+            _RECENT_DWNLD_ROWS.pop(channel_name, None)
+            return None
+        _RECENT_DWNLD_ROWS.pop(channel_name, None)
+        return entry
 
 
 def _record_recent_download(filepath: str, channel: str, title: str,

@@ -251,20 +251,53 @@ def _bracket_segments(label: str, bracket_tag: str = "sync_bracket",
     return segs
 
 
+# Module-level pass-id counter + lock. Each invocation of `sync_all()`
+# (or `sync_one_channel`) calls `_new_pass_id()` once to get a unique
+# token and stashes it on `_ROW_EMIT_PASS_ID.id`; `_sync_row_emit`
+# reads that thread-local by default and appends the token to its
+# in-place-replace marker so passes never collide.
+#
+# Without this, the autorun-triggered second pass's `sync_row_1` emit
+# would find the first pass's `sync_row_1` DOM element (still in
+# scrollback) and silently replace its content — leaving the user
+# staring at a log that seemed to skip most of the channel iteration.
+_PASS_ID_COUNTER = 0
+_PASS_ID_LOCK = threading.Lock()
+_ROW_EMIT_PASS_ID = threading.local()
+
+
+def _new_pass_id() -> str:
+    global _PASS_ID_COUNTER
+    with _PASS_ID_LOCK:
+        _PASS_ID_COUNTER += 1
+        return f"p{_PASS_ID_COUNTER}"
+
+
 def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
                    name: str, summary: Optional[str] = None,
                    name_tag: str = "simpleline_green",
-                   summary_tag: str = "simpleline") -> None:
+                   summary_tag: str = "simpleline",
+                   pass_id: str = "") -> None:
     """Emit a single `[N/total] Name — summary` line that replaces in-
-    place across re-emissions for the same channel index (one-line-per-
-    channel OLD-style log). The first call per channel appends; the
-    second call (with a `summary`) replaces the first.
+    place across re-emissions for the same channel index WITHIN ONE
+    sync pass.
+
+    `pass_id` disambiguates markers across passes: without it, a second
+    sync pass's channel-1 row would replace the first pass's channel-1
+    row WAY up in the log (at its DOM position from 8 minutes ago) and
+    the user sees nothing new at the current scroll position. Callers
+    should pass a unique id (`_new_pass_id()`) when starting a pass.
 
     summary=None → "live" row (just `[N/total] Name`).
     summary=str → "done" row (appends ` — summary`). Pad with spaces
                    so the em-dash column aligns roughly at col 34.
     """
-    marker = f"sync_row_{idx}"
+    # Fall back to the thread-local stashed by sync_all / sync_one_channel
+    # if the caller didn't pass one explicitly.
+    if not pass_id:
+        pass_id = getattr(_ROW_EMIT_PASS_ID, "id", "") or ""
+    marker = (f"sync_row_{pass_id}_{idx}" if pass_id
+              else f"sync_row_{idx}")
     segs = _bracket_segments(f"{idx}/{total}", extra_tag=marker)
     if summary is None:
         segs.append([f"{name}\n", [name_tag, marker]])
@@ -1869,6 +1902,15 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         except Exception:
             pass
 
+    # Per-pass unique id — stashed on a thread-local that
+    # `_sync_row_emit` reads by default, so every call site inside the
+    # sync loop picks it up without having to pass it explicitly.
+    # Autorun-fired second passes were silently replacing the first
+    # pass's rows in-place (far above the current scroll) because
+    # `sync_row_1` collided across passes; a fresh id per pass fixes
+    # it cleanly. Cleared in the `finally` at the bottom of this func.
+    _ROW_EMIT_PASS_ID.id = _new_pass_id()
+
     # Start-of-pass header — show total remaining work, not len(config).
     # In resume mode that's the restored queue size; fresh mode it's the
     # whole channel list we just enqueued.
@@ -2157,6 +2199,10 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         except Exception: pass
     # TuneShine: clear the sync-progress file so the display goes idle.
     try: clear_sync_progress()
+    except Exception: pass
+    # Clear the thread-local pass_id so stray `_sync_row_emit` calls
+    # after this function returns don't tag rows with a dead pass.
+    try: _ROW_EMIT_PASS_ID.id = ""
     except Exception: pass
     return {"ok": True, "downloaded": sum_dl, "errors": sum_err,
             "skipped": skipped,

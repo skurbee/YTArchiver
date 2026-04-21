@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v49.2"
-APP_VERSION_DATE = "4.20.26 7:16pm"
+APP_VERSION      = "v49.3"
+APP_VERSION_DATE = "4.20.26 8:36pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -4508,7 +4508,12 @@ class Api:
             # the usual "[1/1] Name — no new videos" line they expected.
             import time as _t
             from backend.sync import (_sync_row_emit, _short_summary,
-                                       _fmt_duration)
+                                       _fmt_duration, _new_pass_id,
+                                       _ROW_EMIT_PASS_ID)
+            # Unique pass id so this channel's [1/1] row doesn't replace
+            # a prior pass's [1/1] row in the scrollback (same bug class
+            # as the autorun sync_all collision).
+            _ROW_EMIT_PASS_ID.id = _new_pass_id()
             t0 = _t.time()
             try:
                 self._log_stream.emit([
@@ -4539,6 +4544,8 @@ class Api:
             except Exception as e:
                 self._log_stream.emit_error(f"Sync crashed: {e}")
             finally:
+                try: _ROW_EMIT_PASS_ID.id = ""
+                except Exception: pass
                 try:
                     if getattr(self, "_tray", None):
                         self._tray.stop_spin()

@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v51.7"
-APP_VERSION_DATE = "4.21.26 5:50pm"
+APP_VERSION      = "v51.8"
+APP_VERSION_DATE = "4.21.26 8:10pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -121,6 +121,16 @@ class Api:
         self._sync_cancel = threading.Event()
         self._sync_pause = threading.Event() # set == paused; worker blocks
         self._sync_skip = threading.Event() # set == skip current item
+        # Pending redownload chain — right-clicking "Continue Redownload"
+        # on multiple channels queues each request here, and a single
+        # worker thread drains the queue sequentially. Without this
+        # list, the second "Continue Redownload" click hit the
+        # sync_is_running() gate and silently rejected (user sees
+        # "nothing happens"). Items: {ch, folder, new_res, scope_label,
+        # rd_task}. Lock protects append/pop race between JS callers
+        # and the draining worker.
+        self._redwnl_pending: list = []
+        self._redwnl_lock = threading.Lock()
         # Pull whisper model from config so Settings changes actually take
         # effect on next launch. Without this the TranscribeManager defaults
         # to "large-v3" regardless of what the user picked in Settings.
@@ -3170,8 +3180,20 @@ class Api:
         folder = os.path.join(base, _folder_name)
         if not os.path.isdir(folder):
             return {"ok": False, "error": f"Channel folder missing: {folder}"}
-        if self.sync_is_running():
-            return {"ok": False, "error": "Sync pipeline already running"}
+        # Gate behavior:
+        #   - If a regular (non-redownload) sync is running, refuse.
+        #   - If a redownload is running, QUEUE this request so the
+        #     worker picks it up after the current one finishes.
+        #   - If nothing is running, start a worker that drains the
+        #     queue sequentially.
+        # Reported: right-clicking "Continue Redownload" on channel 2
+        # while channel 1 was still redownloading silently failed.
+        _sync_alive = bool(self._sync_thread and self._sync_thread.is_alive())
+        if _sync_alive:
+            _cur = self._queues.current_sync or {}
+            if (_cur.get("kind") or "").lower() != "redownload":
+                return {"ok": False, "error": "Sync pipeline already running"}
+            # Fall through into the enqueue path below.
 
         # Narrow to a year / month subfolder when requested. The
         # `_scan_local_files` walker already handles any folder path, so
@@ -3199,108 +3221,145 @@ class Api:
                         "error": f"Scope folder missing: {sub}"}
             folder = sub
 
-        # Reset cancel/pause for this redownload
-        self._sync_cancel.clear()
-        self._sync_pause.clear()
-        self._sync_skip.clear()
+        # Build a queue item + the UI-visible task dict.
+        _rd_task = dict(ch)
+        _rd_task["kind"] = "redownload"
+        _rd_task["redownload_res"] = new_res
+        _pending_item = {
+            "ch": dict(ch),
+            "folder": folder,
+            "new_res": new_res,
+            "scope_label": scope_label,
+            "rd_task": _rd_task,
+        }
 
-        def _run():
-            from backend import redownload as _rd
-            _scope_text = f" [{scope_label}]" if scope_label else ""
-            # Register the redownload as the active sync task so the
-            # Sync Tasks popover shows a `Redownloading {channel}
-            # ({res}p)` row with Pause/Resume/Cancel controls — matches
-            # the classic visualization (per screenshot reference).
-            # `kind=redownload` + `redownload_res` are read by
-            # `_task_label_sync` to produce the label.
-            _rd_task = dict(ch)
-            _rd_task["kind"] = "redownload"
-            _rd_task["redownload_res"] = new_res
-            try:
-                self._queues.set_current_sync(_rd_task)
-            except Exception:
-                pass
-            try:
-                self._log_stream.emit([
-                    ["[Sync] ", "sync_bracket"],
-                    [f"Redownload {ch.get('name','?')}{_scope_text} \u2192 ",
-                     "simpleline_green"],
-                    [("Best\n" if new_res == "best" else f"{new_res}p\n"),
-                     "simpleline_green"],
-                ])
-                self._log_stream.flush()
-                # Install the 10-sample confirm bridge. The pipeline calls
-                # this callback inline on the worker thread; we park the
-                # thread on a threading.Event until the UI calls
-                # `redownload_sample_confirm(choice)`. Matches OLD's
-                # `_show_sample_popup` behavior at YTArchiver.py:10711.
-                def _confirm(avg_pct, direction, res_label, sample_n):
-                    ev = threading.Event()
-                    self._redwnl_sample = {
+        with self._redwnl_lock:
+            # Always enqueue to the internal chain.
+            self._redwnl_pending.append(_pending_item)
+            # Mirror to the sync-queue UI so the Sync Tasks popover
+            # shows queued redownloads alongside the one running.
+            try: self._queues.sync_enqueue(_rd_task)
+            except Exception: pass
+
+            # If a worker is already draining the chain, we're done —
+            # our item will get picked up when the current one
+            # finishes. Reported: second "Continue Redownload" click
+            # used to silently error with "Sync pipeline already
+            # running"; it now queues and fires in turn.
+            if _sync_alive:
+                self._on_queue_changed()
+                return {"ok": True, "queued": True, "resolution": new_res}
+
+            # Nothing running: reset cancel/pause and spawn the worker.
+            self._sync_cancel.clear()
+            self._sync_pause.clear()
+            self._sync_skip.clear()
+
+            def _worker():
+                while True:
+                    with self._redwnl_lock:
+                        if not self._redwnl_pending:
+                            break
+                        item = self._redwnl_pending.pop(0)
+                    # Remove the about-to-run item from the sync queue
+                    # UI (moves it from "queued" to "running").
+                    try:
+                        self._queues.sync_remove(
+                            item["rd_task"].get("url", ""))
+                    except Exception:
+                        pass
+                    try:
+                        self._run_redownload_one(
+                            item["ch"], item["folder"],
+                            item["new_res"], item["scope_label"])
+                    except Exception as _re:
+                        try: self._log_stream.emit_error(
+                            f"Redownload crashed: {_re}")
+                        except Exception: pass
+                # Chain drained — final bookkeeping.
+                self._on_queue_changed()
+                try: self._autorun.notify_sync_done()
+                except Exception: pass
+                try: threading.Timer(0.5, self._on_queue_changed).start()
+                except Exception: pass
+
+            self._sync_thread = threading.Thread(target=_worker, daemon=True)
+            self._sync_thread.start()
+            self._on_queue_changed()
+            return {"ok": True, "started": True, "resolution": new_res}
+
+    def _run_redownload_one(self, ch, folder, new_res, scope_label):
+        """Run ONE redownload to completion. Called from the chain
+        worker. Previously inlined as `_run` inside `chan_redownload`;
+        extracted so the worker can drain multiple queued items
+        sequentially without re-spawning threads per item.
+        """
+        from backend import redownload as _rd
+        _scope_text = f" [{scope_label}]" if scope_label else ""
+        _rd_task = dict(ch)
+        _rd_task["kind"] = "redownload"
+        _rd_task["redownload_res"] = new_res
+        try:
+            self._queues.set_current_sync(_rd_task)
+        except Exception:
+            pass
+        try:
+            self._log_stream.emit([
+                ["[Sync] ", "sync_bracket"],
+                [f"Redownload {ch.get('name','?')}{_scope_text} \u2192 ",
+                 "simpleline_green"],
+                [("Best\n" if new_res == "best" else f"{new_res}p\n"),
+                 "simpleline_green"],
+            ])
+            self._log_stream.flush()
+
+            def _confirm(avg_pct, direction, res_label, sample_n):
+                ev = threading.Event()
+                self._redwnl_sample = {
+                    "avg_pct": float(avg_pct),
+                    "direction": str(direction),
+                    "res_label": str(res_label),
+                    "sample_n": int(sample_n),
+                    "event": ev,
+                    "choice": "continue",
+                }
+                try:
+                    import json as _json
+                    _payload = _json.dumps({
+                        "kind": "redownload_sample",
                         "avg_pct": float(avg_pct),
                         "direction": str(direction),
                         "res_label": str(res_label),
                         "sample_n": int(sample_n),
-                        "event": ev,
-                        "choice": "continue",
-                    }
-                    # Fire an event the HTML layer listens for via the log
-                    # stream — a zero-width tag payload keeps it out of
-                    # the visible log body.
-                    try:
-                        import json as _json
-                        _payload = _json.dumps({
-                            "kind": "redownload_sample",
-                            "avg_pct": float(avg_pct),
-                            "direction": str(direction),
-                            "res_label": str(res_label),
-                            "sample_n": int(sample_n),
-                        })
-                        self._log_stream.emit([
-                            [_payload, "__control__"],
-                        ])
-                        self._log_stream.flush()
-                    except Exception:
-                        pass
-                    # 5-minute auto-continue safety (OLD auto-continues too)
-                    ev.wait(timeout=300)
-                    return self._redwnl_sample.get("choice", "continue")
-
-                _rd.redownload_channel(
-                    ch.get("name", ""), ch.get("url", ""), folder, new_res,
-                    stream=self._log_stream,
-                    cancel_ev=self._sync_cancel,
-                    pause_ev=self._sync_pause,
-                    confirm_cb=_confirm,
-                )
-            except Exception as e:
-                self._log_stream.emit_error(f"Redownload crashed: {e}")
-            finally:
-                # Drop the redownload row from the Sync Tasks popover.
-                try: self._queues.set_current_sync(None)
-                except Exception: pass
-                self._log_stream.flush()
-                # Invalidate disk cache so Subs table re-scans sizes.
-                try:
-                    from backend import archive_scan as _as
-                    _as.invalidate_channel(ch.get("url", ""))
+                    })
+                    self._log_stream.emit([
+                        [_payload, "__control__"],
+                    ])
+                    self._log_stream.flush()
                 except Exception:
                     pass
-                self._on_queue_changed()
-                # Reset autorun countdown — manual sync just finished, so
-                # the "Syncing..." hold should clear and a fresh interval
-                # begins counting down.
-                try: self._autorun.notify_sync_done()
-                except Exception: pass
-                # Delayed second push so is_alive() reports False
-                # (see sync_start_all's matching fix).
-                try: threading.Timer(0.5, self._on_queue_changed).start()
-                except Exception: pass
+                ev.wait(timeout=300)
+                return self._redwnl_sample.get("choice", "continue")
 
-        self._sync_thread = threading.Thread(target=_run, daemon=True)
-        self._sync_thread.start()
-        self._on_queue_changed()
-        return {"ok": True, "started": True, "resolution": new_res}
+            _rd.redownload_channel(
+                ch.get("name", ""), ch.get("url", ""), folder, new_res,
+                stream=self._log_stream,
+                cancel_ev=self._sync_cancel,
+                pause_ev=self._sync_pause,
+                confirm_cb=_confirm,
+            )
+        except Exception as e:
+            self._log_stream.emit_error(f"Redownload crashed: {e}")
+        finally:
+            try: self._queues.set_current_sync(None)
+            except Exception: pass
+            self._log_stream.flush()
+            try:
+                from backend import archive_scan as _as
+                _as.invalidate_channel(ch.get("url", ""))
+            except Exception:
+                pass
+            self._on_queue_changed()
 
     def redownload_sample_confirm(self, choice):
         """UI → Python bridge for the "check 10 then re-ask" popup.

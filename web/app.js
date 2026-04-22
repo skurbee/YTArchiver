@@ -4739,10 +4739,26 @@
               return r === "best" ? "Best available"
                    : r ? `${r}p` : "target resolution";
             })()}`,
-            action: () => {
+            action: async () => {
               const res = tr.dataset.redownloadRes || "";
               if (!res) return;
-              api?.chan_redownload?.({ name: chan }, res);
+              try {
+                const r = await api?.chan_redownload?.({ name: chan }, res);
+                if (!r) return;
+                if (!r.ok) {
+                  window._showToast?.(r.error || "Redownload failed", "error");
+                  return;
+                }
+                if (r.queued) {
+                  window._showToast?.(
+                    `Queued redownload of ${chan}.`, "ok");
+                } else if (r.started) {
+                  window._showToast?.(
+                    `Redownload started: ${chan}.`, "ok");
+                }
+              } catch (e) {
+                window._showToast?.("Error: " + e, "error");
+              }
             }},
         ] : [
           { label: "Redownload at\u2026",

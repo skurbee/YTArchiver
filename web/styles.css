@@ -2598,8 +2598,38 @@ body {
   min-height: 0;
 }
 .watch-layout > * { min-height: 0; }
+/* Narrow-window graceful degradation.
+   Pre-fix: a single media query at max-width:900px set
+   grid-template-columns to 1fr but DIDN'T adjust
+   grid-template-rows, which stayed at `1fr`. With two grid children
+   in a 1-column / 1-row grid, the second child auto-flowed into an
+   implicit row whose size was squeezed by the parent's fixed
+   height:100% — hiding the video entirely behind the transcript
+   row. Reported: "video goes away entirely" at sub-900px widths.
+   Now: stack vertically with `auto 1fr` rows — video takes its
+   natural aspect-ratio height (capped at 40vh so the transcript
+   still gets breathing room), transcript fills the remainder. */
 @media (max-width: 900px) {
-  .watch-layout { grid-template-columns: 1fr; }
+  .watch-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(200px, 1fr);
+  }
+  .watch-video-wrap {
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+}
+/* Extra-narrow — let the page scroll as a whole rather than forcing
+   a tiny 200px transcript pane. Keeps content legible when the
+   user drags the window very narrow. */
+@media (max-width: 520px) {
+  #view-watch { overflow-y: auto; }
+  .watch-layout {
+    grid-template-rows: auto auto;
+    height: auto;
+    min-height: 100%;
+  }
+  .watch-video-wrap { max-height: none; }
 }
 .watch-video-wrap {
   display: flex;

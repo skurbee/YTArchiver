@@ -169,34 +169,133 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
     return result
 
 
+def _build_metadata_index(folder: str) -> Dict[str, Any]:
+    """Load all aggregated `.{ch} Metadata.jsonl` files under `folder`
+    into three indices for fast matching:
+        by_title: {title.lower(): video_id}
+        by_date:  {YYYYMMDD: [(video_id, title_orig), ...]}
+        by_id:    {video_id: {title, upload_date}}
+
+    Used by `_match_files_to_ids` to catch videos YouTube has renamed
+    since original download (local filename stem no longer matches
+    the current catalog title) and to match 1-video-per-day channels
+    by file mtime alone.
+    """
+    out = {"by_title": {}, "by_date": {}, "by_id": {}}
+    if not folder or not os.path.isdir(folder):
+        return out
+    for dp, _dns, fns in os.walk(folder):
+        for fn in fns:
+            if not (fn.startswith(".") and fn.endswith("Metadata.jsonl")):
+                continue
+            try:
+                with open(os.path.join(dp, fn), "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            obj = json.loads(ln)
+                        except Exception:
+                            continue
+                        vid = (obj.get("video_id") or "").strip()
+                        title = (obj.get("title") or "").strip()
+                        upload_date = str(obj.get("upload_date") or "").strip()
+                        if not vid:
+                            continue
+                        out["by_id"][vid] = {
+                            "title": title, "upload_date": upload_date}
+                        if title:
+                            out["by_title"][title.lower()] = vid
+                        if upload_date and len(upload_date) == 8:
+                            out["by_date"].setdefault(
+                                upload_date, []).append((vid, title))
+            except OSError:
+                continue
+    return out
+
+
 def _match_files_to_ids(local_files: Dict[str, str],
-                         yt_title_to_id: Dict[str, str]) -> List[Dict[str, str]]:
+                         yt_title_to_id: Dict[str, str],
+                         meta_index: Optional[Dict[str, Any]] = None
+                         ) -> List[Dict[str, str]]:
     """Build list of {filename, filepath, video_id, title} for matched files.
 
-    Matching priority:
-      1. Filename has `[VIDEOID]` token (fast path — no yt catalog needed)
-      2. Stem (no ext) equals a yt title exactly
-      3. Substring match (stem contains or is contained by a yt title)
+    Matching priority (stop at first hit):
+      1. Filename has `[VIDEOID]` token (fast path — no catalog needed)
+      2. Stem equals a current YT catalog title exactly (case-insensitive)
+      3. Stem equals a LOCAL metadata title exactly — catches videos
+         YouTube has renamed since download. The aggregated
+         `.{ch} Metadata.jsonl` records each video's title at metadata-
+         fetch time; a later YT-side rename leaves the local filename
+         matching the OLD title, which only this index can resolve.
+      4. File mtime → YYYYMMDD → local metadata's by_date index.
+         yt-dlp `--mtime` stamps file mtime to the YouTube upload date,
+         so this is a bijection for channels that upload ≤ 1 video/day.
+         For higher-frequency channels with multiple videos on one date,
+         the step narrows the candidate set and then re-tries substring
+         match within that day's entries only.
+      5. Substring fallback against the current YT catalog (existing).
+
+    Without steps 3-4 (added because a channel with only 25/41 matched
+    by title had mostly rename-drift + rare multi-video days), the
+    redownload pipeline silently skipped 16 files.
     """
     matched: List[Dict[str, str]] = []
-    # Normalize yt titles to lower for fuzzy match
     yt_lower = {t.lower(): (t, vid) for t, vid in yt_title_to_id.items()}
+    meta_by_title = (meta_index or {}).get("by_title") or {}
+    meta_by_date = (meta_index or {}).get("by_date") or {}
+    meta_by_id = (meta_index or {}).get("by_id") or {}
     for fname, fpath in local_files.items():
         stem = os.path.splitext(fname)[0]
         vid_id = _extract_id_from_filename(fname)
         title = stem
+        # 1. [VIDEOID] in filename — fast path
         if vid_id:
             matched.append({"filename": fname, "filepath": fpath,
                             "video_id": vid_id, "title": title})
             continue
-        # Fuzzy by title
         low = stem.lower()
+        # 2. Exact title match in YT catalog
         if low in yt_lower:
             t, vid = yt_lower[low]
             matched.append({"filename": fname, "filepath": fpath,
                             "video_id": vid, "title": t})
             continue
-        # Substring fallback
+        # 3. Exact title match in LOCAL metadata (catches renames)
+        if low in meta_by_title:
+            vid = meta_by_title[low]
+            t_orig = meta_by_id.get(vid, {}).get("title") or stem
+            matched.append({"filename": fname, "filepath": fpath,
+                            "video_id": vid, "title": t_orig})
+            continue
+        # 4. MTIME-DATE fallback against local metadata
+        try:
+            import datetime as _dt
+            mt_date = _dt.datetime.fromtimestamp(
+                os.path.getmtime(fpath)).strftime("%Y%m%d")
+        except OSError:
+            mt_date = ""
+        if mt_date and mt_date in meta_by_date:
+            candidates = meta_by_date[mt_date]
+            if len(candidates) == 1:
+                vid, t_orig = candidates[0]
+                matched.append({"filename": fname, "filepath": fpath,
+                                "video_id": vid, "title": t_orig or stem})
+                continue
+            # Multiple videos that day — pick the best substring match.
+            best = None
+            for vid, t_orig in candidates:
+                t_low = (t_orig or "").lower()
+                if t_low and (low in t_low or t_low in low):
+                    best = (vid, t_orig)
+                    break
+            if best:
+                vid, t_orig = best
+                matched.append({"filename": fname, "filepath": fpath,
+                                "video_id": vid, "title": t_orig or stem})
+                continue
+        # 5. Substring fallback in YT catalog (existing behavior)
         for t_lower, (t_orig, vid) in yt_lower.items():
             if t_lower in low or low in t_lower:
                 matched.append({"filename": fname, "filepath": fpath,
@@ -439,8 +538,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                      [" YouTube catalog fetch failed.\n", "red"]])
         return {"ok": False, "done": 0, "errors": 1, "total": 0}
 
-    # 3. Match
-    matched = _match_files_to_ids(local, yt_titles)
+    # 3. Match. Load the aggregated `.{ch} Metadata.jsonl` files under
+    #    the channel folder to build secondary title + by-date indices.
+    #    This rescues rename-drift videos (YouTube changed the title
+    #    after we downloaded; local filename still matches the OLD
+    #    title stored in our metadata) and enables mtime-date-based
+    #    matching for low-upload-frequency channels.
+    meta_index = _build_metadata_index(folder)
+    matched = _match_files_to_ids(local, yt_titles, meta_index=meta_index)
     stream.emit([["  \u2014", "simpleline_redwnl"],
                  [f" Matched {len(matched)}/{len(local)} files to YouTube IDs.\n",
                   "simpleline"]])
@@ -543,11 +648,26 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     ["Redownload resumed.\n", "simpleline"],
                 ])
         vid = item["video_id"]
-        if vid in done:
-            n_skipped += 1
-            continue
         fp = item["filepath"]
         file_num = idx + 1
+        if vid in done:
+            # Previously-redownloaded in this resumed pass. Emit a
+            # dim one-liner so the [N/total] sequence stays visible
+            # instead of jumping in random increments. Reported gap
+            # symptoms: numbers skipped from 1294 to 1300 to 1314
+            # with no log between — the missing entries were all
+            # silent "already done" skips from the resume list.
+            stream.emit([
+                ["[", "simpleline_redwnl"],
+                [str(file_num), "simpleline"],
+                ["/", "simpleline_redwnl"],
+                [str(_live_total), "simpleline"],
+                ["] ", "simpleline_redwnl"],
+                [f"{item['title']} \u2014 already done.\n", "dim"],
+            ])
+            _emit_active(file_num, _live_total)
+            n_skipped += 1
+            continue
         if _already_at_target(fp, cur_res[0]):
             # File already at target resolution — skip it. Emit a
             # completed-style `[N/total] filename — already at Xp. skip.`
@@ -586,6 +706,18 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
         out_dir = os.path.dirname(fp) or folder
         new_fp = _download_one(vid, cur_res[0], out_dir, stream, cancel_ev)
         if not new_fp or not os.path.isfile(new_fp):
+            # Emit a visible error line so the [N/total] sequence
+            # doesn't have unexplained gaps — same root-cause fix as
+            # the "already done" silent skip above.
+            stream.emit([
+                ["[", "simpleline_redwnl"],
+                [str(file_num), "simpleline"],
+                ["/", "simpleline_redwnl"],
+                [str(_live_total), "simpleline"],
+                ["] ", "simpleline_redwnl"],
+                [f"{item['title']} \u2014 download failed.\n", "red"],
+            ])
+            _emit_active(file_num, _live_total)
             n_err += 1
             continue
         # Preserve the ORIGINAL filename — OLD does `os.replace(temp, fp)`.

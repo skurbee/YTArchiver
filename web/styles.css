@@ -1178,6 +1178,27 @@ body {
 .activity-log .log-line.hist_row_alt {
   background: var(--c-log-row-alt);
 }
+
+/* [ReDwnl] rows have only 3 count cells (replaced / skipped / errors
+   in primary / secondary / tertiary) and no 4th `errors`-slot value.
+   Collapse that reserved column to 0 so "took" snaps tight to the
+   counts instead of floating out to the right by 60px+. The empty
+   errors <span> still occupies its grid cell — sized to 0 via this
+   override — which is the simplest way to avoid DOM restructuring. */
+.activity-log .log-line.hist-row-ReDwnl {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 2.5fr)
+    8px
+    minmax(98px, 1fr)
+    minmax(98px, 1fr)
+    minmax(98px, 1fr)
+    0           /* errors slot collapsed */
+    minmax(66px, 1fr);
+}
+
 .activity-log .log-line > span {
   overflow: hidden;
   text-overflow: ellipsis;

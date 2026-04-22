@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v53.0"
-APP_VERSION_DATE = "4.22.26 7:49am"
+APP_VERSION      = "v53.4"
+APP_VERSION_DATE = "4.22.26 9:39am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -3519,6 +3519,19 @@ class Api:
             except Exception:
                 pass
             self._on_queue_changed()
+            # Tell the frontend to re-fetch the Subs table so the
+            # chartreuse `_pending_redownload` dot clears now that
+            # `_redownload_progress.json` has been deleted. Without
+            # this push, the Subs table stays cached with the stale
+            # dot until the user manually switches tabs or triggers
+            # another refresh.
+            try:
+                if self._window is not None:
+                    self._window.evaluate_js(
+                        "if (window.refreshSubsTable) "
+                        "window.refreshSubsTable();")
+            except Exception:
+                pass
 
     def redownload_sample_confirm(self, choice):
         """UI → Python bridge for the "check 10 then re-ask" popup.

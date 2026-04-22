@@ -289,7 +289,13 @@
     const tag = c.row_tag || "";
     const tagCls = tag ? "t-" + tag : "";
     const line = document.createElement("div");
-    line.className = "log-line" + (entry.alt ? " hist_row_alt" : "");
+    // Row-kind class lets the grid template adapt per activity kind
+    // (e.g. [ReDwnl] has only 3 counts + took; [Dwnld] has 4 counts +
+    // took). Without per-kind grid overrides, unused count cells
+    // reserve their minmax widths and push adjacent cells out.
+    const _kindSlug = String(c.kind || "").replace(/[^A-Za-z0-9]/g, "");
+    const _kindCls = _kindSlug ? " hist-row-" + _kindSlug : "";
+    line.className = "log-line" + (entry.alt ? " hist_row_alt" : "") + _kindCls;
     // `row_id` lets the backend retroactively update a previously-
     // emitted row (e.g. a [Dwnld] row that fired with `0 transcribed`
     // while Whisper was still running — the transcribe-complete hook

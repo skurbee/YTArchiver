@@ -690,8 +690,23 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
             tertiary = bparts[2]
             errors, took = bparts[3], bparts[4]
         elif len(bparts) == 4:
-            # Metdta shape: primary, skipped/refreshed, errors, took
-            secondary, errors, took = bparts[1], bparts[2], bparts[3]
+            if kind == "ReDwnl":
+                # ReDwnl body: replaced · skipped · errors · took
+                # Pack all 3 counts into the first 3 num columns
+                # (primary · secondary · tertiary) and leave the
+                # errors cell empty. Otherwise the middle tertiary
+                # column (reserved for [Dwnld]'s metadata count)
+                # renders empty and produces a huge gap between
+                # "skipped" and "errors" in the grid. The errors
+                # count's "N errors" regex still gets its red
+                # highlight from _HIST_HILITE regardless of which
+                # cell it sits in.
+                secondary = bparts[1]
+                tertiary = bparts[2]
+                took = bparts[3]
+            else:
+                # Metdta shape: primary, skipped/refreshed, errors, took
+                secondary, errors, took = bparts[1], bparts[2], bparts[3]
         elif len(bparts) == 3:
             # Simpler shape: primary, errors, took
             errors, took = bparts[1], bparts[2]

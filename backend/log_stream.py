@@ -35,6 +35,14 @@ VERBOSE_ONLY_TAGS = frozenset({
     "dlprogress",
     "dlprogress_pct",
     "metadata_using",
+    # "Transcribing — Loading Whisper model (small) on GPU..." uses
+    # this tag. It's a one-time subprocess-spawn diagnostic that would
+    # otherwise land at whatever scroll position the log happens to
+    # be at when Whisper starts up — typically a later channel's "no
+    # new videos" row, way below the video that actually queued the
+    # transcribe job. Hide in Simple mode so the user only sees the
+    # `tx_done_<vid>` placeholder and its eventual ✓ replacement.
+    "transcribe_using",
     # Simple mode only shows the three green startup milestones
     # ("Disk scan complete", "Browse tab preload complete", "Startup
     # checks complete, ready to download"). The per-channel "Loading\u2026

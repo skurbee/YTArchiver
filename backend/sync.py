@@ -195,7 +195,16 @@ _TITLE_RE = re.compile(r"\[download\]\s+Destination:\s+(.+)$")
 # line. Mirrors OLD YTArchiver.py:18625 — we want every flavor of yt-dlp's
 # final-file announcement (merge of separate tracks, remux for M3U8, etc.).
 _MERGE_RE = re.compile(
-    r'\[(?:Merger|ffmpeg|FixupM3u8)\]\s+(?:Merging|Remuxing|Converting)[^"]*"(.+?)"')
+    # Match the FULL quoted path even when the video title contains
+    # internal quote characters — yt-dlp emits the merger target as
+    # `Merging formats into "PATH"` and PATH can legitimately contain
+    # quote marks (e.g. a title like `the "Nice Way" video.mp4`).
+    # Non-greedy `"(.+?)"` used to stop at the first internal quote,
+    # producing a truncated path; _path_to_counter.get() then missed
+    # and the done line orphaned instead of replacing the progress
+    # row. Greedy `"(.+)"` with end-of-line anchor captures the whole
+    # path — yt-dlp always terminates the merger line with `"` + EOL.
+    r'\[(?:Merger|ffmpeg|FixupM3u8)\]\s+(?:Merging|Remuxing|Converting)[^"]*"(.+)"\s*$')
 _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format")
 
 # Module-level download-row counter. The `dlrow_<N>` inplace kind must be
@@ -1012,10 +1021,23 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             # f"tx_done_{vid}"]` it finds this placeholder and
                             # replaces it in place.
                             _tx_marker = f"tx_done_{vid}"
+                            # Placeholder MUST include a non-verbose-only
+                            # segment so it survives Simple mode's
+                            # `_line_is_verbose_only` filter and actually
+                            # lands in DOM. Otherwise the subsequent
+                            # transcribe-done emit (with same tx_done_
+                            # marker) can't find the placeholder to
+                            # replace and appends at log bottom — under
+                            # whichever channel the sync pass is
+                            # currently processing, not under this
+                            # video's section. Using `whisper_bracket`
+                            # for the em-dash + hourglass so the line
+                            # visually matches the eventual ✓ done
+                            # emit's em-dash color.
                             stream.emit([
-                                [" \u2014 \u23F3 ", ["dim", _tx_marker]],
+                                [" \u2014 \u23F3 ", ["whisper_bracket", _tx_marker]],
                                 ["Transcription queued\u2026\n",
-                                 ["dim", _tx_marker]],
+                                 ["simpleline", _tx_marker]],
                             ])
                             transcribe_mgr.enqueue(final_path, t,
                                                     channel=name,

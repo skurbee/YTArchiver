@@ -1548,11 +1548,17 @@ class TranscribeManager:
                 return False
 
             dev = info.get("device", "?").upper()
-            # Green em-dash + checkmark, white body text (request: "make
-            # this line white except for the checkmark").
+            # Verbose-only subprocess-spawn diagnostic. PRIMARY tag
+            # must be `transcribe_using` (in VERBOSE_ONLY_TAGS) so
+            # `_line_is_verbose_only` drops the whole line in Simple
+            # mode. In Verbose mode it renders in the transcribe
+            # color (blue). This line has no inplace marker so it
+            # would otherwise land at whatever log position the
+            # sync pass is at — typically under a later channel's
+            # "no new videos" row, persisting there forever.
             self._stream.emit([
-                [" \u2014 \u2713 ", "simpleline_green"],
-                [f"Whisper model loaded ({m}, {dev}).\n", "simpleline"],
+                [" \u2014 \u2713 ", "transcribe_using"],
+                [f"Whisper model loaded ({m}, {dev}).\n", "transcribe_using"],
             ])
             if info.get("cuda_fallback_reason"):
                 self._stream.emit_dim(

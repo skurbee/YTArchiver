@@ -1923,10 +1923,68 @@ def emit_consolidated_auto_row(stream: "LogStreamer",
                     f"{int(errors or 0)} errors \u00b7 "
                     f"took {took}")
         line = f"{kind_tag} {ts_date} \u2014{ch_part} {body}"
-        _ar.append_history_entry(line)
+        # Row-ID-aware persist: if this row_id has already been
+        # written to config (previous emit for same row), REPLACE
+        # the persisted line instead of appending. Prevents
+        # duplicate [Dwnld] rows when the transcribe-complete hook
+        # re-emits with updated counts.
+        _persist_row_history(row_id, line)
     except Exception:
         pass
     return row_id
+
+
+# Row-ID-aware history persistence. `emit_consolidated_auto_row` can
+# be called twice for the SAME row_id — first when sync_channel
+# finishes (transcribe count may still be 0), then retroactively when
+# the transcribe worker drains. Without tracking which config index
+# each row_id owns, the retroactive call appends a SECOND line to
+# `autorun_history`, producing duplicate [Dwnld] rows on next load
+# (and sometimes immediately if renderActivityLog re-runs). This
+# dict maps row_id -> index in config["autorun_history"] so the
+# retroactive path overwrites the correct slot.
+_HIST_INDEX_BY_ROW_ID: Dict[str, int] = {}
+_HIST_INDEX_LOCK = threading.Lock()
+
+
+def _persist_row_history(row_id: str, line: str) -> None:
+    """Append `line` to config['autorun_history'], or replace the
+    previously-persisted entry if this row_id has already been
+    written. Deduplicates retroactive updates of the same row.
+    """
+    try:
+        from . import autorun as _ar
+        from . import ytarchiver_config as _cfg
+    except Exception:
+        return
+    if not _cfg.config_is_writable():
+        return
+    try:
+        cfg = _cfg.load_config()
+        hist = cfg.setdefault("autorun_history", [])
+        with _HIST_INDEX_LOCK:
+            existing_idx = _HIST_INDEX_BY_ROW_ID.get(row_id) if row_id else None
+            if (existing_idx is not None
+                    and 0 <= existing_idx < len(hist)):
+                # Retroactive update — replace the previous line.
+                hist[existing_idx] = line
+            else:
+                hist.append(line)
+                # Trim + shift any tracked indices if we exceeded cap.
+                if len(hist) > _ar.AUTORUN_HISTORY_MAX:
+                    trim_n = len(hist) - _ar.AUTORUN_HISTORY_MAX
+                    hist = hist[-_ar.AUTORUN_HISTORY_MAX:]
+                    cfg["autorun_history"] = hist
+                    for _k, _v in list(_HIST_INDEX_BY_ROW_ID.items()):
+                        if _v < trim_n:
+                            _HIST_INDEX_BY_ROW_ID.pop(_k, None)
+                        else:
+                            _HIST_INDEX_BY_ROW_ID[_k] = _v - trim_n
+                if row_id:
+                    _HIST_INDEX_BY_ROW_ID[row_id] = len(hist) - 1
+        _cfg.save_config(cfg)
+    except Exception:
+        pass
 
 
 # Registry: channel_name -> (row_id, downloaded, metadata, errors,

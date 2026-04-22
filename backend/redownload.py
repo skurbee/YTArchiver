@@ -468,6 +468,11 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     n_done = 0
     n_skipped = 0
     n_err = 0
+    # Track wall-clock start so the completion-or-cancel activity-log
+    # entry can report "took Xm Ys" (matches classic's
+    # _record_redownload_finish at YTArchiver.py:22678).
+    import time as _t
+    _t_start = _t.time()
     # Use a mutable list for current target so the sample-confirm branch
     # can rewrite it mid-loop without breaking the closure.
     cur_res = [new_res]
@@ -801,5 +806,38 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     stream.emit([["=== Redownload complete: ", "header"],
                  [f"{n_done} done \u00b7 {n_skipped} skipped \u00b7 {n_err} errors ===\n",
                   "header"]])
+
+    # Persist a [ReDwnl] row to the activity-log history — fires on
+    # both full completion AND cancel (partial). Mirrors classic
+    # YTArchiver's _record_redownload_finish (YTArchiver.py:22678).
+    # reported: cancelling a redownload should tell the user how
+    # many were completed before the cancel. Format keeps the
+    # 4-bullet body shape that autorun_history_entries_for_ui parses
+    # as (secondary, errors, took) for render.
+    try:
+        from . import autorun as _ar
+        from datetime import datetime as _dt
+        _now = _dt.now()
+        _ts = (_now.strftime("%-I:%M%p") if os.name != "nt"
+               else _now.strftime("%I:%M%p").lstrip("0")).lower()
+        _date = _now.strftime("%b %d").replace(" 0", " ")
+        _elapsed = int(_t.time() - _t_start)
+        if _elapsed >= 3600:
+            _dur = f"took {_elapsed // 3600}h {(_elapsed % 3600) // 60:02d}m"
+        elif _elapsed >= 60:
+            _dur = f"took {_elapsed // 60}m {_elapsed % 60:02d}s"
+        else:
+            _dur = f"took {_elapsed}s"
+        _ts_date = f"{_ts}, {_date}"
+        _ch_part = f" {ch_name} \u2014" if ch_name else ""
+        _body = (f"{n_done} replaced \u00b7 "
+                 f"{n_skipped} skipped \u00b7 "
+                 f"{n_err} errors \u00b7 "
+                 f"{_dur}")
+        _line = f"[ReDwnl] {_ts_date} \u2014{_ch_part} {_body}"
+        _ar.append_history_entry(_line)
+    except Exception:
+        pass
+
     return {"ok": True, "done": n_done, "skipped": n_skipped, "errors": n_err,
             "total": len(matched)}

@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v51.8"
-APP_VERSION_DATE = "4.21.26 8:10pm"
+APP_VERSION      = "v52.5"
+APP_VERSION_DATE = "4.21.26 10:01pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -563,19 +563,24 @@ class Api:
         """UI toggled log mode. Pushes filter state into LogStreamer + persists (gated)."""
         if mode not in ("Simple", "Verbose"):
             return False
-        if self._config is not None:
-            self._config["log_mode"] = mode
-        # LogStreamer respects `simple_mode` when filtering dim/verbose lines
-        self._log_stream.simple_mode = (mode == "Simple")
-        # Persist to config
+        # Persist to disk FIRST, then mutate in-memory state on success.
+        # If the save fails (permission, write-gate off, disk full),
+        # leaving self._config unchanged keeps the in-memory state
+        # consistent with what the next reload will read.
+        persisted = False
         try:
             from backend.ytarchiver_config import save_config as _sc
             cfg = load_config()
             cfg["log_mode"] = mode
-            _sc(cfg)
+            persisted = bool(_sc(cfg))
         except Exception:
-            pass
-        return True
+            persisted = False
+        if persisted:
+            if self._config is not None:
+                self._config["log_mode"] = mode
+            # LogStreamer respects `simple_mode` when filtering dim/verbose lines
+            self._log_stream.simple_mode = (mode == "Simple")
+        return persisted
 
     # ─── Autorun scheduler ─────────────────────────────────────────────
 
@@ -779,8 +784,12 @@ class Api:
             return {"ok": False, "error": f"Internal error: {e}"}
 
     def subs_remove_channel(self, identity, delete_files=False):
-        """Remove a channel by identity. Snapshots the removed dict so the
-        next subs_undo_remove call can re-add it.
+        """Remove a channel by identity. Pushes the removed dict onto the
+        `_removed_channels_stack` so future subs_undo_remove calls can
+        unwind in reverse-remove order (newest undo first).
+
+        Previously stored a single slot — removing two channels in
+        succession, then undoing once, left the second one unrecoverable.
 
         If `delete_files=True`, the channel's on-disk folder (videos +
         transcripts + metadata + thumbnails) is recursively deleted. Undo
@@ -792,8 +801,15 @@ class Api:
             result = subs_backend.remove_channel(
                 identity or {}, delete_files=bool(delete_files))
             ok = bool(result.get("ok"))
-            if ok and ch_snap:
-                self._last_removed_channel = ch_snap
+            if ok and ch_snap and not delete_files:
+                if not hasattr(self, "_removed_channels_stack"):
+                    self._removed_channels_stack = []
+                self._removed_channels_stack.append(ch_snap)
+                # Bound the stack so we don't grow unbounded across
+                # a long session of repeated removes.
+                if len(self._removed_channels_stack) > 50:
+                    self._removed_channels_stack = (
+                        self._removed_channels_stack[-50:])
             self._reload_config()
             return {
                 "ok": ok,
@@ -809,21 +825,43 @@ class Api:
             return {"ok": False, "error": f"Internal error: {e}"}
 
     def subs_undo_remove(self):
-        """Restore the most recently removed channel. One-shot."""
-        ch = getattr(self, "_last_removed_channel", None)
-        if not ch:
-            return {"ok": False, "error": "Nothing to undo"}
+        """Restore the most recently removed channel. Pops from a stack
+        so multiple consecutive removes can be undone one-at-a-time
+        in LIFO order.
+        """
+        stack = getattr(self, "_removed_channels_stack", None)
+        if not stack:
+            # Back-compat: check the pre-stack single-slot attr in case
+            # a remove happened before this method was upgraded. Shouldn't
+            # hit in normal use, but harmless belt-and-suspenders.
+            legacy = getattr(self, "_last_removed_channel", None)
+            if legacy:
+                self._last_removed_channel = None
+                ch = legacy
+            else:
+                return {"ok": False, "error": "Nothing to undo"}
+        else:
+            ch = stack.pop()
         try:
             payload = dict(ch)
             # add_channel expects 'folder' / 'name'; strip anything that might confuse it
             payload["folder"] = ch.get("name") or ch.get("folder")
             result = subs_backend.add_channel(payload)
-            self._last_removed_channel = None
             self._reload_config()
-            return {"ok": True, "channel": result}
+            return {
+                "ok": True,
+                "channel": result,
+                "more_undo_available": bool(
+                    getattr(self, "_removed_channels_stack", None)),
+            }
         except subs_backend.SubsError as e:
+            # Restore the item to the stack so the user can retry.
+            if stack is not None:
+                stack.append(ch)
             return {"ok": False, "error": str(e)}
         except Exception as e:
+            if stack is not None:
+                stack.append(ch)
             return {"ok": False, "error": str(e)}
 
     def subs_get_channel(self, identity):
@@ -1714,7 +1752,7 @@ class Api:
 
     def transcribe_current_model(self):
         """Return the model the transcribe manager will use for the next job."""
-        return {"model": self._transcribe._model}
+        return {"model": self._transcribe.current_model()}
 
     # ─── Browse tab (reads from transcription_index.db) ────────────────
 
@@ -2209,7 +2247,17 @@ class Api:
     # ─── Bookmarks ──────────────────────────────────────────────────────
 
     def bookmark_list(self):
-        return index_backend.bookmark_list()
+        # Consistent {ok, rows} shape matching the other bookmark_*
+        # methods. Previously returned the raw list, which diverged
+        # from the {ok: bool} shape of bookmark_add/remove/update_note
+        # and would crash a JS caller that tried to read `.ok` on the
+        # array. Legacy callers that iterated directly would stop
+        # working — the one known caller has been updated.
+        try:
+            rows = index_backend.bookmark_list() or []
+            return {"ok": True, "rows": rows}
+        except Exception as e:
+            return {"ok": False, "rows": [], "error": str(e)}
 
     def bookmark_add(self, payload):
         bid = index_backend.bookmark_add(
@@ -3072,6 +3120,102 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def chan_cancel_redownload(self, folder_or_name):
+        """Cancel a pending or running redownload for this channel.
+
+        Four cleanup paths, any of which may apply:
+        1. If this channel's redownload is currently running, fire
+           `_sync_cancel` so the pipeline exits at its next chunk
+           boundary (same mechanism the Sync Tasks popover Cancel
+           button uses).
+        2. Remove any queued entries for this channel from the
+           internal `_redwnl_pending` list — the chain worker won't
+           start them.
+        3. Remove from `queues.sync` so the UI popover drops the
+           row and the task count decrements.
+        4. Delete `_redownload_progress.json` from the channel folder
+           so the Subs-table chartreuse dot + right-click "Continue
+           Redownload" option both disappear on next render.
+
+        Returns `{ok, was_running, was_queued, progress_removed}`.
+        """
+        try:
+            name = folder_or_name if isinstance(folder_or_name, str) else (
+                folder_or_name.get("name") or folder_or_name.get("folder", ""))
+            if not name:
+                return {"ok": False, "error": "channel name required"}
+            ch = subs_backend.get_channel({"name": name})
+            if not ch:
+                return {"ok": False, "error": "Channel not found"}
+            ch_url = (ch.get("url") or "").strip()
+            cfg = self._config or load_config()
+            base = (cfg.get("output_dir") or "").strip()
+            from backend.sync import channel_folder_name as _cfn
+            folder = os.path.join(base, _cfn(ch)) if base else ""
+
+            was_running = False
+            was_queued = False
+            progress_removed = False
+
+            # 1. Currently running? Check the active sync task.
+            try:
+                cur = self._queues.current_sync or {}
+                if ((cur.get("kind") or "").lower() == "redownload"
+                        and (cur.get("url") or "").strip() == ch_url):
+                    was_running = True
+                    self._sync_cancel.set()
+            except Exception:
+                pass
+
+            # 2. Drop matching items from the internal pending chain.
+            try:
+                with self._redwnl_lock:
+                    before = len(self._redwnl_pending)
+                    self._redwnl_pending = [
+                        it for it in self._redwnl_pending
+                        if (it.get("rd_task", {}).get("url") or "").strip()
+                        != ch_url
+                    ]
+                    if len(self._redwnl_pending) < before:
+                        was_queued = True
+            except Exception:
+                pass
+
+            # 3. Remove from the UI queue (may be there without being
+            # in _redwnl_pending if the worker already popped it).
+            try:
+                if ch_url:
+                    removed = self._queues.sync_remove(ch_url)
+                    was_queued = was_queued or bool(removed)
+            except Exception:
+                pass
+
+            # 4. Delete the progress file so the pending state clears.
+            try:
+                if folder:
+                    pp = os.path.join(folder, "_redownload_progress.json")
+                    if os.path.isfile(pp):
+                        os.remove(pp)
+                        progress_removed = True
+            except OSError:
+                pass
+
+            # Invalidate the archive-scan cache so the Subs row
+            # re-reads `_pending_redownload` as False on next render.
+            try:
+                from backend import archive_scan as _as
+                _as.invalidate_channel(ch_url)
+            except Exception:
+                pass
+
+            self._on_queue_changed()
+            return {"ok": True,
+                    "was_running": was_running,
+                    "was_queued": was_queued,
+                    "progress_removed": progress_removed}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def chan_scan_resolution_mismatch(self, folder_or_name, target_res):
         """ffprobe every video in the channel's folder and count how many
         are below `target_res` (height). Returns {ok, mismatch, total}.
@@ -3251,9 +3395,24 @@ class Api:
                 return {"ok": True, "queued": True, "resolution": new_res}
 
             # Nothing running: reset cancel/pause and spawn the worker.
+            # Clear BOTH the threading.Event (pipeline-gate flag) AND
+            # the QueueState flags (UI source-of-truth for the blink
+            # icon + Pause/Resume button labels). `sync_start_all`
+            # does this too — without it, the global pause/resume
+            # button and the Sync Tasks popover's "Pause" button
+            # stick in paused state even though this fresh redownload
+            # is actively running. Reported: user saw the popover
+            # showing a green ▶ "Resume" button while "Redownloading
+            # ChannelName (480p)" was the active task.
             self._sync_cancel.clear()
             self._sync_pause.clear()
             self._sync_skip.clear()
+            try: self._queues.set_sync_paused(False)
+            except Exception: pass
+            try:
+                self._queues.set_gpu_paused(False)
+                self._transcribe.resume()
+            except Exception: pass
 
             def _worker():
                 while True:
@@ -4376,11 +4535,26 @@ class Api:
           - Filename: `{title}.mp4` or `{title} (MM.DD.YY).mp4` when add_date.
           - Custom name sanitizer: `[<>:"/\\|?*\x00-\x1f]` → `_`.
           - `--mtime` when date_file is True so mtime = YT upload date.
+
+        Concurrency guard: a per-URL lock prevents the user from
+        spawning parallel yt-dlp processes for the same URL by
+        double-clicking. Different URLs are still allowed in parallel.
         """
         import re as _re
         url = (url or "").strip()
         if not url:
             return {"ok": False, "error": "Empty URL"}
+        # Concurrency guard — track in-flight URLs so a rapid
+        # double-click doesn't launch two yt-dlp processes fighting
+        # over the same filename.
+        if not hasattr(self, "_archive_single_inflight"):
+            self._archive_single_inflight = set()
+            self._archive_single_lock = threading.Lock()
+        with self._archive_single_lock:
+            if url in self._archive_single_inflight:
+                return {"ok": False,
+                        "error": "Already downloading this URL"}
+            self._archive_single_inflight.add(url)
         # Remember this URL for autocomplete next time
         try:
             self._push_url_history(url)
@@ -4447,13 +4621,29 @@ class Api:
                                  bufsize=1, startupinfo=sync_backend._startupinfo)
             except OSError as e:
                 self._log_stream.emit_error(f"Launch failed: {e}")
+                # Release the in-flight lock on launch failure so a
+                # retry isn't blocked forever.
+                try:
+                    with self._archive_single_lock:
+                        self._archive_single_inflight.discard(url)
+                except Exception:
+                    pass
                 return
-            for line in proc.stdout:
-                self._log_stream.emit_dim(" " + line.rstrip())
-            proc.wait()
-            self._log_stream.emit([["[Archive] ", "simpleline_green"],
-                                    ["done.\n", "simpleline"]])
-            self._log_stream.flush()
+            try:
+                for line in proc.stdout:
+                    self._log_stream.emit_dim(" " + line.rstrip())
+                proc.wait()
+                self._log_stream.emit([["[Archive] ", "simpleline_green"],
+                                        ["done.\n", "simpleline"]])
+                self._log_stream.flush()
+            finally:
+                # Always release the URL guard, even on exception, so
+                # the user can retry without restarting the app.
+                try:
+                    with self._archive_single_lock:
+                        self._archive_single_inflight.discard(url)
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}

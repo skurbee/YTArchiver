@@ -35,7 +35,14 @@ _DISK_ERROR_PATTERNS = [
     r"The device is not ready", # Windows: disk disconnected
     r"\bOSError\b.*(?:writ|permission|access)",
     r"Unable to open .* for writing",
-    r"Permission denied",
+    # "Permission denied" used to be bare here, but yt-dlp also prints
+    # that string for non-disk reasons (age-gate, member-only, expired
+    # cookies, API auth rejection) — tripping the watchdog and pausing
+    # ALL workers for 5 minutes on a benign YouTube restriction.
+    # Require a filesystem-specific context keyword alongside so only
+    # real write failures trigger the pause.
+    r"Permission denied.*(?:writ|output|file|disk|save)",
+    r"(?:writ|output|file|disk|save).*Permission denied",
     r"HTTP Error 5\d\d", # not a disk error but signals upstream trouble
 ]
 _DISK_ERROR_RE = re.compile("|".join(_DISK_ERROR_PATTERNS), re.IGNORECASE)

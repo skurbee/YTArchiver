@@ -227,7 +227,21 @@ def load_config() -> Dict[str, Any]:
                 data = json.load(f)
         merged = dict(DEFAULT_CONFIG)
         merged.update(data)
-        _migrate_pending_tx_ids(merged)
+        # Run migrations exactly once per config, then stamp a flag so
+        # subsequent load_config calls skip the work. Previously
+        # _migrate_pending_tx_ids ran on every load — idempotent but
+        # wasteful, and any future migration accidentally breaking
+        # idempotency would silently corrupt state.
+        if not merged.get("_migration_v2_pending_tx_ids"):
+            _migrate_pending_tx_ids(merged)
+            merged["_migration_v2_pending_tx_ids"] = True
+            # Persist the flag so the migration truly runs once.
+            # Fire-and-forget; if the save fails (e.g. permission),
+            # the migration runs again next launch which is harmless.
+            try:
+                save_config(merged)
+            except Exception:
+                pass
         return merged
     except (json.JSONDecodeError, OSError) as e:
         print(f"[config] WARNING: failed to load {CONFIG_FILE}: {e}")
@@ -476,8 +490,12 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
 
 def _fmt_time_ago(ts) -> str:
     """Mirror YTArchiver.py:32677 _fmt_time_ago."""
+    # Treat None / 0 / empty string as missing, not as Unix epoch.
+    # Without this, missing download_ts rendered as "54 years ago".
+    if not ts:
+        return ""
     try:
-        diff = time.time() - float(ts or 0)
+        diff = time.time() - float(ts)
     except (TypeError, ValueError):
         return ""
     if diff <= 0: return ""
@@ -542,7 +560,20 @@ def recent_for_ui(cfg: Dict[str, Any]):
         _thumb_url = None
 
     out = []
-    for r in cfg.get("recent_downloads", [])[:200]:
+    # Sort newest-first by download_ts BEFORE slicing. Without the
+    # explicit sort, users with >200 lifetime downloads could hide
+    # fresh entries: any past code path that appended to the END of
+    # `recent_downloads` instead of the front leaves new entries in
+    # positions 201+, silently truncated by the [:200] slice. Sort
+    # guarantees the newest 200 are always shown regardless of
+    # insertion order.
+    _all_recent = cfg.get("recent_downloads", []) or []
+    _sorted_recent = sorted(
+        _all_recent,
+        key=lambda r: (r.get("download_ts") or 0),
+        reverse=True,
+    )[:200]
+    for r in _sorted_recent:
         # Prefer download_ts for the "time ago" column; fall back to any
         # already-formatted `time` field an older config might carry.
         t = _fmt_time_ago(r.get("download_ts")) or r.get("time", "") or ""
@@ -597,7 +628,11 @@ def recent_for_ui(cfg: Dict[str, Any]):
             "thumbnail_url": thumbnail_url,
             "size_bytes": size_bytes,
             "uploaded": uploaded_disp,
-            "download_ts": r.get("download_ts") or 0,
+            # Missing download_ts used to default to 0 (Unix epoch), which
+            # the time-ago formatter rendered as "54 years ago" and pushed
+            # rows to the top under descending-time sort. None lets the
+            # display layer show "—" or similar.
+            "download_ts": r.get("download_ts") or None,
         })
     return out
 

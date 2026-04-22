@@ -34,8 +34,12 @@ icon_path = PROJECT_ROOT / 'icon.ico'
 if icon_path.exists():
     datas.append((str(icon_path), '.'))
 
-# If yt-dlp.exe / ffmpeg.exe live next to main.py, bundle them too
-for _exe_name in ('yt-dlp.exe', 'ffmpeg.exe'):
+# If yt-dlp.exe / ffmpeg.exe / ffprobe.exe live next to main.py, bundle them too.
+# ffprobe is used by redownload.py's _ffprobe_height() to detect videos
+# already at the target resolution — if missing on a clean-install
+# machine, every redownload re-downloads every file regardless of its
+# existing resolution (the "0% smaller" spam bug from v50.4).
+for _exe_name in ('yt-dlp.exe', 'ffmpeg.exe', 'ffprobe.exe'):
     _p = PROJECT_ROOT / _exe_name
     if _p.exists():
         datas.append((str(_p), '.'))

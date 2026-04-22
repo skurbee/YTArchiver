@@ -722,9 +722,45 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
                 cmd += ["--cookies-from-browser", "firefox"]
         cmd.append(video_url)
         try:
-            subprocess.run(cmd, stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=120, startupinfo=_startupinfo)
+            # Capture stderr instead of /dev/nulling it so yt-dlp's
+            # explanation for a failed caption fetch (cookies expired,
+            # member-only, region-lock, etc.) surfaces in the log
+            # instead of silently vanishing. User's view goes from
+            # "why did Whisper run on this video?" to a clear dim line
+            # pointing at the root cause. Only emit when the stderr
+            # looks like an auth/cookie issue — generic "no captions
+            # available" is noise.
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE,
+                               timeout=120, startupinfo=_startupinfo)
+            try:
+                err_text = (r.stderr or b"").decode(
+                    "utf-8", errors="replace")
+            except Exception:
+                err_text = ""
+            if err_text and use_cookies:
+                _lower = err_text.lower()
+                if any(p in _lower for p in (
+                        "sign in to confirm",
+                        "cookies are missing",
+                        "cookies are invalid",
+                        "failed to extract any player response",
+                        "this video is private",
+                        "this video is members",
+                )):
+                    try:
+                        # First matching error line, trimmed.
+                        first_err = next(
+                            (ln.strip() for ln in err_text.splitlines()
+                             if ln.strip().lower().startswith(("error", "warning"))),
+                            err_text.strip().splitlines()[0])[:160]
+                        stream.emit([
+                            [" \u26A0 Caption fetch blocked: ", "dim"],
+                            [f"{first_err}\n", "dim"],
+                        ])
+                    except Exception:
+                        pass
             return True
         except Exception:
             return False
@@ -1336,6 +1372,14 @@ def _pending_journal_path() -> Path:
 
 class TranscribeManager:
     """Manages the whisper subprocess + a GPU queue."""
+
+    def current_model(self) -> str:
+        """Return the whisper model this manager is currently using for
+        new jobs. Public accessor — main.py's `transcribe_current_model`
+        used to reach into `self._model` directly, which would silently
+        break on any future refactor of the internals.
+        """
+        return self._model
 
     def __init__(self, stream: LogStreamer, model: str = "large-v3"):
         self._stream = stream

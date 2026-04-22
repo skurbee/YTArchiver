@@ -631,12 +631,39 @@
       el.appendChild(btn);
     }
     root.appendChild(el);
-    setTimeout(() => {
+    // Visibility-aware auto-dismiss — pauses the countdown while the
+    // window is hidden (minimized, tab-switched, locked screen) so
+    // several queued toasts don't all flash out in a rapid burst
+    // when the user returns to the app. Standard web pattern using
+    // document.visibilityState.
+    let remaining = ttl;
+    let startedAt = Date.now();
+    let timer = null;
+    const dismiss = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      document.removeEventListener("visibilitychange", onVis);
       el.style.transition = "opacity 0.25s, transform 0.25s";
       el.style.opacity = "0";
       el.style.transform = "translateX(20px)";
       setTimeout(() => el.remove(), 300);
-    }, ttl);
+    };
+    const schedule = () => {
+      startedAt = Date.now();
+      timer = setTimeout(dismiss, remaining);
+    };
+    const onVis = () => {
+      if (document.visibilityState === "hidden") {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+          remaining = Math.max(0, remaining - (Date.now() - startedAt));
+        }
+      } else if (!timer && el.isConnected) {
+        schedule();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    if (document.visibilityState !== "hidden") schedule();
   };
 
   // ─── Tab switching ───────────────────────────────────────────────────
@@ -968,7 +995,16 @@
     // up (but if the user switches tabs while it's playing, pause)".
     const vEl = document.getElementById("watch-video");
     if (!vEl) return;
-    try { vEl.pause(); } catch (e) { /* noop */ }
+    try {
+      vEl.pause();
+      // Chromium/WebView keeps ~1s of audio buffered ahead of the
+      // decode head. Plain pause() stops the decode but the buffer
+      // still plays out for a second or three — audible after tab
+      // switch. Re-seeking to the current position flushes the
+      // buffer without moving the playhead, cutting audio
+      // immediately on pause.
+      vEl.currentTime = vEl.currentTime;
+    } catch (e) { /* noop */ }
   }
   window._pauseWatchVideo = _pauseWatchVideo;
 
@@ -2242,7 +2278,11 @@
     const api = window.pywebview?.api;
     if (!api?.bookmark_list) return;
     try {
-      const rows = await api.bookmark_list();
+      // bookmark_list() now returns {ok: bool, rows: [...]} to match
+      // the other bookmark_* methods' shape. Back-compat: if an older
+      // build returns the raw array, fall back gracefully.
+      const res = await api.bookmark_list();
+      const rows = Array.isArray(res) ? res : (res?.rows || []);
       if (!rows || rows.length === 0) {
         list.innerHTML = '<div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to add one.</div>';
         return;
@@ -3819,6 +3859,14 @@
       ].filter(Boolean).join("");
       const cur = {
         folder: _folderCur,
+        // Mirror folder into folder_override since the single "Folder
+        // Name" input writes BOTH in the save payload. Without this,
+        // the dirty-check's Object.keys(snap) iteration includes
+        // `folder_override` (present on any channel that ever had one
+        // set), `cur.folder_override` is undefined, and
+        // String(undefined) !== String(snap.folder_override) always
+        // fires — Update button enabled the moment the panel opens.
+        folder_override: _folderCur,
         url: (document.getElementById("edit-url")?.value || "").trim(),
         resolution: String(document.getElementById("edit-resolution")?.value || "720").replace("p",""),
         min_duration: parseInt(document.getElementById("edit-min-dur")?.value, 10) || 0,
@@ -3845,9 +3893,11 @@
     // redownload. Peek on panel open + resume clicks `chan_redownload` with
     // the saved resolution. Mirrors YTArchiver.py:5473 _has_pending_redownload.
     const continueBtn = document.getElementById("edit-res-continue");
+    const cancelBtn = document.getElementById("edit-res-cancel");
     const refreshContinueBtn = async (name) => {
       if (!continueBtn) return;
       continueBtn.hidden = true;
+      if (cancelBtn) cancelBtn.hidden = true;
       if (!name) return;
       const api = window.pywebview?.api;
       if (!api?.chan_redownload_progress_peek) return;
@@ -3860,6 +3910,11 @@
           continueBtn.textContent = `\u21BB Continue ${label} (${p.done || 0} done)`;
           continueBtn.dataset.resolution = res;
           continueBtn.title = `Resume in-progress ${label} redownload (${p.done || 0} videos complete)`;
+          // Cancel button mirrors Continue's visibility. User can
+          // drop the queued/running redownload + clear the pending
+          // state in one click rather than right-clicking the Subs
+          // row and hunting for a Clear menu item.
+          if (cancelBtn) cancelBtn.hidden = false;
         }
       } catch {}
     };
@@ -3886,8 +3941,65 @@
         return;
       }
       const r = await api.chan_redownload(name, res);
-      if (r?.ok) window._showToast?.("Redownload resumed.", "ok");
-      else window._showToast?.(r?.error || "Resume failed.", "error");
+      if (r?.ok) {
+        if (r.queued) {
+          window._showToast?.(`Queued redownload of ${name}.`, "ok");
+        } else {
+          window._showToast?.("Redownload resumed.", "ok");
+        }
+      } else {
+        window._showToast?.(r?.error || "Resume failed.", "error");
+      }
+    });
+    cancelBtn?.addEventListener("click", async () => {
+      const name = _editFolderEl?.value.trim() || "";
+      if (!name) return;
+      const api = window.pywebview?.api;
+      if (!api?.chan_cancel_redownload) {
+        window._showToast?.("Native mode required.", "warn");
+        return;
+      }
+      // Confirm — cancel discards progress. Classic pattern for
+      // destructive actions in the edit panel.
+      const ok = await window.askQuestion?.({
+        title: "Cancel Redownload",
+        message: `Cancel the redownload for "${name}" and discard progress?`,
+        confirm: "Cancel Redownload",
+        cancel: "Keep",
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        const r = await api.chan_cancel_redownload(name);
+        if (!r?.ok) {
+          window._showToast?.(r?.error || "Cancel failed.", "error");
+          return;
+        }
+        // Re-peek so the buttons hide themselves.
+        await refreshContinueBtn(name);
+        // Re-fetch the Subs table so the pending-redownload dot clears.
+        if (typeof window._refreshSubsTable === "function") {
+          window._refreshSubsTable();
+        } else if (window.pywebview?.api?.subs_list_for_ui) {
+          // Fallback — harmless if the refresher isn't exposed.
+          try {
+            const rows = await window.pywebview.api.subs_list_for_ui();
+            if (Array.isArray(rows) && typeof window.renderSubsTable === "function") {
+              window.renderSubsTable(rows);
+            }
+          } catch {}
+        }
+        const bits = [];
+        if (r.was_running) bits.push("stopped running job");
+        else if (r.was_queued) bits.push("removed from queue");
+        if (r.progress_removed) bits.push("cleared saved progress");
+        const msg = bits.length
+          ? `Cancelled \u2014 ${bits.join(", ")}.`
+          : "Nothing to cancel.";
+        window._showToast?.(msg, "ok");
+      } catch (e) {
+        window._showToast?.("Error: " + e, "error");
+      }
     });
 
     // "\u2713 Recheck resolution" — scans the channel folder with ffprobe
@@ -6609,14 +6721,32 @@
               document.addEventListener("keydown", escBlock, true);
 
               browseBtn.addEventListener("click", async () => {
+                // Guard against double-click spawning two picker
+                // dialogs — disable the button for the duration.
+                if (browseBtn.disabled) return;
+                browseBtn.disabled = true;
                 try {
                   const picked = await api.pick_folder("Choose archive root");
                   if (picked?.ok && picked.path) {
                     pickedPath = picked.path;
                     pathEl.value = pickedPath;
                     continueBtn.disabled = false;
+                  } else if (picked && picked.ok === false && picked.error) {
+                    // Picker refused / failed with an explicit error.
+                    window._showToast?.(
+                      "Folder picker failed: " + picked.error, "error");
                   }
-                } catch (_e) {}
+                  // picked?.ok === false without .error means user
+                  // hit Cancel — silent no-op is correct.
+                } catch (e) {
+                  // pywebview bridge error (process detached, picker
+                  // crash, etc.). Pre-fix this was silently swallowed
+                  // and the Browse button appeared dead with no hint.
+                  window._showToast?.(
+                    "Folder picker failed: " + String(e), "error");
+                } finally {
+                  browseBtn.disabled = false;
+                }
               });
               continueBtn.addEventListener("click", async () => {
                 if (!pickedPath) return;

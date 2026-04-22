@@ -235,11 +235,16 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                           "marker": "reorg_active"}),
              "__control__"],
         ])
+        # Color discipline: only [ / ] + "Reorganizing:" render in the
+        # reorg color; numbers + channel name stay white.
         stream.emit([
-            [f"[{_i}/{_total_videos}] ",
-             ["reorg_bracket", "reorg_active"]],
-            [f"Reorganizing: {_ch_name}\u2026\n",
-             ["reorg_bracket", "reorg_active"]],
+            ["[", ["reorg_bracket", "reorg_active"]],
+            [str(_i), ["simpleline", "reorg_active"]],
+            ["/", ["reorg_bracket", "reorg_active"]],
+            [str(_total_videos), ["simpleline", "reorg_active"]],
+            ["] ", ["reorg_bracket", "reorg_active"]],
+            ["Reorganizing: ", ["reorg_bracket", "reorg_active"]],
+            [f"{_ch_name}\u2026\n", ["simpleline", "reorg_active"]],
         ])
 
     def _clear_active():
@@ -274,7 +279,11 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
             d = datetime.fromtimestamp(ts)
         if split_months:
             # Use "01 January" format to match OLD's sync template.
-            target = root / f"{d.year}" / _MONTH_FOLDERS[d.month]
+            # `.get()` with fallback so a corrupt upload_date (month
+            # outside 1-12) doesn't KeyError and abort the entire
+            # reorg pass mid-run with files half-moved.
+            target = root / f"{d.year}" / _MONTH_FOLDERS.get(
+                d.month, "00 Unknown")
         elif split_years:
             target = root / f"{d.year}"
         else:
@@ -285,7 +294,9 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
             continue
         if _move_video(video, target, stream):
             moved += 1
-            if moved % 25 == 0:
+            # Every 10 instead of 25 — on a ≤24-video reorg the old
+            # threshold never fired, making the pass look stalled.
+            if moved % 10 == 0:
                 stream.emit_dim(f" \u2014 {moved} moved so far...")
         else:
             errors += 1

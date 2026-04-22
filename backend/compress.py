@@ -313,10 +313,16 @@ def compress_videos_batch(paths, stream: LogStreamer,
                           "marker": "compress_active"}),
              "__control__"],
         ])
+        # Color discipline: only [ / ] + "<label>:" render in the
+        # compress color; numbers + filename stay white.
         stream.emit([
-            [f"[{_i}/{_n}] ", ["compress_bracket", "compress_active"]],
-            [f"{_batch_label}: {_fname}\u2026\n",
-             ["compress_bracket", "compress_active"]],
+            ["[", ["compress_bracket", "compress_active"]],
+            [str(_i), ["simpleline", "compress_active"]],
+            ["/", ["compress_bracket", "compress_active"]],
+            [str(_n), ["simpleline", "compress_active"]],
+            ["] ", ["compress_bracket", "compress_active"]],
+            [f"{_batch_label}: ", ["compress_bracket", "compress_active"]],
+            [f"{_fname}\u2026\n", ["simpleline", "compress_active"]],
         ])
 
     def _clear_active():

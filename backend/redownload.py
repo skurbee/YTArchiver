@@ -490,11 +490,17 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                           "marker": "redwnl_active"}),
              "__control__"],
         ])
+        # Color discipline (per user spec): ONLY [ / ] + "Redownloading:"
+        # render in the redownload color; numbers + channel name render
+        # white. Matches the visible per-item entry format elsewhere.
         stream.emit([
-            [f"[{current_idx}/{total}] ",
-             ["simpleline_redwnl", "redwnl_active"]],
-            [f"Redownloading: {ch_name}\u2026\n",
-             ["simpleline_redwnl", "redwnl_active"]],
+            ["[", ["simpleline_redwnl", "redwnl_active"]],
+            [str(current_idx), ["simpleline", "redwnl_active"]],
+            ["/", ["simpleline_redwnl", "redwnl_active"]],
+            [str(total), ["simpleline", "redwnl_active"]],
+            ["] ", ["simpleline_redwnl", "redwnl_active"]],
+            ["Redownloading: ", ["simpleline_redwnl", "redwnl_active"]],
+            [f"{ch_name}\u2026\n", ["simpleline", "redwnl_active"]],
         ])
 
     def _clear_active():
@@ -543,10 +549,24 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # line that STAYS in the log (not marker-tagged), then
             # move on.
             stream.emit([
-                [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                ["[", "simpleline_redwnl"],
+                [str(file_num), "simpleline"],
+                ["/", "simpleline_redwnl"],
+                [str(_live_total), "simpleline"],
+                ["] ", "simpleline_redwnl"],
                 [f"{item['title']} already at {cur_res_label[0]} \u2014 skip.\n",
                  "simpleline"],
             ])
+            # Bump the active status line back to the DOM bottom.
+            # Reported: the sticky active line stuck in position above
+            # newly-emitted completed/skip entries because `_emit_active`
+            # only fires at the TOP of each iteration that reaches the
+            # download path — skip paths like this one left a stale
+            # active line from the PREVIOUS iteration hanging above the
+            # skip notice. Re-emit here (and after every other loop-
+            # body emit) to restore the "active is always last line"
+            # invariant.
+            _emit_active(file_num, _live_total)
             done.add(vid)
             _save_progress(folder, ch_url, cur_res[0], done)
             n_skipped += 1
@@ -601,10 +621,16 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     try: os.remove(new_fp)
                     except OSError: pass
                     stream.emit([
-                        [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                        ["[", "simpleline_redwnl"],
+                        [str(file_num), "simpleline"],
+                        ["/", "simpleline_redwnl"],
+                        [str(_live_total), "simpleline"],
+                        ["] ", "simpleline_redwnl"],
                         [f"{item['title']} already at {cur_res_label[0]} "
                          f"\u2014 skip.\n", "simpleline"],
                     ])
+                    # Re-push the active status line to the DOM bottom.
+                    _emit_active(file_num, _live_total)
                     done.add(vid)
                     _save_progress(folder, ch_url, cur_res[0], done)
                     n_skipped += 1
@@ -613,10 +639,42 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             orig_ext = os.path.splitext(fp)[1].lower()
             target_fp = fp
             if new_ext and new_ext != orig_ext:
+                # Two-phase commit so a failed os.replace doesn't lose
+                # the original. Pre-fix path: os.remove(fp) then
+                # os.replace(new_fp, target_fp). If replace failed
+                # (permission, target exists from concurrent write,
+                # etc.) the original was gone and the new file was
+                # stranded in temp. Now we rename the original aside
+                # first; if replace succeeds, drop the aside; if it
+                # fails, rename the aside back.
                 target_fp = os.path.splitext(fp)[0] + new_ext
-                try: os.remove(fp)
-                except OSError: pass
-            os.replace(new_fp, target_fp)
+                aside_fp = fp + ".old"
+                aside_valid = False
+                try:
+                    os.rename(fp, aside_fp)
+                    aside_valid = True
+                except OSError:
+                    # Original rename failed — try the old-behavior
+                    # unlink path as a fallback (same risk window as
+                    # before, no worse). Most likely cause of failure
+                    # here is cross-device rename, which a plain
+                    # remove also can't fix.
+                    try: os.remove(fp)
+                    except OSError: pass
+                try:
+                    os.replace(new_fp, target_fp)
+                except OSError:
+                    # Replace failed — roll back if we have an aside.
+                    if aside_valid:
+                        try: os.rename(aside_fp, fp)
+                        except OSError: pass
+                    raise
+                # Replace succeeded — drop the aside.
+                if aside_valid:
+                    try: os.remove(aside_fp)
+                    except OSError: pass
+            else:
+                os.replace(new_fp, target_fp)
             done.add(vid)
             _save_progress(folder, ch_url, cur_res[0], done)
             n_done += 1
@@ -631,7 +689,11 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # BEFORE the new active line emit.
             _fname = os.path.basename(target_fp)
             stream.emit([
-                [f"[{file_num}/{_live_total}] ", "simpleline_redwnl"],
+                ["[", "simpleline_redwnl"],
+                [str(file_num), "simpleline"],
+                ["/", "simpleline_redwnl"],
+                [str(_live_total), "simpleline"],
+                ["] ", "simpleline_redwnl"],
                 [f"{_fname}\n", "simpleline"],
             ])
             if orig_size > 0 and new_size > 0:
@@ -651,6 +713,12 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                      f"(replaced at {cur_res_label[0]})\n",
                      "simpleline"],
                 ])
+            # Re-push the active status line to the DOM bottom after
+            # the completed-entry + size-diff emit pair. Without this,
+            # the [N/total] filename line and its size-diff child land
+            # BELOW the sticky "Redownloading: <channel>" line,
+            # violating the "active line is always last" invariant.
+            _emit_active(file_num, _live_total)
             # Track sample stats (only successful replacements with a
             # known orig size). Once we hit _SAMPLE_SIZE we fire the cb.
             if not sample_done and orig_size > 0 and new_size > 0:

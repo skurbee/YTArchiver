@@ -399,6 +399,15 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
         # When name changed, keep folder in sync if not explicitly set
         if "name" in payload and "folder" not in payload:
             merged["folder"] = merged["name"]
+        # Reverse case: when ONLY folder changed, keep name in sync.
+        # Without this, editing a channel's folder from "Valve News"
+        # to "Tyler McVicker" would leave `name` stale as "Valve
+        # News" — sync would correctly write to the new folder, but
+        # the Subs table's display-name column, the Browse channel
+        # grid, and the tray tooltip would all still show the old
+        # name until a fresh full-payload edit landed.
+        if "folder" in payload and "name" not in payload:
+            merged["name"] = merged["folder"]
         updated = merged
     else:
         updated = _payload_to_channel(payload)

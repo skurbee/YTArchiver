@@ -607,6 +607,17 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # entry per merged .mp4, cleared at channel end with the other
     # per-channel state.
     _path_to_display_title: Dict[str, str] = {}
+    # dlrow_N values that have already been CLOSED by a DLTRACK ✓ done
+    # emit. yt-dlp sometimes dribbles a final "[download] 100% of X in
+    # Y" progress line AFTER the DLTRACK has fired — if we let it
+    # through, the late progress tick emits with the SAME dlrow_N
+    # marker, inplace-replacing the done line and leaving the user
+    # staring at "Downloading Title 100%" with no ✓. Hit on 2-video
+    # channels where video 1's done got clobbered by a late tick
+    # before video 2's Destination bumped the counter. Once a dlrow_N
+    # is in this set, subsequent progress ticks targeting it are
+    # dropped.
+    _closed_dlrows: set = set()
     downloaded_ids: List[str] = [] # fast-path metadata target list
     # title -> video_id, filled from DLTRACK::: emitted after each video.
     # Needed because filenames no longer carry the [id] suffix (drop-in mode).
@@ -925,6 +936,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                 _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
                             else:
                                 _done_kind = f"dlrow_{_dlrow_n}"
+                                # Close this dlrow — any further progress
+                                # ticks (late 100% etc) will be dropped
+                                # so they can't clobber this done line.
+                                _closed_dlrows.add(_dlrow_n)
                             stream.emit([
                                 [" ", ["dim", _done_kind]],
                                 ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],
@@ -1146,6 +1161,13 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             if m:
                 pct = m.group(1)
                 _prog_kind = f"dlrow_{_DLROW_COUNTER}"
+                # If this dlrow was already closed by a DLTRACK done
+                # emit, drop the progress tick. yt-dlp occasionally
+                # dribbles a late "[download] 100%" line after the
+                # done marker; without this gate it replaces the ✓
+                # done line with a stuck "Downloading Title 100%".
+                if _DLROW_COUNTER in _closed_dlrows:
+                    continue
                 # Resolve display_title for the current in-flight
                 # video by looking up which final_path was assigned
                 # this _DLROW_COUNTER value. If nothing matches, skip.
@@ -2165,9 +2187,15 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
 
     # Start-of-pass header — show total remaining work, not len(config).
     # In resume mode that's the restored queue size; fresh mode it's the
-    # whole channel list we just enqueued.
+    # whole channel list we just enqueued. Exclude kind=redownload
+    # entries — those are handled by Api._redwnl_worker and appear in
+    # the queue only for popover visibility; counting them in "Sync
+    # pass starting (N channels)" would over-report.
     try:
-        _starting_total = len(queues.sync) if queues is not None else len(channels)
+        _starting_total = sum(
+            1 for c in queues.sync
+            if (c.get("kind") or "download").lower() != "redownload"
+        ) if queues is not None else len(channels)
     except Exception:
         _starting_total = len(channels)
     if _resume_mode:
@@ -2265,11 +2293,31 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 ch = None
         if ch is None:
             break
+        # Skip redownload tasks — they live in queues.sync only for
+        # Sync Tasks popover visibility; Api._redwnl_worker drains a
+        # separate `_redwnl_pending` list to actually run them (with
+        # the right resolution, sample-confirm bridge, etc). Falling
+        # through here would mis-process them as regular sync
+        # downloads. reported symptom: "=== Sync pass starting (N
+        # channels) === [1/N] ChannelName — no new videos" appearing
+        # while a redownload of that channel was correctly running
+        # in the popover — because both workers popped the same task.
+        if (ch.get("kind") or "").lower() == "redownload":
+            # Don't count this pop against `_processed` — the user
+            # didn't ask sync_all to do anything with it, so the
+            # "1/total" display should stay accurate to real syncs.
+            continue
         _processed += 1
         i = _processed
         # Recompute total: already processed + remaining in queue.
+        # Exclude kind=redownload entries (same reason as above —
+        # they're drained by a separate worker and shouldn't inflate
+        # this pass's denominator).
         try:
-            _remaining = len(queues.sync) if queues is not None else 0
+            _remaining = sum(
+                1 for c in queues.sync
+                if (c.get("kind") or "download").lower() != "redownload"
+            ) if queues is not None else 0
         except Exception:
             _remaining = 0
         total = _processed + _remaining

@@ -368,7 +368,15 @@
       // Rebuild mini as an exact slice clone of the last N main lines
       m.innerHTML = "";
       for (let i = start; i < all.length; i++) {
-        m.appendChild(all[i].cloneNode(true));
+        // Strip the data-inplace attribute from the clone. Without
+        // this, a subsequent inplace-replace emit (e.g. whisper
+        // progress tick) would find BOTH the main-log line AND the
+        // mini-log clone via the same `data-inplace="<kind>"`
+        // selector and replace whichever it hit last — producing
+        // doubled lines or the done-line landing in the wrong log.
+        const clone = all[i].cloneNode(true);
+        clone.removeAttribute("data-inplace");
+        m.appendChild(clone);
       }
     }
   }
@@ -395,9 +403,13 @@
     if (!el) return;
     wireUserScrollDetection(el);
     el.appendChild(buildLine(segments));
-    // Trim if we get ridiculous (tkinter caps ~8000 lines)
+    // Trim if we get ridiculous (tkinter caps ~8000 lines). keep=5000
+    // gives 3000 lines of growth headroom before the next trim fires,
+    // preventing the "⚠ Log trimmed" warning from chattering every
+    // few seconds during heavy sync output (at keep=6000 the next
+    // 2001 lines triggered another trim visibly often).
     const cap = 8000;
-    const keep = 6000;
+    const keep = 5000;
     if (el.childElementCount > cap) {
       const toRemove = el.childElementCount - keep;
       for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
@@ -517,7 +529,7 @@
         }
         el.appendChild(frag);
         // Same scroll-freeze / trim behavior as appendMainLog
-        const cap = 8000, keep = 6000;
+        const cap = 8000, keep = 5000;
         if (el.childElementCount > cap) {
           const toRemove = el.childElementCount - keep;
           for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);

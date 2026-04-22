@@ -164,10 +164,17 @@ def _ensure_thumbnails_dir(subfolder: str) -> str:
 
 
 def _download_thumbnail(url: str, thumb_dir: str,
-                        title: str, video_id: str) -> None:
+                        title: str, video_id: str,
+                        stream=None) -> None:
     """Download a thumbnail to `{thumb_dir}/{safe_title} [{video_id}].jpg`.
     Dedupes against an existing file with the same [{video_id}] bracket.
-    Matches YTArchiver.py:26784 exactly."""
+    Matches YTArchiver.py:26784 exactly.
+
+    `stream` (optional) — if provided, emits a verbose-only dim
+    diagnostic line on fetch failure. Without this, a missing
+    thumbnail in Browse view was impossible to diagnose because
+    the exception was silently swallowed.
+    """
     if not url or not video_id:
         return
     safe_title = re.sub(r'[<>:"/\\|?*]', '_', title or "")[:100]
@@ -206,8 +213,19 @@ def _download_thumbnail(url: str, thumb_dir: str,
             img_data = resp.read()
         with open(fpath, "wb") as f:
             f.write(img_data)
-    except Exception:
-        pass # non-fatal
+    except Exception as _te:
+        # Non-fatal, but no longer invisible: emit a verbose-only
+        # diagnostic so the user can see WHY a Browse thumbnail is
+        # missing (404, timeout, disk-write failure, etc.) instead
+        # of just seeing a placeholder with no hint.
+        if stream is not None:
+            try:
+                stream.emit([
+                    [" \u26A0 Thumbnail fetch failed ", "dim"],
+                    [f"[{video_id}]: {_te}\n", "dim"],
+                ])
+            except Exception:
+                pass
 
 
 def _fetch_video_metadata(yt: str, video_id: str,
@@ -454,12 +472,14 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
     except Exception as e:
         return {"ok": False, "error": f"write failed: {e}"}
 
-    # Thumbnail (best-effort).
+    # Thumbnail (best-effort). Stream passed through so fetch errors
+    # surface as verbose-only dim log lines instead of disappearing.
     if entry.get("thumbnail_url"):
         thumb_dir = _ensure_thumbnails_dir(subfolder)
         _download_thumbnail(
             entry["thumbnail_url"], thumb_dir,
-            title_hint or entry.get("title", ""), video_id)
+            title_hint or entry.get("title", ""), video_id,
+            stream=stream if emit_inline_log else None)
 
     if emit_inline_log:
         # Per-video metadata done line. Matches the three-line simple-mode
@@ -552,10 +572,16 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                           "marker": "metadata_active"}),
              "__control__"],
         ])
+        # Color discipline: only [ / ] + "Fetching Metadata:" render
+        # in the metadata color; numbers + channel name stay white.
         stream.emit([
-            [f"[{_i}/{_n}] ", ["meta_bracket", "metadata_active"]],
-            [f"Fetching Metadata: {name}\u2026\n",
-             ["meta_bracket", "metadata_active"]],
+            ["[", ["meta_bracket", "metadata_active"]],
+            [str(_i), ["simpleline", "metadata_active"]],
+            ["/", ["meta_bracket", "metadata_active"]],
+            [str(_n), ["simpleline", "metadata_active"]],
+            ["] ", ["meta_bracket", "metadata_active"]],
+            ["Fetching Metadata: ", ["meta_bracket", "metadata_active"]],
+            [f"{name}\u2026\n", ["simpleline", "metadata_active"]],
         ])
 
     def _clear_active():
@@ -675,7 +701,8 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                 changed = True
             if entry.get("thumbnail_url"):
                 _download_thumbnail(entry["thumbnail_url"], thumb_dir,
-                                    title or entry.get("title", ""), vid_id)
+                                    title or entry.get("title", ""), vid_id,
+                                    stream=stream)
 
         if changed:
             try:

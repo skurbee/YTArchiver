@@ -939,13 +939,19 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                  [f"{n_done} done \u00b7 {n_skipped} skipped \u00b7 {n_err} errors ===\n",
                   "header"]])
 
-    # Persist a [ReDwnl] row to the activity-log history — fires on
-    # both full completion AND cancel (partial). Mirrors classic
-    # YTArchiver's _record_redownload_finish (YTArchiver.py:22678).
-    # reported: cancelling a redownload should tell the user how
-    # many were completed before the cancel. Format keeps the
-    # 4-bullet body shape that autorun_history_entries_for_ui parses
-    # as (secondary, errors, took) for render.
+    # Persist a [ReDwnl] row to the activity-log history AND push it
+    # to the live UI. Fires on both full completion AND cancel
+    # (partial). Mirrors classic YTArchiver's
+    # _record_redownload_finish (YTArchiver.py:22678).
+    #
+    # Both emit paths are required: append_history_entry() writes to
+    # config['autorun_history'] so the row survives restart, but does
+    # NOT push to the running UI. stream.emit_activity() pushes to
+    # the live activity-log DOM but does NOT persist. Without the
+    # emit_activity call, the [ReDwnl] row only shows up after the
+    # next app launch — reported symptom: "no activity log from this
+    # channel's redownload" immediately after completion, despite
+    # the other recently-completed channels' rows being visible.
     try:
         from . import autorun as _ar
         from datetime import datetime as _dt
@@ -968,6 +974,25 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                  f"{_dur}")
         _line = f"[ReDwnl] {_ts_date} \u2014{_ch_part} {_body}"
         _ar.append_history_entry(_line)
+        # Live UI push — cells map matches the layout
+        # autorun_history_entries_for_ui builds from the persisted
+        # line. [ReDwnl] packs its 3 counts into primary / secondary
+        # / tertiary so the errors cell can collapse to 0 via the
+        # hist-row-ReDwnl CSS override (took snaps tight to counts).
+        try:
+            stream.emit_activity({
+                "kind": "ReDwnl",
+                "time_date": _ts_date,
+                "channel": ch_name,
+                "primary": f"{n_done} replaced",
+                "secondary": f"{n_skipped} skipped",
+                "tertiary": f"{n_err} errors",
+                "errors": "",
+                "took": _dur,
+                "row_tag": "hist_redwnl" if n_done > 0 else "",
+            })
+        except Exception:
+            pass
     except Exception:
         pass
 

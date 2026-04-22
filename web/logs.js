@@ -455,46 +455,25 @@
    * line carrying that same tag (so progress bar ticks in place). */
   window._logBatch = function (payload) {
     if (!payload) return;
-    // Scan for control-channel segments before anything renders. These are
-    // one-shot bridges from the Python side (e.g. redownload sample-confirm
-    // popup). Emit a CustomEvent and DROP the segment so it never
-    // contaminates the visible log body.
-    if (Array.isArray(payload.main) && payload.main.length) {
-      payload.main = payload.main.filter((segs) => {
-        if (!Array.isArray(segs) || segs.length === 0) return true;
-        // A "control" line has exactly one segment tagged "__control__"
-        // and a JSON payload in position 0.
-        if (segs.length === 1 && Array.isArray(segs[0])
-            && segs[0][1] === "__control__") {
-          try {
-            const data = JSON.parse(segs[0][0] || "{}");
-            // Built-in control handlers. Currently supports:
-            //   { kind: "clear_line", marker: "redwnl_active" }
-            //   — removes every `.log-line[data-inplace="<marker>"]`
-            //     from the main log so a subsequent emit with the same
-            //     marker appends at the current bottom instead of
-            //     getting replaced at the original position. Used by
-            //     the redownload active-status line so it migrates to
-            //     the bottom after each completed video.
-            if (data.kind === "clear_line" && data.marker) {
-              const el = document.getElementById("main-log");
-              if (el) {
-                el.querySelectorAll(
-                  `.log-line[data-inplace="${data.marker}"]`
-                ).forEach((n) => n.remove());
-              }
-            }
-            window.dispatchEvent(new CustomEvent("yt-control", {
-              detail: data,
-            }));
-          } catch (e) {
-            console.error("control payload parse failed:", e);
-          }
-          return false; // drop from visible log
-        }
-        return true;
-      });
-    }
+    // Process payload.main in ORDER. Previously control-channel
+    // segments were filtered out in a pre-pass that ran BEFORE any
+    // regular emissions were rendered — meaning a `clear_line`
+    // control emitted AFTER a new inplace line in the same batch
+    // could only clear DOM from PRIOR batches, not the sibling line
+    // in its own batch.
+    //
+    // Reported symptom: redownload's `_clear_active()` fires right
+    // after the last iteration's `_emit_active()`. Both emits land
+    // in the same 60ms LogStreamer batch. The old pre-pass cleared
+    // whatever was in DOM (from batch N-1, already gone), then
+    // rendered the new active line, then dropped the clear_line —
+    // which never saw the new active line. Result: active line
+    // survived into the final "=== Redownload complete ===" footer
+    // section.
+    //
+    // Fix: inline the control processing into the render loop, so
+    // each control runs AT ITS POSITION and can clear elements
+    // already added to `frag` in this same pass.
     if (Array.isArray(payload.main) && payload.main.length) {
       const el = document.getElementById("main-log");
       if (el) {
@@ -506,6 +485,29 @@
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
         for (const segs of payload.main) {
+          if (!Array.isArray(segs) || segs.length === 0) continue;
+          // Control-line handling — run in order, then skip render.
+          if (segs.length === 1 && Array.isArray(segs[0])
+              && segs[0][1] === "__control__") {
+            try {
+              const data = JSON.parse(segs[0][0] || "{}");
+              if (data.kind === "clear_line" && data.marker) {
+                // Remove matching `data-inplace` elements from BOTH
+                // the committed DOM AND the in-progress fragment —
+                // otherwise a same-batch clear can't see the sibling
+                // inplace line that was just added above it.
+                const sel = `.log-line[data-inplace="${data.marker}"]`;
+                frag.querySelectorAll(sel).forEach((n) => n.remove());
+                el.querySelectorAll(sel).forEach((n) => n.remove());
+              }
+              window.dispatchEvent(new CustomEvent("yt-control", {
+                detail: data,
+              }));
+            } catch (e) {
+              console.error("control payload parse failed:", e);
+            }
+            continue;
+          }
           const line = buildLine(segs);
           const inplaceKind = _inplaceKind(segs);
           if (inplaceKind) {

@@ -2711,9 +2711,19 @@
               video_id: r.video_id || "",
               uploaded: _formatAddedTs(epoch),
               duration: "",
-              views: "",
+              // Preserve the backend's view_count + formatted `views`
+              // display string. Pre-fix these were hardcoded to 0 / ""
+              // which silently broke the "Most Viewed" sort: the client
+              // `sortCurrentVideos` uses `view_count - view_count = 0`
+              // as the comparator → stable sort → no reorder → the grid
+              // stayed in whatever order the backend returned. Backend
+              // DOES sort by view_count when sort === "most_viewed", but
+              // the client-side re-sort on dropdown change clobbered it
+              // back to whatever was there first (usually newest).
+              views: r.views || "",
               upload_ts: epoch * 1000,
-              view_count: 0,
+              view_count: r.view_count || 0,
+              like_count: r.like_count || 0,
               size_bytes: r.size_bytes || 0,
               tx_status: r.tx_status || "pending",
               year: r.year, month: r.month,

@@ -541,12 +541,29 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # making yt-dlp calls here — we rely on the data Cache built up during
     # sync-time metadata fetches.
     metadata_cache: Dict[str, Dict[str, Any]] = {}
+    # Secondary title-keyed index, built alongside the video_id one so
+    # DB rows with a NULL video_id (common for videos indexed before
+    # the video_id column was populated consistently) can still resolve
+    # their metadata by title match. Reported: an entire channel's
+    # videos had video_id=NULL in the index DB, so every view_count
+    # lookup failed — Most Viewed sort was a no-op for all 400+
+    # videos because the sort comparator saw only zeros.
+    metadata_cache_by_title: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    def _norm_title(s: str) -> str:
+        """Loose normalization for title matching — lowercase + collapse
+        whitespace. Enough to bridge minor rendering differences without
+        opening up to false positives.
+        """
+        return " ".join((s or "").lower().split())
+
     def _fetch_meta(folder_key):
         """Lazy-load the aggregated metadata JSONL for a given folder.
         Cache by folder so we don't re-parse the same file per row."""
         if folder_key in metadata_cache:
             return metadata_cache[folder_key]
-        entries = {}
+        entries: Dict[str, Any] = {}
+        by_title: Dict[str, Any] = {}
         try:
             # Walk up the folder tree looking for .{channel} ... Metadata.jsonl
             cur = folder_key
@@ -566,6 +583,12 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                                         vid = obj.get("video_id", "")
                                         if vid:
                                             entries[vid] = obj
+                                        # Title index as a secondary
+                                        # lookup path. Same obj can be
+                                        # reached by either key.
+                                        t = _norm_title(obj.get("title", ""))
+                                        if t:
+                                            by_title[t] = obj
                                     except json.JSONDecodeError:
                                         pass
                         except OSError:
@@ -576,7 +599,17 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         except Exception:
             pass
         metadata_cache[folder_key] = entries
+        metadata_cache_by_title[folder_key] = by_title
         return entries
+
+    def _fetch_meta_by_title(folder_key: str, title: str):
+        """Title-keyed fallback for rows with a missing video_id.
+        Returns the JSONL entry or None.
+        """
+        if folder_key not in metadata_cache_by_title:
+            _fetch_meta(folder_key) # populates both caches
+        return metadata_cache_by_title.get(folder_key, {}).get(
+            _norm_title(title))
 
     # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
     # epoch. Returns 0 on anything unparseable. The aggregated metadata
@@ -611,6 +644,15 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         meta = None
         if fp and vid_id:
             meta = _fetch_meta(os.path.dirname(fp)).get(vid_id)
+        # Fallback — many DB rows (older channels, bulk-imported from
+        # folder scans, pre-ID-column upgrades) have a NULL video_id.
+        # Title-match against the JSONL's `title` field so those rows
+        # still get their view_count populated for the Most Viewed
+        # sort. Loose normalization (lower + whitespace collapse).
+        if meta is None and fp:
+            _t_row = row.get("title", "")
+            if _t_row:
+                meta = _fetch_meta_by_title(os.path.dirname(fp), _t_row)
         if meta:
             ep = _yyyymmdd_to_epoch(meta.get("upload_date", ""))
             if ep > 0:

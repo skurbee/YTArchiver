@@ -2324,9 +2324,18 @@ class TranscribeManager:
                           if _elapsed >= 60 else f"{_elapsed}sec")
             _vid_for_marker = (job.get("video_id") or "").strip()
             _tx_tag = f"tx_done_{_vid_for_marker}" if _vid_for_marker else ""
-            _dim_tags = [t for t in ("dim", job_tag, _tx_tag) if t]
-            _em_tags = [t for t in ("whisper_bracket", job_tag, _tx_tag) if t]
-            _lbl_tags = [t for t in ("simpleline_blue", job_tag, _tx_tag) if t]
+            # _tx_tag FIRST in each tag list so logs.js `_inplaceKind`
+            # resolves this line to tx_done_<vid> and matches the
+            # placeholder emitted by sync.py. Putting _tx_tag last let
+            # the renderer hit `whisper_job_N` first and return that,
+            # so the done line couldn't find the placeholder and
+            # appended fresh below — leaving both "⏳ Transcription
+            # queued…" and "✓ Transcription (took Xsec)" visible.
+            # (logs.js has also been fixed to scan all tags with
+            # tx_done_ priority first; this is belt-and-suspenders.)
+            _dim_tags = [t for t in (_tx_tag, "dim", job_tag) if t]
+            _em_tags = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
+            _lbl_tags = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
             self._stream.emit([
                 [" ", _dim_tags],
                 ["\u2014 \u2713 ", _em_tags],

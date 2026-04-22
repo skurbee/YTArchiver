@@ -29,54 +29,57 @@
     // is a known progress family; the log-batch renderer replaces the
     // previous line of the same kind instead of appending a new one.
     //
-    // TWO-PASS scan: per-job / per-row tags (e.g. "whisper_job_7",
-    // "sync_row_12", "dlrow_5") MUST win over the generic "whisper_"
-    // prefix, otherwise a segment tagged `["whisper_bracket",
-    // "whisper_job_7"]` returns "whisper" (generic) on first iteration
-    // and the done line (tagged `["dim", "whisper_job_7"]`) returns
-    // "whisper_job_7" — different kinds, so the progress 99% line
-    // never gets replaced by the "\u2713 Transcription" done line.
-    // "99% progress line stuck". Pass 1 scans every segment's
-    // every tag for a per-job/per-row match; pass 2 falls back to the
-    // prefix-family match if none found.
+    // PRIORITY-ORDERED MULTI-PASS. The old single-pass scan was
+    // order-sensitive WITHIN a single tag list: a segment tagged
+    // `["dim", "whisper_job_N", "tx_done_vid"]` would hit the
+    // `whisper_job_` check on tag #2 and return that — even though
+    // tx_done_ is supposed to win. Result: the transcribe-done line
+    // resolved to `whisper_job_N` while the placeholder resolved to
+    // `tx_done_vid`, so the done emit couldn't find its placeholder
+    // and appended fresh, leaving the "⏳ Transcription queued…"
+    // line visible alongside the "✓ Transcription" line.
+    //
+    // Fix: separate scan per prefix, in priority order. Check ALL
+    // segments × ALL tags for `tx_done_` first. If none found, fall
+    // back to `whisper_job_`, then `sync_row_`, then `dlrow_`, etc.
     const segs = segments || [];
-
-    // Pass 1 — per-job / per-row unique kinds.
-    // `tx_done_` must win over `whisper_job_` so the final done-line
-    // tagged `["dim", whisper_job_N, tx_done_<vid>]` lands at the
-    // placeholder we emitted under the channel block (via tx_done_)
-    // rather than at the progress-tick at the bottom of the log.
+    const allTags = [];
     for (const seg of segs) {
       if (!seg) continue;
       const tag = seg[1];
-      const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
-      for (const t of tags) {
-        if (t && t.startsWith("tx_done_")) return t;
-        if (t && t.startsWith("whisper_job_")) return t;
-        if (t && t.startsWith("sync_row_")) return t;
-        if (t && t.startsWith("dlrow_")) return t;
-        // Per-workflow "sticky at bottom" active-status lines. Each
-        // module emits a `clear_line` control first so the old line
-        // is removed, then emits a new line with the marker — which
-        // lands at the current DOM bottom instead of being replaced
-        // in place at its original position.
-        if (t === "redwnl_active") return t;
-        if (t === "metadata_active") return t;
-        if (t === "compress_active") return t;
-        if (t === "reorg_active") return t;
+      if (Array.isArray(tag)) {
+        for (const t of tag) if (t) allTags.push(t);
+      } else if (tag) {
+        allTags.push(tag);
       }
     }
 
-    // Pass 2 — prefix-family matches (shared in-place families)
-    for (const seg of segs) {
-      if (!seg) continue;
-      const tag = seg[1];
-      const tags = Array.isArray(tag) ? tag : (tag ? [tag] : []);
-      for (const t of tags) {
-        if (t && t.startsWith("whisper_")) return "whisper";
-        if (t && t.startsWith("encode_")) return "encode";
-        if (t && t.startsWith("startup_")) return "startup";
+    // Priority order for per-job / per-row markers.
+    const priorityPrefixes = [
+      "tx_done_",
+      "whisper_job_",
+      "sync_row_",
+      "dlrow_",
+    ];
+    for (const prefix of priorityPrefixes) {
+      for (const t of allTags) {
+        if (t.startsWith(prefix)) return t;
       }
+    }
+
+    // Per-workflow "sticky at bottom" active-status lines.
+    for (const t of allTags) {
+      if (t === "redwnl_active") return t;
+      if (t === "metadata_active") return t;
+      if (t === "compress_active") return t;
+      if (t === "reorg_active") return t;
+    }
+
+    // Pass 2 — prefix-family matches (shared in-place families)
+    for (const t of allTags) {
+      if (t.startsWith("whisper_")) return "whisper";
+      if (t.startsWith("encode_")) return "encode";
+      if (t.startsWith("startup_")) return "startup";
     }
     return null;
   }

@@ -943,6 +943,29 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                         break
                             if _dlrow_n is None:
                                 _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
+                                # Path-match fell through to orphan, so the
+                                # progress row for THIS video is still
+                                # sitting at its own dlrow_<N> in the DOM
+                                # with no marker match to our done line.
+                                # Best-effort cleanup: emit a clear_line
+                                # control for `dlrow_{_DLROW_COUNTER}` so
+                                # whatever stuck Downloading row was
+                                # anchored to the most recent counter
+                                # gets removed from DOM. Also add it to
+                                # _closed_dlrows so any late progress
+                                # ticks for this counter are dropped.
+                                import json as _json_mod
+                                _stuck_kind = f"dlrow_{_DLROW_COUNTER}"
+                                try:
+                                    stream.emit([
+                                        [_json_mod.dumps({
+                                            "kind": "clear_line",
+                                            "marker": _stuck_kind,
+                                        }), "__control__"],
+                                    ])
+                                except Exception:
+                                    pass
+                                _closed_dlrows.add(_DLROW_COUNTER)
                             else:
                                 _done_kind = f"dlrow_{_dlrow_n}"
                                 # Close this dlrow — any further progress

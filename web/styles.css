@@ -3794,6 +3794,55 @@ body {
   padding: 0 3px;
 }
 .deferred-row button:hover { color: var(--c-log-red); }
+.deferred-row button.deferred-ignore {
+  /* "Ignore" is a stronger action than × (drop) — permanently adds
+     to the skip set. Make it a touch more prominent than the tiny
+     × glyph without looking destructive. */
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--c-dim);
+  color: var(--c-text);
+}
+.deferred-row button.deferred-ignore:hover {
+  color: var(--c-log-red);
+  border-color: var(--c-log-red);
+}
+
+/* Retry dropdown wrapper — positions the menu beneath the button. */
+.deferred-retry-wrap {
+  position: relative;
+  display: inline-block;
+}
+.deferred-retry-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  background: var(--c-card, #1a1b1f);
+  border: 1px solid var(--c-border, #2a2b30);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 50;
+  min-width: 120px;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+}
+.deferred-retry-menu[hidden] { display: none; }
+.deferred-retry-menu button {
+  background: transparent;
+  border: none;
+  color: var(--c-text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 10px;
+  text-align: left;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.deferred-retry-menu button:hover {
+  background: var(--c-hover, #2a2b30);
+}
 
 /* Drag-hover highlight when dragging a URL onto the Download tab */
 .tab-panel.drag-hover {

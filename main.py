@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v53.5"
-APP_VERSION_DATE = "4.22.26 10:06am"
+APP_VERSION      = "v53.6"
+APP_VERSION_DATE = "4.22.26 1:40pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2148,6 +2148,36 @@ class Api:
         try:
             from backend import livestreams as _ls
             return {"ok": _ls.drop(video_id)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def livestreams_ignore(self, video_id):
+        """Permanently skip this deferred livestream/premiere. Adds
+        the video_id to the ignore set so future sync passes never
+        re-defer it. Mirrors a "don't show this again" action."""
+        try:
+            from backend import livestreams as _ls
+            return {"ok": _ls.ignore(video_id)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def livestreams_snooze(self, seconds):
+        """Hide the deferred-livestreams drawer for `seconds` from now.
+        UI's "Retry in 24hrs / 1 week" dropdown uses this to suppress
+        the drawer without forgetting the entries.
+        """
+        try:
+            from backend import livestreams as _ls
+            return {"ok": _ls.snooze_drawer(float(seconds or 0))}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def livestreams_drawer_state(self):
+        """Return {snooze_until_ts, now_ts, visible} so the UI can
+        decide whether to render the drawer at all."""
+        try:
+            from backend import livestreams as _ls
+            return {"ok": True, **_ls.drawer_state()}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

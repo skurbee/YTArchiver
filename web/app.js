@@ -1503,6 +1503,15 @@
     if (!wrap || !list) return;
     if (!api?.livestreams_list) { wrap.hidden = true; return; }
     try {
+      // Check snooze state first — if active, keep the drawer hidden
+      // regardless of how many deferred items exist. Timer in
+      // initDeferredLivestreams re-checks every 30s so the drawer
+      // reappears automatically after snooze expires.
+      const state = await api.livestreams_drawer_state?.();
+      if (state?.ok && state.visible === false) {
+        wrap.hidden = true;
+        return;
+      }
       const res = await api.livestreams_list();
       const items = res?.items || [];
       if (!items.length) { wrap.hidden = true; return; }
@@ -1515,7 +1524,9 @@
         row.innerHTML = `
           <span class="deferred-id"></span>
           <span class="deferred-title"></span>
-          <button data-drop title="Forget this one">&times;</button>
+          <button data-ignore class="deferred-ignore"
+                  title="Never try this video again">Ignore</button>
+          <button data-drop title="Forget this one for now (may reappear on next sync)">&times;</button>
         `;
         row.querySelector(".deferred-id").textContent = it.video_id;
         row.querySelector(".deferred-title").textContent = it.title
@@ -1524,15 +1535,57 @@
           await api.livestreams_drop(it.video_id);
           refreshDeferredLivestreams();
         });
+        row.querySelector("[data-ignore]").addEventListener("click", async () => {
+          const ok = await window.askQuestion?.({
+            title: "Ignore this video?",
+            message: `Permanently skip video ${it.video_id}${it.title ? ` (${it.title.slice(0, 60)})` : ""}? Future sync passes will not re-defer it.`,
+            confirm: "Ignore",
+            cancel: "Keep",
+            danger: true,
+          });
+          if (!ok) return;
+          await api.livestreams_ignore?.(it.video_id);
+          window._showToast?.("Ignored. Won't appear again.", "ok");
+          refreshDeferredLivestreams();
+        });
         list.appendChild(row);
       }
     } catch (e) { console.warn("deferred:", e); }
   }
 
   function initDeferredLivestreams() {
-    document.getElementById("btn-deferred-refresh")?.addEventListener("click", () => {
-      window.pywebview?.api?.sync_start_all?.();
-      window._showToast?.("Retrying deferred livestreams via Sync Subbed.", "ok");
+    // Retry dropdown — Now kicks a sync immediately; 24h / 1 week
+    // snooze the drawer so it stops nagging until that time.
+    const retryBtn = document.getElementById("btn-deferred-retry");
+    const retryMenu = document.getElementById("deferred-retry-menu");
+    const closeMenu = () => { if (retryMenu) retryMenu.hidden = true; };
+    retryBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!retryMenu) return;
+      retryMenu.hidden = !retryMenu.hidden;
+    });
+    document.addEventListener("click", (e) => {
+      if (!retryMenu || retryMenu.hidden) return;
+      if (!retryMenu.contains(e.target) && e.target !== retryBtn) closeMenu();
+    });
+    retryMenu?.querySelectorAll("button[data-retry]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        const mode = b.dataset.retry;
+        const api = window.pywebview?.api;
+        closeMenu();
+        if (mode === "now") {
+          api?.sync_start_all?.();
+          window._showToast?.("Retrying deferred livestreams via Sync Subbed.", "ok");
+        } else if (mode === "24h") {
+          await api?.livestreams_snooze?.(24 * 60 * 60);
+          window._showToast?.("Deferred livestreams snoozed for 24 hours.", "ok");
+          refreshDeferredLivestreams();
+        } else if (mode === "1w") {
+          await api?.livestreams_snooze?.(7 * 24 * 60 * 60);
+          window._showToast?.("Deferred livestreams snoozed for 1 week.", "ok");
+          refreshDeferredLivestreams();
+        }
+      });
     });
     document.getElementById("btn-deferred-clear")?.addEventListener("click", async () => {
       const ok = await askDanger(

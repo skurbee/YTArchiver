@@ -1237,14 +1237,44 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 if _ls.line_looks_live(s):
                     id_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
                     vid = id_m.group(1) if id_m else ""
-                    if vid:
-                        _ls.defer(vid, title=current_title, channel_url=url)
-                        stream.emit([[" [Live] ", "livestream"],
-                                     [f"Deferred {vid}: ", "simpleline"],
-                                     [s[:140] + "\n", "dim"]])
+                    # Clean the title stored in the deferred journal —
+                    # current_title is the most recent Destination-line
+                    # filename stem which often still carries yt-dlp's
+                    # format-selector suffix (e.g. `.f140-4`, `.f137`).
+                    # Strip it so the drawer shows a readable title.
+                    _clean_title = (current_title or "").strip()
+                    if "." in _clean_title:
+                        _last = _clean_title.rsplit(".", 1)[-1]
+                        if (len(_last) >= 2 and _last[0] == "f"
+                                and _last[1].isdigit()):
+                            _clean_title = _clean_title.rsplit(".", 1)[0]
+                    # Classify which kind of live-state for a tight
+                    # single-line log message. "is_upcoming" /
+                    # "premieres in" / "scheduled" → upcoming premiere.
+                    # Anything else that matched line_looks_live →
+                    # currently-live stream.
+                    _s_low = s.lower()
+                    if ("is_upcoming" in _s_low
+                            or "premieres in" in _s_low
+                            or "scheduled" in _s_low
+                            or "starts in" in _s_low
+                            or "will begin" in _s_low):
+                        _kind = "upcoming premiere"
                     else:
-                        stream.emit([[" [Live] ", "livestream"],
-                                     [s[:140] + "\n", "dim"]])
+                        _kind = "currently live"
+                    if vid:
+                        _ls.defer(vid, title=_clean_title, channel_url=url)
+                        stream.emit([
+                            [" [Live] ", "livestream"],
+                            [f"Deferred \u2014 {_clean_title[:80] or vid} "
+                             f"({_kind}).\n", "simpleline"],
+                        ])
+                    else:
+                        stream.emit([
+                            [" [Live] ", "livestream"],
+                            [f"Deferred \u2014 {_kind} stream on this channel.\n",
+                             "simpleline"],
+                        ])
                     continue
             except Exception:
                 pass

@@ -188,8 +188,17 @@
         <span class="deferred-hint">(will auto-retry on next sync)</span>
         <div class="spacer"></div>
         <span class="status-text" id="deferred-count">0</span>
-        <button class="btn btn-ghost btn-thin" id="btn-deferred-refresh"
-                title="Retry all deferred livestreams now">Retry all</button>
+        <!-- Retry dropdown: Now kicks an immediate sync; 24h / 1 week
+             snooze the drawer so it stops nagging until that time. -->
+        <div class="deferred-retry-wrap">
+          <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
+                  title="Retry options">Retry &#x25BE;</button>
+          <div class="deferred-retry-menu" id="deferred-retry-menu" hidden>
+            <button data-retry="now">Now</button>
+            <button data-retry="24h">in 24 hours</button>
+            <button data-retry="1w">in 1 week</button>
+          </div>
+        </div>
         <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"
                 title="Forget every deferred livestream">Clear</button>
       </div>
@@ -1325,6 +1334,6 @@
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally — no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
   <script src="logs.js?v=30"></script>
-  <script src="app.js?v=63"></script>
+  <script src="app.js?v=64"></script>
 </body>
 </html>

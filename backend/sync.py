@@ -2522,13 +2522,25 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _processed -= 1
                     continue
                 _fetched = int(_res.get("fetched", 0) or 0)
-                _summary = (f"{_fetched} new" if _fetched
-                            else "up to date")
+                _refreshed = int(_res.get("refreshed", 0) or 0)
+                # issue #136: when the user runs "Refresh views/
+                # likes" (refresh=True), every on-disk video is re-hit
+                # and counts roll into `refreshed`, not `fetched`. The
+                # old summary ignored `refreshed` entirely, so the task
+                # row said "up to date" even on a successful refresh
+                # pass — "Doesn't seem to 'update' any info."
+                if _fetched:
+                    _summary = f"{_fetched} new"
+                elif _refreshed:
+                    _summary = f"{_refreshed} refreshed"
+                else:
+                    _summary = "up to date"
                 _sync_row_emit(stream, i, total, ch_name,
                                summary=_summary,
                                name_tag="simpleline",
-                               summary_tag="simpleline_pink" if _fetched
-                                           else "dim")
+                               summary_tag=("simpleline_pink"
+                                            if (_fetched or _refreshed)
+                                            else "dim"))
             except Exception as _me:
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
                 _sync_row_emit(stream, i, total, ch_name,

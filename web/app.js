@@ -6332,8 +6332,9 @@
       if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
       const ok = await askConfirm("Refresh views/likes",
         "Re-fetch view counts and like counts for every video on every channel?\n\n" +
-        "This skips channels/videos that already have fresh metadata. Still slow " +
-        "on a 100k-video archive.",
+        "Every on-disk video gets re-hit — previously-skipped failures too " +
+        "(the failure flag is cleared first). Expect one yt-dlp call per video, " +
+        "so this is slow on a 100k-video archive.",
         { confirm: "Refresh" });
       if (!ok) return;
       const res = await api.metadata_queue_all(true);

@@ -160,16 +160,71 @@ def enrich_channels_with_stats(channels: list, cache: Optional[Dict[str, Any]] =
 
 
 def invalidate_channel(ch_url: str) -> bool:
-    """Drop the disk-cache entry for this channel so the next stats scan
-    re-walks the folder from scratch. Used after redownload / compress / reorg.
+    """Drop the disk-cache entry and kick off a background rescan so the
+    Subs table re-reads fresh `num_vids` / `size_bytes` instead of the
+    `—` placeholder it would otherwise show until the next startup walk.
+
+    issue #134: previously this only popped the entry. The Subs
+    row then rendered as "—" because `stats_for_channel` returns zeros on
+    a missing entry. Worse, the next sweep_new_videos pass would stamp
+    `sweep_fingerprint` into the now-empty entry (via `setdefault`), and
+    the startup staleness check (24h) would skip the full rescan — so
+    the "—" persisted across restarts until the user manually invoked a
+    rebuild. Re-scanning synchronously in a daemon thread mirrors the
+    classic YTArchiver.py:3198 _invalidate_channel_disk_cache behavior.
     """
     if not ch_url:
         return False
     cache = load_disk_cache()
     if ch_url in cache:
         del cache[ch_url]
-        return save_disk_cache(cache)
-    return False
+        save_disk_cache(cache)
+
+    def _rescan():
+        try:
+            from .ytarchiver_config import load_config
+            cfg = load_config()
+            ch = next(
+                (c for c in cfg.get("channels", [])
+                 if (c.get("url") or "").strip() == ch_url),
+                None)
+            if ch is not None:
+                update_disk_cache_for_channel(ch)
+        except Exception:
+            pass
+
+    import threading as _th
+    _th.Thread(target=_rescan, daemon=True).start()
+    return True
+
+
+def heal_malformed_cache_entries() -> int:
+    """Drop cache entries that lack `num_vids`/`size_bytes` so the next
+    Subs render triggers a proper rescan instead of showing `—`.
+
+    Older code paths (sweep_new_videos's `setdefault(ch_url, {})` +
+    fingerprint write) could leave behind entries containing only a
+    `sweep_fingerprint` — no video count, no size. Those entries
+    short-circuited the "missing" check in the startup disk walk and
+    the fix loop in `stats_for_channel`, so affected channels showed
+    blank Size / # Vids columns forever. Call this once at startup to
+    purge the bad rows; `sweep_new_videos` itself is also patched to
+    stop creating them on new runs.
+
+    Returns the number of entries dropped.
+    """
+    cache = load_disk_cache()
+    dropped = [
+        url for url, rec in list(cache.items())
+        if not isinstance(rec, dict)
+           or "num_vids" not in rec or "size_bytes" not in rec
+    ]
+    if not dropped:
+        return 0
+    for url in dropped:
+        del cache[url]
+    save_disk_cache(cache)
+    return len(dropped)
 
 
 def archive_totals(cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

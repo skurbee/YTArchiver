@@ -662,6 +662,17 @@
               <button class="btn btn-ghost btn-thin" id="btn-metadata-refresh-all"
                       title="Refresh views/likes on existing metadata for every channel">Refresh views/likes&hellip;</button>
             </div>
+
+            <!-- Moved from the Browse toolbar (issue #135) — it was
+                 an odd fit up there with per-channel navigation and
+                 users asked for it grouped with the other archive-
+                 wide Tools actions. Button id stays `btn-scan-archive`
+                 so `initScanArchive()` in app.js finds it unchanged. -->
+            <label class="edit-gl">Archive</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
+                      title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
+            </div>
           </div>
         </div>
 
@@ -801,8 +812,6 @@
               <input type="checkbox" id="browse-group-month" style="vertical-align:-1px;margin-right:3px;" />Group by month
             </label>
           </div>
-          <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
-                  title="Re-scan archive folders for new files added outside the app">Rescan archive</button>
           <div class="browse-find-wrap">
             <span class="search-icon">&#128269;</span>
             <input type="text" class="ctl-input find-input" id="browse-filter" placeholder="Filter..." />

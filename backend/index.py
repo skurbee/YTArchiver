@@ -1609,9 +1609,21 @@ def sweep_new_videos(output_dir: str, channels: list,
         # Channel walk completed — stamp the fingerprint so next
         # sweep can skip if unchanged. Stamp AFTER the walk so a
         # crash mid-walk doesn't leave a stale "skip me" flag.
+        #
+        # issue #134: only stamp onto an already-populated entry.
+        # If the row is missing (e.g. just invalidated by a redownload
+        # before its background rescan finished), creating a fingerprint-
+        # only entry here would leave num_vids/size_bytes = 0 in the
+        # Subs table and survive restart (staleness check skips the next
+        # walk). Let `update_disk_cache_for_channel` own the initial
+        # populate; next sweep will walk this channel again, which is
+        # cheap compared to the bug.
         if ch_url:
-            row = _fp_cache.setdefault(ch_url, {})
-            row["sweep_fingerprint"] = current_fp
+            existing_row = _fp_cache.get(ch_url)
+            if isinstance(existing_row, dict) and (
+                    "num_vids" in existing_row
+                    or "size_bytes" in existing_row):
+                existing_row["sweep_fingerprint"] = current_fp
 
     # Persist the updated fingerprint cache.
     if skipped_unchanged < total_ch:

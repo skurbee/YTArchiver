@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v53.7"
-APP_VERSION_DATE = "4.22.26 3:52pm"
+APP_VERSION      = "v53.8"
+APP_VERSION_DATE = "4.23.26 2:40pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -1084,12 +1084,19 @@ class Api:
             try:
                 from backend.archive_scan import (
                     load_disk_cache, save_disk_cache, archive_totals,
-                    scan_all_channels,
+                    scan_all_channels, heal_malformed_cache_entries,
                 )
+                # issue #134: drop any cache entries that only contain a
+                # `sweep_fingerprint` (no num_vids/size_bytes). Those can
+                # be left over from older code paths; if present, they
+                # show as "—" in Subs table + Index summary. Force a
+                # walk when any are found so the next pass fills them in.
+                dropped = heal_malformed_cache_entries()
                 stale_hours = int(cfg.get("disk_scan_staleness_hours", 24) or 0)
                 last_ts = float(cfg.get("last_disk_scan_ts", 0) or 0)
                 age_hours = (_time.time() - last_ts) / 3600.0 if last_ts > 0 else 1e9
-                do_walk = (stale_hours <= 0) or (age_hours >= stale_hours) or (last_ts == 0)
+                do_walk = ((stale_hours <= 0) or (age_hours >= stale_hours)
+                           or (last_ts == 0) or (dropped > 0))
 
                 if do_walk:
                     dots_state["sweep"]["phase"] = "Scanning disk"
@@ -1148,6 +1155,20 @@ class Api:
                 else:
                     s.emit_text("--- Disk scan complete ---", "simpleline_green")
                 _flush_now()
+                # issue #134: Subs table was rendered at boot using
+                # whatever was in the cache at that moment — which for
+                # healed/invalidated channels was an empty record that
+                # maps to "—". Now that Stage 2 has just written fresh
+                # stats, ask the UI to re-fetch. Without this push the
+                # user has to click Subs → some other tab → Subs to see
+                # the numbers fill in.
+                try:
+                    if self._window is not None:
+                        self._window.evaluate_js(
+                            "if (window.refreshSubsTable) "
+                            "window.refreshSubsTable();")
+                except Exception:
+                    pass
             except Exception as e:
                 s.emit_error(f"Disk scan error: {e}")
                 _flush_now()

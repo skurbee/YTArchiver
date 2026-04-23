@@ -642,7 +642,17 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             if vid_id in existing and not refresh and not needs_thumb_only:
                 skipped += 1
                 continue
-            _reason = ("Thumbnail" if needs_thumb_only else "Metadata")
+            # issue #136: distinguish a refresh hit from a fresh
+            # fetch in the per-video log line so the user can SEE the
+            # refresh actually doing work (previously every line just
+            # said "Metadata — <title>" regardless, and the summary row
+            # also ignored refresh counts, so the feature looked broken).
+            if needs_thumb_only:
+                _reason = "Thumbnail"
+            elif refresh and vid_id in existing:
+                _reason = "Refresh"
+            else:
+                _reason = "Metadata"
             # Color discipline: only the pink parts are the ones that
             # identify the task source (brackets, em-dash, tag label).
             # Numbers and titles render in the default color so they

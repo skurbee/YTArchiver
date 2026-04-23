@@ -2,7 +2,6 @@
 
 Download, organize, transcribe, search, compress, and browse entire channels
 
-some specific features relating to taking over archives from 4kVD+, and 'fixing' them
 
 
 

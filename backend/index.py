@@ -258,6 +258,20 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         # click picks up the newly-registered video.
         try: invalidate_channel_videos(channel)
         except Exception: pass
+        # bug M-14: if a transcript JSONL sidecar is already on disk at
+        # register-time (e.g. yt-dlp dropped a .vtt → .jsonl before
+        # Whisper even queues), ingest it right now so the Watch view
+        # doesn't open with an empty transcript. Without this, the user
+        # sees "loading..." until the next full sweep (boot-time or
+        # Rescan) — could be hours.
+        try:
+            _base = os.path.splitext(fp)[0]
+            _jp = _base + ".jsonl"
+            if os.path.isfile(_jp):
+                _display_title = title or os.path.basename(_base)
+                ingest_jsonl(fp, _jp, _display_title, channel)
+        except Exception:
+            pass
         return True
     except sqlite3.Error as e:
         print(f"[index] register_video failed: {e}")
@@ -1183,7 +1197,24 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
         return {"labels": [], "values": [], "error": str(e)}
     labels = [str(r[0]) for r in rows if r[0] is not None]
     values = [int(r[1]) for r in rows if r[0] is not None]
-    return {"labels": labels, "values": values}
+    # bug M-13: when the caller requests week-granularity data while
+    # backfill_upload_ts is still populating, the query silently returns
+    # sparse results. Surface a `backfill_pending` count so the UI can
+    # show "Still indexing... N videos pending" instead of letting the
+    # user think their channel has no recent activity.
+    backfill_pending = 0
+    if bucket == "week":
+        try:
+            with _db_lock:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
+                ).fetchone()
+            if row:
+                backfill_pending = int(row[0] or 0)
+        except sqlite3.Error:
+            pass
+    return {"labels": labels, "values": values,
+            "backfill_pending": backfill_pending}
 
 
 def graph_multi(words: List[str], channel: Optional[str] = None,
@@ -1620,9 +1651,13 @@ def sweep_new_videos(output_dir: str, channels: list,
         # cheap compared to the bug.
         if ch_url:
             existing_row = _fp_cache.get(ch_url)
+            # bug L-1: tightened to `and` — update_disk_cache_for_channel
+            # always writes BOTH fields together, so a row with only one
+            # is itself a corruption case we don't want to cement by
+            # adding a fingerprint on top.
             if isinstance(existing_row, dict) and (
                     "num_vids" in existing_row
-                    or "size_bytes" in existing_row):
+                    and "size_bytes" in existing_row):
                 existing_row["sweep_fingerprint"] = current_fp
 
     # Persist the updated fingerprint cache.
@@ -1812,6 +1847,19 @@ def rebuild_fts_index() -> Dict[str, Any]:
                 "SELECT id, text FROM segments"
             )
             rows = conn.execute("SELECT COUNT(*) FROM segments_fts").fetchone()[0]
+            # bug M-4: `indexed_files` (the table used to compute the
+            # "unindexed transcripts" warning banner) is only populated
+            # by ingest_jsonl. A pure FTS rebuild would leave the banner
+            # claiming "N unindexed" even though every segment just got
+            # re-indexed. Refresh indexed_files from the segments table
+            # so the banner reflects reality.
+            conn.execute("DELETE FROM indexed_files")
+            conn.execute(
+                "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
+                "SELECT jsonl_path, 0, COUNT(*) "
+                "FROM segments WHERE jsonl_path IS NOT NULL "
+                "GROUP BY jsonl_path"
+            )
             conn.commit()
         return {"ok": True, "rows_indexed": int(rows)}
     except sqlite3.Error as e:

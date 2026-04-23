@@ -31,6 +31,12 @@ from .log_stream import LogStreamer
 
 
 _COMPRESS_PRESETS = {
+    # bug H-9: 2160 (4K) and 1440 (1440p) used to be missing, causing
+    # silent fallback to 1080p bitrates — 4K output at Generous would
+    # get ~1200 MB/hr when it needs ~2600+. Padding with AV1-appropriate
+    # bitrates (AV1 NVENC on RTX 40-series, roughly 2x efficient vs HEVC).
+    "2160": {"Generous": 2800, "Average": 1600, "Below Average": 800},
+    "1440": {"Generous": 1800, "Average": 1000, "Below Average": 500},
     "1080": {"Generous": 1200, "Average": 700, "Below Average": 300},
     "720": {"Generous": 800, "Average": 475, "Below Average": 200},
     "480": {"Generous": 500, "Average": 300, "Below Average": 130},
@@ -221,6 +227,15 @@ def compress_video(input_path: str, stream: LogStreamer,
             os.replace(temp_path, input_path)
         except OSError as e:
             stream.emit_error(f"Could not replace original: {e}")
+            # bug H-2: on replace-failure (file locked by VLC preview /
+            # antivirus / cross-drive), the temp file used to sit in
+            # _TEMP_COMPRESS/ forever — `temp_cleanup.py` treats non-
+            # empty temp dirs as "in use" and skips them. Clean up now
+            # so we don't leak GB of AV1 encodes on repeated failures.
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
             return {"ok": False, "error": str(e)}
 
     # Per-file done line. Green checkmark + white filename + dim size

@@ -556,7 +556,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
 
     total = sum(len(g["videos"]) for g in groups.values())
     t0 = time.time()
-    fetched = skipped = errors = refreshed = 0
+    fetched = skipped = errors = refreshed = thumb_only = 0
     idx = 0
 
     # Sticky active status line pinned at the bottom of the log while
@@ -671,6 +671,14 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             entry = _fetch_video_metadata(yt, vid_id, title)
             if entry is None:
                 errors += 1
+                # bug L-5: surface a per-video error line so the user
+                # knows WHICH titles failed (previously only the
+                # summary count emerged, making diagnosis impossible).
+                stream.emit([
+                    [" \u2717 ", "red"],
+                    ["Metadata failed \u2014 ", "red"],
+                    [f"{title[:90]}\n", "simpleline"],
+                ])
                 # Mark this video_id as permanently failed so future
                 # rechecks don't re-hit yt-dlp for it. Matches OLD's
                 # `metadata_fetch_failed_ts` pattern — cleared on
@@ -704,7 +712,12 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                 # JSONL entry stays as-is; only the thumbnail is being
                 # backfilled. `changed` stays False so we don't rewrite
                 # the JSONL for a thumbnail-only fetch.
-                fetched += 1
+                # bug M-11: count thumbnail-only refetches separately
+                # from true metadata fetches so the summary + activity
+                # log distinguish the two (was silently lumped under
+                # `fetched`, making thumbnail-only runs look like full
+                # metadata pulls).
+                thumb_only += 1
             else:
                 existing[vid_id] = entry
                 fetched += 1
@@ -729,6 +742,7 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
     summary_parts = []
     if fetched: summary_parts.append(f"{fetched} fetched")
     if refreshed: summary_parts.append(f"{refreshed} refreshed")
+    if thumb_only: summary_parts.append(f"{thumb_only} thumbnails")
     if skipped: summary_parts.append(f"{skipped} skipped")
     if errors: summary_parts.append(f"{errors} errors")
     summary = " \u00b7 ".join(summary_parts) or "nothing to do"
@@ -786,10 +800,18 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
                 "took": f"took {_took_str}",
                 "row_tag": row_tag,
             })
-        except Exception:
-            pass
+        except Exception as _ae:
+            # bug S-9: metadata fetch succeeded but the [Metdta] row
+            # didn't emit — without this log line the user thinks the
+            # fetch never ran. Surface the failure so diagnosis is
+            # possible.
+            try:
+                stream.emit_dim(f" (metadata activity row emit failed: {_ae})")
+            except Exception:
+                pass
     return {"ok": True, "fetched": fetched, "skipped": skipped,
-            "errors": errors, "refreshed": refreshed, "took": elapsed}
+            "errors": errors, "refreshed": refreshed,
+            "thumb_only": thumb_only, "took": elapsed}
 
 
 def _resolve_ids_by_title(yt: str, url: str,

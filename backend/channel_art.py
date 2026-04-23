@@ -141,12 +141,17 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     avatar = _pick_by_prefix(thumbs, "avatar")
     banner = _pick_by_prefix(thumbs, "banner")
 
-    got = {"ok": True}
+    # bug H-12: always include BOTH keys (null when missing) so callers
+    # can safely destructure without accidentally passing `undefined` to
+    # <img src>. Previously only the successful key was present, causing
+    # broken-image icons in the Browse grid when only one of avatar/
+    # banner fetched successfully.
+    got = {"ok": True, "avatar_path": None, "banner_path": None}
     if avatar and avatar.get("url") and _http_get(avatar["url"], avatar_path):
         got["avatar_path"] = avatar_path
     if banner and banner.get("url") and _http_get(banner["url"], banner_path):
         got["banner_path"] = banner_path
-    if "avatar_path" not in got and "banner_path" not in got:
+    if got["avatar_path"] is None and got["banner_path"] is None:
         return {"ok": False, "error": "avatar + banner downloads failed"}
     return got
 

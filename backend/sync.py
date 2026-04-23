@@ -999,10 +999,30 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                 final_path, name, t,
                                 tx_status="pending" if auto_tx else "no_captions",
                                 video_id=vid)
-                        except Exception:
-                            pass
+                        except Exception as _re:
+                            # bug S-1: surface the failure so the user
+                            # knows a download they just saw succeed is
+                            # actually invisible in Browse/Search. Old
+                            # code silently swallowed this.
+                            stream.emit_dim(
+                                f" (index register failed for {t!r}: {_re})")
                         try:
                             _record_recent_download(final_path, name, t, vid)
+                        except Exception as _re2:
+                            # bug S-2: Recent tab goes stale silently
+                            # on any cache write failure without this.
+                            stream.emit_dim(
+                                f" (recent downloads write failed: {_re2})")
+                        # bug C-3: if this vid was previously deferred
+                        # as a livestream/premiere, drop it from the
+                        # deferred journal now that we've successfully
+                        # grabbed the recording. Without this, the
+                        # Deferred Livestreams drawer accumulates stale
+                        # entries forever; only the manual Ignore button
+                        # ever removed them.
+                        try:
+                            from . import livestreams as _ls
+                            _ls.drop(vid)
                         except Exception:
                             pass
                         # Inline metadata fetch — no channel walk.
@@ -1017,8 +1037,13 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             try:
                                 from . import ytarchiver_config as _cfg
                                 _cfg.append_pending_tx_id(name, vid)
-                            except Exception:
-                                pass
+                            except Exception as _re3:
+                                # bug S-3: pending transcribe list
+                                # silently loses the ID otherwise —
+                                # user would later see "Queue Pending"
+                                # miss this video without knowing why.
+                                stream.emit_dim(
+                                    f" (pending-transcribe list write failed: {_re3})")
                         # Auto-transcribe: queue the completed video for whisper
                         if auto_tx and transcribe_mgr is not None:
                             cb = None
@@ -1237,6 +1262,14 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 if _ls.line_looks_live(s):
                     id_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
                     vid = id_m.group(1) if id_m else ""
+                    # bug L-3: if the regex misses, nothing gets written
+                    # to the deferred journal AND the next sync re-
+                    # detects + re-logs the same stream forever. Emit a
+                    # dim warning so the user at least sees it.
+                    if not vid:
+                        stream.emit_dim(
+                            " (live-detect: couldn't extract video_id from "
+                            "yt-dlp output — deferral skipped)")
                     # Clean the title stored in the deferred journal —
                     # current_title is the most recent Destination-line
                     # filename stem which often still carries yt-dlp's
@@ -1282,14 +1315,21 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # Error lines
             low = s.lower()
             if "error" in low or "warning" in low:
-                # Benign non-errors that yt-dlp prints as ERROR lines:
-                # "does not have a streams tab" — channel has no past
-                # livestreams under /streams. Expected for most
-                # non-livestreaming channels, not actually an error.
-                # "does not have a shorts tab" — similar, harmless.
-                # Silenced in Simple mode (dim), counter not bumped.
-                if ("does not have a streams tab" in low
-                        or "does not have a shorts tab" in low):
+                # Benign non-errors that yt-dlp prints as ERROR lines.
+                # bug L-4: extended the allowlist so the error counter
+                # doesn't inflate on these "noise" lines. Counter
+                # remains accurate for real failures.
+                _BENIGN_FRAGMENTS = (
+                    "does not have a streams tab",
+                    "does not have a shorts tab",
+                    "does not have a releases tab",
+                    "does not have a community tab",
+                    "does not have a posts tab",
+                    "unable to extract uploader",  # yt-dlp warns when uploader is blank
+                    "unable to extract n function",  # transient yt-dlp version issue
+                    "precondition check failed",  # known-transient signed-url hiccup
+                )
+                if any(frag in low for frag in _BENIGN_FRAGMENTS):
                     stream.emit([[f" {s}\n", "dim"]])
                     continue
                 # Members-only content — not an error, just a skip.
@@ -1425,8 +1465,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     metadata=_meta_fetched,
                     errors=int(errors or 0),
                     elapsed_start=t_start)
-            except Exception:
-                pass
+            except Exception as _re4:
+                # bug S-8: if the activity-log row register fails, the
+                # sync completed but the user sees no history row.
+                # Surfacing via dim log at least confirms the sync ran.
+                stream.emit_dim(
+                    f" (activity-log register failed: {_re4})")
 
     # Remember the fresh IDs in the channel cache for the next sync pass
     # (lets the quick-check-new-uploads fast path skip enumeration).
@@ -1446,20 +1490,37 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # the fast-sync path.
     if config_is_writable():
         try:
+            # bug C-1: `now` was referenced below without ever being
+            # defined in this scope. The outer try/except silently swallowed
+            # the NameError so `last_sync`, `initialized`, and `sync_complete`
+            # never got written when a sync actually downloaded anything —
+            # invisibly defeating the --break-on-existing fast-path on every
+            # subsequent sync.
+            now = datetime.now()
             cfg2 = load_config()
             _dirty = False
+            # bug S-6: require AT LEAST ONE video to have been walked
+            # (downloaded > 0 OR errors > 0, meaning yt-dlp actually
+            # ran end-to-end) before stamping `initialized=True`. A
+            # first sync that 0-downloads AND 0-errors almost certainly
+            # hit a filter wall (strict duration filter, empty
+            # playlist, auth failure) — stamping initialized there locks
+            # the channel into fast-path forever even though it was
+            # never actually bootstrapped.
+            _walked_meaningfully = (downloaded > 0) or (int(errors or 0) > 0)
             for c in cfg2.get("channels", []):
                 if c.get("url", "").strip() != url:
                     continue
                 if downloaded > 0:
                     c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
                     _dirty = True
-                if not c.get("initialized", False):
-                    c["initialized"] = True
-                    _dirty = True
-                if not c.get("sync_complete", False):
-                    c["sync_complete"] = True
-                    _dirty = True
+                if _walked_meaningfully:
+                    if not c.get("initialized", False):
+                        c["initialized"] = True
+                        _dirty = True
+                    if not c.get("sync_complete", False):
+                        c["sync_complete"] = True
+                        _dirty = True
                 break
             if downloaded > 0:
                 cfg2["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
@@ -1843,7 +1904,22 @@ def _check_batch_cooldown(ch: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def _should_batch_limit(ch: Dict[str, Any], ch_total: int) -> bool:
-    """Return True if this channel should be subject to batch cooldown rules."""
+    """Return True if this channel should be subject to batch cooldown rules.
+
+    bug W-9 clarification: the two flags look similar but gate
+    different things.
+      * `initialized`     = "first sync completed AT LEAST ONCE"
+                            (even if it walked nothing useful —
+                             bug S-6 tightened that path).
+      * `init_complete`   = "full bootstrap has walked the whole
+                             catalog" (definite: not paused mid-walk).
+      * `_check_batch_cooldown` (separate fn, elsewhere) enforces the
+        72h cooldown timestamp; THIS fn just decides if batch-limit
+        rules apply at all.
+    Order matters: mode must be full (channel-wide mode), init_complete
+    short-circuits out (already past bootstrap), and only THEN we fall
+    through to channel-size checks.
+    """
     if ch.get("mode", "full") != "full":
         return False
     if ch.get("init_complete", False):
@@ -2177,9 +2253,18 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         # _maybe_auto_index (32104) + the call at 33247 right after record_download.
         if cfg.get("auto_index_enabled", False):
             threshold = int(cfg.get("auto_index_threshold", 10) or 10)
-            counter = int(cfg.get("_auto_index_counter", 0) or 0) + 1
+            # bug L-13: canonicalize on `downloads_since_last_index` (the
+            # DEFAULT_CONFIG-declared field). Older code wrote to a
+            # separate `_auto_index_counter` which meant the documented
+            # field was never read and a "next auto-index in N"
+            # progress widget couldn't be built on top of it. Migrate
+            # any legacy `_auto_index_counter` into the canonical key
+            # on first write so no downloads are lost.
+            _legacy = int(cfg.pop("_auto_index_counter", 0) or 0)
+            counter = int(cfg.get("downloads_since_last_index", 0) or 0) \
+                      + _legacy + 1
             if counter >= threshold:
-                cfg["_auto_index_counter"] = 0
+                cfg["downloads_since_last_index"] = 0
                 save_config(cfg)
                 # Fire off a background sweep — re-ingests any .jsonl that
                 # wasn't already indexed (cheap no-op for already-indexed ones).
@@ -2194,7 +2279,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                         pass
                 _thr.Thread(target=_bg_sweep, daemon=True).start()
             else:
-                cfg["_auto_index_counter"] = counter
+                cfg["downloads_since_last_index"] = counter
                 save_config(cfg)
     except Exception:
         pass
@@ -2411,8 +2496,18 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     # that's the root-cause bug hit where a resumed half-pass
     # would restart from A because the loop walked config instead of
     # the queue. `_processed` counts what we've done in THIS invocation;
-    # `total` updates dynamically each iteration = processed + remaining.
+    # `total` stays stable at the INITIAL queue size to keep the row
+    # denominator steady across pauses (bug L-2: old code recomputed
+    # per iteration, so pausing+resuming made [3/7] drift to [3/4] as
+    # remaining items drained — confusing.)
     _processed = 0
+    try:
+        _initial_total = sum(
+            1 for c in queues.sync
+            if (c.get("kind") or "download").lower() != "redownload"
+        ) if queues is not None else 0
+    except Exception:
+        _initial_total = 0
     while True:
         # Pop next channel off the queue. When the queue is empty, we're
         # done — this is how the loop terminates, naturally supporting
@@ -2442,10 +2537,11 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             continue
         _processed += 1
         i = _processed
-        # Recompute total: already processed + remaining in queue.
-        # Exclude kind=redownload entries (same reason as above —
-        # they're drained by a separate worker and shouldn't inflate
-        # this pass's denominator).
+        # bug L-2: use the INITIAL total captured above rather than
+        # recomputing from `remaining + processed` each pass. The
+        # denominator stays stable across pauses/resumes. Fall back to
+        # the dynamic calc when initial was 0 (rare) so we still
+        # display something sensible.
         try:
             _remaining = sum(
                 1 for c in queues.sync
@@ -2453,7 +2549,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             ) if queues is not None else 0
         except Exception:
             _remaining = 0
-        total = _processed + _remaining
+        total = max(_initial_total, _processed + _remaining) \
+                if _initial_total else (_processed + _remaining)
         # Honor pause request before we start this channel — if the user
         # paused mid-pass, we park here and re-paint the last-live row
         # as PAUSED. Matches OLD's pause-at-top-of-channel behavior.
@@ -2523,24 +2620,31 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     continue
                 _fetched = int(_res.get("fetched", 0) or 0)
                 _refreshed = int(_res.get("refreshed", 0) or 0)
-                # issue #136: when the user runs "Refresh views/
-                # likes" (refresh=True), every on-disk video is re-hit
-                # and counts roll into `refreshed`, not `fetched`. The
-                # old summary ignored `refreshed` entirely, so the task
-                # row said "up to date" even on a successful refresh
-                # pass — "Doesn't seem to 'update' any info."
+                _errors_meta = int(_res.get("errors", 0) or 0)
+                # issue #136 + bug H-4: when the user runs "Refresh
+                # views/likes" (refresh=True), every on-disk video is
+                # re-hit and counts roll into `refreshed`, not
+                # `fetched`. The old summary ignored `refreshed` and
+                # errors entirely, so the task row said "up to date"
+                # even on a refresh pass with partial failures — hid
+                # real problems.
+                _parts: List[str] = []
                 if _fetched:
-                    _summary = f"{_fetched} new"
-                elif _refreshed:
-                    _summary = f"{_refreshed} refreshed"
-                else:
-                    _summary = "up to date"
+                    _parts.append(f"{_fetched} new")
+                if _refreshed:
+                    _parts.append(f"{_refreshed} refreshed")
+                if _errors_meta:
+                    _parts.append(f"{_errors_meta} errors")
+                if not _parts:
+                    _parts.append("up to date")
+                _summary = " \u00b7 ".join(_parts)
+                _summary_tag = ("red" if _errors_meta else
+                                "simpleline_pink" if (_fetched or _refreshed)
+                                else "dim")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary=_summary,
                                name_tag="simpleline",
-                               summary_tag=("simpleline_pink"
-                                            if (_fetched or _refreshed)
-                                            else "dim"))
+                               summary_tag=_summary_tag)
             except Exception as _me:
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
                 _sync_row_emit(stream, i, total, ch_name,

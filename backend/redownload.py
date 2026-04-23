@@ -427,10 +427,12 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
                      [f" spawn failed for {video_id}: {e}\n", "red"]])
         return None
     dest: Optional[str] = None
+    _cancelled = False
     for raw in proc.stdout:
         if cancel_ev.is_set():
             try: proc.terminate()
             except Exception: pass
+            _cancelled = True
             break
         line = raw.rstrip()
         if "[Merger]" in line and "Merging formats into" in line:
@@ -442,6 +444,21 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     except Exception:
         try: proc.kill()
         except Exception: pass
+    # bug H-3: on cancel mid-download, the .part / intermediate files
+    # sit in _REDOWNLOAD_TEMP/ forever because the end-of-run rmdir only
+    # clears empty dirs. Sweep everything we might have written before
+    # returning so cancels don't leak GBs per use.
+    if _cancelled:
+        try:
+            for fn in os.listdir(temp_dir):
+                if fn.startswith(video_id) or fn.endswith(".part"):
+                    try:
+                        os.remove(os.path.join(temp_dir, fn))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return None
     if proc.returncode != 0:
         return None
     # If yt-dlp produced a different extension after merge (e.g. .mkv),

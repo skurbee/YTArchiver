@@ -73,7 +73,14 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
     if not net_down.is_set():
         return True
     if stream:
-        stream.emit_text(" \u26a0 Network down \u2014 pausing until connection returns...", "red")
+        # bug L-8: surface the 2-probe recovery expectation so the user
+        # doesn't think the app is hung during the ~60s it takes to
+        # confirm the network is really back. Two consecutive OK probes
+        # are required before we un-pause; with _poll_interval_sec ~30s
+        # this bounds worst-case recovery at ~60s.
+        stream.emit_text(
+            " \u26a0 Network down \u2014 pausing until connection returns "
+            "(~30-60s after it's back, to confirm stability)...", "red")
     waited = 0
     while net_down.is_set():
         if check_cancel and check_cancel():

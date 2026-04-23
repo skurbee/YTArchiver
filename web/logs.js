@@ -601,6 +601,11 @@
     // Default undefined -> show, matching legacy behavior.
     const tbl = document.getElementById("subs-table");
     if (tbl && window._subsShowAvg === false) tbl.classList.add("hide-avg-col");
+    // feature F7: the new tbody rows have no row-selected classes, so
+    // the bulk-actions bar should hide itself on re-render. Invoke the
+    // bar updater if it's been wired.
+    const bar = document.getElementById("subs-bulk-bar");
+    if (bar) bar.hidden = true;
   };
 
   function _renderSubsFiltered(rows) {
@@ -1624,7 +1629,20 @@
         segments = res.segments;
         sourceInfo = res.source || null;
       }
-      if (!segments.length) return;
+      // bug H-10: when the retranscribe completes but the segment
+      // fetch comes back empty (JSONL write failed, FTS ingest failed,
+      // whisper produced nothing), the old transcript used to stay on
+      // screen alongside a "complete" toast — user assumed the
+      // retranscribe worked fine. Now explicitly replace with a
+      // placeholder and show a warn toast so the failure is visible.
+      if (!segments.length) {
+        window.renderWatchView(cur, [], sourceInfo,
+                               { skipVideoReload: true });
+        window._showToast?.(
+          "Re-transcription finished but produced no segments \u2014 check the log.",
+          "warn");
+        return;
+      }
       const transcript = segments.map(seg => ({
         ts: (window._formatTs ? window._formatTs(seg.s) : ""),
         text: seg.t, words: seg.w, s: seg.s, e: seg.e,

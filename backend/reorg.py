@@ -54,6 +54,10 @@ def _gather_video_files(root: Path) -> List[Path]:
     return out
 
 
+_VIDEO_SIBLING_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+                       ".wav", ".mp3", ".m4a", ".flac")
+
+
 def _sidecars_for(video: Path) -> List[Path]:
     """Return any .txt/.jsonl/.info.json/.jpg files that share the video stem."""
     stem = video.stem
@@ -71,8 +75,33 @@ def _sidecars_for(video: Path) -> List[Path]:
     return out
 
 
+def _has_video_sibling(video: Path) -> bool:
+    """bug H-8 helper: True iff another video file with the SAME stem but
+    a different media extension exists in the same folder. When two
+    primaries share a stem (e.g. `X.mp4` and `X.mkv` — happens with
+    aborted-then-retried yt-dlp downloads), moving one's sidecars
+    silently orphans the other. In that case we COPY sidecars instead
+    of moving, so both destinations keep their metadata."""
+    stem = video.stem
+    folder = video.parent
+    try:
+        for p in folder.iterdir():
+            if not p.is_file() or p == video:
+                continue
+            if p.stem == stem and p.suffix.lower() in _VIDEO_SIBLING_EXTS:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
-    """Move a video and all of its sidecars to `target_dir`."""
+    """Move a video and all of its sidecars to `target_dir`.
+
+    bug H-8: if another video file shares this stem (e.g. `X.mp4` +
+    `X.mkv`), copy shared sidecars instead of moving them — otherwise
+    the sibling ends up orphaned without metadata.
+    """
     if video.parent == target_dir:
         return True
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -81,15 +110,23 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
         stream.emit_dim(f" [skip] already exists at destination: {video.name}")
         return False
     sidecars = _sidecars_for(video)
+    has_sibling = _has_video_sibling(video)
     try:
         shutil.move(str(video), str(dst))
         for sc in sidecars:
             sc_dst = target_dir / sc.name
-            if not sc_dst.exists():
-                try:
+            if sc_dst.exists():
+                continue
+            try:
+                if has_sibling:
+                    # Shared sidecar — copy instead of move so the
+                    # leftover primary still has it when it's processed
+                    # in a later reorg pass.
+                    shutil.copy2(str(sc), str(sc_dst))
+                else:
                     shutil.move(str(sc), str(sc_dst))
-                except OSError:
-                    pass
+            except OSError:
+                pass
         return True
     except OSError as e:
         stream.emit_error(f"Move failed for {video.name}: {e}")

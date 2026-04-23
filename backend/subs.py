@@ -191,16 +191,24 @@ def _payload_to_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
         "compress_enabled": bool(payload.get("compress_enabled")),
     }
     # Range mapping: subscribe (default, new uploads only) / all / fromdate
+    # bug M-6: keep `date_after` in sync with `from_date` so legacy config
+    # readers that look at the older field name don't see a blank value
+    # after a UI save. Sync itself reads from_date (sync.py:399) — date_after
+    # is legacy from Classic. Writing both keeps migration lossless.
     range_val = payload.get("range", "subscribe")
     if range_val == "all":
         ch["mode"] = "full"
         ch["from_date"] = ""
+        ch["date_after"] = ""
     elif range_val == "fromdate":
         ch["mode"] = "fromdate"
-        ch["from_date"] = payload.get("from_date", "").strip()
+        _fd = payload.get("from_date", "").strip()
+        ch["from_date"] = _fd
+        ch["date_after"] = _fd
     else:
         ch["mode"] = "new"
         ch["from_date"] = ""
+        ch["date_after"] = ""
     # Folder org mapping: flat / years / months
     org = payload.get("folder_org", "years")
     ch["split_years"] = (org in ("years", "months"))
@@ -442,6 +450,18 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
                     _os.rename(old_path, new_path)
                     updated["_folder_renamed"] = {"from": old_path, "to": new_path}
                 except OSError as e:
+                    # bug S-4: old code just captured the error and
+                    # saved the new name anyway, creating a
+                    # disk-vs-config mismatch (config says "NewName",
+                    # folder is still "OldName", next sync creates an
+                    # empty "NewName" folder alongside). Preserve the
+                    # old name and surface the error so the UI can
+                    # toast. The caller (main.py subs_update_channel)
+                    # checks `_folder_rename_error` in the response.
+                    updated["name"] = old_name
+                    updated["folder"] = old_name
+                    if "folder_override" in updated:
+                        updated["folder_override"] = old_name
                     updated["_folder_rename_error"] = str(e)
 
     # Sanity: refuse to save a channel with a blanked-out name. Matches the

@@ -37,7 +37,13 @@
       <!-- Row 1: Video URL -->
       <div class="controls-row">
         <label class="ctl-label">Video URL:</label>
-        <input type="text" class="ctl-input" id="url-input" placeholder="https://www.youtube.com/watch?v=..." />
+        <!-- bug W-2: bind the URL input to a <datalist> populated from
+             url_history so users get autocomplete of recent downloads.
+             The backend api.url_history() returns the list. -->
+        <input type="text" class="ctl-input" id="url-input"
+               list="url-history-list"
+               placeholder="https://www.youtube.com/watch?v=..." />
+        <datalist id="url-history-list"></datalist>
         <!-- "▶ Download" appears only when a YouTube URL is typed/pasted.
              Matches YTArchiver.py:19706 download_btn + _validate_download_btn. -->
         <button class="btn btn-primary btn-thin" id="btn-download-single"
@@ -241,6 +247,27 @@
         </button>
         <span class="status-text clickable-total" id="subs-total-size"
               title="Click to rescan all channel folder sizes">Total: 3.8 TB</span>
+      </div>
+
+      <!-- feature F7: bulk-actions bar. Appears only when ≥2 Subs rows
+           are selected (Ctrl/Shift-click). `_updateSubsBulkBar()` in
+           app.js toggles visibility + updates the count label. -->
+      <div class="subs-bulk-bar" id="subs-bulk-bar" hidden
+           style="display:flex;gap:6px;align-items:center;padding:4px 12px;background:rgba(96,160,255,0.08);border-bottom:1px solid #2a3140;">
+        <span class="status-text" id="subs-bulk-count" style="flex:1;">
+          0 channels selected
+        </span>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-resolution"
+                title="Change resolution for all selected">Change resolution&hellip;</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-auto-tx"
+                title="Toggle Auto-transcribe for all selected">Auto-transcribe&hellip;</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-metadata"
+                title="Queue metadata refresh for all selected">Queue metadata</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-clear"
+                title="Clear selection">Clear</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-delete"
+                title="Delete all selected channels"
+                style="color:#e78a8a;">Delete&hellip;</button>
       </div>
 
       <!-- Channel table -->
@@ -672,6 +699,28 @@
             <div class="edit-gv-inline" style="gap:6px;">
               <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
                       title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
+            </div>
+
+            <!-- bug W-3: About + Diagnostics dialogs existed in the
+                 HTML + JS but had no UI buttons to trigger them. Both
+                 handlers (app.js:6436 / 6471) use getElementById which
+                 silently no-ops when the elements are absent. -->
+            <label class="edit-gl">Info &amp; Self-check</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-about"
+                      title="App version and config info">About&hellip;</button>
+              <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
+                      title="Check yt-dlp, ffmpeg, Python 3.11, GPU, etc.">Diagnostics&hellip;</button>
+            </div>
+
+            <!-- feature F8: projected compress savings dry-run.
+                 Reads duration + size from the index DB and shows how
+                 much disk would be saved at each quality tier — no
+                 actual compression runs. -->
+            <label class="edit-gl">Compress</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
+                      title="Project disk savings at each quality tier without compressing anything">Dry-run savings&hellip;</button>
             </div>
           </div>
         </div>
@@ -1156,6 +1205,19 @@
       <div class="spacer"></div>
       <label class="queue-auto-wrap"><input type="checkbox" id="gpu-auto-checkbox" /><span>Auto</span></label>
     </div>
+    <!-- bug W-11: the JS at app.js:6647 was fully-coded to wire a
+         mid-queue whisper-model swap dropdown, but the <select> element
+         didn't exist. Adding it here lights up the feature — the
+         handler confirms with the user before swapping. -->
+    <div class="gpu-popover-modelswap" style="padding:4px 10px;display:flex;align-items:center;gap:6px;">
+      <label for="gpu-model-swap" class="edit-dim" style="font-size:11px;">Next-job model:</label>
+      <select class="ctl-select" id="gpu-model-swap" style="flex:1;">
+        <option value="tiny">tiny (fastest)</option>
+        <option value="small" selected>small</option>
+        <option value="medium">medium</option>
+        <option value="large-v3">large-v3 (best)</option>
+      </select>
+    </div>
     <div class="queue-popover-body" id="gpu-tasks-body">
       <div class="queue-empty">No GPU tasks queued.</div>
     </div>
@@ -1186,6 +1248,38 @@
       <div class="askq-body" id="about-body">Loading…</div>
       <div class="askq-buttons">
         <button class="btn btn-primary" id="about-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- feature F8: Compress dry-run results dialog. Shows projected
+       disk savings per-channel + grand totals at each quality tier for
+       a user-chosen output resolution. Read-only; does not trigger any
+       compression. -->
+  <div class="askq-backdrop" id="compress-dry-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+      <div class="askq-header">
+        <span>Compress savings &mdash; dry run</span>
+        <span class="status-text" id="compress-dry-summary" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" style="padding:10px 16px;">
+        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
+          <label class="edit-gl" style="flex:0 0 auto;">Output resolution:</label>
+          <select class="ctl-select" id="compress-dry-res" style="width:auto;">
+            <option value="480">480p</option>
+            <option value="720" selected>720p</option>
+            <option value="1080">1080p</option>
+            <option value="1440">1440p</option>
+            <option value="2160">2160p</option>
+          </select>
+          <button class="btn btn-ghost btn-thin" id="compress-dry-recalc">Recompute</button>
+        </div>
+        <div id="compress-dry-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
+          <div class="browse-empty" style="padding:16px;">Computing&hellip;</div>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="compress-dry-close">Close</button>
       </div>
     </div>
   </div>

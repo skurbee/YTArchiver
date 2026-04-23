@@ -845,7 +845,18 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     t0 = time.time()
     try:
         segs = _parse_vtt(vtt)
-    except Exception:
+    except Exception as _ve:
+        # bug L-6: surface the parse failure before bailing. Old code
+        # silently returned False, causing the caller to emit "No
+        # auto-captions available — using Whisper..." even though the
+        # captions WERE present, just unparseable. A dim warning here
+        # makes the distinction visible without derailing the fallback.
+        try:
+            self._stream.emit_dim(
+                f" (auto-captions parse failed: {_ve} \u2014 "
+                f"falling back to Whisper)")
+        except Exception:
+            pass
         # Clean up any temp files we fetched before bailing.
         for _p in _fetched_temp:
             try: os.remove(_p)
@@ -1956,6 +1967,24 @@ class TranscribeManager:
                     stats["err"] += 1
                 else:
                     stats["done"] += 1
+                # bug C-2: if a transcribe job crashed or early-returned
+                # without reaching the success-path decrement, the pending
+                # counter would leak (-1, -2, -3 stuck on the Subs row
+                # forever). Any non-retranscribe transcribe job that didn't
+                # set `_pending_decremented` gets drained here.
+                if (_job_kind != "compress"
+                        and not job.get("retranscribe")
+                        and not job.get("_pending_decremented")):
+                    try:
+                        ch_for_decrement = (job.get("channel") or "").strip()
+                        if ch_for_decrement:
+                            _bump_transcription_pending(ch_for_decrement, -1)
+                        _vid = job.get("video_id") or ""
+                        if _vid:
+                            from . import ytarchiver_config as _cfg
+                            _cfg.remove_pending_tx_id(_vid)
+                    except Exception:
+                        pass
                 self._current_job = None
                 # Clear the "running" slot on completion so the popover
                 # returns to idle (or shows the next queued item as the
@@ -2292,6 +2321,13 @@ class TranscribeManager:
             channel = job.get("channel") or ""
             # Run punctuation pass over the raw text (and each segment's t)
             if self._punctuate_enabled:
+                # bug L-7: track whether punct succeeded so the source
+                # tag can reflect reality. Previously a failed punct
+                # pass left the tag as "(WHISPER:model)" even though
+                # the text was unpunctuated — users assumed punctuation
+                # was present in the Watch banner.
+                result["_punct_attempted"] = True
+                result["_punct_success"] = False
                 try:
                     raw_text = result.get("text", "") or ""
                     if raw_text:
@@ -2306,6 +2342,7 @@ class TranscribeManager:
                                     pt = self._punct.punctuate(t)
                                     if pt:
                                         seg["t"] = pt
+                            result["_punct_success"] = True
                 except Exception as _pe:
                     self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
             self._write_outputs(path, result, title=title, channel=channel,
@@ -2629,7 +2666,19 @@ class TranscribeManager:
         # Without this, the Watch view banner shows just "Whisper
         # transcription" with no model name. this was flagged
         model_name = (result.get("model") or self._model or "").strip()
-        source_tag = f"(WHISPER:{model_name})" if model_name else "(WHISPER)"
+        # bug L-7: when punctuation was attempted but failed, append
+        # "+NO-PUNCT" to the source tag so the Watch banner accurately
+        # reflects that the transcript is unpunctuated. Otherwise the
+        # user sees "Whisper:large-v3" and assumes punct is present.
+        _punct_attempted = bool(result.get("_punct_attempted"))
+        _punct_success = bool(result.get("_punct_success"))
+        _punct_suffix = ""
+        if _punct_attempted and not _punct_success:
+            _punct_suffix = "+NO-PUNCT"
+        if model_name:
+            source_tag = f"(WHISPER:{model_name}{_punct_suffix})"
+        else:
+            source_tag = f"(WHISPER{_punct_suffix})"
         # Diagnostic — emit the tag we're about to write so we can
         # confirm it landed correctly. Visible in Verbose log mode.
         try:
@@ -2689,3 +2738,9 @@ class TranscribeManager:
                     _cfg.remove_pending_tx_id(vid_id)
                 except Exception:
                     pass
+            # bug C-2: mark decrement-done so the worker-loop's
+            # exception finally doesn't decrement AGAIN on the success
+            # path. The finally's decrement exists only for error paths
+            # (Whisper crash, OOM, venv missing) that used to leak the
+            # counter and leave the Subs row stuck at `-N`.
+            job["_pending_decremented"] = True

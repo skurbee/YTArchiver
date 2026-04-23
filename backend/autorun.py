@@ -264,10 +264,11 @@ def format_history_entry(kind: str, channel: str,
     """
     now = datetime.now()
     time_part = now.strftime("%I:%M%p").lstrip("0").lower()
-    try:
-        date_part = now.strftime("%b %-d") if os.name != "nt" else f"{now.strftime('%b')} {now.day}"
-    except Exception:
-        date_part = now.strftime("%b %d")
+    # bug L-14: always strip leading zeros the same way regardless of
+    # platform. `%-d` is POSIX-only and was inconsistent on Windows —
+    # sometimes rendering as "Apr 4" and sometimes "Apr 04" across a
+    # single session. Build it explicitly.
+    date_part = f"{now.strftime('%b')} {now.day}"
 
     # Parse "<N> <label>" out of primary so each kind gets its right verb
     # ("3 downloaded", "14 transcribed", "5 fetched", etc.). OLD's record_*

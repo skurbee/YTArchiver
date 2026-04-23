@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v53.8"
-APP_VERSION_DATE = "4.23.26 2:40pm"
+APP_VERSION      = "v53.9"
+APP_VERSION_DATE = "4.23.26 5:11pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -438,6 +438,16 @@ class Api:
         from backend.autorun import clear_history as _ch
         res = _ch()
         self._reload_config()
+        # bug M-3: push the cleared state to the frontend so the visible
+        # activity log clears immediately instead of waiting for the
+        # next unrelated push or tab switch. The renderer accepts an
+        # empty array; no dedicated `clearActivityLog` shim is needed.
+        try:
+            if self._window is not None:
+                self._window.evaluate_js(
+                    "if (window.renderActivityLog) window.renderActivityLog([]);")
+        except Exception:
+            pass
         return res
 
     def get_initial_main_log(self):
@@ -541,6 +551,12 @@ class Api:
                 # Kick the worker in case it was parked on the Auto
                 # gate AND there are jobs sitting in the internal list.
                 try: self._transcribe._ensure_worker()
+                except Exception: pass
+                # bug M-1: push the updated queue state to the UI so the
+                # Start/Pause button flips to the correct rendered state
+                # immediately. Sync path does this via sync_start_all
+                # (→ _on_queue_changed); GPU path was missing the push.
+                try: self._on_queue_changed()
                 except Exception: pass
             elif kind == "sync" and enabled:
                 # Symmetric with GPU: if the user toggles Auto ON and
@@ -776,8 +792,14 @@ class Api:
         try:
             ch = subs_backend.update_channel(identity or {}, payload or {})
             self._reload_config()
-            return {"ok": True, "channel": ch,
+            # bug S-4: surface folder-rename failures so the user
+            # knows the on-disk folder didn't move. Config was kept at
+            # the old name (subs.py rollback).
+            resp = {"ok": True, "channel": ch,
                     "write_blocked": ch.get("_write_blocked", False)}
+            if ch.get("_folder_rename_error"):
+                resp["folder_rename_error"] = ch["_folder_rename_error"]
+            return resp
         except subs_backend.SubsError as e:
             return {"ok": False, "error": str(e)}
         except Exception as e:
@@ -798,6 +820,26 @@ class Api:
         try:
             # Snapshot before removal for undo
             ch_snap = subs_backend.get_channel(identity or {})
+            # bug S-5: refuse delete_files=True while sync is actively
+            # processing this channel — shutil.rmtree racing yt-dlp's
+            # active writes can crash sync, partially-delete files, or
+            # leave orphan temp dirs. Sub is not removed either since
+            # that side effect would also surprise a live sync.
+            if delete_files and ch_snap:
+                _target_url = (ch_snap.get("url") or "").strip()
+                try:
+                    active_sync = (self._current_sync_channel
+                                   if hasattr(self, "_current_sync_channel")
+                                   else "")
+                    if active_sync and _target_url and active_sync == _target_url:
+                        return {
+                            "ok": False,
+                            "error": ("Sync is currently running on this "
+                                      "channel. Cancel or pause the sync "
+                                      "first, then retry the delete."),
+                        }
+                except Exception:
+                    pass
             result = subs_backend.remove_channel(
                 identity or {}, delete_files=bool(delete_files))
             ok = bool(result.get("ok"))
@@ -848,6 +890,18 @@ class Api:
             payload["folder"] = ch.get("name") or ch.get("folder")
             result = subs_backend.add_channel(payload)
             self._reload_config()
+            # bug M-2: pop the disk-cache entry for the restored channel
+            # so the next Subs-table render triggers a fresh rescan
+            # instead of showing "—" or stale counts. invalidate_channel
+            # spawns a background rescan that repopulates num_vids/
+            # size_bytes.
+            try:
+                from backend import archive_scan as _as
+                _url = (result.get("url") or ch.get("url") or "").strip()
+                if _url:
+                    _as.invalidate_channel(_url)
+            except Exception:
+                pass
             return {
                 "ok": True,
                 "channel": result,
@@ -1354,7 +1408,18 @@ class Api:
                             if self._queues.sync_enqueue(ch):
                                 queued += 1
                     self._on_queue_changed()
-                    return {"ok": True, "started": False, "queued": queued}
+                    # bug M-7: return both `queued` (new items just
+                    # added this call) AND `total_queued` (items sitting
+                    # in the queue, including already-queued ones).
+                    # Callers that only care about "is anything queued"
+                    # can use `total_queued` without guessing.
+                    try:
+                        total_queued = len(self._queues.sync)
+                    except Exception:
+                        total_queued = queued
+                    return {"ok": True, "started": False,
+                            "queued": queued,
+                            "total_queued": total_queued}
             except Exception:
                 # If anything goes wrong here, fall through to the
                 # old behavior (start the worker). Better to over-fire
@@ -1980,27 +2045,15 @@ class Api:
             kind = "yt_captions_raw"
         else:
             kind = "unknown"
-        # Retroactive model-name fill: transcripts written by the buggy
-        # v46.0-v46.5 pywebview builds stored just "(WHISPER)" without
-        # the model name. Classic YTArchiver always wrote e.g.
-        # "(WHISPER SMALL)"; v46.6+ writes "(WHISPER:large-v3)". When we
-        # find a bare "WHISPER" tag (no whitespace or colon followed by
-        # more text) substitute the user's current default model so the
-        # banner has something to show instead of just "Whisper
-        # transcription" with no model qualifier. "we should
-        # NEVER just see 'whisper'. we should know what model was used."
-        # Caveat: this is a best-effort guess — the real model used at
-        # the time wasn't recorded. Accurate only if the user hasn't
-        # changed their default since. Re-transcribe on v46.6+ to
-        # restore the true tag in the file.
+        # bug M-10: stop guessing the model name. Transcripts written by
+        # v46.0-v46.5 stored bare "(WHISPER)" with no model. Previously we
+        # filled in the user's CURRENT default_model — but that misleads
+        # users who've since changed their default: a transcript made
+        # with large-v3 would show as "Whisper:small" if the user is now
+        # on small. Better to surface an honest "model unknown" suffix;
+        # user can Re-transcribe to get a real tag baked in.
         if kind == "whisper" and raw_tag.strip().upper() == "WHISPER":
-            try:
-                cfg = self._config if self._config is not None else load_config()
-                default_model = (cfg or {}).get("whisper_model", "")
-                if default_model:
-                    raw_tag = f"WHISPER:{default_model}"
-            except Exception:
-                pass
+            raw_tag = "WHISPER:unknown"
         return {"source": kind, "raw": raw_tag}
 
     def browse_search_context(self, payload):
@@ -2686,16 +2739,214 @@ class Api:
             f" \u2014 Queued metadata {label} for {queued} channel(s) "
             f"on Sync Tasks.", "simpleline_pink")
         self._log_stream.flush()
-        # Auto-fire the worker to drain the queued metadata tasks. Do
-        # NOT add downloads from config \u2014 the user asked for
-        # metadata-only work, not a full sync pass.
+        # bug H-7: always auto-fire the worker when the user explicitly
+        # clicked "Queue all metadata" / "Refresh views/likes" — the
+        # old code gated this on `autorun_sync=True`, so users with
+        # autorun off saw "Queued for N channels" and then nothing
+        # happened because the worker never started. Passing
+        # add_downloads_from_config=False means we only drain the
+        # already-queued metadata items, not trigger a full sync pass.
         try:
-            if (cfg.get("autorun_sync", False) and
-                    not self.sync_is_running() and queued > 0):
+            if not self.sync_is_running() and queued > 0:
                 self.sync_start_all(add_downloads_from_config=False)
         except Exception:
             pass
         return {"ok": True, "queued": queued, "channels": len(channels)}
+
+    # ─── Compress dry-run (feature F8) ─────────────────────────────────
+
+    def compress_dry_run(self, output_res="720"):
+        """Project how much disk space compression WOULD save if enabled
+        globally at the given output_res. Walks the index DB (no
+        ffprobe), aggregating each channel's total video count +
+        cumulative duration, then computes projected post-compress
+        size for each of the three quality tiers.
+
+        Returns {
+          ok, output_res,
+          channels: [{name, videos, hours, current_gb, generous_gb,
+                       average_gb, below_gb}],
+          total: {videos, hours, current_gb, generous_gb, average_gb, below_gb}
+        }
+        Purely read-only; does not modify anything.
+        """
+        try:
+            from backend import index as _idx
+            from backend import compress as _cpx
+            conn = _idx._open()
+            if conn is None:
+                return {"ok": False, "error": "Index DB unavailable"}
+            presets = _cpx._COMPRESS_PRESETS.get(str(output_res))
+            if not presets:
+                return {"ok": False,
+                        "error": f"No compress preset for output_res={output_res!r}"}
+            # Aggregate per-channel: videos + duration + size. Duration
+            # may be NULL for older rows — treat those as 0 hours so
+            # they don't inflate projected savings (worst-case the real
+            # savings are larger than reported).
+            with _idx._db_lock:
+                rows = conn.execute(
+                    "SELECT channel, COUNT(*), "
+                    "       COALESCE(SUM(duration_s), 0), "
+                    "       COALESCE(SUM(size_bytes), 0) "
+                    "FROM videos "
+                    "WHERE is_duplicate_of IS NULL "
+                    "GROUP BY channel "
+                    "ORDER BY SUM(size_bytes) DESC"
+                ).fetchall()
+            # Per-channel projection.
+            out_channels = []
+            tot_videos = 0
+            tot_hours = 0.0
+            tot_current = 0.0
+            tot_gen = 0.0
+            tot_avg = 0.0
+            tot_below = 0.0
+            for name, n, dur_s, bytes_ in rows:
+                hours = float(dur_s) / 3600.0 if dur_s else 0.0
+                current_gb = float(bytes_) / (1024 ** 3) if bytes_ else 0.0
+                # MB/hr → GB for the whole channel at each tier
+                gen_gb = (presets["Generous"] * hours) / 1024
+                avg_gb = (presets["Average"] * hours) / 1024
+                below_gb = (presets["Below Average"] * hours) / 1024
+                out_channels.append({
+                    "name": name or "(unknown)",
+                    "videos": int(n),
+                    "hours": round(hours, 1),
+                    "current_gb": round(current_gb, 1),
+                    "generous_gb": round(gen_gb, 1),
+                    "average_gb": round(avg_gb, 1),
+                    "below_gb": round(below_gb, 1),
+                })
+                tot_videos += int(n)
+                tot_hours += hours
+                tot_current += current_gb
+                tot_gen += gen_gb
+                tot_avg += avg_gb
+                tot_below += below_gb
+            return {
+                "ok": True,
+                "output_res": str(output_res),
+                "channels": out_channels,
+                "total": {
+                    "videos": tot_videos,
+                    "hours": round(tot_hours, 1),
+                    "current_gb": round(tot_current, 1),
+                    "generous_gb": round(tot_gen, 1),
+                    "average_gb": round(tot_avg, 1),
+                    "below_gb": round(tot_below, 1),
+                },
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ─── Bulk channel operations (feature F7) ──────────────────────────
+
+    def subs_bulk_update(self, names, changes):
+        """Apply a small set of whitelisted changes to N channels at once.
+
+        `names` — list of channel folder / display names.
+        `changes` — dict with keys from the whitelist below:
+          resolution, auto_transcribe, auto_metadata,
+          compress_enabled, compress_level, compress_output_res,
+          compress_batch_size.
+        Returns {ok, updated, failed}. Guarded to the whitelist so the
+        UI can't accidentally wipe urls / folder names / anything
+        load-bearing.
+        """
+        if not isinstance(names, list) or not names:
+            return {"ok": False, "error": "No channels selected"}
+        if not isinstance(changes, dict) or not changes:
+            return {"ok": False, "error": "No changes specified"}
+        _ALLOWED = {"resolution", "auto_transcribe", "auto_metadata",
+                    "compress_enabled", "compress_level",
+                    "compress_output_res", "compress_batch_size"}
+        clean = {k: v for k, v in changes.items() if k in _ALLOWED}
+        if not clean:
+            return {"ok": False, "error": "No allowed fields in changes"}
+        updated = 0
+        failed = []
+        for n in names:
+            try:
+                ch = subs_backend.get_channel({"name": n}) \
+                     or subs_backend.get_channel({"folder": n})
+                if not ch:
+                    failed.append({"name": n, "reason": "not found"})
+                    continue
+                payload = dict(ch)
+                payload.update(clean)
+                # Preserve url so update_channel's identity match works
+                subs_backend.update_channel(
+                    {"url": ch.get("url", ""), "name": ch.get("name", "")},
+                    payload)
+                updated += 1
+            except Exception as e:
+                failed.append({"name": n, "reason": str(e)})
+        self._reload_config()
+        return {"ok": True, "updated": updated, "failed": failed}
+
+    def subs_bulk_delete(self, names, delete_files=False):
+        """Delete N channels at once. `delete_files=True` also removes
+        the on-disk folders. Returns {ok, deleted, failed}.
+        """
+        if not isinstance(names, list) or not names:
+            return {"ok": False, "error": "No channels selected"}
+        deleted = 0
+        failed = []
+        # Collect URLs so undo can push them all onto the stack.
+        if not hasattr(self, "_removed_channels_stack"):
+            self._removed_channels_stack = []
+        for n in names:
+            try:
+                ch = subs_backend.get_channel({"name": n}) \
+                     or subs_backend.get_channel({"folder": n})
+                if not ch:
+                    failed.append({"name": n, "reason": "not found"})
+                    continue
+                # Reuse the single-delete guard for delete_files + active sync
+                res = self.subs_remove_channel(
+                    {"url": ch.get("url", "")},
+                    delete_files=bool(delete_files))
+                if res.get("ok"):
+                    deleted += 1
+                else:
+                    failed.append({"name": n,
+                                   "reason": res.get("error", "unknown")})
+            except Exception as e:
+                failed.append({"name": n, "reason": str(e)})
+        return {"ok": True, "deleted": deleted, "failed": failed}
+
+    def subs_bulk_queue_metadata(self, names, refresh=False):
+        """Queue a metadata fetch (or refresh) for N channels at once.
+        Thin wrapper around the per-channel enqueue path that
+        `metadata_queue_all` uses.
+        """
+        if not isinstance(names, list) or not names:
+            return {"ok": False, "error": "No channels selected"}
+        queued = 0
+        failed = []
+        for n in names:
+            try:
+                ch = subs_backend.get_channel({"name": n}) \
+                     or subs_backend.get_channel({"folder": n})
+                if not ch:
+                    failed.append({"name": n, "reason": "not found"})
+                    continue
+                task = dict(ch)
+                task["kind"] = "metadata"
+                task["refresh"] = bool(refresh)
+                if self._queues.sync_enqueue(task):
+                    queued += 1
+            except Exception as e:
+                failed.append({"name": n, "reason": str(e)})
+        self._on_queue_changed()
+        # Auto-fire the worker (H-7 pattern — don't gate on autorun)
+        try:
+            if not self.sync_is_running() and queued > 0:
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": queued, "failed": failed}
 
     # ─── Channel context actions ───────────────────────────────────────
 
@@ -3013,7 +3264,17 @@ class Api:
                         _ch["transcription_complete"] = True
                     break
                 from backend.ytarchiver_config import save_config as _sc
-                _sc(cfg2)
+                # bug M-9: check the save result. Without this, a
+                # write-gate-off / disk-full save would silently leave
+                # the stale unresolved IDs on disk; next call reloads
+                # them and the same "unresolved" list comes back.
+                if not _sc(cfg2):
+                    self._log_stream.emit_dim(
+                        " (unresolved-id cleanup not persisted — config write-gate off?)")
+                else:
+                    # Refresh in-memory config so the next caller reads
+                    # the pruned list instead of the pre-prune state.
+                    self._config = cfg2
             except Exception:
                 pass
         self._log_stream.flush()
@@ -3260,6 +3521,16 @@ class Api:
                 pass
 
             self._on_queue_changed()
+            # bug H-5: push a Subs refresh so the chartreuse "Continue
+            # Redownload" dot disappears immediately instead of waiting
+            # for a tab switch. Mirrors the redownload-finished path.
+            try:
+                if self._window is not None:
+                    self._window.evaluate_js(
+                        "if (window.refreshSubsTable) "
+                        "window.refreshSubsTable();")
+            except Exception:
+                pass
             return {"ok": True,
                     "was_running": was_running,
                     "was_queued": was_queued,
@@ -3964,10 +4235,28 @@ class Api:
             cfg = load_config()
             existing_urls = {c.get("url") for c in cfg.get("channels", [])}
             added = 0
+            # bug W-10: track WHY each entry was skipped so the UI can
+            # tell the user (previously just reported a raw count with
+            # no way to debug a partial import).
+            skipped_reasons: List[Dict[str, str]] = []
             for ch in imported:
-                if not isinstance(ch, dict) or not ch.get("url"):
+                if not isinstance(ch, dict):
+                    skipped_reasons.append({
+                        "name": "(unknown)",
+                        "reason": "not a valid channel object",
+                    })
+                    continue
+                if not ch.get("url"):
+                    skipped_reasons.append({
+                        "name": ch.get("name") or "(no name)",
+                        "reason": "missing URL",
+                    })
                     continue
                 if ch["url"] in existing_urls:
+                    skipped_reasons.append({
+                        "name": ch.get("name") or ch["url"],
+                        "reason": "already subscribed",
+                    })
                     continue
                 cfg.setdefault("channels", []).append(ch)
                 existing_urls.add(ch["url"])
@@ -3977,7 +4266,9 @@ class Api:
             if not _sc(cfg):
                 return {"ok": False, "error": "Save failed"}
             self._reload_config()
-            return {"ok": True, "added": added, "skipped": len(imported) - added}
+            return {"ok": True, "added": added,
+                    "skipped": len(skipped_reasons),
+                    "skipped_reasons": skipped_reasons}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -4693,13 +4984,124 @@ class Api:
                 except Exception:
                     pass
                 return
+            # bug W-1: parse the DLTRACK line so single-video downloads
+            # land in the videos index, the Recent tab, and the FTS
+            # index — same as channel-sync downloads. Previously this
+            # loop just echoed stdout to the log and the file ended up
+            # on disk invisible to the Browse grid / Recent / Search.
+            _dltrack = None
+            _stderr_errors = []
             try:
                 for line in proc.stdout:
-                    self._log_stream.emit_dim(" " + line.rstrip())
+                    _line = line.rstrip()
+                    self._log_stream.emit_dim(" " + _line)
+                    if _line.startswith("DLTRACK:::"):
+                        _dltrack = _line
+                    # bug W-7: capture known-failure yt-dlp error
+                    # signatures so the post-run branch can surface a
+                    # toast instead of leaving the user staring at dim
+                    # stdout with no actionable info.
+                    _ll = _line.lower()
+                    if "error" in _ll:
+                        if "members-only" in _ll or "join this channel" in _ll:
+                            _stderr_errors.append("members-only content")
+                        elif "private video" in _ll:
+                            _stderr_errors.append("private video")
+                        elif "video unavailable" in _ll or "this video is unavailable" in _ll:
+                            _stderr_errors.append("video unavailable (deleted or region-locked)")
+                        elif "cookies are missing" in _ll or "sign in to confirm" in _ll:
+                            _stderr_errors.append("YouTube wants a sign-in (Firefox/Chrome cookies not found or expired)")
                 proc.wait()
-                self._log_stream.emit([["[Archive] ", "simpleline_green"],
-                                        ["done.\n", "simpleline"]])
+                # Post-download bookkeeping — emulate the channel-sync
+                # path's register_video + _record_recent_download hooks.
+                if _dltrack:
+                    try:
+                        parts = _dltrack.split(":::")
+                        # Format: "DLTRACK" + title, uploader, upload_date,
+                        # filesize, duration, id
+                        _title = parts[1] if len(parts) > 1 else ""
+                        _uploader = parts[2] if len(parts) > 2 else ""
+                        _vid = parts[6] if len(parts) > 6 else ""
+                        # Resolve the final filepath on disk. Template
+                        # was `<title> (MM.DD.YY).ext` or `<title>.ext`
+                        # under `base`. Scan `base` for something
+                        # matching the video ID / title.
+                        final_path = ""
+                        try:
+                            import glob as _glob
+                            for _g in _glob.glob(os.path.join(base, "*")):
+                                if _vid and _vid in os.path.basename(_g):
+                                    final_path = _g
+                                    break
+                            if not final_path and _title:
+                                # Fallback: match by title prefix
+                                _title_sane = _re.sub(
+                                    r'[<>:"/\\|?*\x00-\x1f]', "_", _title)
+                                for _g in _glob.glob(os.path.join(base, "*")):
+                                    if os.path.basename(_g).startswith(_title_sane[:50]):
+                                        final_path = _g
+                                        break
+                        except Exception:
+                            pass
+                        if final_path and os.path.isfile(final_path):
+                            _channel_name = _uploader or "Single Videos"
+                            try:
+                                from backend import index as _idx
+                                _idx.register_video(
+                                    final_path, _channel_name, _title,
+                                    tx_status="no_captions",
+                                    video_id=_vid)
+                            except Exception as _re:
+                                self._log_stream.emit_dim(
+                                    f" (index register failed: {_re})")
+                            try:
+                                sync_backend._record_recent_download(
+                                    final_path, _channel_name, _title, _vid)
+                            except Exception as _re:
+                                self._log_stream.emit_dim(
+                                    f" (recent downloads write failed: {_re})")
+                            # Drop from deferred livestream journal if
+                            # this was a previously-deferred premiere
+                            # that's now finished (matches bug C-3).
+                            if _vid:
+                                try:
+                                    from backend import livestreams as _ls
+                                    _ls.drop(_vid)
+                                except Exception:
+                                    pass
+                    except Exception as _pe:
+                        self._log_stream.emit_dim(
+                            f" (DLTRACK post-processing failed: {_pe})")
+                # bug W-7: if a DLTRACK line never arrived AND yt-dlp
+                # logged a known-failure pattern, report that to the
+                # user via a visible error line + toast so they know
+                # why their download vanished.
+                if not _dltrack and _stderr_errors:
+                    _reason = _stderr_errors[0]
+                    self._log_stream.emit([
+                        ["[Archive] ", "red"],
+                        [f"Download failed \u2014 {_reason}.\n", "red"],
+                    ])
+                    try:
+                        if self._window is not None:
+                            import json as _json
+                            self._window.evaluate_js(
+                                "window._showToast && window._showToast("
+                                f"{_json.dumps(f'Download failed: {_reason}')},"
+                                " 'error');")
+                    except Exception:
+                        pass
+                else:
+                    self._log_stream.emit([["[Archive] ", "simpleline_green"],
+                                            ["done.\n", "simpleline"]])
                 self._log_stream.flush()
+                # Push a Recent-tab refresh so the new video appears
+                # immediately instead of waiting for the next tab
+                # switch. Matches the channel-sync push hook.
+                try:
+                    self._push_recent_refresh()
+                except Exception:
+                    pass
             finally:
                 # Always release the URL guard, even on exception, so
                 # the user can retry without restarting the app.
@@ -4896,6 +5298,26 @@ class Api:
         if not path:
             return {"ok": False, "error": "path required"}
         path = os.path.normpath(path)
+        # bug W-4: verify the directory is accessible + writable before
+        # we commit it. Previously any path was saved blindly, so a
+        # read-only / unplugged / permission-denied path would be
+        # accepted; later sync attempts would fail with cryptic
+        # "write-gate blocked" errors. Probe with a real tmp file +
+        # rmdir so we catch permission issues that os.access (advisory
+        # on Windows) misses.
+        if not os.path.isdir(path):
+            return {"ok": False,
+                    "error": f"Folder doesn't exist or isn't accessible: {path}"}
+        _test_dir = os.path.join(path, ".ytarch-write-test")
+        try:
+            os.makedirs(_test_dir, exist_ok=True)
+            try:
+                os.rmdir(_test_dir)
+            except OSError:
+                pass
+        except OSError as _pe:
+            return {"ok": False,
+                    "error": f"Folder isn't writable: {_pe}"}
         cfg = load_config()
         cfg["output_dir"] = path
         from backend.ytarchiver_config import save_config as _sc
@@ -5340,6 +5762,21 @@ def main():
             window.restore()
         except Exception:
             pass
+        # bug W-5: show()+restore() are no-ops when the window is
+        # already visible-but-behind-other-apps. Force it to the front
+        # via Win32 SetForegroundWindow since pywebview 5.x doesn't
+        # expose a reliable set_focus on Windows. Silently no-op on
+        # other platforms / when ctypes/win32 are unavailable.
+        if os.name == "nt":
+            try:
+                import ctypes as _ct
+                _u32 = _ct.windll.user32
+                hwnd = _u32.FindWindowW(None, "YTArchiver")
+                if hwnd:
+                    _u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    _u32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
     def _tray_hide():
         try:
             window.hide()

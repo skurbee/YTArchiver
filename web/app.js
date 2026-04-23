@@ -320,6 +320,16 @@
       showPicker(false);
       m.hidden = false;
       startTick();
+      // bug L-15: pause the auto-continue countdown while the user is
+      // actively interacting with the modal (mouse hovering). Resumes
+      // when they move the pointer away. Protects a user who is
+      // reading the stats from being rug-pulled by the 5-minute timer.
+      const _pauseOnHover = () => { stopTick(); };
+      const _resumeOnLeave = () => {
+        if (!tickHandle && !m.hidden) startTick();
+      };
+      m.addEventListener("mouseenter", _pauseOnHover);
+      m.addEventListener("mouseleave", _resumeOnLeave);
     });
 
     // Button bindings — defer until DOM is ready since this IIFE runs
@@ -1012,6 +1022,16 @@
     // Save scroll of outgoing view before swapping
     if (_browseState.view === "channels") _saveScroll("channel-grid");
     if (_browseState.view === "videos") _saveScroll("video-grid");
+    // bug M-8: leaving the video grid — wipe the metadata-missing
+    // banner so it doesn't persist into the next channel's grid load
+    // if the user switched mid-fetch. (The banner is recreated on next
+    // sortCurrentVideos call if still appropriate.)
+    if (_browseState.view === "videos" && viewName !== "videos") {
+      try {
+        const vg = document.getElementById("video-grid");
+        vg?.parentElement?.querySelector(".meta-nudge-banner")?.remove();
+      } catch {}
+    }
     // Leaving the Watch view — stop the backgrounded <video> element
     // so audio doesn't keep playing after Back / tab swap. Must happen
     // BEFORE we mutate _browseState.view so the "was in watch?" check
@@ -1164,12 +1184,17 @@
         window._showToast?.("Couldn't resolve source video.", "warn");
         return;
       }
+      // feature F5: pass the active search query through so the Watch
+      // view can auto-pre-fill the transcript Find box, letting the
+      // user jump between hits of THIS video's transcript with
+      // Enter / Shift+Enter.
       window._openVideoInWatch({
         filepath: res.filepath,
         title: state.title,
         channel: state._channel || res.channel || "",
         video_id: state._videoId || res.video_id || "",
         _seek_to: Number(seg.s) || 0,
+        _search_query: state.query || _searchViewerState.query || "",
       });
     }).catch(() => {});
   }
@@ -1866,6 +1891,14 @@
     try { data = await api.browse_graph(word, channel, bucket, normalize); }
     catch (e) { if (emptyEl) emptyEl.textContent = "Error: " + e; return; }
     if (data?.error) { if (emptyEl) emptyEl.textContent = data.error; return; }
+    // bug M-13: backend reports `backfill_pending` when week-bucket
+    // plots are requested before upload_ts backfill finishes. Surface
+    // this so the user knows sparse week data is incomplete, not empty.
+    if (bucket === "week" && data?.backfill_pending) {
+      window._showToast?.(
+        `${data.backfill_pending.toLocaleString()} video(s) still indexing \u2014 ` +
+        `week plot may be incomplete until backfill finishes.`, "warn");
+    }
     if (!data?.labels?.length) {
       if (emptyEl) emptyEl.textContent = `No occurrences found.`;
       _graphDestroy();
@@ -2389,7 +2422,13 @@
             noteEl.classList.add("bookmark-note-saved");
             setTimeout(() => noteEl.classList.remove("bookmark-note-saved"), 1200);
           } else {
-            window._showToast?.("Note save failed.", "error");
+            // bug L-12: revert the DOM to the last-known-good note so
+            // the user doesn't see a "saved" edit that's actually
+            // rejected by the backend (write-gate off / DB error).
+            noteEl.textContent = b.note || "";
+            noteEl.classList.toggle("bookmark-note-empty", !b.note);
+            window._showToast?.(
+              res?.error || "Note save failed \u2014 reverted.", "error");
           }
         });
         row.querySelector("[data-remove]").addEventListener("click", async (e) => {
@@ -2673,6 +2712,24 @@
       }));
     }
     window.renderWatchView(video, transcript, sourceInfo);
+    // feature F5: if we arrived from a search result, pre-fill the
+    // transcript Find box with the query so Enter/Shift+Enter cycle
+    // between hits in this specific video. Saves the round-trip of
+    // Back → click next result → Watch.
+    const _q = (video._search_query || "").trim();
+    if (_q) {
+      const _watchFind = document.getElementById("watch-find");
+      if (_watchFind) {
+        _watchFind.value = _q;
+        // Trigger the existing input listener to build matches + jump
+        // to the first hit. The existing _rebuildFindMatches is scoped
+        // inside initWatchActions and not directly callable, but
+        // dispatching `input` exercises it.
+        try {
+          _watchFind.dispatchEvent(new Event("input", { bubbles: true }));
+        } catch {}
+      }
+    }
     // If the caller passed a seek target (bookmark jump, search-result jump,
     // transcript-segment click from elsewhere), seek the <video> element
     // once it's ready. Wait for `loadedmetadata` so duration is known.
@@ -3813,6 +3870,17 @@
         document.getElementById("edit-transcribe").checked = !!channel.auto_transcribe;
         document.getElementById("edit-metadata").checked = !!channel.auto_metadata;
         document.getElementById("edit-compress").checked = !!channel.compress_enabled;
+        // bug H-1 (extended): compress sub-fields (level / output res /
+        // batch size) were never loaded from the channel dict when the
+        // panel opened, so the dropdowns showed HTML defaults. Any save
+        // then stomped the real saved values with those defaults. Load
+        // them alongside the checkbox.
+        const _lvlEl = document.getElementById("edit-compress-quality");
+        if (_lvlEl && channel.compress_level) _lvlEl.value = channel.compress_level;
+        const _cResEl = document.getElementById("edit-compress-res");
+        if (_cResEl && channel.compress_output_res) _cResEl.value = channel.compress_output_res;
+        const _batchEl = document.getElementById("edit-compress-batch");
+        if (_batchEl && channel.compress_batch_size) _batchEl.value = String(channel.compress_batch_size);
         document.getElementById("edit-compress")?.dispatchEvent(new Event("change"));
         _updateCollapsed();
         // Start with the button disabled — only enable once the user has
@@ -4163,6 +4231,10 @@
         compress_enabled: document.getElementById("edit-compress").checked,
         compress_level: document.getElementById("edit-compress-quality")?.value || "Generous",
         compress_output_res: document.getElementById("edit-compress-res")?.value || "720",
+        // bug H-1: the batch-size dropdown existed in the edit panel
+        // but its value was never read here, so the user's choice was
+        // silently ignored — every save wrote the old value back.
+        compress_batch_size: parseInt(document.getElementById("edit-compress-batch")?.value, 10) || 20,
         range,
         from_date,
       };
@@ -4413,11 +4485,22 @@
               `Permanently delete ${n} file(s) from disk?\n\nThis cannot be undone.`,
               "Delete");
             if (!ok) return;
+            // bug H-11: await each call instead of fire-and-forget, then
+            // refresh the table so deleted rows disappear immediately
+            // instead of lingering until tab switch.
             for (const row of selected) {
               const t = row.querySelector(".col-title")?.textContent;
               const c = row.querySelector(".col-channel")?.textContent;
-              window.pywebview?.api?.recent_delete_file?.(t, c);
+              try {
+                await window.pywebview?.api?.recent_delete_file?.(t, c);
+              } catch {}
             }
+            try {
+              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              if (rows && typeof window.renderRecentTable === "function") {
+                window.renderRecentTable(rows);
+              }
+            } catch {}
           }},
       ] : [
         // "Play video" opens the Browse Watch view (embedded HTML5 <video>
@@ -4461,7 +4544,15 @@
             const ok = await askDanger("Delete file",
               `Delete "${title}" from disk?\n\nThis cannot be undone.`, "Delete");
             if (!ok) return;
-            window.pywebview?.api?.recent_delete_file?.(title, channel);
+            // bug H-11: refresh Recent after delete so the row
+            // disappears instantly instead of needing a tab switch.
+            try {
+              await window.pywebview?.api?.recent_delete_file?.(title, channel);
+              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              if (rows && typeof window.renderRecentTable === "function") {
+                window.renderRecentTable(rows);
+              }
+            } catch {}
           }},
       ];
       showContextMenu(e.clientX, e.clientY, items);
@@ -4674,34 +4765,14 @@
   // Matches YTArchiver's _chan_ctx_menu (line 5596+): Sync now / Edit
   // settings / Open folder in Explorer / Open URL in browser / separator /
   // Organize by year / Organize by month / separator / Remove channel.
-  // ─── Parent Folder native picker (Subs tab) ──────────────────────────
-  function initParentFolderPicker() {
-    const input = document.getElementById("parent-folder-input");
-    const btn = document.getElementById("btn-browse-parent");
-    if (!btn) return;
-    btn.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.pick_folder) {
-        window._showToast?.("Folder picker only works in native mode.", "warn");
-        return;
-      }
-      const current = input?.value || "";
-      try {
-        const res = await api.pick_folder("Choose archive root", current);
-        if (res?.ok && res.path) {
-          if (input) input.value = res.path;
-          const saveRes = await api.set_parent_folder(res.path);
-          if (saveRes?.ok) {
-            window._showToast?.("Parent folder saved.", "ok");
-          } else if (saveRes?.write_blocked) {
-            window._showToast?.("Write-gate off \u2014 path not saved to disk.", "warn");
-          } else {
-            window._showToast?.(saveRes?.error || "Save failed.", "error");
-          }
-        }
-      } catch (e) { window._showToast?.("Error: " + e, "error"); }
-    });
-  }
+  // bug W-12: `initParentFolderPicker` was removed as dead legacy.
+  // The Parent Folder input moved to Settings → General → Archive root
+  // (ids settings-output-dir + settings-browse-output) and has its own
+  // fully-wired handler. The former id `btn-browse-parent` / `parent-
+  // folder-input` pair no longer exists in the HTML. Left as a noop
+  // shim so the init bootstrap call doesn't throw if an old build
+  // calls it.
+  function initParentFolderPicker() {}
 
   // ─── Column sort on Subs + Recent tables ─────────────────────────────
   function initColumnSort() {
@@ -4792,19 +4863,196 @@
     return n * unit;
   }
 
+  // feature F7: helpers for the bulk-actions bar above the Subs table.
+  // Scoped to this IIFE via closure over `tbody` below — we don't
+  // bother exporting since nothing outside needs to call them.
+  function _selectedSubsRows(tbody) {
+    return [...tbody.querySelectorAll("tr.row-selected")];
+  }
+  function _selectedSubsNames(tbody) {
+    return _selectedSubsRows(tbody).map(tr =>
+      tr.dataset.channelName
+      || (tr.querySelector(".col-folder")?.textContent || "").trim())
+      .filter(Boolean);
+  }
+  function _updateSubsBulkBar() {
+    const tbody = document.getElementById("subs-table-body");
+    const bar = document.getElementById("subs-bulk-bar");
+    if (!tbody || !bar) return;
+    const rows = _selectedSubsRows(tbody);
+    const count = rows.length;
+    const countEl = document.getElementById("subs-bulk-count");
+    if (countEl) {
+      countEl.textContent = count === 1
+        ? "1 channel selected"
+        : `${count} channels selected`;
+    }
+    // Only show the bar for multi-select. Single-select keeps the
+    // existing single-row UX (right-click menu, Enter = edit, etc.)
+    // unambiguous.
+    bar.hidden = count < 2;
+  }
+  // Bulk-action button wiring — deferred until the tbody exists.
+  function _wireSubsBulkButtons() {
+    const tbody = document.getElementById("subs-table-body");
+    if (!tbody) return;
+    const api = () => window.pywebview?.api;
+    const clear = () => {
+      tbody.querySelectorAll("tr.row-selected")
+        .forEach(r => r.classList.remove("row-selected"));
+      _updateSubsBulkBar();
+    };
+    document.getElementById("btn-bulk-clear")?.addEventListener("click", clear);
+    // Change resolution
+    document.getElementById("btn-bulk-resolution")
+      ?.addEventListener("click", async () => {
+        const names = _selectedSubsNames(tbody);
+        if (!names.length) return;
+        const pick = await (window.askChoice ? window.askChoice({
+          title: `Change resolution for ${names.length} channel(s)`,
+          message: "Pick the new resolution. Applies only to future syncs — " +
+                   "already-downloaded videos stay at their current " +
+                   "resolution (use the Recheck Resolution tool per-channel " +
+                   "to re-download).",
+          choices: [
+            { label: "audio-only", value: "audio" },
+            { label: "360p", value: "360" },
+            { label: "480p", value: "480" },
+            { label: "720p", value: "720", primary: true },
+            { label: "1080p", value: "1080" },
+            { label: "1440p", value: "1440" },
+            { label: "2160p", value: "2160" },
+            { label: "best", value: "best" },
+          ],
+        }) : null);
+        if (!pick) return;
+        const res = await api()?.subs_bulk_update?.(names, { resolution: pick });
+        if (res?.ok) {
+          window._showToast?.(
+            `Updated ${res.updated} channel(s) to ${pick}.`, "ok");
+          clear();
+          window.refreshSubsTable?.();
+        } else {
+          window._showToast?.(res?.error || "Bulk update failed.", "error");
+        }
+      });
+    // Toggle auto-transcribe
+    document.getElementById("btn-bulk-auto-tx")
+      ?.addEventListener("click", async () => {
+        const names = _selectedSubsNames(tbody);
+        if (!names.length) return;
+        const pick = await (window.askChoice ? window.askChoice({
+          title: `Auto-transcribe for ${names.length} channel(s)`,
+          message: "Toggle the Auto-transcribe flag for all selected " +
+                   "channels. Future downloads will (or won't) run through " +
+                   "Whisper automatically.",
+          choices: [
+            { label: "Enable for all", value: "on", primary: true },
+            { label: "Disable for all", value: "off" },
+          ],
+        }) : null);
+        if (!pick) return;
+        const changes = { auto_transcribe: pick === "on" };
+        const res = await api()?.subs_bulk_update?.(names, changes);
+        if (res?.ok) {
+          window._showToast?.(
+            `Updated ${res.updated} channel(s).`, "ok");
+          clear();
+          window.refreshSubsTable?.();
+        } else {
+          window._showToast?.(res?.error || "Bulk update failed.", "error");
+        }
+      });
+    // Queue metadata
+    document.getElementById("btn-bulk-metadata")
+      ?.addEventListener("click", async () => {
+        const names = _selectedSubsNames(tbody);
+        if (!names.length) return;
+        const ok = await askConfirm(
+          `Queue metadata for ${names.length} channel(s)`,
+          `Enqueue a metadata refresh for every selected channel. ` +
+          `Each becomes its own task on the Sync Tasks popover and ` +
+          `fires as soon as the current sync is idle.`,
+          { confirm: "Queue all" });
+        if (!ok) return;
+        const res = await api()?.subs_bulk_queue_metadata?.(names, true);
+        if (res?.ok) {
+          window._showToast?.(
+            `Queued metadata refresh for ${res.queued} channel(s).`, "ok");
+          clear();
+        } else {
+          window._showToast?.(res?.error || "Bulk queue failed.", "error");
+        }
+      });
+    // Delete
+    document.getElementById("btn-bulk-delete")
+      ?.addEventListener("click", async () => {
+        const names = _selectedSubsNames(tbody);
+        if (!names.length) return;
+        const choice = await (window.askChoice ? window.askChoice({
+          title: `Delete ${names.length} channel(s)?`,
+          message: `You're about to unsubscribe from ${names.length} ` +
+                   `channel(s). Keep files = just remove the subscription. ` +
+                   `Delete files = also wipe the on-disk folders (videos, ` +
+                   `transcripts, metadata).`,
+          choices: [
+            { label: "Keep files", value: "keep", primary: true },
+            { label: "Delete files too", value: "delete", kind: "danger" },
+          ],
+          cancel: "Cancel",
+        }) : null);
+        if (!choice) return;
+        const deleteFiles = choice === "delete";
+        const res = await api()?.subs_bulk_delete?.(names, deleteFiles);
+        if (res?.ok) {
+          window._showToast?.(
+            `Removed ${res.deleted} channel(s).`, "ok");
+          clear();
+          window.refreshSubsTable?.();
+        } else {
+          window._showToast?.(res?.error || "Bulk delete failed.", "error");
+        }
+      });
+  }
+
   function initSubsContextMenu() {
     const tbody = document.getElementById("subs-table-body");
     if (!tbody) return;
+    // feature F7: wire the bulk-actions bar buttons. Idempotent guard
+    // via a dataset flag so re-inits (e.g. hot reload) don't double-bind.
+    if (!tbody.dataset.f7Wired) {
+      tbody.dataset.f7Wired = "1";
+      try { _wireSubsBulkButtons(); } catch (e) { console.error("F7 wire:", e); }
+    }
 
     // Make the tbody focusable so keyboard events fire when the Subs tab is
-    // focused. Single-click selects the row; Enter opens edit; Delete removes.
+    // focused. Click selects the row; Enter opens edit; Delete removes.
+    // feature F7: Ctrl/Cmd-click toggles this row; Shift-click selects a
+    // range. Matches the Recent-table pattern (logs.js:760+). When >1
+    // row is selected, the bulk-actions bar shows up automatically
+    // (wired below in _updateSubsBulkBar).
     tbody.setAttribute("tabindex", "0");
+    let _subsLastClickedIdx = -1;
     tbody.addEventListener("click", (e) => {
       const tr = e.target.closest("tr");
       if (!tr) return;
-      tbody.querySelectorAll("tr.row-selected").forEach(x => x.classList.remove("row-selected"));
-      tr.classList.add("row-selected");
+      const allTrs = [...tbody.querySelectorAll("tr")];
+      const idx = allTrs.indexOf(tr);
+      if (e.ctrlKey || e.metaKey) {
+        tr.classList.toggle("row-selected");
+      } else if (e.shiftKey && _subsLastClickedIdx >= 0) {
+        const [a, b] = [Math.min(_subsLastClickedIdx, idx),
+                        Math.max(_subsLastClickedIdx, idx)];
+        allTrs.forEach((r, i) => {
+          if (i >= a && i <= b) r.classList.add("row-selected");
+        });
+      } else {
+        allTrs.forEach(r => r.classList.remove("row-selected"));
+        tr.classList.add("row-selected");
+      }
+      _subsLastClickedIdx = idx;
       tbody.focus();
+      _updateSubsBulkBar();
     });
     tbody.addEventListener("keydown", async (e) => {
       const selected = tbody.querySelector("tr.row-selected");
@@ -5139,6 +5387,24 @@
     const voPanel = document.getElementById("video-opts-panel");
     const nudgePanel = document.getElementById("channel-nudge-panel");
     if (!input || !btn) return;
+    // bug W-2: populate the url-history datalist so the <input
+    // list=".."> dropdown shows recent URLs. Backend persists the list
+    // via api.url_history(); frontend just populates the <option>s.
+    (async () => {
+      try {
+        const api = window.pywebview?.api;
+        if (!api?.url_history) return;
+        const hist = await api.url_history();
+        const dl = document.getElementById("url-history-list");
+        if (!dl || !Array.isArray(hist)) return;
+        dl.innerHTML = "";
+        for (const u of hist) {
+          const o = document.createElement("option");
+          o.value = String(u);
+          dl.appendChild(o);
+        }
+      } catch { /* non-fatal */ }
+    })();
 
     const urlLooksLikeVideo = (s) => _YT_RE.test((s || "").trim());
     const urlLooksLikeChannel = (s) => {
@@ -5177,6 +5443,55 @@
       refreshErr();
       refreshPanels();
     };
+
+    // bug W-8: persist the Download-tab preferences so they survive
+    // tab switches and restarts. Previously every new session reset
+    // resolution to "1080p" + "Use YT title" to default-checked,
+    // stomping the user's last-chosen settings.
+    const _VO_KEYS = {
+      resolution: "ytarch.vo.resolution",
+      date_file: "ytarch.vo.date_file",
+      add_date: "ytarch.vo.add_date",
+      use_yt_title: "ytarch.vo.use_yt_title",
+    };
+    try {
+      const _load = (k, fallback) => {
+        const v = localStorage.getItem(k);
+        return v == null ? fallback : v;
+      };
+      const _saved_res = _load(_VO_KEYS.resolution, "");
+      const _sel = document.getElementById("vo-resolution");
+      if (_sel && _saved_res && [..._sel.options].some(o => o.value === _saved_res)) {
+        _sel.value = _saved_res;
+      }
+      const _df = document.getElementById("vo-date-file");
+      const _v_df = localStorage.getItem(_VO_KEYS.date_file);
+      if (_df && _v_df != null) _df.checked = _v_df === "1";
+      const _ad = document.getElementById("vo-add-date");
+      const _v_ad = localStorage.getItem(_VO_KEYS.add_date);
+      if (_ad && _v_ad != null) _ad.checked = _v_ad === "1";
+      const _ut = document.getElementById("vo-use-yt-title");
+      const _v_ut = localStorage.getItem(_VO_KEYS.use_yt_title);
+      if (_ut && _v_ut != null) _ut.checked = _v_ut === "1";
+    } catch {}
+    // Persist on every change.
+    const _persistVoField = (id, key, kind) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener("change", () => {
+        try {
+          if (kind === "bool") {
+            localStorage.setItem(key, el.checked ? "1" : "0");
+          } else {
+            localStorage.setItem(key, el.value || "");
+          }
+        } catch {}
+      });
+    };
+    _persistVoField("vo-resolution", _VO_KEYS.resolution, "value");
+    _persistVoField("vo-date-file", _VO_KEYS.date_file, "bool");
+    _persistVoField("vo-add-date", _VO_KEYS.add_date, "bool");
+    _persistVoField("vo-use-yt-title", _VO_KEYS.use_yt_title, "bool");
 
     // Read the Video-options panel into a plain dict to send to the backend.
     const readVideoOptions = () => {
@@ -5251,6 +5566,27 @@
       const current = saveInput?.value || "";
       const res = await api.pick_folder("Save video to…", current);
       if (res?.ok && res.path) {
+        // bug W-6: if the user picks a path outside the archive tree,
+        // the downloaded file won't show up in Browse / Search / FTS
+        // because the scanner only walks output_dir. Warn before
+        // committing so users aren't surprised later.
+        try {
+          const s = await api.settings_load?.();
+          const archiveRoot = (s?.output_dir || "").replace(/[\\/]+$/, "");
+          const picked = String(res.path || "").replace(/[\\/]+$/, "");
+          if (archiveRoot && picked &&
+              !picked.toLowerCase().startsWith(archiveRoot.toLowerCase())) {
+            const ok = await askConfirm(
+              "Save outside archive root?",
+              `The path you picked is outside your archive root.\n\n` +
+              `Root: ${archiveRoot}\n` +
+              `Picked: ${picked}\n\n` +
+              `Videos saved here won't appear in Browse / Search / FTS ` +
+              `(the scanner only walks the archive root). Proceed anyway?`,
+              { confirm: "Save outside" });
+            if (!ok) return;
+          }
+        } catch {}
         if (saveInput) saveInput.value = res.path;
       }
     });
@@ -5490,8 +5826,32 @@
     // Playback speed
     const speedSel = document.getElementById("watch-speed");
     const vEl = document.getElementById("watch-video");
+    // bug M-5: speed used to reset to 1.0x on every video switch because
+    // it wasn't persisted. Mirror the volume-persistence pattern
+    // (_applyPersistedVolume in logs.js) so the user's chosen speed
+    // sticks across videos and sessions.
+    const _SPEED_KEY = "ytarch.watchSpeed";
+    try {
+      const saved = parseFloat(localStorage.getItem(_SPEED_KEY) || "1") || 1;
+      if (speedSel) {
+        // Only assign if the saved value exists as an <option>.
+        if ([...speedSel.options].some(o => parseFloat(o.value) === saved)) {
+          speedSel.value = String(saved);
+        }
+      }
+      if (vEl) vEl.playbackRate = saved;
+    } catch {}
+    // Apply persisted speed every time a new video source loads.
+    vEl?.addEventListener("loadedmetadata", () => {
+      try {
+        const v = parseFloat(localStorage.getItem(_SPEED_KEY) || "1") || 1;
+        vEl.playbackRate = v;
+      } catch {}
+    });
     speedSel?.addEventListener("change", () => {
-      if (vEl) vEl.playbackRate = parseFloat(speedSel.value) || 1.0;
+      const v = parseFloat(speedSel.value) || 1.0;
+      if (vEl) vEl.playbackRate = v;
+      try { localStorage.setItem(_SPEED_KEY, String(v)); } catch {}
     });
 
     // Video-scoped keyboard shortcuts (only active when the watch view is visible)
@@ -5558,6 +5918,17 @@
         ],
       }) : null);
       if (!pick) return;
+      // bug L-10: whitelist the resolution string before forwarding to
+      // the backend. The dialog only presents valid options, but a
+      // future refactor could let other values through — this guards
+      // against a `pick` that the backend wouldn't understand.
+      const _VALID_RES = new Set(
+        ["audio", "144", "240", "360", "480", "720",
+         "1080", "1440", "2160", "best"]);
+      if (!_VALID_RES.has(pick)) {
+        window._showToast?.(`Invalid resolution: ${pick}`, "error");
+        return;
+      }
       bridgeCall("video_redownload", v.video_id || "", v.title || "", pick);
       window._showToast?.(`Redownload queued at ${pick}.`, "ok");
     });
@@ -6341,6 +6712,109 @@
       if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
       else window._showToast?.(res?.error || "Refresh failed.", "error");
     });
+
+    // feature F8: "Compress dry-run" — open the results modal and
+    // render per-channel + grand-total projected savings at each
+    // quality tier for the chosen output resolution.
+    (function wireCompressDryRun() {
+      const btn = document.getElementById("btn-compress-dry-run");
+      const bd = document.getElementById("compress-dry-backdrop");
+      const body = document.getElementById("compress-dry-body");
+      const summary = document.getElementById("compress-dry-summary");
+      const resSel = document.getElementById("compress-dry-res");
+      const closeBtn = document.getElementById("compress-dry-close");
+      const recalcBtn = document.getElementById("compress-dry-recalc");
+      if (!btn || !bd || !body) return;
+      const _fmt = (gb) => {
+        const n = Number(gb) || 0;
+        if (n >= 1024) return (n / 1024).toFixed(1) + " TB";
+        return n.toFixed(1) + " GB";
+      };
+      const _diffPct = (current, projected) => {
+        if (!current || current <= 0) return "";
+        const pct = Math.round((1 - projected / current) * 100);
+        return pct > 0 ? ` (-${pct}%)` : ` (+${-pct}%)`;
+      };
+      const _render = (data) => {
+        if (!data?.ok) {
+          body.innerHTML =
+            `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            + `${data?.error || "Dry run failed."}</div>`;
+          if (summary) summary.textContent = "";
+          return;
+        }
+        const t = data.total || {};
+        if (summary) {
+          summary.textContent =
+            `${t.videos?.toLocaleString()} videos · ${t.hours?.toLocaleString()} hours`;
+        }
+        // Build a simple table. Per-channel rows sorted by current_gb
+        // desc (matches backend query); grand total pinned at top.
+        const escapeHtml = window._escapeHtml || ((s) =>
+          String(s).replace(/[&<>"']/g, c => (
+            {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
+        let html = "";
+        html += `<table style="width:100%;border-collapse:collapse;">`;
+        html += `<thead><tr style="border-bottom:1px solid #2a3140;text-align:right;">`;
+        html += `<th style="text-align:left;padding:4px 6px;">Channel</th>`;
+        html += `<th style="padding:4px 6px;">Videos</th>`;
+        html += `<th style="padding:4px 6px;">Hours</th>`;
+        html += `<th style="padding:4px 6px;">Current</th>`;
+        html += `<th style="padding:4px 6px;">Generous</th>`;
+        html += `<th style="padding:4px 6px;">Average</th>`;
+        html += `<th style="padding:4px 6px;">Below Avg</th>`;
+        html += `</tr></thead><tbody>`;
+        // Grand totals first, highlighted.
+        html += `<tr style="background:rgba(96,160,255,0.08);font-weight:bold;">`;
+        html += `<td style="padding:4px 6px;">ALL CHANNELS (${data.output_res}p target)</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${(t.videos || 0).toLocaleString()}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${(t.hours || 0).toLocaleString()}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.current_gb)}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.generous_gb)}${_diffPct(t.current_gb, t.generous_gb)}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.average_gb)}${_diffPct(t.current_gb, t.average_gb)}</td>`;
+        html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.below_gb)}${_diffPct(t.current_gb, t.below_gb)}</td>`;
+        html += `</tr>`;
+        for (const c of (data.channels || [])) {
+          html += `<tr>`;
+          html += `<td style="padding:2px 6px;">${escapeHtml(c.name)}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${c.videos.toLocaleString()}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${c.hours.toLocaleString()}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.current_gb)}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.generous_gb)}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.average_gb)}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.below_gb)}</td>`;
+          html += `</tr>`;
+        }
+        html += `</tbody></table>`;
+        html += `<div class="edit-dim" style="padding:8px 4px 0;font-size:11px;">`
+              + `Projections use MB/hour bitrate presets applied to each channel's `
+              + `total indexed duration. Videos without duration metadata are `
+              + `skipped (so real savings can be LARGER than shown).</div>`;
+        body.innerHTML = html;
+      };
+      const _open = async () => {
+        bd.style.display = "flex";
+        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Computing…</div>`;
+        if (summary) summary.textContent = "";
+        try {
+          const api = window.pywebview?.api;
+          if (!api?.compress_dry_run) {
+            _render({ ok: false, error: "Native mode required." });
+            return;
+          }
+          const res = await api.compress_dry_run(resSel?.value || "720");
+          _render(res);
+        } catch (e) {
+          _render({ ok: false, error: String(e) });
+        }
+      };
+      btn.addEventListener("click", _open);
+      recalcBtn?.addEventListener("click", _open);
+      closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
+      bd.addEventListener("click", (e) => {
+        if (e.target === bd) bd.style.display = "none";
+      });
+    })();
 
     save?.addEventListener("click", async () => {
       const api = window.pywebview?.api;

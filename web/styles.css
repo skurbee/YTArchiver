@@ -685,6 +685,10 @@ body {
 .metadata-table .md-id-warn { color: #e1b25a; }
 .metadata-table .md-id-bad { color: #d87a7a; }
 .metadata-table .md-id-dim { color: var(--c-dim); }
+/* Neutral state: 90-99% coverage. Not orange (that's reserved for
+   channels that genuinely need attention), not green (some IDs
+   still missing). Default text color so the row doesn't shout. */
+.metadata-table .md-id-neutral { color: var(--c-text); }
 .metadata-table .md-id-ratio {
   color: var(--c-dim);
   font-size: 11px;
@@ -1425,28 +1429,16 @@ body {
     minmax(66px, 1fr);
 }
 
-/* [Metdta] rows have at most one optional secondary count (e.g.
-   "5 new" for views/likes refresh with first-time fetches, or
-   "N unresolved" for ID backfill) and NEVER a tertiary count.
-   Keep secondary at a fixed flex width (not `minmax(0, auto)`)
-   so the "errors" column lands at the same x-position whether
-   or not the secondary cell has content. The previous collapse-
-   when-empty behavior produced a ragged left/right shift in the
-   log that the user flagged as "misaligned columns". Tertiary
-   stays at 0 since it's always empty for this kind. */
-.activity-log .log-line.hist-row-Metdta {
-  grid-template-columns:
-    minmax(58px, auto)
-    minmax(92px, auto)
-    8px
-    minmax(110px, 2.5fr)
-    8px
-    minmax(98px, 1fr)     /* primary */
-    minmax(98px, 1fr)     /* secondary — fixed slot for alignment */
-    0                     /* tertiary — always empty for Metdta */
-    minmax(60px, 0.8fr)   /* errors */
-    minmax(66px, 1fr);    /* took */
-}
+/* [Metdta] rows use the DEFAULT grid template (no override).
+   The user's ask: "i don't care if the columns don't have
+   'consistent' data per column, just that each functions columns
+   are vertically aligned". An empty tertiary cell produces a
+   blank slot between secondary and errors, but "errors" now
+   lands at the same x-position as Dwnld's "errors" column,
+   which is what the user was flagging in the screenshot.
+   Previous overrides that collapsed tertiary to 0 pushed
+   every cell after it to different x-positions per row-kind. */
+/* (override deliberately absent — default .log-line grid applies) */
 
 .activity-log .log-line > span {
   overflow: hidden;

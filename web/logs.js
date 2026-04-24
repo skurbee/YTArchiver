@@ -234,10 +234,20 @@
     [/(\u2713)\s+(compressed)\b/gi, "t-hist_compress"],
     [/\b([1-9]\d*)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
     [/(\u2713)\s+(moved|reorged)\b/gi, "t-hist_reorg"],
-    [/\b([1-9]\d*)\s+(fetched|refreshed|metadata)\b/gi, "t-hist_pink"],
-    [/(\u2713)\s+(fetched|refreshed|metadata)\b/gi, "t-hist_pink"],
+    // Optional-word slot (?:\w+\s+)? catches "N IDs backfilled" or
+    // "N comments refreshed" — the in-use phrase forms where a noun
+    // sits between the count and the verb. Without this, those
+    // phrases matched nothing and rendered in the default color
+    // instead of pink.
+    [/\b([1-9]\d*)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
+    [/(\u2713)\s+(?:\w+\s+)?(fetched|refreshed|metadata|backfilled)\b/gi, "t-hist_pink"],
     [/\b([1-9]\d*)\s+skipped\b/gi, "t-hist_skipped"],
     [/\b([1-9]\d*)\s+errors?\b/gi, "t-hist_error"],
+    // Warning-but-not-error states: "N unresolved" (ID backfill
+    // couldn't match) and "N ambiguous" (title-match hit multiple
+    // candidates). Amber/orange matches the "heads up, look at
+    // this but it's not broken" semantic the user wanted.
+    [/\b([1-9]\d*)\s+(unresolved|ambiguous)\b/gi, "t-hist_skipped"],
   ];
 
   function _buildHistCell(text, extra, colored, tagCls) {

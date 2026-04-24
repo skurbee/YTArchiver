@@ -861,19 +861,31 @@ def _hist_tag_for_kind(kind: str, rest: str):
     represents "exactly 1 of this" per single-video polish.
     """
     import re
-    # Either "\u2713 foo" or "N foo" (N >= 1) counts as "work happened".
+    # Either "\u2713 foo" or "N [optional word] foo" (N >= 1) counts as
+    # "work happened". The optional-word slot catches phrases like
+    # "N IDs backfilled" or "N comments refreshed" where there's a
+    # noun between the count and the verb. Without it, the regex
+    # required the digit to be immediately before the verb — so
+    # "8235 IDs backfilled" reloaded from autorun_history came back
+    # uncolored even though the live emit correctly tagged it pink.
     def _done(pattern: str) -> bool:
-        check = re.search(r"\u2713\s+(?:" + pattern + r")\b", rest)
+        check = re.search(r"\u2713\s+(?:\w+\s+)?(?:" + pattern + r")\b", rest)
         if check:
             return True
-        m = re.search(r"\b(\d+)\s+(?:" + pattern + r")\b", rest)
+        m = re.search(r"\b(\d+)\s+(?:\w+\s+)?(?:" + pattern + r")\b", rest)
         return bool(m and int(m.group(1)) > 0)
 
     if kind == "Trnscr":
         if _done("transcribed"):
             return "hist_blue"
     elif kind == "Metdta":
-        if _done("fetched") or _done("refreshed"):
+        # "fetched" / "refreshed" cover the original bulk-views +
+        # per-video metadata paths. "backfilled" covers the ID
+        # backfill pass (body: "N IDs backfilled"). Without the
+        # third verb, backfill rows reloaded from autorun_history
+        # came back in the default (white) color instead of the
+        # pink all metadata-kind rows should render in.
+        if _done("fetched") or _done("refreshed") or _done("backfilled"):
             return "hist_pink"
     elif kind in ("Manual", "Auto", "Dwnld"):
         if _done("downloaded"):

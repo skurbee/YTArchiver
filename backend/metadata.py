@@ -1039,7 +1039,12 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         # registered in the videos-table with a video_id — the
         # default archive layout per tkinter-era downloads.
         "--print",
-        "%(id)s\t%(view_count)s\t%(like_count)s\t%(comment_count)s\t%(title)s",
+        # Extended with upload_date + duration so backfill_video_ids
+        # can disambiguate title-near-duplicates using the file's
+        # mtime (== YT upload date when yt-dlp ran with --mtime) and
+        # the on-disk duration. Keeping it one pass so we don't
+        # double the API traffic.
+        "%(id)s\t%(view_count)s\t%(like_count)s\t%(comment_count)s\t%(title)s\t%(upload_date)s\t%(duration)s",
         *_find_cookie_source(),
         ch_url,
     ]
@@ -1054,6 +1059,15 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     except OSError as e:
         stream.emit_error(f"Metadata: could not start stats fetch: {e}")
         return {}
+    # Progress tick during the catalog fetch — on large channels (10k+
+    # videos) this can take 30-60s and the caller's "Resolving video
+    # IDs for X..." line otherwise looks frozen the whole time. Emit
+    # every _PROGRESS_TICK_EVERY parsed rows OR every
+    # _PROGRESS_TICK_SECS so the user sees something happening.
+    _PROGRESS_TICK_EVERY = 500
+    _PROGRESS_TICK_SECS = 5.0
+    _tick_count = 0
+    _last_tick_ts = time.time()
     try:
         for raw in proc.stdout:
             if cancel_event is not None and cancel_event.is_set():
@@ -1074,6 +1088,20 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             vid = parts[0].strip()
             if not _ID_RE_11.fullmatch(vid):
                 continue
+            _tick_count += 1
+            _now = time.time()
+            if (_tick_count % _PROGRESS_TICK_EVERY == 0
+                    or (_now - _last_tick_ts) >= _PROGRESS_TICK_SECS):
+                # Non-dim tag so the tick stays visible in Simple
+                # mode — the user's specifically watching this
+                # long-running op for a heartbeat.
+                try:
+                    stream.emit([[f"  \u2014 Fetched {_tick_count:,} videos "
+                                 f"from YouTube catalog\u2026\n",
+                                 "simpleline"]])
+                except Exception:
+                    pass
+                _last_tick_ts = _now
             def _num(s: str) -> Optional[int]:
                 s = (s or "").strip()
                 if not s or s in ("NA", "None", "null"):
@@ -1088,6 +1116,13 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
                 "like_count": _num(parts[2]),
                 "comment_count": _num(parts[3]),
                 "title": _title,
+                # New fields (Colbert backfill fix): upload_date and
+                # duration for non-title disambiguation in
+                # backfill_video_ids. yt-dlp emits upload_date as
+                # YYYYMMDD (or "NA" if unknown); duration as seconds.
+                "upload_date": (parts[5].strip()
+                                if len(parts) >= 6 else ""),
+                "duration": _num(parts[6]) if len(parts) >= 7 else None,
             }
         try: proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -1539,19 +1574,29 @@ def count_video_id_status(channel: Dict[str, Any]) -> Dict[str, Any]:
     tkinter-era YTArchiver, which never wrote [id] brackets into
     filenames nor .info.json sidecars).
 
-    Returns {total, with_id, missing}. `total` is the row count for
-    files under the channel folder; `with_id` counts rows where
-    video_id is non-NULL / non-empty. Purely a DB-read — no disk
-    walk, no yt-dlp. Safe to call for every channel on a tab render.
+    Returns {total, with_id, missing, tried_failed}:
+      * total:        row count for files under the channel folder.
+      * with_id:      rows where video_id is non-NULL / non-empty.
+      * missing:      total - with_id.
+      * tried_failed: rows that are still missing AND have an
+                      id_backfill_tried_ts — i.e. the backfill
+                      pass attempted them and every strategy
+                      returned no match. Separates "probably
+                      genuinely unresolvable (renamed, removed,
+                      title-drift beyond fuzzy threshold)" from
+                      "never tried — run Fix IDs".
+
+    Purely a DB-read — no disk walk, no yt-dlp. Safe to call for
+    every channel on a tab render.
     """
     folder = _folder_for_channel(channel)
     if folder is None:
-        return {"total": 0, "with_id": 0, "missing": 0}
+        return {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
     try:
         from . import index as _idx
         conn = _idx._open()
         if conn is None:
-            return {"total": 0, "with_id": 0, "missing": 0}
+            return {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         _pat = str(folder) + "%"
         with _idx._db_lock:
             _total = conn.execute(
@@ -1561,13 +1606,72 @@ def count_video_id_status(channel: Dict[str, Any]) -> Dict[str, Any]:
                 "SELECT COUNT(*) FROM videos WHERE filepath LIKE ? "
                 "AND video_id IS NOT NULL AND video_id != ''",
                 (_pat,)).fetchone()[0]
+            # Rows still missing an id that have been through the
+            # backfill pass at least once. Column won't exist on
+            # very old DBs; guarded query falls back to 0.
+            try:
+                _tried = conn.execute(
+                    "SELECT COUNT(*) FROM videos WHERE filepath LIKE ? "
+                    "AND (video_id IS NULL OR video_id='') "
+                    "AND id_backfill_tried_ts IS NOT NULL",
+                    (_pat,)).fetchone()[0]
+            except Exception:
+                _tried = 0
         return {
             "total": int(_total or 0),
             "with_id": int(_with_id or 0),
             "missing": int((_total or 0) - (_with_id or 0)),
+            "tried_failed": int(_tried or 0),
         }
     except Exception:
-        return {"total": 0, "with_id": 0, "missing": 0}
+        return {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
+
+
+def _read_info_json_vid(filepath: str) -> str:
+    """Return the video_id from a .info.json sidecar beside a video
+    file (written by yt-dlp --write-info-json). Returns '' if no
+    sidecar, the JSON doesn't parse, or the `id` field isn't a
+    valid 11-char YouTube id.
+
+    Checks the two common naming conventions:
+      a) `<stem>.info.json` beside the video
+      b) `<filename>.info.json` (rare but seen in legacy archives)
+    """
+    try:
+        base_stem, _ = os.path.splitext(filepath)
+        candidates = [
+            base_stem + ".info.json",
+            filepath + ".info.json",
+        ]
+        for sidecar in candidates:
+            if not os.path.isfile(sidecar):
+                continue
+            try:
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            raw = (data.get("id") or "").strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
+                return raw
+    except Exception:
+        pass
+    return ""
+
+
+def _norm_title_for_match(s: str) -> str:
+    """Normalization used by backfill_video_ids.
+
+    Lowercase, strip trailing `[VIDEO_ID]` tag, collapse every non-
+    alphanumeric run to a single space. Shared by every matching
+    strategy so candidates compare apples-to-apples.
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"\s*\[[a-z0-9_-]{11}\]\s*$", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return s.strip()
 
 
 def backfill_video_ids(channel: Dict[str, Any],
@@ -1575,22 +1679,32 @@ def backfill_video_ids(channel: Dict[str, Any],
                        cancel_event: Optional[threading.Event] = None,
                        pause_event: Optional[threading.Event] = None,
                        ) -> Dict[str, Any]:
-    """One-shot video_id backfill — reuses the title-match logic from
-    bulk_refresh_views_likes but WITHOUT the full --dump-json re-fetch
-    pass. Just:
+    """One-shot video_id backfill with multi-strategy resolution.
 
-      1. Flat-playlist to get {id: title} for the channel.
-      2. Walk on-disk videos; for each file whose video_id is empty
-         (no [id] bracket AND no DB entry with id), try to resolve
-         via normalized-title match.
-      3. UPDATE the index videos-table with resolved IDs.
+    For every on-disk file without a video_id in the DB, try in order:
 
-    This is the dedicated fix for archives migrated from the tkinter
-    YTArchiver — thousands of files with no [id] bracket and no
-    .info.json sidecar get IDs in one bulk-playlist call, making
-    subsequent bulk views/likes refreshes work the fast path.
+      1. `.info.json` sidecar (zero-cost, no network)
+      2. Exact normalized-title match against YouTube's current
+         flat-playlist
+      3. Substring title match (local title subset of YT title, or
+         vice-versa) when the single candidate is unambiguous
+      4. Upload-date match (file mtime YYYYMMDD → YT upload_date),
+         disambiguated by duration when >1 candidate exists
+      5. Fuzzy title match via difflib.get_close_matches (0.80
+         cutoff, rejects ambiguous near-ties)
+      6. Stamp `id_backfill_tried_ts` so the UI can distinguish
+         "tried but genuinely unresolvable" from "not yet attempted"
 
-    Returns {ok, resolved, already_set, ambiguous, unresolved, took}.
+    This is the dedicated fix for archives where title-rename,
+    suffix-add, or emoji-drift on the channel side has silently
+    broken the cheap exact-match path. Counts so small that
+    exact-match alone gets <20% (e.g. late-night TV channels with
+    systematic " | The Late Show" suffix additions).
+
+    Returns {ok, resolved, resolved_by_info_json, resolved_by_exact,
+             resolved_by_substring, resolved_by_date,
+             resolved_by_fuzzy, already_set, ambiguous,
+             unresolved_now_tried, took}.
     """
     folder = _folder_for_channel(channel)
     if folder is None:
@@ -1619,89 +1733,422 @@ def backfill_video_ids(channel: Dict[str, Any],
         ])
         return {"ok": False, "error": "bulk_empty"}
 
-    # Build normalized-title → video_id (same rules as
-    # bulk_refresh_views_likes so the two stay consistent).
-    def _norm_title(s: str) -> str:
-        if not s:
-            return ""
-        s = s.lower()
-        s = re.sub(r"\s*\[[a-z0-9_-]{11}\]\s*$", "", s)
-        s = re.sub(r"[^a-z0-9]+", " ", s)
-        return s.strip()
+    # ── Build indices over the YT catalog ────────────────────────────
 
+    # 1. exact normalized title → vid, with ambiguity tracking
     title_to_vid: Dict[str, str] = {}
-    ambiguous: set = set()
-    for _vid, _stats in bulk.items():
-        _nt = _norm_title(_stats.get("title") or "")
-        if not _nt:
-            continue
-        if _nt in title_to_vid and title_to_vid[_nt] != _vid:
-            ambiguous.add(_nt)
-        else:
-            title_to_vid[_nt] = _vid
+    title_ambiguous: set = set()
+    # 2. upload_date (YYYYMMDD) → [(vid, norm_title, duration_s)]
+    date_to_cands: Dict[str, List[Tuple[str, str, Optional[float]]]] = {}
+    # 3. token → set of vids (for fuzzy prefilter)
+    token_to_vids: Dict[str, set] = {}
+    # Keep a dense list of (vid, norm_title) for difflib.get_close_matches
+    norm_titles: List[str] = []
+    norm_title_to_vid: Dict[str, str] = {}
+    # Map vid → duration (seconds) for disambiguation
+    vid_to_duration: Dict[str, Optional[float]] = {}
 
-    # Walk on-disk + try resolution. _scan_channel_videos already
-    # applies [id]-bracket + DB lookup, so anything it returns with
-    # empty vid_id truly has no existing resolution.
+    for _vid, _stats in bulk.items():
+        _raw_title = _stats.get("title") or ""
+        _nt = _norm_title_for_match(_raw_title)
+        _upload = (_stats.get("upload_date") or "").strip()
+        _dur = _stats.get("duration")
+        try:
+            _dur_f = float(_dur) if _dur is not None else None
+        except (TypeError, ValueError):
+            _dur_f = None
+        vid_to_duration[_vid] = _dur_f
+        if _nt:
+            if _nt in title_to_vid and title_to_vid[_nt] != _vid:
+                title_ambiguous.add(_nt)
+            else:
+                title_to_vid[_nt] = _vid
+            if _nt not in norm_title_to_vid:
+                norm_titles.append(_nt)
+                norm_title_to_vid[_nt] = _vid
+            for _tok in _nt.split():
+                if len(_tok) >= 3:
+                    token_to_vids.setdefault(_tok, set()).add(_vid)
+        if _upload and len(_upload) == 8 and _upload.isdigit():
+            date_to_cands.setdefault(_upload, []).append(
+                (_vid, _nt, _dur_f))
+
+    # ── Scan on-disk videos + resolution passes ──────────────────────
+
+    # Pull local duration_s from the index DB in one query (avoids
+    # ffprobe per file). Populated by register_video for fresh
+    # downloads; older rows may be NULL.
+    _local_durations: Dict[str, Optional[float]] = {}
+    try:
+        from . import index as _idx
+        _conn_pre = _idx._open()
+        if _conn_pre is not None:
+            _pat = str(folder) + "%"
+            with _idx._db_lock:
+                for _row in _conn_pre.execute(
+                        "SELECT filepath, duration_s FROM videos "
+                        "WHERE filepath LIKE ?", (_pat,)):
+                    _local_durations[os.path.normpath(_row[0])] = _row[1]
+    except Exception:
+        pass
+
     on_disk = _scan_channel_videos(folder)
     already_set = 0
-    resolved = 0
     ambiguous_hits = 0
     unresolved = 0
-    to_backfill: List[Tuple[str, str]] = []  # (filepath, video_id)
+    resolved_by = {"info_json": 0, "exact": 0, "substring": 0,
+                   "date": 0, "fuzzy": 0}
+    to_backfill: List[Tuple[str, str, str]] = []  # (filepath, vid, how)
+    # Files that failed every strategy — stamp the tried timestamp.
+    tried_failed_paths: List[str] = []
+
+    def _days_diff(d1: str, d2: str) -> Optional[int]:
+        """Return |d1 - d2| in days for two YYYYMMDD strings. None on
+        any parse error or if either is empty."""
+        if not d1 or not d2 or len(d1) != 8 or len(d2) != 8:
+            return None
+        try:
+            import datetime as _dt
+            dt1 = _dt.datetime.strptime(d1, "%Y%m%d").date()
+            dt2 = _dt.datetime.strptime(d2, "%Y%m%d").date()
+            return abs((dt1 - dt2).days)
+        except Exception:
+            return None
+
+    # Scott's rule: "I'd rather have missing info than incorrect
+    # info". Any title-based strategy (substring or fuzzy) that
+    # picks a candidate MUST also have an upload_date within
+    # _DATE_WINDOW_DAYS of the local file's mtime. yt-dlp's
+    # --mtime sets file mtime to the upload date so these should
+    # match exactly; ±1 day covers timezone drift without opening
+    # the door to "similar title, different video" collisions.
+    _DATE_WINDOW_DAYS = 1
+
+    def _date_confirms(vid: str, local_day: str) -> bool:
+        """True when the candidate vid's upload_date is within
+        _DATE_WINDOW_DAYS of the local file's day. Missing date on
+        either side = reject (conservative — absence of evidence is
+        not evidence of a match)."""
+        if not local_day:
+            return False
+        _ud = (bulk.get(vid, {}).get("upload_date") or "").strip()
+        diff = _days_diff(local_day, _ud)
+        return diff is not None and diff <= _DATE_WINDOW_DAYS
+
+    def _find_substring_match(needle_nt: str, local_day: str) -> str:
+        """Walk the candidate list looking for a SINGLE candidate whose
+        normalized title contains the needle, or vice-versa. Length
+        ratio must be >=0.7 so "the" doesn't match every video.
+        Result must also pass the date window check."""
+        if not needle_nt or len(needle_nt) < 5:
+            return ""
+        # Short-circuit via token prefilter: need at least 2 shared
+        # tokens of length >=3 to even consider.
+        needle_tokens = [t for t in needle_nt.split() if len(t) >= 3]
+        if len(needle_tokens) < 2:
+            return ""
+        from collections import Counter as _Counter
+        counter: _Counter = _Counter()
+        for _tok in needle_tokens:
+            if _tok in token_to_vids:
+                for _v in token_to_vids[_tok]:
+                    counter[_v] += 1
+        _candidate_vids = [v for v, n in counter.items() if n >= 2]
+        hits = []
+        for _v in _candidate_vids:
+            _cnt = bulk.get(_v) or {}
+            _cnt_nt = _norm_title_for_match(_cnt.get("title") or "")
+            if not _cnt_nt:
+                continue
+            _short, _long = sorted([len(needle_nt), len(_cnt_nt)])
+            if _long == 0 or _short / _long < 0.7:
+                continue
+            if needle_nt in _cnt_nt or _cnt_nt in needle_nt:
+                hits.append(_v)
+                if len(hits) > 1:
+                    break  # multiple hits — fall through to date filter
+        if not hits:
+            return ""
+        if len(hits) == 1:
+            # Single title hit — still require date agreement so we
+            # don't accept a rename that happens to share a substring.
+            return hits[0] if _date_confirms(hits[0], local_day) else ""
+        # Multiple substring hits — tiebreak by date. Need exactly
+        # one candidate to land inside the date window.
+        date_hits = [v for v in hits if _date_confirms(v, local_day)]
+        return date_hits[0] if len(date_hits) == 1 else ""
+
+    def _find_fuzzy_match(needle_nt: str, local_day: str) -> str:
+        """Fuzzy match via difflib. Returns '' unless (a) there's a
+        clear winner above the cutoff AND (b) its upload_date agrees
+        with the local file's mtime day. Multiple near-tie matches
+        fall through to a date-based tiebreak (rather than being
+        rejected outright) per Scott's request: 'maybe if more than
+        1 hit, try and determine which is correct based on date?'."""
+        if not needle_nt or len(needle_nt) < 5:
+            return ""
+        # Prefilter by shared tokens so we don't run SequenceMatcher
+        # against every title in a 10K-video channel.
+        needle_tokens = [t for t in needle_nt.split() if len(t) >= 3]
+        if len(needle_tokens) < 2:
+            return ""
+        from collections import Counter as _Counter
+        counter: _Counter = _Counter()
+        for _tok in needle_tokens:
+            if _tok in token_to_vids:
+                for _v in token_to_vids[_tok]:
+                    counter[_v] += 1
+        _shortlist_vids = [v for v, n in counter.items() if n >= 2]
+        if not _shortlist_vids:
+            return ""
+        _shortlist_titles = []
+        _title_to_vid_local: Dict[str, str] = {}
+        for _v in _shortlist_vids:
+            _t = bulk.get(_v, {}).get("title") or ""
+            _nt = _norm_title_for_match(_t)
+            if _nt:
+                _shortlist_titles.append(_nt)
+                _title_to_vid_local[_nt] = _v
+        from difflib import get_close_matches, SequenceMatcher
+        # Ask for more matches than before (5 instead of 3) so the
+        # date-based tiebreak has room to operate when several
+        # similar-ish titles pass the ratio cutoff.
+        matches = get_close_matches(needle_nt, _shortlist_titles,
+                                     n=5, cutoff=0.80)
+        if not matches:
+            return ""
+        # Apply date filter to ALL candidates above the cutoff. This
+        # is the core of Scott's "date tiebreak when titles are
+        # similar" rule — a title that fuzzy-matches several videos
+        # only resolves if exactly one of them also lines up on
+        # upload date.
+        date_approved: List[Tuple[str, float]] = []  # (vid, ratio)
+        for _m in matches:
+            _v = _title_to_vid_local.get(_m)
+            if not _v:
+                continue
+            if not _date_confirms(_v, local_day):
+                continue
+            _r = SequenceMatcher(None, needle_nt, _m).ratio()
+            date_approved.append((_v, _r))
+        if not date_approved:
+            return ""
+        if len(date_approved) == 1:
+            return date_approved[0][0]
+        # Multiple candidates both pass title + date. Take the one
+        # with the highest ratio, but ONLY if it's clearly ahead of
+        # the next one (>=0.05 margin) — otherwise it's still too
+        # close to call and we decline rather than guess.
+        date_approved.sort(key=lambda r: r[1], reverse=True)
+        if date_approved[0][1] - date_approved[1][1] >= 0.05:
+            return date_approved[0][0]
+        return ""
+
+    def _find_date_match(filepath: str,
+                          local_dur: Optional[float]) -> str:
+        """Match by file mtime YYYYMMDD == YT upload_date. When
+        multiple YT videos land on the same day, disambiguate by
+        duration (within 2s)."""
+        try:
+            _mtime = os.path.getmtime(filepath)
+        except OSError:
+            return ""
+        try:
+            import datetime as _dt
+            _day = _dt.datetime.fromtimestamp(_mtime).strftime("%Y%m%d")
+        except Exception:
+            return ""
+        cands = date_to_cands.get(_day, [])
+        if not cands:
+            return ""
+        if len(cands) == 1:
+            return cands[0][0]
+        if local_dur is None or local_dur <= 0:
+            return ""
+        best = ""
+        best_diff = 3.0  # must match within 2s (strict); 3s threshold
+        for (_v, _nt, _yd) in cands:
+            if _yd is None or _yd <= 0:
+                continue
+            _diff = abs(_yd - local_dur)
+            if _diff < best_diff:
+                best_diff = _diff
+                best = _v
+            elif abs(_diff - best_diff) < 0.5 and best:
+                # Two videos same day, near-equal duration — ambiguous.
+                return ""
+        return best
+
+    # Per-file progress tick — the real time sink on a 10k-video
+    # channel is this loop (fuzzy shortlist iteration). Emit every
+    # _MATCH_TICK_EVERY files OR _MATCH_TICK_SECS so the log reflects
+    # ongoing work. Also note progress right before the loop starts
+    # so the user sees the transition from "fetching catalog" to
+    # "matching files".
+    _MATCH_TICK_EVERY = 200
+    _MATCH_TICK_SECS = 5.0
+    _match_total = len(on_disk)
+    if _match_total > 0:
+        try:
+            stream.emit([[f"  \u2014 Catalog has {len(bulk):,} videos \u00b7 "
+                         f"matching {_match_total:,} local file(s)\u2026\n",
+                         "simpleline"]])
+        except Exception:
+            pass
+    _match_processed = 0
+    _match_last_tick = time.time()
+
     for (_v, _t, _y, _m, _fp) in on_disk:
         if cancel_event is not None and cancel_event.is_set():
             break
         while (pause_event is not None and pause_event.is_set()
                and not (cancel_event is not None and cancel_event.is_set())):
             time.sleep(0.25)
+        # Bump the tick BEFORE any continue branch so every file
+        # counted toward progress, regardless of which strategy
+        # path it took (skipped, resolved, or unresolved).
+        _match_processed += 1
+        _now = time.time()
+        if (_match_total > 1000
+                and (_match_processed % _MATCH_TICK_EVERY == 0
+                     or (_now - _match_last_tick) >= _MATCH_TICK_SECS)
+                and _match_processed < _match_total):
+            try:
+                _so_far = sum(resolved_by.values())
+                stream.emit([[f"  \u2014 [{_match_processed:,}/"
+                             f"{_match_total:,}] matched {_so_far:,} "
+                             f"so far\u2026\n", "simpleline"]])
+            except Exception:
+                pass
+            _match_last_tick = _now
         if _v:
             already_set += 1
             continue
-        _nt = _norm_title(_t)
-        if not _nt:
-            unresolved += 1
+
+        # Compute file's mtime day once — used by every title-based
+        # strategy as a safety check (Scott: "if 2 videos have very
+        # similar titles that could cause issues — maybe if more
+        # than 1 hit, try and determine which is correct based on
+        # date?"). yt-dlp's --mtime sets file mtime to the YT upload
+        # date so this should be an exact match when the file is
+        # untouched.
+        _local_day = ""
+        try:
+            import datetime as _dt
+            _local_day = _dt.datetime.fromtimestamp(
+                os.path.getmtime(_fp)).strftime("%Y%m%d")
+        except Exception:
+            _local_day = ""
+
+        # Strategy 1: info.json sidecar
+        _side_vid = _read_info_json_vid(_fp)
+        if _side_vid:
+            to_backfill.append((_fp, _side_vid, "info_json"))
+            resolved_by["info_json"] += 1
             continue
-        if _nt in ambiguous:
+
+        _nt = _norm_title_for_match(_t)
+
+        # Strategy 2: exact normalized title — no date check since
+        # an exact normalized title collision is already strong
+        # evidence; adding date would just shrink the coverage.
+        if _nt and _nt not in title_ambiguous:
+            _exact = title_to_vid.get(_nt, "")
+            if _exact:
+                to_backfill.append((_fp, _exact, "exact"))
+                resolved_by["exact"] += 1
+                continue
+
+        # Strategy 3: substring (date-checked)
+        if _nt:
+            _sub = _find_substring_match(_nt, _local_day)
+            if _sub:
+                to_backfill.append((_fp, _sub, "substring"))
+                resolved_by["substring"] += 1
+                continue
+
+        # Strategy 4: date (single-candidate, or duration-disambiguated)
+        _local_dur = _local_durations.get(os.path.normpath(_fp))
+        _by_date = _find_date_match(_fp, _local_dur)
+        if _by_date:
+            to_backfill.append((_fp, _by_date, "date"))
+            resolved_by["date"] += 1
+            continue
+
+        # Strategy 5: fuzzy difflib (date-checked)
+        if _nt:
+            _fuzzy = _find_fuzzy_match(_nt, _local_day)
+            if _fuzzy:
+                to_backfill.append((_fp, _fuzzy, "fuzzy"))
+                resolved_by["fuzzy"] += 1
+                continue
+
+        # Track ambiguous vs genuinely unresolvable
+        if _nt and _nt in title_ambiguous:
             ambiguous_hits += 1
-            continue
-        _guess = title_to_vid.get(_nt, "")
-        if _guess:
-            to_backfill.append((_fp, _guess))
-            resolved += 1
         else:
             unresolved += 1
+        tried_failed_paths.append(_fp)
 
-    # One UPDATE per resolved row. Chunked commit so a huge channel
-    # doesn't block the DB for seconds.
-    if to_backfill:
-        try:
-            from . import index as _idx
-            conn = _idx._open()
-            if conn is not None:
-                with _idx._db_lock:
-                    for _fp, _vid in to_backfill:
-                        _vurl = f"https://www.youtube.com/watch?v={_vid}"
-                        try:
-                            conn.execute(
-                                "UPDATE videos SET video_id=?, video_url=? "
-                                "WHERE filepath=? COLLATE NOCASE "
-                                "AND (video_id IS NULL OR video_id='')",
-                                (_vid, _vurl, _fp))
-                        except Exception:
-                            pass
-                    conn.commit()
-        except Exception as _e:
-            stream.emit_error(f"Backfill DB write failed: {_e}")
+    resolved = sum(resolved_by.values())
+
+    # ── Persist: UPDATE resolved rows + stamp tried-failed rows ──────
+
+    _now_ts = time.time()
+    try:
+        from . import index as _idx
+        conn = _idx._open()
+        if conn is not None:
+            with _idx._db_lock:
+                for _fp, _vid, _how in to_backfill:
+                    _vurl = f"https://www.youtube.com/watch?v={_vid}"
+                    try:
+                        conn.execute(
+                            "UPDATE videos SET video_id=?, video_url=?, "
+                            "id_backfill_tried_ts=? "
+                            "WHERE filepath=? COLLATE NOCASE "
+                            "AND (video_id IS NULL OR video_id='')",
+                            (_vid, _vurl, _now_ts, _fp))
+                    except Exception:
+                        pass
+                # Stamp tried-ts on rows that failed every strategy
+                # so the UI can tell the user these are probably
+                # genuinely unresolvable (title changed too much,
+                # channel renamed them, etc.).
+                for _fp in tried_failed_paths:
+                    try:
+                        conn.execute(
+                            "UPDATE videos SET id_backfill_tried_ts=? "
+                            "WHERE filepath=? COLLATE NOCASE "
+                            "AND (video_id IS NULL OR video_id='')",
+                            (_now_ts, _fp))
+                    except Exception:
+                        pass
+                conn.commit()
+    except Exception as _e:
+        stream.emit_error(f"Backfill DB write failed: {_e}")
 
     took = time.time() - t0
     _parts = []
     if resolved:
         _parts.append(f"{resolved} resolved")
+        _breakdown_bits = []
+        if resolved_by["info_json"]:
+            _breakdown_bits.append(f"{resolved_by['info_json']} .info.json")
+        if resolved_by["exact"]:
+            _breakdown_bits.append(f"{resolved_by['exact']} exact")
+        if resolved_by["substring"]:
+            _breakdown_bits.append(f"{resolved_by['substring']} substring")
+        if resolved_by["date"]:
+            _breakdown_bits.append(f"{resolved_by['date']} date+dur")
+        if resolved_by["fuzzy"]:
+            _breakdown_bits.append(f"{resolved_by['fuzzy']} fuzzy")
+        if _breakdown_bits:
+            _parts.append("(" + ", ".join(_breakdown_bits) + ")")
     if already_set:
         _parts.append(f"{already_set} already set")
     if ambiguous_hits:
-        _parts.append(f"{ambiguous_hits} ambiguous (skipped)")
+        _parts.append(f"{ambiguous_hits} ambiguous")
     if unresolved:
         _parts.append(f"{unresolved} unresolved")
     if not _parts:
@@ -1715,9 +2162,11 @@ def backfill_video_ids(channel: Dict[str, Any],
     return {
         "ok": True,
         "resolved": resolved,
+        "resolved_by": resolved_by,
         "already_set": already_set,
         "ambiguous": ambiguous_hits,
         "unresolved": unresolved,
+        "unresolved_now_tried": len(tried_failed_paths),
         "took": took,
     }
 

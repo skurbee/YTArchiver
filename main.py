@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v56.0"
-APP_VERSION_DATE = "4.24.26 11:27am"
+APP_VERSION      = "v56.5"
+APP_VERSION_DATE = "4.24.26 12:38pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2979,7 +2979,7 @@ class Api:
         rows = []
         for ch in ch_copy:
             _idstats = _cvids(ch) if _cvids else {
-                "total": 0, "with_id": 0, "missing": 0}
+                "total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
             rows.append({
                 "name": ch.get("name") or ch.get("folder") or "",
                 "folder": ch.get("folder") or "",
@@ -2990,6 +2990,11 @@ class Api:
                 "id_total": _idstats.get("total", 0),
                 "id_with_id": _idstats.get("with_id", 0),
                 "id_missing": _idstats.get("missing", 0),
+                # Count of missing videos that the backfill pass has
+                # already tried and couldn't resolve. Powers the UI
+                # "K tried / Y not yet attempted" breakdown so the
+                # user knows when Fix IDs is worth re-running.
+                "id_tried_failed": _idstats.get("tried_failed", 0),
             })
         # Sort oldest-refresh-first by default so stale channels float up.
         # A missing timestamp (never refreshed) sorts as oldest (ts=0).

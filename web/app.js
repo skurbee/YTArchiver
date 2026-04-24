@@ -3862,21 +3862,54 @@
         const v = fmtRel(r.last_views_refresh_ts);
         const c = fmtRel(r.last_comments_refresh_ts);
         const ident = JSON.stringify({ folder: r.folder, url: r.url });
-        // Video IDs status: compute icon + optional ratio suffix +
-        // color class based on missing-count. DB-only count — reflects
-        // what bulk views/likes refresh can actually match.
+        // Video IDs status: compute icon + percentage + color class.
+        // DB-only count — reflects what bulk views/likes refresh can
+        // actually match. Most channels hover at 98-99% (a handful of
+        // removed/privated videos YouTube no longer lists); only
+        // genuine trouble channels drop below the warning threshold.
         const idTotal = r.id_total || 0;
         const idWith = r.id_with_id || 0;
         const idMissing = r.id_missing || 0;
+        const idTriedFailed = r.id_tried_failed || 0;
+        const idNotYet = Math.max(0, idMissing - idTriedFailed);
+        // Threshold below which we turn the cell orange + flag with
+        // a warning triangle. 90% catches the real outliers (e.g. a
+        // late-night TV channel with mass DMCA takedowns) without
+        // flagging typical 164/166 or 453/458 archives.
+        const ID_WARN_THRESHOLD = 0.90;
         let idHtml;
         if (idTotal === 0) {
           idHtml = '<span class="md-id-dim" title="No videos registered in the index DB for this channel">&mdash;</span>';
-        } else if (idMissing === 0) {
-          idHtml = `<span class="md-id-ok" title="All ${idTotal.toLocaleString()} video(s) have a resolvable video_id">\u2713 ${idTotal.toLocaleString()}</span>`;
-        } else if (idWith === 0) {
-          idHtml = `<span class="md-id-bad" title="None of the ${idTotal.toLocaleString()} video(s) have video_ids — run Fix IDs">\u2717 0<span class="md-id-ratio">/${idTotal.toLocaleString()}</span></span>`;
         } else {
-          idHtml = `<span class="md-id-warn" title="${idMissing.toLocaleString()} video(s) missing video_id — run Fix IDs to backfill">\u26A0 ${idWith.toLocaleString()}<span class="md-id-ratio">/${idTotal.toLocaleString()}</span></span>`;
+          const pct = idWith / idTotal;
+          const pctStr = (pct * 100).toFixed(1) + "%";
+          // Rich tooltip: show the split between "tried but
+          // couldn't resolve" (probably genuinely unrecoverable)
+          // vs "not yet attempted" (run Fix IDs to pick these up).
+          let detail = `${idWith.toLocaleString()} of ${idTotal.toLocaleString()} video(s) have resolvable video IDs`;
+          if (idMissing > 0) {
+            detail += ` — ${idMissing.toLocaleString()} missing`;
+            if (idTriedFailed > 0 && idNotYet > 0) {
+              detail += ` (${idTriedFailed.toLocaleString()} tried unsuccessfully, ${idNotYet.toLocaleString()} not yet attempted — run Fix IDs)`;
+            } else if (idTriedFailed > 0) {
+              detail += ` (all tried — likely renamed or removed from YouTube)`;
+            } else {
+              detail += ` (run Fix IDs to backfill)`;
+            }
+          }
+          if (idMissing === 0) {
+            // 100% — keep the checkmark so "all good" is instantly
+            // readable without parsing digits.
+            idHtml = `<span class="md-id-ok" title="${detail}">\u2713 100%</span>`;
+          } else if (idWith === 0) {
+            idHtml = `<span class="md-id-bad" title="${detail}">\u2717 0%</span>`;
+          } else if (pct < ID_WARN_THRESHOLD) {
+            idHtml = `<span class="md-id-warn" title="${detail}">\u26A0 ${pctStr}</span>`;
+          } else {
+            // 90-99% — acceptable range. No warning; just show
+            // the percentage in the neutral row color.
+            idHtml = `<span class="md-id-neutral" title="${detail}">${pctStr}</span>`;
+          }
         }
         // Stash the "needs fix" state on the button so the click
         // handler's menu can emphasize Fix IDs when relevant (and so
@@ -4070,11 +4103,10 @@
         }
         const pick = await (window.askChoice ? window.askChoice({
           title: "Refresh all comments",
-          message: "Comments use the slow per-video yt-dlp path — scope to recent uploads when possible.",
+          message: "Comments use the slow per-video yt-dlp path \u2014 scope to recent uploads when possible.",
           choices: [
-            { label: "Last 7 days", value: 7, kind: "primary" },
-            { label: "Last 30 days", value: 30 },
-            { label: "Last 90 days", value: 90 },
+            { label: "1 month", value: 30, kind: "primary" },
+            { label: "1 year", value: 365 },
             { label: "All videos (slow!)", value: 0, kind: "ghost" },
           ],
         }) : Promise.resolve(30));

@@ -130,6 +130,13 @@ def _open() -> Optional[sqlite3.Connection]:
                 # segments only carry year+month so bucketing weeks
                 # requires joining videos for full-date resolution.
                 "ALTER TABLE videos ADD COLUMN upload_ts REAL",
+                # Last time a video_id backfill pass attempted this
+                # row and couldn't resolve. Lets the UI tell the user
+                # "K of N missing were tried unsuccessfully; Y not yet
+                # attempted — run Fix IDs" instead of pretending Fix
+                # IDs might help every time. Also used by future
+                # passes to deprioritize already-exhausted rows.
+                "ALTER TABLE videos ADD COLUMN id_backfill_tried_ts REAL",
             ):
                 try:
                     _conn.execute(stmt)

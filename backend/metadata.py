@@ -116,21 +116,39 @@ def _read_metadata_jsonl(jsonl_path: str) -> Dict[str, Dict[str, Any]]:
     existing: Dict[str, Dict[str, Any]] = {}
     if not os.path.isfile(jsonl_path):
         return existing
+    # audit H-15: track corrupt-line count and log a warning if any.
+    # Previously bad JSON lines were silently skipped (`continue`),
+    # leaving the user with no signal that metadata for some videos
+    # was effectively missing. With a counter and warning, the user
+    # can investigate the file instead of wondering why views/likes
+    # never refresh for certain videos.
+    _bad_lines = 0
+    _total_lines = 0
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                _total_lines += 1
                 try:
                     entry = json.loads(line)
                     vid = entry.get("video_id", "")
                     if vid:
                         existing[vid] = entry
                 except json.JSONDecodeError:
+                    _bad_lines += 1
                     continue
     except Exception:
         pass
+    if _bad_lines > 0:
+        try:
+            print(
+                f"[metadata] {jsonl_path}: {_bad_lines}/{_total_lines} "
+                f"JSONL lines were corrupt and skipped. "
+                f"Metadata for those videos will appear missing.")
+        except Exception:
+            pass
     return existing
 
 
@@ -1370,6 +1388,17 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         for (_v, _t, _y, _m, _fp) in on_disk:
             if _v and _fp:
                 fp_by_id[_v] = (_fp, _t or "")
+        # Progress tick: emit a dim "[N/total] processed" line every
+        # _PROGRESS_TICK_EVERY videos OR every _PROGRESS_TICK_SECS
+        # so a 600-video channel doesn't look stuck for an hour
+        # between the initial "N video(s) have updated counts..."
+        # line and the final summary. User flagged this as "refresh
+        # views got stuck" on Bernie Sanders (610 videos).
+        _PROGRESS_TICK_EVERY = 25
+        _PROGRESS_TICK_SECS = 20.0
+        _last_tick_ts = time.time()
+        _processed = 0
+        _total = len(changed_ids)
         for vid in changed_ids:
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -1378,6 +1407,7 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
                 time.sleep(0.25)
             _pair = fp_by_id.get(vid)
             if not _pair:
+                _processed += 1
                 continue
             fp, title_hint = _pair
             try:
@@ -1391,6 +1421,21 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
             except Exception as _e:
                 stream.emit_dim(f" (full fetch failed for {vid}: {_e})")
                 full_errors += 1
+            _processed += 1
+            # Emit progress tick on count OR time boundary, whichever
+            # comes first. Skip the very last one (final summary line
+            # replaces it immediately below).
+            _now = time.time()
+            if _processed < _total and (
+                    _processed % _PROGRESS_TICK_EVERY == 0
+                    or (_now - _last_tick_ts) >= _PROGRESS_TICK_SECS):
+                try:
+                    stream.emit_dim(
+                        f" \u2014 [{_processed}/{_total}] "
+                        f"fetching metadata\u2026")
+                except Exception:
+                    pass
+                _last_tick_ts = _now
 
     # Stamp last-refresh timestamp on the channel config. Separate
     # from per-video fetched_at so the Subs UI can say "refreshed

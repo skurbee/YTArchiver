@@ -33,7 +33,29 @@ from typing import Any, Callable, Dict, Optional
 
 
 _CMD_PORT = 9855
-_CMD_BIND = os.environ.get("YTARCHIVER_CMD_BIND", "127.0.0.1")
+# audit C-5: the previous default of `os.environ.get(...)` meant a
+# legacy `YTARCHIVER_CMD_BIND=0.0.0.0` in the user's env would
+# silently re-open the LAN binding even after the 2026-04-23 fix.
+# Require both the env-var AND an explicit opt-in flag
+# `YTARCHIVER_CMD_ALLOW_LAN=1`. Without the second flag, non-
+# loopback bind addresses are ignored and we fall back to
+# loopback. Scott can set both if he needs the old cross-host
+# integration (ArchivePlayer on another PC).
+_env_bind = os.environ.get("YTARCHIVER_CMD_BIND", "127.0.0.1")
+_allow_lan = os.environ.get("YTARCHIVER_CMD_ALLOW_LAN", "") == "1"
+_is_loopback = _env_bind in ("127.0.0.1", "localhost", "::1")
+_CMD_BIND = _env_bind if (_is_loopback or _allow_lan) else "127.0.0.1"
+# If the user asked for LAN binding without the explicit opt-in,
+# print a one-line warning so they know why the effective bind is
+# loopback.
+if _env_bind != "127.0.0.1" and not _allow_lan:
+    print(f"[cmd] ignoring YTARCHIVER_CMD_BIND={_env_bind} — set "
+          "YTARCHIVER_CMD_ALLOW_LAN=1 to confirm LAN exposure.")
+
+# ArchivePlayer companion integration note: if the ArchivePlayer
+# project ever moves to a different host it will need to either
+# (a) run on the same machine (loopback) or (b) set both env vars
+# AND add its own auth header / token. See Scott's audit C-5 notes.
 
 
 _HANDLERS: Dict[str, Dict[str, Callable]] = {"get": {}, "post": {}}
@@ -62,14 +84,42 @@ def _read_body(request) -> Dict[str, Any]:
 class _CmdHandler(_http_server.BaseHTTPRequestHandler):
     server_version = "YTArchiver-CMD"
 
+    def _cors_origin(self) -> str:
+        """audit C-5: return the Access-Control-Allow-Origin value.
+        Wildcard "*" was the prior behavior and let any webpage in
+        any browser tab issue cross-origin POSTs to /cmd/retranscribe.
+        Restrict to null (file://), and localhost origins — the only
+        callers that should reach this server are (a) the pywebview
+        shell from a file:// URL and (b) ArchivePlayer from loopback
+        Python (no CORS gate on non-browser clients). If the
+        incoming Origin doesn't match, omit the CORS header so the
+        browser blocks the response — functionality for the real
+        callers is preserved, CSRF surface eliminated.
+        """
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            # Non-browser (ArchivePlayer / curl) — no CORS needed.
+            return ""
+        if origin in ("null",):
+            return origin
+        if origin.startswith("http://127.0.0.1") or \
+                origin.startswith("http://localhost") or \
+                origin.startswith("https://127.0.0.1") or \
+                origin.startswith("https://localhost"):
+            return origin
+        # Unknown origin — don't advertise CORS. Browser will block.
+        return ""
+
     def _json(self, code, body):
         payload = json.dumps(body).encode("utf-8")
         try:
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            _origin = self._cors_origin()
+            if _origin:
+                self.send_header("Access-Control-Allow-Origin", _origin)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
             self.wfile.write(payload)
         except Exception:
@@ -78,9 +128,11 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         try:
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            _origin = self._cors_origin()
+            if _origin:
+                self.send_header("Access-Control-Allow-Origin", _origin)
+                self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
         except Exception:
             pass

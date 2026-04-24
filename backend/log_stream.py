@@ -31,6 +31,12 @@ SegmentList = List[Segment] # one log line
 # Matches YTArchiver's Simple mode filter at ~line 17776.
 VERBOSE_ONLY_TAGS = frozenset({
     "dim",
+    # audit LG-7: `filterskip` lines (e.g. "[Skip] — short video
+    # filtered (< 60s): ...") were leaking into Simple mode because
+    # only the secondary `filterskip_dim` tag was in this set.
+    # Primary `filterskip` needs to be here too so `_line_is_verbose_only`
+    # classifies the whole line as verbose-only.
+    "filterskip",
     "filterskip_dim",
     "dlprogress",
     "dlprogress_pct",
@@ -71,6 +77,13 @@ def _line_is_verbose_only(segments: SegmentList) -> bool:
         text, tag = seg[0], seg[1]
         # Lines with only "\n" or empty text don't contribute
         if text in (None, "", "\n"):
+            continue
+        # audit M-20: whitespace-only segments (leading " ", padding
+        # " \u2014 ") shouldn't flip the whole line to verbose-only
+        # purely because their tag is None or non-verbose. These
+        # are layout glue, not content. Skip them in the decision
+        # the same way empty text is skipped.
+        if text.strip() == "":
             continue
         saw_content = True
         if tag is None:

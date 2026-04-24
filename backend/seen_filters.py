@@ -42,7 +42,11 @@ def is_seen(title: str) -> bool:
         return False
     with _lock:
         _load_locked()
-        return title.strip() in _cache
+        # audit M-16: case-insensitive match so channels that re-use
+        # a title with different casing ("The Video" vs "the video")
+        # don't emit duplicate [Skip] log lines for what's really
+        # the same video.
+        return title.strip().lower() in {t.lower() for t in _cache}
 
 
 def mark_seen(title: str) -> bool:
@@ -53,7 +57,9 @@ def mark_seen(title: str) -> bool:
     t = title.strip()
     with _lock:
         _load_locked()
-        if t in _cache:
+        # Case-insensitive dedup (matches audit M-16 in is_seen).
+        _lower = t.lower()
+        if any(existing.lower() == _lower for existing in _cache):
             return False
         _cache.add(t)
     if config_is_writable():

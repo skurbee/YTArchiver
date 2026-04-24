@@ -195,19 +195,29 @@ def _build_metadata_index(folder: str) -> Dict[str, Any]:
     out = {"by_title": {}, "by_date": {}, "by_id": {}}
     if not folder or not os.path.isdir(folder):
         return out
+    # audit M-22: count JSONL-parse failures per file so a corrupt
+    # metadata file doesn't silently drop half its entries from the
+    # match index. If any file has notable corruption, emit a dim
+    # warning so the user can investigate before redownload runs
+    # against an incomplete match set.
+    _bad_by_file: Dict[str, int] = {}
+    _total_by_file: Dict[str, int] = {}
     for dp, _dns, fns in os.walk(folder):
         for fn in fns:
             if not (fn.startswith(".") and fn.endswith("Metadata.jsonl")):
                 continue
+            _full = os.path.join(dp, fn)
             try:
-                with open(os.path.join(dp, fn), "r", encoding="utf-8") as f:
+                with open(_full, "r", encoding="utf-8") as f:
                     for ln in f:
                         ln = ln.strip()
                         if not ln:
                             continue
+                        _total_by_file[_full] = _total_by_file.get(_full, 0) + 1
                         try:
                             obj = json.loads(ln)
                         except Exception:
+                            _bad_by_file[_full] = _bad_by_file.get(_full, 0) + 1
                             continue
                         vid = (obj.get("video_id") or "").strip()
                         title = (obj.get("title") or "").strip()
@@ -223,6 +233,13 @@ def _build_metadata_index(folder: str) -> Dict[str, Any]:
                                 upload_date, []).append((vid, title))
             except OSError:
                 continue
+    # Surface parse stats via print (log_stream isn't available here;
+    # caller can decide whether to convert to a log line if desired).
+    for _fp, _bad in _bad_by_file.items():
+        _total = _total_by_file.get(_fp, 0)
+        if _total > 0 and _bad > 0:
+            print(f"[redownload] {_fp}: {_bad}/{_total} JSONL lines corrupt "
+                  f"(matched video IDs may be incomplete)")
     return out
 
 
@@ -417,6 +434,10 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         yt_dlp,
         "--newline", "--no-quiet",
         "--mtime",
+        # audit F-21: resume partials on restart (same rationale as
+        # the sync path). Redownload stages into _REDOWNLOAD_TEMP
+        # and the full partial is there to resume from.
+        "--continue",
         "--trim-filenames", "200",
         "-f", fmt,
         "--merge-output-format", "mp4",
@@ -460,11 +481,27 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     # clears empty dirs. Sweep everything we might have written before
     # returning so cancels don't leak GBs per use.
     if _cancelled:
+        # audit M-28: broaden the cancel cleanup to catch every
+        # file yt-dlp may have produced — .mkv/.mp4 merge
+        # intermediates, .tmp, .ytdl (resume state), .frag (HLS
+        # fragments) — not just `video_id*`+`.part`. Redownload
+        # temp dir is scratch-only, so a broad listdir-and-delete
+        # is safe here; anything legitimately in-flight for
+        # another video already lives under its own subdir or
+        # file-name prefix so would match the known prefixes. We
+        # still restrict the sweep to files NOT currently open
+        # by prefix-matching video_id or any of the temp exts.
+        _cancel_exts = (".part", ".part-Frag", ".ytdl", ".tmp",
+                        ".frag", ".fragment")
         try:
             for fn in os.listdir(temp_dir):
-                if fn.startswith(video_id) or fn.endswith(".part"):
+                _full = os.path.join(temp_dir, fn)
+                if not os.path.isfile(_full):
+                    continue
+                if (fn.startswith(video_id)
+                        or fn.endswith(_cancel_exts)):
                     try:
-                        os.remove(os.path.join(temp_dir, fn))
+                        os.remove(_full)
                     except OSError:
                         pass
         except OSError:
@@ -564,6 +601,15 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     if not yt_titles:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [" YouTube catalog fetch failed.\n", "red"]])
+        # audit M-29: clear the progress file so the next attempt
+        # doesn't resume against a stale catalog-vs-progress mapping.
+        # Leaving the old progress around meant the retry tried to
+        # skip videos whose IDs came from a different catalog view,
+        # producing silent mismatches.
+        try:
+            _clear_progress(folder)
+        except Exception:
+            pass
         return {"ok": False, "done": 0, "errors": 1, "total": 0}
 
     # 3. Match. Load the aggregated `.{ch} Metadata.jsonl` files under
@@ -668,8 +714,25 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 [f"  \u23F8 ", "pauselog"],
                 ["Redownload paused \u2014 click Resume.\n", "pauselog"],
             ])
+            # audit M-30: emit a subtle paused-activity tick every
+            # 60s so a long pause doesn't look like a crashed worker.
+            # Without this, pausing for 30 min showed no log activity
+            # and users thought the app died.
+            _paused_since = time.time()
+            _last_tick = _paused_since
             while pause_ev.is_set() and not cancel_ev.is_set():
                 time.sleep(0.25)
+                _now = time.time()
+                if _now - _last_tick >= 60.0:
+                    _mins = int((_now - _paused_since) // 60)
+                    try:
+                        stream.emit([
+                            [f"  \u23F8 ", "pauselog"],
+                            [f"Still paused ({_mins}m)\u2026\n", "dim"],
+                        ])
+                    except Exception:
+                        pass
+                    _last_tick = _now
             if not cancel_ev.is_set():
                 stream.emit([
                     [f"  \u25B6 ", "simpleline_redwnl"],

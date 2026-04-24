@@ -499,6 +499,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         yt,
         "--newline", "--no-quiet",
         "--mtime", # file mtime = YT upload date (matches original)
+        # audit F-21: --continue lets yt-dlp resume a partial .part
+        # file if the app crashes or is restarted mid-download.
+        # Without this flag, a restart discards the partial and
+        # re-downloads the whole video. Especially valuable for
+        # large 4K files on flaky connections.
+        "--continue",
         "--trim-filenames", "200",
         "--format", fmt,
         "--merge-output-format", "mp4",
@@ -545,8 +551,15 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # syncs only grab new uploads". The download-archive file is what
     # prevents re-downloading across runs.
     cmd += ["--download-archive", str(ARCHIVE_FILE)]
+    # audit M-46: sync_complete default flipped False → True was
+    # wrong. A channel missing this key (import, migration, or a
+    # legacy config) had its fast-path gated on True-by-default,
+    # meaning a brand-new or mid-bootstrap channel could take
+    # --break-on-existing on its first walk and skip middle
+    # videos. False default is the safe pick: fast-path only
+    # after an explicit flip from the config-write path below.
     _is_init = bool(channel.get("initialized", False))
-    _sync_ok = bool(channel.get("sync_complete", True))
+    _sync_ok = bool(channel.get("sync_complete", False))
     if channel.get("init_complete", False):
         _sync_ok = True
     if _is_init and _sync_ok:
@@ -1014,10 +1027,19 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                              [f"{_dur_str}\n", "dim"]])
                         try:
                             from . import index as _idx
+                            # audit C-8: pass the duration through so
+                            # duration_s lands in the videos table.
+                            # `dur` at this point is a float (seconds)
+                            # coming from yt-dlp's DLTRACK line.
+                            try:
+                                _dur_val = float(dur) if dur else None
+                            except (TypeError, ValueError):
+                                _dur_val = None
                             _idx.register_video(
                                 final_path, name, t,
                                 tx_status="pending" if auto_tx else "no_captions",
-                                video_id=vid)
+                                video_id=vid,
+                                duration_secs=_dur_val)
                         except Exception as _re:
                             # bug S-1: surface the failure so the user
                             # knows a download they just saw succeed is
@@ -1546,6 +1568,19 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # bails fast. Without this write, new channels never graduate to
     # the fast-sync path.
     if config_is_writable():
+        # audit H-1: normalize the URL once here so the channel-match
+        # loop below can't silently fail on a trailing-slash /
+        # www-prefix / casing difference. Without normalization, a
+        # mismatch meant `_dirty` stayed False, no channel was
+        # updated, initialized never flipped → sync stuck in slow
+        # path forever.
+        try:
+            from . import subs as _subs_norm
+            _url_norm = _subs_norm.normalize_channel_url(url) or url
+        except Exception:
+            _url_norm = url
+        _url_norm = (_url_norm or "").strip().rstrip("/")
+        _config_write_err: Optional[str] = None
         try:
             # bug C-1: `now` was referenced below without ever being
             # defined in this scope. The outer try/except silently swallowed
@@ -1580,9 +1615,20 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # is still being checked — last_sync going stale-for-months
             # made users think their channel wasn't syncing when it
             # was. No new downloads doesn't mean no activity.
+            _matched_any = False
             for c in cfg2.get("channels", []):
-                if c.get("url", "").strip() != url:
+                # audit H-1: compare normalized URLs so a saved
+                # `youtube.com/@ch/` and a live `www.youtube.com/@ch`
+                # still match the same row.
+                _c_url = (c.get("url", "") or "").strip().rstrip("/")
+                try:
+                    _c_norm = _subs_norm.normalize_channel_url(_c_url) or _c_url
+                except Exception:
+                    _c_norm = _c_url
+                _c_norm = (_c_norm or "").strip().rstrip("/")
+                if _c_norm != _url_norm and _c_url != url:
                     continue
+                _matched_any = True
                 # Capture the pre-update `initialized` state so we can
                 # tell whether this pass is a bootstrap (first-ever
                 # sync of a brand-new channel, EVERY video freshly
@@ -1619,8 +1665,28 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 _dirty = True
             if _dirty:
                 save_config(cfg2)
-        except Exception:
-            pass
+            if not _matched_any:
+                # audit H-1: surface the mismatch as a dim warning.
+                # Before, a URL-normalization mismatch silently no-
+                # op'd the whole config write; no log line existed
+                # to explain why the channel never graduated to
+                # fast-path.
+                _config_write_err = (
+                    f"config update: no channel matched URL "
+                    f"{url!r} (normalized {_url_norm!r}) — "
+                    f"last_sync/initialized/sync_complete not written.")
+        except (OSError, PermissionError, ValueError, KeyError) as _ce:
+            # audit H-2: narrow the catch. Bare `except Exception: pass`
+            # was hiding config-write failures (disk full, file lock,
+            # JSON parse error from a corrupted config). Now we log a
+            # dim warning so the user can investigate instead of
+            # puzzling over why syncs never gain the fast-path flags.
+            _config_write_err = f"config update failed: {_ce}"
+        if _config_write_err:
+            try:
+                stream.emit_dim(f" ({_config_write_err})")
+            except Exception:
+                pass
 
     # Safety net: after the sync pass completes, sweep the channel folder
     # for orphan .vtt caption files and delete them. yt-dlp can drop

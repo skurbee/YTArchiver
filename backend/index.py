@@ -147,6 +147,12 @@ def _open() -> Optional[sqlite3.Connection]:
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr ON videos(channel, year)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr_mo ON videos(channel, year, month)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_video_id ON videos(video_id)",
+                # audit L-16: compound index so the cross-channel
+                # duplicate-detection query in prune_missing_videos
+                # ("WHERE video_id=? AND filepath != ?") uses an
+                # index instead of a full scan. Noticeable difference
+                # once videos crosses 100k rows.
+                "CREATE INDEX IF NOT EXISTS idx_vid_video_id_channel ON videos(video_id, channel)",
             ):
                 try:
                     _conn.execute(stmt)
@@ -202,7 +208,8 @@ def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[
 
 def register_video(filepath: str, channel: str, title: Optional[str] = None,
                    tx_status: str = "pending",
-                   video_id: Optional[str] = None) -> bool:
+                   video_id: Optional[str] = None,
+                   duration_secs: Optional[float] = None) -> bool:
     """Add a newly downloaded video to the videos table.
 
     Called by sync.py each time a .mp4 lands. Browse tab + Index tab both
@@ -273,11 +280,23 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
             # explicit `added_ts=excluded.added_ts` would still reset;
             # instead we write added_ts=? only if the row is new, via
             # COALESCE against the existing value.
+            # audit C-8: populate duration_s so "Sort by duration" and
+            # per-channel runtime totals actually work. If caller
+            # passed duration_secs, use it; otherwise leave NULL /
+            # preserve existing value on update (COALESCE pattern).
+            _dur = None
+            try:
+                if duration_secs is not None:
+                    _d = float(duration_secs)
+                    if _d > 0:
+                        _dur = _d
+            except (TypeError, ValueError):
+                _dur = None
             conn.execute(
                 """INSERT INTO videos
                    (title, channel, year, month, filepath, video_id, video_url,
-                    size_bytes, tx_status, added_ts, upload_ts)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    size_bytes, duration_s, tx_status, added_ts, upload_ts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            COALESCE(
                              (SELECT added_ts FROM videos
                               WHERE filepath=? COLLATE NOCASE),
@@ -291,13 +310,17 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
                      video_id=excluded.video_id,
                      video_url=excluded.video_url,
                      size_bytes=excluded.size_bytes,
+                     duration_s=COALESCE(excluded.duration_s, videos.duration_s),
                      tx_status=excluded.tx_status,
                      upload_ts=excluded.upload_ts
                      /* added_ts deliberately omitted from UPDATE — preserves
-                        the original registration timestamp. */
+                        the original registration timestamp.
+                        duration_s uses COALESCE so a re-register with
+                        no duration info doesn't wipe a previously-set
+                        value. */
                 """,
                 (title, channel, year, month, fp, vid_id, vid_url,
-                 size, tx_status,
+                 size, _dur, tx_status,
                  fp, time.time(), upload_ts),
             )
             conn.commit()
@@ -409,6 +432,16 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 e_val = seg.get("end") if "end" in seg else seg.get("e", 0)
                 t_val = seg.get("text") if "text" in seg else seg.get("t", "")
                 w_val = seg.get("words") if "words" in seg else seg.get("w", [])
+                # audit L-17 / L-19: skip segments with no text content
+                # (Whisper sometimes emits silence-only segments with
+                # empty "t"). Inserting them bloats the FTS index with
+                # empty rows the user can never land on. Also skip if
+                # w_val is a malformed non-list — json.dumps would still
+                # succeed but the saved form would break word-cloud.
+                if not (t_val or "").strip():
+                    continue
+                if not isinstance(w_val, list):
+                    w_val = []
                 # Also prefer per-entry video_id/title if the JSONL carries
                 # them (OLD-compat long-form). Falls back to path-derived.
                 seg_vid = (seg.get("video_id") or vid_id or "").strip()
@@ -421,9 +454,9 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                     month,
                     float(s_val or 0),
                     float(e_val or 0),
-                    t_val or "",
+                    t_val,
                     jp,
-                    json.dumps(w_val or [], ensure_ascii=False),
+                    json.dumps(w_val, ensure_ascii=False),
                 ))
             cur = conn.executemany(
                 """INSERT INTO segments
@@ -749,8 +782,19 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
 
         # View count: fetch from aggregated metadata when available
         if meta:
-            row["view_count"] = int(meta.get("view_count") or 0)
-            row["like_count"] = int(meta.get("like_count") or 0)
+            # audit H-14: a corrupted JSONL entry with view_count="N/A"
+            # would raise ValueError out of this cast and abort the
+            # entire Browse grid render for the channel. Guard with
+            # try/except and fall back to 0 so one bad row doesn't
+            # hide all the others.
+            try:
+                row["view_count"] = int(meta.get("view_count") or 0)
+            except (TypeError, ValueError):
+                row["view_count"] = 0
+            try:
+                row["like_count"] = int(meta.get("like_count") or 0)
+            except (TypeError, ValueError):
+                row["like_count"] = 0
             # Surface as display "views" too
             v = row["view_count"]
             if v >= 1_000_000:
@@ -851,6 +895,10 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
         # that string. Earlier this query tested 'done' — a mismatch
         # that made fully-transcribed channels read as "0 / N" in the
         # Edit-channel disk-stats footer.
+        # audit M-36: exclude duplicate rows (is_duplicate_of NOT NULL)
+        # from the counts. The Browse grid hides duplicates already,
+        # so the footer "N/M transcribed" should match the visible
+        # row count, not include hidden dups.
         row = conn.execute(
             """SELECT
                  COUNT(*) AS total,
@@ -860,7 +908,8 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
                           THEN 1 ELSE 0 END) AS pending,
                  SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed
                FROM videos
-               WHERE channel = ? COLLATE NOCASE""",
+               WHERE channel = ? COLLATE NOCASE
+                 AND is_duplicate_of IS NULL""",
             (channel,),
         ).fetchone()
         if row:
@@ -1876,10 +1925,37 @@ def prune_missing_videos() -> Dict[str, int]:
                         "AND filepath != ? COLLATE NOCASE",
                         (vid, fp)).fetchone()
                     if not other or other[0] == 0:
+                        # audit H-9: cascade the segment delete into
+                        # the FTS external-content table so the
+                        # rowids we just orphaned can't keep
+                        # producing phantom search hits. Using
+                        # segments_fts's special 'delete' command
+                        # would require per-row text, so just drop
+                        # every fts row whose rowid is no longer in
+                        # segments. Simpler + bulletproof.
+                        _seg_ids = [r[0] for r in conn.execute(
+                            "SELECT id FROM segments WHERE video_id=?",
+                            (vid,)).fetchall()]
                         c1 = conn.execute(
                             "DELETE FROM segments WHERE video_id=?",
                             (vid,))
                         segs_removed += c1.rowcount or 0
+                        # Best-effort FTS delete. Skip silently if
+                        # the segments_fts table doesn't exist (very
+                        # old DB).
+                        if _seg_ids:
+                            try:
+                                # Chunk to stay under SQLite's bound
+                                # parameter limit (999 default).
+                                for _start in range(0, len(_seg_ids), 500):
+                                    _chunk = _seg_ids[_start:_start + 500]
+                                    _ph = ",".join("?" * len(_chunk))
+                                    conn.execute(
+                                        f"DELETE FROM segments_fts "
+                                        f"WHERE rowid IN ({_ph})",
+                                        _chunk)
+                            except Exception:
+                                pass
                 c2 = conn.execute(
                     "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
                     (fp,))

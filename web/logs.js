@@ -373,6 +373,19 @@
     if (el.childElementCount > cap) {
       const toRemove = el.childElementCount - keep;
       for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+      // audit LG-2: re-compute zebra-stripe parity on the kept
+      // rows so the alternating background stays coherent after
+      // a trim. Without this, removing an even number of rows from
+      // the top is fine, but removing odd N leaves the visible
+      // log with two adjacent same-background rows at the old
+      // trim boundary.
+      try {
+        const rows = el.querySelectorAll(".log-line");
+        for (let i = 0; i < rows.length; i++) {
+          if (i % 2 === 1) rows[i].classList.add("hist_row_alt");
+          else rows[i].classList.remove("hist_row_alt");
+        }
+      } catch (_e) { /* non-fatal */ }
     }
     maybeSnapToBottom(el);
   };
@@ -634,6 +647,11 @@
         // log would auto-snap on every batch.
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
+        // audit LG-1: also check the in-progress fragment for a row
+        // with the same row_id before adding a duplicate. Without
+        // this, when a [Dwnld] and its retroactive update arrive in
+        // the same batch, the DOM lookup misses (new row isn't in
+        // DOM yet, only in frag), and both rows are appended.
         for (const entry of payload.activity) {
           const row = buildActivityRow(entry);
           const rid = row.dataset.rowId;
@@ -646,6 +664,10 @@
             const existing = el.querySelector(
               `.log-line[data-row-id="${CSS.escape(rid)}"]`);
             if (existing) { existing.replaceWith(row); continue; }
+            // Also search the fragment for a same-batch predecessor.
+            const pending = frag.querySelector(
+              `.log-line[data-row-id="${CSS.escape(rid)}"]`);
+            if (pending) { pending.replaceWith(row); continue; }
           }
           frag.appendChild(row);
         }

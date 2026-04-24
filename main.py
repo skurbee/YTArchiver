@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v55.7"
-APP_VERSION_DATE = "4.24.26 1:54am"
+APP_VERSION      = "v56.0"
+APP_VERSION_DATE = "4.24.26 11:27am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -514,7 +514,14 @@ class Api:
     def get_index_summary(self):
         """Return Index tab data: cards + per-channel breakdown."""
         if self._config is None:
-            return None
+            # audit H-23: never return None to JS — the caller at
+            # app.js:2813 does `.then((idx) => ... idx.get(...))`
+            # which blows up on null. Empty dict keeps the Index
+            # tab render-safe in demo / pre-config mode.
+            return {
+                "cards": [], "per_channel": [],
+                "total_videos": 0, "total_size_bytes": 0,
+            }
         return archive_scan.index_summary()
 
     def get_recent_downloads(self):
@@ -921,6 +928,19 @@ class Api:
                 if len(self._removed_channels_stack) > 50:
                     self._removed_channels_stack = (
                         self._removed_channels_stack[-50:])
+            # audit H-5: drop any queued sync tasks for this
+            # channel so a removed channel doesn't keep getting
+            # synced (which recreates the folder and confuses the
+            # log). Best-effort — removal is authoritative even if
+            # queue cleanup fails.
+            if ok and ch_snap:
+                try:
+                    _ch_url = (ch_snap.get("url") or "").strip()
+                    if _ch_url:
+                        self._queues.sync_remove(_ch_url)
+                        self._on_queue_changed()
+                except Exception:
+                    pass
             self._reload_config()
             return {
                 "ok": ok,
@@ -985,6 +1005,41 @@ class Api:
         except Exception as e:
             if stack is not None:
                 stack.append(ch)
+            return {"ok": False, "error": str(e)}
+
+    def subs_reset_sync_state(self, identity):
+        """audit SM-1: clear a channel's bootstrap / sync-state flags
+        so the next sync does a fresh full-walk. Useful when the
+        user wipes the folder manually or wants to re-bootstrap
+        after a filter change.
+
+        Clears: initialized, sync_complete, batch_resume_index,
+                init_batch_after, init_complete, last_sync.
+        Preserves: everything else (channels/url/filters/etc).
+        """
+        try:
+            ch_snap = subs_backend.get_channel(identity or {})
+            if not ch_snap:
+                return {"ok": False, "error": "Channel not found"}
+            cfg = load_config()
+            _url = (ch_snap.get("url") or "").strip().rstrip("/")
+            _flags = ("initialized", "sync_complete", "init_complete",
+                      "batch_resume_index", "init_batch_after", "last_sync")
+            _cleared = 0
+            for c in cfg.get("channels", []):
+                _c_url = (c.get("url") or "").strip().rstrip("/")
+                if _c_url != _url:
+                    continue
+                for k in _flags:
+                    if k in c:
+                        c.pop(k, None)
+                        _cleared += 1
+                break
+            save_config(cfg)
+            self._reload_config()
+            return {"ok": True, "cleared_flags": _cleared,
+                    "channel": ch_snap.get("name") or ch_snap.get("folder") or ""}
+        except Exception as e:
             return {"ok": False, "error": str(e)}
 
     def subs_get_channel(self, identity):
@@ -1590,7 +1645,20 @@ class Api:
         return {"ok": True, "started": True}
 
     def sync_cancel(self):
+        # audit H-4: drain the redownload pending list on cancel.
+        # Before, a cancel stopped the currently-running redownload
+        # but the next 2+ items in `_redwnl_pending` would still
+        # run silently when the worker looped around. Now cancel
+        # means cancel everything, matching user expectation.
         self._sync_cancel.set()
+        try:
+            _drained = len(self._redwnl_pending)
+            self._redwnl_pending.clear()
+            if _drained:
+                # Notify the UI so the queue popover clears visually.
+                self._on_queue_changed()
+        except Exception:
+            pass
         return {"ok": True}
 
     def sync_clear_queue(self):
@@ -1739,7 +1807,21 @@ class Api:
 
     def transcribe_enqueue(self, path, title=""):
         """Queue a video for transcription."""
-        ok = self._transcribe.enqueue(path, title)
+        try:
+            ok = self._transcribe.enqueue(path, title)
+        except Exception as _e:
+            # audit L-14: surface the error instead of the silent
+            # {ok: False} that the old code returned. Caller can
+            # toast the actual reason (file not found, no whisper
+            # worker, etc.) rather than a generic failure.
+            return {"ok": False, "error": str(_e)}
+        # audit L-13/L-14: nudge the UI queue popover so freshly-
+        # enqueued items show up immediately instead of waiting for
+        # the next automatic poll (~500ms).
+        try:
+            self._on_queue_changed()
+        except Exception:
+            pass
         return {"ok": ok}
 
     def transcribe_folder(self):
@@ -1951,8 +2033,23 @@ class Api:
             banner_url = None
             if base:
                 folder = os.path.join(base, _cfn(ch))
-                bp = ensure_banner_thumb(folder) or banner_path_for(folder)
-                ap = ensure_avatar_thumb(folder) or avatar_path_for(folder)
+                # audit H-19: ensure_* can raise on a transient I/O
+                # error (Pillow missing, .ChannelArt locked, etc).
+                # If we don't wrap them, the fallback to *_path_for
+                # is unreachable and the grid shows a blank card
+                # even when the full-res original exists on disk.
+                try:
+                    bp = ensure_banner_thumb(folder)
+                except Exception:
+                    bp = None
+                if not bp:
+                    bp = banner_path_for(folder)
+                try:
+                    ap = ensure_avatar_thumb(folder)
+                except Exception:
+                    ap = None
+                if not ap:
+                    ap = avatar_path_for(folder)
                 if ap: avatar_url = _file_url(ap)
                 if bp: banner_url = _file_url(bp)
             out.append({
@@ -2413,7 +2510,15 @@ class Api:
                 return {"ok": False, "error": f"Not found: {fp}"}
             if os.name == "nt":
                 import subprocess
-                subprocess.Popen(["explorer", "/select,", fp])
+                # audit SV-7: on Windows, `explorer /select,<path>`
+                # with a path that contains spaces failed to select
+                # the file when passed as separate argv. Windows
+                # parses `/select,` plus the path as one string.
+                # Use a single joined string via cmd.exe so quoting
+                # works even on UNC or space-heavy paths.
+                subprocess.Popen(
+                    ["explorer", f"/select,{fp}"],
+                    close_fds=True)
             elif sys.platform == "darwin":
                 import subprocess
                 subprocess.Popen(["open", "-R", fp])
@@ -3885,6 +3990,13 @@ class Api:
             ["\n", None],
         ])
         self._log_stream.flush()
+        # audit L-13: push a queue-changed notification so the GPU
+        # Tasks popover reflects the freshly-enqueued items without
+        # waiting for the next periodic poll (~500ms).
+        try:
+            self._on_queue_changed()
+        except Exception:
+            pass
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "combined": bool(combined)}
 
@@ -4380,10 +4492,22 @@ class Api:
         cfg = load_config()
         channels = cfg.get("channels", [])
         cache = archive_scan.load_disk_cache()
-        # Simple heuristic: every channel that auto-metadata=True and has
-        # not been synced in the past 2 hours gets flagged as "pending"
+        # audit H-20: scale the "pending" threshold to the user's
+        # autorun interval. If autorun runs every 30 min and the
+        # threshold is a hardcoded 2h, the badge always shows
+        # non-zero even when every channel was synced recently.
+        # Rule: threshold = max(autorun_interval, 2h) so the badge
+        # never flags a channel as pending until at least one
+        # scheduled autorun cycle has passed without it being
+        # touched. Falls back to 2h if no interval is configured.
         import time as _t
-        threshold = _t.time() - 2 * 3600
+        _autorun_min = 0
+        try:
+            _autorun_min = int(cfg.get("autorun_interval_mins") or 0)
+        except (TypeError, ValueError):
+            _autorun_min = 0
+        _interval_secs = max(_autorun_min * 60, 2 * 3600)
+        threshold = _t.time() - _interval_secs
         n_pending = 0
         for ch in channels:
             rec = cache.get(ch.get("url", ""))
@@ -5455,6 +5579,31 @@ class Api:
         url = (url or "").strip()
         if not url:
             return {"ok": False, "error": "Empty URL"}
+        # audit DT-2: normalize the URL before using/storing it.
+        # Strip fragment (#t=30) and unrelated query params; keep
+        # only the `v=<id>` param for watch URLs. Prevents history
+        # pollution (three different entries for the same video)
+        # and avoids confusing yt-dlp with tracking params.
+        def _canonicalize_yt_url(u: str) -> str:
+            try:
+                from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+                p = urlparse(u)
+                # Drop fragment always.
+                # Keep only v= on watch URLs; keep everything on short URLs
+                # (youtu.be/<id>) since the path IS the id.
+                if "youtube" in (p.netloc or "").lower() and \
+                        p.path.rstrip("/").endswith("/watch"):
+                    qs = parse_qs(p.query or "")
+                    v = (qs.get("v") or [""])[0]
+                    new_q = urlencode({"v": v}) if v else ""
+                    return urlunparse((p.scheme or "https", p.netloc,
+                                       p.path, "", new_q, ""))
+                # Clean fragment off everything else.
+                return urlunparse((p.scheme or "https", p.netloc,
+                                   p.path, p.params, p.query, ""))
+            except Exception:
+                return u
+        url = _canonicalize_yt_url(url)
         # Concurrency guard — track in-flight URLs so a rapid
         # double-click doesn't launch two yt-dlp processes fighting
         # over the same filename.
@@ -5466,12 +5615,15 @@ class Api:
                 return {"ok": False,
                         "error": "Already downloading this URL"}
             self._archive_single_inflight.add(url)
-        # Remember this URL for autocomplete next time
-        try:
-            self._push_url_history(url)
-        except Exception:
-            pass
         if not sync_backend.find_yt_dlp():
+            # audit DT-1: DON'T record URL in history on a failed
+            # launch. History write is moved to the success path
+            # in _run() below. A URL that fails validation shouldn't
+            # pollute the autocomplete dropdown.
+            try:
+                self._archive_single_inflight.discard(url)
+            except Exception:
+                pass
             return {"ok": False, "error": "yt-dlp not found"}
         cfg = load_config()
         opts = options if isinstance(options, dict) else {}
@@ -5481,7 +5633,45 @@ class Api:
         base = (opts.get("save_to") or cfg.get("video_out_dir")
                 or cfg.get("output_dir") or "").strip()
         if not base:
+            try:
+                self._archive_single_inflight.discard(url)
+            except Exception:
+                pass
             return {"ok": False, "error": "No output_dir configured"}
+        # audit DT-3: verify target folder is writable before
+        # launching yt-dlp. Creates the dir if it doesn't exist;
+        # bails with a clear error if the dir cannot be written.
+        try:
+            os.makedirs(base, exist_ok=True)
+            _probe = os.path.join(base, ".__ytarchiver_write_probe.tmp")
+            with open(_probe, "w", encoding="utf-8") as _f:
+                _f.write("ok")
+            try: os.remove(_probe)
+            except OSError: pass
+        except OSError as _fe:
+            try:
+                self._archive_single_inflight.discard(url)
+            except Exception:
+                pass
+            return {"ok": False,
+                    "error": f"Output folder not writable: {base} ({_fe})"}
+        # audit DT-11 / DT-5: validate custom name if "use YT title"
+        # is off. An empty/whitespace-only custom name would silently
+        # fall back to YT title at line 5596 below, which isn't what
+        # the user expected.
+        _use_yt = opts.get("use_yt_title", True)
+        _cname = (opts.get("custom_name") or "").strip()
+        if not _use_yt:
+            _safe_cname = _re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_",
+                                  _cname).strip().rstrip(".")
+            if not _safe_cname:
+                try:
+                    self._archive_single_inflight.discard(url)
+                except Exception:
+                    pass
+                return {"ok": False,
+                        "error": "Custom name is empty or all special chars. "
+                                 "Enable 'Use YT title' or enter a real name."}
         import subprocess as _sp
         yt = sync_backend.find_yt_dlp()
         res = str(opts.get("resolution") or "1080").strip()
@@ -5512,7 +5702,7 @@ class Api:
             ])
             # Mirror YTArchiver.py:17327 build_video_cmd exactly — skip the
             # mp4 merge args when downloading audio-only.
-            cmd = [yt, "--newline", "--no-quiet"]
+            cmd = [yt, "--newline", "--no-quiet", "--continue"]
             if date_file:
                 cmd.append("--mtime")
             cmd += ["--trim-filenames", "200", "--format", fmt]
@@ -5568,6 +5758,15 @@ class Api:
                         elif "cookies are missing" in _ll or "sign in to confirm" in _ll:
                             _stderr_errors.append("YouTube wants a sign-in (Firefox/Chrome cookies not found or expired)")
                 proc.wait()
+                # audit DT-1: only write to URL history now that the
+                # download actually ran. Previously written on submit,
+                # which polluted history with any URL the user
+                # clicked even if it failed.
+                if proc.returncode == 0:
+                    try:
+                        self._push_url_history(url)
+                    except Exception:
+                        pass
                 # Post-download bookkeeping — emulate the channel-sync
                 # path's register_video + _record_recent_download hooks.
                 if _dltrack:
@@ -5575,6 +5774,15 @@ class Api:
                         parts = _dltrack.split(":::")
                         # Format: "DLTRACK" + title, uploader, upload_date,
                         # filesize, duration, id
+                        # audit DT-8: guard against yt-dlp output format
+                        # changes / missing fields. The hard-indexed
+                        # parts[1]/parts[6] would raise IndexError and
+                        # abort post-download indexing silently.
+                        if len(parts) < 7:
+                            self._log_stream.emit_dim(
+                                f" (DLTRACK parsing: only {len(parts)} "
+                                f"parts, expected 7 — indexing skipped)")
+                            raise ValueError("dltrack parse")
                         _title = parts[1] if len(parts) > 1 else ""
                         _uploader = parts[2] if len(parts) > 2 else ""
                         _vid = parts[6] if len(parts) > 6 else ""
@@ -6153,6 +6361,28 @@ def main():
     # URL generation has a port to bake in). Bound to 127.0.0.1 only.
     try:
         from backend import local_fileserver as _fs
+        # audit C-4: populate the archive-root allowlist before
+        # starting the server so the _resolve_path gate is live on
+        # the very first request. Roots = every channel output_dir
+        # + the global output_dir + known thumbs/cache dirs.
+        try:
+            _cfg_boot = load_config() or {}
+            _roots: list[str] = []
+            _g_out = _cfg_boot.get("output_dir") or ""
+            if _g_out:
+                _roots.append(_g_out)
+            for _ch in (_cfg_boot.get("channels") or []):
+                _co = _ch.get("output_dir") or ""
+                if _co:
+                    _roots.append(_co)
+            # Common archive root on Scott's machine; harmless elsewhere.
+            _roots.extend([r"Z:\Archive", r"Z:\Archive\Video Archive"])
+            # Thumbs + channel-art cache paths live under ROOT/web,
+            # ROOT/thumbs, ROOT/channel_art per the backend cache modules.
+            _roots.extend([str(ROOT), str(WEB)])
+            _fs.set_allowed_roots(_roots)
+        except Exception as _re:
+            print(f"[fileserver] could not set allowed roots: {_re}")
         _port = _fs.start_server()
         print(f"[fileserver] serving local assets on 127.0.0.1:{_port}")
     except Exception as _fe:

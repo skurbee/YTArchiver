@@ -378,6 +378,18 @@ def save_config(cfg: Dict[str, Any]) -> bool:
         return False
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # audit SM-8: trim autorun_history on save so the config
+        # file can't grow unbounded across years of use. UI only
+        # shows the last 100 entries; keep 500 on-disk for some
+        # scroll headroom + recovery buffer. Trimming in-place on
+        # the passed dict is fine — the UI uses a fresh read of the
+        # last 100 slice per render, so in-memory state stays consistent.
+        try:
+            _hist = cfg.get("autorun_history")
+            if isinstance(_hist, list) and len(_hist) > 500:
+                cfg["autorun_history"] = _hist[-500:]
+        except Exception:
+            pass
         with _config_lock:
             # Write-via-temp for atomicity (matches tkinter app's save_config)
             tmp = CONFIG_FILE.with_suffix(".json.tmp")

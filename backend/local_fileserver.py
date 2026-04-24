@@ -33,6 +33,57 @@ _httpd = None  # audit D-56: module-level handle so stop_server() can
                # the port socket; shutdown stops the serve_forever loop).
 _lock = threading.Lock()
 
+# audit C-4: allowlist of archive roots the fileserver may serve.
+# Populated at start_server() time from the live config's channel
+# output_dirs + Z: archive root + thumbs cache. Requests outside
+# these roots are rejected with 403. Before this, the path check
+# was only "..-in-segments + isabs + exists", which let any
+# absolute path on disk be read through http://127.0.0.1:PORT/file/.
+_allowed_roots: list[str] = []
+
+
+def _normalize_root(p: str) -> str:
+    """Return an absolute, lowercased, no-trailing-sep form of p.
+    Used to compare incoming request paths against the allowlist
+    without case or trailing-slash false-mismatches on Windows.
+    """
+    try:
+        return os.path.normcase(os.path.abspath(p)).rstrip("/\\")
+    except Exception:
+        return ""
+
+
+def set_allowed_roots(roots: list[str]) -> None:
+    """Register the set of directory roots the fileserver may serve.
+    Called from main.py after config load. Roots are normalized to
+    absolute case-insensitive form.
+    """
+    global _allowed_roots
+    _allowed_roots = [r for r in (_normalize_root(x) for x in (roots or [])) if r]
+
+
+def _is_under_allowed_root(path: str) -> bool:
+    """True if `path` resolves to something under one of the registered
+    allowed roots. If no allowlist is set (dev/demo mode), returns
+    True — backward-compatible fallback so the app still works
+    before roots are wired in.
+    """
+    if not _allowed_roots:
+        return True
+    try:
+        p = _normalize_root(path)
+    except Exception:
+        return False
+    if not p:
+        return False
+    for root in _allowed_roots:
+        # os.path.normcase ensures case-insensitive prefix match on
+        # Windows. The + os.sep guard prevents "/ArchiveBad" from
+        # matching an allowed root "/Archive".
+        if p == root or p.startswith(root + os.sep) or p.startswith(root + "/"):
+            return True
+    return False
+
 
 class _FileRequestHandler(BaseHTTPRequestHandler):
     # Advertise HTTP/1.1 so `Accept-Ranges: bytes` + 206 Partial Content
@@ -71,6 +122,13 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400); return None
         if not os.path.isabs(path):
             self.send_error(400); return None
+        # audit C-4: reject requests outside the archive root
+        # allowlist (set_allowed_roots). Previously a request for
+        # /file/C:/Users/*/Documents/*.pdf passed all the other
+        # checks. Allowlist empty = fallback allow (backward-compat
+        # for dev/demo).
+        if not _is_under_allowed_root(path):
+            self.send_error(403); return None
         if not os.path.isfile(path):
             self.send_error(404); return None
         return path

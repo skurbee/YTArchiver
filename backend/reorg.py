@@ -70,6 +70,14 @@ def _sidecars_for(video: Path) -> List[Path]:
     stem = video.stem
     folder = video.parent
     out: List[Path] = []
+    # audit M-2: language-suffixed caption files have a two-dot
+    # extension (e.g. `X.en.vtt`, `X.es.vtt`). Path.stem on those
+    # returns `X.en`, so the exact-stem-equality check misses
+    # them. Maintain a small whitelist of known language codes so
+    # compound suffixes attach to the video they belong to.
+    _LANG_CODES = ("en", "es", "fr", "de", "ja", "ko", "pt", "it",
+                   "ru", "zh", "zh-Hans", "zh-Hant", "ar", "hi",
+                   "tr", "nl", "sv", "pl", "id", "vi", "th")
     for p in folder.iterdir():
         if not p.is_file():
             continue
@@ -84,6 +92,16 @@ def _sidecars_for(video: Path) -> List[Path]:
         # Path.stem gives `X.info`, not `X`. Match via explicit prefix.
         if p.name == stem + ".info.json":
             out.append(p)
+            continue
+        # audit M-2: `X.en.vtt`, `X.es.srt`, etc. — Path.stem is
+        # `X.en`, so pop the language suffix off and re-compare.
+        _sub_exts = (".vtt", ".srt", ".ass", ".ttml")
+        if p.suffix.lower() in _sub_exts:
+            _outer_stem = p.stem  # e.g. "X.en"
+            if "." in _outer_stem:
+                _base, _lang = _outer_stem.rsplit(".", 1)
+                if _base == stem and _lang in _LANG_CODES:
+                    out.append(p)
     return out
 
 
@@ -162,6 +180,11 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
     has_sibling = _has_video_sibling(video)
     try:
         shutil.move(str(video), str(dst))
+        # audit C-6: track sidecar failures so a partial orphan state
+        # is visible instead of silently swallowed. Each failed
+        # sidecar leaves metadata behind in the old folder; the user
+        # needs a line in the log to know about it.
+        _sc_failed: list[tuple[str, str]] = []
         for sc in sidecars:
             sc_dst = target_dir / sc.name
             if sc_dst.exists():
@@ -174,8 +197,16 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
                     shutil.copy2(str(sc), str(sc_dst))
                 else:
                     shutil.move(str(sc), str(sc_dst))
-            except OSError:
-                pass
+            except OSError as _sce:
+                _sc_failed.append((sc.name, str(_sce)))
+        if _sc_failed:
+            # Warn once per video with all failures. Non-fatal — the
+            # primary move succeeded — but the user can investigate
+            # (usually a file lock or permissions issue).
+            _names = ", ".join(n for n, _ in _sc_failed)
+            stream.emit_error(
+                f"Sidecar move failed for {video.name}: {_names} "
+                f"(video moved; metadata left in old folder)")
         return True
     except OSError as e:
         stream.emit_error(f"Move failed for {video.name}: {e}")

@@ -2127,23 +2127,29 @@ class TranscribeManager:
                     except Exception:
                         pass
                 self._current_job = None
-                # audit D-10: if the previous job had been forced into
-                # CPU mode via OOM fallback AND finished without
-                # crashing (`crashed` would be True if it blew up
-                # again), reset the env back to CUDA and kill the
-                # subprocess so the next job starts fresh on GPU.
-                # Prevents the "one OOM = slow for the whole session"
-                # regression.
-                if (self._cpu_fallback_active and not crashed
+                # audit D-10 / audit H-11: if the previous job had been
+                # forced into CPU mode via OOM fallback, reset the env
+                # back to CUDA regardless of whether the fallback job
+                # itself succeeded or crashed. Before, the reset was
+                # gated on `not crashed` — a crashed fallback-job
+                # left WHISPER_DEVICE=cpu in the env forever, so
+                # every subsequent transcribe ran on CPU until app
+                # restart (user reports "transcription mysteriously
+                # slow until I relaunch").
+                if (self._cpu_fallback_active
                         and _job_kind != "compress"):
                     self._cpu_fallback_active = False
                     try:
                         os.environ.pop("WHISPER_DEVICE", None)
                         os.environ.pop("WHISPER_COMPUTE", None)
                         self._stop_subprocess(force=True)
+                        _reset_label = (
+                            "\u21A9 Resetting to GPU mode for next job."
+                            if not crashed else
+                            "\u21A9 Resetting to GPU mode (fallback job crashed "
+                            "\u2014 giving GPU another try).")
                         self._stream.emit_text(
-                            " \u21A9 Resetting to GPU mode for next job.",
-                            "simpleline_blue")
+                            " " + _reset_label, "simpleline_blue")
                     except Exception:
                         pass
                 # Clear the "running" slot on completion so the popover
@@ -2915,6 +2921,23 @@ class TranscribeManager:
         text = (result.get("text") or "").strip()
         segs = result.get("segments", []) or []
 
+        # audit C-7: refuse to write an "empty-but-successful" transcript.
+        # Whisper can return rc=0 with `text=""` when audio is pure
+        # silence, corrupted, or the model produced no output at all.
+        # Before this guard, the empty result was written to disk and
+        # the FTS index was updated to mark the video transcribed,
+        # blocking any future retranscribe. Treat as an error so the
+        # caller can surface it and leave the video un-transcribed.
+        _has_any_seg_text = any(
+            (s.get("t") or s.get("text") or "").strip()
+            for s in segs if isinstance(s, dict))
+        if not text and not _has_any_seg_text:
+            raise RuntimeError(
+                "Whisper returned an empty transcript "
+                "(no text, no non-empty segments) — refusing to "
+                "write an empty .txt/.jsonl and mark the video "
+                "transcribed. Audio may be silent or unreadable.")
+
         # Extract video id — OLD-compat filenames don't carry the `[id]`
         # suffix so we can't rely on the filename alone. Try in order:
         # 0. caller-supplied hint (retranscribe flow passes the id from
@@ -2978,19 +3001,47 @@ class TranscribeManager:
             # Mirrors YTArchiver.py:16462-16474: jsonl FIRST so its
             # video_id-based purge can report back any title-drifted
             # stale entries for the txt pass to also clean up.
+            # audit H-10: two-step replace was non-atomic — if .jsonl
+            # succeeded but .txt failed (lock, permission) the video
+            # ended up with new segments + old text, permanently
+            # inconsistent. Mitigation: try .jsonl first; if it
+            # fails, abort before touching .txt so the old content
+            # remains intact on BOTH files. If .jsonl succeeds but
+            # .txt fails, surface a prominent error and attempt a
+            # roll-back by re-reading the backup we captured first.
+            _jsonl_backup: Optional[bytes] = None
+            try:
+                with open(jsonl_path, "rb") as _jb:
+                    _jsonl_backup = _jb.read()
+            except OSError:
+                _jsonl_backup = None
             try:
                 extra_titles = _replace_jsonl_entry(
                     jsonl_path, title, vid_id, segs) or set()
             except Exception as _je:
                 self._stream.emit_error(
-                    f"Could not update {os.path.basename(jsonl_path)}: {_je}")
-                extra_titles = set()
+                    f"Could not update {os.path.basename(jsonl_path)}: {_je}"
+                    f" — .txt left unchanged to avoid split-state.")
+                return
             try:
                 _replace_txt_entry(txt_path, title, text, source_tag,
                                    extra_titles_to_remove=extra_titles)
             except Exception as _te:
                 self._stream.emit_error(
-                    f"Could not update {os.path.basename(txt_path)}: {_te}")
+                    f"Could not update {os.path.basename(txt_path)}: {_te}"
+                    f" — attempting .jsonl roll-back to prevent split-state.")
+                # Best-effort .jsonl roll-back so the two files stay
+                # consistent. If the roll-back itself fails the user
+                # is notified with a clear message.
+                if _jsonl_backup is not None:
+                    try:
+                        with open(jsonl_path, "wb") as _jw:
+                            _jw.write(_jsonl_backup)
+                    except OSError as _re:
+                        self._stream.emit_error(
+                            f"Roll-back of {os.path.basename(jsonl_path)} "
+                            f"FAILED: {_re}. Files may be out of sync; "
+                            f"retry retranscribe when writable.")
         else:
             if not _write_transcript_entry(txt_path, title, upload_date,
                                            duration, source_tag, text):

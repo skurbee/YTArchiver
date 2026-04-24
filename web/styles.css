@@ -1033,12 +1033,17 @@ body {
   transition: background 0.12s, border-color 0.12s;
 }
 .btn-pause:hover { background: #2f5b80; border-color: #4c7cab; }
+/* Resume state uses the same green as the Sync Subbed button
+   (var(--c-sync) = #145c40) so the two primary-action greens
+   on the top bar stay visually consistent. Previously used
+   #3a5a3a — a washed-out green that didn't match. */
 .btn-pause[data-pause-state="paused"] {
-  background: #3a5a3a;
-  border-color: #4a6a4a;
+  background: var(--c-sync);
+  border-color: #1a6b4c;
 }
 .btn-pause[data-pause-state="paused"]:hover {
-  background: #457a5a;
+  background: #1a6b4c;
+  border-color: #216e52;
 }
 /* audit E-27: keep pointer-events enabled on disabled buttons so
    hover tooltips still fire (they usually explain WHY the button is
@@ -1423,12 +1428,12 @@ body {
 /* [Metdta] rows have at most one optional secondary count (e.g.
    "5 new" for views/likes refresh with first-time fetches, or
    "N unresolved" for ID backfill) and NEVER a tertiary count.
-   Without this override, both secondary + tertiary slots claim
-   minmax(98px, 1fr) each, producing a large dead gap between
-   primary ("26 refreshed") and errors ("0 errors"). `minmax(0,
-   auto)` on secondary lets it collapse to zero width when empty
-   and expand to content width when populated; tertiary stays at
-   0 since it's always empty for this kind. */
+   Keep secondary at a fixed flex width (not `minmax(0, auto)`)
+   so the "errors" column lands at the same x-position whether
+   or not the secondary cell has content. The previous collapse-
+   when-empty behavior produced a ragged left/right shift in the
+   log that the user flagged as "misaligned columns". Tertiary
+   stays at 0 since it's always empty for this kind. */
 .activity-log .log-line.hist-row-Metdta {
   grid-template-columns:
     minmax(58px, auto)
@@ -1437,7 +1442,7 @@ body {
     minmax(110px, 2.5fr)
     8px
     minmax(98px, 1fr)     /* primary */
-    minmax(0, auto)       /* secondary — collapses when empty */
+    minmax(98px, 1fr)     /* secondary — fixed slot for alignment */
     0                     /* tertiary — always empty for Metdta */
     minmax(60px, 0.8fr)   /* errors */
     minmax(66px, 1fr);    /* took */
@@ -2070,7 +2075,11 @@ body {
   padding: 4px 0;
   min-width: 180px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
-  z-index: 10000;
+  /* audit H-24: was 10000, sitting above the modal backdrop
+     (.yt-modal / .askq-backdrop at 9999). A right-click inside a
+     confirm dialog drew the context menu on top of the dialog,
+     trapping the user. Dropped to 9500 so modals always overlay. */
+  z-index: 9500;
   font-size: 12px;
   font-family: var(--font-ui);
   user-select: none;

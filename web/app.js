@@ -711,6 +711,19 @@
         document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
         const panel = document.getElementById("panel-" + target);
         if (panel) panel.classList.add("active");
+        // audit H-28: clear any lingering row-selected highlights
+        // when switching tabs. Without this, rows selected in
+        // Recent / Browse grid stay selected behind the scenes;
+        // coming back to that tab and clicking "Delete Selected"
+        // operates on rows the user thought they deselected.
+        try {
+          document.querySelectorAll("tr.row-selected, .row-selected")
+            .forEach(r => r.classList.remove("row-selected"));
+          // Also hide any "Delete N files" floating button tied to
+          // the selection state.
+          const delBtn = document.getElementById("recent-delete-btn");
+          if (delBtn) delBtn.style.display = "none";
+        } catch (_e) { /* non-fatal */ }
       });
     });
   }
@@ -821,6 +834,18 @@
       } else if (_browseState.view === "videos") {
         showView("channels");
         _restoreScroll("channel-grid", _browseState.currentChannel);
+        // audit L-5: clear any per-video filter text on the way
+        // back to the channel grid. Without this, filter text
+        // from the videos view sticks around even though it's
+        // irrelevant to the Channels view and can mask channels
+        // that don't match the old video-scoped query.
+        try {
+          const _f = document.getElementById("browse-filter");
+          if (_f && _f.value) {
+            _f.value = "";
+            _f.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+        } catch (_e) { /* non-fatal */ }
       }
     };
     document.getElementById("browse-back-btn")?.addEventListener("click", window._browseGoBack);
@@ -1239,6 +1264,13 @@
   }
 
   function _initSearchViewerLoadMore() {
+    // audit L-1: guard against double-wire. If this function runs
+    // twice (hot reload, re-entered after view switch), each call
+    // added another click handler and "Load earlier / later" fired
+    // N times per click — queuing duplicate API calls and rendering
+    // duplicate segments.
+    if (_initSearchViewerLoadMore._wired) return;
+    _initSearchViewerLoadMore._wired = true;
     const api = window.pywebview?.api;
     document.getElementById("search-viewer-earlier")?.addEventListener("click", async () => {
       if (!_searchViewerState.segmentId) return;
@@ -1664,7 +1696,17 @@
       refreshDeferredLivestreams();
     });
     refreshDeferredLivestreams();
-    setInterval(refreshDeferredLivestreams, 30_000);
+    // audit L-2: pause the 30s refresh tick when the window is
+    // hidden (minimized, different virtualdesktop, tray-only).
+    // No reason to burn a backend round-trip every 30s while the
+    // user can't see the drawer. The initial refresh above still
+    // runs so a freshly-opened window is current.
+    const _deferredTick = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        refreshDeferredLivestreams();
+      }
+    }, 30_000);
+    window.addEventListener("beforeunload", () => clearInterval(_deferredTick));
   }
 
   // ─── Last Full Sync live label ───────────────────────────────────────
@@ -1680,7 +1722,12 @@
       } catch (e) { /* ignore */ }
     };
     tick();
-    setInterval(tick, 60_000); // update every minute
+    // audit L-2: same visibility gate as the deferred-livestreams
+    // ticker — the label only matters when the user can see it.
+    const _lastSyncTick = setInterval(() => {
+      if (document.visibilityState === "visible") tick();
+    }, 60_000);
+    window.addEventListener("beforeunload", () => clearInterval(_lastSyncTick));
   }
 
   // ─── Splitter position persistence ───────────────────────────────────
@@ -2484,7 +2531,22 @@
           const ok = await askDanger("Delete bookmark",
             `Remove this bookmark?\n\n"${b.text?.slice(0, 100) || ''}"`, "Delete");
           if (!ok) return;
-          await api.bookmark_remove(b.id);
+          // audit SV-10: gate the success toast on the backend's
+          // `{ok}` flag instead of firing it unconditionally. A
+          // double-click would fire two "Bookmark removed" toasts
+          // even though only the first actually deletes anything.
+          try {
+            const res = await api.bookmark_remove(b.id);
+            if (res && res.ok === false) {
+              window._showToast?.(
+                res.error || "Couldn't delete (already gone?).", "warn");
+              return;
+            }
+            window._showToast?.("Bookmark removed.", "ok");
+          } catch (_re) {
+            window._showToast?.(`Delete failed: ${_re}`, "error");
+            return;
+          }
           refreshBookmarks();
         });
 
@@ -6605,8 +6667,19 @@
         start_time: t,
         text: text.slice(0, 200),
       });
-      if (res?.ok) window._showToast?.("Bookmarked @ " + _formatTs(t), "ok");
-      else window._showToast?.(res?.error || "Bookmark failed.", "error");
+      if (res?.ok) {
+        window._showToast?.("Bookmarked @ " + _formatTs(t), "ok");
+        // audit SV-4: if a Bookmarks panel is already rendered
+        // elsewhere in the UI, nudge it to refresh so the new
+        // bookmark shows up without a manual reload.
+        try {
+          if (typeof window.refreshBookmarks === "function") {
+            window.refreshBookmarks();
+          }
+        } catch (_bre) { /* non-fatal */ }
+      } else {
+        window._showToast?.(res?.error || "Bookmark failed.", "error");
+      }
     });
 
     // Watch-find: cycle through ALL matches. Matches YTArchiver.py:29682
@@ -6699,12 +6772,29 @@
   // When there are no autorun_history entries to show, collapse the
   // activity-log-frame so users don't see an empty 3-row blank above
   // the main log.
+  //
+  // When the log transitions from empty → populated (e.g. first log
+  // emission after the user clicks Clear), drop any user-dragged
+  // height back to the CSS default (3 rows). Without this, a user
+  // who resized the log to 20 rows and then cleared it would see
+  // the next single log line render inside a 20-row empty frame,
+  // which looks broken. Scott's ask: "open to like 3 lines worth of
+  // height when first log gets fired" after a clear.
+  let _lastActivityHasItems = false;
   function syncActivityLogVisibility() {
     const el = document.getElementById("activity-log");
     const frame = document.querySelector(".activity-log-frame");
     const splitter = document.getElementById("paned-splitter");
     if (!el || !frame) return;
     const hasItems = el.childElementCount > 0;
+    // Rising edge: empty → populated. Reset inline flex so the CSS
+    // rule (`.activity-log-frame { flex: 0 0 56px }` → ~3 rows)
+    // takes effect instead of whatever height the splitter drag
+    // last applied.
+    if (hasItems && !_lastActivityHasItems) {
+      try { frame.style.removeProperty("flex"); } catch (_e) { /* noop */ }
+    }
+    _lastActivityHasItems = hasItems;
     frame.hidden = !hasItems;
     if (splitter) splitter.hidden = !hasItems;
   }
@@ -7444,6 +7534,67 @@
       closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
       bd.addEventListener("click", (e) => {
         if (e.target === bd) bd.style.display = "none";
+      });
+    })();
+
+    // audit SM-1: reset sync state button in Settings > Tools.
+    // Picks a channel via a simple prompt, confirms, then calls
+    // subs_reset_sync_state which clears the bootstrap flags.
+    (function wireResetSyncState() {
+      const btn = document.getElementById("btn-reset-sync-state");
+      if (!btn) return;
+      btn.addEventListener("click", async () => {
+        const api = window.pywebview?.api;
+        if (!api?.subs_reset_sync_state) {
+          window._showToast?.("Native mode required.", "warn");
+          return;
+        }
+        // Pick a channel. Use a simple prompt instead of a bespoke
+        // modal — this is an infrequent admin op, the prompt is
+        // minimum UI.
+        let channels = [];
+        try {
+          const data = await api.get_subs_channels?.();
+          if (Array.isArray(data) && data.length === 2) channels = data[0] || [];
+        } catch (_e) { /* fall through */ }
+        if (!channels.length) {
+          window._showToast?.("No channels found.", "warn");
+          return;
+        }
+        const names = channels.map(c => c.name || c.folder || "").filter(Boolean);
+        const pick = window.prompt(
+          "Type the channel name to reset sync state for (case-insensitive)"
+          + " \n\nClears: initialized, sync_complete, init_complete,"
+          + " batch_resume_index, init_batch_after, last_sync."
+          + "\nThe next sync will bootstrap the channel from scratch."
+          + "\n\nChannels:\n" + names.slice(0, 60).join(", ")
+          + (names.length > 60 ? ` ... (+${names.length-60} more)` : ""),
+          "");
+        if (!pick || !pick.trim()) return;
+        const want = pick.trim().toLowerCase();
+        const ch = channels.find(c => (c.name || c.folder || "").toLowerCase() === want);
+        if (!ch) {
+          window._showToast?.(`No channel matched "${pick}".`, "warn");
+          return;
+        }
+        if (!window.confirm(`Reset sync state for "${ch.name || ch.folder}"?`
+                            + `\n\nThis does NOT delete any videos or config`
+                            + ` — it only clears the flags that gate the`
+                            + ` fast-path so the next sync walks the whole`
+                            + ` channel again.`)) return;
+        try {
+          const res = await api.subs_reset_sync_state({
+            url: ch.url, folder: ch.folder, name: ch.name,
+          });
+          if (res?.ok) {
+            window._showToast?.(
+              `Reset ${res.cleared_flags} flag(s) on "${res.channel}".`, "ok");
+          } else {
+            window._showToast?.(res?.error || "Reset failed.", "warn");
+          }
+        } catch (e) {
+          window._showToast?.(`Reset failed: ${e}`, "warn");
+        }
       });
     })();
 

@@ -694,13 +694,11 @@
                       title="Restore a backup zip (snapshots current config first)">Restore&hellip;</button>
             </div>
 
-            <label class="edit-gl">Metadata (all channels)</label>
-            <div class="edit-gv-inline" style="gap:6px;">
-              <button class="btn btn-ghost btn-thin" id="btn-metadata-queue-all"
-                      title="Queue metadata download for every subscribed channel">Queue all&hellip;</button>
-              <button class="btn btn-ghost btn-thin" id="btn-metadata-refresh-all"
-                      title="Refresh views/likes on existing metadata for every channel">Refresh views/likes&hellip;</button>
-            </div>
+            <!-- "Metadata (all channels)" row removed — a dedicated
+                 Metadata tab now hosts these actions + per-channel
+                 refresh status, making this Tools duplication
+                 redundant. btn-metadata-queue-all and btn-metadata-
+                 refresh-all still exist on the Metadata tab itself. -->
 
             <!-- Moved from the Browse toolbar (issue #135) — it was
                  an odd fit up there with per-channel navigation and
@@ -745,6 +743,18 @@
             <div class="edit-gv-inline" style="gap:6px;">
               <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
                       title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
+            </div>
+
+            <!-- audit SM-1: reset sync state for a specific channel.
+                 Clears initialized/sync_complete/batch_resume_index/
+                 init_batch_after/last_sync so the next sync starts
+                 a fresh bootstrap. Useful if the user deleted a
+                 channel folder manually, or wants to re-walk the
+                 whole catalog after a filter change. -->
+            <label class="edit-gl">Channel sync state</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
+                      title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
             </div>
           </div>
         </div>

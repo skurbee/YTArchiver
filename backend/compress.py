@@ -91,6 +91,31 @@ def get_video_duration(filepath: str, ffmpeg: str) -> float:
     return (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
 
 
+def get_video_codec(filepath: str, ffmpeg: str) -> str:
+    """Probe video-stream codec name via ffmpeg -i stderr. Returns
+    lowercase codec string ("av1", "hevc", "h264", ...) or "" on
+    probe failure. Used post-compress to verify NVENC actually
+    produced AV1 and didn't silently fall back to another codec on
+    driver hiccup.
+    """
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-i", filepath],
+            capture_output=True, text=True, timeout=15,
+            startupinfo=_startupinfo,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    # ffmpeg emits lines like:
+    #   Stream #0:0(und): Video: av1 (Main), yuv420p(tv, bt709), ...
+    # We want the token right after "Video: ".
+    import re as _re
+    m = _re.search(r"Video:\s*([a-z0-9]+)", proc.stderr, _re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).lower()
+
+
 def compress_video(input_path: str, stream: LogStreamer,
                    quality: str = "Average",
                    output_res: str = "720",
@@ -240,6 +265,23 @@ def compress_video(input_path: str, stream: LogStreamer,
             return {"ok": False, "error": "duration_mismatch",
                     "reason": "duration_mismatch",
                     "orig_dur": dur, "new_dur": new_dur}
+
+    # audit C-3: verify the output codec is actually AV1. If NVENC
+    # silently falls back to HEVC/H.264 (driver crash, session
+    # collision, unsupported input colorspace), ffmpeg can return
+    # rc=0 + correct duration but wrong codec. Promoting a non-AV1
+    # "compressed" file wastes future re-compress runs and may
+    # produce a larger-than-expected archive.
+    new_codec = get_video_codec(temp_path, ffmpeg)
+    if new_codec and new_codec != "av1":
+        stream.emit_error(
+            f"Compressed output is {new_codec}, not av1 "
+            f"(NVENC silent fallback?) — leaving original intact.")
+        try: os.remove(temp_path)
+        except OSError: pass
+        return {"ok": False, "error": "codec_mismatch",
+                "reason": "codec_mismatch",
+                "expected": "av1", "actual": new_codec}
 
     # Safety: if output is larger than input, skip the replace
     if new_size >= orig_size:

@@ -169,14 +169,18 @@
           <option>12 hr</option>
           <option>24 hr</option>
         </select>
-        <span class="status-text autorun-countdown" id="autorun-countdown"></span>
 
-        <!-- Clear-log dropdown — moved here from Row 2 on 2026-04-23
-             per layout feedback. Behavior + id unchanged so all
-             existing JS wiring still finds it. -->
+        <!-- Clear-log dropdown — placed directly after the Auto-sync
+             select so the two controls read as a paired group. The
+             autorun-countdown span follows the Clear button instead
+             of preceding it; its 140px min-width was otherwise
+             reserving dead space even when auto-sync is Off, which
+             pushed Clear all the way to the right edge. -->
         <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
                 style="margin-left:8px;"
                 title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
+
+        <span class="status-text autorun-countdown" id="autorun-countdown"></span>
 
         <div class="spacer"></div>
         <!-- Startup status stack — two stacked slots so "Indexing new

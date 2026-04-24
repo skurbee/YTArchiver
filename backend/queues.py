@@ -200,10 +200,19 @@ class QueueState:
         the 2-second debounce window, pending changes still flush to
         disk. Without this, close-during-queue-edit silently lost the
         latest enqueue/remove.
+
+        Each call cancels any pending timer and re-arms a fresh one, so
+        a burst of edits coalesces correctly to a single save AFTER the
+        burst quiets. Previously the early-return on existing-timer
+        meant only the FIRST edit was guaranteed to land — edits that
+        arrived within the 2s window weren't persisted until the next
+        unrelated debounce trigger or app shutdown.
         """
         with self._lock:
             if self._save_timer is not None:
-                return
+                try: self._save_timer.cancel()
+                except Exception: pass
+                self._save_timer = None
             t = threading.Timer(self._save_interval_sec, self._do_debounced_save)
             t.daemon = True
             t.start()

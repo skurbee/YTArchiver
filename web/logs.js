@@ -441,9 +441,16 @@
         const clone = all[i].cloneNode(true);
         // Collect to a separate array first — DOM mutation during
         // NamedNodeMap iteration skips entries.
+        // Bug [106]: also strip aria-* and role so screen readers don't
+        // announce the same line twice (once from the main log, once
+        // from this mini-log clone).
         const _toRemove = [];
         for (const _a of clone.attributes) {
-          if (_a.name.startsWith("data-")) _toRemove.push(_a.name);
+          if (_a.name.startsWith("data-")
+              || _a.name.startsWith("aria-")
+              || _a.name === "role") {
+            _toRemove.push(_a.name);
+          }
         }
         for (const _n of _toRemove) clone.removeAttribute(_n);
         m.appendChild(clone);

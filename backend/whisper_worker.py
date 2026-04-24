@@ -70,9 +70,13 @@ for line in sys.stdin:
         req = json.loads(line)
         path = req.get("path", "")
         duration = req.get("duration", 0)
+        # Optional per-job language override; defaults to English.
+        # Pass `null` (or omit) to enable Whisper's auto-detect.
+        language = req.get("language", "en")
     except json.JSONDecodeError:
         path = line
         duration = 0
+        language = "en"
     if not path:
         continue
 
@@ -82,7 +86,7 @@ for line in sys.stdin:
 
         segments_gen, info = model.transcribe(
             path,
-            language="en",
+            language=language,
             beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),

@@ -399,9 +399,21 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # to 60 so a "30 s" entry becomes 1 min instead of being lost to 0.
     min_dur = int(channel.get("min_duration") or 0)
     max_dur = int(channel.get("max_duration") or 0)
+    # Bug [40]: surface the legacy migration so users know why their
+    # filter changed. Previously silent — a user who set min_duration=30
+    # years ago would wake up to find sub-1-min videos no longer
+    # downloading with no log entry explaining why.
     if 0 < min_dur < 60:
+        try:
+            stream.emit_dim(f" (legacy min_duration {min_dur}s upgraded to 60s)")
+        except Exception:
+            pass
         min_dur = 60
     if 0 < max_dur < 60:
+        try:
+            stream.emit_dim(f" (legacy max_duration {max_dur}s upgraded to 60s)")
+        except Exception:
+            pass
         max_dur = 60
     mode = (channel.get("mode") or "new").lower() # "new" | "full" | "fromdate"
     from_date = (channel.get("from_date") or "").strip()
@@ -578,6 +590,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # matches YTArchiver.py:17249 behavior.
     # Skip both live and upcoming streams — they can't be downloaded mid-
     # stream, and the livestream defer journal catches them for retry later.
+    # NOTE: min_dur=0 OR max_dur=0 deliberately means "no limit on that side"
+    # (matches the UI semantics where empty = unbounded). Don't add a
+    # defensive duration>?0 floor — it would change behavior for existing
+    # configs that rely on 0 = unbounded.
     match_parts = ["!is_live", "!is_upcoming"]
     if min_dur > 0:
         match_parts.append(f"duration>?{min_dur}")
@@ -1289,14 +1305,19 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     continue
                 # Resolve display_title for the current in-flight
                 # video by looking up which final_path was assigned
-                # this _DLROW_COUNTER value. If nothing matches, skip.
+                # this _DLROW_COUNTER value.
                 _disp = None
                 for _fp, _ctr in _path_to_counter.items():
                     if _ctr == _DLROW_COUNTER:
                         _disp = _path_to_display_title.get(_fp)
                         break
+                # Bug [98]: emit a fallback progress line even when
+                # the title isn't resolvable yet (the Destination line
+                # for this counter hasn't been processed). Previously
+                # we silently dropped the tick, leaving the UI looking
+                # stuck for a video that's actually downloading.
                 if not _disp:
-                    continue
+                    _disp = f"#{_DLROW_COUNTER}"
                 stream.emit([
                     [" ", ["dim", _prog_kind]],
                     ["\u2014 Downloading ", ["simpleline_green", _prog_kind]],
@@ -2584,10 +2605,22 @@ def cleanup_batch_file() -> None:
 def set_batch_cooldown(ch_url: str) -> None:
     """Apply a 72h cooldown to a channel (called after a bootstrap run)."""
     from datetime import datetime as _dt, timedelta as _td
+    from . import subs as _subs
     cfg = load_config()
+    # Normalize once for the comparison key so trailing slash / www / scheme
+    # variants between the live URL and the config-stored URL still match.
+    try:
+        target = _subs.normalize_channel_url(ch_url)
+    except Exception:
+        target = ch_url
     changed = False
     for cfg_ch in cfg.get("channels", []):
-        if cfg_ch.get("url") == ch_url:
+        cfg_url = cfg_ch.get("url", "")
+        try:
+            cfg_norm = _subs.normalize_channel_url(cfg_url)
+        except Exception:
+            cfg_norm = cfg_url
+        if cfg_norm == target or cfg_url == ch_url:
             cfg_ch["init_batch_after"] = (_dt.now() + _td(hours=_BATCH_COOLDOWN_HOURS)).isoformat()
             changed = True
     if changed:

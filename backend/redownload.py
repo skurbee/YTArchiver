@@ -270,8 +270,25 @@ def _match_files_to_ids(local_files: Dict[str, str],
     redownload pipeline silently skipped 16 files.
     """
     matched: List[Dict[str, str]] = []
-    yt_lower = {t.lower(): (t, vid) for t, vid in yt_title_to_id.items()}
+    # Bug [22]: NFC-normalize before lowercasing so non-ASCII titles
+    # match across composed/decomposed Unicode forms. yt-dlp emits NFC
+    # but some filesystems (notably macOS HFS+) store filenames as NFD;
+    # without normalization, "Café" (NFC) on disk wouldn't match "Café"
+    # (NFD) from the YouTube catalog. Note: we use NFC, not norm_ascii,
+    # so non-Latin titles (Japanese, Cyrillic, Arabic) still compare
+    # correctly instead of getting stripped to empty strings.
+    import unicodedata as _ud
+    def _norm(s: str) -> str:
+        try:
+            return _ud.normalize("NFC", s).lower()
+        except Exception:
+            return s.lower()
+    yt_lower = {_norm(t): (t, vid) for t, vid in yt_title_to_id.items()}
     meta_by_title = (meta_index or {}).get("by_title") or {}
+    # Re-key meta_by_title with the same normalization so step 3 lookups
+    # use a consistent form. Safe to do here because meta_by_title was
+    # built upstream from arbitrary strings; we normalize on read.
+    meta_by_title_norm = {_norm(k): v for k, v in meta_by_title.items()}
     meta_by_date = (meta_index or {}).get("by_date") or {}
     meta_by_id = (meta_index or {}).get("by_id") or {}
     for fname, fpath in local_files.items():
@@ -283,7 +300,7 @@ def _match_files_to_ids(local_files: Dict[str, str],
             matched.append({"filename": fname, "filepath": fpath,
                             "video_id": vid_id, "title": title})
             continue
-        low = stem.lower()
+        low = _norm(stem)
         # 2. Exact title match in YT catalog
         if low in yt_lower:
             t, vid = yt_lower[low]
@@ -291,8 +308,8 @@ def _match_files_to_ids(local_files: Dict[str, str],
                             "video_id": vid, "title": t})
             continue
         # 3. Exact title match in LOCAL metadata (catches renames)
-        if low in meta_by_title:
-            vid = meta_by_title[low]
+        if low in meta_by_title_norm:
+            vid = meta_by_title_norm[low]
             t_orig = meta_by_id.get(vid, {}).get("title") or stem
             matched.append({"filename": fname, "filepath": fpath,
                             "video_id": vid, "title": t_orig})
@@ -314,7 +331,7 @@ def _match_files_to_ids(local_files: Dict[str, str],
             # Multiple videos that day — pick the best substring match.
             best = None
             for vid, t_orig in candidates:
-                t_low = (t_orig or "").lower()
+                t_low = _norm(t_orig or "")
                 if t_low and (low in t_low or t_low in low):
                     best = (vid, t_orig)
                     break

@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v56.7"
-APP_VERSION_DATE = "4.24.26 4:10pm"
+APP_VERSION      = "v56.8"
+APP_VERSION_DATE = "4.24.26 6:14pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -620,7 +620,8 @@ class Api:
             from backend.ytarchiver_config import save_config as _sc
             cfg = load_config()
             cfg[key] = bool(enabled)
-            _sc(cfg)
+            if not _sc(cfg):
+                return {"ok": False, "error": "Config write failed (write-gate off?)"}
             if self._config is not None:
                 self._config[key] = bool(enabled)
             if kind == "gpu" and enabled:
@@ -4706,7 +4707,8 @@ class Api:
             cfg["recent_downloads"] = [r for r in cfg.get("recent_downloads", [])
                                         if not (r.get("title") == title and r.get("channel") == channel)]
             from backend.ytarchiver_config import save_config as _sc
-            _sc(cfg)
+            if not _sc(cfg):
+                return {"ok": False, "error": "File deleted but config write failed; recent_downloads may show stale entry"}
         return {"ok": True}
 
     # ─── Settings dialog: load / save all tunables ─────────────────────

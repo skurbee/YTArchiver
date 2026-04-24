@@ -189,6 +189,7 @@ def compress_video(input_path: str, stream: LogStreamer,
         return {"ok": False, "error": str(e)}
 
     last_pct = -1
+    first_progress_emitted = False
     for line in proc.stderr:
         if cancel_event is not None and cancel_event.is_set():
             try:
@@ -207,8 +208,16 @@ def compress_video(input_path: str, stream: LogStreamer,
         if m and dur > 0:
             sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
             pct = min(99, int(sec / dur * 100))
-            if pct != last_pct and pct % 5 == 0:
+            # Bug [26]: emit at the FIRST progress sample regardless of
+            # whether it lands on a 5% boundary. A fast encode that goes
+            # straight from 0% to 6% to 12% would otherwise never trigger
+            # an emit (none of those % 5 == 0), leaving the UI stuck at
+            # the initial state until the encode completes.
+            should_emit = (pct != last_pct
+                           and (pct % 5 == 0 or not first_progress_emitted))
+            if should_emit:
                 last_pct = pct
+                first_progress_emitted = True
                 stream.emit([
                     [" ", None],
                     ["\u2588" * (pct // 5), "encode_progress"],
@@ -462,7 +471,15 @@ def compress_videos_batch(paths, stream: LogStreamer,
             try:
                 idx = _QUALITY_LADDER.index(quality)
             except ValueError:
-                idx = 1
+                # Bug [105]: was idx=1 (Average) which silently demoted
+                # an unrecognized "Generous"-equivalent quality to a
+                # LOWER tier than the user picked. Default to 0 (most
+                # generous) so a typo / schema drift errs on the safe
+                # side, and log so the user sees the fallback.
+                idx = 0
+                stream.emit_dim(
+                    f" (unrecognized quality {quality!r}; defaulting to "
+                    f"{_QUALITY_LADDER[0]} tier)")
             if idx + 1 < len(_QUALITY_LADDER):
                 retry_q = _QUALITY_LADDER[idx + 1]
                 stream.emit([

@@ -1275,31 +1275,39 @@
     document.getElementById("search-viewer-earlier")?.addEventListener("click", async () => {
       if (!_searchViewerState.segmentId) return;
       _searchViewerState.before += 30;
-      const ctx = await api.browse_search_context({
-        segment_id: _searchViewerState.segmentId,
-        before: _searchViewerState.before,
-        after: _searchViewerState.after,
-        query: _searchViewerState.query,
-      });
-      if (ctx?.ok) {
-        _renderSearchViewer(ctx, _searchViewerState.segmentId);
-        document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-        document.getElementById("search-viewer-later").hidden = !ctx.after_more;
+      try {
+        const ctx = await api.browse_search_context({
+          segment_id: _searchViewerState.segmentId,
+          before: _searchViewerState.before,
+          after: _searchViewerState.after,
+          query: _searchViewerState.query,
+        });
+        if (ctx?.ok) {
+          _renderSearchViewer(ctx, _searchViewerState.segmentId);
+          document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
+          document.getElementById("search-viewer-later").hidden = !ctx.after_more;
+        }
+      } catch (e) {
+        window._showToast?.("Couldn't load earlier context: " + e, "error");
       }
     });
     document.getElementById("search-viewer-later")?.addEventListener("click", async () => {
       if (!_searchViewerState.segmentId) return;
       _searchViewerState.after += 30;
-      const ctx = await api.browse_search_context({
-        segment_id: _searchViewerState.segmentId,
-        before: _searchViewerState.before,
-        after: _searchViewerState.after,
-        query: _searchViewerState.query,
-      });
-      if (ctx?.ok) {
-        _renderSearchViewer(ctx, _searchViewerState.segmentId);
-        document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
-        document.getElementById("search-viewer-later").hidden = !ctx.after_more;
+      try {
+        const ctx = await api.browse_search_context({
+          segment_id: _searchViewerState.segmentId,
+          before: _searchViewerState.before,
+          after: _searchViewerState.after,
+          query: _searchViewerState.query,
+        });
+        if (ctx?.ok) {
+          _renderSearchViewer(ctx, _searchViewerState.segmentId);
+          document.getElementById("search-viewer-earlier").hidden = !ctx.before_more;
+          document.getElementById("search-viewer-later").hidden = !ctx.after_more;
+        }
+      } catch (e) {
+        window._showToast?.("Couldn't load later context: " + e, "error");
       }
     });
   }
@@ -1628,8 +1636,12 @@
         row.querySelector(".deferred-title").textContent = it.title
           ? ` \u2014 ${it.title.slice(0, 60)}` : "";
         row.querySelector("[data-drop]").addEventListener("click", async () => {
-          await api.livestreams_drop(it.video_id);
-          refreshDeferredLivestreams();
+          try {
+            await api.livestreams_drop(it.video_id);
+            refreshDeferredLivestreams();
+          } catch (e) {
+            window._showToast?.("Couldn't drop deferred entry: " + e, "error");
+          }
         });
         row.querySelector("[data-ignore]").addEventListener("click", async () => {
           const ok = await window.askQuestion?.({
@@ -1640,9 +1652,13 @@
             danger: true,
           });
           if (!ok) return;
-          await api.livestreams_ignore?.(it.video_id);
-          window._showToast?.("Ignored. Won't appear again.", "ok");
-          refreshDeferredLivestreams();
+          try {
+            await api.livestreams_ignore?.(it.video_id);
+            window._showToast?.("Ignored. Won't appear again.", "ok");
+            refreshDeferredLivestreams();
+          } catch (e) {
+            window._showToast?.("Couldn't ignore video: " + e, "error");
+          }
         });
         list.appendChild(row);
       }
@@ -3457,13 +3473,19 @@
         const pct = (c.transcribed_pct_channels != null)
           ? c.transcribed_pct_channels.toFixed(1) + "%"
           : "\u2014";
+        // This panel describes the Index (the searchable transcript
+        // database), not the underlying archive. Show the .db file size
+        // and treat hours/segments as zero-valid (a fresh install has
+        // 0 indexed segments — render "0", not "\u2014").
+        const _zeroOK = (v) => (v == null ? "\u2014" :
+          (typeof v === "number" ? v.toLocaleString() : String(v)));
         const lines = [
           `Channels: ${fmt(c.channels)}`,
           `Videos: ${fmt(c.videos)}`,
-          `Segments: ${fmt(c.segments)}`,
+          `Segments: ${_zeroOK(c.segments)}`,
+          `Hours of video: ${_zeroOK(c.hours)}`,
           `Transcribed: ${pct}`,
-          `Total size: ${c.size_label || "\u2014"}`,
-          `Hours of video: ${fmt(c.hours)}`,
+          `Index DB size: ${c.index_db_size_label || "\u2014"}`,
         ];
         statsEl.textContent = lines.join("\n");
         statsEl.dataset.populated = "1";
@@ -4645,17 +4667,7 @@
         // Re-peek so the buttons hide themselves.
         await refreshContinueBtn(name);
         // Re-fetch the Subs table so the pending-redownload dot clears.
-        if (typeof window._refreshSubsTable === "function") {
-          window._refreshSubsTable();
-        } else if (window.pywebview?.api?.subs_list_for_ui) {
-          // Fallback — harmless if the refresher isn't exposed.
-          try {
-            const rows = await window.pywebview.api.subs_list_for_ui();
-            if (Array.isArray(rows) && typeof window.renderSubsTable === "function") {
-              window.renderSubsTable(rows);
-            }
-          } catch {}
-        }
+        try { window.refreshSubsTable?.(); } catch {}
         const bits = [];
         if (r.was_running) bits.push("stopped running job");
         else if (r.was_queued) bits.push("removed from queue");
@@ -7492,8 +7504,14 @@
         }
         const t = data.total || {};
         if (summary) {
+          // Bug [111]: optional-chain `t.videos?.toLocaleString()` returns
+          // undefined when the field is missing/null, rendering literal
+          // "undefined" in the summary. Coerce to 0 to match the per-row
+          // table's `_n()` helper at line 7530+.
+          const _vids = Number.isFinite(Number(t.videos)) ? Number(t.videos) : 0;
+          const _hrs = Number.isFinite(Number(t.hours)) ? Number(t.hours) : 0;
           summary.textContent =
-            `${t.videos?.toLocaleString()} videos · ${t.hours?.toLocaleString()} hours`;
+            `${_vids.toLocaleString()} videos · ${_hrs.toLocaleString()} hours`;
         }
         // Build a simple table. Per-channel rows sorted by current_gb
         // desc (matches backend query); grand total pinned at top.
@@ -7892,9 +7910,18 @@
         recent_view_mode:
           document.getElementById("settings-recent-view-grid")?.checked ? "grid" : "list",
       };
-      const res = await api?.settings_save?.(payload);
-      if (res?.ok) window._showToast?.("Settings saved.", "ok");
-      else window._showToast?.(res?.error || "Save failed.", "error");
+      // Bug [68]: disable Save during in-flight call so a fast double-
+      // click doesn't queue duplicate writes.
+      if (save) save.disabled = true;
+      try {
+        const res = await api?.settings_save?.(payload);
+        if (res?.ok) window._showToast?.("Settings saved.", "ok");
+        else window._showToast?.(res?.error || "Save failed.", "error");
+      } catch (e) {
+        window._showToast?.("Save failed: " + e, "error");
+      } finally {
+        if (save) save.disabled = false;
+      }
     });
 
     browseOut?.addEventListener("click", async () => {

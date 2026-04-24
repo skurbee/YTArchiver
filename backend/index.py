@@ -494,7 +494,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 "UPDATE videos SET tx_status='transcribed' "
                 "WHERE filepath=? COLLATE NOCASE", (fp,))
             conn.commit()
-        return len(segments)
+        # Bug [53]: return the actually-inserted row count, not the
+        # raw segment count from the JSONL. Empty-text segments and
+        # malformed entries are filtered out above (lines 442-451) but
+        # still inflated the reported "ingested" total before this fix.
+        return len(rows)
     except sqlite3.Error as e:
         print(f"[index] ingest_jsonl failed: {e}")
         return 0
@@ -647,10 +651,14 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         "title": "title COLLATE NOCASE ASC",
     }.get(sort, "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC")
     with _db_lock:
+        # Bug [49]: COLLATE NOCASE so a channel named "MyChannel" matches
+        # rows stored as "mychannel" (case drift can come from manual DB
+        # edits or older data). Without it, duplicates from the lower-
+        # cased rows escape the is_duplicate_of filter and show twice.
         cur = conn.execute(
             f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
             f"tx_status, added_ts FROM videos "
-            f"WHERE channel=? AND is_duplicate_of IS NULL "
+            f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
             f"ORDER BY {order} LIMIT ?",
             (channel, limit),
         )
@@ -784,6 +792,11 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             try:
                 if fp and os.path.isfile(fp):
                     row["upload_ts"] = os.path.getmtime(fp)
+                    # Bug [103]: flag the fallback so the UI can render
+                    # the date with a "~estimated" hint. Without this,
+                    # a video whose mtime got reset (re-org, copy across
+                    # volumes) shows the wrong date as if it were real.
+                    row["upload_ts_source"] = "mtime_fallback"
             except OSError:
                 pass
 
@@ -1029,8 +1042,13 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
         where.append("title=?"); args.append(title)
     if not where:
         return []
+    # Use AND across multiple filters: when a caller passes both video_id
+    # and jsonl_path (the common case from main.py:browse_get_transcript),
+    # we want segments that match BOTH, not segments matching either.
+    # OR semantics would mash together segments from any video that shares
+    # a jsonl_path (combined transcripts) with a different video_id.
     q = ("SELECT start_time, end_time, text, words FROM segments "
-         f"WHERE {' OR '.join(where)} ORDER BY start_time")
+         f"WHERE {' AND '.join(where)} ORDER BY start_time")
     with _db_lock:
         cur = conn.execute(q, args)
         out = []
@@ -1534,9 +1552,17 @@ def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,
             try:
                 rows = _run(cleaned)
             except sqlite3.Error as e2:
-                return [{"error": str(e2)}]
+                # Bug [52]: returning [{"error": ...}] poisoned the
+                # iterator since callers access r["segment_id"] etc.
+                # Print the error and return an empty list so the UI
+                # renders "no results" cleanly instead of crashing.
+                try: print(f"[search_fts] FTS error: {e2}")
+                except Exception: pass
+                return []
         else:
-            return [{"error": "Invalid FTS5 query"}]
+            try: print(f"[search_fts] Invalid FTS5 query: {query!r}")
+            except Exception: pass
+            return []
     return [{
         "segment_id": r[0], "video_id": r[1], "title": r[2], "channel": r[3],
         "start_time": r[4], "text": r[5], "jsonl_path": r[6], "snippet": r[7],

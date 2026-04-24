@@ -863,7 +863,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         # captions WERE present, just unparseable. A dim warning here
         # makes the distinction visible without derailing the fallback.
         try:
-            self._stream.emit_dim(
+            stream.emit_dim(
                 f" (auto-captions parse failed: {_ve} \u2014 "
                 f"falling back to Whisper)")
         except Exception:
@@ -1305,6 +1305,11 @@ class PunctuationManager:
         # video's per-job inplace tag. Without it that line shares the
         # generic "whisper" kind and can get stomped by other jobs.
         self._job_tag: str = ""
+        # Bug [43]: track whether the most recent punctuate() call hit
+        # the per-call timeout, separately from other failures. Lets
+        # callers append "+TIMEOUT" to the source tag so the user can
+        # see at-a-glance why the transcript is unpunctuated.
+        self.last_was_timeout: bool = False
 
     def is_available(self) -> bool:
         return self._worker_script.exists() and (self._python311 or find_python311()) is not None
@@ -1391,6 +1396,9 @@ class PunctuationManager:
         """
         if not text or len(text.split()) < 3:
             return text
+        # Bug [43]: reset timeout flag at the start of each call so the
+        # caller can read it after this call returns.
+        self.last_was_timeout = False
         if self._proc is None or self._proc.poll() is not None:
             if not self._start():
                 return text
@@ -1418,6 +1426,7 @@ class PunctuationManager:
                     except Exception:
                         pass
                     self._proc = None
+                    self.last_was_timeout = True
                     self._stream.emit_dim(
                         f" (punctuation timed out after {timeout_sec:.0f}s)")
                     return text
@@ -1857,6 +1866,11 @@ class TranscribeManager:
                     "retranscribe": bool(j.get("retranscribe")),
                     "combined_override": j.get("combined_override"),
                     "bulk_id": j.get("bulk_id", ""),
+                    # Persist bulk batch metadata so the popover tooltip
+                    # ("Transcribing X (3 of 5)") reflects the original
+                    # batch on recovery, not just the surviving items.
+                    "bulk_total": int(j.get("bulk_total", 0) or 0),
+                    "bulk_index": int(j.get("bulk_index", 0) or 0),
                     "kind": j.get("kind", "transcribe"),
                 }
             with self._jobs_lock:
@@ -1934,8 +1948,18 @@ class TranscribeManager:
                     retranscribe=bool(j.get("retranscribe")),
                     video_id=j.get("video_id", ""),
                     bulk_id=j.get("bulk_id", ""),
+                    bulk_total=int(j.get("bulk_total", 0) or 0),
+                    bulk_index=int(j.get("bulk_index", 0) or 0),
                 )
                 recovered += 1
+            # Recovery succeeded — drop the journal file. The next
+            # _persist_pending() call will rewrite it from current
+            # state. Without this, a second crash before the next
+            # persist would re-enqueue the same jobs a second time.
+            try:
+                p.unlink()
+            except OSError:
+                pass
             return recovered
         except Exception:
             return 0
@@ -2523,10 +2547,16 @@ class TranscribeManager:
                 # was present in the Watch banner.
                 result["_punct_attempted"] = True
                 result["_punct_success"] = False
+                result["_punct_timeout"] = False  # bug [43]
                 try:
                     raw_text = result.get("text", "") or ""
                     if raw_text:
                         punct_text = self._punct.punctuate(raw_text)
+                        # Bug [43]: surface a timeout-specific signal so
+                        # downstream code (source tag, summary log) can
+                        # distinguish "model wedged" from other failures.
+                        if getattr(self._punct, "last_was_timeout", False):
+                            result["_punct_timeout"] = True
                         if punct_text and punct_text != raw_text:
                             result["text"] = punct_text
                             # Also run punctuation per-segment so the .jsonl
@@ -2537,6 +2567,8 @@ class TranscribeManager:
                                     pt = self._punct.punctuate(t)
                                     if pt:
                                         seg["t"] = pt
+                                    if getattr(self._punct, "last_was_timeout", False):
+                                        result["_punct_timeout"] = True
                             result["_punct_success"] = True
                 except Exception as _pe:
                     self._stream.emit_dim(f" (punctuation pass skipped: {_pe})")
@@ -3059,7 +3091,15 @@ class TranscribeManager:
             _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
             _idx.mark_video_transcribed(video_path)
         except Exception as e:
-            self._stream.emit_dim(f" (index ingest skipped: {e})")
+            # Bug [101]: was emit_dim — invisible in Simple log mode. The
+            # transcript file IS on disk but FTS is out of sync (search
+            # won't find this video). User-actionable, so use the red
+            # convention used elsewhere for warnings/failures so it shows
+            # in Simple mode too.
+            self._stream.emit_text(
+                f" \u26a0 FTS index sync failed for {os.path.basename(video_path)}: {e}",
+                "red")
+
         # Decrement transcription_pending / set transcription_complete on 0.
         # Matches YTArchiver.py:14629-14630. Skip the decrement on
         # retranscribe — it wasn't incremented when the Re-transcribe

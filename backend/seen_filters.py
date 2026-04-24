@@ -16,11 +16,12 @@ from .ytarchiver_config import SEEN_FILTER_TITLES, config_is_writable
 
 _lock = threading.Lock()
 _cache: Set[str] = set()
+_cache_lower: Set[str] = set()  # parallel lowercased copy for O(1) case-insensitive lookup
 _loaded: bool = False
 
 
 def _load_locked():
-    global _loaded, _cache
+    global _loaded, _cache, _cache_lower
     if _loaded:
         return
     _loaded = True
@@ -32,6 +33,7 @@ def _load_locked():
                 ln = line.strip()
                 if ln:
                     _cache.add(ln)
+                    _cache_lower.add(ln.lower())
     except OSError:
         pass
 
@@ -46,7 +48,11 @@ def is_seen(title: str) -> bool:
         # a title with different casing ("The Video" vs "the video")
         # don't emit duplicate [Skip] log lines for what's really
         # the same video.
-        return title.strip().lower() in {t.lower() for t in _cache}
+        # Bug [19]: use the parallel lowercased set for O(1) lookup.
+        # The previous {t.lower() for t in _cache} comprehension
+        # rebuilt the entire set on every call (O(N) per check, GIL
+        # held throughout) — meaningful CPU on a thousands-entry filter.
+        return title.strip().lower() in _cache_lower
 
 
 def mark_seen(title: str) -> bool:
@@ -59,9 +65,10 @@ def mark_seen(title: str) -> bool:
         _load_locked()
         # Case-insensitive dedup (matches audit M-16 in is_seen).
         _lower = t.lower()
-        if any(existing.lower() == _lower for existing in _cache):
+        if _lower in _cache_lower:
             return False
         _cache.add(t)
+        _cache_lower.add(_lower)
     if config_is_writable():
         try:
             SEEN_FILTER_TITLES.parent.mkdir(parents=True, exist_ok=True)
@@ -76,6 +83,7 @@ def clear():
     """Nuke the cache + file."""
     with _lock:
         _cache.clear()
+        _cache_lower.clear()
     if config_is_writable():
         try:
             if SEEN_FILTER_TITLES.exists():

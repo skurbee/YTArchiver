@@ -288,6 +288,7 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
         return (0, 0)
     n_vids = 0
     total = 0
+    zero_byte = 0
     for dp, _dns, fns in os.walk(ch_folder):
         for fn in fns:
             if not fn.lower().endswith(_CHANNEL_VIDEO_EXTS):
@@ -302,11 +303,23 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
                 # inflate the per-channel video count vs what the
                 # grid actually renders.
                 if size == 0:
+                    zero_byte += 1
                     continue
                 total += size
                 n_vids += 1
             except OSError:
                 pass
+    # Bug [24]: surface 0-byte files instead of silently dropping them.
+    # Previously this was completely invisible — a channel with 100
+    # zero-byte placeholders showed clean stats while the orphans
+    # lingered on disk. Print to stdout so it shows in the activity log.
+    if zero_byte:
+        try:
+            print(f"[archive_scan] {folder_name}: skipped {zero_byte} "
+                  f"0-byte phantom video file(s) (likely interrupted "
+                  f"downloads — safe to delete or re-sync)")
+        except Exception:
+            pass
     # audit D-50: subtract any rows the FTS DB has flagged as
     # duplicates for this channel. list_videos_for_channel filters
     # `is_duplicate_of IS NULL`, so after a prune the Browse grid
@@ -379,7 +392,50 @@ def index_summary() -> Dict[str, Any]:
     tot = archive_totals(cache)
     # Count how many channels have auto_transcribe ON
     transcribed_channels = sum(1 for c in channels if c.get("auto_transcribe"))
-    # Segments + transcribed % would come from transcription_index.db — read separately
+    # Pull index-DB-side stats: segments count, total hours of indexed
+    # video, and the actual .db file size on disk. The Index Statistics
+    # panel is meant to describe the SEARCHABLE INDEX, not the underlying
+    # archive — so the panel shows .db size here, not the multi-TB
+    # archive size (which is surfaced elsewhere via the Browse grid).
+    segments_count = 0
+    hours = 0.0
+    index_db_bytes = 0
+    try:
+        from . import index as _idx
+        from .ytarchiver_config import TRANSCRIPTION_DB as _DB
+        if _DB.exists():
+            try:
+                index_db_bytes = _DB.stat().st_size
+            except OSError:
+                pass
+        _conn = _idx._open()
+        if _conn is not None:
+            with _idx._db_lock:
+                _row = _conn.execute("SELECT COUNT(*) FROM segments").fetchone()
+                if _row:
+                    segments_count = int(_row[0] or 0)
+                # Hours of video — prefer the summed videos.duration_s
+                # column (populated by register_video). For rows where
+                # duration_s is NULL, fall back to the maximum
+                # segments.end_time per video so transcribed videos
+                # without explicit duration metadata still contribute.
+                _row = _conn.execute(
+                    "SELECT COALESCE(SUM(duration_s), 0) FROM videos "
+                    "WHERE duration_s IS NOT NULL").fetchone()
+                if _row:
+                    hours += float(_row[0] or 0) / 3600.0
+                _row = _conn.execute(
+                    "SELECT COALESCE(SUM(max_end), 0) FROM ("
+                    "  SELECT MAX(s.end_time) AS max_end "
+                    "  FROM segments s "
+                    "  LEFT JOIN videos v ON v.video_id = s.video_id "
+                    "  WHERE v.duration_s IS NULL OR v.video_id IS NULL "
+                    "  GROUP BY s.video_id"
+                    ")").fetchone()
+                if _row:
+                    hours += float(_row[0] or 0) / 3600.0
+    except Exception:
+        pass
     per_channel = []
     for ch in channels:
         st = stats_for_channel(ch, cache)
@@ -397,6 +453,13 @@ def index_summary() -> Dict[str, Any]:
             "videos": tot["videos"],
             "size_gb": tot["size_gb"],
             "size_label": _fmt_size(tot["size_bytes"]),
+            # New: index-DB-side stats. The frontend renders these as
+            # the Index Statistics panel; archive_size is still returned
+            # for callers that want it but isn't shown in the Index panel.
+            "segments": segments_count,
+            "hours": round(hours, 1) if hours > 0 else 0,
+            "index_db_bytes": index_db_bytes,
+            "index_db_size_label": _fmt_size(index_db_bytes),
             "transcribed_channels": transcribed_channels,
             "transcribed_pct_channels":
                 (transcribed_channels * 100.0 / len(channels)) if channels else 0.0,

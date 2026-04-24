@@ -99,10 +99,20 @@ class AutorunScheduler:
             # etc.) — classic's _tick_countdown shows "Waiting for queue..."
             # for all such cases.
             waiting = self._waiting_for_sync_done or busy
+            overdue = 0
             if waiting:
                 remaining = None
             elif self._next_fire_ts:
-                remaining = max(0, int(self._next_fire_ts - time.time()))
+                # Bug [27]: also surface negative deltas (autorun is
+                # past-due but hasn't fired yet — e.g., system asleep
+                # past the scheduled time, or a long modal blocked the
+                # tick thread). seconds_remaining stays clamped at 0
+                # for backwards compat with the existing UI; new
+                # overdue_seconds lets a future UI display "Overdue by X".
+                _delta = int(self._next_fire_ts - time.time())
+                remaining = max(0, _delta)
+                if _delta < 0:
+                    overdue = -_delta
             else:
                 remaining = None
             return {
@@ -110,6 +120,7 @@ class AutorunScheduler:
                 "label": next((k for k, v in AUTORUN_OPTIONS.items()
                               if v == self._interval_mins), "Off"),
                 "seconds_remaining": remaining,
+                "overdue_seconds": overdue,
                 "waiting_for_sync": waiting,
             }
 

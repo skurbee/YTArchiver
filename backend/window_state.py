@@ -109,13 +109,18 @@ def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
                 _x = int(out["x"]); _y = int(out["y"])
                 _w = int(out.get("width") or DEFAULT_STATE["width"])
                 _h = int(out.get("height") or DEFAULT_STATE["height"])
-                # If at least ~100px of the window intersects ANY monitor,
-                # keep the saved position; otherwise clamp to the first
-                # monitor's work area.
+                # Bug [31]: require a more substantial visible area
+                # (was 100x100 px). 100px is small enough that the user
+                # might still struggle to grab the window — saw this on
+                # a multi-monitor setup where the window restored as a
+                # 110px sliver on the right edge of the laptop screen.
+                # 250x150 ensures the title bar AND a usable chunk are
+                # actually reachable.
+                _MIN_VIS_W, _MIN_VIS_H = 250, 150
                 _visible = any(
                     (_x + _w > L and _x < R and _y + _h > T and _y < B)
-                    and min(_x + _w, R) - max(_x, L) >= 100
-                    and min(_y + _h, B) - max(_y, T) >= 100
+                    and min(_x + _w, R) - max(_x, L) >= _MIN_VIS_W
+                    and min(_y + _h, B) - max(_y, T) >= _MIN_VIS_H
                     for L, T, R, B in _rects)
                 if not _visible:
                     L, T, R, B = _rects[0]

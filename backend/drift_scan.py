@@ -277,9 +277,18 @@ def scan_channel(channel: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
     fts_phantoms = _count_fts_phantoms()
 
     # Distinct counts (dedup-safe).
-    txt_titles_distinct = len({(r["txt_path"], r["raw"])
+    # Bug [32]: normalize paths via normcase+normpath so case differences
+    # on Windows ("C:\Path" vs "c:\path") don't produce false-distinct
+    # entries. The same .txt or .jsonl file viewed through symlinks /
+    # mixed-case parents would have inflated the distinct count.
+    def _np(p: str) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(p))
+        except Exception:
+            return p
+    txt_titles_distinct = len({(_np(r["txt_path"]), r["raw"])
                                 for r in txt_map.values()})
-    jsonl_titles_distinct = len({(r["jsonl_path"], r["raw"])
+    jsonl_titles_distinct = len({(_np(r["jsonl_path"]), r["raw"])
                                   for r in jsonl_map.values()})
 
     return {

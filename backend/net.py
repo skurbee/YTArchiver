@@ -31,14 +31,33 @@ _probe_timeout_sec = 5.0
 
 
 def probe_once(timeout: float = _probe_timeout_sec) -> bool:
-    """Return True if at least one probe host answers a TCP handshake."""
-    for host, port in _PROBE_HOSTS:
+    """Return True if at least one probe host answers a TCP handshake.
+
+    Bug [30]: probes run in parallel so a slow/dead first host doesn't
+    block reaching the others. Previously the loop tried hosts
+    sequentially with a 5s timeout each; if Cloudflare DNS was slow
+    AND Google DNS was slow, youtube.com never got tried within a
+    reasonable window and the function returned False even though
+    YouTube itself was reachable. With parallel probes the worst-case
+    latency is the per-host timeout, not its multiple.
+    """
+    result_event = threading.Event()
+    success = [False]
+    def _probe(host: str, port: int):
         try:
             with socket.create_connection((host, port), timeout=timeout):
-                return True
+                success[0] = True
+                result_event.set()
         except (socket.timeout, socket.gaierror, OSError):
-            continue
-    return False
+            pass
+    threads = []
+    for host, port in _PROBE_HOSTS:
+        t = threading.Thread(target=_probe, args=(host, port), daemon=True)
+        t.start()
+        threads.append(t)
+    # Wait either until one succeeds or all have finished trying.
+    result_event.wait(timeout=timeout + 0.5)
+    return success[0]
 
 
 def start_monitor():

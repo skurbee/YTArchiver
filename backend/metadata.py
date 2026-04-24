@@ -858,63 +858,15 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
         [summary, "dim"],
         [f" \u00b7 took {elapsed:.1f}s\n", "dim"],
     ])
-    # Persist to autorun history + emit activity-log row so the user sees
-    # [Metdta] entries with pink coloring (matches OLD _record_metadata at
-    # YTArchiver.py:22633). Only persist when something actually happened —
-    # the "history of work done, not noisy status feed" rule.
-    if fetched or refreshed or errors:
-        try:
-            from . import autorun as _ar
-            # Metdta primary: "N fetched" when new arrivals, else "N refreshed".
-            # Secondary column uses "existing" label (OLD:22657) instead of "skipped".
-            if refreshed and not fetched:
-                primary = f"{refreshed} refreshed"
-            else:
-                primary = f"{fetched} fetched"
-            _ar.append_history_entry(
-                _ar.format_history_entry("Metdta", name, primary,
-                                         secondary=f"{skipped} existing",
-                                         errors=errors, took_sec=elapsed))
-        except Exception:
-            pass
-        # Activity log row — coloured pink via _hist_tag_for_kind
-        try:
-            now = datetime.now()
-            time_str = now.strftime("%I:%M%p").lstrip("0").lower()
-            date_str = now.strftime("%b %d").replace(" 0", " ")
-            primary_ui = (f"{refreshed} refreshed" if refreshed and not fetched
-                          else f"{fetched} fetched")
-            row_tag = "hist_pink" if (fetched or refreshed) else ""
-            # Use the same `Xm Ys` helper as the rest of the activity
-            # log so a 215-second run reads as "took 3m 35s" rather
-            # than "took 215.6s" (request — matches OLD
-            # YTArchiver's compact duration format).
-            _el_int = int(elapsed or 0)
-            if _el_int < 60:
-                _took_str = f"{_el_int}s"
-            elif _el_int < 3600:
-                _took_str = f"{_el_int // 60}m {_el_int % 60}s"
-            else:
-                _took_str = f"{_el_int // 3600}h {(_el_int % 3600) // 60}m"
-            stream.emit_activity({
-                "kind": "Metdta",
-                "time_date": f"{time_str}, {date_str}",
-                "channel": name,
-                "primary": primary_ui,
-                "secondary": f"{skipped} existing",
-                "errors": f"{errors} errors",
-                "took": f"took {_took_str}",
-                "row_tag": row_tag,
-            })
-        except Exception as _ae:
-            # bug S-9: metadata fetch succeeded but the [Metdta] row
-            # didn't emit — without this log line the user thinks the
-            # fetch never ran. Surface the failure so diagnosis is
-            # possible.
-            try:
-                stream.emit_dim(f" (metadata activity row emit failed: {_ae})")
-            except Exception:
-                pass
+    # Both activity-log row emit AND history persistence moved to
+    # sync.py's `emit_metadata_activity_row` so ALL metadata-kind
+    # tasks (views/likes refresh, comments refresh, ID backfill,
+    # legacy fetch) produce a single identical [Metdta] row with
+    # a single persisted history entry. Previously this path emitted
+    # + persisted locally while the bulk paths didn't emit at all,
+    # so views/likes refresh never appeared in the activity log
+    # and legacy fetches produced nothing at all from sync.py's
+    # worker loop.
     return {"ok": True, "fetched": fetched, "skipped": skipped,
             "errors": errors, "refreshed": refreshed,
             "thumb_only": thumb_only, "took": elapsed}

@@ -2041,6 +2041,7 @@ def _should_batch_limit(ch: Dict[str, Any], ch_total: int) -> bool:
 # UI push hook — main.py registers a callable here so the Recent tab
 # refreshes live whenever a download lands. No-op if unset (unit tests).
 _on_recent_changed_hook: Optional[Any] = None
+_on_metadata_changed_hook: Optional[Any] = None
 
 
 def set_recent_changed_hook(hook: Optional[Any]) -> None:
@@ -2049,6 +2050,15 @@ def set_recent_changed_hook(hook: Optional[Any]) -> None:
     current recent_downloads list and pushes to the UI."""
     global _on_recent_changed_hook
     _on_recent_changed_hook = hook
+
+
+def set_metadata_changed_hook(hook: Optional[Any]) -> None:
+    """Main.py wires this so Settings > Metadata auto-refreshes its
+    `XXm ago` timestamps after any metadata / metadata_comments /
+    videoid_backfill task completes. Without this, the tab keeps
+    showing pre-pass stamps until the user clicks Reload."""
+    global _on_metadata_changed_hook
+    _on_metadata_changed_hook = hook
 
 
 # Channels with an in-flight `sync_channel` call. Used by
@@ -2092,6 +2102,76 @@ def _count_cell(n: int, label: str) -> str:
     if n == 1:
         return f"\u2713 {label}"
     return f"{n} {label}"
+
+
+def emit_metadata_activity_row(stream: "LogStreamer",
+                                channel_name: str,
+                                primary: str,
+                                secondary: str,
+                                errors: int,
+                                elapsed: float,
+                                green: bool = True) -> str:
+    """Emit a [Metdta] activity-log row for metadata / comments / ID
+    backfill tasks. Parallel to the [Dwnld] row `sync_channel` emits
+    at end of a download pass. Users flagged that metadata refreshes
+    were landing only in the main log, not the activity log above —
+    this fills that gap so all background work has a matching history
+    entry.
+
+    Uses 2 data cells instead of [Dwnld]'s 3 (no transcribed cell —
+    metadata passes never transcribe) so the row reads:
+        [Mtadta] [time,date] — [channel] —
+        [primary] [secondary] [N errors] [took X]
+
+    `primary` example: "61 refreshed", "12 comments refreshed",
+                       "40 IDs backfilled".
+    `secondary` example: "5 new" (new metadata entries), "2 ambiguous"
+                         — additional info beyond the primary count.
+                         Pass empty string when nothing to add.
+    """
+    now = datetime.now()
+    time_str = (now.strftime("%-I:%M%p") if os.name != "nt"
+                else now.strftime("%I:%M%p").lstrip("0")).lower()
+    date_str = now.strftime("%b %d").replace(" 0", " ")
+    took = _fmt_duration(elapsed)
+    row_id = f"metdta_{channel_name}_{int(time.time())}"
+    # Kind label is "Metdta" (6 chars, matches the existing classic
+    # rows emitted by fetch_channel_metadata's legacy path). Row tag
+    # is hist_pink — metadata-kind rows have always rendered pink in
+    # the activity log; `green` was only used here to signal "nothing
+    # happened" vs "something happened", NOT to force green tinting.
+    # When no work happened we leave the tag blank (default color).
+    had_work = green and errors == 0 and primary not in (
+        "up to date", "no videos in scope", "no IDs to backfill",
+        "failed")
+    payload = {
+        "kind": "Metdta",
+        "time_date": f"{time_str}, {date_str}",
+        "channel": channel_name,
+        "primary": primary,
+        "secondary": secondary,
+        "tertiary": "",
+        "errors": f"{errors} errors",
+        "took": f"took {took}",
+        "row_tag": "hist_pink" if had_work else "",
+        "row_id": row_id,
+    }
+    stream.emit_activity(payload)
+    try:
+        kind_tag = f"[{'Metdta'.center(6)}]"
+        ts_date = f"{time_str}, {date_str}".ljust(16)
+        ch_part = f" {channel_name} \u2014" if channel_name else " " * 7
+        # Mirror the [Dwnld] persistence format but with 2 cells
+        # where downloaded / transcribed / metadata would be.
+        body = (f"{primary:<14} \u00b7 "
+                f"{(secondary or '-'):<15} \u00b7 "
+                f"{int(errors or 0)} errors \u00b7 "
+                f"took {took}")
+        line = f"{kind_tag} {ts_date} \u2014{ch_part} {body}"
+        _persist_row_history(row_id, line)
+    except Exception:
+        pass
+    return row_id
 
 
 def emit_consolidated_auto_row(stream: "LogStreamer",
@@ -2754,6 +2834,7 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # controls as downloads. rule: "every channel's
         # metadata check should show as its own sync task."
         _ch_kind = (ch.get("kind") or "download").lower()
+        _task_t0 = time.time()  # per-task timer for [Mtadta] activity row
         if _ch_kind == "metadata":
             try:
                 from . import metadata as _meta
@@ -2815,12 +2896,44 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                summary=_summary,
                                name_tag="simpleline",
                                summary_tag=_summary_tag)
+                # Activity-log row — mirrors the [Dwnld] row pattern.
+                # Primary verb reflects what the pass primarily did
+                # (refreshed counts vs. first-time metadata fetch);
+                # secondary carries the less-common complement.
+                if _refreshed > 0 and _fetched > 0:
+                    _a_primary = f"{_refreshed} refreshed"
+                    _a_secondary = f"{_fetched} new"
+                elif _refreshed > 0:
+                    _a_primary = f"{_refreshed} refreshed"
+                    _a_secondary = ""
+                elif _fetched > 0:
+                    _a_primary = f"{_fetched} fetched"
+                    _a_secondary = ""
+                else:
+                    _a_primary = "up to date"
+                    _a_secondary = ""
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary=_a_primary, secondary=_a_secondary,
+                    errors=_errors_meta,
+                    elapsed=time.time() - _task_t0,
+                    green=(_errors_meta == 0))
             except Exception as _me:
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
                                name_tag="dim", summary_tag="red")
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary="failed", secondary="",
+                    errors=1, elapsed=time.time() - _task_t0,
+                    green=False)
             _last_live["name"] = ""
+            # Push Settings > Metadata tab refresh — last_views_refresh_ts
+            # may have just been stamped on the channel config.
+            if _on_metadata_changed_hook is not None:
+                try: _on_metadata_changed_hook()
+                except Exception: pass
             continue
         # Comments-only refresh task. Separate from `metadata` because
         # comments can only be fetched per-video (no bulk mode) and
@@ -2867,13 +2980,30 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                summary=_summary,
                                name_tag="simpleline",
                                summary_tag=_summary_tag)
+                _a_primary = (f"{_fetched} comments refreshed"
+                              if _fetched else "no videos in scope")
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary=_a_primary, secondary="",
+                    errors=_errors_c, elapsed=time.time() - _task_t0,
+                    green=(_errors_c == 0))
             except Exception as _ce:
                 stream.emit_error(
                     f"Comments refresh failed for {ch_name}: {_ce}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
                                name_tag="dim", summary_tag="red")
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary="failed", secondary="",
+                    errors=1, elapsed=time.time() - _task_t0,
+                    green=False)
             _last_live["name"] = ""
+            # Push Metadata-tab refresh (last_comments_refresh_ts may
+            # have just been stamped).
+            if _on_metadata_changed_hook is not None:
+                try: _on_metadata_changed_hook()
+                except Exception: pass
             continue
         # Video-id backfill task. One-shot resolution + DB write for
         # archives migrated from the tkinter-era YTArchiver that have
@@ -2923,13 +3053,33 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                summary=_summary,
                                name_tag="simpleline",
                                summary_tag=_summary_tag)
+                _a_primary = (f"{_resolved} IDs backfilled" if _resolved
+                              else "no IDs to backfill")
+                _a_secondary = (f"{_unresolved} unresolved"
+                                if _unresolved else "")
+                _a_err = 1 if _res.get("error") else 0
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary=_a_primary, secondary=_a_secondary,
+                    errors=_a_err, elapsed=time.time() - _task_t0,
+                    green=(_a_err == 0))
             except Exception as _be:
                 stream.emit_error(
                     f"ID backfill failed for {ch_name}: {_be}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
                                name_tag="dim", summary_tag="red")
+                emit_metadata_activity_row(
+                    stream, ch_name,
+                    primary="failed", secondary="",
+                    errors=1, elapsed=time.time() - _task_t0,
+                    green=False)
             _last_live["name"] = ""
+            # Push Metadata-tab refresh — the Video IDs column status
+            # just changed (resolved count went up, missing went down).
+            if _on_metadata_changed_hook is not None:
+                try: _on_metadata_changed_hook()
+                except Exception: pass
             continue
         # ── Quick-check fast path ────────────────────────────────────
         # Extra speedup on top of `--break-on-existing`: probe the first
@@ -3014,14 +3164,22 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     # said "N downloaded" even for a views/likes refresh where no
     # download happened — confusing ("why does it say 0 downloaded
     # when I just refreshed 912 videos?").
-    # Build the Pass complete line with per-segment coloring: the
-    # action verb ("X refreshed" / "X downloaded" / "X comments
-    # refreshed" / "X IDs backfilled") renders GREEN+BOLD so it's
-    # the visual anchor; errors render red when non-zero; skipped +
-    # timing stay in header style.
+    # Pass complete line styling:
+    #   === brackets                 → green+bold (simplestatus_green)
+    #   "Pass complete:"             → white+bold (simplestatus_white)
+    #   action verb (N refreshed…)   → green+bold for non-zero,
+    #                                  white+bold for zero (still
+    #                                  readable, just less celebratory)
+    #   separators, errors when 0,
+    #   skipped, "took Ns"           → bright white (simpleline)
+    #   errors when > 0              → red
+    # Prior build used `header` (muted #a0aabb) for body parts, which
+    # users reported as "near unreadable" on their displays. Switched
+    # the body to `simpleline` (bright --c-text) + `simplestatus_white`
+    # for the primary label.
     emit_parts: List[List[str]] = [
         ["=== ", "simplestatus_green"],
-        ["Pass complete: ", "header"],
+        ["Pass complete: ", "simplestatus_white"],
     ]
     _verb_chunks: List[Tuple[str, str]] = []  # (text, tag) pairs for action verbs
     if sum_dl > 0:
@@ -3037,33 +3195,32 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     if not _verb_chunks:
         # All counters zero. Pick a sensible 0-verb matching the
         # pass label so the user sees "something ran" rather than a
-        # blank summary. Same green styling as the non-zero case —
-        # the pass ran successfully, it just didn't have work to do.
-        # Previously these were tagged "dim" (--c-dim = #4a4f5a) which
-        # rendered near-unreadable on the dark log background.
+        # blank summary. White+bold for zero-count (still fully
+        # readable, just not the celebratory green).
         if _label == "Views/likes refresh":
-            _verb_chunks.append(("0 refreshed", "simplestatus_green"))
+            _verb_chunks.append(("0 refreshed", "simplestatus_white"))
         elif _label == "Comments refresh":
-            _verb_chunks.append(("0 comments refreshed", "simplestatus_green"))
+            _verb_chunks.append(("0 comments refreshed", "simplestatus_white"))
         elif _label == "Video ID backfill":
-            _verb_chunks.append(("0 IDs backfilled", "simplestatus_green"))
+            _verb_chunks.append(("0 IDs backfilled", "simplestatus_white"))
         elif _label == "Metadata download":
-            _verb_chunks.append(("0 metadata fetched", "simplestatus_green"))
+            _verb_chunks.append(("0 metadata fetched", "simplestatus_white"))
         else:
-            _verb_chunks.append(("0 downloaded", "simplestatus_green"))
+            _verb_chunks.append(("0 downloaded", "simplestatus_white"))
     # Interleave with separators.
     for _i, (_txt, _tag) in enumerate(_verb_chunks):
         if _i > 0:
-            emit_parts.append([" \u00b7 ", "header"])
+            emit_parts.append([" \u00b7 ", "simpleline"])
         emit_parts.append([_txt, _tag])
-    # Errors: red if non-zero, dim if 0.
-    emit_parts.append([" \u00b7 ", "header"])
-    emit_parts.append([f"{sum_err} errors", "red" if sum_err > 0 else "header"])
+    # Errors: red if non-zero, white if 0.
+    emit_parts.append([" \u00b7 ", "simpleline"])
+    emit_parts.append([f"{sum_err} errors",
+                       "red" if sum_err > 0 else "simpleline"])
     if skipped:
-        emit_parts.append([" \u00b7 ", "header"])
-        emit_parts.append([f"{skipped} skipped", "header"])
-    emit_parts.append([" \u00b7 ", "header"])
-    emit_parts.append([f"took {_fmt_duration(elapsed)} ", "header"])
+        emit_parts.append([" \u00b7 ", "simpleline"])
+        emit_parts.append([f"{skipped} skipped", "simpleline"])
+    emit_parts.append([" \u00b7 ", "simpleline"])
+    emit_parts.append([f"took {_fmt_duration(elapsed)} ", "simpleline"])
     emit_parts.append(["===\n", "simplestatus_green"])
     stream.emit(emit_parts)
     # Clean up: drop any remaining queued items (pass may have broken

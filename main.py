@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v55.3"
-APP_VERSION_DATE = "4.24.26 1:31am"
+APP_VERSION      = "v55.7"
+APP_VERSION_DATE = "4.24.26 1:54am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -242,6 +242,13 @@ class Api:
         # without needing an app restart.
         try:
             sync_backend.set_recent_changed_hook(self._push_recent_refresh)
+        except Exception: pass
+        # Metadata-tab live refresh — fires after every metadata /
+        # metadata_comments / videoid_backfill task so the XXm-ago
+        # timestamps and Video IDs status update in place without
+        # requiring the user to click Reload.
+        try:
+            sync_backend.set_metadata_changed_hook(self._push_metadata_refresh)
         except Exception: pass
         # Autorun scheduler — trigger kicks sync_start_all on the scheduled thread.
         # Passing `sync_busy_fn` so the scheduler can (a) postpone a fire
@@ -518,6 +525,33 @@ class Api:
         """
         cfg = self._config if self._config is not None else load_config()
         return recent_for_ui(cfg)
+
+    def _push_metadata_refresh(self):
+        """Trigger a re-render of Settings > Metadata so the `XXm ago`
+        timestamps update after a refresh pass completes. Without this,
+        the tab keeps showing pre-pass values ("35m ago") even though
+        the backend just stamped a fresh `last_views_refresh_ts` —
+        user has to click Reload manually.
+
+        Called from the sync worker after every metadata / metadata_
+        comments / videoid_backfill task finishes. evaluate_js is
+        cheap when the tab isn't visible (JS guard returns quickly),
+        so no throttling needed for typical refresh cadence.
+        """
+        if self._window is None:
+            return
+        try:
+            # Config may have just been re-saved (bulk_refresh_views_likes
+            # writes last_views_refresh_ts) — reload so any subsequent
+            # js_api calls see the new stamps.
+            try: self._reload_config()
+            except Exception: pass
+            self._window.evaluate_js(
+                "window._refreshMetadataTab && window._refreshMetadataTab();")
+        except Exception as e:
+            try: self._log_stream.emit_dim(
+                f"(metadata tab refresh push failed: {e})")
+            except Exception: pass
 
     def _push_recent_refresh(self):
         """Re-fetch recent_downloads and push to the UI's Recent grid/list.

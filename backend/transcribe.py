@@ -2874,11 +2874,11 @@ class TranscribeManager:
         if not channel:
             # Channel = parent folder name (or parent-of-parent when year-split).
             # audit D-9: bound the "looks like a year/month folder" test
-            # so channels with names starting with a digit (e.g. "5
-            # Minute Crafts", "3kliksphilip" → not this one since no
-            # space) don't get their grandparent misidentified as the
-            # channel. Require either a 4-digit year OR a "NN Month"
-            # pattern with NN in [01..12].
+            # so channels with names starting with a digit (e.g.
+            # "5 Minute Crafts", or similar) don't get their
+            # grandparent misidentified as the channel. Require
+            # either a 4-digit year OR a "NN Month" pattern with NN
+            # in [01..12].
             parent = os.path.basename(os.path.dirname(video_path))
             grand = os.path.basename(os.path.dirname(os.path.dirname(video_path)))
             # Heuristic: if parent is a year like "2024" or matches "01 January",

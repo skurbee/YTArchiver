@@ -1420,6 +1420,29 @@ body {
     minmax(66px, 1fr);
 }
 
+/* [Metdta] rows have at most one optional secondary count (e.g.
+   "5 new" for views/likes refresh with first-time fetches, or
+   "N unresolved" for ID backfill) and NEVER a tertiary count.
+   Without this override, both secondary + tertiary slots claim
+   minmax(98px, 1fr) each, producing a large dead gap between
+   primary ("26 refreshed") and errors ("0 errors"). `minmax(0,
+   auto)` on secondary lets it collapse to zero width when empty
+   and expand to content width when populated; tertiary stays at
+   0 since it's always empty for this kind. */
+.activity-log .log-line.hist-row-Metdta {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 2.5fr)
+    8px
+    minmax(98px, 1fr)     /* primary */
+    minmax(0, auto)       /* secondary — collapses when empty */
+    0                     /* tertiary — always empty for Metdta */
+    minmax(60px, 0.8fr)   /* errors */
+    minmax(66px, 1fr);    /* took */
+}
+
 .activity-log .log-line > span {
   overflow: hidden;
   text-overflow: ellipsis;

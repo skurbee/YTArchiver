@@ -3037,17 +3037,20 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     if not _verb_chunks:
         # All counters zero. Pick a sensible 0-verb matching the
         # pass label so the user sees "something ran" rather than a
-        # blank summary. Dim — nothing to celebrate.
+        # blank summary. Same green styling as the non-zero case —
+        # the pass ran successfully, it just didn't have work to do.
+        # Previously these were tagged "dim" (--c-dim = #4a4f5a) which
+        # rendered near-unreadable on the dark log background.
         if _label == "Views/likes refresh":
-            _verb_chunks.append(("0 refreshed", "dim"))
+            _verb_chunks.append(("0 refreshed", "simplestatus_green"))
         elif _label == "Comments refresh":
-            _verb_chunks.append(("0 comments refreshed", "dim"))
+            _verb_chunks.append(("0 comments refreshed", "simplestatus_green"))
         elif _label == "Video ID backfill":
-            _verb_chunks.append(("0 IDs backfilled", "dim"))
+            _verb_chunks.append(("0 IDs backfilled", "simplestatus_green"))
         elif _label == "Metadata download":
-            _verb_chunks.append(("0 metadata fetched", "dim"))
+            _verb_chunks.append(("0 metadata fetched", "simplestatus_green"))
         else:
-            _verb_chunks.append(("0 downloaded", "dim"))
+            _verb_chunks.append(("0 downloaded", "simplestatus_green"))
     # Interleave with separators.
     for _i, (_txt, _tag) in enumerate(_verb_chunks):
         if _i > 0:

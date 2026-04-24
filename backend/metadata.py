@@ -1082,7 +1082,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             startupinfo=_startupinfo, env=_utf8_env(),
         )
     except OSError as e:
-        stream.emit_error(f"Metadata: bulk-stats spawn failed: {e}")
+        stream.emit_error(f"Metadata: could not start stats fetch: {e}")
         return {}
     try:
         for raw in proc.stdout:
@@ -1123,7 +1123,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         except subprocess.TimeoutExpired:
             proc.terminate()
     except Exception as e:
-        stream.emit_dim(f" (bulk-stats read error: {e})")
+        stream.emit_dim(f" (stats read error: {e})")
         try: proc.terminate()
         except Exception: pass
     return out
@@ -1170,7 +1170,7 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     ch_url = (channel.get("url") or "").strip()
     if not ch_url:
         stream.emit_error(
-            f"Metadata: {name} has no URL — can't bulk-refresh.")
+            f"Metadata: {name} has no URL — can't refresh.")
         return {"ok": False, "error": "no url"}
 
     _scope_year: Optional[int] = None
@@ -1181,7 +1181,7 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     # is an implementation detail (yt-dlp mode) the user doesn't need
     # to see in Simple mode.
     stream.emit([["  \u2014 ", "meta_bracket"],
-                 [f"Bulk-refreshing {name}{_banner}...\n", "simpleline"]])
+                 [f"Refreshing {name}{_banner}...\n", "simpleline"]])
 
     t0 = time.time()
     bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
@@ -1285,9 +1285,8 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         # internal DB state to understand what happened.
         stream.emit([
             [" \u2014 ", "meta_bracket"],
-            [f"Resolved {len(_title_resolved)} video_id(s) by title "
-             f"match \u2014 backfilled into index.\n",
-             "simpleline"],
+            [f"Matched {len(_title_resolved)} video(s) by title "
+             f"\u2014 saved their YouTube IDs.\n", "simpleline"],
         ])
 
     on_disk_ids = {v[0] for v in on_disk if v[0]}
@@ -1611,8 +1610,7 @@ def backfill_video_ids(channel: Dict[str, Any],
         return {"ok": False, "error": "no url"}
 
     stream.emit([["  \u2014 ", "meta_bracket"],
-                 [f"Resolving video_ids for {name} (flat-playlist)...\n",
-                  "simpleline"]])
+                 [f"Resolving video IDs for {name}...\n", "simpleline"]])
 
     t0 = time.time()
     bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
@@ -1620,7 +1618,7 @@ def backfill_video_ids(channel: Dict[str, Any],
     if not bulk:
         stream.emit([
             [" \u26A0 ", "meta_bracket"],
-            [f"Flat-playlist returned no data for {name}.\n", "simpleline"],
+            [f"YouTube returned no video list for {name}.\n", "simpleline"],
         ])
         return {"ok": False, "error": "bulk_empty"}
 
@@ -1898,7 +1896,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         if _res.get("ok") or _res.get("bulk_fetched", 0) > 0:
             return _res
         stream.emit_dim(
-            " (bulk path returned nothing — falling back to "
+            " (fast refresh returned nothing — falling back to "
             "per-video refresh)")
         # Continue into the legacy path below.
 
@@ -2072,8 +2070,8 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         stream.emit([
             [" \u26A0 ", "meta_bracket"],
             [f"{n_without_id:,} on-disk video(s) couldn't be matched "
-             f"to a video_id \u2014 checking channel playlist for id "
-             f"match by title...\n", "simpleline"],
+             f"to a YouTube ID \u2014 checking channel for title "
+             f"match...\n", "simpleline"],
         ])
         url = channel.get("url", "").strip()
         resolved = _resolve_ids_by_title(
@@ -2198,8 +2196,8 @@ def fetch_channel_metadata(channel: Dict[str, Any],
             stream.emit([
                 [" \u2014 ", "meta_bracket"],
                 [f"{len(still_unmatched):,} file(s) couldn't be matched "
-                 f"even by playlist title (deleted? re-uploaded with "
-                 f"new id? filename edited?). Marked as permanent skip.\n",
+                 f"even by title (deleted? re-uploaded with new ID? "
+                 f"filename edited?). Marked as permanent skip.\n",
                  "simpleline"],
             ])
             for _fp in still_unmatched[:5]:

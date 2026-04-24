@@ -137,13 +137,27 @@ def _read_metadata_jsonl(jsonl_path: str) -> Dict[str, Dict[str, Any]]:
 def _write_metadata_jsonl(jsonl_path: str,
                           entries_dict: Dict[str, Dict[str, Any]]) -> None:
     """Write all entries (whole dict) to the aggregated JSONL, hiding on Win.
-    Matches YTArchiver.py:26583."""
+    Matches YTArchiver.py:26583.
+
+    audit C-6: atomic write via .tmp + os.replace. A crash or power
+    loss mid-write used to truncate the entire channel's metadata
+    file (potentially thousands of video records). Write to a temp
+    file in the same directory first, fsync it, then atomically rename
+    over the destination.
+    """
     os.makedirs(os.path.dirname(jsonl_path) or ".", exist_ok=True)
     if os.name == "nt" and os.path.isfile(jsonl_path):
         _unhide_file_win(jsonl_path)
-    with open(jsonl_path, "w", encoding="utf-8") as f:
+    tmp_path = jsonl_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         for _vid, data in entries_dict.items():
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp_path, jsonl_path)
     _hide_file_win(jsonl_path)
 
 
@@ -185,7 +199,9 @@ def _download_thumbnail(url: str, thumb_dir: str,
 
     # Dedup: if a thumb with this [{video_id}] already exists under a
     # different title (YT renamed the video), rename it instead of writing
-    # a duplicate.
+    # a duplicate. audit F-13: rename only if the existing file is recent
+    # (<30 days); otherwise fall through to re-download so a stale thumb
+    # from years ago gets refreshed with the current YouTube URL.
     try:
         if os.path.isdir(thumb_dir):
             bracket = f"[{video_id}]"
@@ -195,24 +211,57 @@ def _download_thumbnail(url: str, thumb_dir: str,
                     continue
                 if bracket in existing and existing != fname:
                     existing_path = os.path.join(thumb_dir, existing)
+                    _is_recent = False
+                    try:
+                        import time as _t
+                        _is_recent = (_t.time() - os.path.getmtime(existing_path)
+                                      ) < (30 * 86400)
+                    except OSError:
+                        pass
                     existing_ext = os.path.splitext(existing)[1]
                     new_fname = f"{safe_title} [{video_id}]{existing_ext}"
                     new_path = os.path.join(thumb_dir, new_fname)
                     try:
                         os.replace(existing_path, new_path)
-                        return
+                        if _is_recent:
+                            return
+                        # Fall through to re-download (YT likely has
+                        # a newer thumbnail; old one renamed for backup).
+                        break
                     except OSError:
                         pass
     except OSError:
         pass
 
+    # audit C-7: atomic write via .tmp + os.replace. Interrupt or crash
+    # during write used to leave a 0-byte .jpg at the target path.
+    # Because the next run sees isfile=True and skips, the broken image
+    # gets cached permanently. Also validate JPEG magic bytes before
+    # committing so a truncated HTML error page doesn't masquerade as
+    # a thumbnail. audit F-14: cap read at 20 MB — YouTube thumbs are
+    # typically <200 KB so anything bigger is suspicious.
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            img_data = resp.read()
-        with open(fpath, "wb") as f:
+            img_data = resp.read(20 * 1024 * 1024)
+        if not img_data or len(img_data) < 16:
+            raise ValueError(f"empty/short response ({len(img_data)} bytes)")
+        # JPEG: FF D8 FF. PNG: 89 50 4E 47. WEBP: RIFF....WEBP.
+        _magic_ok = (img_data[:3] == b"\xFF\xD8\xFF"
+                     or img_data[:4] == b"\x89PNG"
+                     or (img_data[:4] == b"RIFF" and img_data[8:12] == b"WEBP"))
+        if not _magic_ok:
+            raise ValueError("not a recognized image format")
+        tmp_path = fpath + ".tmp"
+        with open(tmp_path, "wb") as f:
             f.write(img_data)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, fpath)
     except Exception as _te:
         # Non-fatal, but no longer invisible: emit a verbose-only
         # diagnostic so the user can see WHY a Browse thumbnail is
@@ -259,20 +308,41 @@ def _fetch_video_metadata(yt: str, video_id: str,
         proc.kill()
         try: proc.communicate(timeout=5)
         except Exception: pass
-        return None
+        # audit E-11: distinguish timeout from real failure. Callers
+        # use the `_timeout` sentinel to skip marking the video with
+        # persistent `metadata_fetch_failed_ts` — a 120s timeout is
+        # more likely a slow network than a dead video, and the old
+        # behavior permanently flagged these until manual Refresh.
+        return {"_timeout": True}
     if proc.returncode != 0:
         return None
 
-    # yt-dlp may print warnings before the JSON dump — slice to the first
-    # balanced JSON object.
-    js = stdout.find("{")
-    je = stdout.rfind("}")
-    if js < 0 or je <= js:
-        return None
-    try:
-        data = json.loads(stdout[js:je + 1])
-    except Exception:
-        return None
+    # audit F-26: yt-dlp --dump-json writes exactly one JSON object on
+    # stdout followed by newline. Parse line-by-line looking for a
+    # line that starts with `{` and parses cleanly. This is robust
+    # against warning chatter that contains literal `{` characters
+    # (e.g. jinja-ish template errors, thumbnail URLs with braces).
+    data: Optional[Dict[str, Any]] = None
+    for _line in stdout.splitlines():
+        _ls = _line.strip()
+        if not _ls or _ls[0] != "{":
+            continue
+        try:
+            data = json.loads(_ls)
+            break
+        except Exception:
+            continue
+    if data is None:
+        # Fall back to the old slice-between-first-and-last-brace
+        # parse, which handles pretty-printed multi-line output.
+        js = stdout.find("{")
+        je = stdout.rfind("}")
+        if js < 0 or je <= js:
+            return None
+        try:
+            data = json.loads(stdout[js:je + 1])
+        except Exception:
+            return None
 
     comments = []
     for c in (data.get("comments") or [])[:50]:
@@ -458,6 +528,16 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         return {"ok": True, "skipped": True}
 
     entry = _fetch_video_metadata(yt, video_id, title_hint)
+    # audit E-11: `{"_timeout": True}` sentinel signals a transient
+    # 120s fetch timeout (slow network) rather than a true failure.
+    # Return without marking anything; caller can retry later.
+    if isinstance(entry, dict) and entry.get("_timeout"):
+        if emit_inline_log:
+            stream.emit([
+                [" \u2014 ", "dim"],
+                ["Metadata fetch timed out (will retry next pass)\n", "dim"],
+            ])
+        return {"ok": False, "error": "timeout", "transient": True}
     if entry is None:
         if emit_inline_log:
             stream.emit([
@@ -594,14 +674,21 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
     for jp, g in groups.items():
         if cancel_event is not None and cancel_event.is_set():
             break
-        # Pause — bail out of the metadata walk the moment the user
-        # hits Pause. Each fetch is a single HTTP call so partial
-        # results are fine; re-running later picks up from where we
-        # left off (via skip-existing).
+        # audit E-12: wait-on-pause loop (not break-on-pause). Old
+        # behavior was "pause = cancel" because the loop bailed out
+        # entirely; user lost partial progress of the current group.
+        # Now we block in-place until Resume (or Cancel) and continue
+        # where we left off. Mirrors the redownload.py pause pattern
+        # around line 651-666.
         if pause_event is not None and pause_event.is_set():
-            stream.emit([[" \u23F8 Paused \u2014 stopping metadata walk.\n",
+            stream.emit([[" \u23F8 Paused \u2014 waiting.\n",
                           "simpleline"]])
-            break
+            while (pause_event.is_set()
+                   and not (cancel_event is not None and cancel_event.is_set())):
+                time.sleep(0.5)
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            stream.emit([[" \u25B6 Resumed.\n", "simpleline"]])
         existing = _read_metadata_jsonl(jp)
         thumb_dir = _ensure_thumbnails_dir(g["subfolder"])
         changed = False
@@ -626,8 +713,16 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
         for vid_id, title, _y, _m, _fp in g["videos"]:
             if cancel_event is not None and cancel_event.is_set():
                 break
+            # audit E-12: wait-on-pause inside the inner per-video loop
+            # too (not just the outer group loop). Without this, pause
+            # during a big group would still march through the rest of
+            # the videos before the outer loop's next iteration checks.
             if pause_event is not None and pause_event.is_set():
-                break
+                while (pause_event.is_set()
+                       and not (cancel_event is not None and cancel_event.is_set())):
+                    time.sleep(0.5)
+                if cancel_event is not None and cancel_event.is_set():
+                    break
             if not vid_id:
                 errors += 1
                 continue
@@ -669,6 +764,17 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             ])
             _emit_active(idx, total)
             entry = _fetch_video_metadata(yt, vid_id, title)
+            # audit E-11: transient timeout sentinel — count as "will
+            # retry" rather than a permanent failure so future rechecks
+            # still try this video. No persistent flag set.
+            if isinstance(entry, dict) and entry.get("_timeout"):
+                errors += 1
+                stream.emit([
+                    [" \u2014 ", "dim"],
+                    ["Metadata timeout (will retry next pass) \u2014 ", "dim"],
+                    [f"{title[:90]}\n", "simpleline"],
+                ])
+                continue
             if entry is None:
                 errors += 1
                 # bug L-5: surface a per-video error line so the user
@@ -925,27 +1031,129 @@ def _normalize_title_for_match(title: str) -> str:
     return t
 
 
-def fetch_channel_metadata(channel: Dict[str, Any],
-                           stream: LogStreamer,
-                           cancel_event: Optional[threading.Event] = None,
-                           refresh: bool = False,
-                           pause_event: Optional[threading.Event] = None
-                           ) -> Dict[str, Any]:
-    """Fill in missing metadata for this channel's on-disk videos.
+_ID_RE_11 = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
-    Two modes:
-      - refresh=False (DEFAULT): DISK-DRIVEN. Enumerate videos on disk
-        via `_scan_channel_videos` (filename `[id]` bracket first, then
-        index-DB filepath lookup). Compare against existing JSONL IDs.
-        Fetch only the missing handful. NO playlist walk — because the
-        playlist would include ~hundreds of channel-videos that aren't
-        downloaded, all of which are irrelevant for this job. "I scrolled through the entire channel, there's only two
-        videos that are missing thumbnails. How did you even come up
-        with 176?" — the 176 were undownloaded playlist entries my
-        old code was pointlessly hitting.
-      - refresh=True: "Refresh Counts" mode — re-hit every on-disk
-        video's YouTube API (views/likes/comments change over time).
-        Still disk-driven, but every id is a target.
+
+def _flat_playlist_bulk_stats(yt: str, ch_url: str,
+                               stream: LogStreamer,
+                               cancel_event: Optional[threading.Event] = None,
+                               pause_event: Optional[threading.Event] = None
+                               ) -> Dict[str, Dict[str, Any]]:
+    """ONE yt-dlp --flat-playlist call returning per-video stats for
+    the whole channel. Returns {video_id: {view_count, like_count,
+    comment_count}} (None values where yt-dlp's flat-playlist path
+    doesn't populate that field — YouTube reliably returns view_count
+    but like_count / comment_count are often null in flat mode).
+
+    This is the smart-refresh primitive: compared to the old path of
+    `--dump-json` per video (one HTTP round-trip each), this folds
+    an entire channel's view-count data into a single request. Users
+    reported a 404-video channel taking ~1h17m under the per-video
+    approach — the flat-playlist equivalent typically finishes in
+    well under a minute.
+
+    Caller decides what to do with the stats; see bulk_refresh_views_likes.
+    """
+    if not ch_url:
+        return {}
+    cmd = [
+        yt,
+        "--flat-playlist",
+        "--lazy-playlist",
+        "--no-warnings",
+        "--skip-download",
+        # TAB-separated so titles (which can contain pipes / commas)
+        # never collide with the field separator. Title is included so
+        # the caller can fall back to title-matching for legacy archive
+        # files whose filenames lack [video_id] brackets AND aren't
+        # registered in the videos-table with a video_id — the
+        # default archive layout per tkinter-era downloads.
+        "--print",
+        "%(id)s\t%(view_count)s\t%(like_count)s\t%(comment_count)s\t%(title)s",
+        *_find_cookie_source(),
+        ch_url,
+    ]
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            encoding="utf-8", errors="replace", bufsize=1,
+            startupinfo=_startupinfo, env=_utf8_env(),
+        )
+    except OSError as e:
+        stream.emit_error(f"Metadata: bulk-stats spawn failed: {e}")
+        return {}
+    try:
+        for raw in proc.stdout:
+            if cancel_event is not None and cancel_event.is_set():
+                try: proc.terminate()
+                except Exception: pass
+                break
+            # Honor pause without dropping the subprocess — same
+            # pattern as _fetch_yt_catalog in redownload.py.
+            while (pause_event is not None and pause_event.is_set()
+                   and not (cancel_event is not None and cancel_event.is_set())):
+                time.sleep(0.25)
+            line = (raw or "").rstrip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            vid = parts[0].strip()
+            if not _ID_RE_11.fullmatch(vid):
+                continue
+            def _num(s: str) -> Optional[int]:
+                s = (s or "").strip()
+                if not s or s in ("NA", "None", "null"):
+                    return None
+                try:
+                    return int(float(s))
+                except (TypeError, ValueError):
+                    return None
+            _title = parts[4].strip() if len(parts) >= 5 else ""
+            out[vid] = {
+                "view_count": _num(parts[1]),
+                "like_count": _num(parts[2]),
+                "comment_count": _num(parts[3]),
+                "title": _title,
+            }
+        try: proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+    except Exception as e:
+        stream.emit_dim(f" (bulk-stats read error: {e})")
+        try: proc.terminate()
+        except Exception: pass
+    return out
+
+
+def bulk_refresh_views_likes(channel: Dict[str, Any],
+                              stream: LogStreamer,
+                              cancel_event: Optional[threading.Event] = None,
+                              pause_event: Optional[threading.Event] = None,
+                              scope: Optional[Dict[str, Any]] = None,
+                              full_fetch_on_change: bool = False,
+                              ) -> Dict[str, Any]:
+    """Fast view-count refresh path. Uses one flat-playlist call to
+    get per-video view/like/comment counts, compares against the
+    existing metadata.jsonl, and only does a full --dump-json fetch
+    for videos whose counts actually changed (to also pick up updated
+    top-comments, descriptions, etc.).
+
+    `full_fetch_on_change=False` skips even that second pass and just
+    updates the count fields in-place — useful for "i only care about
+    the view count, don't waste any more yt-dlp calls" flows.
+
+    `scope={"year": N}` honors the year-scoped refresh introduced for
+    the Browse grid year-head right-click.
+
+    Returns the same shape as fetch_channel_metadata so the sync
+    worker's summary-parser keeps working: `{ok, fetched, refreshed,
+    errors, skipped, bulk_fetched}`. `bulk_fetched` is new and lets
+    callers know how many videos were resolved via the fast path
+    (= "considered" rather than "re-fetched").
     """
     folder = _folder_for_channel(channel)
     if folder is None:
@@ -959,14 +1167,772 @@ def fetch_channel_metadata(channel: Dict[str, Any],
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
+    ch_url = (channel.get("url") or "").strip()
+    if not ch_url:
+        stream.emit_error(
+            f"Metadata: {name} has no URL — can't bulk-refresh.")
+        return {"ok": False, "error": "no url"}
+
+    _scope_year: Optional[int] = None
+    if scope and isinstance(scope.get("year"), int):
+        _scope_year = int(scope["year"])
+    _banner = f" ({_scope_year} only)" if _scope_year is not None else ""
+    # Log kept user-friendly — previously said "(flat-playlist)" which
+    # is an implementation detail (yt-dlp mode) the user doesn't need
+    # to see in Simple mode.
     stream.emit([["  \u2014 ", "meta_bracket"],
-                 [f"Rechecking {name}...\n", "simpleline"]])
+                 [f"Bulk-refreshing {name}{_banner}...\n", "simpleline"]])
+
+    t0 = time.time()
+    bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
+                                     cancel_event, pause_event)
+    if not bulk:
+        stream.emit([
+            [" \u26A0 ", "meta_bracket"],
+            [f"Bulk-stats returned no data for {name} — "
+             f"channel may be empty / private / geo-locked.\n", "simpleline"],
+        ])
+        return {"ok": False, "error": "bulk_empty",
+                "fetched": 0, "refreshed": 0, "errors": 0, "skipped": 0,
+                "bulk_fetched": 0}
+
+    # Enumerate on-disk videos so we only refresh ones we actually
+    # have files for (mirrors fetch_channel_metadata's disk-driven
+    # philosophy — never pay yt-dlp time for playlist entries with
+    # no archive file).
+    on_disk = _scan_channel_videos(folder)
+    if _scope_year is not None:
+        on_disk = [v for v in on_disk if v[2] == _scope_year]
+
+    # Title-fallback resolution. The default archive layout has NO
+    # `[video_id]` bracket in filenames AND many legacy-tkinter-era
+    # registrations landed in the videos-table with video_id=NULL.
+    # Without a second matching strategy every file shows as "missing"
+    # and the whole bulk pass reports "no matches". Fix: build a
+    # normalized-title → video_id map from the bulk data and resolve
+    # empty vid_ids via title lookup. The normalization aggressively
+    # folds whitespace and punctuation so minor filesystem sanitization
+    # differences (en-dash → hyphen, colons dropped, etc.) still match.
+    def _norm_title(s: str) -> str:
+        if not s:
+            return ""
+        s = s.lower()
+        # Drop a trailing `[id]` remnant if present (belt-and-suspenders).
+        s = re.sub(r"\s*\[[a-z0-9_-]{11}\]\s*$", "", s)
+        # Collapse any run of non-alphanumeric into a single space,
+        # strip. This handles filesystem-sanitized colons, question
+        # marks, smart quotes, en-dashes, etc.
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return s.strip()
+
+    _title_to_vid: Dict[str, str] = {}
+    _ambiguous_titles: set = set()
+    for _vid, _stats in bulk.items():
+        _nt = _norm_title(_stats.get("title") or "")
+        if not _nt:
+            continue
+        if _nt in _title_to_vid and _title_to_vid[_nt] != _vid:
+            _ambiguous_titles.add(_nt)
+        else:
+            _title_to_vid[_nt] = _vid
+
+    # Resolve vid_ids for on-disk tuples that came back empty. Track
+    # which (filepath, video_id) pairs we backfilled so we can persist
+    # them to the index DB after the scan — next run skips the title
+    # match entirely because the DB lookup at _scan_channel_videos
+    # fills fp_to_id.
+    _title_resolved: List[Tuple[str, str, str]] = []  # (fp, vid, title)
+    _resolved_on_disk = []
+    for (_v, _t, _y, _m, _fp) in on_disk:
+        if _v:
+            _resolved_on_disk.append((_v, _t, _y, _m, _fp))
+            continue
+        _nt = _norm_title(_t)
+        if not _nt or _nt in _ambiguous_titles:
+            _resolved_on_disk.append((_v, _t, _y, _m, _fp))
+            continue
+        _guess = _title_to_vid.get(_nt, "")
+        if _guess:
+            _resolved_on_disk.append((_guess, _t, _y, _m, _fp))
+            _title_resolved.append((_fp, _guess, _t))
+        else:
+            _resolved_on_disk.append((_v, _t, _y, _m, _fp))
+    on_disk = _resolved_on_disk
+
+    # Backfill resolved video_ids into the videos-table so future
+    # bulk refreshes skip the title-match dance.
+    if _title_resolved:
+        try:
+            from . import index as _idx
+            _conn = _idx._open()
+            if _conn is not None:
+                with _idx._db_lock:
+                    for _fp, _vid, _ttl in _title_resolved:
+                        _vurl = f"https://www.youtube.com/watch?v={_vid}"
+                        try:
+                            _conn.execute(
+                                "UPDATE videos SET video_id=?, video_url=? "
+                                "WHERE filepath=? COLLATE NOCASE "
+                                "AND (video_id IS NULL OR video_id='')",
+                                (_vid, _vurl, _fp))
+                        except Exception:
+                            pass
+                    _conn.commit()
+        except Exception:
+            pass
+        # User-friendly wording: dropped "(no [id] in filename)"
+        # technicality — users shouldn't have to know about the
+        # internal DB state to understand what happened.
+        stream.emit([
+            [" \u2014 ", "meta_bracket"],
+            [f"Resolved {len(_title_resolved)} video_id(s) by title "
+             f"match \u2014 backfilled into index.\n",
+             "simpleline"],
+        ])
+
+    on_disk_ids = {v[0] for v in on_disk if v[0]}
+
+    # Load existing metadata across all on-disk JSONLs, keyed by id.
+    # Track which JSONL each entry came from so we can write it back.
+    existing_by_id: Dict[str, Dict[str, Any]] = {}
+    jsonl_by_id: Dict[str, str] = {}
+    for dp, _dns, fns in os.walk(str(folder)):
+        for fn in fns:
+            if not fn.endswith("Metadata.jsonl"):
+                continue
+            jp = os.path.join(dp, fn)
+            entries = _read_metadata_jsonl(jp)
+            for vid, entry in entries.items():
+                existing_by_id[vid] = entry
+                jsonl_by_id[vid] = jp
+
+    # Walk the bulk data, update or flag-for-fetch per video.
+    changed_ids: List[str] = []       # to re-fetch via --dump-json
+    updated_in_place = 0              # just bumped counts in existing entry
+    skipped_same = 0                  # counts unchanged, nothing to do
+    missing_on_disk = 0               # in bulk but no on-disk file
+    no_meta_entry = 0                 # on disk but no existing metadata
+
+    for vid, stats in bulk.items():
+        if vid not in on_disk_ids:
+            missing_on_disk += 1
+            continue
+        old = existing_by_id.get(vid)
+        if old is None:
+            # Haven't fetched this video's full metadata yet — always
+            # full-fetch it regardless of full_fetch_on_change. We
+            # literally have no record for this video, so there's
+            # nothing to "update in place" — we have to do the full
+            # --dump-json to create the entry. full_fetch_on_change
+            # only governs whether CHANGED-COUNT entries also get
+            # re-fetched (which re-pulls comments too, so the
+            # views/likes refresh path now sets it False to keep
+            # comments out of scope).
+            no_meta_entry += 1
+            changed_ids.append(vid)
+            continue
+        # Decide whether anything moved enough to warrant a full fetch.
+        _view_new = stats.get("view_count")
+        _like_new = stats.get("like_count")
+        _comment_new = stats.get("comment_count")
+        _view_old = old.get("view_count")
+        _like_old = old.get("like_count")
+        _comment_old = old.get("comment_count")
+        _changed = False
+        if _view_new is not None and _view_new != _view_old:
+            _changed = True
+        # like_count often missing in flat mode; only flag if it's
+        # explicitly different (not when the old had a real value and
+        # the new is None — that's a bulk-mode gap, not a real drop).
+        if (_like_new is not None and _like_old is not None
+                and _like_new != _like_old):
+            _changed = True
+        if (_comment_new is not None and _comment_old is not None
+                and _comment_new != _comment_old):
+            _changed = True
+
+        # Always update the stats in-place — even if unchanged, bump
+        # `fetched_at` so the "last refreshed" timestamp is accurate.
+        if _view_new is not None:
+            old["view_count"] = _view_new
+        if _like_new is not None:
+            old["like_count"] = _like_new
+        if _comment_new is not None:
+            old["comment_count"] = _comment_new
+        old["fetched_at"] = datetime.now().isoformat()
+
+        if _changed and full_fetch_on_change:
+            changed_ids.append(vid)
+        elif _changed:
+            updated_in_place += 1
+        else:
+            skipped_same += 1
+
+    # Persist the in-place-updated entries. Group by jsonl path so we
+    # only rewrite each file once.
+    dirty_paths: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for vid, entry in existing_by_id.items():
+        jp = jsonl_by_id.get(vid)
+        if jp is None:
+            continue
+        dirty_paths.setdefault(jp, {})[vid] = entry
+    for jp, entries in dirty_paths.items():
+        # Load current contents, merge our updates on top, rewrite.
+        full = _read_metadata_jsonl(jp)
+        full.update(entries)
+        try:
+            _write_metadata_jsonl(jp, full)
+        except OSError as e:
+            stream.emit_dim(f" (metadata write failed for {os.path.basename(jp)}: {e})")
+
+    # Secondary pass: full --dump-json fetch for videos whose counts
+    # changed (picks up new comments, updated descriptions, etc.).
+    # Reuses the existing per-video fetch_single_video_metadata path
+    # so the logging + error handling stays consistent.
+    full_fetched = 0
+    full_errors = 0
+    if changed_ids:
+        # With full_fetch_on_change=False (the views/likes-refresh
+        # default), this list only contains videos that had NO
+        # existing metadata entry — we're filling in first-time
+        # metadata, not comment refresh. Wording updated so a user
+        # who clicked "Refresh views/likes" doesn't see a line
+        # claiming we're pulling comments.
+        _n = len(changed_ids)
+        _what = ("new entries \u2014 fetching full metadata..."
+                 if not full_fetch_on_change
+                 else "have updated counts \u2014 re-fetching details...")
+        stream.emit([
+            [" \u2014 ", "meta_bracket"],
+            [f"{_n} video(s) {_what}\n", "simpleline"],
+        ])
+        # Build a video_id → (filepath, title) map from on_disk so we
+        # can pass filepath + title_hint to fetch_single_video_metadata
+        # (signature: channel, video_id, file_path, title_hint, stream).
+        # The prior call had `stream` in the title_hint slot AND passed
+        # a nonexistent `cancel_event` kwarg — every per-video fetch
+        # raised TypeError and got caught as an error (users reported
+        # 40/40 errors on a test channel). Fixed by passing args in
+        # the right order; cancel/pause are still honored by the
+        # wrapping loop.
+        fp_by_id: Dict[str, Tuple[str, str]] = {}
+        for (_v, _t, _y, _m, _fp) in on_disk:
+            if _v and _fp:
+                fp_by_id[_v] = (_fp, _t or "")
+        for vid in changed_ids:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            while (pause_event is not None and pause_event.is_set()
+                   and not (cancel_event is not None and cancel_event.is_set())):
+                time.sleep(0.25)
+            _pair = fp_by_id.get(vid)
+            if not _pair:
+                continue
+            fp, title_hint = _pair
+            try:
+                res = fetch_single_video_metadata(
+                    channel, vid, fp, title_hint, stream,
+                    emit_inline_log=False)
+                if res.get("ok"):
+                    full_fetched += 1
+                elif not res.get("transient"):
+                    full_errors += 1
+            except Exception as _e:
+                stream.emit_dim(f" (full fetch failed for {vid}: {_e})")
+                full_errors += 1
+
+    # Stamp last-refresh timestamp on the channel config. Separate
+    # from per-video fetched_at so the Subs UI can say "refreshed
+    # N minutes ago" for the whole channel.
+    try:
+        from . import ytarchiver_config as _cfg
+        cfg = _cfg.load_config()
+        ch_url_norm = ch_url.rstrip("/")
+        now_ts = time.time()
+        for ch in cfg.get("channels", []):
+            if (ch.get("url") or "").rstrip("/") == ch_url_norm:
+                ch["last_views_refresh_ts"] = now_ts
+                break
+        _cfg.save_config(cfg)
+    except Exception:
+        pass
+
+    took = time.time() - t0
+    # Tagged emit: channel name + labels render white, counts render
+    # pink, errors red. Previously the whole line was one pink blob
+    # which users called out as visual noise ("channel name should be
+    # white, labels should be white, only the numbers highlight").
+    # "via bulk path" dropped — user-facing log doesn't need to
+    # surface the internal code path.
+    _err_color = "red" if full_errors else "simpleline_pink"
+    tagged: List[List[str]] = [
+        [" \u2014 ", "meta_bracket"],
+        [f"{name}: ", "simpleline"],
+    ]
+    _first = True
+    def _sep():
+        if not _first:
+            tagged.append([" \u00b7 ", "simpleline"])
+    _emitted_something = False
+    if full_fetched:
+        _sep()
+        tagged.append([f"{full_fetched}", "simpleline_pink"])
+        tagged.append([" with updated counts", "simpleline"])
+        _first = False
+        _emitted_something = True
+    if updated_in_place:
+        _sep()
+        tagged.append([f"{updated_in_place}", "simpleline_pink"])
+        tagged.append([" counts updated in place", "simpleline"])
+        _first = False
+        _emitted_something = True
+    if skipped_same:
+        _sep()
+        tagged.append([f"{skipped_same}", "simpleline_pink"])
+        tagged.append([" unchanged", "simpleline"])
+        _first = False
+        _emitted_something = True
+    if full_errors:
+        _sep()
+        tagged.append([f"{full_errors}", _err_color])
+        tagged.append([" errors", _err_color])
+        _first = False
+        _emitted_something = True
+    if no_meta_entry and not full_fetched:
+        _sep()
+        tagged.append([f"{no_meta_entry}", "simpleline_pink"])
+        tagged.append([" need first fetch", "simpleline"])
+        _first = False
+        _emitted_something = True
+    if not _emitted_something:
+        # Zero matches across all counters. Normally the title-fallback
+        # loop above resolves legacy-tkinter archive files — so hitting
+        # this branch means even title-matching failed. Usually:
+        # (a) empty channel folder, (b) ambiguous titles (duplicates
+        # skipped for safety), or (c) filesystem-sanitized titles too
+        # divergent to match.
+        _n_disk = len(on_disk)
+        _n_bulk = len(bulk)
+        if _n_disk == 0:
+            tagged.append(["no videos on disk for this channel",
+                           "simpleline"])
+        elif _n_bulk == 0:
+            tagged.append(["channel returned no videos", "simpleline"])
+        else:
+            tagged.append([
+                f"no matches ({_n_disk} on disk vs {_n_bulk} from YouTube "
+                f"\u2014 titles too divergent to match)", "simpleline"])
+    tagged.append([f" (took {took:.1f}s)\n", "simpleline"])
+    stream.emit(tagged)
+    return {
+        "ok": True,
+        "fetched": no_meta_entry,
+        "refreshed": full_fetched + updated_in_place,
+        "errors": full_errors,
+        "skipped": skipped_same,
+        "bulk_fetched": len(bulk),
+        "took": took,
+    }
+
+
+def count_video_id_status(channel: Dict[str, Any]) -> Dict[str, Any]:
+    """Cheap DB-only count: how many on-disk videos have a resolvable
+    video_id stored in the index `videos` table? Powers the Settings >
+    Metadata "Video IDs" column so the user can spot channels that
+    need a one-time backfill (common for archives migrated from the
+    tkinter-era YTArchiver, which never wrote [id] brackets into
+    filenames nor .info.json sidecars).
+
+    Returns {total, with_id, missing}. `total` is the row count for
+    files under the channel folder; `with_id` counts rows where
+    video_id is non-NULL / non-empty. Purely a DB-read — no disk
+    walk, no yt-dlp. Safe to call for every channel on a tab render.
+    """
+    folder = _folder_for_channel(channel)
+    if folder is None:
+        return {"total": 0, "with_id": 0, "missing": 0}
+    try:
+        from . import index as _idx
+        conn = _idx._open()
+        if conn is None:
+            return {"total": 0, "with_id": 0, "missing": 0}
+        _pat = str(folder) + "%"
+        with _idx._db_lock:
+            _total = conn.execute(
+                "SELECT COUNT(*) FROM videos WHERE filepath LIKE ?",
+                (_pat,)).fetchone()[0]
+            _with_id = conn.execute(
+                "SELECT COUNT(*) FROM videos WHERE filepath LIKE ? "
+                "AND video_id IS NOT NULL AND video_id != ''",
+                (_pat,)).fetchone()[0]
+        return {
+            "total": int(_total or 0),
+            "with_id": int(_with_id or 0),
+            "missing": int((_total or 0) - (_with_id or 0)),
+        }
+    except Exception:
+        return {"total": 0, "with_id": 0, "missing": 0}
+
+
+def backfill_video_ids(channel: Dict[str, Any],
+                       stream: LogStreamer,
+                       cancel_event: Optional[threading.Event] = None,
+                       pause_event: Optional[threading.Event] = None,
+                       ) -> Dict[str, Any]:
+    """One-shot video_id backfill — reuses the title-match logic from
+    bulk_refresh_views_likes but WITHOUT the full --dump-json re-fetch
+    pass. Just:
+
+      1. Flat-playlist to get {id: title} for the channel.
+      2. Walk on-disk videos; for each file whose video_id is empty
+         (no [id] bracket AND no DB entry with id), try to resolve
+         via normalized-title match.
+      3. UPDATE the index videos-table with resolved IDs.
+
+    This is the dedicated fix for archives migrated from the tkinter
+    YTArchiver — thousands of files with no [id] bracket and no
+    .info.json sidecar get IDs in one bulk-playlist call, making
+    subsequent bulk views/likes refreshes work the fast path.
+
+    Returns {ok, resolved, already_set, ambiguous, unresolved, took}.
+    """
+    folder = _folder_for_channel(channel)
+    if folder is None:
+        stream.emit_error("Backfill: output_dir is not configured.")
+        return {"ok": False, "error": "no output_dir"}
+    yt = find_yt_dlp()
+    if not yt:
+        stream.emit_error("Backfill: yt-dlp not found.")
+        return {"ok": False, "error": "yt-dlp missing"}
+    name = channel.get("name") or channel.get("folder") or "?"
+    ch_url = (channel.get("url") or "").strip()
+    if not ch_url:
+        stream.emit_error(f"Backfill: {name} has no URL.")
+        return {"ok": False, "error": "no url"}
+
+    stream.emit([["  \u2014 ", "meta_bracket"],
+                 [f"Resolving video_ids for {name} (flat-playlist)...\n",
+                  "simpleline"]])
+
+    t0 = time.time()
+    bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
+                                     cancel_event, pause_event)
+    if not bulk:
+        stream.emit([
+            [" \u26A0 ", "meta_bracket"],
+            [f"Flat-playlist returned no data for {name}.\n", "simpleline"],
+        ])
+        return {"ok": False, "error": "bulk_empty"}
+
+    # Build normalized-title → video_id (same rules as
+    # bulk_refresh_views_likes so the two stay consistent).
+    def _norm_title(s: str) -> str:
+        if not s:
+            return ""
+        s = s.lower()
+        s = re.sub(r"\s*\[[a-z0-9_-]{11}\]\s*$", "", s)
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return s.strip()
+
+    title_to_vid: Dict[str, str] = {}
+    ambiguous: set = set()
+    for _vid, _stats in bulk.items():
+        _nt = _norm_title(_stats.get("title") or "")
+        if not _nt:
+            continue
+        if _nt in title_to_vid and title_to_vid[_nt] != _vid:
+            ambiguous.add(_nt)
+        else:
+            title_to_vid[_nt] = _vid
+
+    # Walk on-disk + try resolution. _scan_channel_videos already
+    # applies [id]-bracket + DB lookup, so anything it returns with
+    # empty vid_id truly has no existing resolution.
+    on_disk = _scan_channel_videos(folder)
+    already_set = 0
+    resolved = 0
+    ambiguous_hits = 0
+    unresolved = 0
+    to_backfill: List[Tuple[str, str]] = []  # (filepath, video_id)
+    for (_v, _t, _y, _m, _fp) in on_disk:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        while (pause_event is not None and pause_event.is_set()
+               and not (cancel_event is not None and cancel_event.is_set())):
+            time.sleep(0.25)
+        if _v:
+            already_set += 1
+            continue
+        _nt = _norm_title(_t)
+        if not _nt:
+            unresolved += 1
+            continue
+        if _nt in ambiguous:
+            ambiguous_hits += 1
+            continue
+        _guess = title_to_vid.get(_nt, "")
+        if _guess:
+            to_backfill.append((_fp, _guess))
+            resolved += 1
+        else:
+            unresolved += 1
+
+    # One UPDATE per resolved row. Chunked commit so a huge channel
+    # doesn't block the DB for seconds.
+    if to_backfill:
+        try:
+            from . import index as _idx
+            conn = _idx._open()
+            if conn is not None:
+                with _idx._db_lock:
+                    for _fp, _vid in to_backfill:
+                        _vurl = f"https://www.youtube.com/watch?v={_vid}"
+                        try:
+                            conn.execute(
+                                "UPDATE videos SET video_id=?, video_url=? "
+                                "WHERE filepath=? COLLATE NOCASE "
+                                "AND (video_id IS NULL OR video_id='')",
+                                (_vid, _vurl, _fp))
+                        except Exception:
+                            pass
+                    conn.commit()
+        except Exception as _e:
+            stream.emit_error(f"Backfill DB write failed: {_e}")
+
+    took = time.time() - t0
+    _parts = []
+    if resolved:
+        _parts.append(f"{resolved} resolved")
+    if already_set:
+        _parts.append(f"{already_set} already set")
+    if ambiguous_hits:
+        _parts.append(f"{ambiguous_hits} ambiguous (skipped)")
+    if unresolved:
+        _parts.append(f"{unresolved} unresolved")
+    if not _parts:
+        _parts.append("no on-disk videos")
+    _summary = " \u00b7 ".join(_parts)
+    _tag = "simpleline_pink" if resolved else "dim"
+    stream.emit([
+        [" \u2014 ", "meta_bracket"],
+        [f"{name}: {_summary} (took {took:.1f}s)\n", _tag],
+    ])
+    return {
+        "ok": True,
+        "resolved": resolved,
+        "already_set": already_set,
+        "ambiguous": ambiguous_hits,
+        "unresolved": unresolved,
+        "took": took,
+    }
+
+
+def refresh_channel_comments(channel: Dict[str, Any],
+                              stream: LogStreamer,
+                              cancel_event: Optional[threading.Event] = None,
+                              pause_event: Optional[threading.Event] = None,
+                              only_recent_days: Optional[int] = None,
+                              ) -> Dict[str, Any]:
+    """Per-channel comment refresh. Re-fetches full metadata (via
+    --dump-json --write-comments) for every on-disk video the
+    channel has a metadata entry for. Motivating use case: videos
+    caught within 30 min of upload typically have no "good"
+    comments yet — this lets users pull a fresh top-50 a week later
+    without re-fetching ALL metadata fields.
+
+    `only_recent_days` optionally scopes to videos uploaded within
+    the last N days (using the upload_date stored in the metadata
+    entry) so a 4000-video channel doesn't take hours if you just
+    want recent community updates. `None` = all videos.
+
+    This is ALWAYS a slow path — comments require per-video API
+    calls, no bulk mode exists — so the function is separate from
+    bulk_refresh_views_likes (which is deliberately fast). Both
+    can be run by the user independently; there's no dependency
+    between them.
+
+    Returns {ok, fetched, errors, skipped, took}.
+    """
+    folder = _folder_for_channel(channel)
+    if folder is None:
+        return {"ok": False, "error": "no output_dir"}
+    yt = find_yt_dlp()
+    if not yt:
+        return {"ok": False, "error": "yt-dlp missing"}
+
+    name = channel.get("name") or channel.get("folder") or "?"
+    _scope = f" (last {only_recent_days}d)" if only_recent_days else ""
+    stream.emit([["  \u2014 ", "meta_bracket"],
+                 [f"Refreshing comments for {name}{_scope}...\n",
+                  "simpleline"]])
+
+    on_disk = _scan_channel_videos(folder)
+    fp_by_id: Dict[str, str] = {}
+    for (_v, _t, _y, _m, _fp) in on_disk:
+        if _v and _fp:
+            fp_by_id[_v] = _fp
+
+    # Collect every existing metadata entry. For recent-days scope,
+    # filter by upload_date stored on the entry.
+    targets: List[Tuple[str, str]] = []  # (video_id, filepath)
+    cutoff_yyyymmdd: Optional[str] = None
+    if only_recent_days and only_recent_days > 0:
+        from datetime import timedelta as _td
+        cutoff_yyyymmdd = (datetime.now() - _td(days=only_recent_days)
+                           ).strftime("%Y%m%d")
+    for dp, _dns, fns in os.walk(str(folder)):
+        for fn in fns:
+            if not fn.endswith("Metadata.jsonl"):
+                continue
+            jp = os.path.join(dp, fn)
+            for vid, entry in _read_metadata_jsonl(jp).items():
+                if vid not in fp_by_id:
+                    continue
+                if cutoff_yyyymmdd:
+                    ud = str(entry.get("upload_date") or "")
+                    if not ud or ud < cutoff_yyyymmdd:
+                        continue
+                targets.append((vid, fp_by_id[vid]))
+
+    total = len(targets)
+    if total == 0:
+        stream.emit([[" \u2014 No videos match the comment-refresh "
+                      "scope.\n", "dim"]])
+        return {"ok": True, "fetched": 0, "errors": 0, "skipped": 0,
+                "took": 0}
+
+    t0 = time.time()
+    fetched = 0
+    errors = 0
+    for i, (vid, fp) in enumerate(targets, 1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        while (pause_event is not None and pause_event.is_set()
+               and not (cancel_event is not None and cancel_event.is_set())):
+            time.sleep(0.25)
+        if i == 1 or i % 25 == 0:
+            stream.emit_dim(
+                f"    \u2014 comments refresh: {i}/{total}...")
+        try:
+            res = fetch_single_video_metadata(
+                channel, vid, fp, stream, cancel_event=cancel_event,
+                emit_inline_log=False)
+            if res.get("ok"):
+                fetched += 1
+            elif not res.get("transient"):
+                errors += 1
+        except Exception:
+            errors += 1
+
+    # Stamp separate last-comments-refresh timestamp on the channel.
+    try:
+        from . import ytarchiver_config as _cfg
+        cfg = _cfg.load_config()
+        ch_url_norm = (channel.get("url") or "").rstrip("/")
+        now_ts = time.time()
+        for ch in cfg.get("channels", []):
+            if (ch.get("url") or "").rstrip("/") == ch_url_norm:
+                ch["last_comments_refresh_ts"] = now_ts
+                break
+        _cfg.save_config(cfg)
+    except Exception:
+        pass
+
+    took = time.time() - t0
+    _tag = "red" if errors else "simpleline_pink"
+    stream.emit([
+        [" \u2014 ", "meta_bracket"],
+        [f"{name}: comments refreshed — {fetched} ok, "
+         f"{errors} errors (took {took:.1f}s)\n", _tag],
+    ])
+    return {"ok": True, "fetched": fetched, "errors": errors,
+            "skipped": 0, "took": took}
+
+
+def fetch_channel_metadata(channel: Dict[str, Any],
+                           stream: LogStreamer,
+                           cancel_event: Optional[threading.Event] = None,
+                           refresh: bool = False,
+                           pause_event: Optional[threading.Event] = None,
+                           scope: Optional[Dict[str, Any]] = None,
+                           ) -> Dict[str, Any]:
+    """Fill in missing metadata for this channel's on-disk videos.
+
+    Two modes:
+      - refresh=False (DEFAULT): DISK-DRIVEN. Enumerate videos on disk
+        via `_scan_channel_videos` (filename `[id]` bracket first, then
+        index-DB filepath lookup). Compare against existing JSONL IDs.
+        Fetch only the missing handful. NO playlist walk — because the
+        playlist would include ~hundreds of channel-videos that aren't
+        downloaded, all of which are irrelevant for this job.
+      - refresh=True: "Refresh views/likes" — delegates to
+        bulk_refresh_views_likes() which does one flat-playlist call
+        for all videos, then only full-fetches ones whose counts
+        changed. Users reported the old every-video-full-fetch path
+        taking 1h17m for a 404-video channel; the bulk path typically
+        finishes in well under a minute.
+
+    `scope` restricts which on-disk videos are considered:
+      - `{"year": 2024}` — only videos whose upload year (from mtime)
+        matches. Used by the Browse video-grid year-head context menu
+        to offer year-scoped metadata refresh (feature H-14). Videos
+        whose year can't be determined (mtime lookup failed) are
+        excluded from scoped passes.
+    """
+    # Smart-refresh short-circuit: when the caller wants refresh=True,
+    # go straight to the bulk path. That function knows to only
+    # full-fetch videos with changed counts; for a channel where 99%
+    # of view-counts haven't moved, it becomes ~1 API call instead
+    # of ~N. Error cases (bulk returns empty) fall back below.
+    if refresh:
+        _res = bulk_refresh_views_likes(channel, stream,
+                                        cancel_event=cancel_event,
+                                        pause_event=pause_event,
+                                        scope=scope,
+                                        full_fetch_on_change=True)
+        # Fall through to the old path ONLY if the bulk path couldn't
+        # get any data at all (e.g. channel URL stripped, yt-dlp
+        # returned empty, private channel). That path is still
+        # useful as a safety net — it at least does the
+        # disk-driven fetch for newly-added missing metadata.
+        if _res.get("ok") or _res.get("bulk_fetched", 0) > 0:
+            return _res
+        stream.emit_dim(
+            " (bulk path returned nothing — falling back to "
+            "per-video refresh)")
+        # Continue into the legacy path below.
+
+    folder = _folder_for_channel(channel)
+    if folder is None:
+        stream.emit_error("Metadata: output_dir is not configured.")
+        return {"ok": False, "error": "no output_dir"}
+    folder.mkdir(parents=True, exist_ok=True)
+
+    yt = find_yt_dlp()
+    if not yt:
+        stream.emit_error("Metadata: yt-dlp not found.")
+        return {"ok": False, "error": "yt-dlp missing"}
+
+    name = channel.get("name") or channel.get("folder") or "?"
+    # feature H-14: when scope has a year, banner shows the scope
+    # ("Rechecking Foo (2024 only)..."); otherwise unchanged.
+    _scope_year: Optional[int] = None
+    if scope and isinstance(scope.get("year"), int):
+        _scope_year = int(scope["year"])
+    _scope_banner = f" ({_scope_year} only)" if _scope_year is not None else ""
+    stream.emit([["  \u2014 ", "meta_bracket"],
+                 [f"Rechecking {name}{_scope_banner}...\n", "simpleline"]])
 
     # 1. Enumerate videos ON DISK. `_scan_channel_videos` returns
     # (video_id, title, year, month, filepath) — video_id is
     # filled in either from filename `[id]` bracket or from the
     # index DB (filepath → video_id lookup).
     on_disk = _scan_channel_videos(folder)
+    # feature H-14: year-scoped filter. Entries where year is None
+    # (mtime couldn't be resolved) are excluded from scoped passes —
+    # if we can't place them in a year, we can't honor the year scope.
+    if _scope_year is not None:
+        on_disk = [v for v in on_disk if v[2] == _scope_year]
     on_disk_ids = [v[0] for v in on_disk if v[0]]
     # Previously-failed fetches + previously-failed id-resolves —
     # OLD-YTArchiver compatible skip logic. Videos marked in the DB

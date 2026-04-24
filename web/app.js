@@ -444,25 +444,36 @@
       const backdrop = document.createElement("div");
       backdrop.className = "askq-backdrop";
       const buttonsHtml = choices.map((c, i) => {
-        // Support both `kind: "primary"|"danger"|"ghost"` AND `primary: bool` / `danger: bool`
-        const kind = c.kind || (c.primary ? "primary" : c.danger ? "danger" : "ghost");
+        // Support both `kind: "primary"|"danger"|"ghost"` AND
+        // `primary: bool` / `danger: bool`. Default is now primary
+        // (green) instead of ghost (gray) — per design feedback:
+        // action choices should read as "go" buttons, with only
+        // explicit `kind: "ghost"` dialed back to secondary styling.
+        const kind = c.kind || (c.primary ? "primary" : c.danger ? "danger" : "primary");
         const cls = kind === "primary" ? "btn btn-primary"
                   : kind === "danger" ? "btn btn-danger"
                                        : "btn btn-ghost";
         return `<button class="${cls}" data-value="${escapeHtml(c.value)}">${escapeHtml(c.label)}</button>`;
       }).join("");
       const hasCountdown = cfg.countdownSecs > 0;
-      const cancelBtn = '<button class="btn btn-ghost" data-act="cancel"></button>';
-      const btnsInner = cfg.cancelPlacement === "right"
-        ? `${buttonsHtml}${cancelBtn}`
-        : `${cancelBtn}${buttonsHtml}`;
+      // Cancel now renders on its own bottom row, styled as danger
+      // (red) so it reads as the "stop / back out" affordance. Prior
+      // layout put Cancel inline with the action buttons and they
+      // all wrapped into an awkward mixed grid when the dialog got
+      // narrow (flagged via user screenshot: Cancel stuck on the top
+      // row with two action buttons, while the third wrapped alone
+      // below).
+      const cancelBtn = '<button class="btn btn-danger" data-act="cancel"></button>';
       backdrop.innerHTML = `
         <div class="askq-dialog">
           <div class="askq-header"></div>
           <div class="askq-body"></div>
           ${hasCountdown ? '<div class="askq-countdown" style="margin:8px 0 12px;font-size:12px;color:var(--c-dim);"></div>' : ""}
-          <div class="askq-buttons">
-            ${btnsInner}
+          <div class="askq-buttons askq-buttons-actions">
+            ${buttonsHtml}
+          </div>
+          <div class="askq-buttons askq-buttons-cancel">
+            ${cancelBtn}
           </div>
         </div>
       `;
@@ -886,39 +897,53 @@
     const sortWrap = document.getElementById("browse-sort-wrap");
     const title = document.getElementById("browse-main-title");
     const filter = document.getElementById("browse-filter");
+    // Grab the whole filter+icon wrap so we can hide the orphan
+    // magnifying-glass icon alongside the input on views that don't
+    // use the top-level Browse filter. Previously only the input was
+    // being hidden, leaving a floating 🔍 with nothing to filter.
+    const findWrap = filter?.closest(".browse-find-wrap");
 
     if (mode === "channels") {
       // Restart in channel grid
       _browseState.view = "channels";
+      if (findWrap) findWrap.style.display = "";
       showView("channels");
     } else if (mode === "recent") {
       // Recent was moved from a top-level tab into a Browse submode
       // (users wanted all library navigation in one place). Reuses
       // the same #recent-table / #recent-table-body ids as before so
-      // the existing render + click wiring keeps working.
+      // the existing render + click wiring keeps working. Recent has
+      // its own filter input inside the view, so hide the top-level
+      // find-wrap entirely (wrap, not just input — otherwise the
+      // icon orphans).
       document.getElementById("view-recent").style.display = "";
       title.textContent = "Recent downloads";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
-      if (filter) filter.style.display = "none"; // recent has its own filter
+      if (findWrap) findWrap.style.display = "none";
       _browseState.view = "recent";
     } else if (mode === "search") {
+      // Search view has its own search input inside #view-search, so
+      // hide the top-level find-wrap too (same orphan-icon bug as
+      // recent if we only hid the input).
       document.getElementById("view-search").style.display = "";
       title.textContent = "Search transcripts";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
-      if (filter) filter.placeholder = "Search \u2026";
+      if (findWrap) findWrap.style.display = "none";
     } else if (mode === "graph") {
       document.getElementById("view-graph").style.display = "";
       title.textContent = "Word frequency";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
+      if (findWrap) findWrap.style.display = "none";
       populateGraphChannels();
     } else if (mode === "bookmarks") {
       document.getElementById("view-bookmarks").style.display = "";
       title.textContent = "Bookmarks";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
+      if (findWrap) findWrap.style.display = "none";
       refreshBookmarks();
     } else if (mode === "index") {
       document.getElementById("view-index").style.display = "";
@@ -1045,6 +1070,7 @@
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
     const filter = document.getElementById("browse-filter");
+    const findWrap = filter?.closest(".browse-find-wrap");
 
     if (viewName === "channels") {
       document.getElementById("view-channels").style.display = "";
@@ -1052,20 +1078,24 @@
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
+      if (findWrap) findWrap.style.display = "";
     } else if (viewName === "videos") {
       document.getElementById("view-videos").style.display = "";
       title.textContent = _browseState.currentChannel?.folder || "Videos";
       backBtn.style.display = "";
       sortWrap.style.display = "";
       if (filter) { filter.placeholder = "Filter videos\u2026"; filter.value = ""; }
+      if (findWrap) findWrap.style.display = "";
     } else if (viewName === "watch") {
       document.getElementById("view-watch").style.display = "";
       title.textContent = _browseState.currentVideo?.title || "Watch";
       backBtn.style.display = "";
       sortWrap.style.display = "none";
-      if (filter) filter.style.display = "none";
+      // Hide the whole wrap (input + icon), not just the input —
+      // otherwise a lone magnifying glass sits in the header with
+      // nothing to filter.
+      if (findWrap) findWrap.style.display = "none";
     }
-    if (filter) filter.style.display = viewName === "watch" ? "none" : "";
   }
 
   // ─── Search viewer pane — shows context around a clicked hit ────────
@@ -1196,7 +1226,16 @@
         _seek_to: Number(seg.s) || 0,
         _search_query: state.query || _searchViewerState.query || "",
       });
-    }).catch(() => {});
+    }).catch((err) => {
+      // audit D-34: surface resolve failures so the user sees WHY a
+      // segment click did nothing. Old .catch(() => {}) silently
+      // ate every error (missing file, backend exception, network)
+      // and left the user clicking with zero feedback.
+      console.warn("[search] _openSearchResultInWatch failed:", err);
+      window._showToast?.(
+        `Could not open segment: ${err?.message || err || "unknown error"}`,
+        "error");
+    });
   }
 
   function _initSearchViewerLoadMore() {
@@ -2017,8 +2056,17 @@
           ro.observe(wrap);
           wrap._graphResizeObs = ro;
         }
-        // Window-resize as a second safety net
-        window.addEventListener("resize", kick);
+        // Window-resize as a second safety net.
+        // audit D-33: gate the listener add with a flag on `wrap` the
+        // same way the ResizeObserver is gated, so we don't accumulate
+        // N listeners after N chart-type switches. Each
+        // drawGraphFromData call used to add ANOTHER resize listener,
+        // so after 10 switches 10 handlers fired on every window
+        // resize — noticeable perf hit on wide monitors.
+        if (!wrap._graphWinResize) {
+          window.addEventListener("resize", kick);
+          wrap._graphWinResize = true;
+        }
       }
     } catch (e) { /* resize-safety is best-effort */ }
   }
@@ -3434,6 +3482,7 @@
       performance: document.getElementById("settings-view-performance"),
       appearance: document.getElementById("settings-view-appearance"),
       tools: document.getElementById("settings-view-tools"),
+      metadata: document.getElementById("settings-view-metadata"),
       index: document.getElementById("settings-view-index"),
     };
     const saveFooter = document.getElementById("settings-actions-footer");
@@ -3443,13 +3492,22 @@
       for (const k of Object.keys(views)) {
         if (views[k]) views[k].style.display = (k === key) ? "" : "none";
       }
-      // Hide Save on Index (has its own actions). Show on everything else.
-      if (saveFooter) saveFooter.style.display = (key === "index") ? "none" : "";
+      // Hide Save on Index + Metadata (both have their own actions
+      // and no form fields). Show on everything else.
+      if (saveFooter) {
+        saveFooter.style.display = (key === "index" || key === "metadata") ? "none" : "";
+      }
       if (key === "index") {
         // Pull fresh numbers every visit — stale "Loading…" was showing
         // up after first paint because the initial fetch was racing boot.
         if (typeof window._refreshIndexStats === "function") {
           window._refreshIndexStats();
+        }
+      }
+      if (key === "metadata") {
+        // Pull fresh per-channel refresh timestamps every visit.
+        if (typeof window._refreshMetadataTab === "function") {
+          window._refreshMetadataTab();
         }
       }
     };
@@ -3644,6 +3702,390 @@
     }, 800);
   }
   window._initSettingsArchiveRoots = initSettingsArchiveRoots;
+
+  // Settings > Metadata tab — per-channel refresh status table.
+  // Populates a sortable table showing, for every saved channel,
+  // when views/likes and comments were last refreshed. Defaults to
+  // oldest-first sort so stale channels float to the top. Per-row
+  // actions queue a refresh; bulk row does everything at once.
+  // Added 2026-04-23 alongside the bulk views-refresh rollout.
+  function initMetadataTab() {
+    const tbody = document.getElementById("metadata-tbody");
+    const table = document.getElementById("metadata-table");
+    const bAllViews = document.getElementById("btn-md-refresh-all-views");
+    const bAllComments = document.getElementById("btn-md-refresh-all-comments");
+    const bAllBackfill = document.getElementById("btn-md-backfill-all-ids");
+    const bReload = document.getElementById("btn-md-reload");
+    if (!tbody || !table) return;
+
+    const getApi = () => window.pywebview?.api;
+
+    // Current dataset + sort state. Sort state persists across reloads.
+    let _rows = [];
+    let _sortKey = "views";   // matches data-sort-active in HTML
+    let _sortDir = "asc";     // oldest-first by default
+
+    // Format a timestamp relative to now ("2h ago", "3d ago", "never").
+    // "Never" and >90d get a color class so they're easy to spot.
+    const fmtRel = (ts) => {
+      if (!ts || ts <= 0) return { text: "never", cls: "md-ts-never" };
+      const now = Date.now() / 1000;
+      const delta = Math.max(0, now - ts);
+      const mins = Math.floor(delta / 60);
+      const hrs = Math.floor(delta / 3600);
+      const days = Math.floor(delta / 86400);
+      let text;
+      if (mins < 1) text = "just now";
+      else if (mins < 60) text = `${mins}m ago`;
+      else if (hrs < 24) text = `${hrs}h ago`;
+      else if (days < 365) text = `${days}d ago`;
+      else text = `${Math.floor(days / 365)}y ago`;
+      const cls = days >= 90 ? "md-ts-old"
+                : days >= 30 ? "" : "md-ts-fresh";
+      return { text, cls };
+    };
+
+    const escapeHtml = (s) => String(s || "")
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    const sortRows = (rows) => {
+      const mult = _sortDir === "asc" ? 1 : -1;
+      const kfn = {
+        name: (r) => (r.name || "").toLowerCase(),
+        videos: (r) => r.video_count || 0,
+        // IDs column sorts by ratio of missing ids → worst-first
+        // (highest missing fraction) when descending. Channels with
+        // nothing on disk (id_total=0) sort as ratio=0 so they don't
+        // dominate the "worst" position.
+        ids: (r) => {
+          const t = r.id_total || 0;
+          const m = r.id_missing || 0;
+          return t > 0 ? (m / t) : 0;
+        },
+        views: (r) => r.last_views_refresh_ts || 0,
+        comments: (r) => r.last_comments_refresh_ts || 0,
+      }[_sortKey] || ((r) => 0);
+      const out = rows.slice().sort((a, b) => {
+        const va = kfn(a), vb = kfn(b);
+        if (va < vb) return -1 * mult;
+        if (va > vb) return 1 * mult;
+        // stable tiebreak on name
+        const na = (a.name || "").toLowerCase();
+        const nb = (b.name || "").toLowerCase();
+        if (na < nb) return -1;
+        if (na > nb) return 1;
+        return 0;
+      });
+      return out;
+    };
+
+    const render = () => {
+      // Update th sort indicators.
+      table.querySelectorAll("thead th").forEach(th => {
+        if (th.dataset.sort === _sortKey) {
+          th.setAttribute("data-sort-active", "");
+          th.setAttribute("data-sort-dir", _sortDir);
+        } else {
+          th.removeAttribute("data-sort-active");
+          th.removeAttribute("data-sort-dir");
+        }
+      });
+      if (!_rows.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">No channels configured.</td></tr>';
+        return;
+      }
+      const sorted = sortRows(_rows);
+      tbody.innerHTML = sorted.map(r => {
+        const v = fmtRel(r.last_views_refresh_ts);
+        const c = fmtRel(r.last_comments_refresh_ts);
+        const ident = JSON.stringify({ folder: r.folder, url: r.url });
+        // Video IDs status: compute icon + optional ratio suffix +
+        // color class based on missing-count. DB-only count — reflects
+        // what bulk views/likes refresh can actually match.
+        const idTotal = r.id_total || 0;
+        const idWith = r.id_with_id || 0;
+        const idMissing = r.id_missing || 0;
+        let idHtml;
+        if (idTotal === 0) {
+          idHtml = '<span class="md-id-dim" title="No videos registered in the index DB for this channel">&mdash;</span>';
+        } else if (idMissing === 0) {
+          idHtml = `<span class="md-id-ok" title="All ${idTotal.toLocaleString()} video(s) have a resolvable video_id">\u2713 ${idTotal.toLocaleString()}</span>`;
+        } else if (idWith === 0) {
+          idHtml = `<span class="md-id-bad" title="None of the ${idTotal.toLocaleString()} video(s) have video_ids — run Fix IDs">\u2717 0<span class="md-id-ratio">/${idTotal.toLocaleString()}</span></span>`;
+        } else {
+          idHtml = `<span class="md-id-warn" title="${idMissing.toLocaleString()} video(s) missing video_id — run Fix IDs to backfill">\u26A0 ${idWith.toLocaleString()}<span class="md-id-ratio">/${idTotal.toLocaleString()}</span></span>`;
+        }
+        // Stash the "needs fix" state on the button so the click
+        // handler's menu can emphasize Fix IDs when relevant (and so
+        // the icon picks up a warning color without extra DOM).
+        const needsFix = (idTotal > 0 && idMissing > 0);
+        return `<tr data-identity='${escapeHtml(ident)}'>
+          <td class="md-col-name">${escapeHtml(r.name)}</td>
+          <td class="md-col-num">${r.video_count.toLocaleString()}</td>
+          <td class="md-col-ids">${idHtml}</td>
+          <td class="md-col-ts ${v.cls}">${v.text}</td>
+          <td class="md-col-ts ${c.cls}">${c.text}</td>
+          <td class="md-col-act">
+            <button class="md-row-act-btn md-row-act-menu${needsFix ? ' md-row-act-warn' : ''}" data-act="menu" title="Channel actions (Fix IDs, Refresh views, Refresh comments)" aria-label="Channel actions">\u22EF</button>
+          </td>
+        </tr>`;
+      }).join("");
+    };
+
+    window._refreshMetadataTab = async () => {
+      const api = getApi();
+      if (!api?.get_channel_metadata_status) {
+        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">Native mode required.</td></tr>';
+        return;
+      }
+      try {
+        const rows = await api.get_channel_metadata_status();
+        _rows = Array.isArray(rows) ? rows : [];
+      } catch (e) {
+        console.error("get_channel_metadata_status:", e);
+        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">Failed to load.</td></tr>';
+        return;
+      }
+      render();
+    };
+
+    // Column header click → cycle sort. Same column toggles dir;
+    // new column resets to a sensible default (asc for names, desc
+    // for numbers + "refresh" columns where "most recent first"
+    // reads more naturally).
+    table.querySelectorAll("thead th[data-sort]").forEach(th => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort;
+        if (key === _sortKey) {
+          _sortDir = _sortDir === "asc" ? "desc" : "asc";
+        } else {
+          _sortKey = key;
+          _sortDir = (key === "name") ? "asc" : "desc";
+        }
+        render();
+      });
+    });
+
+    // Per-row action buttons (event delegation). A single "⋯" menu
+    // button per row opens an askChoice picker with all three
+    // actions — much more space-efficient than three visible buttons
+    // at narrow panel widths.
+    const _runRowAct = async (act, ident, rowRefs) => {
+      const api = getApi();
+      if (!api) return;
+      if (act === "views") {
+        if (!api.metadata_refresh_views_channel) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        try {
+          const res = await api.metadata_refresh_views_channel(ident);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.("Queued views/likes refresh.", "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      } else if (act === "backfill") {
+        if (!api.metadata_backfill_ids_channel) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        try {
+          const res = await api.metadata_backfill_ids_channel(ident);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.("Queued video_id backfill.", "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      } else if (act === "comments") {
+        if (!api.metadata_refresh_comments_channel) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        const pick = await (window.askChoice ? window.askChoice({
+          title: "Refresh comments",
+          message: "Scope which videos to refetch comments for:",
+          choices: [
+            { label: "Last 7 days", value: 7, kind: "primary" },
+            { label: "Last 30 days", value: 30 },
+            { label: "Last 90 days", value: 90 },
+            { label: "All videos", value: 0, kind: "ghost" },
+          ],
+        }) : Promise.resolve(null));
+        // askChoice resolves to a string from dataset.value (or null on
+        // cancel). Coerce to int; 0 → "all videos" → null days-scope.
+        if (pick === null || pick === undefined) return;
+        const pickN = parseInt(pick, 10);
+        const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : null;
+        try {
+          const res = await api.metadata_refresh_comments_channel(ident, days);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.(days ? `Queued comments refresh (${days}d).`
+                                     : "Queued comments refresh (all).", "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      }
+    };
+
+    // Wire the single per-row menu button. Clicking "⋯" opens an
+    // askChoice picker with the three actions; the handler then
+    // dispatches into the existing _runRowAct. Primary choice defaults
+    // to Fix IDs when the row is flagged `needsFix` (yellow warn
+    // color on the button), otherwise the most common case — Views.
+    tbody.addEventListener("click", async (e) => {
+      const btn = e.target.closest(".md-row-act-btn");
+      if (!btn) return;
+      const tr = btn.closest("tr");
+      if (!tr) return;
+      let ident = {};
+      try { ident = JSON.parse(tr.dataset.identity || "{}"); } catch {}
+      if (btn.dataset.act !== "menu") return;
+      const needsFix = btn.classList.contains("md-row-act-warn");
+      // Reorder so the most-likely action is FIRST — askChoice focuses
+      // the first primary-kinded button for keyboard confirm. Since
+      // the default kind is now primary (all green), ordering alone
+      // picks the default without making the others visually secondary.
+      const fix = { label: "Fix missing video IDs", value: "backfill" };
+      const views = { label: "Refresh views/likes", value: "views" };
+      const comments = { label: "Refresh comments\u2026", value: "comments" };
+      // Mark the first choice `primary: true` so Enter confirms it
+      // (askChoice uses this flag to pick the keyboard-focus target).
+      // All three still render green — the primary flag only affects
+      // auto-focus, not color, under the new default-to-primary kind.
+      const choices = needsFix
+        ? [{...fix, primary: true}, views, comments]
+        : [{...views, primary: true}, fix, comments];
+      const pick = await (window.askChoice ? window.askChoice({
+        title: "Channel actions",
+        message: "Pick an action for this channel:",
+        choices,
+      }) : Promise.resolve(null));
+      if (!pick) return;
+      await _runRowAct(String(pick), ident);
+    });
+
+    // Bulk buttons.
+    if (bAllViews) {
+      bAllViews.addEventListener("click", async () => {
+        const api = getApi();
+        if (!api?.metadata_queue_all) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        const ok = await (window.askChoice ? window.askChoice({
+          title: "Refresh all views/likes?",
+          message: "This will queue a views/likes refresh for every saved channel. Uses the fast bulk path — most channels finish in under a minute.",
+          choices: [{ label: "Queue all", value: "go", kind: "primary" }],
+        }) : Promise.resolve("go"));
+        // askChoice resolves to a string from dataset.value, or null on
+        // cancel. Any non-null string means the user clicked the
+        // primary button, so proceed.
+        if (!ok) return;
+        try {
+          const res = await api.metadata_queue_all(true);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.(`Queued for ${res.queued} channel(s).`, "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      });
+    }
+    if (bAllComments) {
+      bAllComments.addEventListener("click", async () => {
+        const api = getApi();
+        if (!api?.metadata_refresh_comments_all) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        const pick = await (window.askChoice ? window.askChoice({
+          title: "Refresh all comments",
+          message: "Comments use the slow per-video yt-dlp path — scope to recent uploads when possible.",
+          choices: [
+            { label: "Last 7 days", value: 7, kind: "primary" },
+            { label: "Last 30 days", value: 30 },
+            { label: "Last 90 days", value: 90 },
+            { label: "All videos (slow!)", value: 0, kind: "ghost" },
+          ],
+        }) : Promise.resolve(30));
+        if (pick === null || pick === undefined) return;
+        // askChoice returns strings; coerce. 0 means all (no scope).
+        const pickN = parseInt(pick, 10);
+        const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : 0;
+        try {
+          const res = await api.metadata_refresh_comments_all(days);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.(`Queued for ${res.queued} channel(s).`, "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      });
+    }
+    if (bAllBackfill) {
+      bAllBackfill.addEventListener("click", async () => {
+        const api = getApi();
+        if (!api?.metadata_backfill_ids_all) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        // Show how many channels would be queued BEFORE asking so the
+        // user knows whether this is a big operation or a tiny no-op.
+        // We don't have a dedicated preview method — just show the
+        // aggregate count we're holding from the last tab render.
+        const needing = _rows.filter(r => (r.id_total || 0) > 0 && (r.id_missing || 0) > 0).length;
+        if (needing === 0) {
+          window._showToast?.("All channels already have video_ids \u2014 nothing to do.", "ok");
+          return;
+        }
+        const pick = await (window.askChoice ? window.askChoice({
+          title: "Fix missing video IDs?",
+          message: `Will queue ${needing} channel(s) that currently have missing video_ids. Each channel runs one fast flat-playlist call + title-match to backfill the index DB. No yt-dlp re-fetches, no file changes.`,
+          choices: [
+            { label: `Queue ${needing} channel(s)`, value: "missing", kind: "primary" },
+            { label: "Queue ALL channels (force)", value: "all" },
+          ],
+        }) : Promise.resolve("missing"));
+        if (!pick) return;
+        try {
+          const onlyMissing = (pick === "missing");
+          const res = await api.metadata_backfill_ids_all(onlyMissing);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            const msg = res.skipped_up_to_date
+              ? `Queued ${res.queued} (${res.skipped_up_to_date} already OK).`
+              : `Queued ${res.queued} channel(s).`;
+            window._showToast?.(msg, "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      });
+    }
+    if (bReload) {
+      bReload.addEventListener("click", () => {
+        window._refreshMetadataTab?.();
+      });
+    }
+
+    // If the user's initial panel is the Metadata tab (e.g. after a
+    // restart where it was remembered as active), pull data now.
+    const metaView = document.getElementById("settings-view-metadata");
+    if (metaView && metaView.style.display !== "none") {
+      setTimeout(() => window._refreshMetadataTab?.(), 400);
+    }
+  }
+  window._initMetadataTab = initMetadataTab;
 
   // Compat shim for the old _applyIndexSummary consumers (browse-tab preload).
   // Since the Index tab no longer has idx-channels/idx-videos/etc. elements,
@@ -4234,7 +4676,13 @@
         // bug H-1: the batch-size dropdown existed in the edit panel
         // but its value was never read here, so the user's choice was
         // silently ignored — every save wrote the old value back.
-        compress_batch_size: parseInt(document.getElementById("edit-compress-batch")?.value, 10) || 20,
+        // audit E-56: use Number.isFinite so "0" (user intending to
+        // disable batching) isn't coerced back to 20 by the `|| 20`
+        // fallback. 0 is a legitimate user value meaning "no batching".
+        compress_batch_size: (function () {
+          const _raw = parseInt(document.getElementById("edit-compress-batch")?.value, 10);
+          return Number.isFinite(_raw) && _raw >= 0 ? _raw : 20;
+        })(),
         range,
         from_date,
       };
@@ -4402,9 +4850,21 @@
     }
   }
 
+  // audit D-22: previous body was:
+  //   window._showToast?.(msg, "error") ?? alert(msg);
+  // which fires alert() every time because _showToast returns
+  // undefined on success and `undefined ?? x` evaluates to x. Every
+  // validation error blocked the UI with a browser alert() modal on
+  // top of the toast. The explicit if/else restores toast-only
+  // behavior while still falling back to alert when the toast helper
+  // isn't available.
   function flashError(msg) {
     console.warn("[subs]", msg);
-    window._showToast?.(msg, "error") ?? alert(msg);
+    if (window._showToast) {
+      window._showToast(msg, "error");
+    } else {
+      alert(msg);
+    }
   }
   function flashOk(msg) {
     console.info("[subs]", msg);
@@ -4463,6 +4923,46 @@
       _anchor = null;
     });
 
+    // audit D-30: keyboard handler for Recent table (Delete / Enter /
+    // F2) to match what the Subs tbody supports. Without this, a user
+    // selecting a Recent row couldn't delete it or open it in
+    // Watch without right-clicking — keyboard workflow was broken.
+    tbody.setAttribute("tabindex", "0");
+    tbody.addEventListener("keydown", async (e) => {
+      const selected = tbody.querySelector("tr.row-selected");
+      if (!selected) return;
+      const title = (selected.querySelector(".col-title")?.textContent || "").trim();
+      const channel = (selected.querySelector(".col-channel")?.textContent || "").trim();
+      if (e.key === "Delete") {
+        e.preventDefault();
+        const ok = await askDanger("Delete file",
+          `Permanently delete "${title}" from disk?\n\nThis cannot be undone.`,
+          "Delete");
+        if (!ok) return;
+        try {
+          await window.pywebview?.api?.recent_delete_file?.(title, channel);
+          const rows = await window.pywebview?.api?.get_recent_downloads?.();
+          if (rows && typeof window.renderRecentTable === "function") {
+            window.renderRecentTable(rows);
+          }
+        } catch {}
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const fp = selected.dataset?.filepath || "";
+        if (fp) window.pywebview?.api?.browse_open_video?.(fp);
+      } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const all = [...tbody.querySelectorAll("tr")];
+        const idx = all.indexOf(selected);
+        const next = e.key === "ArrowDown"
+          ? Math.min(all.length - 1, idx + 1)
+          : Math.max(0, idx - 1);
+        all.forEach(t => t.classList.remove("row-selected"));
+        all[next].classList.add("row-selected");
+        all[next].scrollIntoView({ block: "nearest" });
+      }
+    });
+
     tbody.addEventListener("contextmenu", (e) => {
       const tr = e.target.closest("tr");
       if (!tr) return;
@@ -4475,8 +4975,12 @@
       }
       const selected = [...tbody.querySelectorAll("tr.row-selected")];
       const n = selected.length;
-      const title = tr.querySelector(".col-title")?.textContent || "";
-      const channel = tr.querySelector(".col-channel")?.textContent || "";
+      // audit F-37: trim textContent so indicator characters (●, ⚠)
+      // or trailing whitespace in the rendered row don't leak into
+      // the title/channel lookup. Exact-match on the backend side
+      // would silently fail for rows with any prefix/suffix decor.
+      const title = (tr.querySelector(".col-title")?.textContent || "").trim();
+      const channel = (tr.querySelector(".col-channel")?.textContent || "").trim();
       const items = n > 1 ? [
         { label: `Delete ${n} files`, cls: "dim",
           action: async () => {
@@ -4588,6 +5092,22 @@
           { sep: true },
           { label: "Sync now", action: () => api?.sync_one_channel?.({ name }) },
           { label: _metaLabel, action: () => api?.metadata_recheck_channel?.({ name }) },
+          // New 2026-04-23: comments refresh, separate from views/likes.
+          // Submenu offers scope choices so a 4000-video channel doesn't
+          // get re-hit end-to-end when the user only cares about recent
+          // uploads. Backend at metadata.refresh_channel_comments honors
+          // the `only_recent_days` field.
+          { label: "Refresh comments\u2026",
+            submenu: [
+              { label: "Last 7 days",
+                action: () => api?.metadata_refresh_comments_channel?.({ name }, 7) },
+              { label: "Last 30 days",
+                action: () => api?.metadata_refresh_comments_channel?.({ name }, 30) },
+              { label: "Last 90 days",
+                action: () => api?.metadata_refresh_comments_channel?.({ name }, 90) },
+              { label: "All videos (slow)",
+                action: () => api?.metadata_refresh_comments_channel?.({ name }, null) },
+            ]},
           { label: _txLabel, action: () => _askTranscribeChannel(name) },
           { sep: true },
           { label: "Reorg folder",
@@ -4634,6 +5154,7 @@
           if (!year || year === "?" || !chan) return;
           const api = window.pywebview?.api;
           const _scope = { year: parseInt(year, 10) };
+          const _yearInt = parseInt(year, 10);
           showContextMenu(e.clientX, e.clientY, [
             { label: `Redownload ${year} at\u2026`,
               submenu: [
@@ -4652,6 +5173,25 @@
                 { label: "360p",
                   action: () => api?.chan_redownload?.({ name: chan }, "360", _scope) },
               ]},
+            // feature H-14: year-scoped metadata (parallel to the
+            // full-channel metadata actions in Settings > Tools).
+            // "Download" = fetch missing entries for YYYY only.
+            // "Refresh views/likes" = re-hit every YYYY video to pick
+            // up updated view counts / likes / comments.
+            { label: `Download metadata for ${year}`, action: async () => {
+              const res = await api?.metadata_queue_channel_year?.(
+                { name: chan }, _yearInt, false);
+              if (res?.ok) window._showToast?.(
+                `Queued metadata download for ${chan} (${year}).`, "ok");
+              else if (res?.error) window._showToast?.(res.error, "error");
+            }},
+            { label: `Refresh views/likes for ${year}`, action: async () => {
+              const res = await api?.metadata_queue_channel_year?.(
+                { name: chan }, _yearInt, true);
+              if (res?.ok) window._showToast?.(
+                `Queued metadata refresh for ${chan} (${year}).`, "ok");
+              else if (res?.error) window._showToast?.(res.error, "error");
+            }},
           ]);
           return;
         }
@@ -4701,7 +5241,16 @@
               `Queued ${model} re-transcription.`, "ok");
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
-          { label: "Redownload\u2026", action: () => bridgeCall("video_redownload", videoId, title) },
+          { label: "Redownload\u2026", action: async () => {
+            // audit D-24: prompt for resolution first (mirrors the
+            // Watch view's video_redownload flow). Previously the
+            // right-click Redownload fired with no resolution arg
+            // so the backend used its default rather than the
+            // resolution the user wanted.
+            const _res = await (window._askRedownload?.(title));
+            if (!_res) return;
+            bridgeCall("video_redownload", videoId, title, _res);
+          }},
           { sep: true },
           { label: "Delete file", cls: "dim",
             action: () => bridgeCall("video_delete_file", filepath) },
@@ -4728,15 +5277,21 @@
             if (!api?.bookmark_add) return;
             const start = _parseTs(ts.replace(/[\[\]]/g, ""));
             // Match YTArchiver.py:29412 _add_bookmark — prompt for optional note.
-            const note = await askTextInput?.({
+            // audit D-23: DO NOT coalesce with `?? ""` BEFORE the
+            // null check. askTextInput returns null on cancel, and
+            // null ?? "" = "", so the `if (note === null) return`
+            // below never fired — every Cancel created a bookmark
+            // with an empty note. Check raw first, then default.
+            const noteRaw = await askTextInput?.({
               title: "Add bookmark",
               message: `At ${ts || "this moment"}:\n\n\u201C${text.slice(0, 140)}${text.length > 140 ? "\u2026" : ""}\u201D`,
               placeholder: "Add a note (optional)",
               confirm: "Save bookmark",
               cancel: "Cancel",
               allowEmpty: true,
-            }) ?? "";
-            if (note === null) return; // user cancelled
+            });
+            if (noteRaw === null || noteRaw === undefined) return;
+            const note = noteRaw;
             const res = await api.bookmark_add({
               video_id: v.video_id || "",
               title: v.title || "",
@@ -5066,7 +5621,16 @@
       } else if (e.key === "Delete") {
         e.preventDefault();
         const res = await window._removeChannelWithPrompt(folder);
-        if (res && res.ok) location.reload();
+        // audit D-31: refresh in place instead of reloading the entire
+        // page. `location.reload()` nuked the main log, queue state,
+        // any pending toasts, and — critically — the Undo toast that
+        // the remove path tries to show. Use the same refresh
+        // helpers the right-click Remove path uses so keyboard
+        // Delete behaves consistently.
+        if (res && res.ok) {
+          try { window.refreshSubsTable?.(); } catch {}
+          try { window._primeBrowse?.(); } catch {}
+        }
       } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         const allTrs = [...tbody.querySelectorAll("tr")];
@@ -5305,7 +5869,16 @@
     document.removeEventListener("keydown", onCtxKey);
   }
   function onCtxKey(e) {
-    if (e.key === "Escape") closeContextMenu();
+    // audit E-55: stopPropagation so the same Escape press doesn't
+    // bubble up and close popovers / dialogs that happen to be
+    // open underneath the context menu. Old behavior cascaded:
+    // right-click inside a popover → Esc → ctx menu closed AND
+    // popover closed, even though the user only meant to dismiss
+    // the ctx menu.
+    if (e.key === "Escape") {
+      e.stopPropagation();
+      closeContextMenu();
+    }
   }
 
   // ─── Log right-click menu (Copy / Copy all / Clear / Save to file) ──
@@ -5622,15 +6195,28 @@
   function initDragDropUrl() {
     const panel = document.getElementById("panel-download");
     if (!panel) return;
+    // audit D-25: drag-counter pattern so hover state doesn't flicker
+    // or get stuck. dragleave fires on EVERY child element during the
+    // drag — a bare add/remove on dragover/dragleave races itself and
+    // leaves the hover class hanging when the user drops mid-hover.
+    // Increment on dragenter, decrement on dragleave, only remove at 0.
+    let _dragDepth = 0;
+    panel.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      _dragDepth++;
+      panel.classList.add("drag-hover");
+    });
     panel.addEventListener("dragover", (e) => {
       e.preventDefault();
       panel.classList.add("drag-hover");
     });
     panel.addEventListener("dragleave", () => {
-      panel.classList.remove("drag-hover");
+      _dragDepth = Math.max(0, _dragDepth - 1);
+      if (_dragDepth === 0) panel.classList.remove("drag-hover");
     });
     panel.addEventListener("drop", async (e) => {
       e.preventDefault();
+      _dragDepth = 0;
       panel.classList.remove("drag-hover");
       // Prefer URL (from address bar drag); fall back to text
       const url = e.dataTransfer.getData("text/uri-list") ||
@@ -5644,7 +6230,13 @@
       const input = document.querySelector("#panel-download .ctl-input");
       if (input) input.value = trimmed;
       if (window.pywebview?.api?.archive_single_video) {
-        await window.pywebview.api.archive_single_video(trimmed);
+        // audit D-26: pass the same readVideoOptions() dict the URL-
+        // submit flow does, so dropped URLs honor the user's
+        // resolution / save-to / custom-name fields instead of
+        // silently using backend defaults.
+        const opts = (typeof readVideoOptions === "function")
+            ? readVideoOptions() : {};
+        await window.pywebview.api.archive_single_video(trimmed, opts);
         window._showToast?.("Queued: " + trimmed.slice(0, 60), "ok");
       }
     });
@@ -5664,11 +6256,27 @@
         if (window.pywebview?.api?.window_quit) window.pywebview.api.window_quit();
         return;
       }
-      // Ctrl+F: focus Browse > Search input (if on Browse)
+      // Ctrl+F: focus Browse > Search input.
+      // audit E-53: if Search view isn't currently visible, SWITCH to
+      // it + focus. Old behavior silently no-opped when Search view
+      // was hidden (no preventDefault, no action), so the user's
+      // Ctrl+F press did nothing most of the time.
       if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+        e.preventDefault();
         const searchInput = document.getElementById("search-query");
-        if (searchInput && document.getElementById("view-search").style.display !== "none") {
-          e.preventDefault();
+        const browseTab = document.querySelector('.tab[data-tab="browse"]');
+        const viewSearch = document.getElementById("view-search");
+        if (viewSearch && viewSearch.style.display === "none") {
+          // Switch to Browse tab, then into Search submode if the
+          // submode toggle exists. Focus after a tick so the layout
+          // settles and the input is ready to receive focus.
+          browseTab?.click();
+          document.querySelector('[data-browse-sub="search"]')?.click();
+          setTimeout(() => {
+            const si = document.getElementById("search-query");
+            if (si) { si.focus(); si.select(); }
+          }, 80);
+        } else if (searchInput) {
           searchInput.focus();
           searchInput.select();
         }
@@ -5708,11 +6316,17 @@
         document.getElementById("btn-sync-subbed")?.click();
         return;
       }
-      // Ctrl+K: jump to Subs tab + focus filter
+      // Ctrl+K: jump to Subs tab + focus filter.
+      // audit E-54: actually focus the filter input after clicking
+      // the tab. Old behavior only switched tabs — the comment said
+      // "jump to Subs + focus filter" but the focus step was missing.
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
         e.preventDefault();
-        const tabs = document.querySelectorAll(".tab");
-        tabs[1]?.click();
+        document.querySelector('.tab[data-tab="subs"]')?.click();
+        setTimeout(() => {
+          const f = document.getElementById("subs-filter");
+          if (f) { f.focus(); f.select?.(); }
+        }, 60);
         return;
       }
       // Ctrl+P: open Sync Tasks popover
@@ -5832,7 +6446,10 @@
     // sticks across videos and sessions.
     const _SPEED_KEY = "ytarch.watchSpeed";
     try {
-      const saved = parseFloat(localStorage.getItem(_SPEED_KEY) || "1") || 1;
+      // audit F-10: use Number.isFinite so a stored "0" (or any
+      // other falsy-but-valid number) isn't coerced back to 1.
+      const _raw = parseFloat(localStorage.getItem(_SPEED_KEY) || "1");
+      const saved = Number.isFinite(_raw) && _raw > 0 ? _raw : 1;
       if (speedSel) {
         // Only assign if the saved value exists as an <option>.
         if ([...speedSel.options].some(o => parseFloat(o.value) === saved)) {
@@ -5844,7 +6461,9 @@
     // Apply persisted speed every time a new video source loads.
     vEl?.addEventListener("loadedmetadata", () => {
       try {
-        const v = parseFloat(localStorage.getItem(_SPEED_KEY) || "1") || 1;
+        // audit F-10: same Number.isFinite guard as above.
+        const _vRaw = parseFloat(localStorage.getItem(_SPEED_KEY) || "1");
+        const v = Number.isFinite(_vRaw) && _vRaw > 0 ? _vRaw : 1;
         vEl.playbackRate = v;
       } catch {}
     });
@@ -5859,7 +6478,13 @@
       const watchVisible = document.getElementById("view-watch")
         && document.getElementById("view-watch").style.display !== "none";
       if (!watchVisible || !vEl) return;
-      const editing = e.target.tagName === "INPUT" || e.target.isContentEditable;
+      // audit D-29: include TEXTAREA so typing in a bookmark-note
+      // textarea doesn't trigger Space/Arrow/B/M video shortcuts
+      // (typing a space paused the video; arrow keys jumped
+      // playback instead of moving the cursor).
+      const _tag = e.target.tagName;
+      const editing = _tag === "INPUT" || _tag === "TEXTAREA"
+                      || e.target.isContentEditable;
       if (editing) return;
       if (e.key === " " || e.code === "Space") {
         e.preventDefault();
@@ -6774,11 +7399,17 @@
         html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.average_gb)}${_diffPct(t.current_gb, t.average_gb)}</td>`;
         html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.below_gb)}${_diffPct(t.current_gb, t.below_gb)}</td>`;
         html += `</tr>`;
+        // audit D-28: null-safe numeric reads. A single malformed
+        // channel row (e.g. missing videos/hours) used to TypeError
+        // on toLocaleString and kill the whole table render, leaving
+        // the modal blank. Coercing to 0 keeps the dialog usable
+        // even when the backend returns a partial row.
         for (const c of (data.channels || [])) {
+          const _n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
           html += `<tr>`;
-          html += `<td style="padding:2px 6px;">${escapeHtml(c.name)}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${c.videos.toLocaleString()}</td>`;
-          html += `<td style="padding:2px 6px;text-align:right;">${c.hours.toLocaleString()}</td>`;
+          html += `<td style="padding:2px 6px;">${escapeHtml(c.name || "(unknown)")}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_n(c.videos).toLocaleString()}</td>`;
+          html += `<td style="padding:2px 6px;text-align:right;">${_n(c.hours).toLocaleString()}</td>`;
           html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.current_gb)}</td>`;
           html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.generous_gb)}</td>`;
           html += `<td style="padding:2px 6px;text-align:right;">${_fmt(c.average_gb)}</td>`;
@@ -6810,6 +7441,250 @@
       };
       btn.addEventListener("click", _open);
       recalcBtn?.addEventListener("click", _open);
+      closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
+      bd.addEventListener("click", (e) => {
+        if (e.target === bd) bd.style.display = "none";
+      });
+    })();
+
+    // feature H-2: transcript drift scan + fix modal. Opens with a
+    // channel dropdown populated from get_subs_channels; Scan returns
+    // the three drift categories; Fix applies all three (reconstruct
+    // .txt from .jsonl, queue Whisper for .txt-only entries, rebuild
+    // FTS if phantoms). Results render inline; Fix button stays
+    // disabled until a scan with nonzero drift has returned.
+    (function wireDriftScan() {
+      const btn = document.getElementById("btn-drift-scan");
+      const bd = document.getElementById("drift-backdrop");
+      const body = document.getElementById("drift-body");
+      const summary = document.getElementById("drift-summary");
+      const chanSel = document.getElementById("drift-channel");
+      const scanBtn = document.getElementById("drift-scan-btn");
+      const fixBtn = document.getElementById("drift-fix-btn");
+      const closeBtn = document.getElementById("drift-close");
+      if (!btn || !bd || !body || !chanSel || !scanBtn || !fixBtn) return;
+
+      let _lastScan = null;  // { ok, channel, txt_without_jsonl, ... }
+
+      const escapeHtml = window._escapeHtml || ((s) =>
+        String(s).replace(/[&<>"']/g, c => (
+          {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
+
+      const _loadChannels = async () => {
+        try {
+          const api = window.pywebview?.api;
+          const list = await api?.get_subs_channels?.();
+          const channels = Array.isArray(list) ? list : (list?.channels || []);
+          chanSel.innerHTML = "";
+          // Sort alphabetically by name for picker sanity.
+          const sorted = [...channels].sort((a, b) =>
+            (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
+          for (const ch of sorted) {
+            const opt = document.createElement("option");
+            opt.value = JSON.stringify({ name: ch.name || "",
+                                          folder: ch.folder || "" });
+            opt.textContent = ch.name || ch.folder || "(unnamed)";
+            chanSel.appendChild(opt);
+          }
+          if (!sorted.length) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "(no channels)";
+            opt.disabled = true;
+            chanSel.appendChild(opt);
+          }
+        } catch (e) {
+          console.warn("drift: failed to load channels", e);
+        }
+      };
+
+      const _renderScan = (data) => {
+        _lastScan = data;
+        fixBtn.disabled = true;
+        if (!data?.ok) {
+          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            + `${escapeHtml(data?.error || "Scan failed.")}</div>`;
+          if (summary) summary.textContent = "";
+          return;
+        }
+        const txtOrphans = data.txt_without_jsonl || [];
+        const jsonlOrphans = data.jsonl_without_txt || [];
+        const phantoms = data.fts_phantoms || 0;
+        const totals = data.totals || {};
+        const totalDrift = txtOrphans.length + jsonlOrphans.length + (phantoms > 0 ? 1 : 0);
+
+        if (summary) {
+          summary.textContent =
+            `${(totals.txt_titles || 0).toLocaleString()} .txt · `
+            + `${(totals.jsonl_titles || 0).toLocaleString()} .jsonl entries scanned`;
+        }
+
+        let html = "";
+        // Summary bar — green if no drift, red/orange if any found.
+        const okColor = totalDrift === 0 ? "#7acf8a" : "#e8a34e";
+        html += `<div style="padding:8px 10px;border-left:3px solid ${okColor};`
+          + `background:rgba(255,255,255,0.03);margin-bottom:12px;">`;
+        if (totalDrift === 0) {
+          html += `<strong style="color:${okColor};">No drift found.</strong> `
+            + `All .txt / .jsonl / FTS entries are consistent.`;
+        } else {
+          html += `<strong style="color:${okColor};">Drift detected:</strong> `
+            + `${txtOrphans.length} .txt-only · ${jsonlOrphans.length} .jsonl-only`
+            + (phantoms > 0 ? ` · ${phantoms.toLocaleString()} FTS phantoms (global)` : "");
+        }
+        html += `</div>`;
+
+        // Category A: TXT without JSONL
+        html += `<div style="margin-bottom:12px;">`;
+        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+          + `A. In .txt but missing from .jsonl (${txtOrphans.length})</div>`;
+        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+          + `Fix: queue Whisper retranscribe to rebuild both sides. `
+          + `Entries whose video file can't be located in the index are skipped.</div>`;
+        if (!txtOrphans.length) {
+          html += `<div class="edit-dim" style="padding:4px 8px;">—</div>`;
+        } else {
+          html += `<ul style="margin:0;padding-left:18px;">`;
+          for (const o of txtOrphans.slice(0, 50)) {
+            html += `<li style="margin:2px 0;"><span style="color:#d8d8d8;">`
+              + `${escapeHtml(o.title)}</span>`;
+            if (o.src_tag) html += ` <span class="edit-dim">(${escapeHtml(o.src_tag)})</span>`;
+            html += `</li>`;
+          }
+          if (txtOrphans.length > 50) {
+            html += `<li class="edit-dim">… and ${txtOrphans.length - 50} more</li>`;
+          }
+          html += `</ul>`;
+        }
+        html += `</div>`;
+
+        // Category B: JSONL without TXT
+        html += `<div style="margin-bottom:12px;">`;
+        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+          + `B. In .jsonl but missing from .txt (${jsonlOrphans.length})</div>`;
+        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+          + `Fix: reconstruct .txt entry from .jsonl segments. Date from `
+          + `.jsonl mtime; source tag = "RECOVERED-FROM-JSONL".</div>`;
+        if (!jsonlOrphans.length) {
+          html += `<div class="edit-dim" style="padding:4px 8px;">—</div>`;
+        } else {
+          html += `<ul style="margin:0;padding-left:18px;">`;
+          for (const o of jsonlOrphans.slice(0, 50)) {
+            html += `<li style="margin:2px 0;"><span style="color:#d8d8d8;">`
+              + `${escapeHtml(o.title)}</span></li>`;
+          }
+          if (jsonlOrphans.length > 50) {
+            html += `<li class="edit-dim">… and ${jsonlOrphans.length - 50} more</li>`;
+          }
+          html += `</ul>`;
+        }
+        html += `</div>`;
+
+        // Category C: FTS phantoms (global)
+        html += `<div style="margin-bottom:4px;">`;
+        html += `<div style="font-weight:bold;margin-bottom:4px;">`
+          + `C. FTS5 phantom rows (${phantoms.toLocaleString()})</div>`;
+        html += `<div class="edit-dim" style="font-size:11px;margin-bottom:6px;">`
+          + `Fix: rebuild FTS5 index (idempotent; clears orphan rowids `
+          + `from re-ingested transcripts — audit bug C-9). Counted globally; `
+          + `fix is global.</div>`;
+        html += `</div>`;
+
+        body.innerHTML = html;
+        fixBtn.disabled = (totalDrift === 0);
+      };
+
+      const _scan = async () => {
+        const raw = chanSel.value;
+        if (!raw) {
+          _renderScan({ ok: false, error: "Pick a channel first." });
+          return;
+        }
+        let identity;
+        try { identity = JSON.parse(raw); }
+        catch { identity = { name: raw }; }
+        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Scanning…</div>`;
+        if (summary) summary.textContent = "";
+        fixBtn.disabled = true;
+        try {
+          const api = window.pywebview?.api;
+          if (!api?.drift_scan_channel) {
+            _renderScan({ ok: false, error: "Native mode required." });
+            return;
+          }
+          const res = await api.drift_scan_channel(identity);
+          _renderScan(res);
+        } catch (e) {
+          _renderScan({ ok: false, error: String(e) });
+        }
+      };
+
+      const _fix = async () => {
+        if (!_lastScan?.ok) return;
+        const raw = chanSel.value;
+        let identity;
+        try { identity = JSON.parse(raw); }
+        catch { identity = { name: raw }; }
+        const txtCount = (_lastScan.txt_without_jsonl || []).length;
+        const jsonlCount = (_lastScan.jsonl_without_txt || []).length;
+        const phantoms = _lastScan.fts_phantoms || 0;
+        // Confirm before queueing potentially many Whisper jobs.
+        if (txtCount > 0 && window.askDanger) {
+          const ok = await window.askDanger(
+            "Fix transcript drift?",
+            `This will queue ${txtCount} Whisper retranscribe job(s), `
+              + `rebuild ${jsonlCount} .txt entries from .jsonl, and `
+              + (phantoms > 0 ? `rebuild the FTS index. ` : ``)
+              + `Proceed?`,
+            "Fix all");
+          if (!ok) return;
+        }
+        fixBtn.disabled = true;
+        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Applying fixes…</div>`;
+        try {
+          const api = window.pywebview?.api;
+          const res = await api.drift_apply_channel(identity);
+          if (!res?.ok) {
+            body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+              + `${escapeHtml(res?.error || "Fix failed.")}</div>`;
+            return;
+          }
+          const a = res.actions || {};
+          const parts = [];
+          if (a.txt_reconstructed) parts.push(`${a.txt_reconstructed} .txt rebuilt`);
+          if (a.retranscribe_queued) parts.push(`${a.retranscribe_queued} queued for Whisper`);
+          if (a.retranscribe_skipped) parts.push(`${a.retranscribe_skipped} skipped (video file missing)`);
+          if (a.fts_rebuilt) parts.push("FTS rebuilt");
+          if (!parts.length) parts.push("no actions taken");
+          body.innerHTML = `<div style="padding:12px;border-left:3px solid #7acf8a;`
+            + `background:rgba(122,207,138,0.08);">`
+            + `<strong style="color:#7acf8a;">Done.</strong> `
+            + `${parts.map(escapeHtml).join(" · ")}.`
+            + `</div>`
+            + `<div class="edit-dim" style="padding:8px 4px 0;font-size:11px;">`
+            + `Click Scan again to refresh the report.`
+            + `</div>`;
+          window._showToast?.(`Drift fix applied: ${parts.join(" · ")}.`, "ok");
+        } catch (e) {
+          body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+            + `${escapeHtml(String(e))}</div>`;
+        }
+      };
+
+      const _open = async () => {
+        bd.style.display = "flex";
+        body.innerHTML = `<div class="browse-empty" style="padding:16px;">Loading channels…</div>`;
+        if (summary) summary.textContent = "";
+        fixBtn.disabled = true;
+        _lastScan = null;
+        await _loadChannels();
+        body.innerHTML = `<div class="browse-empty" style="padding:16px;">`
+          + `Pick a channel and click Scan.</div>`;
+      };
+
+      btn.addEventListener("click", _open);
+      scanBtn.addEventListener("click", _scan);
+      fixBtn.addEventListener("click", _fix);
       closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
       bd.addEventListener("click", (e) => {
         if (e.target === bd) bd.style.display = "none";
@@ -6867,7 +7742,13 @@
       const res = await window.pywebview?.api?.channels_import?.();
       if (res?.ok) {
         window._showToast?.(`Added ${res.added} channels (${res.skipped} skipped).`, "ok");
-        location.reload();
+        // audit D-32: refresh the Subs table in place instead of
+        // location.reload(). Reloading during an active sync
+        // destroyed the in-flight Whisper progress UI, wiped log
+        // state, and lost any unsaved Settings field edits. Refresh
+        // helpers keep everything else intact.
+        try { window.refreshSubsTable?.(); } catch {}
+        try { window._primeBrowse?.(); } catch {}
       } else if (!res?.cancelled) {
         window._showToast?.(res?.error || "Import failed.", "error");
       }
@@ -6950,8 +7831,12 @@
     if (!bd) return;
 
     async function run() {
+      // audit F-39: early bail if rowsEl is missing (DOM out of sync
+      // during hot reload, partial render, etc). Old code hit a
+      // TypeError on rowsEl.innerHTML and the dialog never opened.
+      if (!rowsEl) return;
       rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Running self-check\u2026</div>';
-      summaryEl.textContent = "";
+      if (summaryEl) summaryEl.textContent = "";
       const api = window.pywebview?.api;
       if (!api?.diagnostics_run) {
         rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Native mode required.</div>';
@@ -7405,17 +8290,25 @@
     const missing = (res && res.missing) || [];
     if (!missing.length) return;
     for (const ch of missing) {
-      const choice = await askChoice?.(
-        `"${ch.name}" — folder missing`,
-        `This channel is subscribed but its folder is gone:\n\n` +
-        ` ${ch.expected}\n\n` +
-        "Locate the folder if you moved it, Remove the subscription if it's " +
-        "no longer needed, or Skip to decide later.",
-        [
+      // audit D-21: askChoice takes a SINGLE opts object, not three
+      // positional args. The old call was passing (title, message,
+      // choices) which askChoice interpreted as opts=title (a string),
+      // ignoring the other two args — the dialog rendered with no
+      // buttons and the user couldn't Locate / Remove / Skip. Now
+      // passed as a proper opts object.
+      const choice = await askChoice?.({
+        title: `"${ch.name}" — folder missing`,
+        message:
+          `This channel is subscribed but its folder is gone:\n\n` +
+          ` ${ch.expected}\n\n` +
+          "Locate the folder if you moved it, Remove the subscription if it's " +
+          "no longer needed, or Skip to decide later.",
+        choices: [
           { label: "Locate\u2026", value: "locate", kind: "primary" },
           { label: "Remove", value: "remove", kind: "danger" },
           { label: "Skip", value: "skip", kind: "ghost" },
-        ]);
+        ],
+      });
       if (choice === "locate") {
         const pick = await api.subs_browse_for_channel_folder?.(ch.name);
         if (pick?.ok && pick.folder_name) {
@@ -7589,6 +8482,7 @@
     try { initScanArchive(); } catch(e){console.error("initScanArchive:",e);}
     try { initIndexControls(); } catch(e){console.error("initIndexControls:",e);}
     try { initSettingsArchiveRoots(); } catch(e){console.error("initSettingsArchiveRoots:",e);}
+    try { initMetadataTab(); } catch(e){console.error("initMetadataTab:",e);}
     try { initSettingsSubTabs(); } catch(e){console.error("initSettingsSubTabs:",e);}
     try { initQueueAutoCheckboxes(); } catch(e){console.error("initQueueAutoCheckboxes:",e);}
     try { initRecentFilter(); } catch(e){console.error("initRecentFilter:",e);}

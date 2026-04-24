@@ -143,8 +143,16 @@ def build_format_string(resolution: str) -> str:
     if resolution == "best":
         return base
 
-    # Adjacent-resolution fallbacks
-    res_int = int(resolution)
+    # Adjacent-resolution fallbacks.
+    # audit E-6: wrap the int() in a try/except so a corrupted config
+    # value (e.g. "720p" instead of "720") doesn't kill the sync pass
+    # with a cryptic traceback. Fall back to "best" so the sync still
+    # completes (with a wider format range than intended, but no data
+    # loss).
+    try:
+        res_int = int(resolution)
+    except (ValueError, TypeError):
+        return base + "/best"
     res_above = None
     res_below = None
     _num_opts = [r for r in RESOLUTION_OPTIONS if r.isdigit()]
@@ -456,6 +464,13 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         stream.emit([["ERROR: ", "red"],
                      [f"Cannot write to {ch_dir} \u2014 disk may be full, read-only, or disconnected.\n", "red"]])
         return SyncResult(ok=False, reason="write blocked", downloaded=0, errors=0)
+    # audit F-20: 2-tier disk space check. Hard-fail under 100MB
+    # (smaller than a typical 720p 10-minute video — downloads WILL
+    # fail mid-stream and leave partial files). Soft-warn under 500MB.
+    if not check_disk_space(str(ch_dir), 100 * 1024 * 1024):
+        stream.emit([["ERROR: ", "red"],
+                     [f"Less than 100 MB free at {ch_dir} \u2014 refusing to start download.\n", "red"]])
+        return SyncResult(ok=False, reason="disk_low", downloaded=0, errors=0)
     if not check_disk_space(str(ch_dir), 500 * 1024 * 1024):
         stream.emit([["\u26a0 ", "red"],
                      [f"Less than 500 MB free at {ch_dir} \u2014 downloads may fail mid-stream.\n", "red"]])
@@ -584,6 +599,10 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # Counters that must persist across the /videos + /streams passes.
     downloaded = 0
     errors = 0
+    # audit E-4: count archived-skip hits (--break-on-existing line)
+    # so SyncResult can report a real `total` = downloaded + skipped.
+    # Used by the batch-cooldown heuristic in sync_all().
+    _archived_skipped = 0
     current_title = ""
     dest_path = ""
     # Path captured from `[Merger] Merging formats into "PATH"` — this is
@@ -1007,7 +1026,8 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             stream.emit_dim(
                                 f" (index register failed for {t!r}: {_re})")
                         try:
-                            _record_recent_download(final_path, name, t, vid)
+                            _record_recent_download(final_path, name, t, vid,
+                                                    upload_date=(ud or "").strip())
                         except Exception as _re2:
                             # bug S-2: Recent tab goes stale silently
                             # on any cache write failure without this.
@@ -1145,6 +1165,13 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # yt-dlp to stop the walk logs this line. Pure noise for
             # the user — filter it as dim so Simple mode hides it.
             if "has already been recorded in the archive" in s:
+                # audit E-4: count archived-skip lines toward the
+                # total-walked tally so the batch-cooldown heuristic
+                # (`_should_batch_limit(ch, total)`) has a real number
+                # to compare against. Before this, `total` was never
+                # populated and large channels never tripped the
+                # cooldown.
+                _archived_skipped += 1
                 stream.emit([[" ", "dim"], [f"{s[:140]}\n", "dim"]])
                 continue
 
@@ -1262,6 +1289,17 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                 if _ls.line_looks_live(s):
                     id_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
                     vid = id_m.group(1) if id_m else ""
+                    # audit F-22: if the line didn't carry a visible
+                    # video_id (age-gated streams hit 403 BEFORE the id
+                    # appears in yt-dlp output), try extracting from
+                    # the URL form `/watch?v=<id>` that yt-dlp usually
+                    # prints alongside. Last-resort fallback catches
+                    # the case the regex missed.
+                    if not vid:
+                        url_m = re.search(r"(?:watch\?v=|youtu\.be/|shorts/)"
+                                          r"([A-Za-z0-9_-]{11})", s)
+                        if url_m:
+                            vid = url_m.group(1)
                     # bug L-3: if the regex misses, nothing gets written
                     # to the deferred journal AND the next sync re-
                     # detects + re-logs the same stream forever. Emit a
@@ -1312,13 +1350,26 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             except Exception:
                 pass
 
-            # Error lines
+            # Error lines.
+            # audit F-21: require the error/warning tokens to appear
+            # with a trailing colon or bracket, so a video whose
+            # literal title contains the word "error" (or "warning")
+            # doesn't falsely bump the error counter on its DLTRACK
+            # line. yt-dlp's own error format is "ERROR: ..." (or
+            # "WARNING: ..."), which the stricter regex matches.
             low = s.lower()
-            if "error" in low or "warning" in low:
+            if (re.search(r"\berror[\s:\]\[]", low)
+                    or re.search(r"\bwarning[\s:\]\[]", low)):
                 # Benign non-errors that yt-dlp prints as ERROR lines.
                 # bug L-4: extended the allowlist so the error counter
                 # doesn't inflate on these "noise" lines. Counter
                 # remains accurate for real failures.
+                # audit D-4: private / deleted / terminated videos
+                # aren't errors — they're content that YouTube
+                # no-longer-serves. Without classifying them as benign,
+                # the error counter inflates on channels with any
+                # removed-over-time content ("sync had 47 errors!"
+                # when actually the channel was fine).
                 _BENIGN_FRAGMENTS = (
                     "does not have a streams tab",
                     "does not have a shorts tab",
@@ -1328,6 +1379,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     "unable to extract uploader",  # yt-dlp warns when uploader is blank
                     "unable to extract n function",  # transient yt-dlp version issue
                     "precondition check failed",  # known-transient signed-url hiccup
+                    "private video",  # expected: uploader made video private
+                    "video unavailable",  # deleted or region-locked
+                    "has been terminated",  # creator account terminated
+                    "removed by the uploader",  # creator deleted this video
+                    "removed by the user",
+                    "this video is not available",
                 )
                 if any(frag in low for frag in _BENIGN_FRAGMENTS):
                     stream.emit([[f" {s}\n", "dim"]])
@@ -1507,13 +1564,36 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             # playlist, auth failure) — stamping initialized there locks
             # the channel into fast-path forever even though it was
             # never actually bootstrapped.
-            _walked_meaningfully = (downloaded > 0) or (int(errors or 0) > 0)
+            # audit D-5: only stamp initialized when downloaded > 0.
+            # Treating errors as "walked meaningfully" was wrong —
+            # a first sync that cookies-expired or got blanket-
+            # --match-filter'd has errors > 0 but zero real walk, and
+            # marking it initialized locks the channel into fast-path
+            # forever (--break-on-existing stops the walk at the first
+            # archive hit). Real first-sync success needs an actual
+            # download.
+            _walked_meaningfully = (downloaded > 0)
+            _meta_did_fetch = int(_meta_counts.get("fetched", 0) or 0) > 0
+            _now_ts = time.time()
+            # audit D-2: update last_sync on every SUCCESSFUL pass, not
+            # just ones with new downloads. A channel with 0 new videos
+            # is still being checked — last_sync going stale-for-months
+            # made users think their channel wasn't syncing when it
+            # was. No new downloads doesn't mean no activity.
             for c in cfg2.get("channels", []):
                 if c.get("url", "").strip() != url:
                     continue
-                if downloaded > 0:
-                    c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
-                    _dirty = True
+                # Capture the pre-update `initialized` state so we can
+                # tell whether this pass is a bootstrap (first-ever
+                # sync of a brand-new channel, EVERY video freshly
+                # fetched → timestamps truly mean "all metadata is
+                # current") versus an incremental sync (thousands of
+                # stale entries + a handful of fresh ones → stamping
+                # "refreshed just now" would be a lie).
+                _was_bootstrap_pass = (not c.get("initialized", False)
+                                       and _walked_meaningfully)
+                c["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
+                _dirty = True
                 if _walked_meaningfully:
                     if not c.get("initialized", False):
                         c["initialized"] = True
@@ -1521,6 +1601,18 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     if not c.get("sync_complete", False):
                         c["sync_complete"] = True
                         _dirty = True
+                # Only stamp the channel-level refresh timestamps on a
+                # bootstrap pass. For incremental syncs (4 new videos
+                # out of 1000), 996 entries still hold older fetched_at
+                # stamps — stamping "just now" would misrepresent the
+                # freshness of the bulk of the channel's data. Design
+                # intent: the column should say "today" for a brand-
+                # new channel add, NOT for a small trickle-in on an
+                # existing channel.
+                if _meta_did_fetch and _was_bootstrap_pass:
+                    c["last_views_refresh_ts"] = _now_ts
+                    c["last_comments_refresh_ts"] = _now_ts
+                    _dirty = True
                 break
             if downloaded > 0:
                 cfg2["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
@@ -1564,8 +1656,16 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # we already consumed + emitted, but harmless if it does).
     clear_sync_active(name)
 
-    return SyncResult(ok=True, downloaded=downloaded, errors=errors,
-                      took=took, exit=proc.returncode)
+    # audit D-3: ok is now True only when yt-dlp exited with a
+    # recognized code (0 = clean, 1 = "some entries failed" which
+    # we've already accounted for in the errors counter). Any other
+    # return code means yt-dlp crashed mid-walk; callers can surface
+    # the failure instead of reporting "no new videos" on a channel
+    # that actually had more content to grab.
+    _ok = proc.returncode in (0, 1)
+    return SyncResult(ok=_ok, downloaded=downloaded, errors=errors,
+                      took=took, exit=proc.returncode,
+                      total=downloaded + _archived_skipped)
 
 
 # ── TuneShine sync-progress JSON ────────────────────────────────────────
@@ -1719,7 +1819,15 @@ def _resolve_final_mp4(dest_path: str) -> Optional[str]:
         elif last.lower() in ("en", "en-orig", "en-us", "en-gb",
                                "en-uk", "es", "fr", "de", "pt", "it"):
             stem = ".".join(parts[:-1])
-    final = p.parent / f"{stem}.mp4"
+    # audit F-18: preserve the ORIGINAL container extension when it was
+    # already a known video format. Hardcoding .mp4 broke DLTRACK path
+    # resolution when yt-dlp merged to .mkv / .webm (happens when the
+    # selected codec combo can't mux into mp4). Recent tab / Browse
+    # grid would then point at a non-existent .mp4 and fall back to
+    # scan-recent which may pick up the wrong file.
+    _video_container_exts = (".mp4", ".mkv", ".webm")
+    _target_ext = ext if ext in _video_container_exts else ".mp4"
+    final = p.parent / f"{stem}{_target_ext}"
     # Return regardless of existence — file may still be writing when we enqueue
     return str(final)
 
@@ -2163,7 +2271,8 @@ def pop_pending_dwnld_row(channel_name: str,
 
 
 def _record_recent_download(filepath: str, channel: str, title: str,
-                             video_id: str = "") -> None:
+                             video_id: str = "",
+                             upload_date: str = "") -> None:
     """Push a fresh entry onto config['recent_downloads'] (newest first).
 
     Keeps the list capped at 500 entries. Silently no-ops when the write
@@ -2213,13 +2322,23 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         except Exception:
             pass
 
-        # Upload date = file mtime (yt-dlp --mtime). Format: YYYYMMDD.
+        # audit E-5: prefer yt-dlp's emitted upload_date (from DLTRACK)
+        # over file mtime. On some Windows network drives + Z: drivepool
+        # setups, --mtime silently fails to set mtime on the new file,
+        # leaving mtime=download-time. Old code wrote "today" as the
+        # upload date in that case; now we use the authoritative
+        # YYYYMMDD value yt-dlp already knows and only fall back to
+        # mtime if it wasn't provided.
         date_str = ""
-        try:
-            from datetime import datetime as _dt
-            date_str = _dt.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y%m%d")
-        except OSError:
-            pass
+        _ud = (upload_date or "").strip()
+        if len(_ud) == 8 and _ud.isdigit():
+            date_str = _ud
+        else:
+            try:
+                from datetime import datetime as _dt
+                date_str = _dt.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y%m%d")
+            except OSError:
+                pass
 
         cfg = load_config()
         entries = list(cfg.get("recent_downloads", []) or [])
@@ -2410,22 +2529,62 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     # the queue only for popover visibility; counting them in "Sync
     # pass starting (N channels)" would over-report.
     try:
-        _starting_total = sum(
-            1 for c in queues.sync
+        _queue_snapshot = [
+            c for c in (queues.sync if queues is not None else [])
             if (c.get("kind") or "download").lower() != "redownload"
-        ) if queues is not None else len(channels)
+        ]
+        _starting_total = len(_queue_snapshot) if queues is not None else len(channels)
     except Exception:
+        _queue_snapshot = []
         _starting_total = len(channels)
+
+    # Label the banner with the actual action the queue represents
+    # instead of the generic "Sync pass". A queue of views-refresh items
+    # now says "Views/likes refresh starting" so the user isn't
+    # second-guessing what the pass is doing. Mixed kinds fall back to
+    # "Sync pass".
+    def _pass_label(items):
+        if not items:
+            return "Sync pass"
+        kinds = {(c.get("kind") or "download").lower() for c in items}
+        if kinds == {"download"}:
+            return "Sync pass"
+        if kinds == {"metadata_comments"}:
+            return "Comments refresh"
+        if kinds == {"videoid_backfill"}:
+            return "Video ID backfill"
+        if kinds == {"metadata"}:
+            # All refresh=True → views/likes refresh; all refresh=False →
+            # metadata download; mixed → generic metadata pass.
+            refreshes = {bool(c.get("refresh")) for c in items}
+            if refreshes == {True}:
+                return "Views/likes refresh"
+            if refreshes == {False}:
+                return "Metadata download"
+            return "Metadata pass"
+        return "Sync pass"  # mixed kinds
+
+    _label = _pass_label(_queue_snapshot if queues is not None else channels)
     if _resume_mode:
-        stream.emit([["=== Resuming sync pass ", "header"],
+        stream.emit([[f"=== Resuming {_label.lower()} ", "header"],
                      [f"({_starting_total} channels remaining) ===\n", "header"]])
     else:
-        stream.emit([["=== Sync pass starting ", "header"],
+        stream.emit([[f"=== {_label} starting ", "header"],
                      [f"({_starting_total} channels) ===\n", "header"]])
 
     sum_dl = 0
     sum_err = 0
     skipped = 0
+    # Per-kind accumulators so the Pass-complete line can say the
+    # verb that actually happened — "X refreshed" for a views/likes
+    # pass, "X comments refreshed" for a comments pass, "X IDs
+    # backfilled" for a video_id backfill, etc. Before, only sum_dl
+    # / sum_err tracked anything, so a refresh pass always read as
+    # "0 downloaded" even when 900 videos had their counts updated.
+    sum_meta_refreshed = 0    # bulk_refresh_views_likes `refreshed`
+    sum_meta_fetched = 0      # new metadata entries (first-time fetch)
+    sum_comments_refreshed = 0
+    sum_ids_backfilled = 0
     t_start = time.time()
 
     # Load the global download-archive ONCE into a set for O(1) membership
@@ -2598,10 +2757,16 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         if _ch_kind == "metadata":
             try:
                 from . import metadata as _meta
+                # feature H-14: year-scoped metadata tasks carry a
+                # `scope: {"year": N}` set by
+                # Api.metadata_queue_channel_year so the backend filters
+                # on-disk videos to that year before processing. None
+                # for whole-channel tasks (existing behavior unchanged).
                 _res = _meta.fetch_channel_metadata(
                     ch, stream, cancel_event,
                     refresh=bool(ch.get("refresh")),
-                    pause_event=pause_event)
+                    pause_event=pause_event,
+                    scope=ch.get("scope"))
                 # Detect pause-interrupted metadata walk — same
                 # re-enqueue-at-front treatment as downloads.
                 if (pause_event is not None and pause_event.is_set()
@@ -2621,6 +2786,11 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 _fetched = int(_res.get("fetched", 0) or 0)
                 _refreshed = int(_res.get("refreshed", 0) or 0)
                 _errors_meta = int(_res.get("errors", 0) or 0)
+                # Roll into pass-wide accumulators so Pass complete
+                # reports accurate numbers per kind.
+                sum_meta_fetched += _fetched
+                sum_meta_refreshed += _refreshed
+                sum_err += _errors_meta
                 # issue #136 + bug H-4: when the user runs "Refresh
                 # views/likes" (refresh=True), every on-disk video is
                 # re-hit and counts roll into `refreshed`, not
@@ -2647,6 +2817,115 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                summary_tag=_summary_tag)
             except Exception as _me:
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="failed",
+                               name_tag="dim", summary_tag="red")
+            _last_live["name"] = ""
+            continue
+        # Comments-only refresh task. Separate from `metadata` because
+        # comments can only be fetched per-video (no bulk mode) and
+        # users wanted them as a distinct user-triggered action — NOT
+        # bundled into "Refresh views/likes". Task dict may carry
+        # `only_recent_days` to scope to the most-recent uploads.
+        if _ch_kind == "metadata_comments":
+            try:
+                from . import metadata as _meta
+                _res = _meta.refresh_channel_comments(
+                    ch, stream, cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    only_recent_days=ch.get("only_recent_days"))
+                # Honor pause the same way the metadata branch does.
+                if (pause_event is not None and pause_event.is_set()
+                        and queues is not None):
+                    try:
+                        queues.sync.insert(0, ch)
+                        queues._notify()
+                    except Exception:
+                        pass
+                    _sync_row_emit(stream, i, total, ch_name,
+                                   summary="paused",
+                                   name_tag="simpleline",
+                                   summary_tag="simpleline")
+                    _last_live["name"] = ""
+                    _processed -= 1
+                    continue
+                _fetched = int(_res.get("fetched", 0) or 0)
+                _errors_c = int(_res.get("errors", 0) or 0)
+                sum_comments_refreshed += _fetched
+                sum_err += _errors_c
+                _parts = []
+                if _fetched:
+                    _parts.append(f"{_fetched} comments refreshed")
+                if _errors_c:
+                    _parts.append(f"{_errors_c} errors")
+                if not _parts:
+                    _parts.append("no videos in scope")
+                _summary = " \u00b7 ".join(_parts)
+                _summary_tag = ("red" if _errors_c else
+                                "simpleline_pink" if _fetched else "dim")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary=_summary,
+                               name_tag="simpleline",
+                               summary_tag=_summary_tag)
+            except Exception as _ce:
+                stream.emit_error(
+                    f"Comments refresh failed for {ch_name}: {_ce}")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="failed",
+                               name_tag="dim", summary_tag="red")
+            _last_live["name"] = ""
+            continue
+        # Video-id backfill task. One-shot resolution + DB write for
+        # archives migrated from the tkinter-era YTArchiver that have
+        # no [id] bracket in filenames and no .info.json sidecars —
+        # without this, the bulk views/likes refresh path can't match
+        # ANY on-disk file to its YouTube row. Separate from the
+        # views/likes kind because it's deliberately a fast, cheap
+        # prerequisite pass, not an actual metadata refresh.
+        if _ch_kind == "videoid_backfill":
+            try:
+                from . import metadata as _meta
+                _res = _meta.backfill_video_ids(
+                    ch, stream, cancel_event=cancel_event,
+                    pause_event=pause_event)
+                if (pause_event is not None and pause_event.is_set()
+                        and queues is not None):
+                    try:
+                        queues.sync.insert(0, ch)
+                        queues._notify()
+                    except Exception:
+                        pass
+                    _sync_row_emit(stream, i, total, ch_name,
+                                   summary="paused",
+                                   name_tag="simpleline",
+                                   summary_tag="simpleline")
+                    _last_live["name"] = ""
+                    _processed -= 1
+                    continue
+                _resolved = int(_res.get("resolved", 0) or 0)
+                _unresolved = int(_res.get("unresolved", 0) or 0)
+                _already = int(_res.get("already_set", 0) or 0)
+                sum_ids_backfilled += _resolved
+                _parts = []
+                if _resolved:
+                    _parts.append(f"{_resolved} backfilled")
+                if _already:
+                    _parts.append(f"{_already} already had ID")
+                if _unresolved:
+                    _parts.append(f"{_unresolved} unresolved")
+                if not _parts:
+                    _parts.append(_res.get("error") or "nothing to do")
+                _summary = " \u00b7 ".join(_parts)
+                _summary_tag = ("simpleline_pink" if _resolved
+                                else "dim" if not _res.get("error")
+                                else "red")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary=_summary,
+                               name_tag="simpleline",
+                               summary_tag=_summary_tag)
+            except Exception as _be:
+                stream.emit_error(
+                    f"ID backfill failed for {ch_name}: {_be}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
                                name_tag="dim", summary_tag="red")
@@ -2730,11 +3009,60 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             set_batch_cooldown(ch.get("url", ""))
 
     elapsed = time.time() - t_start
-    summary = (f"{sum_dl} downloaded \u00b7 {sum_err} errors" +
-               (f" \u00b7 {skipped} skipped" if skipped else "") +
-               f" \u00b7 took {_fmt_duration(elapsed)}")
-    stream.emit([["\n=== Pass complete: ", "header"],
-                 [f"{summary} ===\n", "header"]])
+    # Per-kind summary: the action verb on the Pass complete line
+    # now reflects what the pass actually did. Previously it always
+    # said "N downloaded" even for a views/likes refresh where no
+    # download happened — confusing ("why does it say 0 downloaded
+    # when I just refreshed 912 videos?").
+    # Build the Pass complete line with per-segment coloring: the
+    # action verb ("X refreshed" / "X downloaded" / "X comments
+    # refreshed" / "X IDs backfilled") renders GREEN+BOLD so it's
+    # the visual anchor; errors render red when non-zero; skipped +
+    # timing stay in header style.
+    emit_parts: List[List[str]] = [
+        ["=== ", "simplestatus_green"],
+        ["Pass complete: ", "header"],
+    ]
+    _verb_chunks: List[Tuple[str, str]] = []  # (text, tag) pairs for action verbs
+    if sum_dl > 0:
+        _verb_chunks.append((f"{sum_dl} downloaded", "simplestatus_green"))
+    if sum_meta_refreshed > 0:
+        _verb_chunks.append((f"{sum_meta_refreshed} refreshed", "simplestatus_green"))
+    if sum_meta_fetched > 0:
+        _verb_chunks.append((f"{sum_meta_fetched} metadata fetched", "simplestatus_green"))
+    if sum_comments_refreshed > 0:
+        _verb_chunks.append((f"{sum_comments_refreshed} comments refreshed", "simplestatus_green"))
+    if sum_ids_backfilled > 0:
+        _verb_chunks.append((f"{sum_ids_backfilled} IDs backfilled", "simplestatus_green"))
+    if not _verb_chunks:
+        # All counters zero. Pick a sensible 0-verb matching the
+        # pass label so the user sees "something ran" rather than a
+        # blank summary. Dim — nothing to celebrate.
+        if _label == "Views/likes refresh":
+            _verb_chunks.append(("0 refreshed", "dim"))
+        elif _label == "Comments refresh":
+            _verb_chunks.append(("0 comments refreshed", "dim"))
+        elif _label == "Video ID backfill":
+            _verb_chunks.append(("0 IDs backfilled", "dim"))
+        elif _label == "Metadata download":
+            _verb_chunks.append(("0 metadata fetched", "dim"))
+        else:
+            _verb_chunks.append(("0 downloaded", "dim"))
+    # Interleave with separators.
+    for _i, (_txt, _tag) in enumerate(_verb_chunks):
+        if _i > 0:
+            emit_parts.append([" \u00b7 ", "header"])
+        emit_parts.append([_txt, _tag])
+    # Errors: red if non-zero, dim if 0.
+    emit_parts.append([" \u00b7 ", "header"])
+    emit_parts.append([f"{sum_err} errors", "red" if sum_err > 0 else "header"])
+    if skipped:
+        emit_parts.append([" \u00b7 ", "header"])
+        emit_parts.append([f"{skipped} skipped", "header"])
+    emit_parts.append([" \u00b7 ", "header"])
+    emit_parts.append([f"took {_fmt_duration(elapsed)} ", "header"])
+    emit_parts.append(["===\n", "simplestatus_green"])
+    stream.emit(emit_parts)
     # Clean up: drop any remaining queued items (pass may have broken
     # out early on cancel), clear the running-slot, and clear the
     # pass-progress decoration. The popover should return to empty

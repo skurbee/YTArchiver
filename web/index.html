@@ -126,8 +126,8 @@
             <rect x="9" y="3" width="3" height="10" rx="0.5"/>
           </svg>
         </button>
-        <button class="btn btn-ghost" id="btn-clear-menu"
-                title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
+        <!-- Clear-log dropdown moved to Row 3 (next to Auto-sync
+             selection) per 2026-04-23 layout feedback. See below. -->
 
         <div class="spacer"></div>
 
@@ -170,6 +170,13 @@
           <option>24 hr</option>
         </select>
         <span class="status-text autorun-countdown" id="autorun-countdown"></span>
+
+        <!-- Clear-log dropdown — moved here from Row 2 on 2026-04-23
+             per layout feedback. Behavior + id unchanged so all
+             existing JS wiring still finds it. -->
+        <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
+                style="margin-left:8px;"
+                title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
 
         <div class="spacer"></div>
         <!-- Startup status stack — two stacked slots so "Indexing new
@@ -545,6 +552,7 @@
         <div class="settings-subnav-btn" data-settings-view="performance">Performance</div>
         <div class="settings-subnav-btn" data-settings-view="appearance">Appearance</div>
         <div class="settings-subnav-btn" data-settings-view="tools">Tools</div>
+        <div class="settings-subnav-btn" data-settings-view="metadata">Metadata</div>
         <div class="settings-subnav-btn" data-settings-view="index">Index</div>
       </div>
 
@@ -722,6 +730,78 @@
               <button class="btn btn-ghost btn-thin" id="btn-compress-dry-run"
                       title="Project disk savings at each quality tier without compressing anything">Dry-run savings&hellip;</button>
             </div>
+
+            <!-- feature H-2: transcript drift scan + fix. Cross-
+                 references .txt / .jsonl / FTS for a channel and
+                 reports mismatches. Fix rebuilds missing .txt entries
+                 from .jsonl data, queues Whisper retranscribe for
+                 entries that only exist in .txt, and cleans up FTS5
+                 phantom rows (C-9). -->
+            <label class="edit-gl">Transcript drift</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-drift-scan"
+                      title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Metadata — per-channel refresh status + quick actions.
+             Added 2026-04-23 after the bulk views-refresh path landed.
+             Rows show when each channel's views/likes and comments
+             were last refreshed; sort defaults to "oldest first" so
+             stale channels float to the top and are easy to spot. -->
+        <div class="settings-view" id="settings-view-metadata" style="display:none;">
+          <label class="subs-section-label">Metadata</label>
+          <div class="metadata-panel">
+            <div class="metadata-hint">
+              Per-channel metadata refresh status. <b>Views/likes</b>
+              uses the fast bulk path (one yt-dlp call per channel)
+              and only re-fetches videos whose counts actually changed.
+              <b>Comments</b> is slower (per-video yt-dlp calls — no
+              bulk mode exists) so scope it to recent uploads when
+              possible.
+            </div>
+
+            <!-- Bulk row -->
+            <div class="metadata-bulk-row">
+              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-views"
+                      title="Queue a fast views/likes refresh for every subscribed channel">
+                Refresh views/likes &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-refresh-all-comments"
+                      title="Queue a comments refresh for every channel, scoped to the last 30 days">
+                Refresh comments (30d) &mdash; all channels
+              </button>
+              <button class="btn btn-ghost btn-thin" id="btn-md-backfill-all-ids"
+                      title="For every channel missing video_ids, do a one-time flat-playlist + title-match pass to fill them in. Essential for archives migrated from the tkinter-era YTArchiver.">
+                Fix missing video IDs &mdash; all channels
+              </button>
+              <div class="spacer"></div>
+              <button class="btn btn-ghost btn-thin" id="btn-md-reload"
+                      title="Re-query per-channel refresh times">Reload</button>
+            </div>
+
+            <!-- Per-channel table -->
+            <div class="metadata-table-wrap">
+              <table class="metadata-table" id="metadata-table">
+                <thead>
+                  <tr>
+                    <th class="md-col-name" data-sort="name">Channel</th>
+                    <th class="md-col-num" data-sort="videos">Videos</th>
+                    <th class="md-col-ids" data-sort="ids"
+                        title="Checkmark means every on-disk video has a resolvable video_id stored in the index DB (fast views/likes refresh works). Warn/X means a video_id backfill is recommended — click Fix IDs on the row.">Video IDs</th>
+                    <th class="md-col-ts" data-sort="views" data-sort-active
+                        title="Last time views/likes were bulk-refreshed for this channel (or the channel was bootstrapped)">Views</th>
+                    <th class="md-col-ts" data-sort="comments"
+                        title="Last time comments were refreshed for this channel (or the channel was bootstrapped)">Comments</th>
+                    <th class="md-col-act"></th>
+                  </tr>
+                </thead>
+                <tbody id="metadata-tbody">
+                  <tr><td colspan="6" class="md-empty">Loading&hellip;</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
@@ -825,7 +905,11 @@
         <div class="submode-btn" data-submode="graph">Graph</div>
         <div class="submode-btn" data-submode="bookmarks">Bookmarks</div>
         <div class="library-stats">
-          <div><span id="stat-segments">8,173,727</span> segments</div>
+          <!-- audit E-25: placeholder '—' instead of hard-coded
+               "8,173,727". On first paint (before api.browse_stats
+               populates the real number) new users saw a fake count
+               that reflected nothing on their disk. -->
+          <div><span id="stat-segments">—</span> segments</div>
           <div><span id="stat-videos">92,316</span> videos</div>
           <div><span id="stat-channels">100</span> channels</div>
         </div>
@@ -1018,7 +1102,9 @@
                  highlighted hit + 600 after. Up/Down "Load more" expand. -->
             <div class="search-split">
               <div class="search-results" id="search-results">
-                <div class="browse-empty">Enter a query to search <span id="search-stat-segments">8,173,727</span> transcript segments.</div>
+                <!-- audit E-25: same placeholder rationale as the
+                     Browse-header stat. -->
+                <div class="browse-empty">Enter a query to search <span id="search-stat-segments">—</span> transcript segments.</div>
               </div>
               <div class="search-viewer" id="search-viewer">
                 <div class="search-viewer-head">
@@ -1205,19 +1291,21 @@
       <div class="spacer"></div>
       <label class="queue-auto-wrap"><input type="checkbox" id="gpu-auto-checkbox" /><span>Auto</span></label>
     </div>
-    <!-- bug W-11: the JS at app.js:6647 was fully-coded to wire a
-         mid-queue whisper-model swap dropdown, but the <select> element
-         didn't exist. Adding it here lights up the feature — the
-         handler confirms with the user before swapping. -->
-    <div class="gpu-popover-modelswap" style="padding:4px 10px;display:flex;align-items:center;gap:6px;">
-      <label for="gpu-model-swap" class="edit-dim" style="font-size:11px;">Next-job model:</label>
-      <select class="ctl-select" id="gpu-model-swap" style="flex:1;">
-        <option value="tiny">tiny (fastest)</option>
-        <option value="small" selected>small</option>
-        <option value="medium">medium</option>
-        <option value="large-v3">large-v3 (best)</option>
-      </select>
-    </div>
+    <!-- Next-job model selector removed 2026-04-23 — the default
+         whisper model is set in Settings, mid-queue swap is overkill
+         for the popover. Element kept commented for future reference
+         in case the per-job swap feature is resurrected.
+         <div class="gpu-popover-modelswap" style="padding:4px 10px;display:flex;align-items:center;gap:6px;">
+           <label for="gpu-model-swap" class="edit-dim" style="font-size:11px;">Next-job model:</label>
+           <select class="ctl-select" id="gpu-model-swap" style="flex:1;">
+             <option value="tiny">tiny (fastest)</option>
+             <option value="small" selected>small</option>
+             <option value="medium">medium</option>
+             <option value="large-v3">large-v3 (best)</option>
+           </select>
+         </div>
+    -->
+
     <div class="queue-popover-body" id="gpu-tasks-body">
       <div class="queue-empty">No GPU tasks queued.</div>
     </div>
@@ -1280,6 +1368,31 @@
       </div>
       <div class="askq-buttons">
         <button class="btn btn-ghost" id="compress-dry-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Transcript drift scan/fix modal (feature H-2) -->
+  <div class="askq-backdrop" id="drift-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+      <div class="askq-header">
+        <span>Transcript drift &mdash; scan &amp; fix</span>
+        <span class="status-text" id="drift-summary" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" style="padding:10px 16px;">
+        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
+          <label class="edit-gl" style="flex:0 0 auto;">Channel:</label>
+          <select class="ctl-select" id="drift-channel" style="flex:1;max-width:400px;"></select>
+          <button class="btn btn-ghost btn-thin" id="drift-scan-btn">Scan</button>
+        </div>
+        <div id="drift-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
+          <div class="browse-empty" style="padding:16px;">Pick a channel and click Scan.</div>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="drift-fix-btn" disabled
+                title="Apply all three fixes: rebuild missing .txt entries, queue Whisper retranscribe for .txt-only entries, rebuild FTS if phantoms found">Fix all</button>
+        <button class="btn btn-ghost" id="drift-close">Close</button>
       </div>
     </div>
   </div>
@@ -1368,7 +1481,12 @@
 
   <!-- First-launch archive-root picker. Non-dismissable: the user
        MUST choose a folder before the app becomes usable. -->
-  <div id="welcome-modal" class="yt-modal" hidden>
+  <!-- audit E-26: inline style="display:none" alongside the `hidden`
+       attribute so the modal stays hidden regardless of whether the
+       CSS `.yt-modal` rule uses `display: flex` or something that
+       would otherwise override the bare `hidden` attribute. JS that
+       opens the modal sets style.display explicitly. -->
+  <div id="welcome-modal" class="yt-modal" hidden style="display:none;">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body" style="min-width:460px; max-width:560px;">
       <div class="yt-modal-title">Pick an archive folder</div>
@@ -1398,7 +1516,9 @@
   <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
        listens for the `yt-control` event (kind=redownload_sample) and
        fills/shows it. Buttons call api.redownload_sample_confirm(). -->
-  <div id="redwnl-sample-modal" class="yt-modal" hidden>
+  <!-- audit E-26: same inline display:none belt-and-suspenders as
+       welcome-modal above. -->
+  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body">
       <div class="yt-modal-title">Sample Complete</div>

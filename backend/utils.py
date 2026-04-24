@@ -175,6 +175,17 @@ def check_directory_writable(path: str) -> bool:
     try:
         if not os.path.isdir(path):
             return False
+        # audit F-32: clean up any stale probe files from a previous
+        # run (crashed process, antivirus-blocked unlink, etc.) before
+        # writing a new one. Without this, the archive root accumulates
+        # `.yta_probe_<PID>` litter over time.
+        try:
+            for _f in os.listdir(path):
+                if _f.startswith(".yta_probe_"):
+                    try: os.remove(os.path.join(path, _f))
+                    except OSError: pass
+        except OSError:
+            pass
         probe = os.path.join(path, f".yta_probe_{os.getpid()}")
         with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
@@ -281,11 +292,17 @@ def try_find_by_title(channel_folder: str, title: str,
     Tries an exact-stem match first, then a `[videoId]` token match, then
     an ASCII-fuzzy match on the title. Returns the first hit or None.
     """
+    # audit F-33: early-return on the first exact or [id] hit instead
+    # of walking the whole folder before returning. For a 5000-video
+    # channel, an exact match at depth 1 used to walk every subfolder
+    # before returning. Also: bail early once we have an ascii-fuzzy
+    # candidate and the remaining walk is likely to just duplicate it.
     if not channel_folder or not os.path.isdir(channel_folder):
         return None
     norm_title = norm_ascii(title)
     vid_norm = (video_id or "").strip().lower()
     first_ascii_match: Optional[str] = None
+    _title_stripped = (title or "").strip()
     for dp, _dns, fns in os.walk(channel_folder):
         for fn in fns:
             low = fn.lower()
@@ -293,12 +310,13 @@ def try_find_by_title(channel_folder: str, title: str,
                 continue
             stem = os.path.splitext(fn)[0]
             # 1. Exact stem match (after strip)
-            if stem.strip() == (title or "").strip():
+            if stem.strip() == _title_stripped:
                 return os.path.join(dp, fn)
             # 2. Bracketed video-id match
             if vid_norm and f"[{vid_norm}]" in low:
                 return os.path.join(dp, fn)
-            # 3. Fuzzy ASCII stem
+            # 3. Fuzzy ASCII stem — capture first hit, keep walking in
+            # case a later exact/bracket match trumps it.
             if norm_title and not first_ascii_match:
                 if norm_ascii(stem) == norm_title:
                     first_ascii_match = os.path.join(dp, fn)

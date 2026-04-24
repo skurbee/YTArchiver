@@ -81,7 +81,38 @@ DEFAULT_CONFIG = {
     "last_disk_scan_ts": 0.0,
 }
 
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()  # audit F-36: reentrant so nested
+# load_config→save_config→load_config sequences don't self-deadlock.
+# Several helpers (append_pending_tx_id, remove_pending_tx_id, etc.)
+# acquire this lock and can recurse via save_config → migration trigger
+# → save_config again. A non-reentrant Lock would wedge the first such
+# path the moment it recursed.
+
+# audit E-39: periodic backup trigger. Writes a dated snapshot every
+# _BACKUP_EVERY_N_SAVES save_config() calls so recovery windows are
+# hourly (typical users save ~1-10 times per hour in normal use)
+# rather than only-at-startup. Counter resets on process restart;
+# backup_config_on_start still fires the first one at launch.
+_save_counter = 0
+_BACKUP_EVERY_N_SAVES = 20
+
+
+def _long_path(p: str) -> str:
+    """audit F-31: Windows \\?\\-prefix long paths (>240 chars). Other
+    modules can import and adopt when their derived paths might exceed
+    MAX_PATH. Config paths here are always short so the helper is not
+    applied to CONFIG_FILE itself — output_dir and tp_archive_roots
+    callers are the risk surface.
+
+    No-op on non-Windows and on paths already prefixed."""
+    if os.name != "nt" or not p:
+        return p
+    if p.startswith("\\\\?\\") or len(p) <= 240:
+        return p
+    # UNC paths need the \\?\UNC\ form
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p.lstrip("\\")
+    return "\\\\?\\" + p
 
 # Per-channel defaults (matches YTArchiver.py CHANNEL_DEFAULTS at line 173,
 # extended with the full set of fields actually stored).
@@ -139,11 +170,19 @@ def _migrate_pending_tx_ids(cfg: Dict[str, Any]) -> None:
         if "pending_tx_ids" not in ch or not isinstance(
                 ch.get("pending_tx_ids"), list):
             ch["pending_tx_ids"] = []
-            # Drifted legacy counter → drop to 0 now that the ID list
-            # is the source of truth. complete=True so the Subs cell
-            # reads "A ✓" cleanly instead of stale "-730".
-            ch["transcription_pending"] = 0
-            ch["transcription_complete"] = True
+            # audit D-44: previous migration unconditionally zeroed
+            # transcription_pending and flipped transcription_complete=True
+            # for EVERY channel missing pending_tx_ids — which silently
+            # wiped real in-flight pending counts when someone upgraded
+            # with a channel legitimately mid-transcribe. Now: only
+            # reset to "complete" if the stored counter is already 0 or
+            # missing (truly no pending work). If the counter is > 0
+            # we leave it alone; next sync pass will reconcile naturally
+            # via the pending_tx_ids append path.
+            _legit_pending = int(ch.get("transcription_pending") or 0)
+            if _legit_pending <= 0:
+                ch["transcription_pending"] = 0
+                ch["transcription_complete"] = True
 
 
 def append_pending_tx_id(channel_name: str, video_id: str) -> None:
@@ -234,14 +273,23 @@ def load_config() -> Dict[str, Any]:
         # idempotency would silently corrupt state.
         if not merged.get("_migration_v2_pending_tx_ids"):
             _migrate_pending_tx_ids(merged)
-            merged["_migration_v2_pending_tx_ids"] = True
-            # Persist the flag so the migration truly runs once.
-            # Fire-and-forget; if the save fails (e.g. permission),
-            # the migration runs again next launch which is harmless.
+            # audit D-43: only stamp the migration flag AFTER
+            # save_config returns True. Previously we set the flag,
+            # then wrapped save in except:pass — if the save failed
+            # (antivirus lock, OneDrive sync), the migration re-ran
+            # every launch, and its zero-out of transcription_pending
+            # silently wiped real pending work between boots. Setting
+            # the flag post-save guarantees the re-run only happens
+            # if we truly never persisted.
             try:
-                save_config(merged)
-            except Exception:
-                pass
+                if save_config(merged):
+                    merged["_migration_v2_pending_tx_ids"] = True
+                    # Re-save once more so the flag itself lands on disk.
+                    save_config(merged)
+                else:
+                    print("[config] migration save failed; will retry next launch")
+            except Exception as _me:
+                print(f"[config] migration save exception: {_me}")
         return merged
     except (json.JSONDecodeError, OSError) as e:
         print(f"[config] WARNING: failed to load {CONFIG_FILE}: {e}")
@@ -312,7 +360,19 @@ def backup_config_on_start(keep: int = 10) -> Optional[str]:
 
 
 def save_config(cfg: Dict[str, Any]) -> bool:
-    """Save config back to disk. Gated by config_is_writable()."""
+    """Save config back to disk. Gated by config_is_writable().
+
+    audit C-8: fsyncs the temp file before os.replace so a power loss
+    or BSOD between write and rename can't commit a zero-byte /
+    truncated file over the real one. Also cheap (<10ms per save for
+    a typical config).
+
+    audit E-39: triggers a dated snapshot every _BACKUP_EVERY_N_SAVES
+    saves so the recovery chain is minutes/hours old rather than
+    hours/days. backup_config_on_start still handles the at-launch
+    snapshot.
+    """
+    global _save_counter
     if not config_is_writable():
         print("[config] write blocked")
         return False
@@ -323,7 +383,24 @@ def save_config(cfg: Dict[str, Any]) -> bool:
             tmp = CONFIG_FILE.with_suffix(".json.tmp")
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
+                # audit C-8: flush + fsync before closing so the
+                # os.replace below commits a file whose contents are
+                # physically on disk (not just in the OS write cache).
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
             tmp.replace(CONFIG_FILE)
+        # audit E-39: periodic snapshot. Runs outside the lock because
+        # backup_config_on_start does its own I/O. Non-fatal on failure.
+        _save_counter += 1
+        if _save_counter >= _BACKUP_EVERY_N_SAVES:
+            _save_counter = 0
+            try:
+                backup_config_on_start(keep=20)
+            except Exception:
+                pass
         return True
     except OSError as e:
         print(f"[config] ERROR: failed to save: {e}")
@@ -357,30 +434,53 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         mode = ch.get("mode", "")
         # YTArchiver stores min/max as SECONDS on disk (180 = 3 minutes).
         # Display in minutes to match the original UI + user expectation.
+        # audit F-35: sub-minute durations used to floor to "0m" which the
+        # renderer then dashed to "—", hiding a real filter. Now:
+        # values between 1-59 seconds show as "<1m" so the user knows
+        # the filter is set (just non-zero rather than invisible).
         min_d = int(ch.get("min_duration", 0) or 0)
         max_d = int(ch.get("max_duration", 0) or 0)
         min_mins = max(0, min_d // 60)
         max_mins = max(0, max_d // 60)
-        # Last-sync shown as relative ("10hr ago") to match YTArchiver.py:5307
-        ls_raw = (ch.get("last_sync") or "").strip()
+        # Expose sub-minute sentinels so the UI can render specially.
+        if 0 < min_d < 60 and min_mins == 0:
+            min_mins = -1  # signals "<1m"
+        if 0 < max_d < 60 and max_mins == 0:
+            max_mins = -1
+        # Last-sync shown as relative ("10hr ago") to match YTArchiver.py:5307.
+        # audit D-55: parser now tolerates both the legacy naive-string
+        # format AND an epoch-float value. Epoch is DST-safe and compares
+        # directly to time.time(); new code writing last_sync can emit
+        # either. Naive strings get best-effort parsing but are marked
+        # approximate (read as local-TZ without adjustment, so two days
+        # per year the delta will be off by ±1h — tolerable for a UI
+        # relative-time display).
+        ls_raw_val = ch.get("last_sync")
         ls_str = "Never"
-        if ls_raw:
+        _diff_secs: Optional[float] = None
+        if isinstance(ls_raw_val, (int, float)) and ls_raw_val > 0:
+            _diff_secs = max(0.0, time.time() - float(ls_raw_val))
+        elif isinstance(ls_raw_val, str) and ls_raw_val.strip():
+            ls_raw = ls_raw_val.strip()
             try:
                 import datetime as _dt
                 dt = _dt.datetime.strptime(ls_raw, "%Y-%m-%d %H:%M")
-                diff_mins = int((_dt.datetime.now() - dt).total_seconds() // 60)
-                if diff_mins < 1:
-                    ls_str = "just now"
-                elif diff_mins < 60:
-                    ls_str = f"{diff_mins}m ago"
-                elif diff_mins < 1440:
-                    ls_str = f"{diff_mins // 60}hr ago"
-                elif diff_mins < 43200:
-                    ls_str = f"{diff_mins // 1440}d ago"
-                else:
-                    ls_str = f"{diff_mins // 43200}mo ago"
+                _diff_secs = max(0.0,
+                                 (_dt.datetime.now() - dt).total_seconds())
             except Exception:
                 ls_str = ls_raw[:12]
+        if _diff_secs is not None:
+            diff_mins = int(_diff_secs // 60)
+            if diff_mins < 1:
+                ls_str = "just now"
+            elif diff_mins < 60:
+                ls_str = f"{diff_mins}m ago"
+            elif diff_mins < 1440:
+                ls_str = f"{diff_mins // 60}hr ago"
+            elif diff_mins < 43200:
+                ls_str = f"{diff_mins // 1440}d ago"
+            else:
+                ls_str = f"{diff_mins // 43200}mo ago"
         # Original YTArchiver shows "A ✓" when the channel has auto-<X>=true
         # and the <X>-enabled flag is also on (e.g. `auto_transcribe=True` AND
         # the channel's been transcribed at least once). Match that here by
@@ -602,9 +702,20 @@ def recent_for_ui(cfg: Dict[str, Any]):
 
         # uploaded — prefer explicit `date` (YYYYMMDD) on the entry, fall
         # back to `download_ts` so the grid card still shows something.
+        # audit F-34: validate YYYYMMDD parses as a real calendar date
+        # before accepting it — otherwise "99999999" stored on a
+        # corrupted entry renders as "9999-99-99" and confuses the UI.
         uploaded_disp = ""
         date_str = str(r.get("date") or "")
+        _date_ok = False
         if len(date_str) == 8 and date_str.isdigit():
+            try:
+                import datetime as _dt_v
+                _dt_v.datetime.strptime(date_str, "%Y%m%d")
+                _date_ok = True
+            except ValueError:
+                _date_ok = False
+        if _date_ok:
             uploaded_disp = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
         elif r.get("download_ts"):
             try:

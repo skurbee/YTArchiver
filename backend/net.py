@@ -42,10 +42,22 @@ def probe_once(timeout: float = _probe_timeout_sec) -> bool:
 
 
 def start_monitor():
-    """Start the background poller. Safe to call repeatedly."""
+    """Start the background poller. Safe to call repeatedly.
+
+    audit F-50: runs one synchronous probe before starting the
+    background thread. Without this initial probe, workers kicking off
+    right after launch see net_down=False even if the network was
+    already down — they try jobs that immediately fail until the first
+    background poll fires ~30s later.
+    """
     global _monitor_thread
     if _monitor_thread and _monitor_thread.is_alive():
         return
+    try:
+        if not probe_once():
+            net_down.set()
+    except Exception:
+        pass
     _monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
     _monitor_thread.start()
 
@@ -82,6 +94,13 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
             " \u26a0 Network down \u2014 pausing until connection returns "
             "(~30-60s after it's back, to confirm stability)...", "red")
     waited = 0
+    # audit D-39: require 2 consecutive OK probes to clear net_down
+    # from inside the inline wait loop, matching the background
+    # monitor's stability requirement. Without this, a single blip
+    # of connectivity ends the wait — flappy connections then
+    # pause/resume repeatedly as yt-dlp hits another dropout a second
+    # later and net_down re-sets.
+    _inline_ok = 0
     while net_down.is_set():
         if check_cancel and check_cancel():
             return False
@@ -90,8 +109,12 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
         # Re-probe immediately every ~5s so we don't have to wait up to 30s
         if waited % 5 == 0:
             if probe_once():
-                net_down.clear()
-                break
+                _inline_ok += 1
+                if _inline_ok >= 2:
+                    net_down.clear()
+                    break
+            else:
+                _inline_ok = 0
     if stream:
         stream.emit_text(" \u2713 Network back.", "simpleline_green")
     return True

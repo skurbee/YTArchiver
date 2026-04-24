@@ -71,12 +71,19 @@ class AutorunScheduler:
             self._waiting_for_sync_done = False
             if self._interval_mins > 0:
                 self._schedule_next_locked()
-        # Persist to config (gated)
+        # Persist to config (gated).
+        # audit D-42: check save_config return so a write-gate failure
+        # surfaces to the caller instead of silently keeping the old
+        # interval on disk. User sets "1 hr", restart later, finds it
+        # reverted — previously no error shown.
+        persisted = True
         if config_is_writable():
             cfg = load_config()
             cfg["autorun_interval"] = self._interval_mins
-            save_config(cfg)
-        return {"ok": True, "mins": self._interval_mins}
+            persisted = bool(save_config(cfg))
+        else:
+            persisted = False
+        return {"ok": True, "mins": self._interval_mins, "persisted": persisted}
 
     def get_state(self) -> Dict[str, Any]:
         # Check sync busy state OUTSIDE the lock — the callback may
@@ -140,19 +147,26 @@ class AutorunScheduler:
         # `_sync_pipeline_busy()` check at YTArchiver.py:22769 — without
         # this, autorun calls sync_start_all which errors out and the
         # timer never re-arms correctly.
-        if self._sync_busy_fn:
+        # audit D-16: if no busy-fn was wired, treat as "busy" (safer
+        # default than "not busy", which could double-launch Sync
+        # Subbed if autorun fires while a manual pass is still running).
+        if self._sync_busy_fn is None:
+            busy = True
+        elif self._sync_busy_fn:
             try: busy = bool(self._sync_busy_fn())
             except Exception: busy = False
-            if busy:
-                if self._stream:
-                    self._stream.emit_text(
-                        "\u2014 Autorun: sync still running, checking again in 60s\u2026",
-                        "simpleline_dim")
-                with self._lock:
-                    self._waiting_for_sync_done = False
-                    if self._interval_mins > 0:
-                        self._schedule_next_locked(sec=60)
-                return
+        else:
+            busy = False
+        if busy:
+            if self._stream:
+                self._stream.emit_text(
+                    "\u2014 Autorun: sync still running, checking again in 60s\u2026",
+                    "simpleline_dim")
+            with self._lock:
+                self._waiting_for_sync_done = False
+                if self._interval_mins > 0:
+                    self._schedule_next_locked(sec=60)
+            return
         # Path A: interval elapsed + sync idle → kick the sync. Entering
         # waiting-for-completion state means the countdown holds at
         # "Syncing..." until notify_sync_done() is invoked by the sync
@@ -203,6 +217,9 @@ class AutorunScheduler:
 
 # ── Activity-log history append ────────────────────────────────────────
 
+_HISTORY_LOCK = threading.Lock()
+
+
 def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     """Append an autorun-history entry to config['autorun_history'].
 
@@ -210,15 +227,22 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     END of the list, trim via `hist[-MAX:]` to keep the last N. Earlier
     builds reversed this (insert(0)/keep first N) which scrambled
     history chronology when alternating OLD/NEW runs.
+
+    audit E-35: module-level lock wraps the load-modify-save cycle so
+    two near-simultaneous completions (rare but possible when multiple
+    sources trigger autorun notifications) can't race and drop an
+    entry. Without the lock, the second load_config saw a stale cfg
+    missing the first's append.
     """
     if not config_is_writable():
         return False
-    cfg = load_config()
-    hist = cfg.setdefault("autorun_history", [])
-    hist.append(entry)
-    if len(hist) > AUTORUN_HISTORY_MAX:
-        cfg["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
-    save_config(cfg)
+    with _HISTORY_LOCK:
+        cfg = load_config()
+        hist = cfg.setdefault("autorun_history", [])
+        hist.append(entry)
+        if len(hist) > AUTORUN_HISTORY_MAX:
+            cfg["autorun_history"] = hist[-AUTORUN_HISTORY_MAX:]
+        save_config(cfg)
     return True
 
 

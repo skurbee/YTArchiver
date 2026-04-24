@@ -165,19 +165,38 @@ _ID_RE_IN_NAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 
 
 def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[int]]:
-    """Best-effort year/month from a path like .../<channel>/<year>/<Month>/<file>."""
-    parts = Path(filepath).parts
-    year = None
-    month = None
-    for p in parts:
+    """Best-effort year/month from a path like .../<channel>/<year>/<Month>/<file>.
+
+    audit E-37: walk parts TAIL-FIRST so the innermost year/month wins.
+    Deep archive paths like `Z:\\Archive\\2024\\Channels\\SomeCh\\2020\\
+    March\\file.mp4` used to set year=2024 (from archive root), then
+    overwrite to 2020 (correct) — but a base path containing a 4-digit
+    year-like number mid-path could silently clobber the real channel
+    year. Tail-first is unambiguous: the nearest year ancestor matters.
+    """
+    parts = list(Path(filepath).parts)
+    months = ["january","february","march","april","may","june",
+              "july","august","september","october","november","december"]
+    year: Optional[int] = None
+    month: Optional[int] = None
+    # Walk from the file back to the root, grabbing month then year on
+    # the first hits. "NN Month" patterns (e.g. "01 January") also match.
+    for p in reversed(parts):
+        low = p.lower().strip()
+        # Month hit — either "january" style OR "01 January" style.
+        if month is None:
+            first_tok = low.split(" ", 1)[0] if " " in low else low
+            if first_tok in months:
+                month = months.index(first_tok) + 1
+                continue
+            if (" " in low) and first_tok.isdigit() and low.split(" ", 1)[1] in months:
+                # "01 January" — use the text name to be robust.
+                month = months.index(low.split(" ", 1)[1]) + 1
+                continue
+        # Year hit — pure 4-digit in the valid range.
         if p.isdigit() and 1900 < int(p) < 2100:
             year = int(p)
-        elif year is not None:
-            low = p.lower()
-            months = ["january","february","march","april","may","june",
-                      "july","august","september","october","november","december"]
-            if low in months:
-                month = months.index(low) + 1
+            break
     return year, month
 
 
@@ -245,13 +264,41 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         upload_ts = None
     try:
         with _db_lock:
+            # audit C-10: preserve `added_ts` on re-register.
+            # INSERT OR REPLACE silently wiped it every time sweep
+            # re-registered an existing video, making "new in last 7
+            # days" (Dashboard) and Recent-sort by added_ts useless —
+            # every video touched by ANY sweep/invalidation/
+            # mark_transcribed counted as "new". UPSERT with an
+            # explicit `added_ts=excluded.added_ts` would still reset;
+            # instead we write added_ts=? only if the row is new, via
+            # COALESCE against the existing value.
             conn.execute(
-                """INSERT OR REPLACE INTO videos
+                """INSERT INTO videos
                    (title, channel, year, month, filepath, video_id, video_url,
                     size_bytes, tx_status, added_ts, upload_ts)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(
+                             (SELECT added_ts FROM videos
+                              WHERE filepath=? COLLATE NOCASE),
+                             ?),
+                           ?)
+                   ON CONFLICT(filepath) DO UPDATE SET
+                     title=excluded.title,
+                     channel=excluded.channel,
+                     year=excluded.year,
+                     month=excluded.month,
+                     video_id=excluded.video_id,
+                     video_url=excluded.video_url,
+                     size_bytes=excluded.size_bytes,
+                     tx_status=excluded.tx_status,
+                     upload_ts=excluded.upload_ts
+                     /* added_ts deliberately omitted from UPDATE — preserves
+                        the original registration timestamp. */
+                """,
                 (title, channel, year, month, fp, vid_id, vid_url,
-                 size, tx_status, time.time(), upload_ts),
+                 size, tx_status,
+                 fp, time.time(), upload_ts),
             )
             conn.commit()
         # Drop the browse-list cache for this channel so the next grid
@@ -339,6 +386,18 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
 
     try:
         with _db_lock:
+            # audit C-9: FTS5 external-content tables don't auto-sync
+            # when rows are deleted from the content table. Without
+            # the explicit FTS delete-from-content idiom, re-ingesting
+            # a .jsonl leaves orphan FTS rowids pointing at deleted
+            # segment IDs — searches return phantom hits that JOIN
+            # against an empty segments row. Do the FTS-side delete
+            # FIRST so rowids get cleaned out of the FTS index, then
+            # DELETE from segments, then re-INSERT.
+            conn.execute(
+                "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                "SELECT 'delete', id, text FROM segments "
+                "WHERE jsonl_path=?", (jp,))
             # Clear any existing segments for this jsonl (re-ingest)
             conn.execute("DELETE FROM segments WHERE jsonl_path=?", (jp,))
             rows = []
@@ -384,6 +443,16 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 "VALUES (?, ?, ?)",
                 (jp, os.path.getmtime(jp), len(rows)),
             )
+            # audit D-46: flip tx_status='transcribed' on successful
+            # ingest so channel_transcription_stats reflects reality
+            # right away. Previously only mark_video_transcribed did
+            # this, and if ingest_jsonl was called without a follow-up
+            # mark_video_transcribed the Edit-channel footer and stats
+            # queries reported stale 'pending' counts for videos that
+            # had segments in the index.
+            conn.execute(
+                "UPDATE videos SET tx_status='transcribed' "
+                "WHERE filepath=? COLLATE NOCASE", (fp,))
             conn.commit()
         return len(segments)
     except sqlite3.Error as e:
@@ -866,12 +935,20 @@ def find_thumbnail(video_filepath: str,
             except OSError:
                 continue
 
-    # 4. Prefix match by stem (last resort — catches `<stem> [<id>].jpg`)
+    # 4. Prefix match by stem (last resort — catches `<stem> [<id>].jpg`).
+    # audit D-48: drop the bare `startswith(stem)` fallback — it used to
+    # match unrelated thumbnails whose name coincidentally began with
+    # this video's stem ("Intel reveals" stem matches "Intel reveals
+    # X-ray secret.jpg"), returning the first os.listdir hit at random.
+    # The "<stem> [<id>].jpg" and exact-file-match cases handle the
+    # legitimate layouts; anything else is indeterminate and shouldn't
+    # silently return a wrong thumbnail.
     for tf in search_dirs:
         try:
             for fn in os.listdir(tf):
                 low = fn.lower()
-                if (fn.startswith(stem + " [") or fn.startswith(stem)) \
+                _name_no_ext = os.path.splitext(fn)[0]
+                if (fn.startswith(stem + " [") or _name_no_ext == stem) \
                         and low.endswith((".jpg", ".jpeg", ".webp", ".png")):
                     return os.path.normpath(os.path.join(tf, fn))
         except OSError:
@@ -1158,17 +1235,20 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
         return {"labels": [], "values": []}
     word = word.strip()
     if bucket == "week":
-        # %Y-W%W uses Sunday-start weeks 00-53. Chart.js renders these
-        # as "2024-W12" etc., sortable as strings.
-        # Backfill is kicked off from main.py on startup (background
-        # thread). If the user hits Week before backfill finishes, the
-        # query returns whatever subset has upload_ts already.
+        # audit D-45: LEFT JOIN so segments with NULL video_id (common
+        # for legacy rows and drop-in-mode archives without .info.json)
+        # still COUNT against the match totals. Without this, the
+        # inner join silently excluded them and the week graph showed
+        # undercount. We still filter out rows that resolve to NULL
+        # upload_ts (no bucket to assign) in the WHERE clause.
+        # audit E-36: raw epoch is returned here; ISO-week labels are
+        # computed in Python after fetch so week 52-53 → week 1
+        # transitions don't split spanning weeks across two labels.
         sql = (
-            "SELECT strftime('%Y-W%W', datetime(v.upload_ts, 'unixepoch')) AS bucket, "
-            " COUNT(*) "
+            "SELECT v.upload_ts, COUNT(*) "
             " FROM segments_fts fts "
             " JOIN segments s ON s.id = fts.rowid "
-            " JOIN videos v ON v.video_id = s.video_id "
+            " LEFT JOIN videos v ON v.video_id = s.video_id "
             " WHERE fts.text MATCH ? "
             " AND v.upload_ts IS NOT NULL"
         )
@@ -1176,7 +1256,7 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
         if channel:
             sql += " AND s.channel=?"
             args.append(channel)
-        sql += " GROUP BY bucket ORDER BY bucket"
+        # No GROUP BY here — we aggregate in Python using isocalendar().
     else:
         # FTS5 MATCH to find segments containing the word
         group_col = ("year || '-' || printf('%02d', month)"
@@ -1195,8 +1275,28 @@ def graph_word_frequency(word: str, channel: Optional[str] = None,
             rows = conn.execute(sql, args).fetchall()
     except sqlite3.Error as e:
         return {"labels": [], "values": [], "error": str(e)}
-    labels = [str(r[0]) for r in rows if r[0] is not None]
-    values = [int(r[1]) for r in rows if r[0] is not None]
+    # audit E-36: for week bucket, aggregate in Python using
+    # isocalendar() so year-boundary weeks (e.g. 2024-12-30 is in
+    # ISO week 2025-W01) don't split into two half-sized bars.
+    if bucket == "week":
+        import datetime as _dt_w
+        counts_by_iso: Dict[str, int] = {}
+        for ts, cnt in rows:
+            if ts is None:
+                continue
+            try:
+                _dtobj = _dt_w.datetime.fromtimestamp(float(ts))
+                iso = _dtobj.isocalendar()
+                key = f"{iso.year:04d}-W{iso.week:02d}"
+            except Exception:
+                continue
+            counts_by_iso[key] = counts_by_iso.get(key, 0) + int(cnt)
+        _sorted = sorted(counts_by_iso.items())
+        labels = [k for k, _ in _sorted]
+        values = [v for _, v in _sorted]
+    else:
+        labels = [str(r[0]) for r in rows if r[0] is not None]
+        values = [int(r[1]) for r in rows if r[0] is not None]
     # bug M-13: when the caller requests week-granularity data while
     # backfill_upload_ts is still populating, the query silently returns
     # sparse results. Surface a `backfill_pending` count so the UI can
@@ -1346,11 +1446,18 @@ def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,
     if channel:
         suffix += " AND s.channel=?"
         args_suffix.append(channel)
+    # audit D-49: OR-include s.year IS NULL when a year filter is set.
+    # Legacy rows (drop-in mode, pre-path-parsing, channels where the
+    # folder layout isn't year-organized) have segments.year=NULL;
+    # without the NULL clause the filter silently excluded them even
+    # though the user's intent was "all results within this window,
+    # including ones we can't place yet". Net effect: year-filtered
+    # searches now include NULL-year rows rather than missing them.
     if year_from is not None:
-        suffix += " AND s.year >= ?"
+        suffix += " AND (s.year >= ? OR s.year IS NULL)"
         args_suffix.append(int(year_from))
     if year_to is not None:
-        suffix += " AND s.year <= ?"
+        suffix += " AND (s.year <= ? OR s.year IS NULL)"
         args_suffix.append(int(year_to))
     suffix += " LIMIT ?"
     args_suffix.append(limit)
@@ -1414,23 +1521,33 @@ def bookmark_list(limit: int = 500) -> List[Dict[str, Any]]:
 
 
 def bookmark_remove(bm_id: int) -> bool:
+    # audit D-47: return True only when an actual row changed. Old
+    # behavior returned True unconditionally, so a stale-id click (e.g.
+    # double-click after another session already deleted it) surfaced
+    # as "Bookmark removed" while nothing happened, then the next
+    # refresh showed the bookmark still there. Now False = nothing
+    # matched that id.
     conn = _open()
     if conn is None:
         return False
     with _db_lock:
-        conn.execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
+        cur = conn.execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
         conn.commit()
-    return True
+    return cur.rowcount > 0
 
 
 def bookmark_update_note(bm_id: int, note: str) -> bool:
+    # audit D-47: same reasoning as bookmark_remove — return False when
+    # the id didn't match anything so callers don't show misleading
+    # success toasts.
     conn = _open()
     if conn is None:
         return False
     with _db_lock:
-        conn.execute("UPDATE bookmarks SET note=? WHERE id=?", (note, bm_id))
+        cur = conn.execute(
+            "UPDATE bookmarks SET note=? WHERE id=?", (note, bm_id))
         conn.commit()
-    return True
+    return cur.rowcount > 0
 
 
 # ── Stats ───────────────────────────────────────────────────────────────

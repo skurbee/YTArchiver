@@ -192,17 +192,54 @@ def compress_video(input_path: str, stream: LogStreamer,
                 ])
                 if progress_cb:
                     try: progress_cb(pct)
-                    except Exception: pass
+                    # audit F-12: previously silently eaten; surface so
+                    # a broken UI hook shows up in logs instead of
+                    # mysteriously going silent mid-encode.
+                    except Exception as _cb_e:
+                        stream.emit_dim(f" (progress_cb failed: {_cb_e})")
 
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.terminate()
 
+    # audit C-1: check ffmpeg returncode BEFORE accepting the output.
+    # A mid-encode crash (NVENC driver reset, OOM, etc.) leaves a short
+    # temp file that was smaller than the original — with no returncode
+    # check, the "smaller than orig" safety below would PROMOTE the
+    # truncated stub over the pristine source. Not recoverable.
+    if proc.returncode is not None and proc.returncode != 0:
+        stream.emit_error(
+            f"ffmpeg exited with code {proc.returncode}; leaving original intact.")
+        try: os.remove(temp_path)
+        except OSError: pass
+        return {"ok": False, "error": f"ffmpeg rc={proc.returncode}",
+                "reason": "ffmpeg_error"}
+
     if not os.path.isfile(temp_path):
         stream.emit_error("Compress: output file was not created.")
         return {"ok": False, "error": "no output"}
     new_size = os.path.getsize(temp_path)
+
+    # audit C-2: ffprobe the temp file's duration and require it within
+    # ~2% of the original. A partial/truncated encode that SOMEHOW
+    # passes the returncode check (Windows hard-kill, ffmpeg oddity)
+    # could still be a 2-minute stub of a 60-minute video. Without this
+    # guard the "smaller than orig" check below promotes it, silently
+    # destroying the tail.
+    if dur > 0:
+        new_dur = get_video_duration(temp_path, ffmpeg)
+        # 2% tolerance, minimum 3 seconds absolute slack for very short clips.
+        max_loss = max(3.0, dur * 0.02)
+        if new_dur <= 0 or (dur - new_dur) > max_loss:
+            stream.emit_error(
+                f"Compressed duration mismatch "
+                f"(orig {dur:.0f}s, new {new_dur:.0f}s) — leaving original intact.")
+            try: os.remove(temp_path)
+            except OSError: pass
+            return {"ok": False, "error": "duration_mismatch",
+                    "reason": "duration_mismatch",
+                    "orig_dur": dur, "new_dur": new_dur}
 
     # Safety: if output is larger than input, skip the replace
     if new_size >= orig_size:
@@ -223,10 +260,24 @@ def compress_video(input_path: str, stream: LogStreamer,
     saved_pct = 100.0 * (1 - new_size / orig_size)
 
     if replace_original:
-        try:
-            os.replace(temp_path, input_path)
-        except OSError as e:
-            stream.emit_error(f"Could not replace original: {e}")
+        # audit E-10: retry the replace a couple of times on transient
+        # Windows file locks (VLC preview, antivirus, Explorer preview-
+        # pane, Thumbnail cache). AV1 encodes cost minutes of GPU time;
+        # throwing away the output because another process held the
+        # target for 2 seconds is bad economics.
+        _replace_err: Optional[Exception] = None
+        for _try in range(3):
+            try:
+                os.replace(temp_path, input_path)
+                _replace_err = None
+                break
+            except OSError as e:
+                _replace_err = e
+                if _try < 2:
+                    time.sleep(2.0)
+        if _replace_err is not None:
+            stream.emit_error(
+                f"Could not replace original after 3 attempts: {_replace_err}")
             # bug H-2: on replace-failure (file locked by VLC preview /
             # antivirus / cross-drive), the temp file used to sit in
             # _TEMP_COMPRESS/ forever — `temp_cleanup.py` treats non-
@@ -236,7 +287,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                 os.remove(temp_path)
             except OSError:
                 pass
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(_replace_err)}
 
     # Per-file done line. Green checkmark + white filename + dim size
     # delta, with the saved-percent in compress color to match the

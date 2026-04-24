@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v53.9"
-APP_VERSION_DATE = "4.23.26 5:11pm"
+APP_VERSION      = "v55.1"
+APP_VERSION_DATE = "4.24.26 1:07am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -137,7 +137,28 @@ class Api:
         _init_model = (load_config() or {}).get("whisper_model") or "small"
         self._transcribe = TranscribeManager(self._log_stream, model=_init_model)
         # Disk-error watchdog — pauses all tasks on write failure, resumes
-        # when the drive becomes writable again. Scans each emitted log line.
+        # audit E-60: construct _queues BEFORE DiskErrorMonitor so the
+        # monitor's on_pause/on_resume lambdas don't fire on a not-yet-
+        # existent self._queues attribute (which would AttributeError
+        # inside the watchdog callback and silently fail to pause).
+        # audit E-59: wrap queue load in try/except so a corrupt queue
+        # file doesn't brick the entire app — log + start empty, and
+        # back up the corrupt file for debugging.
+        self._queues = QueueState()
+        try:
+            self._queues.load()
+        except Exception as _qe:
+            try:
+                import shutil as _sh
+                from backend.ytarchiver_config import QUEUE_FILE as _QF
+                _bak = str(_QF) + ".corrupt"
+                _sh.copy2(str(_QF), _bak)
+                print(f"[queues] corrupt queue file backed up to {_bak}: {_qe}")
+            except Exception:
+                print(f"[queues] queue load failed: {_qe}")
+            # Reset to a fresh empty state so the app can still launch.
+            self._queues = QueueState()
+
         from backend.disk_watch import DiskErrorMonitor
         self._disk_mon = DiskErrorMonitor(
             self._log_stream,
@@ -170,8 +191,8 @@ class Api:
             except Exception:
                 pass
         self._log_stream.add_line_scanner(_dl_scan)
-        self._queues = QueueState()
-        self._queues.load()
+        # Note: self._queues was already constructed + loaded above
+        # (moved earlier for audit E-60 — DiskErrorMonitor references it).
         # Connect the transcribe manager to the shared GPU queue so
         # enqueued jobs show up in the Tasks popover + the Auto
         # checkbox actually gates firing. Without this the manager's
@@ -451,8 +472,17 @@ class Api:
         return res
 
     def get_initial_main_log(self):
-        """Return a big batch of main-log lines for initial render."""
-        return stream_main_log_sample(initial=True)
+        """Return a big batch of main-log lines for initial render.
+
+        audit D-36: gated on a `YTARCHIVER_DEMO_MODE=1` env var so the
+        fictional sample log lines (FilmFan / GameReviews etc.) never
+        leak into a real user's session. In production the caller gets
+        an empty list; JS renders a clean blank log until real content
+        arrives via the push pipeline.
+        """
+        if os.environ.get("YTARCHIVER_DEMO_MODE") == "1":
+            return stream_main_log_sample(initial=True)
+        return []
 
     def get_subs_channels(self):
         """Return (rows, total_label) for the Subs table. Real data if avail.
@@ -466,8 +496,13 @@ class Api:
             cfg_copy = _copy.deepcopy(self._config)
             archive_scan.enrich_channels_with_stats(cfg_copy.get("channels", []))
             return channels_for_subs_ui(cfg_copy)
-        rows, total = generate_subs_channels()
-        return rows, total
+        # audit D-36: only serve fake channel data in DEMO mode. A
+        # user whose real config has no channels yet gets an empty
+        # list, not fictional "FilmFan / GameReviews" rows.
+        if os.environ.get("YTARCHIVER_DEMO_MODE") == "1":
+            rows, total = generate_subs_channels()
+            return rows, total
+        return [], "0 channels · 0 videos · 0 GB"
 
     def get_index_summary(self):
         """Return Index tab data: cards + per-channel breakdown."""
@@ -971,15 +1006,22 @@ class Api:
         cfg = self._config or load_config()
         # cfg["min_duration"] is SECONDS (180 = 3 min) per YTArchiver's schema
         raw_min_secs = int(cfg.get("min_duration", 180) or 0)
+        # audit E-57: read user-configured defaults from config if set,
+        # fall back to conservative defaults. Previously these were
+        # hardcoded constants so the "Restore defaults" button in the
+        # edit panel always clobbered user preference with the constant
+        # values — if user set Settings>General auto_transcribe=true
+        # and then clicked Restore on a channel, the channel flipped
+        # to false regardless of their stated preference.
         return {
             "resolution": cfg.get("default_resolution", "720"),
             "min_duration": max(0, raw_min_secs // 60),
             "max_duration": 0,
-            "auto_metadata": True,
-            "auto_transcribe": False,
-            "compress_enabled": False,
-            "mode": "new",
-            "folder_org": "years",
+            "auto_metadata": bool(cfg.get("default_auto_metadata", True)),
+            "auto_transcribe": bool(cfg.get("default_auto_transcribe", False)),
+            "compress_enabled": bool(cfg.get("default_compress_enabled", False)),
+            "mode": (cfg.get("default_mode") or "new"),
+            "folder_org": (cfg.get("default_folder_org") or "years"),
         }
 
     # ─── Sync ───────────────────────────────────────────────────────────
@@ -2706,6 +2748,327 @@ class Api:
             _enqueue_task(False)
         return {"ok": True, "queued": True}
 
+    # ─── Feature H-14: year-scoped metadata from grid year-head ctx ─────
+
+    def metadata_queue_channel_year(self, identity, year, refresh=False):
+        """Queue a year-scoped metadata task for one channel.
+
+        Called from the Browse video-grid year-head right-click menu
+        (app.js:4624, parallel to chan_redownload's year scope). Drops
+        a `kind: "metadata"` item on the sync queue with
+        `scope: {"year": N}` so `fetch_channel_metadata` filters
+        on-disk videos to that year before processing. Everything else
+        (skip-previously-failed, refresh-counts behavior, Sync Tasks
+        popover visibility, pause/cancel) works identically to the
+        whole-channel metadata flow — this is just a scope refinement.
+
+        `refresh=False`: fetch metadata for on-disk videos in YEAR that
+        don't yet have it (fast, skip-existing).
+        `refresh=True`:  re-hit every on-disk video in YEAR to refresh
+        views/likes (slow, re-fetch-all).
+        """
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        try:
+            year_int = int(year)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"Invalid year: {year!r}"}
+        task = dict(ch)
+        task["kind"] = "metadata"
+        task["refresh"] = bool(refresh)
+        task["scope"] = {"year": year_int}
+        try:
+            self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._on_queue_changed()
+        label = "refresh" if refresh else "download"
+        ch_name = ch.get("name") or ch.get("folder", "")
+        self._log_stream.emit_text(
+            f" \u2014 Queued metadata {label} for {ch_name} ({year_int}) "
+            f"on Sync Tasks.", "simpleline_pink")
+        self._log_stream.flush()
+        # Mirror metadata_queue_all's H-7 behavior: always auto-kick
+        # the worker when the user explicitly clicked the menu item
+        # (don't gate on autorun_sync — they asked for it by clicking).
+        try:
+            if not self.sync_is_running():
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": True, "year": year_int,
+                "refresh": bool(refresh)}
+
+    # ─── Settings > Metadata tab: per-channel refresh status ─────────────
+
+    def get_channel_metadata_status(self):
+        """Return per-channel metadata refresh status for Settings > Metadata.
+
+        Powers the table in settings-view-metadata (index.html:753). Each
+        row shows the last time views/likes and comments were refreshed
+        for that channel, so stale channels float to the top when sorted
+        oldest-first.
+
+        Pulls straight from `self._config["channels"]` — the timestamps
+        (`last_views_refresh_ts`, `last_comments_refresh_ts`) get stamped
+        by `bulk_refresh_views_likes` and `refresh_channel_comments` in
+        backend/metadata.py when those paths finish successfully.
+
+        Returns list[dict] with keys: name, folder, url, video_count,
+        last_views_refresh_ts, last_comments_refresh_ts.
+        """
+        cfg = self._config if self._config is not None else load_config()
+        channels = list(cfg.get("channels", []) or [])
+        if not channels:
+            return []
+        # Enrich a copy with n_vids so we don't mutate the live config.
+        import copy as _copy
+        ch_copy = _copy.deepcopy(channels)
+        try:
+            archive_scan.enrich_channels_with_stats(ch_copy)
+        except Exception:
+            pass
+        # Pull video-id DB counts so the Metadata tab can show a
+        # per-channel status indicator (green if every on-disk file
+        # has a resolvable video_id, warn if some missing, red if
+        # none). Cheap — DB-only count per channel, no disk walk.
+        try:
+            from backend.metadata import count_video_id_status as _cvids
+        except Exception:
+            _cvids = None
+        rows = []
+        for ch in ch_copy:
+            _idstats = _cvids(ch) if _cvids else {
+                "total": 0, "with_id": 0, "missing": 0}
+            rows.append({
+                "name": ch.get("name") or ch.get("folder") or "",
+                "folder": ch.get("folder") or "",
+                "url": ch.get("url") or "",
+                "video_count": int(ch.get("n_vids") or 0),
+                "last_views_refresh_ts": ch.get("last_views_refresh_ts"),
+                "last_comments_refresh_ts": ch.get("last_comments_refresh_ts"),
+                "id_total": _idstats.get("total", 0),
+                "id_with_id": _idstats.get("with_id", 0),
+                "id_missing": _idstats.get("missing", 0),
+            })
+        # Sort oldest-refresh-first by default so stale channels float up.
+        # A missing timestamp (never refreshed) sorts as oldest (ts=0).
+        rows.sort(key=lambda r: (r.get("last_views_refresh_ts") or 0,
+                                 (r.get("name") or "").lower()))
+        return rows
+
+    def metadata_refresh_comments_all(self, only_recent_days=30):
+        """Queue a comments-only refresh for every saved channel.
+
+        Bulk version of metadata_refresh_comments_channel (Settings >
+        Metadata > "Refresh comments — all channels" button). Defaults
+        to a 30-day scope because comments are the slow per-video path
+        and most of the value sits in recently-uploaded videos (users
+        often catch videos within 30 minutes of upload, before
+        comments exist).
+        """
+        cfg = self._config or load_config()
+        channels = sorted(cfg.get("channels", []),
+                          key=lambda c: (c.get("name") or "").lower())
+        if not channels:
+            return {"ok": False, "error": "No channels configured"}
+        try:
+            _d = int(only_recent_days) if only_recent_days is not None else None
+            if _d is not None and _d <= 0:
+                _d = None
+        except (TypeError, ValueError):
+            _d = None
+        queued = 0
+        for ch in channels:
+            try:
+                task = dict(ch)
+                task["kind"] = "metadata_comments"
+                if _d is not None:
+                    task["only_recent_days"] = _d
+                if self._queues.sync_enqueue(task):
+                    queued += 1
+            except Exception as e:
+                self._log_stream.emit_error(
+                    f"Comments enqueue failed for {ch.get('name')}: {e}")
+        self._on_queue_changed()
+        scope_str = f" (last {_d}d)" if _d else ""
+        self._log_stream.emit_text(
+            f" \u2014 Queued comments refresh{scope_str} for {queued} "
+            f"channel(s) on Sync Tasks.", "simpleline_pink")
+        self._log_stream.flush()
+        # Auto-kick the worker (H-7 pattern, same as metadata_queue_all).
+        try:
+            if not self.sync_is_running() and queued > 0:
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": queued, "channels": len(channels),
+                "only_recent_days": _d}
+
+    def metadata_backfill_ids_channel(self, identity):
+        """Queue a one-shot video_id backfill for a single channel.
+
+        Powers Settings > Metadata's per-row "Fix IDs" button. Lands
+        on the sync queue as `kind: "videoid_backfill"` so the user
+        sees it in Sync Tasks and can pause / cancel like any other
+        sync item. Backend dispatch routes to
+        backend.metadata.backfill_video_ids.
+        """
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        task = dict(ch)
+        task["kind"] = "videoid_backfill"
+        try:
+            self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._on_queue_changed()
+        try:
+            if not self.sync_is_running():
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": True}
+
+    def metadata_backfill_ids_all(self, only_missing=True):
+        """Queue a video_id backfill for every saved channel. Default
+        `only_missing=True` skips channels whose DB already reports
+        zero missing IDs — no point paying yt-dlp time for channels
+        that don't need it. Pass False to force-queue everything.
+
+        Important for users migrating from the tkinter-era YTArchiver:
+        filenames never carried `[id]` brackets and no .info.json
+        sidecars got archived, so the index DB's video_id column is
+        NULL for thousands of rows. Without the backfill, the bulk
+        views/likes refresh path can't match any on-disk file to its
+        YouTube row.
+        """
+        cfg = self._config or load_config()
+        channels = sorted(cfg.get("channels", []),
+                          key=lambda c: (c.get("name") or "").lower())
+        if not channels:
+            return {"ok": False, "error": "No channels configured"}
+        try:
+            from backend.metadata import count_video_id_status as _cvids
+        except Exception:
+            _cvids = None
+        queued = 0
+        skipped = 0
+        for ch in channels:
+            if only_missing and _cvids:
+                try:
+                    st = _cvids(ch)
+                    if st.get("total", 0) > 0 and st.get("missing", 0) == 0:
+                        skipped += 1
+                        continue
+                except Exception:
+                    pass
+            try:
+                task = dict(ch)
+                task["kind"] = "videoid_backfill"
+                if self._queues.sync_enqueue(task):
+                    queued += 1
+            except Exception as e:
+                self._log_stream.emit_error(
+                    f"Backfill enqueue failed for {ch.get('name')}: {e}")
+        self._on_queue_changed()
+        try:
+            if not self.sync_is_running() and queued > 0:
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": queued,
+                "skipped_up_to_date": skipped,
+                "channels": len(channels)}
+
+    def metadata_refresh_views_channel(self, identity):
+        """Per-channel views/likes refresh — no prompt, straight enqueue.
+
+        metadata_recheck_channel prompts the user when existing metadata
+        is found (Check for New / Refresh Counts / Cancel). The Settings
+        > Metadata table's per-row "Refresh views" action is always
+        "refresh counts", so this method skips the prompt and enqueues
+        a refresh=True metadata task directly. Uses the fast bulk path
+        (bulk_refresh_views_likes) via fetch_channel_metadata's
+        refresh=True delegate.
+        """
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        task = dict(ch)
+        task["kind"] = "metadata"
+        task["refresh"] = True
+        try:
+            self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._on_queue_changed()
+        # No "Queued ..." log line — the pass-starting banner
+        # emitted by sync.py already states the action, so an
+        # earlier "Queued views/likes refresh for X on Sync Tasks."
+        # just duplicated info one line above.
+        try:
+            if not self.sync_is_running():
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": True}
+
+    # ─── Refresh comments (separate per-channel action) ────────────────
+
+    def metadata_refresh_comments_channel(self, identity,
+                                           only_recent_days=None):
+        """Per-channel comments-only refresh.
+
+        Separate from views/likes refresh because comments require
+        per-video yt-dlp calls (no bulk mode exists), so it's always
+        the slow path — worth it when pulling community updates for
+        videos caught within minutes of upload (no comments at
+        download time, decent comments a week later).
+
+        `only_recent_days` optionally scopes to videos uploaded in
+        the last N days. None = all videos for the channel.
+
+        Enqueues on the sync queue as a `kind: "metadata_comments"`
+        task (dispatched by sync.py:2693's kind-router) so the user
+        sees it in the Sync Tasks popover with pause / cancel
+        controls like any other sync task.
+        """
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        task = dict(ch)
+        task["kind"] = "metadata_comments"
+        if only_recent_days is not None:
+            try:
+                _d = int(only_recent_days)
+                if _d > 0:
+                    task["only_recent_days"] = _d
+            except (TypeError, ValueError):
+                pass
+        try:
+            self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        self._on_queue_changed()
+        ch_name = ch.get("name") or ch.get("folder", "")
+        scope_str = (f" (last {task['only_recent_days']}d)"
+                     if task.get("only_recent_days") else "")
+        self._log_stream.emit_text(
+            f" \u2014 Queued comments refresh for {ch_name}{scope_str} "
+            f"on Sync Tasks.", "simpleline_pink")
+        self._log_stream.flush()
+        # Auto-kick the worker (same H-7 pattern as metadata_queue_all).
+        try:
+            if not self.sync_is_running():
+                self.sync_start_all(add_downloads_from_config=False)
+        except Exception:
+            pass
+        return {"ok": True, "queued": True,
+                "only_recent_days": task.get("only_recent_days")}
+
     def metadata_queue_all(self, refresh=False):
         """Enqueue every saved channel as a `kind: "metadata"` sync
         task — each one becomes its own row in the Sync Tasks popover
@@ -2752,6 +3115,96 @@ class Api:
         except Exception:
             pass
         return {"ok": True, "queued": queued, "channels": len(channels)}
+
+    # ─── Transcript drift scan (feature H-2) ──────────────────────────
+
+    def drift_scan_channel(self, identity):
+        """Scan one channel's transcript files for drift between the
+        aggregated .txt, hidden .jsonl, and FTS index.
+
+        Cross-references three sources:
+          - `{Ch} Transcript.txt` (header-delimited entries)
+          - hidden `.{Ch} Transcript.jsonl` (one line per segment)
+          - segments_fts (FTS5 external-content table)
+
+        Reports three drift categories:
+          A. TXT-without-JSONL — entry in .txt but no matching .jsonl
+          B. JSONL-without-TXT — segments in .jsonl but no .txt entry
+          C. FTS phantoms — global count of orphan FTS rowids (C-9)
+
+        Pure read, no mutations. Apply side is drift_apply_channel."""
+        from backend import drift_scan as _ds
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        cfg = self._config or load_config()
+        output_dir = (cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return {"ok": False, "error": "output_dir is not configured"}
+        return _ds.scan_channel(ch, output_dir)
+
+    def drift_apply_channel(self, identity):
+        """Apply the three drift fixes for one channel:
+          A. Queue Whisper retranscribe for each TXT-without-JSONL entry
+             whose video file can be located in the FTS videos table.
+          B. Reconstruct TXT entries from .jsonl segments for each
+             JSONL-without-TXT entry (body = concat of segment text,
+             date = .jsonl mtime, src_tag = "RECOVERED-FROM-JSONL").
+          C. Rebuild FTS if phantom count > 0.
+
+        Runs a fresh scan internally so the apply always acts on current
+        state."""
+        from backend import drift_scan as _ds
+        ch = subs_backend.get_channel(identity or {})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        cfg = self._config or load_config()
+        output_dir = (cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return {"ok": False, "error": "output_dir is not configured"}
+
+        # Hook: queue a Whisper retranscribe. Wraps self.transcribe_retranscribe
+        # so the drift_scan module stays decoupled from the Api class.
+        def _enqueue_retranscribe(filepath, title, video_id):
+            self.transcribe_retranscribe(filepath, title, video_id)
+
+        result = _ds.apply_channel(
+            ch, output_dir,
+            enqueue_retranscribe_fn=_enqueue_retranscribe,
+            rebuild_fts_fn=_ds.rebuild_fts_index)
+
+        # Surface what happened in the main log so the user has a
+        # record (same pattern as other Tools actions).
+        if result.get("ok"):
+            a = result.get("actions", {})
+            parts = []
+            if a.get("txt_reconstructed"):
+                parts.append(f"{a['txt_reconstructed']} .txt rebuilt")
+            if a.get("retranscribe_queued"):
+                parts.append(f"{a['retranscribe_queued']} queued for Whisper")
+            if a.get("retranscribe_skipped"):
+                parts.append(f"{a['retranscribe_skipped']} skipped (video file missing)")
+            if a.get("fts_rebuilt"):
+                parts.append("FTS rebuilt")
+            ch_name = ch.get("name") or ch.get("folder", "")
+            if parts:
+                self._log_stream.emit_text(
+                    f" \u2014 Drift fix for {ch_name}: "
+                    f"{' \u00b7 '.join(parts)}.", "simpleline_pink")
+            else:
+                self._log_stream.emit_text(
+                    f" \u2014 Drift fix for {ch_name}: no actions taken.",
+                    "dim")
+            self._log_stream.flush()
+            # Kick the sync worker so retranscribe jobs drain (matches
+            # the H-7 pattern used in metadata_queue_*).
+            try:
+                if (a.get("retranscribe_queued", 0) > 0
+                        and not self.sync_is_running()):
+                    self.sync_start_all(add_downloads_from_config=False)
+            except Exception:
+                pass
+        return result
 
     # ─── Compress dry-run (feature F8) ─────────────────────────────────
 
@@ -2960,11 +3413,15 @@ class Api:
             folder_or_name.get("name") or folder_or_name.get("folder", ""))
         from backend.sync import sanitize_folder
         path = os.path.join(base, sanitize_folder(name))
+        # audit D-38: if the folder doesn't exist yet, don't silently
+        # CREATE it. Right-clicking "Open folder" on a channel that
+        # has never synced (URL-only subscription) used to materialize
+        # an empty directory on the archive drive — polluting the
+        # filesystem with empty folders for every channel the user
+        # only clicked "Open folder" on.
         if not os.path.isdir(path):
-            try:
-                os.makedirs(path, exist_ok=True)
-            except OSError:
-                return {"ok": False, "error": f"Folder not found: {path}"}
+            return {"ok": False,
+                    "error": f"Folder not created yet (no sync has run): {path}"}
         try:
             if os.name == "nt":
                 os.startfile(path)
@@ -4053,15 +4510,33 @@ class Api:
             os.remove(fp)
         except OSError as e:
             return {"ok": False, "error": str(e)}
-        # Also drop sidecars
+        # Also drop sidecars.
+        # audit F-24: broadened sidecar list — yt-dlp can leave
+        # .description, .live_chat.json, .en.srt, .en-orig.vtt,
+        # .en-US.vtt and other variants. The narrow list missed
+        # these and leaked them on every Recent delete.
         base = os.path.splitext(fp)[0]
-        for ext in (".txt", ".jsonl", ".info.json", ".jpg", ".webp", ".vtt", ".en.vtt"):
+        _basic_exts = (".txt", ".jsonl", ".info.json", ".description",
+                       ".live_chat.json", ".srt",
+                       ".jpg", ".jpeg", ".webp", ".png")
+        for ext in _basic_exts:
             try:
                 sc = base + ext
                 if os.path.isfile(sc):
                     os.remove(sc)
             except OSError:
                 pass
+        # Language-coded caption sidecars (en, en-orig, en-US, es, etc.)
+        # We use a glob rather than enumerating every language code.
+        try:
+            import glob as _glob
+            for pat in (base + ".*.vtt", base + ".*.srt",
+                        base + ".*.ttml"):
+                for _hit in _glob.glob(pat):
+                    try: os.remove(_hit)
+                    except OSError: pass
+        except Exception:
+            pass
         # Remove from recent_downloads (if writable)
         if config_is_writable():
             cfg = load_config()
@@ -4180,8 +4655,19 @@ class Api:
                 for line in proc.stdout:
                     self._log_stream.emit_dim(" " + line.rstrip())
                 proc.wait()
-                self._log_stream.emit([["[Update] ", "update_head"],
-                                        ["yt-dlp update complete.\n", "update_sep"]])
+                # audit D-1: check proc.returncode before declaring
+                # success. Old code always emitted "update complete"
+                # even on non-zero exit (most common cause: the yt-dlp
+                # exe is locked by a running sync, so the self-update
+                # fails but the banner still claimed it worked).
+                if proc.returncode == 0:
+                    self._log_stream.emit([["[Update] ", "update_head"],
+                                            ["yt-dlp update complete.\n", "update_sep"]])
+                else:
+                    self._log_stream.emit_error(
+                        f"yt-dlp update failed (exit code {proc.returncode}). "
+                        "If a sync is running, stop it and try again — the "
+                        ".exe can't be replaced while it's open.")
             except Exception as e:
                 self._log_stream.emit_error(f"yt-dlp update failed: {e}")
             finally:
@@ -4256,6 +4742,19 @@ class Api:
                     skipped_reasons.append({
                         "name": ch.get("name") or ch["url"],
                         "reason": "already subscribed",
+                    })
+                    continue
+                # audit E-44: validate URL shape before adding. Old
+                # code accepted any non-empty ch["url"] so a corrupted
+                # import file with "not-a-url" values landed channels
+                # that failed at sync time with cryptic yt-dlp errors.
+                # Checking here surfaces the problem at import time
+                # when the user can act on it.
+                _u = str(ch.get("url") or "").strip().lower()
+                if not (("youtube.com/" in _u) or ("youtu.be/" in _u)):
+                    skipped_reasons.append({
+                        "name": ch.get("name") or ch["url"],
+                        "reason": "URL doesn't look like a YouTube link",
                     })
                     continue
                 cfg.setdefault("channels", []).append(ch)
@@ -4476,8 +4975,16 @@ class Api:
                     self._log_stream.emit([[f" Download: {rel_url}\n", "update_head"]])
                     self._log_stream.emit([[f"{sep}\n\n", "update_sep"]])
                     self._log_stream.flush()
-            except Exception:
-                pass # no network, rate-limited, etc.
+            except Exception as _e:
+                # audit F-23: surface the failure as a dim log line
+                # so the user has evidence the check ran (and why it
+                # failed). Old code silently swallowed, leaving no
+                # trace of whether the update probe ever fired.
+                try:
+                    self._log_stream.emit_dim(
+                        f"[Update] check skipped: {_e}")
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
@@ -4847,9 +5354,24 @@ class Api:
                                  close_fds=True,
                                  creationflags=0x00000008)
             # Small delay so the new process initializes before we tear down.
+            # audit D-58: call _shutdown_cleanup() BEFORE os._exit so
+            # queue state gets saved, window geometry persisted, and
+            # child subprocesses (yt-dlp / whisper / ffmpeg) killed
+            # rather than carried over into the restarted process
+            # where they'd race with the new instance's fresh jobs.
             def _die():
                 time.sleep(0.6)
                 try:
+                    # Best-effort: if the function is in scope it runs
+                    # the full close sequence. If not (import order,
+                    # shutdown teardown, etc.) we still os._exit so
+                    # the user's restart request doesn't stall.
+                    try:
+                        _shutdown_cleanup()  # type: ignore[name-defined]
+                    except NameError:
+                        pass
+                    except Exception as _ce:
+                        print(f"[app_restart] shutdown_cleanup: {_ce}")
                     if self._window:
                         self._window.destroy()
                 except Exception:
@@ -5026,21 +5548,51 @@ class Api:
                         # was `<title> (MM.DD.YY).ext` or `<title>.ext`
                         # under `base`. Scan `base` for something
                         # matching the video ID / title.
+                        # audit E-61: when multiple candidate files
+                        # match, prefer the NEWEST by mtime (this is
+                        # the fresh download). Old code picked the
+                        # first glob hit, which for users with two
+                        # copies pointed at the stale/duplicate file.
+                        # audit F-49: title-prefix fallback now requires
+                        # a full-title match (not just first 50 chars)
+                        # so series with similar long-title prefixes
+                        # ("Video 1:...", "Video 2:...") don't collide.
                         final_path = ""
                         try:
                             import glob as _glob
-                            for _g in _glob.glob(os.path.join(base, "*")):
-                                if _vid and _vid in os.path.basename(_g):
-                                    final_path = _g
-                                    break
+                            _vid_candidates = []
+                            if _vid:
+                                for _g in _glob.glob(os.path.join(base, "*")):
+                                    if _vid in os.path.basename(_g):
+                                        _vid_candidates.append(_g)
+                            if _vid_candidates:
+                                _vid_candidates.sort(
+                                    key=lambda p: os.path.getmtime(p)
+                                    if os.path.isfile(p) else 0,
+                                    reverse=True)
+                                final_path = _vid_candidates[0]
                             if not final_path and _title:
-                                # Fallback: match by title prefix
+                                # Fallback: match by full sanitized title.
                                 _title_sane = _re.sub(
                                     r'[<>:"/\\|?*\x00-\x1f]', "_", _title)
+                                _title_candidates = []
                                 for _g in _glob.glob(os.path.join(base, "*")):
-                                    if os.path.basename(_g).startswith(_title_sane[:50]):
-                                        final_path = _g
-                                        break
+                                    _stem = os.path.splitext(
+                                        os.path.basename(_g))[0]
+                                    # Match if the stem EQUALS the full
+                                    # sanitized title (possibly with a
+                                    # " (MM.DD.YY)" date suffix stripped).
+                                    _stem_no_date = _re.sub(
+                                        r"\s*\(\d{2}\.\d{2}\.\d{2}\)\s*$",
+                                        "", _stem)
+                                    if _stem == _title_sane or _stem_no_date == _title_sane:
+                                        _title_candidates.append(_g)
+                                if _title_candidates:
+                                    _title_candidates.sort(
+                                        key=lambda p: os.path.getmtime(p)
+                                        if os.path.isfile(p) else 0,
+                                        reverse=True)
+                                    final_path = _title_candidates[0]
                         except Exception:
                             pass
                         if final_path and os.path.isfile(final_path):
@@ -5116,13 +5668,27 @@ class Api:
 
     def export_full_backup(self):
         """ZIP the user's config + queue state + cached ID list + seen-filters
-        + disk cache + livestream journal into a user-picked file. Doesn't
-        copy the FTS DB (it's tens of GB for a real archive)."""
+        + disk cache + livestream journal into a user-picked file.
+
+        audit C-14: also include the FTS transcript index DB when it's
+        small enough to fit (< 2GB). Previously the DB was
+        unconditionally skipped, which meant "full backup" restore
+        returned a usable archive browser that then had EVERY
+        transcript search return empty until the user kicked off a
+        full re-transcribe. Now the authoritative search index rides
+        along in the ZIP too — the backup is actually full.
+
+        The 2GB cap is a pragmatic stop: ZIP deflate slows dramatically
+        past that size and the ZIP64 format has its own constraints.
+        For archives where the DB exceeds the cap, the UI surfaces a
+        size warning so users can decide to export manually.
+        """
         try:
             import io as _io, zipfile as _zf, webview as _wv
             from backend.ytarchiver_config import (
                 CONFIG_FILE, QUEUE_FILE, DISK_CACHE_FILE,
                 SEEN_FILTER_TITLES, CHANNEL_ID_CACHE, APP_DATA_DIR,
+                TRANSCRIPTION_DB,
             )
             candidates = [
                 CONFIG_FILE,
@@ -5133,6 +5699,20 @@ class Api:
                 APP_DATA_DIR / "ytarchiver_livestream_defer.json",
                 APP_DATA_DIR / "ytarchiver_pending_transcribe.json",
             ]
+            # audit C-14: opt-in include of the FTS DB if it fits.
+            _fts_skipped_reason = ""
+            try:
+                if TRANSCRIPTION_DB.exists():
+                    _fts_sz = TRANSCRIPTION_DB.stat().st_size
+                    if _fts_sz < 2 * 1024 * 1024 * 1024:
+                        candidates.append(TRANSCRIPTION_DB)
+                    else:
+                        _fts_skipped_reason = (
+                            f"FTS DB skipped — too large "
+                            f"({_fts_sz / (1024**3):.1f} GB > 2 GB). "
+                            f"Back up manually if needed.")
+            except OSError:
+                pass
             if self._window is None:
                 return {"ok": False, "error": "No window"}
             import datetime as _dt
@@ -5158,7 +5738,10 @@ class Api:
                     if snaps:
                         zf.write(str(snaps[0]), arcname=f"backups/{snaps[0].name}")
                         n += 1
-            return {"ok": True, "path": out_path, "files": n}
+            _resp = {"ok": True, "path": out_path, "files": n}
+            if _fts_skipped_reason:
+                _resp["fts_skipped"] = _fts_skipped_reason
+            return _resp
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -5199,6 +5782,8 @@ class Api:
                 return {"ok": False, "error": "Backup is empty"}
 
             # Whitelist — only restore files we recognise from export.
+            # audit C-14: also allow the FTS index DB so backups that
+            # include it can restore cleanly.
             allowed_top = {
                 "ytarchiver_config.json",
                 "ytarchiver_queue.json",
@@ -5207,6 +5792,7 @@ class Api:
                 "ytarchiver_channel_id_cache.json",
                 "ytarchiver_livestream_defer.json",
                 "ytarchiver_pending_transcribe.json",
+                "transcription_index.db",
             }
 
             if not config_is_writable():
@@ -5232,8 +5818,26 @@ class Api:
             # Extract whitelisted files.
             restored = []
             skipped = []
+            # audit F-25: resolve APP_DATA_DIR once for path-containment
+            # checks. Any target that doesn't resolve under it after
+            # path-join gets rejected. This blocks a crafted ZIP with
+            # "backups/../../../../Windows/File.json"-style names from
+            # writing outside APP_DATA_DIR even though each individual
+            # component looks innocuous.
+            _app_data_resolved = Path(str(APP_DATA_DIR)).resolve()
             with _zf.ZipFile(zip_path, "r") as zf:
                 for name in names:
+                    # audit F-25: reject entries containing `..` OR a
+                    # drive letter / absolute path. ZipFile preserves
+                    # the raw name, which on Windows can contain
+                    # drive-qualified paths that write anywhere.
+                    _bad_chars = (".." in name.split("/")
+                                  or name.startswith("/")
+                                  or name.startswith("\\")
+                                  or (len(name) > 1 and name[1] == ":"))
+                    if _bad_chars:
+                        skipped.append(f"{name} (rejected — suspicious path)")
+                        continue
                     # Strip any directory prefix for top-level files; keep
                     # backups/config_*.json in its folder.
                     if name.startswith("backups/") and name.endswith(".json"):
@@ -5244,6 +5848,17 @@ class Api:
                             skipped.append(name)
                             continue
                         target = APP_DATA_DIR / base
+                    # audit F-25: final containment check — resolve the
+                    # target and require it to sit under APP_DATA_DIR.
+                    try:
+                        _t_resolved = Path(str(target)).resolve()
+                        if not str(_t_resolved).startswith(
+                                str(_app_data_resolved)):
+                            skipped.append(f"{name} (rejected — escapes APP_DATA_DIR)")
+                            continue
+                    except Exception:
+                        skipped.append(f"{name} (rejected — path resolve failed)")
+                        continue
                     try:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         with zf.open(name, "r") as src, open(target, "wb") as dst:
@@ -5737,6 +6352,52 @@ def main():
             # 5. Cancel any in-flight sync (best effort).
             try: api._sync_cancel.set()
             except Exception: pass
+            # audit D-57: also kill child yt-dlp / ffmpeg subprocesses
+            # that the sync cancel event might not reach in time.
+            # Without this, quitting during a sync leaves orphan
+            # yt-dlp.exe / ffmpeg.exe finishing their current file
+            # after the parent window is already gone → partial .part
+            # files on disk. psutil is already a dependency.
+            try:
+                import psutil as _ps
+                _me = _ps.Process(os.getpid())
+                for _ch in _me.children(recursive=True):
+                    _name = ""
+                    try: _name = (_ch.name() or "").lower()
+                    except Exception: pass
+                    if any(k in _name for k in
+                           ("yt-dlp", "yt_dlp", "ffmpeg", "ffprobe")):
+                        try: _ch.terminate()
+                        except Exception: pass
+                # Give them a moment, then force-kill stragglers.
+                try:
+                    _gone, _alive = _ps.wait_procs(_me.children(recursive=True),
+                                                    timeout=1.5)
+                    for _ch in _alive:
+                        try: _ch.kill()
+                        except Exception: pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # audit D-56: stop the HTTP servers so port 9855 (cmd)
+            # and the local fileserver port are released cleanly. If
+            # webview.start() ever returns through a path that doesn't
+            # immediately os._exit, these kept the process alive AND
+            # held the ports until reboot — re-launch then failed to
+            # bind 9855.
+            try:
+                from backend import cmd_server as _cs
+                _cs.stop_server()
+            except Exception:
+                pass
+            try:
+                from backend import local_fileserver as _lfs
+                _stop = getattr(_lfs, "stop_server", None)
+                if callable(_stop):
+                    _stop()
+            except Exception:
+                pass
             # 6. Clear TuneShine sync-progress so it doesn't show stale
             # "running" state after the app closes. Matches OLD's
             # YTArchiver.py:34306 _clear_sync_progress() shutdown call.

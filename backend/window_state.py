@@ -16,7 +16,8 @@ Schema:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 from .ytarchiver_config import load_config, save_config
 
@@ -82,6 +83,46 @@ def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
         out["width"] = DEFAULT_STATE["width"]
     if h < 300 or h > 20000:
         out["height"] = DEFAULT_STATE["height"]
+    # audit E-43: if monitor config has changed since the save (dock
+    # unplug, presentation mode turned off a secondary display,
+    # DPI re-scale), clamp the saved x/y to the union of currently-
+    # connected monitor work areas so the window never restores off-
+    # screen. Windows-only (ctypes EnumDisplayMonitors); falls back
+    # to the saved coords on any failure.
+    if os.name == "nt" and out.get("x") is not None and out.get("y") is not None:
+        try:
+            import ctypes as _ct
+            from ctypes import wintypes as _wt
+            _rects: List[Tuple[int, int, int, int]] = []
+            _MON_CB = _ct.WINFUNCTYPE(
+                _ct.c_int, _ct.c_void_p, _ct.c_void_p,
+                _ct.POINTER(_wt.RECT), _ct.c_double)
+
+            def _cb(_hmon, _hdc, lprc, _lparam):
+                r = lprc.contents
+                _rects.append((int(r.left), int(r.top),
+                               int(r.right), int(r.bottom)))
+                return 1
+            _ct.windll.user32.EnumDisplayMonitors(
+                None, None, _MON_CB(_cb), 0)
+            if _rects:
+                _x = int(out["x"]); _y = int(out["y"])
+                _w = int(out.get("width") or DEFAULT_STATE["width"])
+                _h = int(out.get("height") or DEFAULT_STATE["height"])
+                # If at least ~100px of the window intersects ANY monitor,
+                # keep the saved position; otherwise clamp to the first
+                # monitor's work area.
+                _visible = any(
+                    (_x + _w > L and _x < R and _y + _h > T and _y < B)
+                    and min(_x + _w, R) - max(_x, L) >= 100
+                    and min(_y + _h, B) - max(_y, T) >= 100
+                    for L, T, R, B in _rects)
+                if not _visible:
+                    L, T, R, B = _rects[0]
+                    out["x"] = max(L, min(L + 40, R - _w))
+                    out["y"] = max(T, min(T + 40, B - _h))
+        except Exception:
+            pass
     return out
 
 

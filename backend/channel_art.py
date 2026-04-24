@@ -92,6 +92,20 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
                 return {"ok": True, "skipped": True,
                         "avatar_path": avatar_path,
                         "banner_path": banner_path}
+            # audit D-52: when only ONE art file exists (banner failed
+            # on initial fetch, or got deleted manually), the old skip
+            # logic required BOTH to exist and would re-fetch EVERY
+            # call — hammering yt-dlp for channels that simply don't
+            # have a banner. Now: if a zero-byte ".last_attempt"
+            # sentinel exists and is fresh (< 1 day old), skip too.
+            # This throttles repeat probes without requiring both
+            # files to exist.
+            attempt_sentinel = os.path.join(art_dir, ".last_attempt")
+            if os.path.isfile(attempt_sentinel):
+                if (now - os.path.getmtime(attempt_sentinel)) < 86400:
+                    return {"ok": True, "skipped": True,
+                            "avatar_path": avatar_path if os.path.isfile(avatar_path) else "",
+                            "banner_path": banner_path if os.path.isfile(banner_path) else ""}
         except OSError:
             pass
 
@@ -101,9 +115,17 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         return {"ok": False, "error": f"mkdir failed: {e}"}
     _hide_folder_win(art_dir)
 
+    # audit E-40: strip all YouTube sub-page suffixes, not just
+    # /videos. Channels added via a /streams, /shorts, or /about URL
+    # used to fetch metadata for the wrong sub-page and came back
+    # with a missing or wrong banner.
     base_url = ch_url.rstrip("/")
-    if base_url.endswith("/videos"):
-        base_url = base_url[:-len("/videos")]
+    for _suffix in ("/videos", "/streams", "/shorts", "/featured",
+                    "/about", "/community", "/playlists", "/store",
+                    "/releases", "/podcasts"):
+        if base_url.endswith(_suffix):
+            base_url = base_url[:-len(_suffix)]
+            break
 
     yt_dlp = find_yt_dlp() or "yt-dlp"
     cmd = [
@@ -146,6 +168,16 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     # <img src>. Previously only the successful key was present, causing
     # broken-image icons in the Browse grid when only one of avatar/
     # banner fetched successfully.
+    # audit D-52: always stamp the .last_attempt sentinel, regardless
+    # of whether either art download succeeded. The skip-logic above
+    # uses its mtime to throttle retries; without this, channels
+    # whose art genuinely doesn't exist get re-probed on every call.
+    try:
+        _sentinel = os.path.join(art_dir, ".last_attempt")
+        with open(_sentinel, "w", encoding="utf-8") as _sf:
+            _sf.write("ok\n")
+    except OSError:
+        pass
     got = {"ok": True, "avatar_path": None, "banner_path": None}
     if avatar and avatar.get("url") and _http_get(avatar["url"], avatar_path):
         got["avatar_path"] = avatar_path

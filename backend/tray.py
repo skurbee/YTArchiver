@@ -229,7 +229,13 @@ class TrayController:
             try:
                 self._icon.run()
             except Exception as e:
+                # audit F-52: tray run crashed — flip _started back to
+                # False so later callers don't try to operate on a dead
+                # icon and fail silently. Previously _started stayed
+                # True and every start_spin/set_badge/update_tooltip
+                # call hit the dead icon with swallowed exceptions.
                 print(f"[tray] icon.run crashed: {e}")
+                self._started = False
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
@@ -254,7 +260,19 @@ class TrayController:
         self._spin_thread.start()
 
     def stop_spin(self):
+        # audit E-42: join the spin thread (short timeout) before
+        # nulling the ref, so a rapid stop_spin → start_spin cycle
+        # can't race with the old loop still writing icon.icon while
+        # the new loop also writes it. Previously the two threads
+        # overlapped and the icon flickered between their frames,
+        # sometimes getting stuck on an intermediate state.
         self._spin_stop.set()
+        _old_thread = self._spin_thread
+        if _old_thread is not None:
+            try:
+                _old_thread.join(timeout=0.5)
+            except Exception:
+                pass
         self._spin_thread = None
         # Restore base icon (possibly with badge if a count is set)
         if self._icon and self._base_img:

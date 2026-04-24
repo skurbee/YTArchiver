@@ -12,8 +12,14 @@ Additional endpoints the live app has (repair-orphans, repair-duplicates,
 repair-mismatches) are NOT wired here — they'd need the whole playlist-diff
 machinery, and neither viewer calls them in day-to-day use yet.
 
-Bind defaults to 0.0.0.0 so LAN viewers can reach it, matching OLD. Use
-env `YTARCHIVER_CMD_BIND=127.0.0.1` to lock to loopback only.
+Bind defaults to 127.0.0.1 (loopback only). ArchivePlayer's host-discovery
+probes 127.0.0.1 first (archive_player.py:3017) so same-machine integration
+works out of the box. For cross-machine LAN integration — where ArchivePlayer
+runs on a different PC and relies on the /24 subnet scan path — set env
+`YTARCHIVER_CMD_BIND=0.0.0.0` to re-enable LAN binding.
+
+Previous default was 0.0.0.0 which exposed an unauthenticated control plane
+to every host on the LAN. Switched to loopback 2026-04-23 (audit D-40).
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ from typing import Any, Callable, Dict, Optional
 
 
 _CMD_PORT = 9855
-_CMD_BIND = os.environ.get("YTARCHIVER_CMD_BIND", "0.0.0.0")
+_CMD_BIND = os.environ.get("YTARCHIVER_CMD_BIND", "127.0.0.1")
 
 
 _HANDLERS: Dict[str, Dict[str, Callable]] = {"get": {}, "post": {}}

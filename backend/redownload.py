@@ -144,6 +144,17 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             if cancel_ev.is_set():
                 proc.terminate()
                 break
+            # audit E-9: honor pause_ev during the catalog walk. Without
+            # this, a paused user has to wait until the full playlist
+            # enumeration completes (minutes on a 10k-video channel)
+            # before the pause actually acts. Mirrors the pause-wait
+            # pattern used in the download loop at lines ~651-666.
+            while (pause_ev is not None and pause_ev.is_set()
+                   and not cancel_ev.is_set()):
+                time.sleep(0.25)
+            if cancel_ev.is_set():
+                proc.terminate()
+                break
             line = raw.strip()
             if "|||" in line:
                 vid_id, title = line.split("|||", 1)
@@ -744,6 +755,30 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 new_size = os.path.getsize(new_fp)
             except OSError:
                 pass
+            # audit C-4: if the new file is drastically smaller than the
+            # original (<10% of size), it's almost certainly a broken
+            # download (geo-blocked fallback, "video unavailable" stub,
+            # members-only error page). Real down-resolution downloads
+            # (4K → 480p) still produce files 15-20% of source size.
+            # Refuse to replace the original and treat as a download
+            # failure instead.
+            if (orig_size > 0 and new_size > 0
+                    and new_size < (orig_size * 0.10)):
+                stream.emit([
+                    ["[", "simpleline_redwnl"],
+                    [str(file_num), "simpleline"],
+                    ["/", "simpleline_redwnl"],
+                    [str(_live_total), "simpleline"],
+                    ["] ", "simpleline_redwnl"],
+                    [f"{item['title']} \u2014 broken download "
+                     f"({new_size:,} vs original {orig_size:,} bytes) "
+                     f"\u2014 keeping original.\n", "red"],
+                ])
+                try: os.remove(new_fp)
+                except OSError: pass
+                _emit_active(file_num, _live_total)
+                n_err += 1
+                continue
             # Belt-and-suspenders for the `already-at-target` path: if
             # ffprobe missed (returned None and we downloaded anyway) but
             # the resulting file is byte-identical to the original, the
@@ -755,20 +790,26 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     and os.path.isfile(fp)):
                 _ident = False
                 try:
-                    # Chunked compare so a 10GB file doesn't try to
-                    # live in RAM twice. 256KB chunks is enough that
-                    # modern SSDs saturate well before buffer size
-                    # becomes the bottleneck.
+                    # audit E-8: replaced full-file chunked compare (10GB+
+                    # double disk read for every size-match) with a header
+                    # + tail sample. If both 1MB windows match, treat the
+                    # files as identical. The full-compare used to burn
+                    # hours of disk I/O on a mostly-at-target channel
+                    # rescan for vanishingly little correctness gain (two
+                    # videos with byte-identical size+header+tail but
+                    # different middles is a rounding-error-rare case).
                     _ident = True
+                    _SAMPLE = 1 * 1024 * 1024
+                    _orig_sz = orig_size
                     with open(fp, "rb") as _a, open(new_fp, "rb") as _b:
-                        while True:
-                            _ca = _a.read(256 * 1024)
-                            _cb = _b.read(256 * 1024)
-                            if _ca != _cb:
+                        if _a.read(_SAMPLE) != _b.read(_SAMPLE):
+                            _ident = False
+                        elif _orig_sz > _SAMPLE * 2:
+                            _tail_off = _orig_sz - _SAMPLE
+                            _a.seek(_tail_off)
+                            _b.seek(_tail_off)
+                            if _a.read(_SAMPLE) != _b.read(_SAMPLE):
                                 _ident = False
-                                break
-                            if not _ca:
-                                break
                 except OSError:
                     _ident = False
                 if _ident:

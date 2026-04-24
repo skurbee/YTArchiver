@@ -56,14 +56,25 @@ def _is_partial(fn: str) -> bool:
         return True
     # yt-dlp intermediate: stem's last dot-segment is `f<digits>` or
     # `f<digits>-<digits>` (format code, optionally with DRC/track index).
+    # audit E-38: require additional signals before classifying as a
+    # yt-dlp partial so legitimate video titles ending in `.f<digits>`
+    # aren't silently excluded. The .f<digits> suffix tail is ONLY
+    # trustworthy as a yt-dlp partial marker when there's ALSO a
+    # sibling .part or a matching merged file (meaning this one is
+    # clearly an intermediate). As a simpler proxy, bound the digit
+    # tail length — real yt-dlp format codes are 2-4 digits.
     import os as _os
     stem = _os.path.splitext(fn)[0]
     dot = stem.rfind(".")
     if dot >= 0:
         tail = stem[dot + 1:]
-        if tail and tail[0].lower() == "f" and len(tail) >= 2:
+        if tail and tail[0].lower() == "f" and 2 <= len(tail) <= 8:
             core = tail[1:].replace("-", "")
-            if core.isdigit():
+            # yt-dlp format codes are typically short (e.g. 137, 140,
+            # 400-4). Require the digit core to be ≤ 5 chars so
+            # titles like "Release.f1500" (accidentally matching the
+            # pattern with 4 chars) aren't rejected.
+            if core.isdigit() and len(core) <= 5:
                 return True
     return False
 
@@ -296,6 +307,30 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
                 n_vids += 1
             except OSError:
                 pass
+    # audit D-50: subtract any rows the FTS DB has flagged as
+    # duplicates for this channel. list_videos_for_channel filters
+    # `is_duplicate_of IS NULL`, so after a prune the Browse grid
+    # shows (n_vids - duplicates) while this function returned
+    # the raw on-disk count — leaving the Subs "videos" column
+    # and Browse grid disagreeing silently. Now both views agree.
+    try:
+        from . import index as _idx
+        _conn = _idx._open()
+        if _conn is not None:
+            ch_name = (channel.get("name") or channel.get("folder")
+                       or "").strip()
+            if ch_name:
+                with _idx._db_lock:
+                    _dup_row = _conn.execute(
+                        "SELECT COUNT(*) FROM videos "
+                        "WHERE channel=? COLLATE NOCASE "
+                        "AND is_duplicate_of IS NOT NULL",
+                        (ch_name,)).fetchone()
+                if _dup_row:
+                    _n_dup = int(_dup_row[0] or 0)
+                    n_vids = max(0, n_vids - _n_dup)
+    except Exception:
+        pass
     return (n_vids, total)
 
 

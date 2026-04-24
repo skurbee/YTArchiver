@@ -91,6 +91,11 @@ class LogStreamer:
         self._window = window
         self._buffer: List[SegmentList] = []
         self._buffer_activity: List[dict] = []
+        # audit E-17: staging buffers populated by _flush_now_locked
+        # under self._lock; _do_flush reads them from here AFTER the
+        # lock is released so evaluate_js doesn't stall workers.
+        self._pending_main: List[SegmentList] = []
+        self._pending_act: List[dict] = []
         self._lock = threading.Lock()
         self._flush_timer: Optional[threading.Timer] = None
         self._last_flush = 0.0
@@ -138,11 +143,26 @@ class LogStreamer:
         # Feed the disk-error watchdog (and any other scanners) before we
         # buffer — scanners may need to react before the line renders.
         self._run_line_scanners(segments)
+        _fire_now = False
         with self._lock:
             self._buffer.append(segments)
             if len(self._buffer) >= self.MAX_BATCH_SIZE:
+                # audit E-17: swap buffers under lock, fire JS bridge
+                # call outside the lock. Also cancel any scheduled
+                # timer so we don't double-fire.
+                if self._flush_timer is not None:
+                    try: self._flush_timer.cancel()
+                    except Exception: pass
+                    self._flush_timer = None
                 self._flush_now_locked()
-                return
+                _main = self._pending_main
+                _act = self._pending_act
+                self._pending_main = []
+                self._pending_act = []
+                _fire_now = True
+        if _fire_now:
+            self._do_flush(_main, _act)
+            return
         self._schedule_flush()
 
     def emit_text(self, text: str, tag: Optional[str] = None):
@@ -173,25 +193,51 @@ class LogStreamer:
     # ── batching ──
 
     def _schedule_flush(self):
-        if self._flush_timer is not None:
-            return
-        t = threading.Timer(self.BATCH_INTERVAL_SEC, self._flush)
-        t.daemon = True
-        t.start()
-        self._flush_timer = t
+        # audit F-51: check + set _flush_timer inside the lock so two
+        # concurrent emit() calls can't each create a Timer, leaving
+        # orphan timers that fire into a closed window. Previously the
+        # `if _flush_timer is not None: return` check happened outside
+        # any lock, racing with the timer's own self-clear.
+        with self._lock:
+            if self._flush_timer is not None:
+                return
+            t = threading.Timer(self.BATCH_INTERVAL_SEC, self._flush)
+            t.daemon = True
+            t.start()
+            self._flush_timer = t
 
     def _flush(self):
+        # audit E-17: DO NOT hold self._lock while evaluate_js is
+        # running — pywebview's JS bridge can block for seconds under
+        # load (devtools attached, huge payload, GC pause), and every
+        # worker emit() stalls behind it while the lock is held. Swap
+        # the buffers inside the lock, release, then evaluate_js.
         with self._lock:
             self._flush_timer = None
-            self._flush_now_locked()
+            main_batch = self._buffer
+            act_batch = self._buffer_activity
+            self._buffer = []
+            self._buffer_activity = []
+            self._last_flush = time.time()
+        self._do_flush(main_batch, act_batch)
 
     def _flush_now_locked(self):
-        """Must be called with self._lock held."""
+        """Must be called with self._lock held. Swaps buffers out under
+        the caller's lock, but the evaluate_js call itself runs after
+        this method returns (see _flush + flush) so the lock doesn't
+        block on the JS bridge. Kept named *_locked because callers
+        expect it to be lock-safe to invoke."""
         main_batch = self._buffer
         act_batch = self._buffer_activity
         self._buffer = []
         self._buffer_activity = []
         self._last_flush = time.time()
+        # Stash for the caller to flush outside the lock. Writing these
+        # two attrs is safe under the lock; the JS bridge call is not.
+        self._pending_main = main_batch
+        self._pending_act = act_batch
+
+    def _do_flush(self, main_batch, act_batch):
         if not main_batch and not act_batch:
             return
         if self._window is None:
@@ -208,9 +254,19 @@ class LogStreamer:
     # ── helpers ──
 
     def flush(self):
-        """Force an immediate flush. Call before shutting down the window."""
+        """Force an immediate flush. Call before shutting down the window.
+
+        audit E-17: performs the JS-bridge call OUTSIDE the lock so a
+        slow evaluate_js doesn't stall other emit() callers queueing
+        up behind it.
+        """
         with self._lock:
             if self._flush_timer is not None:
                 self._flush_timer.cancel()
                 self._flush_timer = None
             self._flush_now_locked()
+            _main = getattr(self, "_pending_main", [])
+            _act = getattr(self, "_pending_act", [])
+            self._pending_main = []
+            self._pending_act = []
+        self._do_flush(_main, _act)

@@ -249,14 +249,24 @@
     if (baseCls) s.className = baseCls;
     if (text == null || text === "") return s;
 
-    // Build an index of (start, end, cls) ranges
+    // Build an index of (start, end, cls) ranges.
+    // audit F-3: always reset rx.lastIndex at the END of the loop too
+    // (via try/finally). If an error thrown mid-iteration leaves
+    // lastIndex dirty, the NEXT call's rx.exec starts at that stale
+    // offset — highlights would land at wrong offsets and paint the
+    // wrong text. Guarding with try/finally makes the reset
+    // unconditional.
     const ranges = [];
     for (const [rx, cls] of _HIST_HILITE) {
-      let m;
-      rx.lastIndex = 0;
-      while ((m = rx.exec(text)) !== null) {
-        ranges.push({ start: m.index, end: m.index + m[0].length, cls });
-        if (m.index === rx.lastIndex) rx.lastIndex++;
+      try {
+        let m;
+        rx.lastIndex = 0;
+        while ((m = rx.exec(text)) !== null) {
+          ranges.push({ start: m.index, end: m.index + m[0].length, cls });
+          if (m.index === rx.lastIndex) rx.lastIndex++;
+        }
+      } finally {
+        rx.lastIndex = 0;
       }
     }
     if (!ranges.length) { s.textContent = String(text); return s; }
@@ -347,12 +357,23 @@
     });
   };
 
-  /** Append a single activity log entry. */
+  /** Append a single activity log entry.
+   * audit E-18: mirror the main-log cap/keep behavior so the activity
+   * log doesn't grow unbounded. User windows often stay open for days;
+   * without a cap this DOM node accumulates until the layout engine
+   * starts struggling. cap=4000 / keep=2500 gives 1500 lines of
+   * headroom between trims.
+   */
   window.appendActivityLog = function (entry) {
     const el = document.getElementById("activity-log");
     if (!el) return;
     wireUserScrollDetection(el);
     el.appendChild(buildActivityRow(entry));
+    const cap = 4000, keep = 2500;
+    if (el.childElementCount > cap) {
+      const toRemove = el.childElementCount - keep;
+      for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
+    }
     maybeSnapToBottom(el);
   };
 
@@ -383,8 +404,20 @@
         // mini-log clone via the same `data-inplace="<kind>"`
         // selector and replace whichever it hit last — producing
         // doubled lines or the done-line landing in the wrong log.
+        // audit F-2: strip every data-* attribute that participates
+        // in in-place selectors (not just data-inplace). If a future
+        // feature adds another selector-attracting dataset key, the
+        // mini-log clones would silently start colliding with it
+        // again. Enumerating the attribute list and removing any
+        // data-* makes the clones truly inert.
         const clone = all[i].cloneNode(true);
-        clone.removeAttribute("data-inplace");
+        // Collect to a separate array first — DOM mutation during
+        // NamedNodeMap iteration skips entries.
+        const _toRemove = [];
+        for (const _a of clone.attributes) {
+          if (_a.name.startsWith("data-")) _toRemove.push(_a.name);
+        }
+        for (const _n of _toRemove) clone.removeAttribute(_n);
         m.appendChild(clone);
       }
     }
@@ -427,7 +460,11 @@
       // inline trim marker. Re-emits periodically if trimming continues.
       const existing = el.querySelector(".log-line.log-trim-warn");
       if (existing) existing.remove();
-      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+      // audit F-4: dropped the trailing \n — buildLine emits a <div>
+      // per segment and the literal \n was just noise in the cell
+      // (collapsed to whitespace by the default white-space rules,
+      // but still inflated the character count of this one entry).
+      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.", "dim"]]);
       warn.classList.add("log-trim-warn");
       el.insertBefore(warn, el.firstChild);
     }
@@ -436,13 +473,31 @@
   };
 
   /** Append to a mini log (by element id). NO-OP — kept for backward-compat.
-   * Mini logs are now a pure mirror of the last 5 main-log lines. */
+   * Mini logs are now a pure mirror of the last 5 main-log lines.
+   * audit E-20: kept as a no-op shim rather than removed so any legacy
+   * call sites don't ReferenceError. Caller code at
+   * web/app.js:7377-7380 will eventually be removed — this just
+   * absorbs for now. */
   window.appendMiniLog = function () {};
 
-  /** Clear a log container. */
+  /** Clear a log container.
+   * audit E-19: also reset the scrollState.userScrolled flag for the
+   * cleared element so the next appendMainLog auto-scrolls to the
+   * bottom. Without this, "Clear log" while scrolled up left the
+   * element pinned to a non-existent scroll position — new lines
+   * arrived but the log looked frozen.
+   */
   window.clearLog = function (id) {
     const el = document.getElementById(id);
-    if (el) el.innerHTML = "";
+    if (!el) return;
+    el.innerHTML = "";
+    try {
+      const st = scrollState.get(el);
+      if (st) {
+        st.userScrolled = false;
+        el.scrollTop = 0;
+      }
+    } catch {}
     // If the main log was cleared, clear the mirrors too.
     if (id === "main-log") mirrorMiniLogs();
   };
@@ -491,12 +546,21 @@
               && segs[0][1] === "__control__") {
             try {
               const data = JSON.parse(segs[0][0] || "{}");
+              // audit E-22: use CSS.escape on data.marker when building
+              // the selector. If a marker ever contains special CSS
+              // chars (", ], \, etc.) the raw interpolation produces
+              // an invalid selector and querySelectorAll throws —
+              // killing the entire log batch and breaking in-place
+              // replacements downstream. CSS.escape is browser-native.
               if (data.kind === "clear_line" && data.marker) {
                 // Remove matching `data-inplace` elements from BOTH
                 // the committed DOM AND the in-progress fragment —
                 // otherwise a same-batch clear can't see the sibling
                 // inplace line that was just added above it.
-                const sel = `.log-line[data-inplace="${data.marker}"]`;
+                const _esc = (typeof CSS !== "undefined" && CSS.escape)
+                  ? CSS.escape(data.marker) : String(data.marker)
+                    .replace(/["\\\]]/g, "\\$&");
+                const sel = `.log-line[data-inplace="${_esc}"]`;
                 frag.querySelectorAll(sel).forEach((n) => n.remove());
                 el.querySelectorAll(sel).forEach((n) => n.remove());
               }
@@ -547,7 +611,11 @@
           // Inline trim warning, same pattern as appendMainLog.
           const existing = el.querySelector(".log-line.log-trim-warn");
           if (existing) existing.remove();
-          const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.\n", "dim"]]);
+          // audit F-4: dropped the trailing \n — buildLine emits a <div>
+      // per segment and the literal \n was just noise in the cell
+      // (collapsed to whitespace by the default white-space rules,
+      // but still inflated the character count of this one entry).
+      const warn = buildLine([[" \u26A0 Log trimmed \u2014 older lines removed to keep it scrollable.", "dim"]]);
           warn.classList.add("log-trim-warn");
           el.insertBefore(warn, el.firstChild);
         }
@@ -1231,6 +1299,12 @@
   const PREFETCH_LIMIT = 40;
 
   function _prefetchChannelArt(channels) {
+    // audit E-21: explicitly reset the module-level queue at the
+    // top so a second renderChannelGrid call doesn't accidentally
+    // append (safe no-op today — the assignment below replaces —
+    // but defensive against any future refactor that changes the
+    // assignment to a push).
+    _prefetchQueue = [];
     const first = channels.slice(0, PREFETCH_LIMIT);
     const urls = [];
     for (const c of first) {

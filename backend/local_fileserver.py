@@ -28,6 +28,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _server_port: int = 0
 _server_thread: threading.Thread | None = None
+_httpd = None  # audit D-56: module-level handle so stop_server() can
+               # shut the server down cleanly (server_close releases
+               # the port socket; shutdown stops the serve_forever loop).
 _lock = threading.Lock()
 
 
@@ -166,17 +169,42 @@ def _pick_free_port() -> int:
 
 def start_server() -> int:
     """Start the local file server (once). Returns the port number."""
-    global _server_port, _server_thread
+    global _server_port, _server_thread, _httpd
     with _lock:
         if _server_port and _server_thread and _server_thread.is_alive():
             return _server_port
         port = _pick_free_port()
-        httpd = ThreadingHTTPServer(("127.0.0.1", port), _FileRequestHandler)
+        _httpd = ThreadingHTTPServer(("127.0.0.1", port), _FileRequestHandler)
         _server_thread = threading.Thread(
-            target=httpd.serve_forever, name="YTA-FileServer", daemon=True)
+            target=_httpd.serve_forever, name="YTA-FileServer", daemon=True)
         _server_thread.start()
         _server_port = port
         return port
+
+
+def stop_server() -> None:
+    """Shut the server down cleanly. Idempotent — safe to call from
+    shutdown paths even if the server never started.
+
+    audit D-56: without this, the listening socket was held until the
+    Python process exited. On clean webview shutdown paths that
+    returned from webview.start() without hitting os._exit (rare but
+    possible under dev-reload), port 9855's neighbor (this file-
+    server's picked port) would linger, and a re-launch would fail to
+    bind. Calling shutdown() stops the serve_forever loop; server_close
+    frees the socket immediately.
+    """
+    global _server_port, _server_thread, _httpd
+    with _lock:
+        httpd = _httpd
+        _httpd = None
+        _server_port = 0
+        _server_thread = None
+    if httpd is not None:
+        try: httpd.shutdown()
+        except Exception: pass
+        try: httpd.server_close()
+        except Exception: pass
 
 
 def get_port() -> int:

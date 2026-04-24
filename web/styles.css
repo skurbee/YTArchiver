@@ -42,6 +42,12 @@
   --c-log-filterskip-dim: #4a5060;
   --c-livestream: #f5a023;
 
+  /* audit F-45: palette token for the recent/index table's odd-row
+     stripe. Prior code hardcoded #0c0f14 in two places, so tweaking
+     the palette later didn't update these rows. Named token keeps
+     the tonal drift manageable. */
+  --c-log-row-odd: #0c0f14;
+
   /* Fonts */
   --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-log: "Consolas", "Cascadia Mono", "Courier New", monospace;
@@ -552,6 +558,204 @@ body {
   padding-left: 20px !important;
 }
 
+/* Metadata tab — matches the single-column card treatment used on
+   Index so the two sibling panels visually rhyme. Introduced
+   2026-04-23 alongside the bulk views-refresh rollout (see
+   index.html:748 and backend/metadata.py:bulk_refresh_views_likes). */
+.settings-view .metadata-panel {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 22px !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.metadata-hint {
+  color: var(--c-text);
+  opacity: 0.82;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 10px 12px;
+}
+.metadata-bulk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.metadata-bulk-row .spacer { flex: 1 1 auto; }
+.metadata-table-wrap {
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  /* No horizontal scroll — at narrow widths we want the channel
+     name column to ellipsis-truncate instead of letting the right-
+     hand Actions column scroll out of view. Hard UX rule: the
+     action button must never be hidden at any width. Squeeze the
+     most-squishable column (channel name) first; fixed-width
+     columns (counts, timestamps, action) are always visible. */
+  overflow: hidden;
+  background: var(--c-log-bg);
+}
+.metadata-table {
+  width: 100%;
+  /* `table-layout: fixed` binds column widths to their declared
+     sizes — without it, browsers auto-size based on cell content
+     and the "long channel name" overflow would grow the whole
+     table beyond its container. Fixed layout makes the channel
+     cell honor its column width strictly and truncate. */
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--c-text);
+}
+.metadata-table thead th {
+  text-align: left;
+  padding: 7px 10px;
+  background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-accent);
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.metadata-table thead th:hover { background: rgba(160, 170, 187, 0.10); }
+.metadata-table thead th[data-sort-active] { color: var(--c-text); }
+.metadata-table thead th[data-sort-active]::after {
+  content: " \25BE"; /* ▾ */
+  opacity: 0.6;
+  font-size: 10px;
+}
+.metadata-table thead th[data-sort-active][data-sort-dir="asc"]::after {
+  content: " \25B4"; /* ▴ */
+}
+.metadata-table tbody tr {
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.metadata-table tbody tr:last-child { border-bottom: none; }
+.metadata-table tbody tr:hover { background: rgba(160, 170, 187, 0.06); }
+.metadata-table tbody td {
+  padding: 6px 10px;
+  vertical-align: middle;
+}
+/* Channel name column: the ONLY flexible column. Takes whatever
+   horizontal space remains after the fixed-width columns claim
+   theirs, and ellipsis-truncates when space is tight. No min-width
+   — the action button must never be clipped, so the name shrinks
+   down to a few characters + ellipsis if needed. */
+.metadata-table .md-col-name {
+  width: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.metadata-table .md-col-num {
+  width: 54px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-dim);
+}
+.metadata-table .md-col-ts {
+  width: 82px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* Video IDs column — small status icon + optional count. Green
+   when every on-disk file has a resolvable id in the DB; yellow
+   when some are missing (backfill recommended); red when none
+   are set (migrated-from-tkinter archive pre-backfill). */
+.metadata-table .md-col-ids {
+  width: 88px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.metadata-table .md-id-ok { color: #a3c99a; }
+.metadata-table .md-id-warn { color: #e1b25a; }
+.metadata-table .md-id-bad { color: #d87a7a; }
+.metadata-table .md-id-dim { color: var(--c-dim); }
+.metadata-table .md-id-ratio {
+  color: var(--c-dim);
+  font-size: 11px;
+  margin-left: 2px;
+}
+.metadata-table .md-col-act {
+  width: 38px;
+  white-space: nowrap;
+  text-align: center;
+  padding-left: 2px !important;
+  padding-right: 2px !important;
+}
+/* Single-button "⋯" menu opener for a row's action picker. Sized
+   to be a comfy 26×22 click target but still narrow enough for
+   tight panel widths. Prev: 3 visible buttons ≈ 190px of column. */
+.metadata-table .md-row-act-menu {
+  width: 26px;
+  height: 22px;
+  padding: 0 !important;
+  margin: 0 !important;
+  line-height: 18px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+/* Warning tint on the menu button when the row needs a Fix IDs
+   pass — gives a gentle visual cue without adding another column. */
+.metadata-table .md-row-act-warn {
+  color: #e1b25a;
+  border-color: rgba(225, 178, 90, 0.4);
+}
+.metadata-table .md-row-act-warn:hover {
+  border-color: #e1b25a;
+}
+.metadata-table .md-ts-never { color: #d87a7a; }
+.metadata-table .md-ts-old { color: #e1b25a; }
+.metadata-table .md-ts-fresh { color: #a3c99a; }
+.metadata-table .md-empty {
+  text-align: center;
+  color: var(--c-dim);
+  padding: 20px !important;
+  font-style: italic;
+}
+.metadata-table .md-row-act-btn {
+  display: inline-block;
+  padding: 2px 6px;
+  margin-left: 3px;
+  background: transparent;
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  border-radius: 2px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.metadata-table .md-row-act-btn:hover {
+  background: rgba(160, 170, 187, 0.12);
+  border-color: var(--c-accent);
+}
+/* Fix IDs button when the channel doesn't need fixing — visually
+   deemphasized so the user's eye is drawn to the rows that DO need
+   attention. Still clickable (user may want to force a re-check). */
+.metadata-table .md-row-act-btn.md-row-act-dim {
+  opacity: 0.5;
+}
+.metadata-table .md-row-act-btn.md-row-act-dim:hover {
+  opacity: 1;
+}
+
 /* Single-column views (Index) — match the card-container treatment */
 .settings-view .settings-index-grid {
   width: 100%;
@@ -815,15 +1019,20 @@ body {
 }
 
 /* Big Pause button (Download tab) — GLOBAL pause/resume for both queues.
-   Idle = transparent/ghost so it reads as "nothing special happening".
-   Paused = solid green to match the sync icon-btn paused blink style.
+   Per 2026-04-23 UX feedback: the old transparent/ghost style while
+   running made the button look disabled or inactive — easy to miss
+   as a clickable control. Now:
+     running → solid blue (clearly "this does something")
+     paused  → solid green (inviting "click to resume")
+     disabled → inherits default .btn:disabled (opacity 0.4)
    data-pause-state is set by paintBlinkState() in app.js. */
 .btn-pause {
-  background: transparent;
-  border-color: var(--c-border);
+  background: #234866;
+  border-color: #3c6690;
+  color: var(--c-text);
   transition: background 0.12s, border-color 0.12s;
 }
-.btn-pause:hover { background: var(--c-btn); }
+.btn-pause:hover { background: #2f5b80; border-color: #4c7cab; }
 .btn-pause[data-pause-state="paused"] {
   background: #3a5a3a;
   border-color: #4a6a4a;
@@ -831,10 +1040,15 @@ body {
 .btn-pause[data-pause-state="paused"]:hover {
   background: #457a5a;
 }
+/* audit E-27: keep pointer-events enabled on disabled buttons so
+   hover tooltips still fire (they usually explain WHY the button is
+   disabled — kills discoverability otherwise). Clicks are still
+   blocked via the native `disabled` attribute on <button> elements;
+   the `.disabled` class mirrors that behavior via JS handlers. */
 .btn.disabled, .btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
-  pointer-events: none;
+  /* pointer-events: none;  -- removed, see above. */
 }
 
 .btn-thin {
@@ -1051,6 +1265,13 @@ body {
   background: var(--c-bg);
   cursor: ns-resize;
   position: relative;
+}
+/* audit F-41: keyboard affordance. JS (panel.js / equivalent) sets
+   tabindex=0 on the splitter so it can receive focus; this outline
+   makes the focused state visible for keyboard-only users. */
+.paned-splitter:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -2px;
 }
 .paned-splitter::after {
   content: "";
@@ -1745,7 +1966,11 @@ body {
   border-color: #8a4e1c;
   color: var(--c-text);
 }
-.btn-warn:hover { background: #5a2f0d; }
+/* audit E-28: hover LIGHTER than base, matching other warn/danger
+   buttons. Previous hover (#5a2f0d) was darker than base (#6b3a10),
+   which visually read as "pressed" or "disabled" on hover rather
+   than the expected brighten. */
+.btn-warn:hover { background: #7e4616; }
 .recent-table-frame {
   flex: 1 1 auto;
   min-height: 0;
@@ -1793,7 +2018,8 @@ body {
 .recent-table col.col-time { width: 100px; }
 .recent-table col.col-length { width: 72px; }
 .recent-table col.col-size { width: 72px; }
-.recent-table tbody tr:nth-child(odd) td { background: #0c0f14; }
+/* audit F-45: use the palette token (see :root --c-log-row-odd). */
+.recent-table tbody tr:nth-child(odd) td { background: var(--c-log-row-odd); }
 .recent-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
 .recent-table tbody tr:hover td { background: rgba(255,255,255,0.04); }
 .recent-table tbody tr.row-selected td { background: rgba(96,160,255,0.12); }
@@ -2485,6 +2711,11 @@ body {
 .video-grid-month-head:hover .vgy-label {
   color: var(--c-accent);
 }
+/* audit E-30: target the month section's OWN inner wrapper, not
+   the year wrapper (a month section never contains a year-inner).
+   Both class names are covered defensively so whichever the HTML
+   actually uses gets hidden. */
+.video-grid-month-section.collapsed .video-grid-month-inner,
 .video-grid-month-section.collapsed .video-grid-year-inner {
   display: none;
 }
@@ -2494,13 +2725,20 @@ body {
   border-radius: 4px;
   overflow: hidden;
   cursor: pointer;
-  transition: transform 0.12s, border-color 0.12s;
+  /* audit E-29: remove `transform` from the transition so :hover
+     doesn't trigger a layer thrash across dense grids. Same perf
+     trap called out in .channel-card (removed there). */
+  transition: border-color 0.12s;
   display: flex;
   flex-direction: column;
 }
 .video-card:hover {
+  /* audit E-29: removed transform:translateY(-2px) — each hover
+     promoted the card to its own composite layer, which on 100+
+     cards created a cascade of repaints and dropped the framerate
+     during fast cursor movement. Border-color change is enough
+     visual feedback. */
   border-color: var(--c-accent);
-  transform: translateY(-2px);
 }
 .video-thumb {
   position: relative;
@@ -2831,8 +3069,12 @@ body {
   background: var(--c-log-bg);
   min-height: 0;
 }
-.search-result.selected {
-  background: rgba(108, 180, 238, 0.18) !important;
+/* audit F-47: dropped `!important` from the background. Using
+   higher specificity (.search-results .search-result.selected)
+   keeps precedence over :hover without locking out future states
+   like :focus-visible / .flash-hit etc. */
+.search-results .search-result.selected {
+  background: rgba(108, 180, 238, 0.18);
   border-left: 3px solid var(--c-accent);
   padding-left: 9px;
 }
@@ -3018,7 +3260,9 @@ body {
 .chart-type-btn:hover { background: var(--c-btn-hvr, rgba(255,255,255,0.05)); color: var(--c-text); }
 .chart-type-btn.active {
   background: var(--c-accent);
-  color: #0f1012;
+  /* audit F-46: use var(--c-bg) so theme drift is safe — hardcoded
+     #0f1012 would stop inverting cleanly if --c-bg ever changes. */
+  color: var(--c-bg);
   font-weight: 600;
 }
 /* Word cloud — positioned over the graph canvas */
@@ -3100,7 +3344,8 @@ body {
   border-radius: 2px;
   background: var(--c-log-bg);
 }
-.index-table tbody tr:nth-child(odd) td { background: #0c0f14; }
+/* audit F-45: use the palette token (see :root --c-log-row-odd). */
+.index-table tbody tr:nth-child(odd) td { background: var(--c-log-row-odd); }
 .index-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
 
 .browse-tree-pane {
@@ -3280,9 +3525,14 @@ body {
 .index-roots-list .root-entry.auto {
   color: var(--c-dim);
 }
+/* audit E-31: WCAG AA contrast fix — the old combo of --c-accent bg
+   (#a0aabb grey-blue) with white text gave ~2.8:1 contrast ratio,
+   below AA's 4.5:1 minimum for normal text. Switched to a tinted
+   overlay with full-strength body text — same "selected" affordance
+   at much higher readability. */
 .index-roots-list .root-entry.selected {
-  background: var(--c-accent);
-  color: #fff;
+  background: rgba(160, 170, 187, 0.22);
+  color: var(--c-text);
 }
 .index-section-buttons {
   display: flex;
@@ -3423,6 +3673,11 @@ body {
   0% { background-position: 0% 0; }
   100% { background-position: 200% 0; }
 }
+/* audit F-43: the progress bar's -3px bottom margin used to pull
+   the next sibling up under it, making the first ~3px of the first
+   search result unclickable (the sticky bar intercepted the click).
+   Removed the negative margin; the 3px height + sticky now occupy
+   proper space without overlapping results. */
 .search-progress-bar {
   position: sticky;
   top: 0;
@@ -3437,7 +3692,7 @@ body {
       transparent 100%)
     0 0 / 200% 100% no-repeat;
   animation: search-progress-kf 1.2s linear infinite;
-  margin: 0 0 -3px;
+  margin: 0;
 }
 
 /* ═══ Un-indexed warning banner (Search + Graph views) ═══ */
@@ -3626,6 +3881,14 @@ body {
   color: var(--c-log-txt);
   white-space: nowrap;
 }
+/* audit F-48: give mini-log lines an ellipsis when the content
+   overflows the frame width instead of silently clipping. Long
+   channel names / titles that used to disappear without warning
+   now get a "..." hint that there's more content. */
+.mini-log .log-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* ═══ Placeholder panels for non-implemented tabs ═══ */
 .placeholder-panel {
@@ -3690,14 +3953,25 @@ body {
   border-color: var(--c-accent);
 }
 .askq-buttons {
-  padding: 10px 14px;
   display: flex;
   justify-content: flex-end;
-  flex-wrap: wrap; /* wrap onto a new row when too many choices */
+  flex-wrap: wrap;
   row-gap: 6px;
   gap: 6px;
-  border-top: 1px solid var(--c-border);
   background: rgba(0, 0, 0, 0.15);
+}
+/* Two-row layout: actions on top (all green / primary by default),
+   Cancel alone on the bottom (red / danger). Splitting them keeps
+   the "go" affordances cleanly grouped and prevents Cancel from
+   wrapping into a row with action buttons at narrow dialog widths.
+   Flagged via UX feedback: a 4-button dialog was rendering with
+   Cancel stranded next to two actions while the third wrapped. */
+.askq-buttons-actions {
+  padding: 10px 14px 6px;
+  border-top: 1px solid var(--c-border);
+}
+.askq-buttons-cancel {
+  padding: 0 14px 10px;
 }
 .askq-buttons .btn {
   min-width: 84px;

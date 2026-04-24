@@ -59,7 +59,14 @@ _VIDEO_SIBLING_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
 
 
 def _sidecars_for(video: Path) -> List[Path]:
-    """Return any .txt/.jsonl/.info.json/.jpg files that share the video stem."""
+    """Return any .txt/.jsonl/.info.json/.jpg files that share the video stem.
+
+    audit D-8: match on EXACT stem equality (file stem == video stem),
+    not prefix. Old code used `p.name.startswith(stem)`, which matched
+    `X_Part2.txt` to video `X.mp4` → moving X.mp4 dragged Part2's
+    transcripts along for the ride. Now we compare stems exactly,
+    which also handles the dot-before-extension convention correctly.
+    """
     stem = video.stem
     folder = video.parent
     out: List[Path] = []
@@ -68,9 +75,14 @@ def _sidecars_for(video: Path) -> List[Path]:
             continue
         if p == video:
             continue
-        if p.name.startswith(stem) and p.suffix.lower() in _SIDECAR_EXTS:
+        # Exact stem match handles the common case:
+        #   X.mp4 → X.txt, X.jsonl, X.info.json, X.jpg
+        if p.stem == stem and p.suffix.lower() in _SIDECAR_EXTS:
             out.append(p)
-        elif p.name.startswith(stem + ".") and p.name.endswith(".info.json"):
+            continue
+        # Compound suffix exception: `.info.json` is two extensions so
+        # Path.stem gives `X.info`, not `X`. Match via explicit prefix.
+        if p.name == stem + ".info.json":
             out.append(p)
     return out
 
@@ -107,8 +119,45 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
     target_dir.mkdir(parents=True, exist_ok=True)
     dst = target_dir / video.name
     if dst.exists():
-        stream.emit_dim(f" [skip] already exists at destination: {video.name}")
-        return False
+        # audit E-13: destination collision. Before, we silently left
+        # the source in place AND kept going, which for a previously-
+        # interrupted reorg produced duplicate files in both folders
+        # with no dedupe. Now: if dst and src look identical (same
+        # size + mtime within 2s), assume this is a resumed reorg and
+        # remove the source as cleanup. If they differ, emit an error
+        # so the user can investigate instead of silent leak.
+        try:
+            _s_stat = video.stat()
+            _d_stat = dst.stat()
+            _same = (_s_stat.st_size == _d_stat.st_size
+                     and abs(_s_stat.st_mtime - _d_stat.st_mtime) <= 2.0)
+        except OSError:
+            _same = False
+        if _same:
+            try:
+                video.unlink()
+                stream.emit_dim(
+                    f" [dedup] removed duplicate source: {video.name}")
+                # Also move/remove sidecars so they don't linger.
+                for _sc in _sidecars_for(video):
+                    _sc_dst = target_dir / _sc.name
+                    if _sc_dst.exists():
+                        try: _sc.unlink()
+                        except OSError: pass
+                    else:
+                        try: shutil.move(str(_sc), str(_sc_dst))
+                        except OSError: pass
+                return True
+            except OSError as _ue:
+                stream.emit_dim(
+                    f" [skip] duplicate but couldn't remove source: "
+                    f"{video.name} ({_ue})")
+                return False
+        else:
+            stream.emit_error(
+                f" [conflict] different file already at destination "
+                f"for {video.name} \u2014 leaving both in place.")
+            return False
     sidecars = _sidecars_for(video)
     has_sibling = _has_video_sibling(video)
     try:
@@ -197,7 +246,13 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
             break
         if not p.is_file():
             continue
-        if p.suffix.lower() not in (".mp4", ".mkv", ".webm", ".m4a", ".mov"):
+        # audit E-14: use the shared _VIDEO_EXTS constant so "Fix file
+        # dates" handles the same file types as the full reorg walker.
+        # Previously the hard-coded 5-ext list silently skipped
+        # .avi / .flv / .wmv / .m4v / .wav / .mp3 / .flac archives,
+        # leaving their mtimes wrong after a full reorg had already
+        # moved them.
+        if p.suffix.lower() not in _VIDEO_EXTS:
             continue
         d = _date_from_info_json(p)
         if d is None:
@@ -331,6 +386,18 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
             continue
         if _move_video(video, target, stream):
             moved += 1
+            # audit F-28: re-stamp the moved file's mtime to the date
+            # we chose for it. On StableBit DrivePool pooled drives a
+            # cross-physical-drive move can reset mtime to "now", and
+            # future reorg passes would then classify this file under
+            # today's year instead of its upload year — silently
+            # rotating files through folders.
+            try:
+                _moved_path = target / video.name
+                ts_stamp = d.timestamp()
+                os.utime(_moved_path, (ts_stamp, ts_stamp))
+            except (OSError, ValueError):
+                pass
             # Every 10 instead of 25 — on a ≤24-video reorg the old
             # threshold never fired, making the pass look stalled.
             if moved % 10 == 0:
@@ -338,7 +405,15 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         else:
             errors += 1
 
-    _cleanup_empty_dirs(root)
+    # audit F-27: skip the empty-dirs sweep when the pass was
+    # cancelled. Half-moved state with some files in year folders and
+    # others still flat is a legitimate intermediate; sweeping
+    # away the emptied source folders in that state would remove
+    # useful structure the user might want to resume into.
+    if cancel_event is not None and cancel_event.is_set():
+        stream.emit_dim(" \u2014 cancel: skipping empty-folder cleanup.")
+    else:
+        _cleanup_empty_dirs(root)
 
     # Drop the sticky active-status line before the done-summary.
     _clear_active()

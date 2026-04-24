@@ -41,9 +41,19 @@ _DISK_ERROR_PATTERNS = [
     # ALL workers for 5 minutes on a benign YouTube restriction.
     # Require a filesystem-specific context keyword alongside so only
     # real write failures trigger the pause.
-    r"Permission denied.*(?:writ|output|file|disk|save)",
+    # audit F-53: stricter Permission-denied pattern. Require the
+    # associated path to end in a media/partial extension so yt-dlp's
+    # age-gate / cookie-expired errors don't trip the watchdog (they
+    # say "Permission denied" with no file path).
+    r"Permission denied:.*\.(part|temp|ytdl|mp4|mkv|webm|m4a)",
     r"(?:writ|output|file|disk|save).*Permission denied",
-    r"HTTP Error 5\d\d", # not a disk error but signals upstream trouble
+    # Windows variant of the same error.
+    r"Access is denied.*\.(part|temp|ytdl|mp4|mkv|webm|m4a)",
+    # audit D-12: HTTP 5xx REMOVED — it was flagging YouTube's
+    # upstream errors as "DISK ERROR" and pausing every worker for
+    # 5 minutes on transient 502s from YouTube. Disk and upstream
+    # service outages are unrelated; mixing them in the watchdog
+    # pattern was pure noise.
 ]
 _DISK_ERROR_RE = re.compile("|".join(_DISK_ERROR_PATTERNS), re.IGNORECASE)
 
@@ -51,7 +61,15 @@ DISK_RETRY_MINUTES = 5 # mirrors YTArchiver._DISK_RETRY_MINUTES
 
 
 def _check_directory_writable(path: str) -> bool:
-    """Return True if we can open and delete a probe file in `path`."""
+    """Return True if we can open and delete a probe file in `path`
+    AND at least 2 GB of free space is available.
+
+    audit D-13: the bare writability probe passed at 1 MB free, which
+    let the monitor prematurely "recover" after an ENOSPC pause — the
+    next multi-GB download immediately failed, tripping the pause
+    again. Require meaningful free space before declaring the drive
+    healthy so recovery doesn't oscillate.
+    """
     if not path:
         return False
     try:
@@ -62,6 +80,16 @@ def _check_directory_writable(path: str) -> bool:
             f.write("ok")
         try: os.remove(probe)
         except OSError: pass
+        # Minimum 2 GB free before calling the drive "writable" from
+        # a watchdog-recovery perspective. Tunable via env.
+        try:
+            import shutil as _sh
+            _min_free = int(os.environ.get("YTARCHIVER_DISK_MIN_FREE_GB", "2"))
+            _free_bytes = _sh.disk_usage(path).free
+            if _free_bytes < _min_free * 1024 * 1024 * 1024:
+                return False
+        except Exception:
+            pass
         return True
     except OSError:
         return False

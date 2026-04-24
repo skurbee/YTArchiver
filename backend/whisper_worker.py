@@ -25,8 +25,16 @@ Protocol:
 import sys, json, os, io
 
 # Save real stdout for our JSON protocol, redirect stdout/stderr to suppress
-# prints from huggingface_hub downloads, tqdm bars, or import warnings
+# prints from huggingface_hub downloads, tqdm bars, or import warnings.
+# audit D-54: keep a handle to the REAL stderr so crashes during model
+# load or transcription land somewhere the parent can read. Previously
+# the io.StringIO capture was restored to sys.__stderr__ on line 49, but
+# the parent spawned this subprocess with stderr=DEVNULL anyway, so
+# nothing ever surfaced. The parent side must pass stderr=subprocess.PIPE
+# (see transcribe.py start_subprocess) for the captured stderr to be
+# readable on abnormal exit.
 _out = sys.stdout
+_real_err = sys.stderr
 sys.stdout = io.StringIO()
 sys.stderr = io.StringIO()
 

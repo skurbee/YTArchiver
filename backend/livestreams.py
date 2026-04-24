@@ -85,12 +85,16 @@ def ignore(video_id: str) -> bool:
     that encounter this ID via line_looks_live will NOT re-defer it
     because defer() checks the ignore set first.
     """
+    global _ignore_cache, _ignore_cache_loaded
     if not video_id:
         return False
     with _lock:
         ids = _load_ignore()
         ids.add(video_id)
         _save_ignore(ids)
+        # Invalidate the cache — next is_ignored() re-reads.
+        _ignore_cache = ids
+        _ignore_cache_loaded = True
         # Also drop from deferred so it disappears from the drawer.
         items = _load()
         new = [it for it in items if it.get("video_id") != video_id]
@@ -99,10 +103,25 @@ def ignore(video_id: str) -> bool:
     return True
 
 
+_ignore_cache: Optional[set] = None
+_ignore_cache_loaded = False
+
+
 def is_ignored(video_id: str) -> bool:
+    """audit F-54: in-memory cache of the ignore set. Old code read
+    the file from disk on EVERY call, which was called in tight loops
+    during sync. Now the set is lazy-loaded once and invalidated by
+    `ignore()` on write. Wrapped in the module lock so
+    concurrent-write races are defined (mark_seen-style duplicate
+    lines are no longer possible)."""
+    global _ignore_cache, _ignore_cache_loaded
     if not video_id:
         return False
-    return video_id in _load_ignore()
+    with _lock:
+        if not _ignore_cache_loaded:
+            _ignore_cache = _load_ignore()
+            _ignore_cache_loaded = True
+        return video_id in (_ignore_cache or set())
 
 
 def defer(video_id: str, title: str = "", channel_url: str = "") -> bool:
@@ -191,15 +210,24 @@ def count() -> int:
 # ── Livestream-line detector for yt-dlp stdout ─────────────────────────
 
 # Patterns yt-dlp uses when a video is live / scheduled / premiere.
+# audit E-41: stricter phrases so ordinary upload titles containing
+# "is live" (e.g. "Tom's wedding is live now!") don't silently defer.
+# yt-dlp's actual live-detection messages are full-sentence, not
+# fragment matches — this list uses the longer authoritative phrases
+# yt-dlp emits. Fragmentary matches could still legitimately apply
+# to some yt-dlp variants; rely on the surrounding context (error
+# prefix) via the caller's other filters to disambiguate.
 _LIVE_MARKERS = (
-    "is live",
+    "this video is live",
+    "this live stream",
     "is currently live",
     "premieres in",
     "scheduled live",
-    "starts in",
+    "live event starts in",
     "will begin at",
     "scheduled to start",
     "this live event",
+    "waiting for stream",
 )
 
 

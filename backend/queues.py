@@ -69,6 +69,16 @@ class QueueState:
         # Listeners notified on any state change (UI push)
         self._listeners: List[Callable[[], None]] = []
 
+        # audit D-35: register atexit hook so a crash/kill within the
+        # 2s debounce window still flushes. Idempotent — atexit only
+        # fires once per process, and _atexit_flush is a no-op when
+        # nothing is pending.
+        try:
+            import atexit as _atx
+            _atx.register(self._atexit_flush)
+        except Exception:
+            pass
+
     # ── listener registration ───────────────────────────────────────
 
     def add_listener(self, fn: Callable[[], None]):
@@ -140,7 +150,31 @@ class QueueState:
                 "gpu_paused": self.gpu_paused,
                 "sync_paused": self.sync_paused,
             }
-            # Include in-flight items so they survive restart
+            # audit C-11: in-flight items now persist in a separate
+            # `resuming` dict instead of being inserted at the front of
+            # the regular queue lists. Old behavior re-popped the same
+            # item on next boot and treated it as a normal queued job,
+            # which silently re-processed it (partial downloads got
+            # re-run, retranscribes silently reverted to regular
+            # transcribes). Putting them in `resuming` means load()
+            # can emit a visible "restart notice" and requeue them in
+            # a controlled way rather than letting them race the fresh
+            # boot state.
+            resuming: Dict[str, Any] = {}
+            if self.current_sync is not None:
+                resuming["sync"] = copy.deepcopy(self.current_sync)
+            if self.current_redownload is not None:
+                resuming["redownload"] = copy.deepcopy(self.current_redownload)
+            if self.current_metadata is not None:
+                resuming["metadata"] = copy.deepcopy(self.current_metadata)
+            if self.current_gpu is not None:
+                resuming["gpu"] = copy.deepcopy(self.current_gpu)
+            if resuming:
+                payload["resuming"] = resuming
+            # Also keep the legacy-style front-insertion so existing
+            # load() code paths (and any third-party tools reading the
+            # file) see in-flight items in the queue. The new
+            # `resuming` key is additive; load() uses it when present.
             if self.current_sync is not None:
                 payload["sync"].insert(0, copy.deepcopy(self.current_sync))
             if self.current_redownload is not None:
@@ -159,7 +193,14 @@ class QueueState:
             return False
 
     def save_debounced(self):
-        """Schedule a save for _save_interval_sec from now (coalesces bursts)."""
+        """Schedule a save for _save_interval_sec from now (coalesces bursts).
+
+        audit D-35: an atexit hook is registered at construction
+        (see __init__) so that if the app is killed or crashes during
+        the 2-second debounce window, pending changes still flush to
+        disk. Without this, close-during-queue-edit silently lost the
+        latest enqueue/remove.
+        """
         with self._lock:
             if self._save_timer is not None:
                 return
@@ -172,6 +213,21 @@ class QueueState:
         with self._lock:
             self._save_timer = None
         self.save_now()
+
+    def _atexit_flush(self):
+        """atexit hook — cancel any pending debounce timer and force a
+        synchronous save. No-op if nothing is pending. Called once per
+        process at interpreter shutdown."""
+        try:
+            with self._lock:
+                t = self._save_timer
+                self._save_timer = None
+            if t is not None:
+                try: t.cancel()
+                except Exception: pass
+            self.save_now()
+        except Exception:
+            pass
 
     # ── sync queue ──────────────────────────────────────────────────
 
@@ -199,8 +255,18 @@ class QueueState:
             if not self.sync:
                 return None
             ch = self.sync.pop(0)
-            self.order = [o for o in self.order
-                          if not (o and o[0] == "sync" and o[1] == ch.get("url"))]
+            # audit E-15: remove only the FIRST matching order entry
+            # (not all of them). Same URL can legitimately have multiple
+            # sync jobs queued (e.g. a Download task and a separate
+            # Metadata-recheck task — `sync_enqueue` dedupes on
+            # (kind, url), not url alone). Wiping all order entries for
+            # that URL dropped the bookkeeping for the OTHER pending
+            # job, which then dispatched out of insertion order.
+            _u = ch.get("url")
+            for _i, _o in enumerate(self.order):
+                if _o and _o[0] == "sync" and _o[1] == _u:
+                    self.order.pop(_i)
+                    break
         self._notify()
         self.save_debounced()
         return ch
@@ -511,6 +577,11 @@ class QueueState:
     # ── stats ───────────────────────────────────────────────────────
 
     def counts(self) -> Dict[str, int]:
+        # audit E-16: include transcribe + video counts so the UI
+        # badge totals don't silently undercount. Old counts() only
+        # returned sync/gpu/redownload/metadata/reorg, so items on
+        # transcribe/video lists were invisible to any caller using
+        # this dict for summaries.
         with self._lock:
             return {
                 "sync": len(self.sync) + (1 if self.current_sync else 0),
@@ -518,6 +589,8 @@ class QueueState:
                 "redownload": len(self.redownload),
                 "metadata": len(self.metadata),
                 "reorg": len(self.reorg),
+                "transcribe": len(self.transcribe),
+                "video": len(self.video),
             }
 
     # ── restore-on-launch helpers ───────────────────────────────────

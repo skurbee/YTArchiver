@@ -95,18 +95,28 @@ def set_cached_ids(url: str, ids: Iterable[str]):
 
 
 def append_ids(url: str, new_ids: Iterable[str]):
-    """Merge new IDs into the cache (front of list)."""
+    """Merge new IDs into the cache (front of list).
+
+    audit D-53: DON'T touch last_refreshed here. Only
+    `set_cached_ids` / `refresh_cache_via_ytdlp` should reset the
+    timestamp, because those are the paths that actually walk the
+    full channel. Updating last_refreshed on every 1-video append
+    made a cache built 3 months ago look perpetually fresh, so sync
+    skipped the full --flat-playlist walk forever — even though the
+    cache was wildly incomplete by then.
+    """
     new = [i for i in new_ids if i]
     if not new:
         return
     with _lock:
         _load_locked()
-        rec = _cache.setdefault(url, {"last_refreshed": time.time(), "ids": []})
-        existing = set(rec.get("ids", []))
+        # Preserve existing last_refreshed (or default to 0 if brand-new).
+        # Only `set_cached_ids` / `refresh_cache_via_ytdlp` should bump it.
+        rec = _cache.setdefault(url, {"last_refreshed": 0.0, "ids": []})
         # Prepend newly-downloaded IDs (they're latest)
         merged = list(new) + [i for i in rec.get("ids", []) if i not in set(new)]
         rec["ids"] = merged
-        rec["last_refreshed"] = time.time()
+        # NOTE: intentionally not updating rec["last_refreshed"] here.
         _save_locked()
 
 

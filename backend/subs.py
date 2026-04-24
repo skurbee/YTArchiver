@@ -130,11 +130,24 @@ def validate_channel_url(url: str) -> Tuple[bool, str]:
     parsed = urlparse(norm)
     if parsed.scheme not in ("http", "https"):
         return False, "URL must start with http:// or https://."
-    if "youtube.com" not in parsed.netloc and "youtu.be" not in parsed.netloc:
-        return False, "URL must be a youtube.com link."
+    # audit D-6: reject youtu.be — that's the short video-URL form and
+    # never hosts channels. Accepting it let users paste a video URL,
+    # pass validation, then sync tried to walk "a channel" built from
+    # one video's URL → garbage results silently.
+    if "youtube.com" not in parsed.netloc:
+        return False, "URL must be a youtube.com channel link (not youtu.be)."
     path = parsed.path.strip("/")
     if not path:
         return False, "URL must include a channel path (/@handle, /channel/UC..., /c/name, /user/name)."
+    # audit D-7: verify the path LOOKS like a channel path, not a
+    # watch/playlist URL. Accepting /watch?v=... as "a channel" meant
+    # sync enumerated a single-video URL and produced silent
+    # wrong-result output.
+    _valid_prefixes = ("@", "channel/UC", "c/", "user/")
+    if not any(path.startswith(p) for p in _valid_prefixes):
+        return False, ("URL doesn't look like a channel path. "
+                       "Expected one of: /@handle, /channel/UC..., /c/name, /user/name. "
+                       "Watch (/watch?v=...) and playlist URLs are not channels.")
     return True, ""
 
 
@@ -441,6 +454,19 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
     old_name = (existing.get("name") or existing.get("folder") or "").strip()
     new_name = (updated.get("name") or updated.get("folder") or "").strip()
     if old_name and new_name and old_name != new_name:
+        # audit E-47: preflight — refuse if the new name collides with
+        # ANY other existing channel. Without this, two channels could
+        # end up with the same normalized name, which then has
+        # _find_channel lookups return whichever was seen first.
+        _new_lower = new_name.lower()
+        for _j, _other in enumerate(channels):
+            if _j == idx:
+                continue
+            _o_name = (_other.get("name") or _other.get("folder") or "").strip().lower()
+            if _o_name == _new_lower:
+                raise SubsError(
+                    f"A channel named {new_name!r} already exists. "
+                    f"Choose a different name.")
         base = (cfg.get("output_dir") or "").strip()
         if base:
             old_path = _os.path.join(base, _sync.sanitize_folder(old_name))
@@ -450,19 +476,16 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
                     _os.rename(old_path, new_path)
                     updated["_folder_renamed"] = {"from": old_path, "to": new_path}
                 except OSError as e:
-                    # bug S-4: old code just captured the error and
-                    # saved the new name anyway, creating a
-                    # disk-vs-config mismatch (config says "NewName",
-                    # folder is still "OldName", next sync creates an
-                    # empty "NewName" folder alongside). Preserve the
-                    # old name and surface the error so the UI can
-                    # toast. The caller (main.py subs_update_channel)
-                    # checks `_folder_rename_error` in the response.
-                    updated["name"] = old_name
-                    updated["folder"] = old_name
-                    if "folder_override" in updated:
-                        updated["folder_override"] = old_name
-                    updated["_folder_rename_error"] = str(e)
+                    # audit E-45: if the folder rename fails, REJECT the
+                    # whole update. Old behavior silently reverted name
+                    # to old_name but still saved OTHER mutations (res,
+                    # compress settings, etc.) — creating a partial-
+                    # apply state that the user didn't intend.
+                    # Now we raise; caller turns it into a UI error and
+                    # the user sees the full update didn't land.
+                    raise SubsError(
+                        f"Could not rename folder from {old_name!r} to "
+                        f"{new_name!r}: {e}. No settings saved.")
 
     # Sanity: refuse to save a channel with a blanked-out name. Matches the
     # add_channel guard — prevents sync from routing to _unnamed/ on the
@@ -495,11 +518,16 @@ def remove_channel(identity: Dict[str, str],
     if idx is None:
         raise SubsError(f"Channel not found: {identity}")
     ch = dict(channels[idx])
-    channels.pop(idx)
-    saved = save_config(cfg)
 
-    result: Dict[str, Any] = {"ok": bool(saved), "deleted_folder": False}
-    if saved and delete_files:
+    # audit E-46: delete files FIRST, then update the config. Old
+    # order (pop + save_config before delete) meant a crash mid-delete
+    # left the config updated but the folder orphaned — the user
+    # couldn't retry delete-files via the UI because the channel was
+    # already gone from the subs list. Now the folder delete runs
+    # first; the subs-list removal only happens after the delete
+    # resolves (or was never requested).
+    result: Dict[str, Any] = {"ok": False, "deleted_folder": False}
+    if delete_files:
         base = (cfg.get("output_dir") or "").strip()
         if base:
             try:
@@ -511,7 +539,16 @@ def remove_channel(identity: Dict[str, str],
                     result["deleted_folder"] = True
                     result["folder_path"] = folder_path
             except Exception as e:
+                # Delete failed — surface the error but STILL drop the
+                # subs-list entry. The alternative (keeping it in the
+                # list) leaves the user stuck with a broken record
+                # that their UI can't recover from. Partial success is
+                # strictly better than no-progress.
                 result["delete_error"] = str(e)
+    # Now drop the subs-list entry and persist config.
+    channels.pop(idx)
+    saved = save_config(cfg)
+    result["ok"] = bool(saved)
     return result
 
 

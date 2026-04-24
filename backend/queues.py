@@ -522,6 +522,12 @@ class QueueState:
             # check metadata part of these tasks in queue are supposed
             # to be colored pink LIKE THEY WERE IN PREVIOUS VERSION."
             return f"Metadata check \u2014 {name}"
+        if kind == "videoid_backfill":
+            # Fix IDs task — share the Metadata color family (pink)
+            # since it's a metadata-kind repair, not a download. Label
+            # starts with "Metadata" so colorizeTaskName picks up the
+            # pink `qv-meta` class like the other metadata rows.
+            return f"Metadata ID fix \u2014 {name}"
         if kind == "redownload":
             # Classic showed active redownload as "Redownload
             # ChannelName (480p)" with a Pause/Resume state.

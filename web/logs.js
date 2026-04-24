@@ -73,6 +73,11 @@
       if (t === "metadata_active") return t;
       if (t === "compress_active") return t;
       if (t === "reorg_active") return t;
+      // Video ID backfill — two progress phases that replace in-
+      // place: "Fetched N videos from YouTube catalog..." counter,
+      // then the "[N/M] matched K so far..." match-loop counter.
+      // Both cleared via clear_line when the final summary emits.
+      if (t === "backfill_progress") return t;
     }
 
     // Pass 2 — prefix-family matches (shared in-place families)

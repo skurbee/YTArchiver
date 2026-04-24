@@ -1092,13 +1092,16 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             _now = time.time()
             if (_tick_count % _PROGRESS_TICK_EVERY == 0
                     or (_now - _last_tick_ts) >= _PROGRESS_TICK_SECS):
-                # Non-dim tag so the tick stays visible in Simple
-                # mode — the user's specifically watching this
-                # long-running op for a heartbeat.
+                # In-place update on a single line ("backfill_progress"
+                # is registered in logs.js _inplaceKind so each emit
+                # with this marker replaces the previous one instead
+                # of appending). Cleared by clear_line when the final
+                # summary emits so the transient counter doesn't
+                # persist after completion.
                 try:
                     stream.emit([[f"  \u2014 Fetched {_tick_count:,} videos "
                                  f"from YouTube catalog\u2026\n",
-                                 "simpleline"]])
+                                 ["simpleline", "backfill_progress"]]])
                 except Exception:
                     pass
                 _last_tick_ts = _now
@@ -1917,31 +1920,51 @@ def backfill_video_ids(channel: Dict[str, Any],
                                      n=5, cutoff=0.80)
         if not matches:
             return ""
+        # Score everything up front so both the date-approved path
+        # AND the high-confidence-no-date escape can reuse the
+        # ratios without re-running SequenceMatcher.
+        scored: List[Tuple[str, float]] = []  # (vid, ratio)
+        for _m in matches:
+            _v = _title_to_vid_local.get(_m)
+            if not _v:
+                continue
+            _r = SequenceMatcher(None, needle_nt, _m).ratio()
+            scored.append((_v, _r))
+        if not scored:
+            return ""
+
         # Apply date filter to ALL candidates above the cutoff. This
         # is the core of Scott's "date tiebreak when titles are
         # similar" rule — a title that fuzzy-matches several videos
         # only resolves if exactly one of them also lines up on
         # upload date.
-        date_approved: List[Tuple[str, float]] = []  # (vid, ratio)
-        for _m in matches:
-            _v = _title_to_vid_local.get(_m)
-            if not _v:
-                continue
-            if not _date_confirms(_v, local_day):
-                continue
-            _r = SequenceMatcher(None, needle_nt, _m).ratio()
-            date_approved.append((_v, _r))
-        if not date_approved:
-            return ""
+        date_approved = [(v, r) for (v, r) in scored
+                         if _date_confirms(v, local_day)]
         if len(date_approved) == 1:
             return date_approved[0][0]
-        # Multiple candidates both pass title + date. Take the one
-        # with the highest ratio, but ONLY if it's clearly ahead of
-        # the next one (>=0.05 margin) — otherwise it's still too
-        # close to call and we decline rather than guess.
-        date_approved.sort(key=lambda r: r[1], reverse=True)
-        if date_approved[0][1] - date_approved[1][1] >= 0.05:
-            return date_approved[0][0]
+        if len(date_approved) >= 2:
+            # Multiple pass title + date. Take the highest ratio,
+            # but only if >=0.05 clear of the next — otherwise too
+            # close to call and we decline rather than guess.
+            date_approved.sort(key=lambda r: r[1], reverse=True)
+            if date_approved[0][1] - date_approved[1][1] >= 0.05:
+                return date_approved[0][0]
+            return ""
+
+        # High-confidence-no-date escape (Scott's request). When the
+        # date-approved path found nothing, fall back to accepting
+        # a match if there's exactly ONE candidate with ratio
+        # >= 0.95. That similarity is basically "near-identical
+        # string"; two different videos rarely hit 0.95 on the
+        # normalized-title form. Useful when a file's mtime was
+        # bumped (re-encode, tool touch, missing --mtime on old
+        # downloads) so the date check rejects an otherwise-
+        # obvious match. Any ambiguity at the 0.95 threshold and
+        # we bail — the conservative principle still holds.
+        _HIGH_CONF = 0.95
+        _high = [(v, r) for (v, r) in scored if r >= _HIGH_CONF]
+        if len(_high) == 1:
+            return _high[0][0]
         return ""
 
     def _find_date_match(filepath: str,
@@ -1990,9 +2013,12 @@ def backfill_video_ids(channel: Dict[str, Any],
     _match_total = len(on_disk)
     if _match_total > 0:
         try:
+            # Same "backfill_progress" marker so this transition
+            # line REPLACES the last "Fetched N videos..." tick
+            # (both phases share one in-place line).
             stream.emit([[f"  \u2014 Catalog has {len(bulk):,} videos \u00b7 "
                          f"matching {_match_total:,} local file(s)\u2026\n",
-                         "simpleline"]])
+                         ["simpleline", "backfill_progress"]]])
         except Exception:
             pass
     _match_processed = 0
@@ -2017,7 +2043,8 @@ def backfill_video_ids(channel: Dict[str, Any],
                 _so_far = sum(resolved_by.values())
                 stream.emit([[f"  \u2014 [{_match_processed:,}/"
                              f"{_match_total:,}] matched {_so_far:,} "
-                             f"so far\u2026\n", "simpleline"]])
+                             f"so far\u2026\n",
+                             ["simpleline", "backfill_progress"]]])
             except Exception:
                 pass
             _match_last_tick = _now
@@ -2154,7 +2181,28 @@ def backfill_video_ids(channel: Dict[str, Any],
     if not _parts:
         _parts.append("no on-disk videos")
     _summary = " \u00b7 ".join(_parts)
-    _tag = "simpleline_pink" if resolved else "dim"
+    # Clear the sticky "backfill_progress" in-place line so the
+    # transient counter ("Fetched 1,000 videos from YouTube
+    # catalog...") doesn't linger beside the final summary.
+    try:
+        import json as _json
+        stream.emit([[_json.dumps({
+            "kind": "clear_line", "marker": "backfill_progress"}),
+            "__control__"]])
+    except Exception:
+        pass
+    # Final summary tag: pink on newly-resolved work, plain-white
+    # simpleline otherwise. The dim tag made "already-set + some
+    # unresolved" summaries look faded even though they're a
+    # normal successful outcome — no new work to do because every
+    # video was already set. Only fall back to dim if there was
+    # literally nothing to report (no on-disk videos).
+    if resolved:
+        _tag = "simpleline_pink"
+    elif _parts == ["no on-disk videos"]:
+        _tag = "dim"
+    else:
+        _tag = "simpleline"
     stream.emit([
         [" \u2014 ", "meta_bracket"],
         [f"{name}: {_summary} (took {took:.1f}s)\n", _tag],

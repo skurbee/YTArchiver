@@ -31,6 +31,36 @@ _db_lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 
 
+def _open_independent() -> Optional[sqlite3.Connection]:
+    """Open a FRESH SQLite connection (separate from the shared `_conn`).
+
+    Long-running background work (the startup sweep especially) used to
+    funnel every per-file write through `_conn` + the Python-level
+    `_db_lock`, which serialized ALL DB activity across the app. While
+    the sweep was running, sync's DLTRACK `register_video` calls and
+    transcribe's FTS-ingest calls had to wait — observed as a video
+    stuck at "Downloading 100%" for many minutes during boot.
+
+    With a separate connection, the sweep no longer competes for
+    `_db_lock`. SQLite's WAL mode (already enabled at the file level
+    by `_open()`'s init) handles cross-connection serialization at the
+    DB layer — multiple readers run concurrently, and brief writes
+    from sync interleave with the sweep's writes via SQLite's much
+    finer-grained per-write lock.
+
+    Caller is responsible for closing the connection when done.
+    """
+    try:
+        TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(str(TRANSCRIPTION_DB),
+                            check_same_thread=False, timeout=30.0)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        return c
+    except Exception:
+        return None
+
+
 # ── DB open / schema ────────────────────────────────────────────────────
 
 def _open() -> Optional[sqlite3.Connection]:
@@ -216,7 +246,8 @@ def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[
 def register_video(filepath: str, channel: str, title: Optional[str] = None,
                    tx_status: str = "pending",
                    video_id: Optional[str] = None,
-                   duration_secs: Optional[float] = None) -> bool:
+                   duration_secs: Optional[float] = None,
+                   _conn_override: Optional[sqlite3.Connection] = None) -> bool:
     """Add a newly downloaded video to the videos table.
 
     Called by sync.py each time a .mp4 lands. Browse tab + Index tab both
@@ -225,8 +256,15 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
     If `video_id` is provided (e.g. from yt-dlp's DLTRACK line), it takes
     priority over trying to parse it out of the filename — necessary for
     drop-in-compatible filenames that don't embed `[videoID]`.
+
+    `_conn_override`: caller may supply its OWN sqlite3 connection (from
+    `_open_independent()`) to bypass the shared `_db_lock` — used by
+    `sweep_new_videos` so the long-running boot sweep doesn't block sync's
+    DLTRACK register calls. WAL mode handles cross-connection
+    serialization at the SQLite layer.
     """
-    conn = _open()
+    use_override = _conn_override is not None
+    conn = _conn_override if use_override else _open()
     if conn is None:
         return False
     fp = os.path.normpath(filepath)
@@ -277,7 +315,13 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
     except OSError:
         upload_ts = None
     try:
-        with _db_lock:
+        # When the caller provided their own connection, skip _db_lock
+        # entirely — SQLite's WAL handles cross-connection serialization,
+        # and acquiring the Python lock would re-introduce the bottleneck
+        # this whole feature exists to bypass.
+        from contextlib import nullcontext as _nullctx
+        _ctx = _nullctx() if use_override else _db_lock
+        with _ctx:
             # audit C-10: preserve `added_ts` on re-register.
             # INSERT OR REPLACE silently wiped it every time sweep
             # re-registered an existing video, making "new in last 7
@@ -379,9 +423,16 @@ def mark_video_transcribed(filepath: str) -> bool:
 # ── Transcript ingest (from .jsonl sidecar) ─────────────────────────────
 
 def ingest_jsonl(video_filepath: str, jsonl_path: str,
-                 title: str, channel: str) -> int:
-    """Load a .jsonl transcript into segments + FTS. Returns segment count."""
-    conn = _open()
+                 title: str, channel: str,
+                 _conn_override: Optional[sqlite3.Connection] = None) -> int:
+    """Load a .jsonl transcript into segments + FTS. Returns segment count.
+
+    `_conn_override`: see register_video — caller may supply their own
+    connection (from `_open_independent()`) so the call doesn't compete
+    for `_db_lock`. Used by `sweep_new_videos`.
+    """
+    use_override = _conn_override is not None
+    conn = _conn_override if use_override else _open()
     if conn is None:
         return 0
     fp = os.path.normpath(video_filepath)
@@ -415,7 +466,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         return 0
 
     try:
-        with _db_lock:
+        # When the caller provided their own connection, skip _db_lock
+        # (see register_video for the reasoning).
+        from contextlib import nullcontext as _nullctx
+        _ctx = _nullctx() if use_override else _db_lock
+        with _ctx:
             # audit C-9: FTS5 external-content tables don't auto-sync
             # when rows are deleted from the content table. Without
             # the explicit FTS delete-from-content idiom, re-ingesting
@@ -1662,14 +1717,25 @@ def sweep_new_videos(output_dir: str, channels: list,
     status line. Called on the same thread as the walk.
 
     Returns {registered, ingested} counts.
+
+    The sweep uses its OWN sqlite3 connection (via _open_independent)
+    so its many per-file writes don't go through the shared `_db_lock`.
+    Without this, sync's DLTRACK register_video calls + transcribe's
+    FTS-ingest calls all serialized behind the sweep's lock acquisition,
+    causing visible "Downloading 100%" hangs of many minutes during
+    boot. WAL mode handles cross-connection serialization at the
+    SQLite layer instead.
     """
     from pathlib import Path as _Path
     import os as _os
 
     if not output_dir:
         return {"registered": 0, "ingested": 0}
-    conn = _open()
-    if conn is None:
+    # Make sure the shared connection's schema-init has run at least
+    # once (creates tables, sets PRAGMAs at the file level).
+    _ = _open()
+    sweep_conn = _open_independent()
+    if sweep_conn is None:
         return {"registered": 0, "ingested": 0}
 
     _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
@@ -1677,12 +1743,13 @@ def sweep_new_videos(output_dir: str, channels: list,
     registered = 0
     ingested = 0
 
-    # Cache existing filepaths to avoid hitting the DB per file
-    with _db_lock:
-        existing = {r[0].lower() for r in conn.execute("SELECT filepath FROM videos").fetchall()
-                    if r[0]}
-        indexed_jsonls = {r[0].lower() for r in conn.execute("SELECT path FROM indexed_files").fetchall()
-                          if r[0]}
+    # Cache existing filepaths to avoid hitting the DB per file. Use
+    # the sweep's private connection — readers in WAL mode never block
+    # writers, so this doesn't compete with anything.
+    existing = {r[0].lower() for r in sweep_conn.execute("SELECT filepath FROM videos").fetchall()
+                if r[0]}
+    indexed_jsonls = {r[0].lower() for r in sweep_conn.execute("SELECT path FROM indexed_files").fetchall()
+                      if r[0]}
 
     # Per-channel folder fingerprint — lets us skip channels whose
     # folder tree hasn't been touched since the last successful sweep.
@@ -1816,7 +1883,10 @@ def sweep_new_videos(output_dir: str, channels: list,
                         if (jp_lower not in indexed_jsonls
                                 and _os.path.isfile(jp)):
                             title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
-                            if ingest_jsonl(fp, jp, title, ch_name):
+                            # Pass sweep_conn so this call doesn't compete
+                            # for _db_lock — see _open_independent docstring.
+                            if ingest_jsonl(fp, jp, title, ch_name,
+                                            _conn_override=sweep_conn):
                                 ingested += 1
                         continue
                     # New file — need size now (both for 0-byte skip
@@ -1827,14 +1897,15 @@ def sweep_new_videos(output_dir: str, channels: list,
                         continue
                     if size == 0:
                         continue
-                    register_video(fp, ch_name)
+                    register_video(fp, ch_name, _conn_override=sweep_conn)
                     registered += 1
                     # Ingest .jsonl sidecar if present.
                     base = _os.path.splitext(fp)[0]
                     jp = base + ".jsonl"
                     if _os.path.isfile(jp):
                         title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
-                        if ingest_jsonl(fp, jp, title, ch_name):
+                        if ingest_jsonl(fp, jp, title, ch_name,
+                                        _conn_override=sweep_conn):
                             ingested += 1
         # Channel walk completed — stamp the fingerprint so next
         # sweep can skip if unchanged. Stamp AFTER the walk so a
@@ -1865,6 +1936,13 @@ def sweep_new_videos(output_dir: str, channels: list,
             _save_dc(_fp_cache)
         except Exception:
             pass
+
+    # Close the sweep's private connection — best-effort, don't fail the
+    # whole sweep if close raises (DB file is fine either way).
+    try:
+        sweep_conn.close()
+    except Exception:
+        pass
 
     return {"registered": registered, "ingested": ingested,
             "skipped_unchanged": skipped_unchanged,

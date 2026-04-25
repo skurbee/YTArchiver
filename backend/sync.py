@@ -991,29 +991,22 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                         break
                             if _dlrow_n is None:
                                 _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
-                                # Path-match fell through to orphan, so the
-                                # progress row for THIS video is still
-                                # sitting at its own dlrow_<N> in the DOM
-                                # with no marker match to our done line.
-                                # Best-effort cleanup: emit a clear_line
-                                # control for `dlrow_{_DLROW_COUNTER}` so
-                                # whatever stuck Downloading row was
-                                # anchored to the most recent counter
-                                # gets removed from DOM. Also add it to
-                                # _closed_dlrows so any late progress
-                                # ticks for this counter are dropped.
-                                import json as _json_mod
-                                _stuck_kind = f"dlrow_{_DLROW_COUNTER}"
-                                try:
-                                    stream.emit([
-                                        [_json_mod.dumps({
-                                            "kind": "clear_line",
-                                            "marker": _stuck_kind,
-                                        }), "__control__"],
-                                    ])
-                                except Exception:
-                                    pass
-                                _closed_dlrows.add(_DLROW_COUNTER)
+                                # Path-match fell through to orphan. The
+                                # done line lands at log bottom; the
+                                # actual orphaned in-place row (whichever
+                                # dlrow this video was anchored to) gets
+                                # cleaned up by the post-channel sweep
+                                # at the end of sync_channel — sweeping
+                                # `_path_to_counter.values() - _closed_dlrows`
+                                # catches every dlrow that never got a
+                                # done-line, regardless of how the path
+                                # match failed. Trying to guess the
+                                # right counter HERE was wrong: when
+                                # video 1's DLTRACK fires after video
+                                # 2's Destination, _DLROW_COUNTER points
+                                # to video 2, so clearing
+                                # `dlrow_{_DLROW_COUNTER}` would wipe
+                                # video 2's actively-downloading row.
                             else:
                                 _done_kind = f"dlrow_{_dlrow_n}"
                                 # Close this dlrow — any further progress
@@ -1311,13 +1304,21 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     if _ctr == _DLROW_COUNTER:
                         _disp = _path_to_display_title.get(_fp)
                         break
-                # Bug [98]: emit a fallback progress line even when
-                # the title isn't resolvable yet (the Destination line
-                # for this counter hasn't been processed). Previously
-                # we silently dropped the tick, leaving the UI looking
-                # stuck for a video that's actually downloading.
+                # If no title is resolvable, drop the tick silently.
+                # The previous "Bug [98]" fallback emitted a visible
+                # "Downloading #N" placeholder, but yt-dlp emits
+                # progress for sidecars / metadata / pre-flight before
+                # the main-video Destination line \u2014 so that fallback
+                # produced visible orphan lines for every channel
+                # that had a fast first-tick (Dr Insanity #0, etc).
+                # The original "UI looks stuck" risk Bug [98] tried to
+                # address turned out to be theoretical \u2014 in practice
+                # Destination fires before any visible progress for
+                # the actual video, so the lookup succeeds for real
+                # video progress. Sidecars / metadata are fast enough
+                # that dropping their ticks is invisible.
                 if not _disp:
-                    _disp = f"#{_DLROW_COUNTER}"
+                    continue
                 stream.emit([
                     [" ", ["dim", _prog_kind]],
                     ["\u2014 Downloading ", ["simpleline_green", _prog_kind]],
@@ -1742,6 +1743,29 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # after this point (shouldn't happen for sync-originated jobs since
     # we already consumed + emitted, but harmless if it does).
     clear_sync_active(name)
+
+    # Post-channel orphan cleanup: any dlrow_<N> we created via a
+    # Destination line but never closed via a DLTRACK done emit is an
+    # orphan (path-match failure, sidecar-only Destination, etc.). The
+    # in-place line for it is sitting visible as "Downloading Title
+    # 100%" with no done-line replacement. Sweep them now and emit
+    # clear_line markers so they vanish from the log before the next
+    # channel's rows render.
+    try:
+        import json as _json_mod_clean
+        for _ctr in set(_path_to_counter.values()) - _closed_dlrows:
+            _stuck_kind = f"dlrow_{_ctr}"
+            try:
+                stream.emit([
+                    [_json_mod_clean.dumps({
+                        "kind": "clear_line",
+                        "marker": _stuck_kind,
+                    }), "__control__"],
+                ])
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # audit D-3: ok is now True only when yt-dlp exited with a
     # recognized code (0 = clean, 1 = "some entries failed" which

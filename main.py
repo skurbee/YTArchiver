@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v57.7"
-APP_VERSION_DATE = "4.24.26 11:52pm"
+APP_VERSION      = "v57.8"
+APP_VERSION_DATE = "4.25.26 12:14am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -714,35 +714,55 @@ class Api:
     # ─── Queue mutations (right-click menu) ────────────────────────────
 
     def queues_sync_remove(self, identifier):
-        """Remove a pending sync item by URL (primary) or channel name.
-        `sync_remove` matches on `url` field; if the identifier doesn't
-        look like a URL, fall through to a second pass that matches on
-        `name` / `folder` to handle payloads where the URL was empty."""
+        """Remove ONE pending sync item by URL or channel name.
+        First-match semantics — when the queue has duplicates (same
+        channel queued for download AND metadata refresh), only the
+        first one drops. The popover X-click should prefer
+        `queues_sync_remove_at` (index-based with identity guard);
+        this method is a fallback for callers without an index."""
         ident = str(identifier or "").strip()
         ok = self._queues.sync_remove(ident)
         if not ok and ident:
-            # Try name / folder fallback — loop through and match by
-            # the channel's visible label instead of URL.
+            # Name / folder fallback — first match only (was: list
+            # comprehension that dropped EVERY matching row, which
+            # surprised users who clicked X on one duplicate row and
+            # watched two disappear).
             with self._queues._lock:
-                before = len(self._queues.sync)
-                self._queues.sync = [
-                    c for c in self._queues.sync
-                    if (c.get("name") or c.get("folder") or "") != ident
-                ]
-                ok = before != len(self._queues.sync)
+                target_idx = -1
+                for i, c in enumerate(self._queues.sync):
+                    if (c.get("name") or c.get("folder") or "") == ident:
+                        target_idx = i
+                        break
+                if target_idx >= 0:
+                    del self._queues.sync[target_idx]
+                    ok = True
             if ok:
                 self._queues._notify()
                 self._queues.save_debounced()
         self._on_queue_changed()
         return {"ok": ok}
 
+    def queues_sync_remove_at(self, idx, expected_url="", expected_name=""):
+        """Remove the sync queue item at exactly `idx` (the row index
+        the user actually clicked X on in the popover). The optional
+        identity hints prevent deleting the wrong item if the queue
+        shifted between paint and click."""
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad index"}
+        ok = self._queues.sync_remove_at(
+            i,
+            expected_url=str(expected_url or "").strip(),
+            expected_name=str(expected_name or "").strip(),
+        )
+        self._on_queue_changed()
+        return {"ok": ok}
+
     def queues_gpu_remove(self, identifier):
-        """Remove a pending GPU job by path (preferred) or bulk_id.
-        If the identifier starts with a recognizable bulk-id prefix
-        (hex tokens from `chan_transcribe_pending`), fall through to
-        `gpu_remove_bulk` to drop every sibling in that bulk at once —
-        otherwise the coalesced "Transcribe {ch} (N videos)" row only
-        removes a single underlying job per click."""
+        """Remove ONE pending GPU job by path (preferred) or bulk_id.
+        First-match semantics. The popover X-click should prefer
+        `queues_gpu_remove_at` (index-based with identity guard)."""
         ident = str(identifier or "").strip()
         if not ident:
             return {"ok": False}
@@ -751,6 +771,23 @@ class Api:
             # Fallback: treat as bulk_id.
             dropped = self._queues.gpu_remove_bulk(ident)
             ok = dropped > 0
+        self._on_queue_changed()
+        return {"ok": ok}
+
+    def queues_gpu_remove_at(self, idx, expected_path="", expected_bulk_id=""):
+        """Remove the GPU queue item at exactly `idx` (the row index
+        the user actually clicked X on). For coalesced "Transcribe X
+        (N videos)" rows the popover should call queues_gpu_remove_bulk
+        instead — this drops a single slot."""
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad index"}
+        ok = self._queues.gpu_remove_at(
+            i,
+            expected_path=str(expected_path or "").strip(),
+            expected_bulk_id=str(expected_bulk_id or "").strip(),
+        )
         self._on_queue_changed()
         return {"ok": ok}
 

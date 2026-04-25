@@ -291,16 +291,71 @@ class QueueState:
         return ch
 
     def sync_remove(self, url: str) -> bool:
+        """Remove ONE queued sync item matching `url`.
+
+        Two callers (frontend X click + main.py fallback). When the
+        same URL appears multiple times in the queue (e.g. a download
+        + a metadata refresh for the same channel), only the FIRST
+        matching item is removed — the X click is a per-row action,
+        not a per-channel sweep.
+
+        For exact-row removal (the common case from the popover X
+        click), prefer sync_remove_at(idx, expected_url) which
+        identifies the item by position — see logs.js:1077.
+        """
         with self._lock:
-            before = len(self.sync)
-            self.sync = [c for c in self.sync if c.get("url") != url]
-            self.order = [o for o in self.order
-                          if not (o and o[0] == "sync" and o[1] == url)]
-            changed = len(self.sync) != before
-        if changed:
-            self._notify()
-            self.save_debounced()
-        return changed
+            target_idx = -1
+            for i, c in enumerate(self.sync):
+                if c.get("url") == url:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                return False
+            del self.sync[target_idx]
+            # Drop ONE matching order entry (same first-match rule).
+            for j, o in enumerate(self.order):
+                if o and o[0] == "sync" and o[1] == url:
+                    del self.order[j]
+                    break
+        self._notify()
+        self.save_debounced()
+        return True
+
+    def sync_remove_at(self, idx: int, expected_url: str = "",
+                       expected_name: str = "") -> bool:
+        """Remove the queued sync item at exactly `idx`, with an
+        identity guard so we don't accidentally delete a different
+        item if the queue shifted between paint and click.
+
+        `expected_url` / `expected_name` describe what the caller
+        thought was at that slot — we refuse to delete if neither
+        matches. Both empty = skip the guard (legacy callers).
+        """
+        with self._lock:
+            if idx < 0 or idx >= len(self.sync):
+                return False
+            item = self.sync[idx]
+            if expected_url or expected_name:
+                cur_url = (item.get("url") or "").strip()
+                cur_name = (item.get("name")
+                            or item.get("folder") or "").strip()
+                # Allow either match — frontend may pass whichever
+                # field was visible. Refuse only when BOTH disagree.
+                _url_ok = (not expected_url) or (cur_url == expected_url)
+                _name_ok = (not expected_name) or (cur_name == expected_name)
+                if not (_url_ok or _name_ok):
+                    return False
+            removed_url = (item.get("url") or "").strip()
+            del self.sync[idx]
+            # Drop the matching order entry (first one with this URL).
+            if removed_url:
+                for j, o in enumerate(self.order):
+                    if o and o[0] == "sync" and o[1] == removed_url:
+                        del self.order[j]
+                        break
+        self._notify()
+        self.save_debounced()
+        return True
 
     def sync_clear(self) -> int:
         """Remove every queued sync task; keep the currently-running one.
@@ -366,15 +421,42 @@ class QueueState:
         return it
 
     def gpu_remove(self, task_id: str) -> bool:
+        """Remove ONE queued GPU item matching `task_id` (id or path).
+        First-match semantics — when the same path appears twice the
+        X click only drops the one the user clicked. For exact-row
+        removal, prefer gpu_remove_at(idx, expected_path)."""
         with self._lock:
-            before = len(self.gpu)
-            self.gpu = [i for i in self.gpu
-                        if (i.get("id") or i.get("path")) != task_id]
-            changed = len(self.gpu) != before
-        if changed:
-            self._notify()
-            self.save_debounced()
-        return changed
+            target_idx = -1
+            for i, item in enumerate(self.gpu):
+                if (item.get("id") or item.get("path")) == task_id:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                return False
+            del self.gpu[target_idx]
+        self._notify()
+        self.save_debounced()
+        return True
+
+    def gpu_remove_at(self, idx: int, expected_path: str = "",
+                      expected_bulk_id: str = "") -> bool:
+        """Remove the queued GPU item at exactly `idx`, with an
+        identity guard. See sync_remove_at — same idea."""
+        with self._lock:
+            if idx < 0 or idx >= len(self.gpu):
+                return False
+            item = self.gpu[idx]
+            if expected_path or expected_bulk_id:
+                cur_path = (item.get("path") or "").strip()
+                cur_bulk = str(item.get("bulk_id") or "").strip()
+                _path_ok = (not expected_path) or (cur_path == expected_path)
+                _bulk_ok = (not expected_bulk_id) or (cur_bulk == expected_bulk_id)
+                if not (_path_ok or _bulk_ok):
+                    return False
+            del self.gpu[idx]
+        self._notify()
+        self.save_debounced()
+        return True
 
     def gpu_remove_bulk(self, bulk_id: str) -> int:
         """Remove every GPU queue item sharing a `bulk_id`. Returns the

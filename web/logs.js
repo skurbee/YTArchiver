@@ -1066,35 +1066,71 @@
       // YTArchiver.py:20131 _active_label cycling dots.
       const dotsSpan = statusCls === "running" ? '<span class="queue-task-dots"></span>' : "";
 
+      // X button hidden for the running row — that item lives in
+      // current_sync / current_gpu, NOT in queues.sync / queues.gpu.
+      // An index-based delete on the running row would silently drop
+      // the next-queued item (the one that visually slid up to slot 0
+      // after the running row's translation). For running rows the
+      // user should use the right-click context menu's Skip / Cancel
+      // actions instead.
+      const closeBtnHtml = statusCls === "running"
+        ? ""
+        : '<button class="queue-task-close" title="Remove">&times;</button>';
+
       row.innerHTML = `
         <span class="queue-task-index">${i + 1}.</span>
         <span class="queue-task-state ${statusCls}">${stateGlyph}</span>
         <span class="queue-task-name"></span>${dotsSpan}
-        <button class="queue-task-close" title="Remove">&times;</button>
+        ${closeBtnHtml}
       `;
       row.querySelector(".queue-task-name").innerHTML = nameHtml;
 
-      row.querySelector(".queue-task-close").addEventListener("click", (e) => {
+      row.querySelector(".queue-task-close")?.addEventListener("click", (e) => {
         e.stopPropagation();
-        const idx = Number(row.dataset.idx);
-        const removed = _queueState[queueKind][idx];
-        _queueState[queueKind].splice(idx, 1);
+        const popoverIdx = Number(row.dataset.idx);
+        const removed = _queueState[queueKind][popoverIdx];
+        // The X is a per-ROW action. Translate popover index ->
+        // backend queue index (the popover prepends current_sync /
+        // current_gpu as the running row, so any 'running' rows
+        // before our position need to be subtracted off — that
+        // position doesn't exist in the backend's queues list).
+        let runningBefore = 0;
+        for (let j = 0; j < popoverIdx; j++) {
+          if ((_queueState[queueKind][j] || {}).status === "running") {
+            runningBefore++;
+          }
+        }
+        const queueIdx = popoverIdx - runningBefore;
+        _queueState[queueKind].splice(popoverIdx, 1);
         paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
-        // Notify backend. The payload now carries `url` / `channel_name`
-        // for sync rows and `path` / `bulk_id` for gpu rows (see
-        // queues.to_ui_payload), so the backend removal API actually
-        // finds the right item instead of missing on a display-label
-        // mismatch. For coalesced "Transcribe {ch} (N videos)" rows,
-        // fire the bulk-remove endpoint so all siblings drop together.
+        // Original code passed only a URL / path, which deleted EVERY
+        // queue entry sharing that identifier (e.g. one X click on a
+        // metadata-refresh row also dropped the download row for the
+        // same channel because both shared the channel URL).
+        // Fix: prefer the index-based remove API (queues_*_remove_at)
+        // with identity guard. Falls back to the legacy URL-based API
+        // only on backends that don't expose the new method.
         if (!window.pywebview?.api || !removed) return;
         const api = window.pywebview.api;
-        if (queueKind === "sync" && api.queues_sync_remove) {
-          api.queues_sync_remove(removed.url || removed.channel_name
-                                  || removed.name || "");
+        if (queueKind === "sync") {
+          if (api.queues_sync_remove_at) {
+            api.queues_sync_remove_at(queueIdx,
+              removed.url || "",
+              removed.channel_name || removed.name || "");
+          } else if (api.queues_sync_remove) {
+            api.queues_sync_remove(removed.url || removed.channel_name
+                                    || removed.name || "");
+          }
         } else if (queueKind === "gpu") {
+          // Coalesced "Transcribe {ch} (N videos)" row → bulk-remove
+          // (drop all siblings). Single rows use index-based API.
           const isBulk = !!removed.bulk_id && (removed.bulk_count || 0) > 1;
           if (isBulk && api.queues_gpu_remove_bulk) {
             api.queues_gpu_remove_bulk(removed.bulk_id);
+          } else if (api.queues_gpu_remove_at) {
+            api.queues_gpu_remove_at(queueIdx,
+              removed.path || "",
+              removed.bulk_id || "");
           } else if (api.queues_gpu_remove) {
             api.queues_gpu_remove(removed.path || removed.bulk_id
                                    || removed.id || removed.name || "");

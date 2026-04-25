@@ -3962,20 +3962,68 @@
       }).join("");
     };
 
+    // Compact elapsed formatter — mirrors backend utils.format_elapsed
+    // (Scott's rule: never show raw seconds beyond 60 — fold into
+    // "Xm YYs" / "Xh Ym YYs"). Used by the Loading... ticker so the
+    // Metadata tab table doesn't sit silent during a slow DB query.
+    const _fmtElapsed = (s) => {
+      s = Math.max(0, Math.floor(s));
+      if (s < 60) return s + "s";
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const ss = s % 60;
+      const pad = (n) => (n < 10 ? "0" + n : "" + n);
+      if (h) return `${h}h ${m}m ${pad(ss)}s`;
+      return `${m}m ${pad(ss)}s`;
+    };
+
     window._refreshMetadataTab = async () => {
       const api = getApi();
       if (!api?.get_channel_metadata_status) {
         tbody.innerHTML = '<tr><td colspan="6" class="md-empty">Native mode required.</td></tr>';
         return;
       }
+      // Live "Loading channels..." with elapsed counter so the table
+      // doesn't sit silent during a slow DB query (sometimes the
+      // index DB lock is held by an in-flight sweep / ingest, in
+      // which case this call blocks until they finish).
+      const _t0 = Date.now();
+      tbody.innerHTML = '<tr><td colspan="6" class="md-empty">'
+        + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
+        + '</td></tr>';
+      const _info = document.getElementById("md-load-info");
+      const _paint = () => {
+        if (!_info || !_info.isConnected) return;
+        const el = (Date.now() - _t0) / 1000;
+        let msg = `(${_fmtElapsed(el)})`;
+        // After ~10s the call is unusually slow. Tell the user why
+        // so they don't think the app is hung. After ~30s, escalate
+        // — the DB is almost certainly contending with another op
+        // (most often a startup-time backfill / sweep / preload that
+        // hasn't finished yet on a large archive).
+        if (el > 30) {
+          msg += " \u00b7 still waiting on the index DB \u2014 a startup "
+                + "task (backfill / sweep / preload) is likely holding "
+                + "the lock; this clears once the green "
+                + "\"Browse preload complete\" indicator appears";
+        } else if (el > 10) {
+          msg += " \u00b7 querying the index DB\u2026";
+        }
+        _info.textContent = msg;
+      };
+      _paint();
+      const _ticker = setInterval(_paint, 1000);
       try {
         const rows = await api.get_channel_metadata_status();
         _rows = Array.isArray(rows) ? rows : [];
       } catch (e) {
         console.error("get_channel_metadata_status:", e);
-        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">Failed to load.</td></tr>';
+        clearInterval(_ticker);
+        tbody.innerHTML = `<tr><td colspan="6" class="md-empty">`
+          + `Failed to load: ${escapeHtml(String(e))}</td></tr>`;
         return;
       }
+      clearInterval(_ticker);
       render();
     };
 

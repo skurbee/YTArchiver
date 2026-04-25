@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v57.5"
-APP_VERSION_DATE = "4.24.26 11:37pm"
+APP_VERSION      = "v57.7"
+APP_VERSION_DATE = "4.24.26 11:52pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -3011,15 +3011,30 @@ class Api:
         # Pull video-id DB counts so the Metadata tab can show a
         # per-channel status indicator (green if every on-disk file
         # has a resolvable video_id, warn if some missing, red if
-        # none). Cheap — DB-only count per channel, no disk walk.
+        # none).
+        # Bulk path: ONE GROUP BY query covers every channel at once.
+        # Was 3 COUNT(*) per channel * 100+ channels = 300+ serialized
+        # queries holding the FTS DB lock; took 30+ seconds and would
+        # appear hung when another op (ingest, sweep) was contending
+        # for the lock. The bulk variant returns in under a second.
         try:
-            from backend.metadata import count_video_id_status as _cvids
+            from backend.metadata import (
+                count_video_id_status_bulk as _cvids_bulk,
+                count_video_id_status as _cvids,
+            )
         except Exception:
-            _cvids = None
+            _cvids_bulk, _cvids = None, None
+        _id_lookup = _cvids_bulk(ch_copy) if _cvids_bulk else {}
+        _empty_ids = {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         rows = []
         for ch in ch_copy:
-            _idstats = _cvids(ch) if _cvids else {
-                "total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
+            _ch_key = (ch.get("name") or ch.get("folder") or "").lower()
+            _idstats = _id_lookup.get(_ch_key)
+            if _idstats is None:
+                # Fall back to the per-channel query when the bulk
+                # lookup didn't cover this channel (e.g. case-drift
+                # between config name and DB channel column).
+                _idstats = _cvids(ch) if _cvids else _empty_ids
             rows.append({
                 "name": ch.get("name") or ch.get("folder") or "",
                 "folder": ch.get("folder") or "",

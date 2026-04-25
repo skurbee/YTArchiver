@@ -121,6 +121,33 @@ def format_duration_hms(secs: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def format_elapsed(secs: float) -> str:
+    """Compact elapsed-time format for in-line log strings.
+
+    Rules (per Scott: "always fold into Xm XXs"):
+      < 60s      -> "Xs"            ("47s")
+      < 1h       -> "Xm YYs"        ("3m 21s", zero-padded seconds)
+      >= 1h      -> "Xh Ym YYs"     ("1h 5m 03s")
+
+    Use this anywhere the user-facing log would otherwise show raw
+    seconds for a duration (heartbeats, "took N", elapsed counters).
+    Never emit bare "201s" — fold via this helper instead.
+    """
+    try:
+        s = int(float(secs or 0))
+    except (TypeError, ValueError):
+        return "0s"
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    h, rem = divmod(s, 3600)
+    m, ss = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {ss:02d}s"
+    return f"{m}m {ss:02d}s"
+
+
 def format_enc_size(mb: float) -> str:
     """Format a megabyte count for encode progress display (e.g. '1.23 GB')."""
     try:

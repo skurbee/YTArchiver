@@ -63,8 +63,15 @@
       };
       document.addEventListener("keydown", onKey);
 
-      // Focus the default button
-      setTimeout(() => backdrop.querySelector('[data-act="confirm"]').focus(), 30);
+      // Focus the default button.
+      // Audit U-10: for danger dialogs, focus Cancel by default so an
+      // accidental Enter press doesn't fire the destructive action.
+      // For non-danger / OK-style dialogs, keep Confirm focused (the
+      // common-case "yes" flow stays one-key fast).
+      const _focusTarget = (cfg.danger && cancelBtn)
+        ? cancelBtn
+        : backdrop.querySelector('[data-act="confirm"]');
+      setTimeout(() => _focusTarget?.focus(), 30);
     });
   };
 
@@ -4904,21 +4911,27 @@
       const api = window.pywebview?.api;
       if (!api) { flashError("Not running in native mode \u2014 writes disabled."); return; }
 
-      // Duplicate pre-check when ADDING (editing is allowed to keep its own url)
-      if (!_editingIdentity && api.subs_check_duplicate) {
+      // Duplicate pre-check (audit U-5: now runs on edit too \u2014 pass the
+      // identity of the channel being edited so it isn't flagged as a
+      // duplicate of itself). Audit U-6: dropped the misleading "Try
+      // anyway" override \u2014 the backend rejects real dups regardless,
+      // so offering it as an option lied to the user.
+      if (api.subs_check_duplicate) {
         try {
-          const dup = await api.subs_check_duplicate(payload.url, payload.folder);
+          const dup = await api.subs_check_duplicate(
+            payload.url, payload.folder, _editingIdentity || null);
           if (dup?.ok && (dup.dup_url || dup.dup_folder)) {
             const parts = [];
             if (dup.dup_url) parts.push(`\u2022 URL already used by:\n ${dup.dup_url}`);
             if (dup.dup_folder) parts.push(`\u2022 Folder name already taken by:\n ${dup.dup_folder}`);
-            const proceed = await askDanger(
+            await askConfirm(
               "Duplicate channel",
-              "This would clash with an existing subscription:\n\n" +
+              "This clashes with an existing subscription:\n\n" +
               parts.join("\n\n") +
-              "\n\nAdding will fail on the backend. Continue anyway?",
-              "Try anyway");
-            if (!proceed) return;
+              "\n\nResolve the conflict (change the URL or folder name) " +
+              "and try again.",
+              { confirm: "OK", noCancel: true });
+            return;  // hard-block \u2014 no override path
           }
         } catch { /* if check fails, let the real add surface the error */ }
       }
@@ -6415,6 +6428,17 @@
       const tag = e.target.tagName;
       const editing = tag === "INPUT" || tag === "TEXTAREA" ||
                       e.target.isContentEditable;
+
+      // Audit U-8 + U-9: when ANY modal is open (askq backdrop), every
+      // shortcut except Esc/Enter is blocked. Modals own input focus —
+      // Ctrl+S firing Sync while a "Delete files?" confirm is up was
+      // a real footgun. The number-key tab switches (1-5) similarly
+      // could leave a backdrop floating over the wrong panel since
+      // tab switch doesn't dismiss modals.
+      const _modalOpen = !!document.querySelector(".askq-backdrop");
+      if (_modalOpen && e.key !== "Escape" && e.key !== "Enter") {
+        return;
+      }
 
       // Ctrl+Q: quit (close window via tray-quit path)
       if ((e.ctrlKey || e.metaKey) && e.key === "q") {
@@ -8140,7 +8164,52 @@
     impBtn?.addEventListener("click", async () => {
       const res = await window.pywebview?.api?.channels_import?.();
       if (res?.ok) {
-        window._showToast?.(`Added ${res.added} channels (${res.skipped} skipped).`, "ok");
+        const skipped = res.skipped || 0;
+        const reasons = Array.isArray(res.skipped_reasons) ? res.skipped_reasons : [];
+        if (skipped > 0 && reasons.length > 0) {
+          // Audit U-13: surface per-skip reasons in a confirm modal so
+          // the user can see WHY each channel was skipped (already
+          // subscribed / missing URL / not a YouTube link / etc.).
+          // Previously the toast just said "5 skipped" with no detail.
+          const _esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+               '"': "&quot;", "'": "&#39;" }[c]));
+          // Group by reason for a tidy summary.
+          const byReason = {};
+          for (const r of reasons) {
+            const key = r.reason || "(unknown)";
+            (byReason[key] = byReason[key] || []).push(r.name || "(no name)");
+          }
+          const reasonHtml = Object.keys(byReason).map(reason => {
+            const names = byReason[reason];
+            const more = names.length > 5 ? ` <span style="color:#888;">+ ${names.length - 5} more</span>` : "";
+            return `
+              <div style="margin-bottom:8px;">
+                <div style="font-weight:600;color:#cdd;">${_esc(reason)}
+                  <span style="color:#888;font-weight:normal;">(${names.length})</span>
+                </div>
+                <div style="font-size:11px;color:#aaa;padding-left:10px;">
+                  ${names.slice(0, 5).map(_esc).join("<br>")}${more}
+                </div>
+              </div>`;
+          }).join("");
+          // Open dialog and inject HTML before awaiting (same pattern as U-11).
+          const dialogPromise = askQuestion({
+            title: `Imported ${res.added} channels (${skipped} skipped)`,
+            message: "",
+            confirm: "OK",
+            noCancel: true,
+          });
+          try {
+            const body = document.querySelector(".askq-backdrop:last-child .askq-body");
+            if (body) body.innerHTML =
+              `<div style="margin-bottom:8px;color:#888;font-size:11px;">` +
+              `Skipped channels by reason:</div>` + reasonHtml;
+          } catch {}
+          await dialogPromise;
+        } else {
+          window._showToast?.(`Added ${res.added} channels (${skipped} skipped).`, "ok");
+        }
         // audit D-32: refresh the Subs table in place instead of
         // location.reload(). Reloading during an active sync
         // destroyed the in-flight Whisper progress UI, wiped log
@@ -8159,15 +8228,90 @@
       else if (!res?.cancelled) window._showToast?.(res?.error || "Backup failed.", "error");
     });
     bkImpBtn?.addEventListener("click", async () => {
-      const confirm1 = await askDanger("Restore backup",
-        "Restoring a backup will OVERWRITE your current config, queue state, and journals.\n\n" +
-        "A snapshot of the current config is saved to backups/ first, so you can roll back.",
-        { confirm: "Pick ZIP\u2026" });
-      if (!confirm1) return;
-      const res = await window.pywebview?.api?.import_full_backup?.();
+      const api = window.pywebview?.api;
+      if (!api) return;
+      // Audit U-11: preview the backup BEFORE overwriting. Two-stage
+      // flow: (1) preview returns the ZIP's manifest without writing
+      // anything; (2) user reviews the file list + total size; (3) on
+      // confirm, the same ZIP path is passed to import_full_backup
+      // for the actual restore.
+      const prev = await (api.import_full_backup_preview
+        ? api.import_full_backup_preview()
+        : Promise.resolve(null));
+      if (!prev) {
+        // Older backend without preview support \u2014 fall back to legacy
+        // one-click flow with the strong-warning askDanger.
+        const okLegacy = await askDanger("Restore backup",
+          "Restoring a backup will OVERWRITE your current config, queue state, and journals.\n\n" +
+          "A snapshot of the current config is saved to backups/ first, so you can roll back.",
+          "Pick ZIP\u2026");
+        if (!okLegacy) return;
+        const res = await api.import_full_backup?.();
+        _handleImportResult(res);
+        return;
+      }
+      if (!prev.ok) {
+        if (!prev.cancelled) {
+          window._showToast?.(prev.error || "Preview failed.", "error");
+        }
+        return;
+      }
+      // Build the preview list. Each item: name, size, modified.
+      const _esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+           '"': "&quot;", "'": "&#39;" }[c]));
+      const rows = (prev.items || []).map(it =>
+        `<tr>
+          <td>${_esc(it.name)}</td>
+          <td style="text-align:right;">${_esc(it.size_label)}</td>
+          <td style="color:#888;">${_esc(it.modified)}</td>
+        </tr>`
+      ).join("");
+      const previewHtml =
+        `<div style="max-height:280px;overflow:auto;
+                     border:1px solid #2a2d33;border-radius:4px;
+                     padding:6px;margin-top:8px;">
+           <table style="width:100%;font-size:11px;
+                         border-collapse:collapse;">
+             <thead>
+               <tr style="text-align:left;color:#888;">
+                 <th>File</th><th style="text-align:right;">Size</th>
+                 <th>Modified</th>
+               </tr>
+             </thead>
+             <tbody>${rows}</tbody>
+           </table>
+         </div>
+         <div style="margin-top:8px;font-size:11px;color:#888;">
+           Total: ${prev.items.length} file(s) \u2014 ${_esc(prev.total_label)}.
+           Your current config will be snapshotted before overwrite.
+         </div>`;
+      // Open the dialog (askQuestion creates the backdrop synchronously
+      // and returns a promise that resolves on Confirm / Cancel / Esc).
+      // We inject the rich preview HTML BEFORE awaiting \u2014 otherwise the
+      // user would see an empty modal until they clicked something.
+      const previewPromise = askQuestion({
+        title: "Restore this backup?",
+        message: "",  // body filled in below
+        confirm: "Restore",
+        cancel: "Cancel",
+        danger: true,
+      });
+      try {
+        const body = document.querySelector(".askq-backdrop:last-child .askq-body");
+        if (body) body.innerHTML = previewHtml;
+      } catch {}
+      const confirmRestore = await previewPromise;
+      if (!confirmRestore) return;
+      const res = await api.import_full_backup?.(prev.zip_path);
+      _handleImportResult(res);
+    });
+
+    function _handleImportResult(res) {
       if (res?.ok) {
         window._showToast?.(
-          `Restored ${res.files_restored} files. Restart to apply.`,
+          `Restored ${res.files_restored || res.files || "?"} files. ` +
+          `Restart to apply.`,
           "ok",
           { ttlMs: 10000, action: { label: "Restart now", onClick: () => {
             window.pywebview?.api?.app_restart?.();
@@ -8181,7 +8325,7 @@
       } else if (!res?.cancelled) {
         window._showToast?.(res?.error || "Restore failed.", "error");
       }
-    });
+    }
   }
 
   // ─── About dialog ────────────────────────────────────────────────────

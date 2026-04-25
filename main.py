@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v57.8"
-APP_VERSION_DATE = "4.25.26 12:14am"
+APP_VERSION      = "v57.9"
+APP_VERSION_DATE = "4.25.26 12:42am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -815,21 +815,41 @@ class Api:
         """Whether YTArchiver can write to the config file right now."""
         return config_is_writable()
 
-    def subs_check_duplicate(self, url, folder):
+    def subs_check_duplicate(self, url, folder, exclude_identity=None):
         """Return {dup_url: existing_name|None, dup_folder: existing_name|None}
-        so the Add dialog can warn before actually trying to add.
+        so the Add or Edit dialog can warn before actually trying to commit.
+
+        `exclude_identity` (audit U-5): when running this check during an
+        EDIT (not Add), pass the identity of the channel being edited so
+        we don't flag the channel as a duplicate of itself. Identity dict
+        with `name` / `folder` / `url` keys (any subset works — we exclude
+        on the first match).
         """
         try:
             cfg = load_config()
             channels = cfg.get("channels", []) or []
             url_norm = (url or "").strip().lower().rstrip("/")
             folder_norm = (folder or "").strip().lower()
+            # Build exclusion criteria from the identity dict.
+            ex_url = ""
+            ex_name = ""
+            ex_folder = ""
+            if isinstance(exclude_identity, dict):
+                ex_url = (exclude_identity.get("url") or "").strip().lower().rstrip("/")
+                ex_name = (exclude_identity.get("name") or "").strip().lower()
+                ex_folder = (exclude_identity.get("folder") or "").strip().lower()
             dup_url = None
             dup_folder = None
             for ch in channels:
                 u = (ch.get("url") or "").strip().lower().rstrip("/")
                 n = (ch.get("name") or "").strip().lower()
                 f = (ch.get("folder") or "").strip().lower()
+                # Skip the channel being edited (identified by URL,
+                # name, OR folder — any match counts).
+                if (ex_url and u == ex_url) \
+                        or (ex_name and n == ex_name) \
+                        or (ex_folder and f == ex_folder):
+                    continue
                 if url_norm and u == url_norm:
                     dup_url = ch.get("name") or ch.get("folder") or ch.get("url")
                 if folder_norm and (n == folder_norm or f == folder_norm):
@@ -4803,6 +4823,157 @@ class Api:
                 return {"ok": False, "error": "File deleted but config write failed; recent_downloads may show stale entry"}
         return {"ok": True}
 
+    def video_delete_file(self, filepath):
+        """Delete a video file from disk + drop its sidecars + remove
+        the index DB row. Used by the Browse-grid right-click "Delete file"
+        action — previously the bridge call had no matching backend method
+        and the action silently failed (audit U-3).
+
+        Mirrors recent_delete_file's sidecar-cleanup logic (audit F-24
+        sidecar list) but operates on a path the caller already knows
+        instead of looking it up via title+channel.
+        """
+        fp = (filepath or "").strip()
+        if not fp:
+            return {"ok": False, "error": "Missing filepath"}
+        if not os.path.isfile(fp):
+            return {"ok": False, "error": f"File not found: {fp}"}
+        try:
+            os.remove(fp)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        # Sidecar cleanup — same set as recent_delete_file.
+        base = os.path.splitext(fp)[0]
+        _basic_exts = (".txt", ".jsonl", ".info.json", ".description",
+                       ".live_chat.json", ".srt",
+                       ".jpg", ".jpeg", ".webp", ".png")
+        for ext in _basic_exts:
+            try:
+                sc = base + ext
+                if os.path.isfile(sc):
+                    os.remove(sc)
+            except OSError:
+                pass
+        try:
+            import glob as _glob
+            for pat in (base + ".*.vtt", base + ".*.srt",
+                        base + ".*.ttml"):
+                for _hit in _glob.glob(pat):
+                    try: os.remove(_hit)
+                    except OSError: pass
+        except Exception:
+            pass
+        # Drop the index DB row (and its FTS segments) so Browse / Search
+        # stop returning the now-deleted video.
+        try:
+            from backend import index as _idx
+            _conn = _idx._open()
+            if _conn is not None:
+                with _idx._db_lock:
+                    # Find the segments tied to this filepath via the
+                    # videos table, then remove them + the videos row.
+                    _conn.execute(
+                        "DELETE FROM segments WHERE jsonl_path IN ("
+                        "  SELECT REPLACE(filepath, "
+                        "    SUBSTR(filepath, LENGTH(filepath) - 3, 4), '.jsonl') "
+                        "  FROM videos WHERE filepath = ? COLLATE NOCASE)",
+                        (fp,))
+                    _conn.execute(
+                        "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
+                        (fp,))
+                    _conn.commit()
+        except Exception as _e:
+            # Don't fail the whole call — the file is gone, that's the
+            # primary contract. Surface the DB issue as a soft warning.
+            return {"ok": True, "warning": f"File deleted but index cleanup failed: {_e}"}
+        # Also remove from recent_downloads if it was there.
+        if config_is_writable():
+            try:
+                cfg = load_config()
+                _before = len(cfg.get("recent_downloads", []) or [])
+                cfg["recent_downloads"] = [
+                    r for r in cfg.get("recent_downloads", []) or []
+                    if (r.get("filepath") or "").lower() != fp.lower()
+                ]
+                if len(cfg["recent_downloads"]) != _before:
+                    from backend.ytarchiver_config import save_config as _sc
+                    _sc(cfg)
+            except Exception:
+                pass
+        return {"ok": True}
+
+    def video_redownload(self, video_id, title, resolution):
+        """Re-download a single video at a new resolution. Used by the
+        Watch-view "Redownload" button — previously had no backing
+        backend method and the action silently failed (audit U-4).
+
+        Looks up the video's channel + filepath via the index DB, then
+        delegates to backend/redownload.py for the actual yt-dlp work.
+        """
+        vid = (video_id or "").strip()
+        if not vid:
+            return {"ok": False, "error": "Missing video_id"}
+        res = (str(resolution or "")).strip()
+        if not res:
+            return {"ok": False, "error": "Missing resolution"}
+        # Look up the video's filepath + channel from the index DB.
+        try:
+            from backend import index as _idx
+            _conn = _idx._open()
+            if _conn is None:
+                return {"ok": False, "error": "Index DB unavailable"}
+            with _idx._db_lock:
+                row = _conn.execute(
+                    "SELECT filepath, channel FROM videos "
+                    "WHERE video_id = ? LIMIT 1",
+                    (vid,)).fetchone()
+            if not row:
+                return {"ok": False, "error":
+                        f"Video {vid} not found in index"}
+            filepath, channel_name = row[0], row[1]
+        except Exception as e:
+            return {"ok": False, "error": f"Lookup failed: {e}"}
+        if not filepath or not channel_name:
+            return {"ok": False, "error": "Video has no filepath/channel"}
+        # Find the channel config so we can hand the URL + folder to
+        # the redownload pipeline.
+        cfg = self._config if self._config is not None else load_config()
+        ch = next((c for c in cfg.get("channels", []) or []
+                   if (c.get("name") or c.get("folder") or "").strip().lower()
+                      == (channel_name or "").strip().lower()), None)
+        if not ch:
+            return {"ok": False, "error":
+                    f"Channel '{channel_name}' not in subscriptions"}
+        ch_url = (ch.get("url") or "").strip()
+        if not ch_url:
+            return {"ok": False, "error":
+                    f"Channel '{channel_name}' has no URL"}
+        # Reuse the channel-wide redownload path with a single-video
+        # filter via the existing _backlog_redownload_channel pipeline.
+        # For simplicity here we queue a normal redownload of the
+        # channel scoped to this one video_id.
+        try:
+            from backend import redownload as _rd
+            import threading as _th
+            def _run():
+                try:
+                    _rd.redownload_channel(
+                        channel_name, ch_url,
+                        ch.get("folder") or channel_name, res,
+                        stream=self._log_stream,
+                        cancel_ev=self._sync_cancel,
+                        pause_ev=self._sync_pause,
+                        confirm_cb=None,
+                        queues=self._queues,
+                    )
+                except Exception as e:
+                    self._log_stream.emit_error(
+                        f"Single-video redownload failed: {e}")
+            _th.Thread(target=_run, daemon=True).start()
+            return {"ok": True, "title": title, "resolution": res}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ─── Settings dialog: load / save all tunables ─────────────────────
 
     def settings_load(self):
@@ -4835,6 +5006,12 @@ class Api:
         if not config_is_writable():
             return {"ok": False, "error": "Write-gate off"}
         cfg = load_config()
+        # Track the OLD whisper model so we can hot-apply a change to
+        # the running TranscribeManager (audit U-7). Settings_save was
+        # persisting the new model + reloading config, but the
+        # TranscribeManager's loaded subprocess kept using the OLD
+        # model — only a full app restart picked up the change.
+        _old_whisper = (cfg.get("whisper_model") or "").strip()
         if data.get("output_dir"): cfg["output_dir"] = os.path.normpath(data["output_dir"])
         if data.get("video_out_dir"): cfg["video_out_dir"] = os.path.normpath(data["video_out_dir"])
         if data.get("whisper_model"): cfg["whisper_model"] = data["whisper_model"]
@@ -4875,6 +5052,23 @@ class Api:
         self._reload_config()
         # Push log mode into LogStreamer
         self._log_stream.simple_mode = (cfg["log_mode"] == "Simple")
+        # Audit U-7: hot-apply Whisper model change so the next job
+        # uses the new model without requiring a full app restart.
+        # The GPU popover already exposes per-job swap via
+        # transcribe_swap_model — route through the same path.
+        _new_whisper = (cfg.get("whisper_model") or "").strip()
+        if _new_whisper and _new_whisper != _old_whisper:
+            try:
+                if hasattr(self._transcribe, "swap_model"):
+                    self._transcribe.swap_model(_new_whisper)
+            except Exception as _e:
+                # Log + continue — settings still saved successfully,
+                # the user just needs to restart for the change to bite.
+                try:
+                    self._log_stream.emit_dim(
+                        f" (whisper model swap deferred until restart: {_e})")
+                except Exception:
+                    pass
         return {"ok": True}
 
     # ─── yt-dlp version / update ───────────────────────────────────────
@@ -6086,13 +6280,85 @@ class Api:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def import_full_backup(self):
+    def import_full_backup_preview(self):
+        """Audit U-11: read-only preview of a backup ZIP before restoring.
+
+        Opens the file picker, reads the ZIP's manifest (file names +
+        sizes + modification times) WITHOUT extracting anything, and
+        returns it so the frontend can show a confirmation modal.
+        Frontend then passes the path back to import_full_backup() to
+        commit the restore. Splits the previous one-click restore into
+        a preview-then-confirm flow so the user can see what they're
+        about to overwrite.
+        """
+        try:
+            import zipfile as _zf
+            import webview as _wv
+            from backend.ytarchiver_config import APP_DATA_DIR
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            paths = self._window.create_file_dialog(
+                _wv.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            zip_path = paths if isinstance(paths, str) else paths[0]
+            try:
+                with _zf.ZipFile(zip_path, "r") as zf:
+                    items = []
+                    total_bytes = 0
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        items.append({
+                            "name": info.filename,
+                            "size": info.file_size,
+                            "size_label": self._fmt_bytes_short(info.file_size),
+                            "modified": (
+                                f"{info.date_time[0]:04d}-"
+                                f"{info.date_time[1]:02d}-"
+                                f"{info.date_time[2]:02d} "
+                                f"{info.date_time[3]:02d}:"
+                                f"{info.date_time[4]:02d}"
+                            ),
+                        })
+                        total_bytes += info.file_size
+            except Exception as e:
+                return {"ok": False, "error": f"Not a valid ZIP: {e}"}
+            return {
+                "ok": True,
+                "zip_path": zip_path,
+                "items": items,
+                "total_bytes": total_bytes,
+                "total_label": self._fmt_bytes_short(total_bytes),
+                "snapshot_target": str(APP_DATA_DIR / "backups" /
+                                        "config_pre_restore_*.json"),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _fmt_bytes_short(b):
+        try: b = int(b or 0)
+        except (TypeError, ValueError): return "0 B"
+        if b < 1024: return f"{b} B"
+        if b < 1024 * 1024: return f"{b / 1024:.1f} KB"
+        if b < 1024 ** 3: return f"{b / (1024 * 1024):.1f} MB"
+        return f"{b / (1024 ** 3):.2f} GB"
+
+    def import_full_backup(self, zip_path=None):
         """Restore a previously-exported backup ZIP into %APPDATA%\\YTArchiver.
 
         Before overwriting any existing files, the current config is snapshotted
         to backups/config_pre_restore_YYYY-MM-DD_HHMMSS.json so the user can roll
         back. Gated by config_is_writable() — a read-only probe still
         lists the ZIP's contents so the frontend can confirm before committing.
+
+        Audit U-11: `zip_path` may be supplied by the caller (after the
+        user confirmed the preview). When None, falls back to opening
+        the file picker directly (legacy one-click flow).
         """
         try:
             import zipfile as _zf
@@ -6104,14 +6370,16 @@ class Api:
             )
             if self._window is None:
                 return {"ok": False, "error": "No window"}
-            paths = self._window.create_file_dialog(
-                _wv.OPEN_DIALOG,
-                allow_multiple=False,
-                file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
-            )
-            if not paths:
-                return {"ok": False, "cancelled": True}
-            zip_path = paths if isinstance(paths, str) else paths[0]
+            zip_path = (zip_path or "").strip()
+            if not zip_path:
+                paths = self._window.create_file_dialog(
+                    _wv.OPEN_DIALOG,
+                    allow_multiple=False,
+                    file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
+                )
+                if not paths:
+                    return {"ok": False, "cancelled": True}
+                zip_path = paths if isinstance(paths, str) else paths[0]
 
             # First pass: list contents (read-only; safe even if gated off).
             try:

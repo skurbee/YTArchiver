@@ -1195,11 +1195,19 @@
         if (window.showContextMenu) window.showContextMenu(ev.clientX, ev.clientY, items);
       });
 
-      // Drag-and-drop (HTML5)
+      // Drag-and-drop (HTML5).
+      // U-1: encode source-queue identity into dataTransfer so a drop
+      //      across queues (Sync row dropped on GPU popover, etc.) can
+      //      be rejected. Previously stored just the index — drop on the
+      //      other queue would splice _queueState[wrong_queue] using
+      //      the source's index = state corruption.
+      // U-2: notify backend of the reorder. Without this the next push
+      //      from main.py snaps the rows back to old order.
       row.addEventListener("dragstart", (e) => {
         row.classList.add("drag-src");
         e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData("text/plain", String(i));
+        e.dataTransfer.setData("text/plain",
+          JSON.stringify({ queueKind: queueKind, idx: i }));
       });
       row.addEventListener("dragend", () => {
         row.classList.remove("drag-src");
@@ -1207,6 +1215,15 @@
             .forEach(el => el.classList.remove("drag-target-above", "drag-target-below"));
       });
       row.addEventListener("dragover", (e) => {
+        // Refuse drop visualization for cross-queue drags so the user
+        // gets no false "you can drop here" feedback.
+        let srcKind = queueKind;
+        try {
+          const raw = e.dataTransfer.types.includes("text/plain")
+            ? null  // dragover doesn't expose the data — fall back to
+                    // assuming same-queue and validate at drop time
+            : null;
+        } catch {}
         e.preventDefault();
         const rect = row.getBoundingClientRect();
         const halfway = rect.top + rect.height / 2;
@@ -1218,7 +1235,26 @@
       });
       row.addEventListener("drop", (e) => {
         e.preventDefault();
-        const srcIdx = Number(e.dataTransfer.getData("text/plain"));
+        // Parse the source identity. Refuse cross-queue drops — the
+        // dragged item belongs to a different queue's _queueState
+        // and a different backend reorder API. Splicing across queues
+        // would corrupt state (U-1).
+        let parsed;
+        try { parsed = JSON.parse(e.dataTransfer.getData("text/plain")); }
+        catch { parsed = null; }
+        // Back-compat: legacy payload was a bare index string. If parse
+        // fails, treat as same-queue drop (matches old behavior).
+        const srcKind = (parsed && parsed.queueKind) || queueKind;
+        const srcIdx = parsed && Number.isFinite(parsed.idx)
+          ? parsed.idx
+          : Number(e.dataTransfer.getData("text/plain"));
+        if (srcKind !== queueKind) {
+          // Cross-queue drop: no-op. Show a brief toast so the user
+          // knows the drag was registered but rejected on purpose.
+          window._showToast?.(
+            "Can't drag tasks between Sync and GPU queues.", "warn");
+          return;
+        }
         const dstIdx = Number(row.dataset.idx);
         if (Number.isNaN(srcIdx) || srcIdx === dstIdx) return;
         const rect = row.getBoundingClientRect();
@@ -1230,7 +1266,23 @@
         if (below) insertAt += 1;
         list.splice(insertAt, 0, moved);
         paintTaskList(body, list, emptyText, queueKind);
-        // Phase 6: notify Python of reorder
+        // U-2: notify the backend so the reorder actually persists.
+        // Mirrors the right-click "Move to top" handler, which already
+        // calls queues_*_reorder. Without this, the next backend push
+        // snaps the rows back to the old order — the drag looked like
+        // it took effect for one frame, then visually undid itself.
+        const api = window.pywebview?.api;
+        if (api && moved) {
+          if (queueKind === "sync" && api.queues_sync_reorder) {
+            api.queues_sync_reorder(
+              moved.url || moved.channel_name || moved.name || "",
+              insertAt);
+          } else if (queueKind === "gpu" && api.queues_gpu_reorder) {
+            api.queues_gpu_reorder(
+              moved.path || moved.bulk_id || moved.id || moved.name || "",
+              insertAt);
+          }
+        }
       });
 
       body.appendChild(row);

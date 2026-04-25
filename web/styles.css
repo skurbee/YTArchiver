@@ -326,6 +326,18 @@ body {
   padding-right: 22px;
   min-width: 0;
 }
+/* Hint paragraph that spans both grid columns under a settings field.
+   Used for fields where the semantics aren't obvious (e.g. Archive
+   root only affecting NEW downloads). Audit U-14. */
+.settings-view .edit-grid > .edit-gh {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--c-dim);
+  line-height: 1.4;
+  padding: 0 22px 14px 0;
+  margin-top: -8px;
+  border-top: none;  /* override the row-divider rule above */
+}
 
 /* Thin horizontal dividers between rows. The label and value cells
    sit in the same row, so applying border-top to ALL cells except

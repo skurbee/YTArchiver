@@ -1049,6 +1049,36 @@ body {
   background: #1a6b4c;
   border-color: #216e52;
 }
+/* Pause-pending: user clicked Pause but the worker is still mid-
+   operation (e.g. the long re-fetch loop in a metadata refresh).
+   Blink the button between paused-green and the running-blue so
+   the click is acknowledged. Stops automatically when the backend
+   flips pausedActive → true and JS removes this class. */
+.btn-pause.pause-pending {
+  animation: pause-pending-blink 1s ease-in-out infinite;
+}
+.popover-footer-btn.pause-pending {
+  animation: pause-pending-blink 1s ease-in-out infinite;
+}
+@keyframes pause-pending-blink {
+  0%, 100% {
+    background: var(--c-sync);
+    border-color: #1a6b4c;
+  }
+  50% {
+    background: #234866;
+    border-color: #3c6690;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn-pause.pause-pending,
+  .popover-footer-btn.pause-pending {
+    animation: none;
+    /* Solid teal-ish so the state still differs from "paused" without motion. */
+    background: #1a5a6b;
+    border-color: #267585;
+  }
+}
 /* audit E-27: keep pointer-events enabled on disabled buttons so
    hover tooltips still fire (they usually explain WHY the button is
    disabled — kills discoverability otherwise). Clicks are still

@@ -3467,28 +3467,40 @@
       }
       const fmt = (v) => (v == null ? "\u2014" :
         (typeof v === "number" ? v.toLocaleString() : String(v)));
-      try {
-        const idx = await api.get_index_summary();
-        const c = (idx && idx.cards) || {};
+      const _zeroOK = (v) => (v == null ? "\u2014" :
+        (typeof v === "number" ? v.toLocaleString() : String(v)));
+      const _renderLines = (c, db) => {
         const pct = (c.transcribed_pct_channels != null)
           ? c.transcribed_pct_channels.toFixed(1) + "%"
           : "\u2014";
-        // This panel describes the Index (the searchable transcript
-        // database), not the underlying archive. Show the .db file size
-        // and treat hours/segments as zero-valid (a fresh install has
-        // 0 indexed segments — render "0", not "\u2014").
-        const _zeroOK = (v) => (v == null ? "\u2014" :
-          (typeof v === "number" ? v.toLocaleString() : String(v)));
-        const lines = [
+        // db may be null while the slow query is in flight — show
+        // "loading\u2026" for those fields so the user sees they're
+        // intentionally pending, not broken.
+        const _loading = "loading\u2026";
+        return [
           `Channels: ${fmt(c.channels)}`,
           `Videos: ${fmt(c.videos)}`,
-          `Segments: ${_zeroOK(c.segments)}`,
-          `Hours of video: ${_zeroOK(c.hours)}`,
+          `Segments: ${db ? _zeroOK(db.segments) : _loading}`,
+          `Hours of video: ${db ? _zeroOK(db.hours) : _loading}`,
           `Transcribed: ${pct}`,
-          `Index DB size: ${c.index_db_size_label || "\u2014"}`,
-        ];
-        statsEl.textContent = lines.join("\n");
+          `Index DB size: ${db ? (db.index_db_size_label || "\u2014") : _loading}`,
+        ].join("\n");
+      };
+      try {
+        const idx = await api.get_index_summary();
+        const c = (idx && idx.cards) || {};
+        // Render basics immediately so the panel isn't blank during
+        // the multi-second index-DB query that follows.
+        statsEl.textContent = _renderLines(c, null);
         statsEl.dataset.populated = "1";
+        // Async-fetch the slow index-DB stats. Re-render once they
+        // arrive. If the API doesn't exist (older backend), leave
+        // the loading\u2026 placeholders.
+        if (api.get_index_db_stats) {
+          api.get_index_db_stats().then((db) => {
+            if (db) statsEl.textContent = _renderLines(c, db);
+          }).catch(() => {});
+        }
       } catch (e) {
         statsEl.textContent = `Stats unavailable: ${e}`;
       }
@@ -7085,13 +7097,30 @@
   const _blinkState = {
     clockOn: false,
     timer: null,
+    pendingTimer: null,  // separate clock for pause-pending blink
+    pendingClockOn: false,
     // `count` = items queued for this pipeline. Used by
     // _syncPauseButtonState so the global Pause button enables when
     // items are queued-but-paused-without-a-live-thread (the state after
     // a cold launch when QueueState.load() restored persisted items).
-    sync: { running: false, paused: false, count: 0 },
-    gpu: { running: false, paused: false, count: 0 },
+    // `pausedActive` = true when the worker has actually entered its
+    // pause-wait block. Distinct from `paused` (= request received).
+    // When paused && !pausedActive, the Resume button BLINKS to show
+    // the pause is queued but not yet effective (e.g. an in-flight
+    // metadata refresh has to finish its current re-fetch loop before
+    // pause takes hold — could be minutes).
+    sync: { running: false, paused: false, pausedActive: false, count: 0,
+            pausedAtMs: 0 },
+    gpu: { running: false, paused: false, pausedActive: false, count: 0,
+           pausedAtMs: 0 },
   };
+  // Minimum visible duration of the pause-pending blink (ms). Without
+  // this, a fast pause-handshake (worker hits its pause-wait within
+  // 50ms of the click) would flip pausedActive=true so quickly the
+  // user couldn't see the blink — they'd just see the button go from
+  // "pause" straight to "resume" with no visible "queued" indication.
+  // 1500ms = ~3 cycles of the 1s blink animation, enough to register.
+  const _PAUSE_PENDING_MIN_MS = 1500;
   // Expose for logs.js's renderQueues so it can mirror queue counts
   // into _blinkState the moment a fresh payload arrives.
   window._blinkState = _blinkState;
@@ -7100,11 +7129,31 @@
 
   function initQueueBlink() {
     // Backend drives blink state via:
-    // window.setQueueState({ sync: {running, paused}, gpu: {running, paused} })
+    // window.setQueueState({ sync: {running, paused, pausedActive}, gpu: {...} })
     window.setQueueState = (state) => {
-      if (state.sync) Object.assign(_blinkState.sync, state.sync);
-      if (state.gpu) Object.assign(_blinkState.gpu, state.gpu);
+      // Capture the moment paused goes from false → true so we can
+      // hold the "pending" blink for a minimum visible window even
+      // if the backend flips pausedActive=true within 50ms (which it
+      // will if yt-dlp is actively streaming output and the pause
+      // check fires on the next line).
+      if (state.sync) {
+        if (state.sync.paused && !_blinkState.sync.paused) {
+          _blinkState.sync.pausedAtMs = Date.now();
+        } else if (!state.sync.paused) {
+          _blinkState.sync.pausedAtMs = 0;
+        }
+        Object.assign(_blinkState.sync, state.sync);
+      }
+      if (state.gpu) {
+        if (state.gpu.paused && !_blinkState.gpu.paused) {
+          _blinkState.gpu.pausedAtMs = Date.now();
+        } else if (!state.gpu.paused) {
+          _blinkState.gpu.pausedAtMs = 0;
+        }
+        Object.assign(_blinkState.gpu, state.gpu);
+      }
       ensureBlinkRunning();
+      ensurePendingBlinkRunning();
       paintBlinkState();
     };
     // Paint initial idle state (buttons default to gray)
@@ -7145,7 +7194,21 @@
         if (queues && "gpu_paused" in queues) {
           _blinkState.gpu.paused = !!queues.gpu_paused;
         }
+        // Mirror the new pause-active flags (worker has entered its
+        // wait block). Default to true when missing so an older backend
+        // payload doesn't accidentally make the button blink forever.
+        if (queues && "sync_paused_active" in queues) {
+          _blinkState.sync.pausedActive = !!queues.sync_paused_active;
+        } else if (queues) {
+          _blinkState.sync.pausedActive = !!queues.sync_paused;
+        }
+        if (queues && "gpu_paused_active" in queues) {
+          _blinkState.gpu.pausedActive = !!queues.gpu_paused_active;
+        } else if (queues) {
+          _blinkState.gpu.pausedActive = !!queues.gpu_paused;
+        }
         _syncPauseButtonState();
+        ensurePendingBlinkRunning();
         paintBlinkState();
       };
     }
@@ -7192,6 +7255,48 @@
     paintBlinkState();
   }
 
+  // Returns true if THIS pipeline is currently in the pause-pending
+  // visual state. Centralized so paint code + timer code agree.
+  // "Pending" = paused requested AND ( worker hasn't entered its
+  // pause-wait yet OR we're still inside the minimum visible window
+  // since the pause click ).
+  function _isPipelinePending(s) {
+    if (!s.paused || !s.running) return false;
+    if (!s.pausedActive) return true;
+    if (s.pausedAtMs && (Date.now() - s.pausedAtMs) < _PAUSE_PENDING_MIN_MS) {
+      return true;
+    }
+    return false;
+  }
+
+  // Separate clock for the pause-pending blink (Resume button while
+  // the worker is still finishing its current operation). Faster
+  // cadence (500ms) so it reads as "in progress, hold on" rather
+  // than ambient state. Stops the moment pause becomes active AND
+  // the minimum visible window has passed.
+  function ensurePendingBlinkRunning() {
+    const anyPending = _isPipelinePending(_blinkState.sync)
+                        || _isPipelinePending(_blinkState.gpu);
+    if (anyPending && !_blinkState.pendingTimer) {
+      _blinkState.pendingClockOn = false;
+      _blinkState.pendingTimer = setInterval(pendingBlinkTick, 500);
+    } else if (!anyPending && _blinkState.pendingTimer) {
+      clearInterval(_blinkState.pendingTimer);
+      _blinkState.pendingTimer = null;
+      _blinkState.pendingClockOn = false;
+      paintBlinkState();
+    }
+  }
+
+  function pendingBlinkTick() {
+    _blinkState.pendingClockOn = !_blinkState.pendingClockOn;
+    // Re-check on each tick: the minimum-window timer might have
+    // expired since the timer started. paintBlinkState reads the
+    // same _isPipelinePending so the visual stays in sync.
+    ensurePendingBlinkRunning();
+    paintBlinkState();
+  }
+
   function paintBlinkState() {
     // Three visual states, per user rule:
     // idle → grey (nothing running, nothing paused mid-pass)
@@ -7205,18 +7310,33 @@
     // at idle" (grey).
     const syncBtn = document.getElementById("btn-sync-tasks");
     const gpuBtn = document.getElementById("btn-gpu-tasks");
+    // Use a separate `pause-pending` state when the user has clicked
+    // pause but the worker hasn't reached its wait block yet (e.g.
+    // metadata refresh's long re-fetch loop has to finish first).
+    // Visually a slow blink between paused + on. Stops the moment
+    // pausedActive flips true.
     if (syncBtn) {
       const s = _blinkState.sync;
       let state = "idle";
-      if (s.running && s.paused) state = "paused";
-      else if (s.running) state = _blinkState.clockOn ? "on" : "off";
+      if (_isPipelinePending(s)) {
+        state = _blinkState.pendingClockOn ? "paused" : "on";
+      } else if (s.running && s.paused) {
+        state = "paused";
+      } else if (s.running) {
+        state = _blinkState.clockOn ? "on" : "off";
+      }
       syncBtn.dataset.blinkState = state;
     }
     if (gpuBtn) {
       const g = _blinkState.gpu;
       let state = "idle";
-      if (g.running && g.paused) state = "paused";
-      else if (g.running) state = _blinkState.clockOn ? "on" : "off";
+      if (_isPipelinePending(g)) {
+        state = _blinkState.pendingClockOn ? "paused" : "on";
+      } else if (g.running && g.paused) {
+        state = "paused";
+      } else if (g.running) {
+        state = _blinkState.clockOn ? "on" : "off";
+      }
       gpuBtn.dataset.blinkState = state;
     }
     // Global Pause button (Download tab). Three visual states:
@@ -7238,10 +7358,22 @@
       const gpuPausedWithItems = !g.running && g.paused && g.count > 0;
       const anyPaused = syncActive || gpuActive ||
                         syncPausedWithItems || gpuPausedWithItems;
-      pauseBtn.dataset.pauseState = anyPaused ? "paused" : "running";
-      pauseBtn.title = anyPaused
-        ? "Resume all queues"
-        : "Pause all queues (current jobs finish first)";
+      // Pause-pending: the user clicked Pause but the worker is still
+      // mid-operation (e.g. metadata refresh's long re-fetch loop).
+      // Surface a third visual state so the click is acknowledged
+      // without lying about whether the pause is actually in effect.
+      // Also held for a minimum visible window after the click so a
+      // fast pause-handshake doesn't skip the blink entirely.
+      const anyPending = _isPipelinePending(s) || _isPipelinePending(g);
+      let visState = anyPaused ? "paused" : "running";
+      if (anyPending) visState = "pending";
+      pauseBtn.dataset.pauseState = visState;
+      pauseBtn.classList.toggle("pause-pending", anyPending);
+      pauseBtn.title = anyPending
+        ? "Pause queued — current job will finish first. Click to cancel pause."
+        : (anyPaused
+            ? "Resume all queues"
+            : "Pause all queues (current jobs finish first)");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
         const want = anyPaused ? "play" : "bars";
@@ -7298,13 +7430,22 @@
     const activelyPaused = state.running && state.paused;
     const deadPausedWithItems = !state.running && state.paused && state.count > 0;
     const isPaused = activelyPaused || deadPausedWithItems;
+    // Pause-pending: requested but worker still finishing current op.
+    // Also held for a minimum window after the click so a fast pause
+    // handshake doesn't skip the visual feedback.
+    const isPending = _isPipelinePending(state);
     const svg = btn.querySelector("svg");
     const span = btn.querySelector("span");
     if (span) span.textContent = isPaused ? "Resume" : "Pause";
-    btn.title = isPaused
-      ? `Resume ${label.toLowerCase()} queue`
-      : `Pause ${label.toLowerCase()} queue (current job finishes first)`;
-    btn.dataset.pauseState = isPaused ? "paused" : "running";
+    btn.title = isPending
+      ? `Pause queued — ${label.toLowerCase()} job finishing first. Click to cancel pause.`
+      : (isPaused
+          ? `Resume ${label.toLowerCase()} queue`
+          : `Pause ${label.toLowerCase()} queue (current job finishes first)`);
+    btn.dataset.pauseState = isPending
+      ? "pending"
+      : (isPaused ? "paused" : "running");
+    btn.classList.toggle("pause-pending", isPending);
     if (svg) {
       const want = isPaused ? "play" : "bars";
       if (svg.dataset.icon !== want) {

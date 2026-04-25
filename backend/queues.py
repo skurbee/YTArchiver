@@ -46,6 +46,16 @@ class QueueState:
         self.order: List[list] = [] # [[kind, id], ...]
         self.gpu_paused: bool = False
         self.sync_paused: bool = False
+        # Pause is requested via set_*_paused(True), but the worker may
+        # still be mid-operation (e.g. yt-dlp download in progress, or
+        # the long re-fetch loop in metadata refresh). The "_active"
+        # flags below flip True ONLY when the worker has actually
+        # entered its pause-wait block. Frontend uses (paused AND NOT
+        # active) to render the Resume button as "blinking" (pause
+        # queued but not yet effective) so the user knows their click
+        # was registered. Runtime-only — never persisted.
+        self.gpu_paused_active: bool = False
+        self.sync_paused_active: bool = False
 
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: Optional[Dict[str, Any]] = None
@@ -512,6 +522,11 @@ class QueueState:
                 "gpu": gpu_list,
                 "gpu_paused": self.gpu_paused,
                 "sync_paused": self.sync_paused,
+                # Pause-pending vs pause-active distinction so the UI
+                # can blink the Resume button between "user clicked
+                # pause" and "worker actually entered pause-wait".
+                "gpu_paused_active": self.gpu_paused_active,
+                "sync_paused_active": self.sync_paused_active,
             }
 
     @staticmethod
@@ -580,14 +595,39 @@ class QueueState:
     def set_gpu_paused(self, paused: bool):
         with self._lock:
             self.gpu_paused = bool(paused)
+            # Reset the active flag whenever pause state changes —
+            # workers will re-set it when they enter pause-wait.
+            self.gpu_paused_active = False
         self._notify()
         self.save_debounced()
 
     def set_sync_paused(self, paused: bool):
         with self._lock:
             self.sync_paused = bool(paused)
+            self.sync_paused_active = False
         self._notify()
         self.save_debounced()
+
+    def set_sync_paused_active(self, active: bool):
+        """Worker-side hook: flip True when the sync worker has actually
+        entered its pause-wait block, False on exit. Frontend reads this
+        to distinguish "pause requested" (button blinks) vs "actually
+        paused" (button solid)."""
+        with self._lock:
+            new_val = bool(active)
+            if self.sync_paused_active == new_val:
+                return  # no change → no notify (avoid renderQueues spam)
+            self.sync_paused_active = new_val
+        self._notify()
+
+    def set_gpu_paused_active(self, active: bool):
+        """Worker-side hook for the GPU/transcribe queue (see set_sync_paused_active)."""
+        with self._lock:
+            new_val = bool(active)
+            if self.gpu_paused_active == new_val:
+                return
+            self.gpu_paused_active = new_val
+        self._notify()
 
     # ── stats ───────────────────────────────────────────────────────
 

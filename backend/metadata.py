@@ -597,12 +597,51 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
     return {"ok": True, "fetched": True}
 
 
+def _enter_pause_wait(stream: LogStreamer, label: str, queues) -> None:
+    """Worker hit a pause-wait. Tell the queues UI ("actually paused")
+    and emit a one-shot Paused log line so the user sees the pause
+    take effect, not just see the button stop blinking. Mirrors the
+    pattern in sync.py:_wait_if_paused so the log style matches.
+    """
+    if queues is not None:
+        try: queues.set_sync_paused_active(True)
+        except Exception: pass
+    try:
+        from datetime import datetime as _dt
+        _now = _dt.now().strftime("%I:%M%p").lstrip("0").lower()
+        stream.emit([
+            ["\u23F8 Paused at ", "simpleline"],
+            [_now, "simpleline"],
+            [f" \u2014 {label} \u2014 click Resume.\n", "dim"],
+        ])
+    except Exception:
+        pass
+
+
+def _exit_pause_wait(stream: LogStreamer, label: str, queues) -> None:
+    """Worker exiting pause-wait (resumed or cancelled)."""
+    if queues is not None:
+        try: queues.set_sync_paused_active(False)
+        except Exception: pass
+    try:
+        from datetime import datetime as _dt
+        _now = _dt.now().strftime("%I:%M%p").lstrip("0").lower()
+        stream.emit([
+            ["\u25B6 Resumed at ", "simpleline_green"],
+            [_now, "simpleline_green"],
+            [".\n", "dim"],
+        ])
+    except Exception:
+        pass
+
+
 def fetch_metadata_for_videos(channel: Dict[str, Any],
                               video_ids: Iterable[str],
                               stream: LogStreamer,
                               cancel_event: Optional[threading.Event] = None,
                               refresh: bool = False,
-                              pause_event: Optional[threading.Event] = None
+                              pause_event: Optional[threading.Event] = None,
+                              queues=None,
                               ) -> Dict[str, Any]:
     """Fetch metadata for the given video IDs into the aggregated JSONL(s).
 
@@ -699,14 +738,17 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
         # where we left off. Mirrors the redownload.py pause pattern
         # around line 651-666.
         if pause_event is not None and pause_event.is_set():
-            stream.emit([[" \u23F8 Paused \u2014 waiting.\n",
-                          "simpleline"]])
+            _enter_pause_wait(stream,
+                              f"{channel.get('name', '?')} (metadata fetch)",
+                              queues)
             while (pause_event.is_set()
                    and not (cancel_event is not None and cancel_event.is_set())):
                 time.sleep(0.5)
+            _exit_pause_wait(stream,
+                             f"{channel.get('name', '?')} (metadata fetch)",
+                             queues)
             if cancel_event is not None and cancel_event.is_set():
                 break
-            stream.emit([[" \u25B6 Resumed.\n", "simpleline"]])
         existing = _read_metadata_jsonl(jp)
         thumb_dir = _ensure_thumbnails_dir(g["subfolder"])
         changed = False
@@ -736,9 +778,15 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
             # during a big group would still march through the rest of
             # the videos before the outer loop's next iteration checks.
             if pause_event is not None and pause_event.is_set():
+                _enter_pause_wait(stream,
+                                  f"{channel.get('name', '?')} (metadata fetch)",
+                                  queues)
                 while (pause_event.is_set()
                        and not (cancel_event is not None and cancel_event.is_set())):
                     time.sleep(0.5)
+                _exit_pause_wait(stream,
+                                 f"{channel.get('name', '?')} (metadata fetch)",
+                                 queues)
                 if cancel_event is not None and cancel_event.is_set():
                     break
             if not vid_id:
@@ -1007,7 +1055,9 @@ _ID_RE_11 = re.compile(r"^[A-Za-z0-9_-]{11}$")
 def _flat_playlist_bulk_stats(yt: str, ch_url: str,
                                stream: LogStreamer,
                                cancel_event: Optional[threading.Event] = None,
-                               pause_event: Optional[threading.Event] = None
+                               pause_event: Optional[threading.Event] = None,
+                               queues=None,
+                               progress_cb: Optional[Callable[[int], None]] = None,
                                ) -> Dict[str, Dict[str, Any]]:
     """ONE yt-dlp --flat-playlist call returning per-video stats for
     the whole channel. Returns {video_id: {view_count, like_count,
@@ -1076,9 +1126,12 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
                 break
             # Honor pause without dropping the subprocess — same
             # pattern as _fetch_yt_catalog in redownload.py.
-            while (pause_event is not None and pause_event.is_set()
-                   and not (cancel_event is not None and cancel_event.is_set())):
-                time.sleep(0.25)
+            if pause_event is not None and pause_event.is_set():
+                _enter_pause_wait(stream, "catalog walk", queues)
+                while (pause_event.is_set()
+                       and not (cancel_event is not None and cancel_event.is_set())):
+                    time.sleep(0.25)
+                _exit_pause_wait(stream, "catalog walk", queues)
             line = (raw or "").rstrip()
             if not line:
                 continue
@@ -1092,18 +1145,27 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             _now = time.time()
             if (_tick_count % _PROGRESS_TICK_EVERY == 0
                     or (_now - _last_tick_ts) >= _PROGRESS_TICK_SECS):
-                # In-place update on a single line ("backfill_progress"
-                # is registered in logs.js _inplaceKind so each emit
-                # with this marker replaces the previous one instead
-                # of appending). Cleared by clear_line when the final
-                # summary emits so the transient counter doesn't
-                # persist after completion.
-                try:
-                    stream.emit([[f"  \u2014 Fetched {_tick_count:,} videos "
-                                 f"from YouTube catalog\u2026\n",
-                                 ["simpleline", "backfill_progress"]]])
-                except Exception:
-                    pass
+                # If a caller (e.g. bulk_refresh_views_likes) provided
+                # a progress callback, fold the count into THEIR active
+                # heartbeat line instead of emitting a separate
+                # "Fetched N from catalog" line. That way the user sees
+                # ONE updating line per channel, not two side-by-side.
+                if progress_cb is not None:
+                    try: progress_cb(_tick_count)
+                    except Exception: pass
+                else:
+                    # In-place update on a single line ("backfill_progress"
+                    # is registered in logs.js _inplaceKind so each emit
+                    # with this marker replaces the previous one instead
+                    # of appending). Cleared by clear_line when the final
+                    # summary emits so the transient counter doesn't
+                    # persist after completion.
+                    try:
+                        stream.emit([[f"  \u2014 Fetched {_tick_count:,} videos "
+                                     f"from YouTube catalog\u2026\n",
+                                     ["simpleline", "backfill_progress"]]])
+                    except Exception:
+                        pass
                 _last_tick_ts = _now
             def _num(s: str) -> Optional[int]:
                 s = (s or "").strip()
@@ -1143,6 +1205,7 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
                               pause_event: Optional[threading.Event] = None,
                               scope: Optional[Dict[str, Any]] = None,
                               full_fetch_on_change: bool = False,
+                              queues=None,
                               ) -> Dict[str, Any]:
     """Fast view-count refresh path. Uses one flat-playlist call to
     get per-video view/like/comment counts, compares against the
@@ -1188,17 +1251,68 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     # Log kept user-friendly — previously said "(flat-playlist)" which
     # is an implementation detail (yt-dlp mode) the user doesn't need
     # to see in Simple mode.
-    stream.emit([["  \u2014 ", "meta_bracket"],
-                 [f"Refreshing {name}{_banner}...\n", "simpleline"]])
+    # Tag the per-channel transitional emits with `views_refresh_progress`
+    # so each replaces the previous in-place. Cleared via clear_line just
+    # before the final summary so Simple mode ends with the channel
+    # header + the catalog-walk counter + the summary, no transitional
+    # noise. (User asked: "should look like [3 lines], just delete those
+    # lines when all is finished".)
+    stream.emit([["  \u2014 ", ["meta_bracket", "views_refresh_progress"]],
+                 [f"Refreshing {name}{_banner}...\n",
+                  ["simpleline", "views_refresh_progress"]]])
 
     t0 = time.time()
+    # Heartbeat thread — re-emits the in-place "Refreshing X..." line
+    # every 3s with elapsed time + current sub-phase so the user always
+    # sees motion. Without this the line sits silent while yt-dlp spins
+    # up + walks the catalog (many seconds on cold-cookie firefox; can
+    # be 30s+ before any output streams).
+    _hb_phase = ["fetching catalog from YouTube"]  # mutable holder
+    _hb_catalog_count = [0]  # running count from _flat_playlist_bulk_stats
+    _hb_alive = [True]
+    def _heartbeat():
+        while _hb_alive[0]:
+            time.sleep(3)
+            if not _hb_alive[0]:
+                break
+            try:
+                _el = int(time.time() - t0)
+                # Fold the catalog count into the phase string when known
+                # so the user sees ONE active line per channel, not two.
+                _phase = _hb_phase[0]
+                if _hb_catalog_count[0] > 0:
+                    _phase = (f"{_phase} \u00b7 "
+                              f"{_hb_catalog_count[0]:,} videos in catalog")
+                stream.emit([
+                    ["  \u2014 ", ["meta_bracket", "views_refresh_progress"]],
+                    [f"Refreshing {name}{_banner} \u2014 {_phase} ({_el}s)\n",
+                     ["simpleline", "views_refresh_progress"]],
+                ])
+            except Exception:
+                pass
+    _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    _hb_thread.start()
+
+    def _catalog_progress(n):
+        _hb_catalog_count[0] = int(n)
+
     bulk = _flat_playlist_bulk_stats(yt, ch_url, stream,
-                                     cancel_event, pause_event)
+                                     cancel_event, pause_event,
+                                     queues=queues,
+                                     progress_cb=_catalog_progress)
+    # Lock in the final catalog count once the walk completes.
+    _hb_catalog_count[0] = max(_hb_catalog_count[0], len(bulk))
+    _hb_phase[0] = "matching local files"
     if not bulk:
+        _hb_alive[0] = False  # stop heartbeat
+        # Replace the in-place "Refreshing X..." line with this warning
+        # so the user sees the failure cleanly instead of two side-by-
+        # side lines (the warning + the orphaned Refreshing... line).
         stream.emit([
-            [" \u26A0 ", "meta_bracket"],
+            [" \u26A0 ", ["meta_bracket", "views_refresh_progress"]],
             [f"Bulk-stats returned no data for {name} — "
-             f"channel may be empty / private / geo-locked.\n", "simpleline"],
+             f"channel may be empty / private / geo-locked.\n",
+             ["simpleline", "views_refresh_progress"]],
         ])
         return {"ok": False, "error": "bulk_empty",
                 "fetched": 0, "refreshed": 0, "errors": 0, "skipped": 0,
@@ -1292,9 +1406,10 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         # technicality — users shouldn't have to know about the
         # internal DB state to understand what happened.
         stream.emit([
-            [" \u2014 ", "meta_bracket"],
+            [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
             [f"Matched {len(_title_resolved)} video(s) by title "
-             f"\u2014 saved their YouTube IDs.\n", "simpleline"],
+             f"\u2014 saved their YouTube IDs.\n",
+             ["simpleline", "views_refresh_progress"]],
         ])
 
     on_disk_ids = {v[0] for v in on_disk if v[0]}
@@ -1377,6 +1492,7 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
 
     # Persist the in-place-updated entries. Group by jsonl path so we
     # only rewrite each file once.
+    _hb_phase[0] = "writing updated counts"
     dirty_paths: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for vid, entry in existing_by_id.items():
         jp = jsonl_by_id.get(vid)
@@ -1409,9 +1525,13 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         _what = ("new entries \u2014 fetching full metadata..."
                  if not full_fetch_on_change
                  else "have updated counts \u2014 re-fetching details...")
+        _hb_phase[0] = (f"fetching full metadata for {_n} new entries"
+                        if not full_fetch_on_change
+                        else f"re-fetching details for {_n} updated videos")
         stream.emit([
-            [" \u2014 ", "meta_bracket"],
-            [f"{_n} video(s) {_what}\n", "simpleline"],
+            [" \u2014 ", ["meta_bracket", "views_refresh_progress"]],
+            [f"{_n} video(s) {_what}\n",
+             ["simpleline", "views_refresh_progress"]],
         ])
         # Build a video_id → (filepath, title) map from on_disk so we
         # can pass filepath + title_hint to fetch_single_video_metadata
@@ -1440,9 +1560,15 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         for vid in changed_ids:
             if cancel_event is not None and cancel_event.is_set():
                 break
-            while (pause_event is not None and pause_event.is_set()
-                   and not (cancel_event is not None and cancel_event.is_set())):
-                time.sleep(0.25)
+            # Pause-wait between videos. The user might have clicked
+            # Pause minutes ago — they're waiting on this exact loop
+            # to land here. Emit a Paused log line + signal active.
+            if pause_event is not None and pause_event.is_set():
+                _enter_pause_wait(stream, f"{name} (metadata refresh)", queues)
+                while (pause_event.is_set()
+                       and not (cancel_event is not None and cancel_event.is_set())):
+                    time.sleep(0.25)
+                _exit_pause_wait(stream, f"{name} (metadata refresh)", queues)
             _pair = fp_by_id.get(vid)
             if not _pair:
                 _processed += 1
@@ -1460,20 +1586,10 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
                 stream.emit_dim(f" (full fetch failed for {vid}: {_e})")
                 full_errors += 1
             _processed += 1
-            # Emit progress tick on count OR time boundary, whichever
-            # comes first. Skip the very last one (final summary line
-            # replaces it immediately below).
-            _now = time.time()
-            if _processed < _total and (
-                    _processed % _PROGRESS_TICK_EVERY == 0
-                    or (_now - _last_tick_ts) >= _PROGRESS_TICK_SECS):
-                try:
-                    stream.emit_dim(
-                        f" \u2014 [{_processed}/{_total}] "
-                        f"fetching metadata\u2026")
-                except Exception:
-                    pass
-                _last_tick_ts = _now
+            # Update the heartbeat phase with [N/total] so the
+            # 3-second heartbeat tick shows live progress.
+            _hb_phase[0] = f"refreshing metadata [{_processed}/{_total}]"
+            _last_tick_ts = time.time()
 
     # Stamp last-refresh timestamp on the channel config. Separate
     # from per-video fetched_at so the Subs UI can say "refreshed
@@ -1491,7 +1607,24 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     except Exception:
         pass
 
+    # Stop the heartbeat thread BEFORE the clear_line + summary so
+    # the in-place line doesn't get re-painted on top of the summary.
+    _hb_alive[0] = False
     took = time.time() - t0
+    # Drop all the per-channel transitional lines tagged with
+    # `views_refresh_progress` ("Refreshing X...", "N video(s) have
+    # updated counts...", "[N/M] fetching metadata..."). The summary
+    # line below stays as the only post-completion artifact alongside
+    # the catalog-walk counter (which uses `backfill_progress` and
+    # is preserved). Mirrors the same clear_line pattern used by
+    # backfill_video_ids' final summary.
+    try:
+        import json as _json
+        stream.emit([[_json.dumps({
+            "kind": "clear_line", "marker": "views_refresh_progress"}),
+            "__control__"]])
+    except Exception:
+        pass
     # Tagged emit: channel name + labels render white, counts render
     # pink, errors red. Previously the whole line was one pink blob
     # which users called out as visual noise ("channel name should be
@@ -1681,6 +1814,7 @@ def backfill_video_ids(channel: Dict[str, Any],
                        stream: LogStreamer,
                        cancel_event: Optional[threading.Event] = None,
                        pause_event: Optional[threading.Event] = None,
+                       queues=None,
                        ) -> Dict[str, Any]:
     """One-shot video_id backfill with multi-strategy resolution.
 
@@ -2027,9 +2161,16 @@ def backfill_video_ids(channel: Dict[str, Any],
     for (_v, _t, _y, _m, _fp) in on_disk:
         if cancel_event is not None and cancel_event.is_set():
             break
-        while (pause_event is not None and pause_event.is_set()
-               and not (cancel_event is not None and cancel_event.is_set())):
-            time.sleep(0.25)
+        if pause_event is not None and pause_event.is_set():
+            _enter_pause_wait(stream,
+                              f"{channel.get('name', '?')} (ID backfill)",
+                              queues)
+            while (pause_event.is_set()
+                   and not (cancel_event is not None and cancel_event.is_set())):
+                time.sleep(0.25)
+            _exit_pause_wait(stream,
+                             f"{channel.get('name', '?')} (ID backfill)",
+                             queues)
         # Bump the tick BEFORE any continue branch so every file
         # counted toward progress, regardless of which strategy
         # path it took (skipped, resolved, or unresolved).
@@ -2224,6 +2365,7 @@ def refresh_channel_comments(channel: Dict[str, Any],
                               cancel_event: Optional[threading.Event] = None,
                               pause_event: Optional[threading.Event] = None,
                               only_recent_days: Optional[int] = None,
+                              queues=None,
                               ) -> Dict[str, Any]:
     """Per-channel comment refresh. Re-fetches full metadata (via
     --dump-json --write-comments) for every on-disk video the
@@ -2299,9 +2441,16 @@ def refresh_channel_comments(channel: Dict[str, Any],
     for i, (vid, fp) in enumerate(targets, 1):
         if cancel_event is not None and cancel_event.is_set():
             break
-        while (pause_event is not None and pause_event.is_set()
-               and not (cancel_event is not None and cancel_event.is_set())):
-            time.sleep(0.25)
+        if pause_event is not None and pause_event.is_set():
+            _enter_pause_wait(stream,
+                              f"{channel.get('name', '?')} (comments refresh)",
+                              queues)
+            while (pause_event.is_set()
+                   and not (cancel_event is not None and cancel_event.is_set())):
+                time.sleep(0.25)
+            _exit_pause_wait(stream,
+                             f"{channel.get('name', '?')} (comments refresh)",
+                             queues)
         if i == 1 or i % 25 == 0:
             stream.emit_dim(
                 f"    \u2014 comments refresh: {i}/{total}...")
@@ -2347,6 +2496,7 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                            refresh: bool = False,
                            pause_event: Optional[threading.Event] = None,
                            scope: Optional[Dict[str, Any]] = None,
+                           queues=None,
                            ) -> Dict[str, Any]:
     """Fill in missing metadata for this channel's on-disk videos.
 
@@ -2381,7 +2531,8 @@ def fetch_channel_metadata(channel: Dict[str, Any],
                                         cancel_event=cancel_event,
                                         pause_event=pause_event,
                                         scope=scope,
-                                        full_fetch_on_change=True)
+                                        full_fetch_on_change=True,
+                                        queues=queues)
         # Fall through to the old path ONLY if the bulk path couldn't
         # get any data at all (e.g. channel URL stripped, yt-dlp
         # returned empty, private channel). That path is still
@@ -2727,7 +2878,8 @@ def fetch_channel_metadata(channel: Dict[str, Any],
 
     return fetch_metadata_for_videos(channel, targets, stream,
                                      cancel_event, refresh=refresh,
-                                     pause_event=pause_event)
+                                     pause_event=pause_event,
+                                     queues=queues)
 
 
 # ── Back-compat shim: earlier builds had an `existing_info_ids` helper ──

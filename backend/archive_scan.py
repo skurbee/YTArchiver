@@ -384,6 +384,11 @@ def index_summary() -> Dict[str, Any]:
     """Return stats for the Browse > Index sub-mode.
 
     Provides per-card counters plus a per-channel table.
+
+    NOTE: index-DB-side stats (segments count, hours of video, DB file
+    size) live in `index_db_stats()` — separate so they don't block
+    the boot sequence with multi-second SQL on large archives. The
+    Settings panel fetches that one async after the basics render.
     """
     cfg = load_config()
     cache = load_disk_cache()
@@ -392,11 +397,54 @@ def index_summary() -> Dict[str, Any]:
     tot = archive_totals(cache)
     # Count how many channels have auto_transcribe ON
     transcribed_channels = sum(1 for c in channels if c.get("auto_transcribe"))
-    # Pull index-DB-side stats: segments count, total hours of indexed
-    # video, and the actual .db file size on disk. The Index Statistics
-    # panel is meant to describe the SEARCHABLE INDEX, not the underlying
-    # archive — so the panel shows .db size here, not the multi-TB
-    # archive size (which is surfaced elsewhere via the Browse grid).
+    per_channel = []
+    for ch in channels:
+        st = stats_for_channel(ch, cache)
+        per_channel.append({
+            "folder": ch.get("name") or ch.get("folder", ""),
+            "n_vids": st["n_vids"],
+            "size_gb": st["size_gb"],
+            "size": _fmt_size(st["size_bytes"]),
+            "auto_transcribe": bool(ch.get("auto_transcribe")),
+        })
+    per_channel.sort(key=lambda r: (-r["size_gb"], (r["folder"] or "").lower()))
+    return {
+        "cards": {
+            "channels": len(channels),
+            "videos": tot["videos"],
+            "size_gb": tot["size_gb"],
+            "size_label": _fmt_size(tot["size_bytes"]),
+            "transcribed_channels": transcribed_channels,
+            "transcribed_pct_channels":
+                (transcribed_channels * 100.0 / len(channels)) if channels else 0.0,
+        },
+        "per_channel": per_channel,
+    }
+
+
+def _fmt_size(b: int) -> str:
+    if b <= 0:
+        return "\u2014"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    i = 0
+    v = float(b)
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.1f} {units[i]}" if i >= 2 else f"{int(v)} {units[i]}"
+
+
+def index_db_stats() -> Dict[str, Any]:
+    """Slow index-DB-side stats: segments count, hours of indexed video,
+    and the FTS DB file size. Split out from index_summary() because
+    on a large archive (Scott: 9M+ segments, 16GB DB) the COUNT(*) +
+    JOIN aggregate run for many seconds — long enough to hang the
+    boot sequence if it ran inline. Settings panel calls this async.
+
+    Returns: {segments, hours, index_db_bytes, index_db_size_label}
+    All numeric fields default to 0 on any error (frontend renders
+    "0" instead of "\u2014").
+    """
     segments_count = 0
     hours = 0.0
     index_db_bytes = 0
@@ -436,45 +484,9 @@ def index_summary() -> Dict[str, Any]:
                     hours += float(_row[0] or 0) / 3600.0
     except Exception:
         pass
-    per_channel = []
-    for ch in channels:
-        st = stats_for_channel(ch, cache)
-        per_channel.append({
-            "folder": ch.get("name") or ch.get("folder", ""),
-            "n_vids": st["n_vids"],
-            "size_gb": st["size_gb"],
-            "size": _fmt_size(st["size_bytes"]),
-            "auto_transcribe": bool(ch.get("auto_transcribe")),
-        })
-    per_channel.sort(key=lambda r: (-r["size_gb"], (r["folder"] or "").lower()))
     return {
-        "cards": {
-            "channels": len(channels),
-            "videos": tot["videos"],
-            "size_gb": tot["size_gb"],
-            "size_label": _fmt_size(tot["size_bytes"]),
-            # New: index-DB-side stats. The frontend renders these as
-            # the Index Statistics panel; archive_size is still returned
-            # for callers that want it but isn't shown in the Index panel.
-            "segments": segments_count,
-            "hours": round(hours, 1) if hours > 0 else 0,
-            "index_db_bytes": index_db_bytes,
-            "index_db_size_label": _fmt_size(index_db_bytes),
-            "transcribed_channels": transcribed_channels,
-            "transcribed_pct_channels":
-                (transcribed_channels * 100.0 / len(channels)) if channels else 0.0,
-        },
-        "per_channel": per_channel,
+        "segments": segments_count,
+        "hours": round(hours, 1) if hours > 0 else 0,
+        "index_db_bytes": index_db_bytes,
+        "index_db_size_label": _fmt_size(index_db_bytes),
     }
-
-
-def _fmt_size(b: int) -> str:
-    if b <= 0:
-        return "\u2014"
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    i = 0
-    v = float(b)
-    while v >= 1024 and i < len(units) - 1:
-        v /= 1024
-        i += 1
-    return f"{v:.1f} {units[i]}" if i >= 2 else f"{int(v)} {units[i]}"

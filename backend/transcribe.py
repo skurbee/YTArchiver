@@ -2071,9 +2071,29 @@ class TranscribeManager:
             # "if the GPU task list auto box is unchecked and a
             # transcription task gets kicked over there, it
             # doesn't fire." We poll both every 250ms.
+            # Track whether we've signaled "actually paused" to the UI
+            # so we only call set_gpu_paused_active(True) once per
+            # entry into pause-wait (and clear it once on exit). The
+            # outer Auto-disabled gate doesn't count as a "pause" —
+            # only the explicit _paused flag does.
+            _signaled_paused_active = False
             while (not self._cancel_all.is_set() and
                    (self._paused.is_set() or not self._auto_enabled())):
+                if (self._paused.is_set()
+                        and not _signaled_paused_active
+                        and self._queues is not None):
+                    try:
+                        self._queues.set_gpu_paused_active(True)
+                        _signaled_paused_active = True
+                    except Exception:
+                        pass
                 time.sleep(0.25)
+            # Either we exited because cancel fired or because both
+            # _paused and Auto-disabled cleared. Drop the active flag
+            # if we set it.
+            if _signaled_paused_active and self._queues is not None:
+                try: self._queues.set_gpu_paused_active(False)
+                except Exception: pass
             if self._cancel_all.is_set():
                 break
             with self._jobs_lock:
@@ -2655,9 +2675,18 @@ class TranscribeManager:
             for ci in range(n_chunks):
                 if cancel.is_set() or self._cancel_all.is_set():
                     break
-                # Respect pause between chunks
-                while self._paused.is_set() and not cancel.is_set():
-                    time.sleep(0.5)
+                # Respect pause between chunks. A 2h chunk could keep the
+                # user waiting many minutes; signal "actually paused" so
+                # the Resume button stops blinking once we land here.
+                if self._paused.is_set() and not cancel.is_set():
+                    if self._queues is not None:
+                        try: self._queues.set_gpu_paused_active(True)
+                        except Exception: pass
+                    while self._paused.is_set() and not cancel.is_set():
+                        time.sleep(0.5)
+                    if self._queues is not None:
+                        try: self._queues.set_gpu_paused_active(False)
+                        except Exception: pass
                 if cancel.is_set():
                     break
 
@@ -2835,11 +2864,21 @@ class TranscribeManager:
                 return None
             # audit D-17: pause also polled inside the read loop so a
             # long chunk mid-transcription can actually pause, not
-            # just at chunk boundaries.
-            while (self._paused.is_set()
-                   and not job["cancel"].is_set()
-                   and not self._cancel_all.is_set()):
-                time.sleep(0.5)
+            # just at chunk boundaries. Signal "actually paused" so the
+            # Resume button stops blinking once we land in the wait.
+            if (self._paused.is_set()
+                    and not job["cancel"].is_set()
+                    and not self._cancel_all.is_set()):
+                if self._queues is not None:
+                    try: self._queues.set_gpu_paused_active(True)
+                    except Exception: pass
+                while (self._paused.is_set()
+                       and not job["cancel"].is_set()
+                       and not self._cancel_all.is_set()):
+                    time.sleep(0.5)
+                if self._queues is not None:
+                    try: self._queues.set_gpu_paused_active(False)
+                    except Exception: pass
             if job["cancel"].is_set() or self._cancel_all.is_set():
                 return None
             try:

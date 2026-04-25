@@ -2813,11 +2813,23 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             [_now_clock().lower(), "simpleline"],
             [" \u2014 click Resume.\n", "dim"],
         ])
+        # Tell the UI the pause is now ACTUALLY in effect (vs just
+        # requested). Frontend stops blinking the Resume button.
+        if queues is not None:
+            try: queues.set_sync_paused_active(True)
+            except Exception: pass
         # Block until resumed (or cancelled).
         while pause_event.is_set():
             if cancel_event is not None and cancel_event.is_set():
+                if queues is not None:
+                    try: queues.set_sync_paused_active(False)
+                    except Exception: pass
                 return
             time.sleep(0.25)
+        # Resumed — clear the active flag.
+        if queues is not None:
+            try: queues.set_sync_paused_active(False)
+            except Exception: pass
         stream.emit([
             ["\u25B6 Sync resumed at ", "simpleline_green"],
             [_now_clock().lower(), "simpleline_green"],
@@ -2934,6 +2946,16 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # metadata check should show as its own sync task."
         _ch_kind = (ch.get("kind") or "download").lower()
         _task_t0 = time.time()  # per-task timer for [Mtadta] activity row
+        # Set current_sync for non-download kinds too. Without this,
+        # the popover head row is empty during metadata / comments /
+        # backfill passes, which breaks the "Pause is taking effect"
+        # blink (paintBlinkState requires a running head row to compute
+        # `sync_running=true`). Cleared at the end of the iteration
+        # below so the next channel doesn't inherit a stale row.
+        if _ch_kind in ("metadata", "metadata_comments", "videoid_backfill"):
+            if queues is not None:
+                try: queues.set_current_sync(ch)
+                except Exception: pass
         if _ch_kind == "metadata":
             try:
                 from . import metadata as _meta
@@ -2946,7 +2968,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     ch, stream, cancel_event,
                     refresh=bool(ch.get("refresh")),
                     pause_event=pause_event,
-                    scope=ch.get("scope"))
+                    scope=ch.get("scope"),
+                    queues=queues)
                 # Detect pause-interrupted metadata walk — same
                 # re-enqueue-at-front treatment as downloads.
                 if (pause_event is not None and pause_event.is_set()
@@ -3045,7 +3068,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 _res = _meta.refresh_channel_comments(
                     ch, stream, cancel_event=cancel_event,
                     pause_event=pause_event,
-                    only_recent_days=ch.get("only_recent_days"))
+                    only_recent_days=ch.get("only_recent_days"),
+                    queues=queues)
                 # Honor pause the same way the metadata branch does.
                 if (pause_event is not None and pause_event.is_set()
                         and queues is not None):
@@ -3116,7 +3140,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 from . import metadata as _meta
                 _res = _meta.backfill_video_ids(
                     ch, stream, cancel_event=cancel_event,
-                    pause_event=pause_event)
+                    pause_event=pause_event,
+                    queues=queues)
                 if (pause_event is not None and pause_event.is_set()
                         and queues is not None):
                     try:

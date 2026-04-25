@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v56.8"
-APP_VERSION_DATE = "4.24.26 6:14pm"
+APP_VERSION      = "v57.4"
+APP_VERSION_DATE = "4.24.26 10:28pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -339,13 +339,22 @@ class Api:
             _gpu_auto = bool(_cfg.get("autorun_gpu", False))
             sync_running = sync_working or (_sync_auto and sync_alive)
             gpu_running = gpu_working or (_gpu_auto and gpu_alive)
+            # Forward `*_paused_active` (default to *_paused for older
+            # payloads) so the UI can blink the Resume button between
+            # "user clicked pause" and "worker actually parked".
+            _sync_pa = bool(payload.get('sync_paused_active',
+                                        payload.get('sync_paused')))
+            _gpu_pa = bool(payload.get('gpu_paused_active',
+                                       payload.get('gpu_paused')))
             js = (
                 f"if (window.renderQueues) window.renderQueues({_json.dumps(payload)});"
                 f"if (window.setQueueState) window.setQueueState("
                 f" {{sync: {{running: {str(sync_running).lower()}, "
-                f"paused: {str(payload['sync_paused']).lower()}}},"
+                f"paused: {str(payload['sync_paused']).lower()}, "
+                f"pausedActive: {str(_sync_pa).lower()}}},"
                 f" gpu: {{running: {str(gpu_running).lower()}, "
-                f"paused: {str(payload['gpu_paused']).lower()}}}}});"
+                f"paused: {str(payload['gpu_paused']).lower()}, "
+                f"pausedActive: {str(_gpu_pa).lower()}}}}});"
             )
             self._window.evaluate_js(js)
             # Drive tray icon spin + tooltip with current task name.
@@ -523,6 +532,19 @@ class Api:
                 "total_videos": 0, "total_size_bytes": 0,
             }
         return archive_scan.index_summary()
+
+    def get_index_db_stats(self):
+        """Slow index-DB-side stats (segments, hours, .db file size).
+        Split from get_index_summary so it doesn't block the boot
+        sequence — on a large archive (9M+ segments / 16GB DB) the
+        COUNT + JOIN aggregate runs for many seconds. Settings panel
+        calls this async after the basics render."""
+        try:
+            return archive_scan.index_db_stats()
+        except Exception as e:
+            return {"segments": 0, "hours": 0, "index_db_bytes": 0,
+                    "index_db_size_label": "\u2014",
+                    "error": str(e)}
 
     def get_recent_downloads(self):
         """Return real recent-downloads from config. Empty list when none.
@@ -4437,6 +4459,7 @@ class Api:
                 cancel_ev=self._sync_cancel,
                 pause_ev=self._sync_pause,
                 confirm_cb=_confirm,
+                queues=self._queues,
             )
         except Exception as e:
             self._log_stream.emit_error(f"Redownload crashed: {e}")

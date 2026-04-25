@@ -116,7 +116,8 @@ def _scan_local_files(folder: str) -> Dict[str, str]:
 
 def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
                       pause_ev: Optional[threading.Event],
-                      stream: LogStreamer) -> Dict[str, str]:
+                      stream: LogStreamer,
+                      queues=None) -> Dict[str, str]:
     """Run yt-dlp --flat-playlist to enumerate the channel. Returns {title: id}."""
     yt_dlp = find_yt_dlp() or "yt-dlp"
     enum_cmd = [
@@ -149,9 +150,15 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             # enumeration completes (minutes on a 10k-video channel)
             # before the pause actually acts. Mirrors the pause-wait
             # pattern used in the download loop at lines ~651-666.
-            while (pause_ev is not None and pause_ev.is_set()
-                   and not cancel_ev.is_set()):
-                time.sleep(0.25)
+            if pause_ev is not None and pause_ev.is_set():
+                if queues is not None:
+                    try: queues.set_sync_paused_active(True)
+                    except Exception: pass
+                while (pause_ev.is_set() and not cancel_ev.is_set()):
+                    time.sleep(0.25)
+                if queues is not None:
+                    try: queues.set_sync_paused_active(False)
+                    except Exception: pass
             if cancel_ev.is_set():
                 proc.terminate()
                 break
@@ -560,6 +567,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        pause_ev: Optional[threading.Event] = None,
                        confirm_cb: Optional[Callable[[float, str, str, int],
                                                      str]] = None,
+                       queues=None,
                        ) -> Dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
@@ -587,8 +595,14 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             [f"  \u23F8 ", "pauselog"],
             ["Redownload paused \u2014 click Resume.\n", "pauselog"],
         ])
+        if queues is not None:
+            try: queues.set_sync_paused_active(True)
+            except Exception: pass
         while pause_ev.is_set() and not cancel_ev.is_set():
             time.sleep(0.25)
+        if queues is not None:
+            try: queues.set_sync_paused_active(False)
+            except Exception: pass
         if not cancel_ev.is_set():
             stream.emit([
                 [f"  \u25B6 ", "simpleline_redwnl"],
@@ -612,7 +626,8 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
         return {"ok": False, "cancelled": True}
     stream.emit([["  \u2014", "simpleline_redwnl"],
                  [" Fetching YouTube video list\u2026\n", "simpleline"]])
-    yt_titles = _fetch_yt_catalog(ch_url, cancel_ev, pause_ev, stream)
+    yt_titles = _fetch_yt_catalog(ch_url, cancel_ev, pause_ev, stream,
+                                  queues=queues)
     if cancel_ev.is_set():
         return {"ok": False, "cancelled": True}
     if not yt_titles:
@@ -737,6 +752,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # and users thought the app died.
             _paused_since = time.time()
             _last_tick = _paused_since
+            if queues is not None:
+                try: queues.set_sync_paused_active(True)
+                except Exception: pass
             while pause_ev.is_set() and not cancel_ev.is_set():
                 time.sleep(0.25)
                 _now = time.time()
@@ -750,6 +768,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     except Exception:
                         pass
                     _last_tick = _now
+            if queues is not None:
+                try: queues.set_sync_paused_active(False)
+                except Exception: pass
             if not cancel_ev.is_set():
                 stream.emit([
                     [f"  \u25B6 ", "simpleline_redwnl"],

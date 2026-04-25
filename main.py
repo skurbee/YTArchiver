@@ -17,8 +17,8 @@ from pathlib import Path
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v57.4"
-APP_VERSION_DATE = "4.24.26 10:28pm"
+APP_VERSION      = "v57.5"
+APP_VERSION_DATE = "4.24.26 11:37pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -1252,9 +1252,12 @@ class Api:
                 if log_parts:
                     _loading(" \u00b7 ".join(log_parts))
                 _time.sleep(0.4)
-            # Hide both slots once startup is fully done.
-            _push_indicator("sweep", None)
-            _push_indicator("preload", None)
+            # NOTE: post-stage-3 indicator state is handled by the
+            # caller after stage3_done.set() — sweep slot is cleared
+            # and preload slot gets a persistent dim "Browse preload
+            # complete: ..." line. The animator deliberately doesn't
+            # touch the slots on exit so it can't race-overwrite that
+            # completion text.
         threading.Thread(target=_animate_dots, daemon=True).start()
 
         def _clear_loading():
@@ -1452,20 +1455,18 @@ class Api:
             t_sweep.join()
             t_preload.join()
 
-            # Emit the stage-3 milestone now that both have drained.
+            # Pull the post-stage-3 totals so the preload indicator slot
+            # can hold a persistent dim-italic completion line. (Used to
+            # be a green log milestone — moved off the activity log per
+            # user request: "move the Browse tab preload complete line
+            # to where the browse preload dim line is".)
             try:
                 from backend import archive_scan as _as
                 idx = _as.index_summary()
-                n_ch = idx["cards"].get("channels", 0) if idx else 0
-                n_vids = idx["cards"].get("videos", 0) if idx else 0
-                s.emit_text(
-                    f"--- Browse tab preload complete ({n_ch} channels \u00b7 "
-                    f"{n_vids:,} videos cached) ---",
-                    "simpleline_green")
-                _flush_now()
-            except Exception as e:
-                s.emit_error(f"Browse preload error: {e}")
-                _flush_now()
+                _stage3_n_ch = idx["cards"].get("channels", 0) if idx else 0
+                _stage3_n_vids = idx["cards"].get("videos", 0) if idx else 0
+            except Exception:
+                _stage3_n_ch, _stage3_n_vids = 0, 0
 
             sweep_reg = sweep_result["registered"]
             sweep_ing = sweep_result["ingested"]
@@ -1507,8 +1508,24 @@ class Api:
                 pass
 
             stage3_done.set()
-            _time.sleep(0.05) # let the animator notice
+            # Wait > the animator's 0.4s sleep cycle so its loop
+            # definitely sees stage3_done and exits BEFORE we push the
+            # persistent completion text. Without this, the animator's
+            # last in-flight iteration could race-overwrite our text
+            # with a stale "Preloading Browse..." line.
+            _time.sleep(0.5)
             _clear_loading()
+            # Replace the live "Preloading..." indicator with a persistent
+            # dim-italic completion line. Sweep slot cleared (indexing
+            # is done), preload slot gets the completion summary.
+            try:
+                _push_indicator("sweep", None)
+                _push_indicator("preload",
+                                f"Browse preload complete: "
+                                f"{_stage3_n_ch} channels \u00b7 "
+                                f"{_stage3_n_vids:,} videos cached")
+            except Exception:
+                pass
 
         # Sequential stages on one background thread — each milestone
         # fires the moment its stage finishes.

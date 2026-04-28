@@ -111,7 +111,7 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
         # this bounds worst-case recovery at ~60s.
         stream.emit_text(
             " \u26a0 Network down \u2014 pausing until connection returns "
-            "(~30-60s after it's back, to confirm stability)...", "red")
+            "(60s of confirmed stability)...", "red")
     waited = 0
     # audit D-39: require 2 consecutive OK probes to clear net_down
     # from inside the inline wait loop, matching the background

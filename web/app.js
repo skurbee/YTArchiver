@@ -1640,27 +1640,77 @@
         results.innerHTML = '<div class="browse-empty">Search requires native mode.</div>';
         return;
       }
-      const scopeVal = scope?.value || "all";
-      // .txt: global title search runs through a different backend
-      // path that hits the videos table by title (no FTS, no
-      // transcript snippet). Re-shape the rows into the same {title,
-      // channel, text, snippet} fields the renderer below expects so
-      // we don't need a parallel renderer.
-      const chan = (scopeVal === "channel")
-        ? (_browseState.currentChannel?.folder || null) : null;
+      // Read what + where from the new search UI.
+      //   wantTranscripts / wantTitles → which backends to call
+      //   selectedChannels → array of channel folders (empty = all)
+      // Legacy callers (Graph drill-in via _drillIntoSearch) still set
+      // the hidden #search-scope select; we honor those signals so old
+      // entry points keep working.
+      const inTx = document.getElementById("search-in-transcripts");
+      const inTi = document.getElementById("search-in-titles");
+      let wantTranscripts = inTx ? inTx.checked : true;
+      let wantTitles = inTi ? inTi.checked : false;
+      const legacyScope = (scope?.value || "all");
+      if (legacyScope === "titles") {
+        wantTranscripts = false; wantTitles = true;
+      }
+      const selectedChannels = (typeof window._searchSelectedChannels === "function")
+        ? (window._searchSelectedChannels() || [])
+        : ((legacyScope === "channel" && _browseState.currentChannel?.folder)
+            ? [_browseState.currentChannel.folder]
+            : []);
+      if (!wantTranscripts && !wantTitles) {
+        results.innerHTML = '<div class="browse-empty">Pick at least one of Transcripts or Video Title.</div>';
+        counter.textContent = "—";
+        return;
+      }
       try {
-        let rows;
-        if (scopeVal === "titles") {
-          rows = await api.browse_search_titles?.(q, 200) || [];
-          rows = rows.map(r => ({
-            ...r,
-            text: r.title || "",
-            snippet: escapeHtml(r.title || ""),
-            start_time: 0,
-            jsonl_path: "",
-          }));
+        const promises = [];
+        // Transcripts leg — FTS5 against segments.
+        if (wantTranscripts) {
+          promises.push(
+            Promise.resolve(api.browse_search(q, selectedChannels, 200))
+              .then(rs => (rs || []).map(r => ({ ...r, _match_kind: "transcript" })))
+              .catch(() => [])
+          );
         } else {
-          rows = await api.browse_search(q, chan, 200);
+          promises.push(Promise.resolve([]));
+        }
+        // Titles leg — videos table LIKE search, re-shaped to look
+        // like a transcript hit so the renderer below stays unified.
+        if (wantTitles) {
+          promises.push(
+            Promise.resolve(api.browse_search_titles?.(q, selectedChannels, 200))
+              .then(rs => (rs || []).map(r => ({
+                ...r,
+                text: r.title || "",
+                snippet: escapeHtml(r.title || ""),
+                start_time: 0,
+                jsonl_path: "",
+                _match_kind: "title",
+              })))
+              .catch(() => [])
+          );
+        } else {
+          promises.push(Promise.resolve([]));
+        }
+        const [txRows, tiRows] = await Promise.all(promises);
+        let rows = [...txRows, ...tiRows];
+        // Surface a backend-shaped error row if either leg returned one.
+        const errRow = rows.find(r => r && r.error);
+        if (errRow) rows = [errRow];
+        // When BOTH legs ran, prepend a tiny [title]/[transcript] tag
+        // to each row's snippet so the user can tell the source at a
+        // glance. Single-leg searches stay unbadged to match the
+        // pre-refactor look.
+        const bothLegs = wantTranscripts && wantTitles;
+        if (bothLegs) {
+          rows = rows.map(r => {
+            if (!r || r.error) return r;
+            const kind = r._match_kind === "title" ? "title" : "transcript";
+            const badge = `<span class="search-match-pill search-match-${kind}">${kind}</span>`;
+            return { ...r, snippet: badge + " " + (r.snippet || "") };
+          });
         }
         if (!Array.isArray(rows) || rows.length === 0 || (rows[0] && rows[0].error)) {
           const errMsg = (rows && rows[0] && rows[0].error) ? `Search error: ${rows[0].error}` : "No matches.";
@@ -1797,6 +1847,178 @@
         input.focus();
       });
     });
+
+    // ── New search UI wiring: content-type checkboxes + channel multi ──
+    _initSearchContentCheckboxes(scope);
+    _initSearchChannelMulti(scope);
+  }
+
+  /** Wire the two "match against" checkboxes (Transcripts / Video
+   * Title). Toggling them grey-out the FTS-only operator buttons and
+   * year inputs when Transcripts is unchecked; they only apply to the
+   * FTS leg. Also syncs the hidden #search-scope compat shim so the
+   * legacy Graph drill-in callers and any third-party readers keep
+   * seeing a sensible value. */
+  function _initSearchContentCheckboxes(scopeShim) {
+    const inTx = document.getElementById("search-in-transcripts");
+    const inTi = document.getElementById("search-in-titles");
+    const filters = document.querySelector(".search-filters");
+    const btnRun = document.getElementById("btn-search-run");
+    if (!inTx || !inTi) return;
+    const sync = () => {
+      const onlyTitles = !inTx.checked && inTi.checked;
+      const onlyTranscripts = inTx.checked && !inTi.checked;
+      const neither = !inTx.checked && !inTi.checked;
+      if (filters) filters.classList.toggle("search-operators-disabled", onlyTitles);
+      if (btnRun) btnRun.disabled = neither;
+      // Keep the hidden compat select roughly in sync so legacy
+      // drill-in callers from Graph view continue to function.
+      if (scopeShim) {
+        if (onlyTitles) scopeShim.value = "titles";
+        else if (onlyTranscripts) scopeShim.value = "all";
+        else scopeShim.value = "all";
+      }
+    };
+    inTx.addEventListener("change", sync);
+    inTi.addEventListener("change", sync);
+    sync();
+  }
+
+  /** Initialize the channel multi-select dropdown.
+   *
+   * The trigger is a styled button; the panel below holds an "All
+   * channels" master checkbox plus one row per channel. Master toggles
+   * all individuals; toggling any individual unchecks master (and
+   * checking the LAST one re-syncs master). Label collapses to "All
+   * channels" / "<one name>" / "<N> channels" depending on state.
+   * Closes on click-outside.
+   *
+   * Channel list source: prefer the cached `window._subsAllRows`
+   * (populated whenever the Subs tab renders) for instant open; fall
+   * back to `api.browse_list_channels` if the cache is empty (e.g.
+   * the user hasn't opened Subs yet this session). Re-syncs on each
+   * panel open so newly-added channels show up. */
+  function _initSearchChannelMulti(scopeShim) {
+    const wrap = document.getElementById("search-channel-multi");
+    const trigger = document.getElementById("search-channel-trigger");
+    const panel = document.getElementById("search-channel-panel");
+    const label = document.getElementById("search-channel-label");
+    const allCb = document.getElementById("search-channel-all");
+    const list = document.getElementById("search-channel-list");
+    if (!wrap || !trigger || !panel || !list || !allCb || !label) return;
+
+    // Selected folder names, stored as a Set on the wrap element so it
+    // survives panel re-renders. Empty Set = "All channels".
+    const selected = new Set();
+    wrap._searchSelected = selected;
+
+    const isAllMode = () => selected.size === 0;
+
+    const updateLabel = () => {
+      if (isAllMode()) { label.textContent = "All channels"; return; }
+      if (selected.size === 1) {
+        const only = Array.from(selected)[0];
+        // Use the display name if we have one cached
+        const row = (window._subsAllRows || []).find(r => r.folder === only);
+        label.textContent = row?.name || row?.folder || only;
+        return;
+      }
+      label.textContent = `${selected.size} channels`;
+    };
+
+    const refreshAllCheckbox = () => {
+      allCb.checked = isAllMode();
+    };
+
+    const populate = async () => {
+      // Snapshot the channel list. Sort alphabetically by display
+      // name so the user can scan it quickly.
+      let rows = window._subsAllRows || [];
+      if (!rows.length) {
+        try {
+          const api = window.pywebview?.api;
+          const res = await api?.browse_list_channels?.();
+          if (Array.isArray(res)) rows = res;
+        } catch { /* leave empty */ }
+      }
+      rows = rows
+        .map(r => ({ folder: r.folder || r.name || "", name: r.name || r.folder || "" }))
+        .filter(r => r.folder)
+        .sort((a, b) => (a.name || a.folder).toLowerCase()
+                          .localeCompare((b.name || b.folder).toLowerCase()));
+      list.innerHTML = "";
+      const frag = document.createDocumentFragment();
+      for (const r of rows) {
+        const opt = document.createElement("label");
+        opt.className = "search-channel-opt";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.value = r.folder;
+        cb.checked = selected.has(r.folder);
+        const sp = document.createElement("span");
+        sp.textContent = r.name || r.folder;
+        opt.appendChild(cb);
+        opt.appendChild(sp);
+        frag.appendChild(opt);
+        cb.addEventListener("change", () => {
+          if (cb.checked) selected.add(r.folder);
+          else selected.delete(r.folder);
+          refreshAllCheckbox();
+          updateLabel();
+          // Keep the hidden compat select in sync: "channel" when
+          // exactly one is picked, "all" otherwise.
+          if (scopeShim) {
+            scopeShim.value = (selected.size === 1) ? "channel" : "all";
+          }
+        });
+      }
+      list.appendChild(frag);
+    };
+
+    const open = async () => {
+      await populate();
+      panel.hidden = false;
+      trigger.classList.add("is-open");
+    };
+    const close = () => {
+      panel.hidden = true;
+      trigger.classList.remove("is-open");
+    };
+    const toggle = (e) => {
+      e.stopPropagation();
+      if (panel.hidden) open(); else close();
+    };
+
+    trigger.addEventListener("click", toggle);
+
+    // Master "All channels" — checking it clears all individual
+    // selections (and the empty-set state means "all"). Unchecking
+    // it doesn't really make sense in isolation (no positive
+    // selection), so re-tick it.
+    allCb.addEventListener("change", () => {
+      if (allCb.checked) {
+        selected.clear();
+        // Refresh individual checkboxes' visual state
+        list.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+      } else {
+        // Re-tick — empty selection always means "All channels".
+        allCb.checked = true;
+      }
+      updateLabel();
+      if (scopeShim) scopeShim.value = "all";
+    });
+
+    // Click outside the dropdown closes it.
+    document.addEventListener("click", (e) => {
+      if (panel.hidden) return;
+      if (!wrap.contains(e.target)) close();
+    });
+
+    // Expose the read function for doSearch (returns [] when "all").
+    window._searchSelectedChannels = () => Array.from(selected);
+
+    updateLabel();
+    refreshAllCheckbox();
   }
 
   function escapeHtml(s) {
@@ -2412,10 +2634,31 @@
     if (m1) { if (yf) yf.value = m1[1]; if (yt) yt.value = m1[1]; }
     else if (m2) { if (yf) yf.value = m2[1]; if (yt) yt.value = m2[1]; }
     if (scope && channel) {
-      // Select the channel if it's in the scope dropdown
+      // Set the hidden compat select so the legacy path picks up the
+      // single-channel scope.
       for (const opt of scope.options) {
         if (opt.value === "channel") { scope.value = "channel"; break; }
       }
+      // Also seed the new multi-select state so the modern doSearch
+      // path (which prefers _searchSelectedChannels over the legacy
+      // shim) actually scopes to this channel. The Graph view passes
+      // either the channel folder or the channel name; try to resolve
+      // the folder by matching either against the Subs cache.
+      try {
+        const rows = window._subsAllRows || [];
+        const match = rows.find(r => r.folder === channel || r.name === channel);
+        const folder = match?.folder || channel;
+        const wrap = document.getElementById("search-channel-multi");
+        if (wrap && wrap._searchSelected) {
+          wrap._searchSelected.clear();
+          wrap._searchSelected.add(folder);
+          // Update the visible label without re-opening the panel.
+          const label = document.getElementById("search-channel-label");
+          if (label) label.textContent = match?.name || folder;
+          const allCb = document.getElementById("search-channel-all");
+          if (allCb) allCb.checked = false;
+        }
+      } catch { /* drill-in is best-effort UI sugar */ }
     }
     // Fire the search
     setTimeout(() => document.getElementById("btn-search-run")?.click(), 80);

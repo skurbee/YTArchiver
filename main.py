@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v62.6"
-APP_VERSION_DATE = "5.15.26 3:36pm"
+APP_VERSION      = "v62.7"
+APP_VERSION_DATE = "5.15.26 5:46pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2636,14 +2636,25 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     def browse_search(self, query, channel=None, limit=200):
-        """FTS5 search across all segments."""
+        """FTS5 search across transcript segments.
+
+        `channel` accepts either a single channel-folder string, a list
+        of folders (multi-channel scope), or None / empty list ("all
+        channels"). Passing a list lets the new search UI scope to a
+        subset of channels without forcing the user to run separate
+        searches.
+        """
         return index_backend.search_fts(query, channel=channel, limit=limit)
 
-    def browse_search_titles(self, query, limit=200):
-        """.txt request: global video search by title across every
-        channel. Returns hits sorted by upload date (newest first).
+    def browse_search_titles(self, query, channel=None, limit=200):
+        """Global video search by title across every channel (or a
+        subset). `channel` follows the same accept-string-or-list rule
+        as `browse_search` so the new search UI can apply its channel
+        multi-select to titles too. Returns hits sorted by upload date
+        (newest first).
         """
-        return index_backend.search_video_titles(query, limit=limit)
+        return index_backend.search_video_titles(
+            query, channel=channel, limit=limit)
 
     def browse_graph(self, word, channel=None, bucket="month", normalize=False):
         """Word frequency over time for the Graph sub-mode.

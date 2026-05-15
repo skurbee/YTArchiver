@@ -1735,17 +1735,18 @@ def _sanitize_fts_query(q: str) -> str:
     return cleaned
 
 
-def search_video_titles(query: str, limit: int = 200
+def search_video_titles(query: str,
+                          channel: Optional[Any] = None,
+                          limit: int = 200
                           ) -> List[Dict[str, Any]]:
-    """Global title-only search across every channel's videos. .txt
-    request: "search for a video by title from every channel". The
-    existing search_fts hits the transcripts (segment-level FTS5),
-    which works inside a channel but doesn't surface partial title
-    matches across the whole archive.
+    """Global title-only search across the archive's videos.
 
-    LIKE-based, case-insensitive. Returns up to `limit` matches sorted
-    by upload_ts DESC (newest first). Result shape mirrors search_fts
-    so the frontend renderer can swap modes without restructuring.
+    `channel` scopes the search: None / empty list → all channels;
+    a string → that one channel; a list of strings → that subset.
+    Title is LIKE-based, case-insensitive. Returns up to `limit`
+    matches sorted by upload_ts DESC (newest first). Result shape
+    mirrors search_fts so the frontend renderer can swap modes
+    without restructuring.
     """
     if not query or not query.strip():
         return []
@@ -1758,13 +1759,26 @@ def search_video_titles(query: str, limit: int = 200
     if not parts:
         return []
     where_clauses = " AND ".join(["title LIKE ? COLLATE NOCASE"] * len(parts))
-    args = [f"%{p}%" for p in parts] + [int(limit)]
+    args: List[Any] = [f"%{p}%" for p in parts]
+    # Channel scope: accept string (legacy) or list (new multi-select).
+    chan_sql = ""
+    if isinstance(channel, str) and channel.strip():
+        chan_sql = " AND channel = ?"
+        args.append(channel.strip())
+    elif isinstance(channel, (list, tuple)) and channel:
+        _names = [str(c).strip() for c in channel if str(c).strip()]
+        if _names:
+            placeholders = ",".join(["?"] * len(_names))
+            chan_sql = f" AND channel IN ({placeholders})"
+            args.extend(_names)
+    args.append(int(limit))
     try:
         with _db_lock:
             cur = conn.execute(
                 f"SELECT video_id, title, channel, filepath, year, "
                 f"COALESCE(upload_ts, added_ts, 0) AS ts "
-                f"FROM videos WHERE {where_clauses} "
+                f"FROM videos WHERE {where_clauses}"
+                f"{chan_sql} "
                 f"AND is_duplicate_of IS NULL "
                 f"ORDER BY ts DESC LIMIT ?",
                 args)
@@ -1783,7 +1797,7 @@ def search_video_titles(query: str, limit: int = 200
     } for r in rows]
 
 
-def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,
+def search_fts(query: str, channel: Optional[Any] = None, limit: int = 200,
                year_from: Optional[int] = None, year_to: Optional[int] = None
                ) -> List[Dict[str, Any]]:
     """Run FTS5 MATCH against segments. Returns hits with context.
@@ -1807,9 +1821,20 @@ def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,
          " WHERE segments_fts MATCH ?")
     args_suffix: List[Any] = []
     suffix = ""
-    if channel:
+    # Channel scope: string (legacy single-channel) or list (new
+    # multi-select). Empty list / None = all channels.
+    if isinstance(channel, str) and channel.strip():
         suffix += " AND s.channel=?"
-        args_suffix.append(channel)
+        args_suffix.append(channel.strip())
+    elif isinstance(channel, (list, tuple)) and channel:
+        _names = [str(c).strip() for c in channel if str(c).strip()]
+        if len(_names) == 1:
+            suffix += " AND s.channel=?"
+            args_suffix.append(_names[0])
+        elif _names:
+            placeholders = ",".join(["?"] * len(_names))
+            suffix += f" AND s.channel IN ({placeholders})"
+            args_suffix.extend(_names)
     # audit D-49: OR-include s.year IS NULL when a year filter is set.
     # Legacy rows (drop-in mode, pre-path-parsing, channels where the
     # folder layout isn't year-organized) have segments.year=NULL;

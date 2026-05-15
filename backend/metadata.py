@@ -3802,6 +3802,41 @@ def refresh_channel_comments(channel: Dict[str, Any],
         from datetime import timedelta as _td
         cutoff_yyyymmdd = (datetime.now() - _td(days=only_recent_days)
                            ).strftime("%Y%m%d")
+    # Mid-channel resume support. When the task is paused mid-run and
+    # the app is closed + reopened, the queue restores `current_sync`
+    # back to the front of the sync queue and we land here again with
+    # the same dict. Without this, we'd rebuild targets from i=1 and
+    # silently re-fetch the videos we already did in the prior partial
+    # pass. Track a `_pass_start_ts` on the task dict the FIRST time
+    # we run; on subsequent resumptions of the same dict, filter out
+    # any entry whose fetched_at >= _pass_start_ts (already refreshed
+    # in this pass). Manual re-trigger = brand-new dict, so no skip.
+    #
+    # NB: queues.set_current_sync uses copy.deepcopy(), so mutating
+    # `channel` alone DOESN'T propagate to queues.current_sync and
+    # therefore wouldn't survive a save_now. We re-call set_current_sync
+    # with the mutated dict to push the new field through.
+    _pass_start_ts: float = float(channel.get("_pass_start_ts") or 0.0)
+    if _pass_start_ts <= 0:
+        _pass_start_ts = time.time()
+        channel["_pass_start_ts"] = _pass_start_ts
+        if queues is not None:
+            try:
+                queues.set_current_sync(channel)
+                queues.save_debounced()
+            except Exception:
+                pass
+    def _entry_already_done_this_pass(entry: dict) -> bool:
+        fa = entry.get("fetched_at") or ""
+        if not fa:
+            return False
+        try:
+            # ISO format from datetime.now().isoformat() — no tz, local.
+            ts = datetime.fromisoformat(str(fa)).timestamp()
+        except (ValueError, TypeError):
+            return False
+        return ts >= _pass_start_ts
+    _skipped_already_done = 0
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
             if not fn.endswith("Metadata.jsonl"):
@@ -3814,9 +3849,16 @@ def refresh_channel_comments(channel: Dict[str, Any],
                     ud = str(entry.get("upload_date") or "")
                     if not ud or ud < cutoff_yyyymmdd:
                         continue
+                if _entry_already_done_this_pass(entry):
+                    _skipped_already_done += 1
+                    continue
                 _title = str(entry.get("title") or "")
                 _old_comments = entry.get("comments") or []
                 targets.append((vid, fp_by_id[vid], _title, _old_comments))
+    if _skipped_already_done > 0:
+        stream.emit_dim(
+            f"    — resuming: skipping {_skipped_already_done} video(s) "
+            f"already refreshed in this pass")
 
     total = len(targets)
     if total == 0:

@@ -3482,10 +3482,105 @@ body {
   cursor: pointer;
 }
 .search-op-btn:hover { background: var(--c-primary); color: var(--c-text); }
+/* When ONLY the Video Title checkbox is on, the FTS5-only operators
+   (AND/OR/NOT/"exact phrase"/word*) and the year-range inputs grey
+   out — they don't affect a plain title LIKE search. */
+.search-filters.search-operators-disabled .search-op-btn,
+.search-filters.search-operators-disabled #search-year-from,
+.search-filters.search-operators-disabled #search-year-to {
+  opacity: 0.4;
+  pointer-events: none;
+}
 .search-filters {
   display: flex; gap: 14px; align-items: center;
   padding: 4px 2px; font-size: 12px;
   border-bottom: 1px solid var(--c-border);
+}
+/* "Match against" checkboxes — Transcripts / Video Title. Sits in
+   .search-inputs next to the query box and the channel dropdown. */
+.search-in-group {
+  display: flex; gap: 10px; align-items: center;
+  padding: 0 6px;
+  border-left: 1px solid var(--c-border);
+  border-right: 1px solid var(--c-border);
+}
+.search-in-opt {
+  display: inline-flex; gap: 5px; align-items: center;
+  cursor: pointer; font-size: 12px; color: var(--c-text);
+  user-select: none; white-space: nowrap;
+}
+.search-in-opt input[type="checkbox"] { cursor: pointer; }
+/* Multi-select channel dropdown — single-line trigger button that
+   opens a checkbox panel. Style the trigger to match ctl-select so
+   it sits flush next to the rest of the controls. */
+.search-channel-multi { position: relative; flex: 0 0 auto; }
+.search-channel-trigger {
+  display: inline-flex; align-items: center; gap: 6px;
+  min-width: 160px; max-width: 240px;
+  padding: 6px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.search-channel-trigger:hover { background: var(--c-input); }
+.search-channel-trigger.is-open {
+  border-color: var(--c-accent);
+}
+.search-channel-label {
+  flex: 1 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px;
+}
+.search-channel-caret { color: var(--c-dim); font-size: 10px; }
+.search-channel-panel {
+  position: absolute;
+  top: calc(100% + 4px); left: 0;
+  min-width: 240px; max-width: 320px;
+  max-height: 360px; overflow-y: auto;
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  z-index: 100;
+  padding: 4px 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.search-channel-panel[hidden] { display: none; }
+.search-channel-opt {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  cursor: pointer; font-size: 12px;
+  user-select: none;
+}
+.search-channel-opt:hover { background: var(--c-btn); }
+.search-channel-opt input[type="checkbox"] { cursor: pointer; }
+.search-channel-opt span {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.search-channel-all-row { font-weight: 600; }
+.search-channel-divider {
+  height: 1px;
+  background: var(--c-border);
+  margin: 4px 0;
+}
+/* Match-source pill prefixed to each result snippet when BOTH legs
+   ran (Transcripts + Video Title both checked). Single-leg searches
+   leave the snippet unbadged. */
+.search-match-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 2px;
+  margin-right: 4px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.search-match-transcript {
+  background: rgba(108, 180, 238, 0.18);
+  color: #6cb4ee;
+}
+.search-match-title {
+  background: rgba(232, 122, 172, 0.18);
+  color: #e87aac;
 }
 /* Split layout — results list on the left, context viewer on the right.
    Mirrors YTArchiver.py:29598 PanedWindow. */

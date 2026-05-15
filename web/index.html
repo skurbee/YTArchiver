@@ -1203,14 +1203,48 @@
             </div>
             <div class="search-inputs">
               <input type="text" class="ctl-input search-main-input" id="search-query"
-                     placeholder="Search transcripts &mdash; word or phrase" />
-              <select class="ctl-select" id="search-scope">
-                <option value="all">All channels (transcripts)</option>
-                <option value="channel">Single channel (transcripts)</option>
-                <option value="titles">All videos (titles only)</option>
-              </select>
+                     placeholder="Search videos &mdash; title or transcript" />
+              <div class="search-in-group" id="search-in-group"
+                   title="Choose what to match against. Uncheck Transcripts to do title-only search; the AND/OR/NOT operators apply to the transcript leg only.">
+                <label class="search-in-opt">
+                  <input type="checkbox" id="search-in-transcripts" checked />
+                  <span>Transcripts</span>
+                </label>
+                <label class="search-in-opt">
+                  <input type="checkbox" id="search-in-titles" checked />
+                  <span>Video Title</span>
+                </label>
+              </div>
+              <div class="search-channel-multi" id="search-channel-multi">
+                <button type="button" class="ctl-select search-channel-trigger"
+                        id="search-channel-trigger"
+                        title="Scope the search to specific channels. Default: all channels.">
+                  <span class="search-channel-label" id="search-channel-label">All channels</span>
+                  <span class="search-channel-caret">&#x25BE;</span>
+                </button>
+                <div class="search-channel-panel" id="search-channel-panel" hidden>
+                  <label class="search-channel-opt search-channel-all-row">
+                    <input type="checkbox" id="search-channel-all" checked />
+                    <span>All channels</span>
+                  </label>
+                  <div class="search-channel-divider"></div>
+                  <div class="search-channel-list" id="search-channel-list">
+                    <!-- one label per channel, populated by JS -->
+                  </div>
+                </div>
+              </div>
               <button class="btn btn-sync btn-thin" id="btn-search-run">Search</button>
             </div>
+            <!-- Hidden compatibility shim: legacy code paths read this
+                 #search-scope <select> to set scope ("titles" /
+                 "channel" / "all"). Kept invisible so _drillIntoSearch
+                 from the Graph view and any third-party caller still
+                 work; the new UI doesn't surface it. -->
+            <select id="search-scope" hidden>
+              <option value="all" selected>all</option>
+              <option value="channel">channel</option>
+              <option value="titles">titles</option>
+            </select>
             <div class="search-filters">
               <span class="search-hint-label">Match:</span>
               <button class="search-op-btn" data-op="AND"

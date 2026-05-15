@@ -817,6 +817,21 @@
   // the window. Re-entrant safe — only one dialog at a time.
   window._showCloseDialog = function () {
     if (document.getElementById("close-confirm-modal")) return;
+    // BUG FIX 2026-05-15 (audit): dismiss any already-open modal before
+    // showing the close confirm. User hit this by clicking X while a
+    // Diagnostics dialog was open — the close dialog appeared ON TOP
+    // of Diagnostics, two modals stacked. Now we tear down any open
+    // modal first (compress-dry, diagnostics, drift, manual-tx, etc.)
+    // by hiding their backdrops, so the close dialog is the only one
+    // visible.
+    try {
+      document.querySelectorAll(".askq-backdrop").forEach((el) => {
+        if (el.id && el.id !== "close-confirm-modal"
+            && el.style.display !== "none") {
+          el.style.display = "none";
+        }
+      });
+    } catch (_e) { /* non-fatal */ }
     const backdrop = document.createElement("div");
     backdrop.className = "askq-backdrop";
     backdrop.id = "close-confirm-modal";
@@ -4316,9 +4331,20 @@
       } else if (onTotChecked > 0 && onRemovedChecked > 0) {
         const live = Math.max(0, onTotChecked - onRemovedChecked);
         const p = pct(live, onTotChecked);
+        // Bug fix v62.4: a tiny number of removals on a huge total
+        // (e.g. 20 removed of 101,988 = 99.98%) used to round up to
+        // "100.0%" via toFixed(1). The user then saw "100%" in the
+        // card while per-row entries showed 99.8%/99.9% — a confusing
+        // mismatch even though both sides agreed on the underlying
+        // count. Bump to toFixed(2) whenever toFixed(1) would round
+        // to "100.0" so the "we found N removed" signal stays in the
+        // displayed percentage instead of getting hidden by rounding.
+        let pStr = p.toFixed(1);
+        if (pStr === "100.0" && p < 100) pStr = p.toFixed(2);
         setCard("md-tot-card-onyt", "md-tot-onyt",
-                `${p.toFixed(1)}%`,
-                `${fmt(live)} / ${fmt(onTotChecked)}`
+                `${pStr}%`,
+                `${fmt(live)} / ${fmt(onTotChecked)} · `
+                  + `${fmt(onRemovedChecked)} removed`
                   + (onChannelsChecked < nChannels
                      ? ` (${onChannelsChecked}/${nChannels})` : ""),
                 tier(p));
@@ -6345,7 +6371,7 @@
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
-          { label: "Re-transcribe", action: async () => {
+          { label: "Re-transcribe…", action: async () => {
             // Mirrors OLD YTArchiver.py:28357 `_on_retranscribe` — ask for
             // a Whisper model, then queue a GPU task. No extra "are you
             // sure" confirm (the model picker Cancel handles that).
@@ -6413,7 +6439,7 @@
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
-          { label: "Re-transcribe", action: async () => {
+          { label: "Re-transcribe…", action: async () => {
             if (!filepath || !api?.transcribe_retranscribe) return;
             const model = await (window._askWhisperModel?.(`"${title}"`));
             if (!model) return;
@@ -9079,12 +9105,12 @@
         html += `<table style="width:100%;border-collapse:collapse;">`;
         html += `<thead><tr style="border-bottom:1px solid #2a3140;text-align:right;">`;
         html += `<th style="text-align:left;padding:4px 6px;">Channel</th>`;
-        html += `<th style="padding:4px 6px;">Videos</th>`;
-        html += `<th style="padding:4px 6px;">Hours</th>`;
-        html += `<th style="padding:4px 6px;">Current</th>`;
-        html += `<th style="padding:4px 6px;">Generous</th>`;
-        html += `<th style="padding:4px 6px;">Average</th>`;
-        html += `<th style="padding:4px 6px;">Below Avg</th>`;
+        html += `<th style="padding:4px 6px;" title="Total videos on disk for this channel.">Videos</th>`;
+        html += `<th style="padding:4px 6px;" title="Sum of video durations.">Hours</th>`;
+        html += `<th style="padding:4px 6px;" title="Current bytes used on disk before compression.">Current</th>`;
+        html += `<th style="padding:4px 6px;" title="Estimated size after AV1 compression at the GENEROUS bitrate tier (largest files, best quality).">Generous</th>`;
+        html += `<th style="padding:4px 6px;" title="Estimated size at the AVERAGE bitrate tier (middle ground — recommended for most archives).">Average</th>`;
+        html += `<th style="padding:4px 6px;" title="Estimated size at the BELOW-AVERAGE bitrate tier (smallest files, most aggressive savings; some quality loss).">Below Avg</th>`;
         html += `</tr></thead><tbody>`;
         // Grand totals first, highlighted.
         html += `<tr style="background:rgba(96,160,255,0.08);font-weight:bold;">`;
@@ -9138,9 +9164,16 @@
       };
       btn.addEventListener("click", _open);
       recalcBtn?.addEventListener("click", _open);
-      closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
+      const _close = () => { bd.style.display = "none"; };
+      closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
-        if (e.target === bd) bd.style.display = "none";
+        if (e.target === bd) _close();
+      });
+      // BUG FIX 2026-05-15 (audit): Esc was a no-op on this dialog —
+      // every other modal in the app dismisses on Esc but dry-run
+      // didn't. Wire global keydown to close when the dialog is open.
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && bd.style.display !== "none") _close();
       });
     })();
 
@@ -9467,9 +9500,15 @@
       btn.addEventListener("click", _open);
       scanBtn.addEventListener("click", _scan);
       fixBtn.addEventListener("click", _fix);
-      closeBtn?.addEventListener("click", () => { bd.style.display = "none"; });
+      const _close = () => { bd.style.display = "none"; };
+      closeBtn?.addEventListener("click", _close);
       bd.addEventListener("click", (e) => {
-        if (e.target === bd) bd.style.display = "none";
+        if (e.target === bd) _close();
+      });
+      // BUG FIX 2026-05-15 (audit): consistent Esc-to-close behavior
+      // across all custom modals.
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && bd.style.display !== "none") _close();
       });
     })();
 
@@ -9803,6 +9842,11 @@
     closeBtn?.addEventListener("click", hide);
     refreshBtn?.addEventListener("click", run);
     bd.addEventListener("click", (e) => { if (e.target === bd) hide(); });
+    // BUG FIX 2026-05-15 (audit): Esc was a no-op on this dialog. Wire
+    // it through to match the rest of the modal system.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && bd.style.display !== "none") hide();
+    });
   }
 
   // ─── Manual Transcribe dialog ────────────────────────────────────────
@@ -9822,6 +9866,10 @@
     openBtn?.addEventListener("click", show);
     cancelBtn?.addEventListener("click", hide);
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) hide(); });
+    // BUG FIX 2026-05-15 (audit): consistent Esc-to-close across modals.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && backdrop.style.display !== "none") hide();
+    });
 
     // "Transcribe folder..." — recursively queue every untranscribed video
     // under a picked folder. Native folder picker handles the prompt.

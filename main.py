@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v62.2"
-APP_VERSION_DATE = "5.15.26 12:10am"
+APP_VERSION      = "v62.4"
+APP_VERSION_DATE = "5.15.26 9:04am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2458,6 +2458,23 @@ class Api:
             v = (s or "").strip().lower()
             return _re_cl.sub(r"[\.\?\!…]+$", "", v).strip()
 
+        # v62.4 bug fix: header format is
+        #   ===(title), (DATE), (TIME), (SOURCE)===
+        # The original parser did `body.split(",")` and assumed
+        # parts[0] is the title — which silently broke for titles
+        # that contain a comma (e.g. voidzilla's "i tried getting
+        # scammed, instead i got the t1 phone"). The title would
+        # come out as "i tried getting scammed" — no match against
+        # the requested title — so the classifier returned unknown
+        # and the Watch view dropped its source banner entirely.
+        # Anchor the parse on the END of the line where DATE / TIME
+        # / SOURCE never contain commas, and let the title absorb
+        # whatever comes before — title can contain commas or even
+        # parens without breaking the match.
+        _hdr_re = _re_cl.compile(
+            r"^\((.*)\)\s*,\s*\(([^()]+)\)\s*,\s*\(([^()]+)\)\s*,"
+            r"\s*\(([^()]+)\)\s*$"
+        )
         raw_tag = ""
         norm_title = _classify_norm(title)
         for d in search_dirs:
@@ -2476,6 +2493,16 @@ class Api:
                             if not line.startswith("==="):
                                 continue
                             body = line.strip().rstrip("=").lstrip("=").strip()
+                            m = _hdr_re.match(body)
+                            if m:
+                                head_title = m.group(1).strip()
+                                tag = m.group(4).strip()
+                                if _classify_norm(head_title) == norm_title:
+                                    _last_tag = tag
+                                continue
+                            # Fallback: pre-regex split-by-comma path
+                            # for any legacy/odd header that doesn't
+                            # match the canonical 4-field shape.
                             parts = [p.strip() for p in body.split(",")]
                             if not parts:
                                 continue

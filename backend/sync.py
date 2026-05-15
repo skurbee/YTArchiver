@@ -3392,11 +3392,14 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     continue
                 _fetched = int(_res.get("fetched", 0) or 0)
                 _errors_c = int(_res.get("errors", 0) or 0)
+                _unchanged = int(_res.get("unchanged", 0) or 0)
                 sum_comments_refreshed += _fetched
                 sum_err += _errors_c
                 _parts = []
                 if _fetched:
                     _parts.append(f"{_fetched} comments refreshed")
+                if _unchanged:
+                    _parts.append(f"{_unchanged} unchanged")
                 if _errors_c:
                     _parts.append(f"{_errors_c} errors")
                 if not _parts:
@@ -3414,9 +3417,14 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _a_primary = "comments refresh failed"
                 else:
                     _a_primary = "no videos in scope"
+                # "X unchanged" goes in tertiary (matches the views/likes
+                # refresh column convention so the activity-log columns
+                # stay vertically aligned across [Metdta] rows).
+                _a_tertiary = f"{_unchanged} unchanged" if _unchanged else ""
                 emit_metadata_activity_row(
                     stream, ch_name,
                     primary=_a_primary, secondary="",
+                    tertiary=_a_tertiary,
                     errors=_errors_c, elapsed=time.time() - _task_t0,
                     green=(_errors_c == 0))
             except Exception as _ce:

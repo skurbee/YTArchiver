@@ -606,7 +606,9 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
             ["Metadata ", _md_tag("simpleline_pink")],
             ["downloaded\n", _md_tag("simpleline")],
         ])
-    return {"ok": True, "fetched": True}
+    # Return the entry so callers (refresh_channel_comments) can
+    # diff old-vs-new to count "unchanged" videos.
+    return {"ok": True, "fetched": True, "entry": entry}
 
 
 def _enter_pause_wait(stream: LogStreamer, label: str, queues) -> None:
@@ -3791,7 +3793,10 @@ def refresh_channel_comments(channel: Dict[str, Any],
 
     # Collect every existing metadata entry. For recent-days scope,
     # filter by upload_date stored on the entry.
-    targets: List[Tuple[str, str, str]] = []  # (video_id, filepath, title_hint)
+    # (video_id, filepath, title_hint, old_comments). Capturing
+    # old_comments here lets us count "unchanged" videos after
+    # the refetch without re-reading the JSONL.
+    targets: List[Tuple[str, str, str, list]] = []
     cutoff_yyyymmdd: Optional[str] = None
     if only_recent_days and only_recent_days > 0:
         from datetime import timedelta as _td
@@ -3810,7 +3815,8 @@ def refresh_channel_comments(channel: Dict[str, Any],
                     if not ud or ud < cutoff_yyyymmdd:
                         continue
                 _title = str(entry.get("title") or "")
-                targets.append((vid, fp_by_id[vid], _title))
+                _old_comments = entry.get("comments") or []
+                targets.append((vid, fp_by_id[vid], _title, _old_comments))
 
     total = len(targets)
     if total == 0:
@@ -3851,7 +3857,8 @@ def refresh_channel_comments(channel: Dict[str, Any],
     t0 = time.time()
     fetched = 0
     errors = 0
-    for i, (vid, fp, title_hint) in enumerate(targets, 1):
+    unchanged = 0
+    for i, (vid, fp, title_hint, old_comments) in enumerate(targets, 1):
         if cancel_event is not None and cancel_event.is_set():
             break
         if pause_event is not None and pause_event.is_set():
@@ -3872,6 +3879,12 @@ def refresh_channel_comments(channel: Dict[str, Any],
                 emit_inline_log=False, refresh=True)
             if res.get("ok"):
                 fetched += 1
+                # Did the comments actually change? Python list-
+                # of-dict equality is byte-exact; this catches
+                # like-count updates AND comment add/remove.
+                _new_comments = (res.get("entry") or {}).get("comments") or []
+                if _new_comments == old_comments:
+                    unchanged += 1
             elif not res.get("transient"):
                 errors += 1
         except Exception:
@@ -3906,13 +3919,16 @@ def refresh_channel_comments(channel: Dict[str, Any],
         [f"{name}: comments refreshed — ", base_color],
         [f"{fetched} ok", base_color],
     ]
+    if unchanged:
+        segs.append([", ", base_color])
+        segs.append([f"{unchanged} unchanged", base_color])
     if errors:
         segs.append([", ", base_color])
         segs.append([f"{errors} errors", "red"])
     segs.append([f" (took {took_str})\n", base_color])
     stream.emit(segs)
     return {"ok": True, "fetched": fetched, "errors": errors,
-            "skipped": 0, "took": took}
+            "unchanged": unchanged, "skipped": 0, "took": took}
 
 
 def fetch_channel_metadata(channel: Dict[str, Any],

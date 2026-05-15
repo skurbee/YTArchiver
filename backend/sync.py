@@ -2501,9 +2501,15 @@ def emit_metadata_activity_row(stream: "LogStreamer",
     # the activity log; `green` was only used here to signal "nothing
     # happened" vs "something happened", NOT to force green tinting.
     # When no work happened we leave the tag blank (default color).
-    had_work = green and errors == 0 and primary not in (
+    # User: had_work used to flip false the moment errors > 0, so a
+    # channel that refreshed 80 comments but failed 1 video painted
+    # the "80 comments refreshed" cell white instead of pink.
+    # Decouple from `errors` and `green` (the errors cell renders
+    # in red separately). Pink fires whenever the primary string
+    # indicates real work, regardless of partial failures.
+    had_work = primary not in (
         "up to date", "no videos in scope", "no IDs to backfill",
-        "failed")
+        "failed", "comments refresh failed")
     payload = {
         "kind": "Metdta",
         "time_date": f"{time_str}, {date_str}",
@@ -3402,8 +3408,12 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                summary=_summary,
                                name_tag="simpleline",
                                summary_tag=_summary_tag)
-                _a_primary = (f"{_fetched} comments refreshed"
-                              if _fetched else "no videos in scope")
+                if _fetched:
+                    _a_primary = f"{_fetched} comments refreshed"
+                elif _errors_c:
+                    _a_primary = "comments refresh failed"
+                else:
+                    _a_primary = "no videos in scope"
                 emit_metadata_activity_row(
                     stream, ch_name,
                     primary=_a_primary, secondary="",

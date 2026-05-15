@@ -492,7 +492,8 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
                                 file_path: str,
                                 title_hint: str,
                                 stream: LogStreamer,
-                                emit_inline_log: bool = True
+                                emit_inline_log: bool = True,
+                                refresh: bool = False,
                                 ) -> Dict[str, Any]:
     """Fetch metadata for ONE just-downloaded video, inline per-video.
 
@@ -544,8 +545,10 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         name, str(folder), split_years, split_months, year, month)
 
     existing = _read_metadata_jsonl(jp)
-    if video_id in existing:
+    if video_id in existing and not refresh:
         # Already have metadata for this id — nothing to do. No log.
+        # `refresh=True` (comments refresh) bypasses this so the entry
+        # gets re-fetched with current comments/views/likes.
         return {"ok": True, "skipped": True}
 
     entry = _fetch_video_metadata(yt, video_id, title_hint)
@@ -3788,7 +3791,7 @@ def refresh_channel_comments(channel: Dict[str, Any],
 
     # Collect every existing metadata entry. For recent-days scope,
     # filter by upload_date stored on the entry.
-    targets: List[Tuple[str, str]] = []  # (video_id, filepath)
+    targets: List[Tuple[str, str, str]] = []  # (video_id, filepath, title_hint)
     cutoff_yyyymmdd: Optional[str] = None
     if only_recent_days and only_recent_days > 0:
         from datetime import timedelta as _td
@@ -3806,7 +3809,8 @@ def refresh_channel_comments(channel: Dict[str, Any],
                     ud = str(entry.get("upload_date") or "")
                     if not ud or ud < cutoff_yyyymmdd:
                         continue
-                targets.append((vid, fp_by_id[vid]))
+                _title = str(entry.get("title") or "")
+                targets.append((vid, fp_by_id[vid], _title))
 
     total = len(targets)
     if total == 0:
@@ -3815,13 +3819,43 @@ def refresh_channel_comments(channel: Dict[str, Any],
         return {"ok": True, "fetched": 0, "errors": 0, "skipped": 0,
                 "took": 0}
 
+    # Sticky live-updating progress line \u2014 mirrors fetch_metadata_for_videos.
+    # Each emission clears the previous "comments_refresh_active" line and
+    # writes a new one at the bottom, so the user sees [N/total] tick up
+    # in place. Without this, a 100-video channel takes ~15 minutes with
+    # no UI feedback (Simple mode filters dim-tagged progress lines).
+    import json as _json
+    def _emit_active(_i: int, _n: int):
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "comments_refresh_active"}),
+             "__control__"],
+        ])
+        stream.emit([
+            ["    [", ["meta_bracket", "comments_refresh_active"]],
+            [str(_i), ["simpleline", "comments_refresh_active"]],
+            ["/", ["meta_bracket", "comments_refresh_active"]],
+            [str(_n), ["simpleline", "comments_refresh_active"]],
+            ["] ", ["meta_bracket", "comments_refresh_active"]],
+            ["Refreshing comments: ", ["meta_bracket", "comments_refresh_active"]],
+            [f"{name}\u2026\n", ["simpleline", "comments_refresh_active"]],
+        ])
+
+    def _clear_active():
+        stream.emit([
+            [_json.dumps({"kind": "clear_line",
+                          "marker": "comments_refresh_active"}),
+             "__control__"],
+        ])
+
     t0 = time.time()
     fetched = 0
     errors = 0
-    for i, (vid, fp) in enumerate(targets, 1):
+    for i, (vid, fp, title_hint) in enumerate(targets, 1):
         if cancel_event is not None and cancel_event.is_set():
             break
         if pause_event is not None and pause_event.is_set():
+            _clear_active()
             _enter_pause_wait(stream,
                               f"{channel.get('name', '?')} (comments refresh)",
                               queues)
@@ -3831,19 +3865,18 @@ def refresh_channel_comments(channel: Dict[str, Any],
             _exit_pause_wait(stream,
                              f"{channel.get('name', '?')} (comments refresh)",
                              queues)
-        if i == 1 or i % 25 == 0:
-            stream.emit_dim(
-                f"    \u2014 comments refresh: {i}/{total}...")
+        _emit_active(i, total)
         try:
             res = fetch_single_video_metadata(
-                channel, vid, fp, stream, cancel_event=cancel_event,
-                emit_inline_log=False)
+                channel, vid, fp, title_hint, stream,
+                emit_inline_log=False, refresh=True)
             if res.get("ok"):
                 fetched += 1
             elif not res.get("transient"):
                 errors += 1
         except Exception:
             errors += 1
+    _clear_active()
 
     # Stamp separate last-comments-refresh timestamp on the channel.
     try:
@@ -3860,12 +3893,24 @@ def refresh_channel_comments(channel: Dict[str, Any],
         pass
 
     took = time.time() - t0
-    _tag = "red" if errors else "simpleline_pink"
-    stream.emit([
+    # Lazy import to avoid circular (sync.py imports metadata).
+    from .sync import _fmt_duration as _dur
+    took_str = _dur(took)
+    # Color discipline: when ANY comments refreshed, keep the
+    # success portion pink and only the errors count goes red.
+    # A single deleted/private video shouldn't paint the whole
+    # line red when 80 others succeeded.
+    base_color = "simpleline_pink" if fetched > 0 else "red"
+    segs = [
         [" \u2014 ", "meta_bracket"],
-        [f"{name}: comments refreshed — {fetched} ok, "
-         f"{errors} errors (took {took:.1f}s)\n", _tag],
-    ])
+        [f"{name}: comments refreshed — ", base_color],
+        [f"{fetched} ok", base_color],
+    ]
+    if errors:
+        segs.append([", ", base_color])
+        segs.append([f"{errors} errors", "red"])
+    segs.append([f" (took {took_str})\n", base_color])
+    stream.emit(segs)
     return {"ok": True, "fetched": fetched, "errors": errors,
             "skipped": 0, "took": took}
 

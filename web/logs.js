@@ -86,6 +86,11 @@
       // each replaces the previous in-place. Cleared via
       // clear_line when the final per-channel summary emits.
       if (t === "views_refresh_progress") return t;
+      // Comments refresh sticky [N/total] progress line — replaces
+      // in-place per video so the user sees progress on long
+      // channels (e.g. David Pakman = 2086 videos). Cleared via
+      // clear_line when the channel finishes or pauses.
+      if (t === "comments_refresh_active") return t;
     }
 
     // Pass 2 — prefix-family matches (shared in-place families)
@@ -747,6 +752,17 @@
         // log would auto-snap on every batch.
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
+        // Issue #159: backend can lose track of alt across long sessions
+        // (every emit_activity defaults alt=false). The single-append
+        // path in appendActivityLog applies a parity override after
+        // appendChild, but the batched path here never did — so any
+        // metadata row arriving via _logBatch ended up with no
+        // hist_row_alt class, breaking zebra striping after the first
+        // few backend-painted rows. Track parity from the last row
+        // in DOM and toggle as we append.
+        let prevAlt = false;
+        const _lastDom = el.lastElementChild;
+        if (_lastDom) prevAlt = _lastDom.classList.contains("hist_row_alt");
         // audit LG-1: also check the in-progress fragment for a row
         // with the same row_id before adding a duplicate. Without
         // this, when a [Dwnld] and its retroactive update arrive in
@@ -760,15 +776,32 @@
             // already in the DOM, swap it rather than appending a
             // duplicate. Used by the [Dwnld] retroactive update when
             // a slow transcribe finishes after the row first emitted
-            // with `0 transcribed`.
+            // with `0 transcribed`. Preserve the existing row's alt
+            // class so the parity sequence doesn't shift.
             const existing = el.querySelector(
               `.log-line[data-row-id="${CSS.escape(rid)}"]`);
-            if (existing) { existing.replaceWith(row); continue; }
+            if (existing) {
+              const wasAlt = existing.classList.contains("hist_row_alt");
+              if (wasAlt) row.classList.add("hist_row_alt");
+              else row.classList.remove("hist_row_alt");
+              existing.replaceWith(row);
+              continue;
+            }
             // Also search the fragment for a same-batch predecessor.
             const pending = frag.querySelector(
               `.log-line[data-row-id="${CSS.escape(rid)}"]`);
-            if (pending) { pending.replaceWith(row); continue; }
+            if (pending) {
+              const wasAlt = pending.classList.contains("hist_row_alt");
+              if (wasAlt) row.classList.add("hist_row_alt");
+              else row.classList.remove("hist_row_alt");
+              pending.replaceWith(row);
+              continue;
+            }
           }
+          // Append path — flip parity from the previous row.
+          if (prevAlt) row.classList.remove("hist_row_alt");
+          else row.classList.add("hist_row_alt");
+          prevAlt = !prevAlt;
           frag.appendChild(row);
         }
         el.appendChild(frag);

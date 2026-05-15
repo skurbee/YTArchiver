@@ -29,6 +29,56 @@ from .ytarchiver_config import TRANSCRIPTION_DB
 
 _db_lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
+# Issue #153: a dedicated read-only connection for Browse queries so
+# they never wait on `_db_lock` (held by sync register_video, FTS
+# ingest, etc.). WAL handles cross-connection serialization so this
+# connection sees the writer's committed state without blocking.
+# Wrapped in its own lock because SQLite connections aren't
+# free-threaded — readers serialize across this connection only.
+_reader_conn: Optional[sqlite3.Connection] = None
+_reader_lock = threading.RLock()
+# Flag set to True once `_open()` has successfully initialized the
+# schema. `_reader_open()` checks this WITHOUT grabbing `_db_lock`
+# so a read connection can be returned even while a long-running
+# writer (FTS ingest, etc.) holds the writer lock. Without this
+# gate, _reader_open's "ensure schema exists" call had to take
+# `_db_lock` itself, which made Browse / Metadata / Recent queries
+# wait behind ingest_jsonl transactions that hold the lock for
+# many seconds at a time.
+_schema_inited: bool = False
+
+
+def _reader_open() -> Optional[sqlite3.Connection]:
+    """Open or return the long-lived read-only connection used by
+    Browse-style queries. Separate from `_conn` so writer contention
+    on `_db_lock` doesn't block the Browse tab during indexing.
+
+    Schema is initialized lazily by the FIRST `_open()` call any
+    caller makes; once the `_schema_inited` flag flips True we skip
+    re-checking it from this path so we never have to wait on
+    `_db_lock`.
+    """
+    global _reader_conn
+    if not _schema_inited:
+        # Cold-start path: schema may not exist yet. Take the slow
+        # route ONCE to make sure the DB file + tables exist.
+        try: _open()
+        except Exception: pass
+    with _reader_lock:
+        if _reader_conn is not None:
+            return _reader_conn
+        try:
+            TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
+            _reader_conn = sqlite3.connect(
+                str(TRANSCRIPTION_DB),
+                check_same_thread=False, timeout=30.0)
+            _reader_conn.execute("PRAGMA journal_mode=WAL")
+            _reader_conn.execute("PRAGMA synchronous=NORMAL")
+            _reader_conn.execute("PRAGMA query_only=ON")
+            return _reader_conn
+        except Exception:
+            _reader_conn = None
+            return None
 
 
 def _open_independent() -> Optional[sqlite3.Connection]:
@@ -167,6 +217,24 @@ def _open() -> Optional[sqlite3.Connection]:
                 # IDs might help every time. Also used by future
                 # passes to deprioritize already-exhausted rows.
                 "ALTER TABLE videos ADD COLUMN id_backfill_tried_ts REAL",
+                # Marked when bulk views/likes refresh sees the file's
+                # video_id is NOT in YouTube's current flat-playlist
+                # response (uploader deleted / privated / unlisted the
+                # video). UI uses this to show a red ✗ on per-video
+                # tiles and a channel-level "N gone from YT" stat.
+                # Future refresh runs can skip these rows so we stop
+                # wasting yt-dlp calls on dead vids. Cleared if the
+                # vid reappears in the catalog (uploader restored it).
+                "ALTER TABLE videos ADD COLUMN removed_from_yt_ts REAL",
+                # Persisted "does this video have a thumbnail sidecar
+                # somewhere in the channel folder?" flag. Populated
+                # lazily by `count_thumbnail_status_bulk` on first
+                # walk; updated by `sweep_missing_thumbnails` when a
+                # thumb is downloaded. Lets the Settings > Metadata
+                # Thumbnails column query the same SQL GROUP BY path
+                # as Video IDs — no disk walk on every page open. NULL
+                # = "not yet checked", 0 = no thumb, 1 = thumb on disk.
+                "ALTER TABLE videos ADD COLUMN has_thumbnail INTEGER",
             ):
                 try:
                     _conn.execute(stmt)
@@ -196,6 +264,10 @@ def _open() -> Optional[sqlite3.Connection]:
                 except sqlite3.OperationalError:
                     pass
             _conn.commit()
+            # Mark schema-ready so future _reader_open() calls can
+            # skip the _db_lock-acquiring _open() call entirely.
+            global _schema_inited
+            _schema_inited = True
             return _conn
         except sqlite3.Error as e:
             print(f"[index] Could not open DB: {e}")
@@ -563,8 +635,13 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
 
 def list_recent_videos(limit: int = 200, channel: Optional[str] = None
                        ) -> List[Dict[str, Any]]:
-    """Return the N newest videos (by added_ts), optionally filtered by channel."""
-    conn = _open()
+    """Return the N newest videos (by added_ts), optionally filtered by channel.
+
+    Uses `_reader_conn` (read-only, separate from `_conn`) so the Recent tab
+    never waits on sync's `register_video` write lock. WAL handles the
+    cross-connection visibility.
+    """
+    conn = _reader_open() or _open()
     if conn is None:
         return []
     q = ("SELECT title, channel, filepath, video_id, size_bytes, year, month, "
@@ -575,7 +652,7 @@ def list_recent_videos(limit: int = 200, channel: Optional[str] = None
         args.append(channel)
     q += "ORDER BY added_ts DESC LIMIT ?"
     args.append(limit)
-    with _db_lock:
+    with _reader_lock:
         cur = conn.execute(q, args)
         out = []
         for row in cur.fetchall():
@@ -630,15 +707,26 @@ def preload_all_channels(channel_names: List[str],
                          sort: str = "newest",
                          limit: int = 500) -> Dict[str, int]:
     """Warm the per-channel video-list cache for every subscribed channel.
-    Mirrors OLD YTArchiver.py:27572 `_grid_preload_all` but without the
-    200ms per-channel sleep — our DB reads are cheap enough that the
-    sleep was just padding wall-clock time. Still iterates one channel
-    at a time so progress_cb fires granularly (user sees real progress
-    behind the "Loading…" line).
 
-    `progress_cb(idx, total, channel_name)` is called before each channel.
+    Per Scott (2026-05-13): "Browse preload should ALWAYS be the bottom
+    priority — if a user is downloading or loading the metadata page,
+    that should supersede the preload."
+
+    How we deliver on that:
+    1. Reads go through `_reader_conn` (separate from the writer's
+       `_conn`), so preload never grabs `_db_lock`. WAL mode means
+       writers don't block readers and vice versa.
+    2. A 30 ms politeness yield between channels lets other Python
+       threads (sync worker, GPU worker, HTTP requests for metadata
+       page) advance. On 100+ channels this adds ~3 seconds total —
+       imperceptible vs the multi-minute preload duration on a real
+       archive.
+    3. If sync or GPU is actively running, we yield 200 ms instead so
+       the user-visible work gets more breathing room.
+
     Returns {channel_name: row_count}.
     """
+    import time as _t
     out: Dict[str, int] = {}
     total = len(channel_names)
     for i, ch in enumerate(channel_names):
@@ -651,6 +739,13 @@ def preload_all_channels(channel_names: List[str],
             out[ch] = preload_channel_videos(ch, sort=sort, limit=limit)
         except Exception:
             out[ch] = 0
+        # Politeness yield. Active sync/GPU = longer yield.
+        try:
+            from . import sync as _sync
+            active = _sync.is_any_sync_active()
+        except Exception:
+            active = False
+        _t.sleep(0.2 if active else 0.03)
     return out
 
 
@@ -688,40 +783,51 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                     and c_thumbs == bool(include_thumbs)
                     and c_lim >= limit):
                 return list(rows[:limit]) if len(rows) > limit else list(rows)
-    conn = _open()
+    # Issue #153: use the long-lived read-only connection
+    # (`_reader_conn`, opened on first use below) so this Browse
+    # query never contends on `_db_lock` with sync's register_video
+    # calls. WAL mode handles cross-connection serialization for us.
+    conn = _reader_open()
     if conn is None:
         return []
-    # Use year/month as the primary sort (stable proxy for upload_ts
-    # / file mtime), with added_ts as the per-month tiebreaker. This
-    # is important for large channels (a high-video-count channel: 27k videos) where
-    # a `added_ts DESC LIMIT 500` would return only whatever 500 rows
-    # happened to be indexed most recently — that's often a random
-    # year distribution if a bootstrap / reorg touched added_ts
-    # out-of-upload-order. Sorting by year first guarantees the grid
-    # covers the newest years contiguously.
     order = {
         "newest": "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC",
         "oldest": "COALESCE(year, 99999) ASC, COALESCE(month, 99) ASC, COALESCE(added_ts, 0) ASC",
         "largest": "COALESCE(size_bytes, 0) DESC",
         "title": "title COLLATE NOCASE ASC",
     }.get(sort, "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC")
-    with _db_lock:
-        # Bug [49]: COLLATE NOCASE so a channel named "MyChannel" matches
-        # rows stored as "mychannel" (case drift can come from manual DB
-        # edits or older data). Without it, duplicates from the lower-
-        # cased rows escape the is_duplicate_of filter and show twice.
-        cur = conn.execute(
-            f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
-            f"tx_status, added_ts FROM videos "
-            f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
-            f"ORDER BY {order} LIMIT ?",
-            (channel, limit),
-        )
-        out = [{
-            "title": r[0], "channel": r[1], "filepath": r[2], "video_id": r[3],
-            "size_bytes": r[4] or 0, "year": r[5], "month": r[6],
-            "tx_status": r[7], "added_ts": r[8],
-        } for r in cur.fetchall()]
+    with _reader_lock:
+        # Select removed_from_yt_ts last so older DBs (where the column
+        # may not exist yet during the first run after upgrade) can be
+        # handled via try/except fallback.
+        try:
+            cur = conn.execute(
+                f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
+                f"tx_status, added_ts, removed_from_yt_ts FROM videos "
+                f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
+                f"ORDER BY {order} LIMIT ?",
+                (channel, limit),
+            )
+            out = [{
+                "title": r[0], "channel": r[1], "filepath": r[2], "video_id": r[3],
+                "size_bytes": r[4] or 0, "year": r[5], "month": r[6],
+                "tx_status": r[7], "added_ts": r[8],
+                "removed_from_yt": bool(r[9]),
+            } for r in cur.fetchall()]
+        except Exception:
+            cur = conn.execute(
+                f"SELECT title, channel, filepath, video_id, size_bytes, year, month, "
+                f"tx_status, added_ts FROM videos "
+                f"WHERE channel=? COLLATE NOCASE AND is_duplicate_of IS NULL "
+                f"ORDER BY {order} LIMIT ?",
+                (channel, limit),
+            )
+            out = [{
+                "title": r[0], "channel": r[1], "filepath": r[2], "video_id": r[3],
+                "size_bytes": r[4] or 0, "year": r[5], "month": r[6],
+                "tx_status": r[7], "added_ts": r[8],
+                "removed_from_yt": False,
+            } for r in cur.fetchall()]
     # Enrich: upload_ts + view_count (from aggregated metadata) + thumbnails.
     # View count enables "Most Viewed" sort in the Browse grid without
     # making yt-dlp calls here — we rely on the data Cache built up during
@@ -796,6 +902,78 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             _fetch_meta(folder_key) # populates both caches
         return metadata_cache_by_title.get(folder_key, {}).get(
             _norm_title(title))
+
+    # Filter out rows whose mp4 file no longer exists on disk. Sync
+    # can leave behind stale DB entries when a download starts but
+    # fails / gets interrupted / the user later deletes the file —
+    # those rows would render as gradient placeholders with no
+    # thumbnail and clicking them would 404. Cheaper to hide them
+    # entirely. Cost: ~one os.path.exists() per row, cached by the
+    # browse cache anyway.
+    out = [r for r in out
+           if r.get("filepath") and os.path.exists(r["filepath"])]
+
+    # Channel-wide thumbnail index. `find_thumbnail` walks UP the path
+    # at most 3 levels — it does NOT cross over to sibling year folders.
+    # On channels where thumbnails ended up in a different year's
+    # `.Thumbnails/` than where the mp4 currently lives (e.g.
+    # The PrimeTime had most thumbs in 2025/.Thumbnails/ but the mp4s
+    # got re-foldered into 2023/ and 2024/), every Browse video tile
+    # rendered as the gradient placeholder. Pre-walk the channel root
+    # once, build vid → path, and use it for vid-keyed lookup. Falls
+    # back to find_thumbnail for the no-vid / stem-only path.
+    _thumb_by_vid: Dict[str, str] = {}
+    if include_thumbs and out:
+        _vid_re_local = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+        # Locate the channel root from any video's filepath. mp4s
+        # live at one of:
+        #    <root>/<year>/<file>           (split_years=True)
+        #    <root>/<year>/<month>/<file>   (split_years + split_months)
+        #    <root>/<file>                  (split_years=False)
+        # If the mp4's parent dir name is a 4-digit year, go up one
+        # level; if the grandparent's name is a 4-digit year and
+        # the parent looks like a month bucket, go up two.
+        # Earlier bug: walked up the FIRST dirname found, which
+        # was just the year folder, so the channel-wide scan only
+        # saw one year's .Thumbnails/.
+        _ch_root = None
+        for _row in out:
+            _fp = _row.get("filepath") or ""
+            if not _fp or not os.path.isfile(_fp):
+                continue
+            _parent = os.path.dirname(_fp)
+            _gp = os.path.dirname(_parent)
+            _parent_name = os.path.basename(_parent)
+            _gp_name = os.path.basename(_gp)
+            _year_re = re.compile(r"^[12][0-9]{3}$")
+            if _year_re.match(_parent_name):
+                # parent is "<year>" → channel root is grandparent
+                _ch_root = _gp
+            elif _year_re.match(_gp_name):
+                # grandparent is "<year>" → great-grandparent is root
+                _ch_root = os.path.dirname(_gp)
+            else:
+                # No year-bucketing → mp4 lives directly under channel root
+                _ch_root = _parent
+            if _ch_root and os.path.isdir(_ch_root):
+                break
+            _ch_root = None
+        if _ch_root and os.path.isdir(_ch_root):
+            try:
+                for _dp, _dns, _fns in os.walk(_ch_root):
+                    if os.path.basename(_dp) != ".Thumbnails":
+                        continue
+                    for _fn in _fns:
+                        _low = _fn.lower()
+                        if not _low.endswith(
+                                (".jpg", ".jpeg", ".webp", ".png")):
+                            continue
+                        _m = _vid_re_local.search(_fn)
+                        if _m:
+                            _thumb_by_vid[_m.group(1)] = os.path.normpath(
+                                os.path.join(_dp, _fn))
+            except OSError:
+                pass
 
     # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
     # epoch. Returns 0 on anything unparseable. The aggregated metadata
@@ -879,7 +1057,16 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             elif v > 0:
                 row["views"] = str(v)
         if include_thumbs:
-            tp = find_thumbnail(fp, row.get("video_id"))
+            tp = None
+            _vid = (row.get("video_id") or "").strip()
+            # Try the channel-wide vid→path map first (correctly finds
+            # thumbs that live in sibling year folders).
+            if _vid:
+                tp = _thumb_by_vid.get(_vid)
+            # Fall back to legacy find_thumbnail for vid-less rows or
+            # stem-name layouts that the pre-walk wouldn't catch.
+            if not tp:
+                tp = find_thumbnail(fp, row.get("video_id"))
             if tp:
                 row["thumbnail"] = tp
                 row["thumbnail_url"] = _file_url(tp)
@@ -1546,6 +1733,54 @@ def _sanitize_fts_query(q: str) -> str:
     # Collapse whitespace
     cleaned = _re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def search_video_titles(query: str, limit: int = 200
+                          ) -> List[Dict[str, Any]]:
+    """Global title-only search across every channel's videos. .txt
+    request: "search for a video by title from every channel". The
+    existing search_fts hits the transcripts (segment-level FTS5),
+    which works inside a channel but doesn't surface partial title
+    matches across the whole archive.
+
+    LIKE-based, case-insensitive. Returns up to `limit` matches sorted
+    by upload_ts DESC (newest first). Result shape mirrors search_fts
+    so the frontend renderer can swap modes without restructuring.
+    """
+    if not query or not query.strip():
+        return []
+    conn = _open()
+    if conn is None:
+        return []
+    # Allow multi-word queries to match in any order — split on
+    # whitespace and AND each word together.
+    parts = [p.strip() for p in query.strip().split() if p.strip()]
+    if not parts:
+        return []
+    where_clauses = " AND ".join(["title LIKE ? COLLATE NOCASE"] * len(parts))
+    args = [f"%{p}%" for p in parts] + [int(limit)]
+    try:
+        with _db_lock:
+            cur = conn.execute(
+                f"SELECT video_id, title, channel, filepath, year, "
+                f"COALESCE(upload_ts, added_ts, 0) AS ts "
+                f"FROM videos WHERE {where_clauses} "
+                f"AND is_duplicate_of IS NULL "
+                f"ORDER BY ts DESC LIMIT ?",
+                args)
+            rows = cur.fetchall()
+    except sqlite3.Error as e:
+        try: print(f"[search_video_titles] error: {e}")
+        except Exception: pass
+        return []
+    return [{
+        "video_id": r[0] or "",
+        "title": r[1] or "",
+        "channel": r[2] or "",
+        "filepath": r[3] or "",
+        "year": r[4],
+        "ts": r[5],
+    } for r in rows]
 
 
 def search_fts(query: str, channel: Optional[str] = None, limit: int = 200,

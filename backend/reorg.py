@@ -288,17 +288,41 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
         d = _date_from_info_json(p)
         if d is None:
             missing += 1
+            # Verbose-only: log every video that couldn't be dated.
+            stream.emit([
+                ["    — ", ["dim"]],
+                [f"{p.name} · no info.json sidecar (skipped)\n",
+                 ["dim"]],
+            ])
             continue
         target_ts = d.timestamp()
         try:
             cur = p.stat().st_mtime
             if abs(cur - target_ts) < 24 * 3600:
                 skipped += 1
+                stream.emit([
+                    ["    — ", ["dim"]],
+                    [f"{p.name} · mtime already matches "
+                     f"{d.strftime('%Y-%m-%d')} (no change)\n", ["dim"]],
+                ])
                 continue
             os.utime(str(p), (target_ts, target_ts))
             updated += 1
-        except OSError:
+            # Verbose-only: per-video before/after.
+            from datetime import datetime as _dt
+            _cur_str = _dt.fromtimestamp(cur).strftime('%Y-%m-%d')
+            _new_str = d.strftime('%Y-%m-%d')
+            stream.emit([
+                ["    — ", ["dim"]],
+                [f"{p.name} · mtime {_cur_str} → {_new_str}\n",
+                 ["dim"]],
+            ])
+        except OSError as _oe:
             missing += 1
+            stream.emit([
+                ["    — ", ["dim"]],
+                [f"{p.name} · OSError: {_oe}\n", ["dim"]],
+            ])
 
     stream.emit([["  \u2014 \u2713 ", "simpleline_green"],
                  [f"Date fix complete: {updated} updated \u00b7 "
@@ -384,9 +408,11 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         _emit_active(i)
         # Determine target dir based on split flags
         d = None
+        _date_source = ""
         if recheck_dates:
             d = _date_from_info_json(video)
             if d is not None:
+                _date_source = "info.json sidecar"
                 # Also sync the file's mtime so future non-recheck runs are correct
                 try:
                     ts_new = d.timestamp()
@@ -397,8 +423,11 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         if d is None:
             try:
                 ts = video.stat().st_mtime if use_mtime else time.time()
+                _date_source = ("file mtime" if use_mtime
+                                else "current time (fallback)")
             except OSError:
                 ts = time.time()
+                _date_source = "current time (stat failed)"
             d = datetime.fromtimestamp(ts)
         if split_months:
             # Use "01 January" format to match OLD's sync template.
@@ -411,6 +440,24 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
             target = root / f"{d.year}"
         else:
             target = root
+
+        # VERBOSE-ONLY per-video decision trace. Lets Verbose users
+        # see exactly which date source drove each move and where each
+        # file is being routed. Suppressed in Simple mode (dim tag).
+        try:
+            _rel_src = video.relative_to(root)
+        except ValueError:
+            _rel_src = video.name
+        try:
+            _rel_tgt = target.relative_to(root)
+        except ValueError:
+            _rel_tgt = target.name
+        stream.emit([
+            ["    \u2014 ", ["dim"]],
+            [f"{video.name} \u00b7 date {d.strftime('%Y-%m-%d')} "
+             f"(from {_date_source}) \u00b7 "
+             f"{_rel_src} \u2192 {_rel_tgt or '<root>'}\n", ["dim"]],
+        ])
 
         if video.parent == target:
             skipped += 1

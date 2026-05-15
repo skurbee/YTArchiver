@@ -225,10 +225,22 @@ def start_server(app_version: str = "",
 
 
 def stop_server():
+    """Stop the cmd HTTP server. BUG FIX (2026-05-13): `srv.shutdown()`
+    blocks until handler threads return — if a ping request is in
+    flight (frequent during normal use), shutdown waits indefinitely
+    and the Quit path freezes. Close the socket on a timeout-bounded
+    thread; daemon handler threads die with the process.
+    """
     srv = _STATE.get("srv")
-    if srv is not None:
-        try: srv.shutdown()
-        except Exception: pass
     _STATE["srv"] = None
     _STATE["thread"] = None
     _STATE["started"] = False
+    if srv is None:
+        return
+    def _close():
+        try: srv.server_close()
+        except Exception: pass
+    import threading as _th
+    t = _th.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(timeout=1.0)

@@ -136,7 +136,7 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
         )
     except Exception as e:
         stream.emit([["  \u2014", "simpleline_redwnl"],
-                     [f" yt-dlp spawn failed: {e}\n", "red"]])
+                     [f" Couldn't start the download tool: {e}\n", "red"]])
         return {}
     result: Dict[str, str] = {}
     last_page = 0
@@ -471,6 +471,29 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         *(_find_cookie_source() or []),
         url,
     ]
+    # VERBOSE-ONLY: log the URL, target resolution, format string and
+    # full yt-dlp command before we kick the subprocess off. Lets the
+    # user reproduce the exact download in a terminal if it fails.
+    _cmd_str = " ".join(repr(c) if " " in c or '"' in c else c for c in cmd)
+    if len(_cmd_str) > 600:
+        _cmd_str = _cmd_str[:600] + "\u2026"
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"redownload {video_id} \u00b7 target {new_res}p \u00b7 format `{fmt}`\n",
+         ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"url: {url}\n", ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"output: {dl_path}\n", ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"yt-dlp cmd: {_cmd_str}\n", ["dim"]],
+    ])
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -480,7 +503,8 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         )
     except Exception as e:
         stream.emit([["  \u2014", "simpleline_redwnl"],
-                     [f" spawn failed for {video_id}: {e}\n", "red"]])
+                     [f" Couldn't start the download tool for {video_id}: {e}\n",
+                      "red"]])
         return None
     dest: Optional[str] = None
     _cancelled = False
@@ -610,10 +634,26 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             ])
 
     # 1. Local scan
+    # Issue #162: when folder is missing or unreadable, distinguish
+    # "really no videos" from "wrong folder path". The previous
+    # message "No video files found" tripped the user up on channels
+    # that obviously had hundreds of files \u2014 the root cause was a
+    # mis-built folder argument upstream that pointed at the parent
+    # archive root instead of the channel subfolder.
     local = _scan_local_files(folder)
     if not local:
-        stream.emit([["  \u2014", "simpleline_redwnl"],
-                     [" No video files found.\n", "simpleline"]])
+        if not folder:
+            stream.emit([["  \u2014", "simpleline_redwnl"],
+                         [" Redownload aborted \u2014 channel folder is empty in "
+                          "the config. Re-add the channel or fix output_dir.\n",
+                          "red"]])
+        elif not os.path.isdir(folder):
+            stream.emit([["  \u2014", "simpleline_redwnl"],
+                         [f" Redownload aborted \u2014 folder not found: "
+                          f"{folder}\n", "red"]])
+        else:
+            stream.emit([["  \u2014", "simpleline_redwnl"],
+                         [f" No video files in {folder}.\n", "simpleline"]])
         return {"ok": True, "done": 0, "skipped": 0, "errors": 0, "total": 0}
     stream.emit([["  \u2014", "simpleline_redwnl"],
                  [f" Found {len(local)} local file(s).\n", "simpleline"]])

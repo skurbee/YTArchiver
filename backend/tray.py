@@ -334,19 +334,34 @@ class TrayController:
     def _spin_loop(self):
         import math
         frame = 0
+        # .txt issue: the spin animation was barely visible — a single
+        # 4-pixel dot in a 32x32 icon at typical DPI. Draw a brighter
+        # ring of fading dots so the animation reads at a glance even
+        # on hi-DPI displays. Eight dots, with the "head" of the spin
+        # at full opacity and trailing dots fading down.
+        DOT_COUNT = 8
+        # Trailing dot opacities — head bright, tail dim.
+        OPACITIES = [255, 220, 180, 140, 100, 70, 40, 25]
         while not self._spin_stop.is_set():
             try:
                 img = self._base_img.copy()
                 draw = self._ImageDraw.Draw(img)
-                # Draw a small dot rotating around the bottom-right
                 w, h = img.size
-                cx, cy = w - 6, h - 6
-                r = 4
-                angle = (frame * 45) % 360
-                x = cx + r * math.cos(math.radians(angle))
-                y = cy + r * math.sin(math.radians(angle))
-                draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=self._spin_color)
-                # Overlay the badge on top of the spin (if set)
+                # Center the ring near the bottom-right but with enough
+                # margin for the radius so dots stay inside the icon.
+                cx = w - 8
+                cy = h - 8
+                ring_r = min(6, w // 5)
+                dot_r = max(2, ring_r // 3)
+                base_color = self._spin_color  # RGBA tuple
+                for i in range(DOT_COUNT):
+                    angle = (frame * 45 - i * (360 / DOT_COUNT)) % 360
+                    x = cx + ring_r * math.cos(math.radians(angle))
+                    y = cy + ring_r * math.sin(math.radians(angle))
+                    a = OPACITIES[i] if i < len(OPACITIES) else 25
+                    fill = (base_color[0], base_color[1], base_color[2], a)
+                    draw.ellipse([x - dot_r, y - dot_r,
+                                  x + dot_r, y + dot_r], fill=fill)
                 if self._badge_count:
                     img = self._compose_badge(img)
                 if self._icon:

@@ -38,7 +38,7 @@
   --c-log-compress: #c084fc;
   --c-log-reorg: #ff8c42;
 
-  --c-log-row-alt: #101520;
+  --c-log-row-alt: #1c2433;  /* bumped from #101520 — old shade was nearly indistinguishable from the page background, so alternating rows looked uniform (UI audit 2026-05-14) */
   --c-log-filterskip-dim: #4a5060;
   --c-livestream: #f5a023;
 
@@ -146,9 +146,10 @@ body {
   background: var(--c-text);
   opacity: 0.9;
 }
-/* Tab order: Download | Subs | Recent | Browse (grouped left) ... Settings (far right).
+/* Tab order: Download | Subs | Browse (grouped left) ... Settings (far right).
    `margin-left: auto` on Settings pushes it to the right edge, creating
-   visual separation from the main tab group. */
+   visual separation from the main tab group. (Recent was folded into
+   Browse — comment updated 2026-05-13.) */
 .tab.settings-tab {
   margin-left: auto;
 }
@@ -201,20 +202,36 @@ body {
   font-weight: 600;
 }
 .settings-subnav-btn {
-  padding: 6px 16px;
-  font-size: 13px;
+  /* Sizing folded in from a second .settings-subnav-btn block that
+     used !important to override these values — consolidated to one
+     authoritative rule per UI audit #28. */
+  padding: 10px 22px;
+  font-size: 13.5px;
   color: var(--c-text);
   cursor: pointer;
   user-select: none;
+  border-radius: 0;
+  transition: background 0.12s;
 }
 .settings-subnav-btn:hover {
-  background: rgba(255, 255, 255, 0.04);
+  /* Was 0.04 — virtually invisible at dark-bg luminance. Bumped to
+     0.08 so the user actually sees the hover affordance.
+     UI sweep 2026-05-14. */
+  background: rgba(255, 255, 255, 0.08);
 }
 .settings-subnav-btn.active {
-  background: var(--c-surface);
-  border-left: 2px solid var(--c-accent);
-  padding-left: 14px;
+  /* Active tab was just an underline + surface bg + weight bump.
+     Reads too subtle next to inactive tabs on a quick glance. Now
+     also tints the bg with the accent color and slightly brightens
+     the text so the current view is obvious. */
+  background: rgba(74, 158, 122, 0.14);
+  border-left: 3px solid var(--c-accent);
+  padding-left: 19px;
   font-weight: 600;
+  color: #d6e8df;
+}
+.settings-subnav-btn.active:hover {
+  background: rgba(74, 158, 122, 0.22);
 }
 .settings-main {
   flex: 1 1 auto;
@@ -556,19 +573,12 @@ body {
   padding: 24px 0 20px !important;
 }
 .settings-subnav-label {
-  padding: 0 22px 10px !important;
-  font-size: 11px !important;
+  padding: 0 22px 10px;
+  font-size: 11px;
   letter-spacing: 1.2px;
 }
-.settings-subnav-btn {
-  padding: 10px 22px !important;
-  font-size: 13.5px !important;
-  border-radius: 0;
-  transition: background 0.12s;
-}
-.settings-subnav-btn.active {
-  padding-left: 20px !important;
-}
+/* (Second .settings-subnav-btn block + !important overrides were
+   consolidated into the canonical rule above — audit #28.) */
 
 /* Metadata tab — matches the single-column card treatment used on
    Index so the two sibling panels visually rhyme. Introduced
@@ -604,6 +614,76 @@ body {
   flex-wrap: wrap;
 }
 .metadata-bulk-row .spacer { flex: 1 1 auto; }
+/* Archive-wide totals strip. Five compact stat cards spaced evenly
+   across the panel width. Mirrors the dense, slightly-elevated
+   "stat tile" treatment used elsewhere in Settings so the visual
+   language is consistent. */
+.metadata-totals {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.metadata-totals .md-total-card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 8px 12px;
+  text-align: left;
+  min-width: 0;
+}
+.metadata-totals .md-total-label {
+  font-size: 10.5px;
+  color: var(--c-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metadata-totals .md-total-value {
+  font-size: 14px;
+  color: var(--c-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Two-line layout for percentage tiles: big percent on top, smaller
+   "X of Y" count below. Prevents the long "X/Y (Z%)" form from
+   getting clipped in a narrow tile (audit found "98,039/101,919
+   (96…" truncation at the typical Settings panel width). */
+.metadata-totals .md-total-value .md-total-primary {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metadata-totals .md-total-value .md-total-sub {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--c-dim);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Color-state variants for the percentage-bearing tiles, mirroring
+   the IDs/Thumbs/StillOnYT column colors. The CSS vars give the
+   tile a left border accent so a glance is enough to tell which
+   stats are healthy vs need attention. */
+.metadata-totals .md-total-card.is-ok { border-left: 3px solid #6f9c5f; }
+.metadata-totals .md-total-card.is-warn { border-left: 3px solid #e1b25a; }
+.metadata-totals .md-total-card.is-bad { border-left: 3px solid #d87a7a; }
+.metadata-totals .md-total-card.is-ok .md-total-value { color: #a3c99a; }
+.metadata-totals .md-total-card.is-warn .md-total-value { color: #e1b25a; }
+.metadata-totals .md-total-card.is-bad .md-total-value { color: #d87a7a; }
 .metadata-table-wrap {
   border: 1px solid var(--c-border);
   border-radius: 3px;
@@ -656,7 +736,140 @@ body {
   border-bottom: 1px solid rgba(255,255,255,0.04);
 }
 .metadata-table tbody tr:last-child { border-bottom: none; }
-.metadata-table tbody tr:hover { background: rgba(160, 170, 187, 0.06); }
+/* Hover state for clickable rows. The whole row is now the click
+   target (left OR right click opens the action menu) — was a tiny
+   "⋯" button before, which most users didn't see. Slightly stronger
+   highlight than the old subtle hover so the affordance is obvious. */
+.metadata-table tbody tr.md-row-clickable {
+  cursor: pointer;
+  /* No left padding shift on hover — the border-left baseline below
+     keeps the row's left edge anchored even when needs-fix paints in. */
+  border-left: 3px solid transparent;
+}
+.metadata-table tbody tr.md-row-clickable:hover {
+  background: rgba(160, 170, 187, 0.10);
+}
+/* Channels with missing video IDs get a subtle yellow left rail so
+   they stay scannable now that the warn-colored "⋯" button is gone. */
+.metadata-table tbody tr.md-row-needs-fix {
+  border-left-color: rgba(225, 178, 90, 0.55);
+}
+.metadata-table tbody tr.md-row-needs-fix:hover {
+  border-left-color: #e1b25a;
+  background: rgba(225, 178, 90, 0.08);
+}
+/* The little "›" chevron in the action column. No click handler of
+   its own — it's purely a visual cue that the row is interactive. */
+.metadata-table .md-row-chev {
+  display: inline-block;
+  color: var(--c-dim);
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 400;
+  opacity: 0.5;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.metadata-table tbody tr.md-row-clickable:hover .md-row-chev {
+  opacity: 1;
+  color: var(--c-accent);
+  transform: translateX(2px);
+}
+/* Floating right-click-style dropdown menu for the row actions in
+   the Metadata table. Positioned at the cursor via inline left/top.
+   Compact, Windows-context-menu vibe — NOT a centered modal. */
+.md-context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 200px;
+  background: #1c1f23;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--c-text);
+  user-select: none;
+  animation: md-cm-pop 0.08s ease-out;
+}
+@keyframes md-cm-pop {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.md-cm-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--c-text);
+  padding: 6px 14px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.md-cm-item:hover,
+.md-cm-item:focus {
+  background: rgba(120, 165, 220, 0.18);
+  color: #fff;
+  outline: 0;
+}
+.md-cm-warn { color: #e1b25a; }
+.md-cm-warn:hover, .md-cm-warn:focus { color: #f0c46d; }
+/* Submenu wrapper — parent holds the head row + a hidden flyout. The
+   flyout appears to the right when the head is hovered or focused
+   inside. CSS-only show/hide, no JS state. */
+.md-cm-sub-wrap { position: relative; }
+.md-cm-has-sub { display: flex; align-items: center; }
+.md-cm-chev {
+  margin-left: auto;
+  padding-left: 14px;
+  opacity: 0.55;
+  font-weight: 600;
+}
+.md-cm-sub {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  min-width: 150px;
+  background: #1c1f23;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
+  padding: 4px 0;
+  display: none;
+}
+.md-cm-sub-wrap:hover > .md-cm-sub,
+.md-cm-sub-wrap:focus-within > .md-cm-sub {
+  display: block;
+}
+.md-cm-sub-wrap:hover > .md-cm-has-sub {
+  background: rgba(120, 165, 220, 0.18);
+  color: #fff;
+}
+
+/* Spinning loader for the Thumbnails column while the bulk disk walk
+   is in flight. Replaces the old "—" which was indistinguishable from
+   a genuinely-empty channel. */
+.metadata-table .md-thumb-loading {
+  color: var(--c-dim);
+  font-style: italic;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.metadata-table .md-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid rgba(160, 170, 187, 0.25);
+  border-top-color: var(--c-accent);
+  border-radius: 50%;
+  animation: md-spinner-rot 0.85s linear infinite;
+  vertical-align: -1px;
+  margin-right: 5px;
+}
+@keyframes md-spinner-rot {
+  to { transform: rotate(360deg); }
+}
 .metadata-table tbody td {
   padding: 6px 10px;
   vertical-align: middle;
@@ -687,6 +900,14 @@ body {
    when every on-disk file has a resolvable id in the DB; yellow
    when some are missing (backfill recommended); red when none
    are set (migrated-from-tkinter archive pre-backfill). */
+.metadata-table .md-col-onyt {
+  /* Wider than md-col-ids because the longest cell renders as
+     "405/610 (66.4%)" — needs more characters of breathing room. */
+  width: 150px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
 .metadata-table .md-col-ids {
   width: 88px;
   white-space: nowrap;
@@ -1028,7 +1249,27 @@ body {
 }
 .btn-sync:hover { background: #1a6b4c; }
 
-.btn-primary { background: var(--c-primary); }
+/* Primary action button — green like Sync Subbed and the askChoice
+   primary so "this is the go button" is consistent across the app.
+   Previously this class painted the same grey as a regular .btn,
+   which gave NO visual hierarchy on Save / Confirm / Apply buttons
+   throughout the app. UI audit #16. */
+.btn-primary {
+  background: var(--c-sync);
+  border-color: #1d7a56;
+  color: var(--c-text);
+  font-weight: 600;
+}
+.btn-primary:hover {
+  background: #1a6b4c;
+  border-color: #216e52;
+}
+.btn-primary:disabled,
+.btn-primary[disabled] {
+  background: var(--c-primary);
+  border-color: var(--c-border);
+  font-weight: 400;
+}
 
 .btn-ghost {
   background: var(--c-btn);
@@ -1311,7 +1552,14 @@ body {
   overflow: hidden;
 }
 .activity-log-frame {
-  flex: 0 0 56px; /* ~3 rows at 18px line-height + padding */
+  /* Default to ~5 rows when the log first becomes populated. The
+     user can drag the splitter to grow it; that choice persists via
+     window_state_save. (Was 240px ≈ 15 rows, which opened to a huge
+     unfilled void after a single entry — UI audit 2026-05-14.) The
+     old "huge void on tall monitors" concern doesn't apply anymore
+     because `frame.hidden` is toggled by syncActivityLogVisibility
+     when the log is empty. */
+  flex: 0 0 90px;
   background: var(--c-input);
   overflow: hidden;
   border: 1px solid var(--c-border);
@@ -1438,12 +1686,16 @@ body {
     minmax(58px, auto) /* [Kind] */
     minmax(92px, auto) /* time,date */
     8px /* em-dash */
-    minmax(110px, 2.5fr) /* channel — biggest flex */
+    minmax(110px, 1fr) /* channel — was 2.5fr, evened to 1fr */
     8px /* em-dash */
     minmax(98px, 1fr) /* primary (N downloaded) */
-    minmax(98px, 1fr) /* secondary (N transcribed — ✓ variant a bit wider than digits) */
+    8px /* em-dash */
+    minmax(98px, 1fr) /* secondary (N transcribed) */
+    8px /* em-dash */
     minmax(98px, 1fr) /* tertiary (N metadata) */
-    minmax(60px, 0.8fr) /* errors */
+    8px /* em-dash */
+    minmax(60px, 1fr) /* errors — was 0.8fr, evened to 1fr */
+    8px /* em-dash */
     minmax(66px, 1fr); /* took */
   max-width: 1800px;
   justify-content: stretch;
@@ -1470,12 +1722,16 @@ body {
     minmax(58px, auto)
     minmax(92px, auto)
     8px
-    minmax(110px, 2.5fr)
+    minmax(110px, 1fr)  /* channel — evened to 1fr (was 2.5fr) */
     8px
     minmax(98px, 1fr)
+    8px
     minmax(98px, 1fr)
+    8px
     minmax(98px, 1fr)
+    8px
     0           /* errors slot collapsed */
+    8px
     minmax(66px, 1fr);
 }
 
@@ -1715,7 +1971,10 @@ body {
   text-align: right;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: clip;
+  /* Audit fix: was `clip`, which hard-cuts long values (e.g. a wide
+     "Last Sync" string in a narrowed column). Ellipsis is the
+     standard affordance — tells the user there's more to see. */
+  text-overflow: ellipsis;
 }
 .subs-table td.col-folder {
   text-align: left;
@@ -1917,7 +2176,7 @@ body {
   width: 54px;
   flex: 0 0 54px;
 }
-.edit-grid .icon-btn-slim { width: 22px; height: 24px; }
+.edit-grid .icon-btn-slim { width: 26px; height: 26px; }
 .edit-grid .edit-dim { color: var(--c-dim); font-size: 11.5px; }
 
 /* Compact inline radio */
@@ -2508,6 +2767,24 @@ body {
   padding: 14px;
 }
 
+/* Inline loading spinner — for places where async work is happening
+   and a static "loading…" text feels dead. Sized small so it sits
+   inline with body text. UI sweep 2026-05-14. */
+.spinner-inline {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--c-border);
+  border-top-color: var(--c-accent);
+  border-radius: 50%;
+  animation: spinner-spin 0.8s linear infinite;
+  vertical-align: -1px;
+  margin-right: 4px;
+}
+@keyframes spinner-spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Diagnostics dialog rows */
 .diag-rows {
   font-family: var(--font-log);
@@ -2540,7 +2817,12 @@ body {
 .diag-row .diag-detail {
   color: var(--c-dim);
   font-size: 11.5px;
-  word-break: break-all;
+  /* `break-all` was breaking short values mid-character (e.g. "(17.36 G\nB)",
+     "(73% ful\nl)"). `anywhere` only breaks when nothing else fits, so
+     short values stay intact and only genuinely long unbreakable strings
+     (paths with no spaces) wrap. UI sweep 2026-05-14. */
+  overflow-wrap: anywhere;
+  word-break: normal;
 }
 
 /* "New this week" summary bar above the channel grid */
@@ -2844,6 +3126,37 @@ body {
   padding: 2px 6px;
   border-radius: 2px;
 }
+/* "Removed from YT" badge — corner pill on tiles where the uploader
+   deleted/privated/unlisted the video since download. Local file is
+   still playable; we just can't refresh metadata for it. */
+.video-thumb .video-removed-badge {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  background: rgba(165, 28, 28, 0.92);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  z-index: 2;
+}
+/* Whole-card visual treatment for removed videos — desaturated +
+   slight dim so the user can scan the grid and spot them quickly.
+   Hover restores full opacity so the card is still browseable. */
+.video-card.video-card-removed .video-thumb {
+  filter: grayscale(0.55) brightness(0.78);
+}
+.video-card.video-card-removed:hover .video-thumb {
+  filter: grayscale(0) brightness(1);
+}
+.video-card.video-card-removed .video-card-title {
+  color: #c4a8a8;
+}
 .video-card-body {
   padding: 8px 10px;
   display: flex;
@@ -2903,13 +3216,27 @@ body {
 }
 .watch-layout {
   display: grid;
-  grid-template-columns: 2fr 1fr;
+  /* .txt: transcript pane width is user-adjustable via the splitter
+     below. Fallback to the legacy 1fr split when the var isn't set. */
+  grid-template-columns: 1fr 6px var(--watch-tx-width, minmax(280px, 1fr));
   grid-template-rows: 1fr;
-  gap: 14px;
+  gap: 8px;
   height: 100%;
   min-height: 0;
 }
 .watch-layout > * { min-height: 0; }
+.watch-splitter {
+  background: transparent;
+  border-left: 1px solid var(--c-border);
+  border-right: 1px solid var(--c-border);
+  cursor: col-resize;
+  user-select: none;
+  transition: background 120ms ease;
+}
+.watch-splitter:hover,
+.watch-splitter.dragging {
+  background: rgba(108, 180, 238, 0.35);
+}
 /* Narrow-window graceful degradation.
    Pre-fix: a single media query at max-width:900px set
    grid-template-columns to 1fr but DIDN'T adjust
@@ -2926,6 +3253,8 @@ body {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(200px, 1fr);
   }
+  /* Hide the drag splitter on narrow layouts where the panes stack. */
+  .watch-splitter { display: none; }
   .watch-video-wrap {
     max-height: 40vh;
     overflow-y: auto;
@@ -2982,6 +3311,19 @@ body {
   align-items: center;
   margin-top: 6px;
   font-size: 11.5px;
+  /* Keep buttons on a single row even at narrow widths. Without
+     this, the row wraps and individual buttons break their labels
+     across lines ("Open\nin\nplayer", "Re-\ntranscribe…"). Overflow
+     scroll-x is preferable to multi-line button labels which look
+     broken. */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.watch-actions .btn {
+  /* Stop button label wrapping mid-word. */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .watch-title {
   color: var(--c-text);
@@ -3016,12 +3358,20 @@ body {
   overflow-y: auto;
   padding: 10px 12px;
   font-family: var(--font-log);
-  font-size: 12.5px;
+  /* .txt request: user-adjustable transcript text size, controlled by
+     the Aa-/Aa+ buttons in the transcript header. Persisted via
+     settings.transcript_font_size; the document-level CSS var
+     `--watch-transcript-fz` is set on <html> at boot. */
+  font-size: var(--watch-transcript-fz, 12.5px);
   line-height: 1.55;
   color: var(--c-log-txt);
 }
 .watch-transcript .word {
-  transition: color 0.08s, background 0.08s;
+  /* .txt: smoother karaoke transition — ease-out gives a softer
+     handoff between adjacent words than a flat linear timing curve.
+     Slightly longer than 80ms feels more cohesive without lagging
+     visibly behind playback. */
+  transition: color 160ms ease-out, background 160ms ease-out;
   padding: 0 1px;
   border-radius: 2px;
   cursor: pointer;
@@ -3031,6 +3381,8 @@ body {
   color: #fff;
   background: rgba(108, 180, 238, 0.35);
   font-weight: 600;
+  /* No transform — keeps line height stable so adjacent words don't
+     visibly jump. The color/background fade alone is the cue. */
 }
 .watch-transcript .seg.active {
   background: rgba(108, 180, 238, 0.07);
@@ -3094,10 +3446,15 @@ body {
 .watch-retranscribe-link:hover { color: var(--c-log-blue); }
 
 /* Continuous transcript body — no per-segment margins, just one flowing
-   paragraph of words. Matches ArchivePlayer's `.yt-transcript-body`. */
+   paragraph of words. Matches ArchivePlayer's `.yt-transcript-body`.
+   BUG FIX 2026-05-14: was `font-size: 13px` hardcoded — clobbered the
+   `--watch-transcript-fz` variable set by the Aa-/Aa+ buttons on the
+   parent `.watch-transcript`. Scott: "the text size increase and
+   decrease buttons don't do anything for the transcript." Now inherits
+   from parent so the buttons actually move the rendered text size. */
 .watch-transcript-body {
   line-height: 1.65;
-  font-size: 13px;
+  font-size: inherit;
 }
 
 /* ═══ Browse sub-modes: Search / Graph / Bookmarks / Index ═══ */
@@ -3117,7 +3474,10 @@ body {
   color: var(--c-accent);
   font-family: var(--font-log);
   font-size: 11px;
-  padding: 2px 7px;
+  /* Bumped padding so AND/OR/NOT/"exact phrase"/word* hit a comfy
+     click target. Previously ~18px tall; below mouse-friendly
+     guidelines and easy to misclick (UI audit). */
+  padding: 5px 10px;
   border-radius: 2px;
   cursor: pointer;
 }
@@ -3532,12 +3892,15 @@ body {
   background: var(--c-btn);
   border: 1px solid var(--c-border);
   color: var(--c-text);
-  width: 22px;
-  height: 22px;
+  /* Bumped from 22x22 to 26x26 so the reset / refresh micro-buttons
+     hit a comfortable click target (UI audit). Glyph stays the
+     same; visually still narrow next to the dropdown it sits on. */
+  width: 26px;
+  height: 26px;
   padding: 0;
   border-radius: 2px;
   cursor: pointer;
-  font-size: 10px;
+  font-size: 11px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3954,6 +4317,12 @@ body {
   line-height: 16px;
   color: var(--c-log-txt);
   white-space: nowrap;
+  /* Frame disables pointer events; re-enable selection on the text
+     content so users can copy mini-log lines like the main log. */
+  pointer-events: auto;
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
 }
 /* audit F-48: give mini-log lines an ellipsis when the content
    overflows the frame width instead of silently clipping. Long
@@ -3979,7 +4348,11 @@ body {
 .askq-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  /* 0.6 was heavy — felt like a security warning when most dialogs
+     are routine confirms. Reduced to 0.45 so the dialog still pops
+     against the dimmed bg without burying the underlying UI.
+     UI sweep 2026-05-14. */
+  background: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4047,6 +4420,12 @@ body {
 .askq-buttons-cancel {
   padding: 0 14px 10px;
 }
+/* Inline (single-row) variant: used when a dialog has just one action
+   button + Cancel. Pads top and bottom so the row sits balanced inside
+   the footer instead of leaving a dead strip below it. */
+.askq-buttons-inline {
+  padding: 10px 14px;
+}
 .askq-buttons .btn {
   min-width: 84px;
   padding: 6px 14px;
@@ -4107,8 +4486,34 @@ body {
 .subs-filter-input {
   flex: 1 1 auto;
   font-size: 11.5px;
-  padding: 3px 6px 3px 22px;
+  padding: 3px 22px 3px 22px;
   height: 24px;
+}
+/* Clear (×) button — appears when the filter has text, mirrors the
+   modern-app pattern of an inline reset affordance. */
+.subs-filter-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: 0;
+  color: var(--c-dim);
+  font-size: 14px;
+  line-height: 1;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s, color 0.1s;
+}
+.subs-filter-clear:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--c-text);
 }
 
 /* Inline Sync button on each row */

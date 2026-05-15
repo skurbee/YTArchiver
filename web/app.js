@@ -298,8 +298,14 @@
       stopTick();
       const m = modal();
       if (m) m.hidden = true;
-      if (!window.api || !window.api.redownload_sample_confirm) return;
-      try { window.api.redownload_sample_confirm(choice); }
+      // Issue #162: the API namespace is `window.pywebview.api`, not
+      // `window.api` — the wrong path silently no-op'd every click so
+      // the modal closed but the parked Python worker never resumed,
+      // and the 10-sample dialog "never appeared" from the user's POV
+      // because subsequent retries hit the same dead handler.
+      const api = window.pywebview?.api;
+      if (!api?.redownload_sample_confirm) return;
+      try { api.redownload_sample_confirm(choice); }
       catch (e) { console.error("redownload_sample_confirm failed:", e); }
     }
 
@@ -443,6 +449,7 @@
         buttons: null, // alias for `choices` so callers can use either name
         cancel: "Cancel",
         cancelPlacement: "left", // "left" (default) or "right"
+        cancelKind: null, // "ghost" | "danger" | "primary". null = auto
         countdownSecs: 0, // >0 → auto-pick primary after this many seconds
         countdownLabel: "", // optional prefix for the "...in Ns" line
       }, opts || {});
@@ -463,15 +470,41 @@
         return `<button class="${cls}" data-value="${escapeHtml(c.value)}">${escapeHtml(c.label)}</button>`;
       }).join("");
       const hasCountdown = cfg.countdownSecs > 0;
-      // Cancel now renders on its own bottom row, styled as danger
-      // (red) so it reads as the "stop / back out" affordance. Prior
-      // layout put Cancel inline with the action buttons and they
-      // all wrapped into an awkward mixed grid when the dialog got
-      // narrow (flagged via user screenshot: Cancel stuck on the top
-      // row with two action buttons, while the third wrapped alone
-      // below).
-      const cancelBtn = '<button class="btn btn-danger" data-act="cancel"></button>';
-      backdrop.innerHTML = `
+      // Layout: when there's a single action button, render cancel
+      // INLINE on the same row (with cancel as a muted ghost button)
+      // — that's the standard OS-dialog pattern and avoids two same-
+      // sized buttons stacked vertically looking like a typo. For 2+
+      // action buttons keep the two-row layout (which solved an
+      // earlier wrap-into-uneven-grid issue).
+      const compact = choices.length <= 1;
+      // Cancel styling: auto-pick ghost in compact mode (so it
+      // doesn't compete visually with the danger action it sits
+      // next to), or danger in stacked mode (where it reads as the
+      // dedicated "back out" affordance on its own row). Caller can
+      // force either via cancelKind.
+      const _cancelKind = cfg.cancelKind
+        || (compact ? "ghost" : "danger");
+      const _cancelCls = _cancelKind === "primary" ? "btn btn-primary"
+                       : _cancelKind === "ghost"   ? "btn btn-ghost"
+                                                    : "btn btn-danger";
+      const cancelBtn = `<button class="${_cancelCls}" data-act="cancel"></button>`;
+      // Compact = single row with [Action] [Cancel] side-by-side
+      //           (action FIRST in markup so within the right-aligned
+      //            flex group it lands on the LEFT, cancel on the RIGHT
+      //            — per UX feedback Scott wants the destructive
+      //            primary on the left and the back-out on the right
+      //            for this layout).
+      // Stacked = action buttons row + cancel row underneath.
+      backdrop.innerHTML = compact ? `
+        <div class="askq-dialog">
+          <div class="askq-header"></div>
+          <div class="askq-body"></div>
+          ${hasCountdown ? '<div class="askq-countdown" style="margin:8px 0 12px;font-size:12px;color:var(--c-dim);"></div>' : ""}
+          <div class="askq-buttons askq-buttons-actions askq-buttons-inline">
+            ${buttonsHtml}${cancelBtn}
+          </div>
+        </div>
+      ` : `
         <div class="askq-dialog">
           <div class="askq-header"></div>
           <div class="askq-body"></div>
@@ -502,10 +535,19 @@
       });
       backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => cleanup(null));
       backdrop.addEventListener("click", (e) => { if (e.target === backdrop) cleanup(null); });
-      const onKey = (e) => { if (e.key === "Escape") cleanup(null); };
+      // UI audit #12: askChoice was missing Enter→primary handling
+      // (only Escape was wired). Mirror askQuestion: Enter fires the
+      // primary choice if one is defined; otherwise it does nothing.
+      const primary = choices.find(c => c.primary || c.kind === "primary");
+      const onKey = (e) => {
+        if (e.key === "Escape") { cleanup(null); return; }
+        if (e.key === "Enter" && primary) {
+          e.preventDefault();
+          cleanup(primary.value);
+        }
+      };
       document.addEventListener("keydown", onKey);
 
-      const primary = choices.find(c => c.primary || c.kind === "primary");
       if (primary) {
         setTimeout(() => backdrop.querySelector(`[data-value="${primary.value}"]`)?.focus(), 30);
       }
@@ -614,6 +656,12 @@
   // the string values "skip" / "overwrite" / "append" for back-compat, so we
   // pass through both the OLD-app names and the NEW shortcuts.
   window.askMetadataAlreadyDownloaded = async function (channelName, count) {
+    // NB: don't add a third "Cancel" action button — askChoice renders
+    // its own Cancel below the action row, and a separate explicit
+    // Cancel choice produced TWO Cancel buttons stacked (UX feedback
+    // 2026-05-14). The default askChoice cancel returns null which the
+    // mapping below correctly funnels into "skip" (the back-compat
+    // sentinel the Python sync pipeline reads).
     const choice = await askChoice({
       title: "Metadata Already Downloaded",
       message: `"${channelName}" already has metadata for ${count} video(s) on disk.\n\n` +
@@ -622,15 +670,71 @@
       buttons: [
         { label: "Check for New", value: "new", kind: "primary" },
         { label: "Refresh Counts", value: "refresh", kind: "ghost" },
-        { label: "Cancel", value: "cancel", kind: "ghost" },
       ],
     });
     // Map OLD-app returns back to the back-compat strings the existing
-    // Python sync pipeline expects.
+    // Python sync pipeline expects. null (default-cancel) → "skip".
     if (choice === "new") return "append";
     if (choice === "refresh") return "overwrite";
     return "skip";
   };
+
+  // UI audit #37: sanitize raw exception strings before showing them
+  // to the user. Strip Python traceback prefixes ("TypeError: ",
+  // "AttributeError: ", "pywebview.JavascriptException: ", etc.),
+  // strip wrapping quotes, collapse whitespace, and cap length. The
+  // raw text still gets console.warn'd for developer debugging.
+  function _sanitizeErrorMsg(raw) {
+    // Handle non-string inputs first. A naive `String(obj)` would
+    // give "[object Object]" which is meaningless to the user. Try
+    // to extract a `.message` (Error objects, rejected fetches) or
+    // a `.error` field (our backend convention) before falling back.
+    if (raw == null) return "";
+    if (typeof raw !== "string") {
+      if (raw && typeof raw === "object") {
+        const extracted = (raw.message || raw.error
+                            || raw.detail || raw.msg);
+        if (typeof extracted === "string" && extracted.trim()) {
+          raw = extracted;
+        } else {
+          // Last resort: stringify safely. Truncated so we never
+          // dump a giant blob into a toast.
+          try {
+            raw = JSON.stringify(raw).slice(0, 200);
+          } catch {
+            raw = "(unreadable error)";
+          }
+        }
+      } else {
+        raw = String(raw);
+      }
+    }
+    let s = String(raw || "").trim();
+    if (!s) return "";
+    // Catch the residual case where something stringified to the
+    // useless default before reaching us.
+    if (s === "[object Object]" || s === "[object Promise]") {
+      return "Something went wrong.";
+    }
+    // Pywebview wraps Python exceptions in this prefix.
+    s = s.replace(/^pywebview\.[A-Za-z]+:\s*/i, "");
+    // Strip common Python error class prefix like "TypeError: ", but
+    // only when the rest of the message is human-readable (don't eat
+    // an "Error:" the developer typed intentionally — heuristic:
+    // require capital + lowercase + "Error" + ":" pattern).
+    s = s.replace(/^[A-Z][A-Za-z]*Error:\s*/, "");
+    // Strip a leading "Error:" prefix once if the surrounding caller
+    // already added it.
+    s = s.replace(/^Error:\s*/i, "");
+    // Browser-side Error objects stringify as "Error: message".
+    // After the strip above, sometimes a stray newline / json line
+    // sneaks in — collapse to first line for a toast.
+    const firstLine = s.split(/\r?\n/, 1)[0].trim();
+    if (firstLine) s = firstLine;
+    // Cap so a 10KB stack trace doesn't blow up the toast layout.
+    if (s.length > 220) s = s.slice(0, 217) + "…";
+    return s || "Something went wrong.";
+  }
 
   // ─── Toast notifications ─────────────────────────────────────────────
   // Usage: window._showToast("message", "ok" | "error" | "warn")
@@ -641,6 +745,18 @@
     const opts = typeof msgOrOpts === "string"
       ? { msg: msgOrOpts, kind }
       : (msgOrOpts || {});
+    // Sanitize error-kind messages so raw Python exceptions don't
+    // surface verbatim to the user (audit #37). The original text is
+    // logged to the console so developers can still see the raw form.
+    if (opts.kind === "error" && opts.msg) {
+      try {
+        const cleaned = _sanitizeErrorMsg(opts.msg);
+        if (cleaned !== opts.msg) {
+          console.warn("[toast/error raw]", opts.msg);
+          opts.msg = cleaned;
+        }
+      } catch {}
+    }
     const ttl = opts.ttlMs ?? (opts.kind === "error" ? 4500 : 2500);
     const el = document.createElement("div");
     el.className = "toast " + (opts.kind || "");
@@ -694,6 +810,104 @@
     if (document.visibilityState !== "hidden") schedule();
   };
 
+  // .txt request: close-to-tray dialog. Triggered by main.py's
+  // _on_closing handler via evaluate_js when settings.close_behavior
+  // is "ask". Offers Quit / Tray plus a remember-choice checkbox; the
+  // result drives api.confirm_close which either hides or destroys
+  // the window. Re-entrant safe — only one dialog at a time.
+  window._showCloseDialog = function () {
+    if (document.getElementById("close-confirm-modal")) return;
+    const backdrop = document.createElement("div");
+    backdrop.className = "askq-backdrop";
+    backdrop.id = "close-confirm-modal";
+    // Three-button layout: [Cancel] [Close to tray] [Quit].
+    // Cancel sits on the left (ghost, muted) so it reads as "back
+    // out, don't close yet" — matches the standard OS confirm-close
+    // pattern. Quit is the primary (Enter-focused) action because
+    // that's what the X-button most commonly means.
+    backdrop.innerHTML = `
+      <div class="askq-dialog">
+        <div class="askq-header">Close YTArchiver?</div>
+        <div class="askq-body">Quit completely, or close to the system tray and keep syncing in the background?</div>
+        <label style="display:flex;align-items:center;gap:6px;margin:8px 0 12px;
+                      font-size:12px;color:var(--c-dim);user-select:none;">
+          <input type="checkbox" id="close-remember-choice" />
+          Remember my choice
+        </label>
+        <div class="askq-buttons askq-buttons-actions askq-buttons-inline">
+          <button class="btn btn-ghost" data-act="cancel">Cancel</button>
+          <button class="btn btn-ghost" data-act="tray">Close to tray</button>
+          <button class="btn btn-danger" data-act="quit">Quit</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(backdrop);
+    const remember = backdrop.querySelector("#close-remember-choice");
+    const choose = async (action) => {
+      const rem = !!remember?.checked;
+      backdrop.remove();
+      // Cancel = pure dismiss. Window stays open, no config change
+      // (we deliberately ignore the Remember box here — saving the
+      // user's "Cancel" choice as their default close behavior makes
+      // no sense; there's no `close_behavior: cancel` state).
+      if (action === "cancel") return;
+      try {
+        await window.pywebview?.api?.confirm_close?.(action, rem);
+      } catch {}
+    };
+    backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => choose("cancel"));
+    backdrop.querySelector('[data-act="tray"]').addEventListener("click", () => choose("tray"));
+    backdrop.querySelector('[data-act="quit"]').addEventListener("click", () => choose("quit"));
+    backdrop.addEventListener("click", (e) => {
+      // Click outside the dialog cancels (= treat as "don't close").
+      if (e.target === backdrop) backdrop.remove();
+    });
+    document.addEventListener("keydown", function onKey(e) {
+      if (e.key === "Escape") {
+        document.removeEventListener("keydown", onKey);
+        backdrop.remove();
+      }
+    });
+    setTimeout(() => backdrop.querySelector('[data-act="quit"]')?.focus(), 30);
+  };
+
+  // Issue #164: bookmark Yes/No timestamp dialog. Replaces the old
+  // note-prompt flow. Resolves to "yes" (bookmark with timestamp),
+  // "no" (bookmark whole video), or null (cancel).
+  window._askBookmarkKind = function () {
+    return new Promise((resolve) => {
+      const backdrop = document.createElement("div");
+      backdrop.className = "askq-backdrop";
+      backdrop.innerHTML = `
+        <div class="askq-dialog">
+          <div class="askq-header">Add bookmark</div>
+          <div class="askq-body">Bookmark this exact moment, or the
+            entire video?</div>
+          <div class="askq-buttons askq-buttons-actions">
+            <button class="btn btn-ghost" data-act="no">Whole video</button>
+            <button class="btn btn-primary" data-act="yes">At timestamp</button>
+          </div>
+          <div class="askq-buttons askq-buttons-cancel">
+            <button class="btn btn-danger" data-act="cancel">Cancel</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(backdrop);
+      const close = (val) => { backdrop.remove(); resolve(val); };
+      backdrop.querySelector('[data-act="yes"]').addEventListener("click", () => close("yes"));
+      backdrop.querySelector('[data-act="no"]').addEventListener("click", () => close("no"));
+      backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => close(null));
+      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(null); });
+      document.addEventListener("keydown", function onKey(e) {
+        if (e.key === "Escape") {
+          document.removeEventListener("keydown", onKey);
+          close(null);
+        }
+      });
+      setTimeout(() => backdrop.querySelector('[data-act="yes"]')?.focus(), 30);
+    });
+  };
+
   // ─── Tab switching ───────────────────────────────────────────────────
   function initTabs() {
     const tabs = document.querySelectorAll(".tab");
@@ -729,7 +943,7 @@
           // Also hide any "Delete N files" floating button tied to
           // the selection state.
           const delBtn = document.getElementById("recent-delete-btn");
-          if (delBtn) delBtn.style.display = "none";
+          if (delBtn) delBtn.hidden = true;
         } catch (_e) { /* non-fatal */ }
       });
     });
@@ -1411,10 +1625,28 @@
         results.innerHTML = '<div class="browse-empty">Search requires native mode.</div>';
         return;
       }
-      const chan = (scope?.value === "channel")
+      const scopeVal = scope?.value || "all";
+      // .txt: global title search runs through a different backend
+      // path that hits the videos table by title (no FTS, no
+      // transcript snippet). Re-shape the rows into the same {title,
+      // channel, text, snippet} fields the renderer below expects so
+      // we don't need a parallel renderer.
+      const chan = (scopeVal === "channel")
         ? (_browseState.currentChannel?.folder || null) : null;
       try {
-        const rows = await api.browse_search(q, chan, 200);
+        let rows;
+        if (scopeVal === "titles") {
+          rows = await api.browse_search_titles?.(q, 200) || [];
+          rows = rows.map(r => ({
+            ...r,
+            text: r.title || "",
+            snippet: escapeHtml(r.title || ""),
+            start_time: 0,
+            jsonl_path: "",
+          }));
+        } else {
+          rows = await api.browse_search(q, chan, 200);
+        }
         if (!Array.isArray(rows) || rows.length === 0 || (rows[0] && rows[0].error)) {
           const errMsg = (rows && rows[0] && rows[0].error) ? `Search error: ${rows[0].error}` : "No matches.";
           results.innerHTML = `<div class="browse-empty">${escapeHtml(errMsg)}</div>`;
@@ -1651,9 +1883,14 @@
           }
         });
         row.querySelector("[data-ignore]").addEventListener("click", async () => {
+          // UI audit #11: lead with the human title, not the raw
+          // YouTube ID. ID is secondary detail under the title.
+          const _name = (it.title && it.title.trim())
+            ? it.title.slice(0, 80)
+            : `(no title)  ${it.video_id}`;
           const ok = await window.askQuestion?.({
             title: "Ignore this video?",
-            message: `Permanently skip video ${it.video_id}${it.title ? ` (${it.title.slice(0, 60)})` : ""}? Future sync passes will not re-defer it.`,
+            message: `Permanently skip "${_name}"? Future sync passes will not re-defer it.`,
             confirm: "Ignore",
             cancel: "Keep",
             danger: true,
@@ -2462,17 +2699,33 @@
   // ─── Subs filter input (live) ────────────────────────────────────────
   function initSubsFilter() {
     const input = document.getElementById("subs-filter");
+    const clearBtn = document.getElementById("subs-filter-clear");
     if (!input) return;
     let deb = null;
+    const syncClear = () => {
+      if (clearBtn) clearBtn.hidden = !input.value;
+    };
     input.addEventListener("input", () => {
+      syncClear();
       clearTimeout(deb);
       deb = setTimeout(() => {
         window._applySubsFilter?.(input.value);
       }, 100);
     });
     input.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { input.value = ""; window._applySubsFilter?.(""); }
+      if (e.key === "Escape") {
+        input.value = "";
+        window._applySubsFilter?.("");
+        syncClear();
+      }
     });
+    clearBtn?.addEventListener("click", () => {
+      input.value = "";
+      window._applySubsFilter?.("");
+      syncClear();
+      input.focus();
+    });
+    syncClear();
   }
 
   // ─── Browse > Bookmarks sub-mode ─────────────────────────────────────
@@ -2495,60 +2748,28 @@
       for (const b of rows) {
         const row = document.createElement("div");
         row.className = "bookmark-row";
+        // Issue #164: two bookmark kinds now.
+        // start_time < 0 (sentinel = whole-video bookmark) renders
+        // like a YouTube favorites card: title + thumbnail + channel,
+        // no timestamp/transcript line.
+        // start_time >= 0 renders as before: title + timestamp +
+        // transcript text. Note field is gone (no longer captured).
+        const isWholeVideo = Number(b.start_time) < 0;
         row.innerHTML = `
           <div class="bookmark-head">
             <span class="bookmark-title"></span>
             <span class="bookmark-meta"></span>
             <button class="icon-btn-slim" data-remove="${b.id}" title="Delete bookmark">\u00d7</button>
           </div>
-          <div class="bookmark-text"></div>
-          <div class="bookmark-note" contenteditable="true"></div>
+          ${isWholeVideo ? "" : '<div class="bookmark-text"></div>'}
         `;
         row.querySelector(".bookmark-title").textContent = b.title || "(untitled)";
-        row.querySelector(".bookmark-meta").textContent =
-          `${b.channel || ""} \u00b7 ${_formatTs(b.start_time)}`;
-        row.querySelector(".bookmark-text").textContent = b.text || "";
-        const noteEl = row.querySelector(".bookmark-note");
-        noteEl.textContent = b.note || "";
-        noteEl.dataset.placeholder = "Add a note\u2026";
-        if (!b.note) noteEl.classList.add("bookmark-note-empty");
-        noteEl.addEventListener("focus", () => {
-          noteEl.classList.remove("bookmark-note-empty");
-        });
-        noteEl.addEventListener("input", () => {
-          noteEl.classList.toggle("bookmark-note-empty",
-            noteEl.textContent.trim() === "");
-        });
-        noteEl.addEventListener("keydown", (ev) => {
-          // Ctrl+Enter saves and blurs; Escape cancels to the stored note.
-          if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
-            ev.preventDefault();
-            noteEl.blur();
-          } else if (ev.key === "Escape") {
-            ev.preventDefault();
-            noteEl.textContent = b.note || "";
-            noteEl.classList.toggle("bookmark-note-empty", !b.note);
-            noteEl.blur();
-          }
-        });
-        noteEl.addEventListener("blur", async () => {
-          const t = noteEl.textContent.trim();
-          if (t === (b.note || "")) return; // no change
-          const res = await api.bookmark_update_note?.(b.id, t);
-          if (res?.ok) {
-            b.note = t; // reflect in local data so Escape-revert is accurate
-            noteEl.classList.add("bookmark-note-saved");
-            setTimeout(() => noteEl.classList.remove("bookmark-note-saved"), 1200);
-          } else {
-            // bug L-12: revert the DOM to the last-known-good note so
-            // the user doesn't see a "saved" edit that's actually
-            // rejected by the backend (write-gate off / DB error).
-            noteEl.textContent = b.note || "";
-            noteEl.classList.toggle("bookmark-note-empty", !b.note);
-            window._showToast?.(
-              res?.error || "Note save failed \u2014 reverted.", "error");
-          }
-        });
+        row.querySelector(".bookmark-meta").textContent = isWholeVideo
+          ? (b.channel || "")
+          : `${b.channel || ""} \u00b7 ${_formatTs(b.start_time)}`;
+        if (!isWholeVideo) {
+          row.querySelector(".bookmark-text").textContent = b.text || "";
+        }
         row.querySelector("[data-remove]").addEventListener("click", async (e) => {
           e.stopPropagation();
           const ok = await askDanger("Delete bookmark",
@@ -2579,7 +2800,9 @@
         // editor or delete button must NOT trigger jump, so we scope to the
         // head + text area only.
         const _jumpToBookmark = async () => {
-          const start = Number(b.start_time) || 0;
+          // Whole-video bookmarks (sentinel start_time = -1) open at 0.
+          let start = Number(b.start_time);
+          if (!Number.isFinite(start) || start < 0) start = 0;
           const vid = b.video_id || "";
           const title = b.title || "";
           // Resolve the actual video file via the title+channel index.
@@ -2721,16 +2944,12 @@
       const s = await api?.settings_load?.();
       if (s?.whisper_model) currentDefault = String(s.whisper_model);
     } catch (_e) {}
-    const models = [
-      { name: "tiny", blurb: "fastest, lowest quality" },
-      { name: "small", blurb: "balanced (default)" },
-      { name: "medium", blurb: "higher quality, slower" },
-      { name: "large-v3", blurb: "best quality, slowest" },
-    ];
+    // Issue #150 \u2014 just the model names, no verbose blurbs.
+    const models = ["tiny", "small", "medium", "large-v3"];
     const choices = models.map((m) => ({
-      label: `${m.name} \u2014 ${m.blurb}`,
-      value: m.name,
-      primary: m.name === currentDefault,
+      label: m,
+      value: m,
+      primary: m === currentDefault,
     }));
     const msg = contextLabel
       ? `Pick a Whisper model for ${contextLabel}.`
@@ -2804,20 +3023,74 @@
 
   // Exposed so other modules (e.g. Recent table dblclick) can pop a video
   // into the Watch view with a proper transcript + karaoke bind.
+  // Issue #153: a slow browse_get_transcript (DB lock contention with a
+  // long indexing sweep) used to leave the player blank, and the
+  // eventual response would render in the background — even if the
+  // user had navigated away and the next video had been picked. Track
+  // a monotonic token per open call and bail when it changes.
+  let _watchOpenToken = 0;
+  // Expose on window so logs.js _loadVideoSource can read the current
+  // token + browse state after its own awaits and bail before
+  // accidentally autoplaying after the user navigated away (bug Scott
+  // hit 2026-05-14: clicked Back during load → video played in
+  // background, no UI to stop short of returning to same video).
+  window._browseState = _browseState;
+  Object.defineProperty(window, "_watchOpenToken", {
+    get() { return _watchOpenToken; },
+    configurable: true,
+  });
   window._openVideoInWatch = async function (video) {
     if (!video) return;
+    const myToken = ++_watchOpenToken;
     // Ensure we're on the Browse tab and in Watch view.
     document.querySelector('.tab[data-tab="browse"]')?.click();
-    // Record the view we're leaving so Back can return the user
-    // to it. `_browseState.view` was "videos" (normal channel-drill
-    // flow), "channels" (quick jump from a card), or a submode name
-    // ("recent" / "search" / "bookmarks" / "graph"). The
-    // `_browseGoBack` handler dispatches off this. Without this,
-    // Back from Recent → Watch landed on a blank #video-grid
-    // because no currentChannel was ever set — a bug report.
     _browseState.watchReturnTo = _browseState.view || null;
     _browseState.currentVideo = video;
     showView("watch");
+
+    // BUG FIX 2026-05-14: paint title/meta/loading state IMMEDIATELY.
+    // Previously these stayed at the literal HTML placeholders ("Video
+    // Title", "Channel · upload date · duration") until the slow
+    // `browse_get_transcript` API call resolved — meaning a user who
+    // clicked a freshly-downloaded video saw the empty-state placeholders
+    // for seconds with no indication anything was loading. The video
+    // element also stayed at "Select a video to play". Now we set
+    // everything to the real video info up-front, and the video area
+    // gets a spinner-equivalent "Loading…" treatment via _loadVideoSource
+    // being kicked off pre-transcript.
+    try {
+      const titleEl = document.getElementById("watch-title");
+      const metaEl = document.getElementById("watch-meta");
+      if (titleEl) titleEl.textContent = video.title || "Loading…";
+      if (metaEl) {
+        const parts = [];
+        if (video.channel) parts.push(video.channel);
+        if (video.uploaded) parts.push(video.uploaded);
+        if (video.duration) parts.push(video.duration);
+        if (video.views) parts.push(video.views + " views");
+        metaEl.textContent = parts.join(" · ") || "Loading…";
+      }
+      // Show "Loading…" placeholder in the video area immediately.
+      const vEl = document.getElementById("watch-video");
+      const ph = document.getElementById("watch-video-placeholder");
+      if (ph && video.filepath) {
+        ph.style.display = "";
+        ph.innerHTML =
+          '<div class="watch-play-icon" style="visibility:hidden;">▶</div>' +
+          '<div class="watch-placeholder-text" '
+          + 'style="font-size:13px;color:var(--c-text);">'
+          + '<span class="spinner-inline"></span>Loading…</div>';
+        if (vEl) vEl.style.display = "none";
+      }
+      // Clear stale transcript pane so it doesn't show the previous
+      // video's text while the new one's transcript loads.
+      const tr = document.getElementById("watch-transcript");
+      if (tr) {
+        tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic; padding: 12px;">'
+          + '<span class="spinner-inline"></span>Loading transcript…</div>';
+      }
+    } catch (_e) { /* non-fatal */ }
+
     const api = window.pywebview?.api;
     let transcript = null;
     let sourceInfo = null;
@@ -2827,8 +3100,10 @@
           video_id: video.video_id || undefined,
           title: video.title || "",
         });
-        // New return shape: {ok, segments, source}. Back-compat: if the
-        // result is a plain array, treat it as old-style segment list.
+        // If the user navigated away (different video, different tab)
+        // while we were waiting, drop the result on the floor so the
+        // late response doesn't start playing the wrong video.
+        if (myToken !== _watchOpenToken) return;
         if (Array.isArray(res)) {
           transcript = res;
         } else if (res && res.segments) {
@@ -2837,6 +3112,11 @@
         }
       } catch { /* ignore */ }
     }
+    if (myToken !== _watchOpenToken) return;
+    // Bug fix: if user navigated away from Watch view entirely (back
+    // button, Browse sub-mode switch, etc.) abort rather than render
+    // into a hidden Watch view and accidentally autoplay audio.
+    if (_browseState.view !== "watch") return;
     if (!transcript || transcript.length === 0) {
       transcript = synthesizeTranscript(video);
     } else {
@@ -2844,6 +3124,8 @@
         ts: _formatTs(seg.s), text: seg.t, words: seg.w, s: seg.s, e: seg.e,
       }));
     }
+    if (myToken !== _watchOpenToken) return;
+    if (_browseState.view !== "watch") return;
     window.renderWatchView(video, transcript, sourceInfo);
     // feature F5: if we arrived from a search result, pre-fill the
     // transcript Find box with the query so Enter/Shift+Enter cycle
@@ -3011,7 +3293,9 @@
     if (age < 86400*30) return Math.floor(age / 86400) + "d ago";
     if (age < 86400*365) return Math.floor(age / (86400*30)) + "mo ago";
     const years = Math.floor(age / (86400*365));
-    return years + (years === 1 ? "y ago" : "y ago");
+    // Abbreviation form is intentionally identical across counts
+    // (matches "Nm/Nh/Nd/Nmo" style above). Was a dead ternary.
+    return years + "y ago";
   }
 
   function sortCurrentVideos(sortBy) {
@@ -3483,14 +3767,21 @@
         // db may be null while the slow query is in flight — show
         // "loading\u2026" for those fields so the user sees they're
         // intentionally pending, not broken.
-        const _loading = "loading\u2026";
+        // 2026-05-14: was plain "loading\u2026" text inside `<pre>` set
+        // via .textContent. Felt dead during the multi-second slow-
+        // index query. Switched to innerHTML with an inline spinner
+        // span on the pending rows so the user sees active motion.
+        const _esc = (s) => String(s).replace(/[&<>"']/g, ch => ({
+          "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+        }[ch]));
+        const _loading = '<span class="spinner-inline"></span>loading\u2026';
         return [
-          `Channels: ${fmt(c.channels)}`,
-          `Videos: ${fmt(c.videos)}`,
-          `Segments: ${db ? _zeroOK(db.segments) : _loading}`,
-          `Hours of video: ${db ? _zeroOK(db.hours) : _loading}`,
-          `Transcribed: ${pct}`,
-          `Index DB size: ${db ? (db.index_db_size_label || "\u2014") : _loading}`,
+          `Channels: ${_esc(fmt(c.channels))}`,
+          `Videos: ${_esc(fmt(c.videos))}`,
+          `Segments: ${db ? _esc(_zeroOK(db.segments)) : _loading}`,
+          `Hours of video: ${db ? _esc(_zeroOK(db.hours)) : _loading}`,
+          `Transcribed: ${_esc(pct)}`,
+          `Index DB size: ${db ? _esc(db.index_db_size_label || "\u2014") : _loading}`,
         ].join("\n");
       };
       try {
@@ -3498,14 +3789,14 @@
         const c = (idx && idx.cards) || {};
         // Render basics immediately so the panel isn't blank during
         // the multi-second index-DB query that follows.
-        statsEl.textContent = _renderLines(c, null);
+        statsEl.innerHTML = _renderLines(c, null);
         statsEl.dataset.populated = "1";
         // Async-fetch the slow index-DB stats. Re-render once they
-        // arrive. If the API doesn't exist (older backend), leave
-        // the loading\u2026 placeholders.
+        // arrive. If the API doesn't exist (older backend), the
+        // spinner placeholders just keep spinning.
         if (api.get_index_db_stats) {
           api.get_index_db_stats().then((db) => {
-            if (db) statsEl.textContent = _renderLines(c, db);
+            if (db) statsEl.innerHTML = _renderLines(c, db);
           }).catch(() => {});
         }
       } catch (e) {
@@ -3818,6 +4109,7 @@
     const bAllViews = document.getElementById("btn-md-refresh-all-views");
     const bAllComments = document.getElementById("btn-md-refresh-all-comments");
     const bAllBackfill = document.getElementById("btn-md-backfill-all-ids");
+    const bAllThumbs = document.getElementById("btn-md-refetch-all-thumbs");
     const bReload = document.getElementById("btn-md-reload");
     if (!tbody || !table) return;
 
@@ -3827,6 +4119,16 @@
     let _rows = [];
     let _sortKey = "views";   // matches data-sort-active in HTML
     let _sortDir = "asc";     // oldest-first by default
+    // Whether the bulk thumbnail walk has returned at least once for the
+    // currently-rendered rows. Used to swap the Thumbnails column between
+    // "loading…" (spinner) and the real percentage. Cleared on each
+    // refresh + force-recheck so the indicator shows up again.
+    let _thumbsLoaded = false;
+    // Cutoff for the "Still on YT" column. bulk_refresh_views_likes only
+    // started populating `removed_from_yt_ts` after 2026-05-13. Channels
+    // whose `last_views_refresh_ts` predates that have no real signal —
+    // the column shows "—" instead of a misleading "✓ 100%".
+    const REMOVED_DETECTION_SINCE = 1778630400; // 2026-05-13 00:00 UTC
 
     // Format a timestamp relative to now ("2h ago", "3d ago", "never").
     // "Never" and >90d get a color class so they're easy to spot.
@@ -3866,6 +4168,20 @@
           const m = r.id_missing || 0;
           return t > 0 ? (m / t) : 0;
         },
+        // Issue #154: same "missing ratio" pattern for the thumbs col.
+        thumbs: (r) => {
+          const t = r.thumb_total || 0;
+          const w = r.thumb_with || 0;
+          return t > 0 ? ((t - w) / t) : 0;
+        },
+        // "Still on YT" column — sort by the removed-from-YT ratio so
+        // channels hemorrhaging videos float to the top when sorting
+        // descending. Channels with no on-disk videos sort as 0.
+        onyt: (r) => {
+          const t = r.id_total || 0;
+          const rm = r.removed_from_yt || 0;
+          return t > 0 ? (rm / t) : 0;
+        },
         views: (r) => r.last_views_refresh_ts || 0,
         comments: (r) => r.last_comments_refresh_ts || 0,
       }[_sortKey] || ((r) => 0);
@@ -3883,7 +4199,146 @@
       return out;
     };
 
+    // Aggregate archive-wide stats across every channel and paint the
+    // 5-tile totals strip above the table. Hidden until rows arrive.
+    const _renderTotals = () => {
+      const totalsEl = document.getElementById("metadata-totals");
+      if (!totalsEl) return;
+      if (!_rows.length) {
+        totalsEl.hidden = true;
+        return;
+      }
+      let nChannels = _rows.length;
+      let nVideos = 0;
+      let idTot = 0, idWith = 0;
+      let thTot = 0, thWith = 0;
+      // For Still-on-YT: only aggregate channels that have actually been
+      // bulk-checked since the removed-from-YT detection shipped. Sum-
+      // ming the others would dilute the percentage with channels whose
+      // `removed_from_yt` is 0 only because nobody ever checked.
+      let onTotChecked = 0, onRemovedChecked = 0;
+      let onChannelsChecked = 0;
+      for (const r of _rows) {
+        nVideos += (r.video_count || 0);
+        idTot += (r.id_total || 0);
+        idWith += (r.id_with_id || 0);
+        thTot += (r.thumb_total || 0);
+        thWith += (r.thumb_with || 0);
+        const _vts = r.last_views_refresh_ts || 0;
+        if (_vts >= REMOVED_DETECTION_SINCE) {
+          onTotChecked += (r.id_total || 0);
+          onRemovedChecked += (r.removed_from_yt || 0);
+          onChannelsChecked++;
+        }
+      }
+      const fmt = (n) => n.toLocaleString();
+      const pct = (a, b) => b > 0 ? ((a / b) * 100) : 0;
+      // Color tier helper — mirrors the per-row column thresholds.
+      const tier = (p) => p >= 90 ? "is-ok"
+                       : p >= 50 ? "is-warn"
+                       : "is-bad";
+
+      // Tile renderer. Two-line layout: big primary value on top,
+      // smaller "sub" value below. For percentage tiles, primary
+      // is the percent and sub is the count fraction (fits even
+      // in a narrow tile, unlike the previous one-line format
+      // which clipped to "98,039/101,9… (96…").
+      const setCard = (cardId, valId, primary, sub, klass) => {
+        const card = document.getElementById(cardId);
+        const val = document.getElementById(valId);
+        if (val) {
+          if (sub) {
+            val.innerHTML =
+              `<span class="md-total-primary"></span>`
+              + `<span class="md-total-sub"></span>`;
+            val.querySelector(".md-total-primary").textContent = primary;
+            val.querySelector(".md-total-sub").textContent = sub;
+          } else {
+            val.textContent = primary;
+          }
+        }
+        if (card) {
+          card.classList.remove("is-ok", "is-warn", "is-bad");
+          if (klass) card.classList.add(klass);
+        }
+      };
+
+      const _chanEl = document.getElementById("md-tot-channels");
+      if (_chanEl) _chanEl.textContent = fmt(nChannels);
+      const _vidEl = document.getElementById("md-tot-videos");
+      if (_vidEl) _vidEl.textContent = fmt(nVideos);
+
+      // IDs tile.
+      if (idTot > 0) {
+        const p = pct(idWith, idTot);
+        setCard("md-tot-card-ids", "md-tot-ids",
+                `${p.toFixed(1)}%`,
+                `${fmt(idWith)} / ${fmt(idTot)}`,
+                tier(p));
+      } else {
+        setCard("md-tot-card-ids", "md-tot-ids", "—", "", null);
+      }
+      // Thumbs tile.
+      if (thTot > 0) {
+        const p = pct(thWith, thTot);
+        setCard("md-tot-card-thumbs", "md-tot-thumbs",
+                `${p.toFixed(1)}%`,
+                `${fmt(thWith)} / ${fmt(thTot)}`,
+                tier(p));
+      } else {
+        setCard("md-tot-card-thumbs", "md-tot-thumbs",
+                _thumbsLoaded ? "—" : "loading…",
+                "",
+                null);
+      }
+      // Still-on-YT tile. ONLY counts channels actually checked since
+      // detection shipped (see filter above). Three states:
+      //   - No channel checked yet → "—" + "(run views/likes refresh)"
+      //   - Some checked, some/no removals → live percentage of checked
+      //   - All checked, 0 removed → real 100%
+      const _onyt_card = document.getElementById("md-tot-card-onyt");
+      if (_onyt_card) {
+        // Override the static title so the tooltip reflects scope.
+        _onyt_card.title = onChannelsChecked === 0
+          ? "No channels have been views/likes-refreshed since the "
+            + "removed-from-YouTube detection shipped. Run a bulk "
+            + "Refresh views/likes to populate this column."
+          : `${onChannelsChecked} of ${nChannels} channel(s) have been `
+            + `checked. The other ${nChannels - onChannelsChecked} have `
+            + `no removal data yet — run Refresh views/likes on them to `
+            + `include them in this number.`;
+      }
+      if (onChannelsChecked === 0) {
+        setCard("md-tot-card-onyt", "md-tot-onyt",
+                "—",
+                "not yet checked",
+                null);
+      } else if (onTotChecked > 0 && onRemovedChecked > 0) {
+        const live = Math.max(0, onTotChecked - onRemovedChecked);
+        const p = pct(live, onTotChecked);
+        setCard("md-tot-card-onyt", "md-tot-onyt",
+                `${p.toFixed(1)}%`,
+                `${fmt(live)} / ${fmt(onTotChecked)}`
+                  + (onChannelsChecked < nChannels
+                     ? ` (${onChannelsChecked}/${nChannels})` : ""),
+                tier(p));
+      } else if (onTotChecked > 0) {
+        // We DID check ≥1 channel and found zero removed across the
+        // checked subset — real 100% (not a placeholder this time).
+        setCard("md-tot-card-onyt", "md-tot-onyt",
+                "100%",
+                `${fmt(onTotChecked)} / ${fmt(onTotChecked)}`
+                  + (onChannelsChecked < nChannels
+                     ? ` (${onChannelsChecked}/${nChannels})` : ""),
+                "is-ok");
+      } else {
+        setCard("md-tot-card-onyt", "md-tot-onyt", "—", "", null);
+      }
+      totalsEl.hidden = false;
+    };
+
     const render = () => {
+      _renderTotals();
       // Update th sort indicators.
       table.querySelectorAll("thead th").forEach(th => {
         if (th.dataset.sort === _sortKey) {
@@ -3895,7 +4350,7 @@
         }
       });
       if (!_rows.length) {
-        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">No channels configured.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="md-empty">No channels configured.</td></tr>';
         return;
       }
       const sorted = sortRows(_rows);
@@ -3956,15 +4411,90 @@
         // handler's menu can emphasize Fix IDs when relevant (and so
         // the icon picks up a warning color without extra DOM).
         const needsFix = (idTotal > 0 && idMissing > 0);
-        return `<tr data-identity='${escapeHtml(ident)}'>
+
+        // Issue #154: thumbnail coverage column. Same color/style
+        // grammar as the Video IDs column so users can scan both at
+        // once. Right-click context menu (or the row menu) is where
+        // "Refetch missing thumbnails" lives.
+        const thTotal = r.thumb_total || 0;
+        const thWith = r.thumb_with || 0;
+        const thMissing = Math.max(0, thTotal - thWith);
+        const TH_WARN_THRESHOLD = 0.90;
+        let thumbHtml;
+        if (!_thumbsLoaded) {
+          // Bulk thumb walk still in flight — show a spinner so the user
+          // knows the column is loading, not actually 0%. Was "—" before,
+          // which was indistinguishable from "no on-disk videos".
+          thumbHtml = '<span class="md-thumb-loading" title="Counting thumbnail sidecars on disk…"><span class="md-spinner" aria-hidden="true"></span>loading…</span>';
+        } else if (thTotal === 0) {
+          thumbHtml = '<span class="md-id-dim" title="No on-disk videos to check">&mdash;</span>';
+        } else {
+          const pct = thWith / thTotal;
+          const pctStr = (pct * 100).toFixed(1) + "%";
+          let detail = `${thWith.toLocaleString()} of ${thTotal.toLocaleString()} video(s) have a thumbnail sidecar`;
+          if (thMissing > 0) {
+            detail += ` \u2014 ${thMissing.toLocaleString()} missing. Right-click channel \u2192 "Refetch missing thumbnails"`;
+          }
+          if (thMissing === 0) {
+            thumbHtml = `<span class="md-id-ok" title="${detail}">\u2713 100%</span>`;
+          } else if (thWith === 0) {
+            thumbHtml = `<span class="md-id-bad" title="${detail}">\u2717 0%</span>`;
+          } else if (pct < TH_WARN_THRESHOLD) {
+            thumbHtml = `<span class="md-id-warn" title="${detail}">\u26A0 ${pctStr}</span>`;
+          } else {
+            thumbHtml = `<span class="md-id-neutral" title="${detail}">${pctStr}</span>`;
+          }
+        }
+
+        // "Still on YT" column. `removed_from_yt` is populated by
+        // bulk_refresh_views_likes \u2014 files whose video_id disappeared
+        // from YouTube's flat-playlist response between syncs. The
+        // detection code shipped on 2026-05-13; any channel last
+        // views-refreshed BEFORE that has no real signal to report
+        // (its column was never populated by a sweep that knew to
+        // look). Show "\u2014" + tooltip in that case rather than a
+        // misleading "100%" \u2014 which used to be the bug.
+        const onTotal = idTotal;
+        const onRemoved = r.removed_from_yt || 0;
+        const onLive = Math.max(0, onTotal - onRemoved);
+        const _viewsTs = r.last_views_refresh_ts || 0;
+        const _checkedRecently = _viewsTs >= REMOVED_DETECTION_SINCE;
+        let onYtHtml;
+        if (onTotal === 0) {
+          onYtHtml = '<span class="md-id-dim" title="No tracked videos">&mdash;</span>';
+        } else if (!_checkedRecently) {
+          onYtHtml = `<span class="md-id-dim" title="No removed-from-YouTube data for this channel yet. Run 'Refresh views/likes' for this row (or the bulk button) to populate.">&mdash;</span>`;
+        } else if (onRemoved === 0) {
+          // We DID check, found zero removed \u2014 show a real 100%.
+          onYtHtml = `<span class="md-id-ok" title="${onTotal.toLocaleString()} video(s) on disk, all still on YouTube as of the last bulk refresh.">\u2713 100%</span>`;
+        } else {
+          const pct = onLive / onTotal;
+          const pctStr = (pct * 100).toFixed(1) + "%";
+          const detail = `${onLive.toLocaleString()} of ${onTotal.toLocaleString()} still on YouTube \u2014 ${onRemoved.toLocaleString()} removed / privated / unlisted by the uploader since download. Removed videos can't be metadata-refreshed; local files + IDs are preserved.`;
+          if (pct < 0.50) {
+            onYtHtml = `<span class="md-id-bad" title="${detail}">\u2717 ${pctStr} (${onLive.toLocaleString()}/${onTotal.toLocaleString()})</span>`;
+          } else if (pct < 0.90) {
+            onYtHtml = `<span class="md-id-warn" title="${detail}">\u26A0 ${pctStr} (${onLive.toLocaleString()}/${onTotal.toLocaleString()})</span>`;
+          } else {
+            onYtHtml = `<span class="md-id-neutral" title="${detail}">${pctStr} (${onLive.toLocaleString()}/${onTotal.toLocaleString()})</span>`;
+          }
+        }
+
+        // Row is clickable (left OR right) anywhere \u2014 opens the action
+        // picker. The chevron in the last cell is just a visual hint;
+        // it has no click handler of its own. `needsFix` paints a
+        // subtle yellow left-border on the row so attention-needing
+        // channels still stand out at-a-glance now that the warn-colored
+        // \u22EF button is gone.
+        return `<tr data-identity='${escapeHtml(ident)}' class="md-row-clickable${needsFix ? ' md-row-needs-fix' : ''}" title="Click for channel actions (or right-click)">
           <td class="md-col-name">${escapeHtml(r.name)}</td>
           <td class="md-col-num">${r.video_count.toLocaleString()}</td>
           <td class="md-col-ids">${idHtml}</td>
+          <td class="md-col-ids">${thumbHtml}</td>
+          <td class="md-col-onyt">${onYtHtml}</td>
           <td class="md-col-ts ${v.cls}">${v.text}</td>
           <td class="md-col-ts ${c.cls}">${c.text}</td>
-          <td class="md-col-act">
-            <button class="md-row-act-btn md-row-act-menu${needsFix ? ' md-row-act-warn' : ''}" data-act="menu" title="Channel actions (Fix IDs, Refresh views, Refresh comments)" aria-label="Channel actions">\u22EF</button>
-          </td>
+          <td class="md-col-act"><span class="md-row-chev" aria-hidden="true">\u203A</span></td>
         </tr>`;
       }).join("");
     };
@@ -3987,7 +4517,7 @@
     window._refreshMetadataTab = async () => {
       const api = getApi();
       if (!api?.get_channel_metadata_status) {
-        tbody.innerHTML = '<tr><td colspan="6" class="md-empty">Native mode required.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="md-empty">Native mode required.</td></tr>';
         return;
       }
       // Live "Loading channels..." with elapsed counter so the table
@@ -3995,7 +4525,7 @@
       // index DB lock is held by an in-flight sweep / ingest, in
       // which case this call blocks until they finish).
       const _t0 = Date.now();
-      tbody.innerHTML = '<tr><td colspan="6" class="md-empty">'
+      tbody.innerHTML = '<tr><td colspan="8" class="md-empty">'
         + 'Loading channels\u2026 <span id="md-load-info" class="md-load-info"></span>'
         + '</td></tr>';
       const _info = document.getElementById("md-load-info");
@@ -4020,13 +4550,44 @@
       };
       _paint();
       const _ticker = setInterval(_paint, 1000);
+      // Mark thumbnails as not-yet-loaded so the column renders a
+      // spinner until the bulk walk completes.
+      _thumbsLoaded = false;
       try {
         const rows = await api.get_channel_metadata_status();
         _rows = Array.isArray(rows) ? rows : [];
+        // Issue #154 (fix): thumbnail_status_bulk walks every channel
+        // folder on disk (~100k probes on a 100-channel archive on a
+        // network-pooled drive — multi-minute). DO NOT await it here.
+        // Render the table immediately with a spinner in the Thumbnails
+        // column, then kick the bulk walk in the background and patch
+        // the column when it returns.
+        if (api?.thumbnail_status_bulk) {
+          api.thumbnail_status_bulk().then((thRes) => {
+            const thMap = thRes?.rows || {};
+            for (const r of _rows) {
+              const key = (r.name || r.folder || "").toLowerCase();
+              const t = thMap[key];
+              if (t) {
+                r.thumb_total = t.total || 0;
+                r.thumb_with = t.with_thumb || 0;
+                r.thumb_missing = t.missing || 0;
+              }
+            }
+            _thumbsLoaded = true;
+            // Re-render once thumb data is in. Cheap — same rows,
+            // just rebuilt with the merged values.
+            try { render(); } catch {}
+          }).catch(() => { _thumbsLoaded = true; try { render(); } catch {} });
+        } else {
+          // No native API → no walk is going to happen. Don't sit on
+          // a spinner forever; flip to loaded so the column shows "—".
+          _thumbsLoaded = true;
+        }
       } catch (e) {
         console.error("get_channel_metadata_status:", e);
         clearInterval(_ticker);
-        tbody.innerHTML = `<tr><td colspan="6" class="md-empty">`
+        tbody.innerHTML = `<tr><td colspan="8" class="md-empty">`
           + `Failed to load: ${escapeHtml(String(e))}</td></tr>`;
         return;
       }
@@ -4051,10 +4612,62 @@
       });
     });
 
-    // Per-row action buttons (event delegation). A single "⋯" menu
-    // button per row opens an askChoice picker with all three
-    // actions — much more space-efficient than three visible buttons
-    // at narrow panel widths.
+    // Per-row action handlers — routed from _openRowMenu after the
+    // user picks an action in the askChoice dropdown. Each handler
+    // hits a different backend endpoint, all of which enqueue onto
+    // the sync queue (except refetch_thumbnails which spawns its own
+    // background thread).
+    //
+    // Toast wording branches on res.paused: when the queue is paused,
+    // we want the user to know the task was queued but the queue
+    // won't auto-start. Surface message ends with "queue is paused —
+    // resume to start." in that case.
+    const _pausedTail = (res) => res?.paused ? " Queue is paused — resume to start." : "";
+
+    // Prompt the user to pick fast vs thorough backfill mode. Time
+    // estimates derived from videoCount: fast is mostly catalog-walk
+    // (constant-ish) + ffprobe (~0.07s/file local); thorough is
+    // dominated by per-video upload_date fetches at ~0.75s/vid wall
+    // clock with 4-wide parallelism, scoped to the candidate shortlist
+    // (which we conservatively estimate at videoCount × 0.5 since
+    // ~half the files are typically already-resolved and skip).
+    //
+    // Returns "fast" | "thorough" | null (cancelled).
+    const _fmtMin = (sec) => {
+      if (sec < 60) return `${Math.max(5, Math.round(sec / 5) * 5)}s`;
+      const m = sec / 60;
+      if (m < 2) return `~1 min`;
+      if (m < 60) return `~${Math.round(m)} min`;
+      const h = m / 60;
+      return `~${h.toFixed(h < 3 ? 1 : 0)} hr`;
+    };
+    const _promptBackfillMode = async (videoCount, ctxLabel) => {
+      const n = Math.max(1, Number(videoCount) || 1);
+      const fastSec = 30 + n * 0.07;  // ffprobe is the variable cost
+      const thoroughSec = fastSec + (n * 0.5 * 0.75);
+      const fastTxt = _fmtMin(fastSec);
+      const thoroughTxt = _fmtMin(thoroughSec);
+      const msg = (ctxLabel ? ctxLabel + "\n\n" : "")
+        + "Fast: match by title + duration only. Works great for "
+        + "channels with stable titles and varied durations. "
+        + "Doesn't help when YouTube renamed lots of titles AND "
+        + "many videos share a duration.\n\n"
+        + "Thorough: also re-fetches the upload date for every "
+        + "candidate video so date can disambiguate renamed titles. "
+        + "Hits YouTube hard — one request per candidate (~3s each, "
+        + "parallelized 4-wide). Use when Fast left a lot unresolved.";
+      const pick = await window.askChoice({
+        title: "Fix missing video IDs",
+        message: msg,
+        choices: [
+          { label: `Fast (${fastTxt})`, value: "fast", kind: "primary" },
+          { label: `Thorough (${thoroughTxt})`, value: "thorough" },
+        ],
+      });
+      return pick === "thorough" ? "thorough"
+           : pick === "fast" ? "fast"
+           : null;
+    };
     const _runRowAct = async (act, ident, rowRefs) => {
       const api = getApi();
       if (!api) return;
@@ -4067,7 +4680,8 @@
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.("Queued views/likes refresh.", "ok");
+            window._showToast?.("Queued views/likes refresh." + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -4076,12 +4690,44 @@
         if (!api.metadata_backfill_ids_channel) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
+        // Look up this channel's video count from the cached _rows
+        // so the dialog can show real time estimates.
+        let _vc = 0;
         try {
-          const res = await api.metadata_backfill_ids_channel(ident);
+          const _r = _rows.find(r => r.folder === ident.folder
+                                   || r.url === ident.url);
+          _vc = _r?.video_count || 0;
+        } catch {}
+        const _mode = await _promptBackfillMode(
+          _vc, `Channel: ${ident.folder || ident.url || ""}`);
+        if (!_mode) return; // cancelled
+        try {
+          const res = await api.metadata_backfill_ids_channel(ident, _mode);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.("Queued video_id backfill.", "ok");
+            const head = _mode === "thorough"
+              ? "Queued video_id backfill (thorough)."
+              : "Queued video_id backfill (fast).";
+            window._showToast?.(head + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      } else if (act === "thumbs") {
+        // Issue #154: refetch missing thumbnails for one channel.
+        if (!api.refetch_thumbnails) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        try {
+          const res = await api.refetch_thumbnails(ident);
+          if (res?.started) {
+            window._showToast?.(
+              "Thumbnail refetch started — check the log for progress.",
+              "ok");
+          } else if (res?.error) {
+            window._showToast?.(res.error, "error");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -4090,28 +4736,20 @@
         if (!api.metadata_refresh_comments_channel) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
-        const pick = await (window.askChoice ? window.askChoice({
-          title: "Refresh comments",
-          message: "Scope which videos to refetch comments for:",
-          choices: [
-            { label: "Last 7 days", value: 7, kind: "primary" },
-            { label: "Last 30 days", value: 30 },
-            { label: "Last 90 days", value: 90 },
-            { label: "All videos", value: 0, kind: "ghost" },
-          ],
-        }) : Promise.resolve(null));
-        // askChoice resolves to a string from dataset.value (or null on
-        // cancel). Coerce to int; 0 → "all videos" → null days-scope.
-        if (pick === null || pick === undefined) return;
-        const pickN = parseInt(pick, 10);
+        // Caller passes the time-scope directly as the `arg` parameter
+        // (set by the context-menu submenu's data-days attribute).
+        // null = all videos. Numeric = N-day window.
+        const pickN = parseInt(rowRefs, 10);
         const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : null;
         try {
           const res = await api.metadata_refresh_comments_channel(ident, days);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.(days ? `Queued comments refresh (${days}d).`
-                                     : "Queued comments refresh (all).", "ok");
+            const head = days ? `Queued comments refresh (${days}d).`
+                              : "Queued comments refresh (all).";
+            window._showToast?.(head + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -4119,41 +4757,134 @@
       }
     };
 
-    // Wire the single per-row menu button. Clicking "⋯" opens an
-    // askChoice picker with the three actions; the handler then
-    // dispatches into the existing _runRowAct. Primary choice defaults
-    // to Fix IDs when the row is flagged `needsFix` (yellow warn
-    // color on the button), otherwise the most common case — Views.
-    tbody.addEventListener("click", async (e) => {
-      const btn = e.target.closest(".md-row-act-btn");
-      if (!btn) return;
-      const tr = btn.closest("tr");
-      if (!tr) return;
+    // Right-click-style dropdown for the action menu. Positioned at
+    // the cursor, NOT a centered modal. Left + right click both open
+    // the same dropdown at the click point. Active reference + close
+    // helper — only one menu lives at a time.
+    let _activeMenu = null;
+    const _closeRowMenu = () => {
+      if (_activeMenu) {
+        try { _activeMenu.remove(); } catch {}
+        _activeMenu = null;
+      }
+    };
+    const _openRowMenu = (tr, clientX, clientY) => {
+      _closeRowMenu();
       let ident = {};
       try { ident = JSON.parse(tr.dataset.identity || "{}"); } catch {}
-      if (btn.dataset.act !== "menu") return;
-      const needsFix = btn.classList.contains("md-row-act-warn");
+      const needsFix = tr.classList.contains("md-row-needs-fix");
       // Reorder so the most-likely action is FIRST — askChoice focuses
       // the first primary-kinded button for keyboard confirm. Since
       // the default kind is now primary (all green), ordering alone
       // picks the default without making the others visually secondary.
-      const fix = { label: "Fix missing video IDs", value: "backfill" };
-      const views = { label: "Refresh views/likes", value: "views" };
-      const comments = { label: "Refresh comments\u2026", value: "comments" };
+      // Build the dropdown DOM. Compact list, positioned at the
+      // cursor \u2014 looks like a Windows right-click menu, NOT a
+      // centered askChoice modal.
+      const menu = document.createElement("div");
+      menu.className = "md-context-menu";
+      menu.setAttribute("role", "menu");
+      const mkItem = (label, act, opts) => {
+        opts = opts || {};
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "md-cm-item" + (opts.warn ? " md-cm-warn" : "");
+        b.dataset.act = act;
+        if (opts.days !== undefined) b.dataset.days = String(opts.days);
+        b.textContent = label;
+        return b;
+      };
+      const fixItem = mkItem("Fix missing video IDs", "backfill",
+                             { warn: needsFix });
+      const viewsItem = mkItem("Refresh views/likes", "views");
+      const thumbsItem = mkItem("Refetch missing thumbnails", "thumbs");
+      // "Refresh comments" carries a hover-submenu with day-scope picks.
+      const commentsWrap = document.createElement("div");
+      commentsWrap.className = "md-cm-sub-wrap";
+      const commentsHead = document.createElement("button");
+      commentsHead.type = "button";
+      commentsHead.className = "md-cm-item md-cm-has-sub";
+      commentsHead.innerHTML = "Refresh comments<span class=\"md-cm-chev\">\u203a</span>";
+      const commentsSub = document.createElement("div");
+      commentsSub.className = "md-cm-sub";
+      commentsSub.appendChild(mkItem("Last 7 days", "comments", { days: 7 }));
+      commentsSub.appendChild(mkItem("Last 30 days", "comments", { days: 30 }));
+      commentsSub.appendChild(mkItem("Last 90 days", "comments", { days: 90 }));
+      commentsSub.appendChild(mkItem("All videos", "comments", { days: 0 }));
+      commentsWrap.appendChild(commentsHead);
+      commentsWrap.appendChild(commentsSub);
       // Mark the first choice `primary: true` so Enter confirms it
       // (askChoice uses this flag to pick the keyboard-focus target).
       // All three still render green — the primary flag only affects
       // auto-focus, not color, under the new default-to-primary kind.
-      const choices = needsFix
-        ? [{...fix, primary: true}, views, comments]
-        : [{...views, primary: true}, fix, comments];
-      const pick = await (window.askChoice ? window.askChoice({
-        title: "Channel actions",
-        message: "Pick an action for this channel:",
-        choices,
-      }) : Promise.resolve(null));
-      if (!pick) return;
-      await _runRowAct(String(pick), ident);
+      if (needsFix) {
+        menu.appendChild(fixItem);
+        menu.appendChild(viewsItem);
+      } else {
+        menu.appendChild(viewsItem);
+        menu.appendChild(fixItem);
+      }
+      menu.appendChild(commentsWrap);
+      menu.appendChild(thumbsItem);
+
+      // Leaf-item click → close + dispatch. Submenu header is hover-only.
+      menu.addEventListener("click", async (ev) => {
+        const btn = ev.target.closest(".md-cm-item");
+        if (!btn) return;
+        if (btn.classList.contains("md-cm-has-sub")) return;
+        const act = btn.dataset.act;
+        const days = btn.dataset.days; // string or undefined
+        _closeRowMenu();
+        await _runRowAct(act, ident, days);
+      });
+
+      document.body.appendChild(menu);
+      _activeMenu = menu;
+
+      // Position at the click point, flipping if it would go off-screen.
+      const margin = 4;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let x = clientX, y = clientY;
+      const r = menu.getBoundingClientRect();
+      if (x + r.width + margin > vw) x = Math.max(margin, vw - r.width - margin);
+      if (y + r.height + margin > vh) y = Math.max(margin, vh - r.height - margin);
+      menu.style.left = x + "px";
+      menu.style.top = y + "px";
+
+      setTimeout(() => {
+        const first = menu.querySelector(".md-cm-item:not(.md-cm-has-sub)");
+        first?.focus?.();
+      }, 0);
+    };
+    // Outside click / Escape / scroll / resize → close.
+    document.addEventListener("mousedown", (e) => {
+      if (!_activeMenu) return;
+      if (_activeMenu.contains(e.target)) return;
+      _closeRowMenu();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (_activeMenu && e.key === "Escape") {
+        e.preventDefault();
+        _closeRowMenu();
+      }
+    });
+    window.addEventListener("resize", _closeRowMenu);
+    window.addEventListener("scroll", _closeRowMenu, true);
+    // Left click anywhere on a row → open menu at the click point.
+    tbody.addEventListener("click", (e) => {
+      const tr = e.target.closest("tr.md-row-clickable");
+      if (!tr) return;
+      try {
+        const sel = window.getSelection?.();
+        if (sel && sel.toString().length > 0) return;
+      } catch {}
+      _openRowMenu(tr, e.clientX, e.clientY);
+    });
+    // Right click anywhere on a row → open SAME menu at the click point.
+    tbody.addEventListener("contextmenu", (e) => {
+      const tr = e.target.closest("tr.md-row-clickable");
+      if (!tr) return;
+      e.preventDefault();
+      _openRowMenu(tr, e.clientX, e.clientY);
     });
 
     // Bulk buttons.
@@ -4177,7 +4908,9 @@
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.(`Queued for ${res.queued} channel(s).`, "ok");
+            window._showToast?.(
+              `Queued for ${res.queued} channel(s).` + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -4208,7 +4941,9 @@
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
-            window._showToast?.(`Queued for ${res.queued} channel(s).`, "ok");
+            window._showToast?.(
+              `Queued for ${res.queued} channel(s).` + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
@@ -4232,32 +4967,166 @@
         }
         const pick = await (window.askChoice ? window.askChoice({
           title: "Fix missing video IDs?",
-          message: `Will queue ${needing} channel(s) that currently have missing video_ids. Each channel runs one fast flat-playlist call + title-match to backfill the index DB. No yt-dlp re-fetches, no file changes.`,
+          message: `Will queue ${needing} channel(s) that currently have missing video_ids. Next step asks which match mode to use.`,
           choices: [
             { label: `Queue ${needing} channel(s)`, value: "missing", kind: "primary" },
             { label: "Queue ALL channels (force)", value: "all" },
           ],
         }) : Promise.resolve("missing"));
         if (!pick) return;
+        // Sum total videos across affected channels so the time
+        // estimate reflects the actual workload.
+        const _targetChannels = _rows.filter(r =>
+          pick === "all" ? true
+            : ((r.id_total || 0) > 0 && (r.id_missing || 0) > 0));
+        const _totalVideos = _targetChannels.reduce(
+          (sum, r) => sum + (r.video_count || 0), 0);
+        const _mode = await _promptBackfillMode(
+          _totalVideos,
+          `Running across ${_targetChannels.length} channel(s), `
+          + `${_totalVideos.toLocaleString()} total videos. Time `
+          + `estimates below are total — each channel runs sequentially.`);
+        if (!_mode) return;
         try {
           const onlyMissing = (pick === "missing");
-          const res = await api.metadata_backfill_ids_all(onlyMissing);
+          const res = await api.metadata_backfill_ids_all(onlyMissing, _mode);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
+            const tail = _mode === "thorough" ? " (thorough)" : " (fast)";
             const msg = res.skipped_up_to_date
-              ? `Queued ${res.queued} (${res.skipped_up_to_date} already OK).`
-              : `Queued ${res.queued} channel(s).`;
-            window._showToast?.(msg, "ok");
+              ? `Queued ${res.queued} (${res.skipped_up_to_date} already OK)${tail}.`
+              : `Queued ${res.queued} channel(s)${tail}.`;
+            window._showToast?.(msg + _pausedTail(res),
+              res?.paused ? "warn" : "ok");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
         }
       });
     }
+    // Bulk thumbnail refetch — walks every channel sequentially in
+    // the background. Doesn't touch the sync queue (thumbnails are
+    // a cosmetic side-channel fetch). Aggregate the missing-thumb
+    // count from the cached _rows so the confirmation dialog can
+    // tell the user how big the job actually is.
+    if (bAllThumbs) {
+      bAllThumbs.addEventListener("click", async () => {
+        const api = getApi();
+        if (!api?.refetch_thumbnails_all) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        const nMissing = _rows.reduce(
+          (sum, r) => sum + Math.max(
+            0, (r.thumb_total || 0) - (r.thumb_with || 0)),
+          0);
+        const nChannels = _rows.filter(r =>
+          (r.thumb_total || 0) > (r.thumb_with || 0)).length;
+        if (nMissing === 0) {
+          window._showToast?.(
+            "Every channel already has all its thumbnails.", "ok");
+          return;
+        }
+        const ok = await (window.askChoice ? window.askChoice({
+          title: "Refetch missing thumbnails for all channels?",
+          message: `${nMissing.toLocaleString()} thumbnail(s) missing `
+            + `across ${nChannels} channel(s). Each missing thumbnail `
+            + `is downloaded from the URL cached in metadata.jsonl. `
+            + `Runs in the background; progress streams to the log. `
+            + `(Some thumbnails may be unrecoverable if the source URL `
+            + `404s or the video was removed from YouTube.)`,
+          choices: [
+            { label: "Start", value: "go", kind: "primary" },
+          ],
+        }) : Promise.resolve("go"));
+        if (!ok) return;
+        try {
+          const res = await api.refetch_thumbnails_all();
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Failed.", "error");
+          } else {
+            window._showToast?.(
+              `Thumbnail refetch started across ${res.channels} channel(s) `
+              + `— watch the log for progress.`, "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      });
+    }
+
     if (bReload) {
       bReload.addEventListener("click", () => {
         window._refreshMetadataTab?.();
+      });
+    }
+
+    // Force-recheck ALL stats — ignores every cache and walks/queries
+    // fresh: video counts (archive_scan), Video IDs (DB GROUP BY),
+    // Thumbnails (parallel disk walk).
+    const bRecheckThumbs = document.getElementById("btn-md-recheck-thumbs");
+    const recheckProgress = document.getElementById("md-recheck-progress");
+    if (bRecheckThumbs) {
+      bRecheckThumbs.addEventListener("click", async () => {
+        if (bRecheckThumbs.disabled) return;
+        const api = getApi();
+        if (!api?.thumbnail_status_bulk || !api?.get_channel_metadata_status) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        bRecheckThumbs.disabled = true;
+        if (recheckProgress) {
+          recheckProgress.hidden = false;
+          recheckProgress.textContent = " · rechecking…";
+        }
+        // Reset the loaded flag so the Thumbnails column shows the
+        // spinner again while the force-walk runs. (The row data
+        // itself is left intact — we don't blank it out — but the
+        // spinner takes precedence so the user sees that work is
+        // in progress.)
+        _thumbsLoaded = false;
+        try { render(); } catch {}
+        const _t0 = Date.now();
+        const _tick = setInterval(() => {
+          if (!recheckProgress || recheckProgress.hidden) return;
+          const sec = Math.floor((Date.now() - _t0) / 1000);
+          recheckProgress.textContent = ` · rechecking ${sec}s…`;
+        }, 1000);
+        try {
+          // Fire both in parallel — they read separate sources (DB
+          // vs filesystem) so they don't contend.
+          const [metaRows, thRes] = await Promise.all([
+            api.get_channel_metadata_status(true),
+            api.thumbnail_status_bulk(true),
+          ]);
+          _rows = Array.isArray(metaRows) ? metaRows : [];
+          const thMap = thRes?.rows || {};
+          for (const r of _rows) {
+            const key = (r.name || r.folder || "").toLowerCase();
+            const t = thMap[key];
+            if (t) {
+              r.thumb_total = t.total || 0;
+              r.thumb_with = t.with_thumb || 0;
+              r.thumb_missing = t.missing || 0;
+            }
+          }
+          _thumbsLoaded = true;
+          try { render(); } catch {}
+          const ch = Object.keys(thMap).length;
+          window._showToast?.(
+            `Rechecked ${ch} channel(s).`, "ok");
+        } catch (e) {
+          // Stuck spinner is worse than a dash — flip back on error.
+          _thumbsLoaded = true;
+          try { render(); } catch {}
+          window._showToast?.(String(e), "error");
+        } finally {
+          clearInterval(_tick);
+          bRecheckThumbs.disabled = false;
+          if (recheckProgress) {
+            recheckProgress.hidden = true;
+            recheckProgress.textContent = "";
+          }
+        }
       });
     }
 
@@ -5240,6 +6109,39 @@
       ];
       showContextMenu(e.clientX, e.clientY, items);
     });
+
+    // Clear list button — empties the recent-downloads list (does NOT
+    // delete files on disk). The button itself is shown/hidden by the
+    // renderer based on whether there are rows. .txt: handler was
+    // missing in the pywebview port, so the button did nothing.
+    const clearListBtn = document.getElementById("btn-clear-recent");
+    if (clearListBtn && !clearListBtn._wired) {
+      clearListBtn._wired = true;
+      clearListBtn.addEventListener("click", async () => {
+        const ok = await askDanger(
+          "Clear Recent Downloads",
+          "Clear the entire recent downloads list?\n\n"
+            + "This only removes the list entries — downloaded files are not deleted.",
+          "Clear list");
+        if (!ok) return;
+        try {
+          const res = await window.pywebview?.api?.clear_recent_downloads?.();
+          if (res?.ok) {
+            window._showToast?.("Recent list cleared.", "ok");
+            try {
+              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              if (typeof window.renderRecentTable === "function") {
+                window.renderRecentTable(rows || []);
+              }
+            } catch {}
+          } else {
+            window._showToast?.(res?.error || "Could not clear list.", "error");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        }
+      });
+    }
   }
 
   // ─── Browse tab context menus ────────────────────────────────────────
@@ -5270,6 +6172,41 @@
           { label: "Open channel on YouTube", action: () => api?.chan_open_url?.(name) },
           { sep: true },
           { label: "Sync now", action: () => api?.sync_one_channel?.({ name }) },
+          // Issue #154: refetch missing thumbnails for this channel.
+          // Surfaces the same backend function used by the Settings >
+          // Metadata "Refresh thumbnails" affordance.
+          { label: "Refetch missing thumbnails", action: async () => {
+            const r = await api?.refetch_thumbnails?.({ name });
+            if (r?.started) {
+              window._showToast?.(
+                `Thumbnail refetch started for ${name}.`, "ok");
+            } else if (r?.error) {
+              window._showToast?.(r.error, "error");
+            }
+          }},
+          // .txt request: right-click → re-transcribe whole channel
+          // with a Whisper model picker. Same API as the Subs context
+          // menu version.
+          { label: "Re-transcribe channel…", action: async () => {
+            const model = await (window._askWhisperModel?.(`channel "${name}"`));
+            if (!model) return;
+            const ok = await askDanger(
+              "Re-transcribe entire channel",
+              `Queue every video in "${name}" for re-transcription with `
+                + `Whisper ${model}?\n\nThis can take hours on large channels.`,
+              "Queue all");
+            if (!ok) return;
+            const res = await api?.transcribe_retranscribe_channel?.(
+              { name }, model);
+            if (res?.ok) {
+              window._showToast?.(
+                `Queued ${res.queued} video(s) from ${name} for Whisper ${model}.`,
+                "ok");
+            } else {
+              window._showToast?.(res?.error || "Channel retranscribe failed.",
+                                  "error");
+            }
+          }},
           { label: _metaLabel, action: () => api?.metadata_recheck_channel?.({ name }) },
           // New 2026-04-23: comments refresh, separate from views/likes.
           // Submenu offers scope choices so a 4000-video channel doesn't
@@ -5437,6 +6374,66 @@
       });
     }
 
+    // Issue #161: Recent tab in grid view needs the same right-click menu
+    // as the Browse > Channel video grid. Same card class, different
+    // container, so we bind a second handler on #recent-grid.
+    const recentGrid = document.getElementById("recent-grid");
+    if (recentGrid) {
+      recentGrid.addEventListener("contextmenu", (e) => {
+        const card = e.target.closest(".video-card");
+        if (!card) return;
+        e.preventDefault();
+        const filepath = card.dataset.filepath || "";
+        const videoId = card.dataset.videoId || "";
+        const title = card.dataset.title || "";
+        const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
+        const api = window.pywebview?.api;
+        showContextMenu(e.clientX, e.clientY, [
+          { label: "Play video", action: () => {
+            if (filepath && api?.browse_open_video) api.browse_open_video(filepath);
+          }},
+          { label: "Open on YouTube", action: () => {
+            if (ytUrl) window.open(ytUrl, "_blank");
+          }},
+          { label: "Copy YouTube URL", action: () => {
+            if (ytUrl) {
+              navigator.clipboard?.writeText(ytUrl);
+              window._showToast?.("URL copied.", "ok");
+            }
+          }},
+          { label: "Show in Explorer", action: () => {
+            if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
+          }},
+          { sep: true },
+          { label: "Transcribe now", action: async () => {
+            if (filepath && api?.transcribe_enqueue) {
+              const model = await (window._askWhisperModel?.(`"${title}"`));
+              if (model === null) return;
+              api.transcribe_enqueue(filepath, title);
+              window._showToast?.("Queued for whisper.", "ok");
+            }
+          }},
+          { label: "Re-transcribe", action: async () => {
+            if (!filepath || !api?.transcribe_retranscribe) return;
+            const model = await (window._askWhisperModel?.(`"${title}"`));
+            if (!model) return;
+            const res = await api.transcribe_retranscribe(filepath, title, videoId || "");
+            if (res?.ok) window._showToast?.(
+              `Queued ${model} re-transcription.`, "ok");
+            else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
+          }},
+          { label: "Redownload…", action: async () => {
+            const _res = await (window._askRedownload?.(title));
+            if (!_res) return;
+            bridgeCall("video_redownload", videoId, title, _res);
+          }},
+          { sep: true },
+          { label: "Delete file", cls: "dim",
+            action: () => bridgeCall("video_delete_file", filepath) },
+        ]);
+      });
+    }
+
     // Transcript segments in Watch view
     const transcript = document.getElementById("watch-transcript");
     if (transcript) {
@@ -5455,32 +6452,22 @@
           { label: "Bookmark this moment\u2026", action: async () => {
             if (!api?.bookmark_add) return;
             const start = _parseTs(ts.replace(/[\[\]]/g, ""));
-            // Match YTArchiver.py:29412 _add_bookmark — prompt for optional note.
-            // audit D-23: DO NOT coalesce with `?? ""` BEFORE the
-            // null check. askTextInput returns null on cancel, and
-            // null ?? "" = "", so the `if (note === null) return`
-            // below never fired — every Cancel created a bookmark
-            // with an empty note. Check raw first, then default.
-            const noteRaw = await askTextInput?.({
-              title: "Add bookmark",
-              message: `At ${ts || "this moment"}:\n\n\u201C${text.slice(0, 140)}${text.length > 140 ? "\u2026" : ""}\u201D`,
-              placeholder: "Add a note (optional)",
-              confirm: "Save bookmark",
-              cancel: "Cancel",
-              allowEmpty: true,
-            });
-            if (noteRaw === null || noteRaw === undefined) return;
-            const note = noteRaw;
+            // Issue #164: right-click on a transcript segment always
+            // creates a timestamped bookmark with no note prompt.
             const res = await api.bookmark_add({
               video_id: v.video_id || "",
               title: v.title || "",
               channel: v.channel || "",
               start_time: start,
               text: text,
-              note: note || "",
+              note: "",
             });
-            if (res?.ok) window._showToast?.("Bookmarked.", "ok");
-            else window._showToast?.(res?.error || "Bookmark failed.", "error");
+            if (res?.ok) {
+              window._showToast?.("Bookmarked.", "ok");
+              try { window.refreshBookmarks?.(); } catch {}
+            } else {
+              window._showToast?.(res?.error || "Bookmark failed.", "error");
+            }
           }},
         ]);
       });
@@ -5842,8 +6829,14 @@
       // Sync List" → "Channel Transcribing...").
       const _syncState = window._queueHasSyncForChannel?.(chan);
       const _gpuState = window._queueHasGpuForChannel?.(chan);
+      // Issue #155: when a sync pipeline is active, "Sync now" should
+      // ENQUEUE the channel rather than do nothing. Only the
+      // already-running and already-queued states stay disabled.
+      const _syncActiveButOtherChannel =
+        (window._anySyncRunning?.() || false) && !_syncState;
       const _syncLabel = _syncState === "running" ? "Syncing now \u2026 (already running)"
                        : _syncState === "queued" ? "Already in Sync queue"
+                       : _syncActiveButOtherChannel ? "Add to Sync queue"
                                                   : "Sync now";
       const _syncDisabled = Boolean(_syncState);
       const _txLabel = _gpuState === "running" ? "Channel transcribing \u2026"
@@ -5854,7 +6847,15 @@
       // with sub-menus for organization mode + redownload quality.
       showContextMenu(e.clientX, e.clientY, [
         { label: _syncLabel, cls: _syncDisabled ? "dim" : "",
-          action: () => { if (!_syncDisabled) api?.sync_one_channel?.({ name: chan }); }},
+          action: async () => {
+            if (_syncDisabled) return;
+            const r = await api?.sync_one_channel?.({ name: chan });
+            if (r?.ok && r?.queued) {
+              window._showToast?.(`Added "${r.name || chan}" to sync queue.`, "ok");
+            } else if (r?.error) {
+              window._showToast?.(r.error, "error");
+            }
+          }},
         { label: "Edit settings", action: () => window._editChannelFromContext?.(chan) },
         { label: "Open folder in Explorer", action: () => api?.chan_open_folder?.(chan) },
         { label: "Open URL in browser", action: () => api?.chan_open_url?.(chan) },
@@ -5891,6 +6892,29 @@
         { sep: true },
         { label: _txLabel, cls: _txDisabled ? "dim" : "",
           action: () => { if (!_txDisabled) _askTranscribeChannel(chan); }},
+        // .txt request: right-click → re-transcribe entire channel with
+        // model selection. Confirms first because this can be a long
+        // GPU job (hundreds of videos on large channels).
+        { label: "Re-transcribe channel…", action: async () => {
+          const model = await (window._askWhisperModel?.(`channel "${chan}"`));
+          if (!model) return;
+          const ok = await askDanger(
+            "Re-transcribe entire channel",
+            `Queue every video in "${chan}" for re-transcription with `
+              + `Whisper ${model}?\n\nThis can take hours on large channels.`,
+            "Queue all");
+          if (!ok) return;
+          const res = await api?.transcribe_retranscribe_channel?.(
+            { name: chan }, model);
+          if (res?.ok) {
+            window._showToast?.(
+              `Queued ${res.queued} video(s) from ${chan} for Whisper ${model}.`,
+              "ok");
+          } else {
+            window._showToast?.(res?.error || "Channel retranscribe failed.",
+                                "error");
+          }
+        }},
         { label: "Download metadata", action: () => api?.metadata_recheck_channel?.({ name: chan }) },
         { sep: true },
         // Pending-redownload swap: when `_redownload_progress.json` is
@@ -6755,9 +7779,122 @@
     // doesn't warn about deleted sidecars because transcripts aren't
     // per-video sidecars — they're appended to a per-month aggregated
     // Transcript.txt managed by the transcription pipeline.
+    // .txt request: Aa- / Aa+ buttons in the transcript header tweak the
+    // font size on .watch-transcript via a document-level CSS variable.
+    // Bounded to a sane range so users can't accidentally make text
+    // unreadably tiny or comically huge. Persisted to settings so the
+    // chosen size survives restarts.
+    const _TX_FONT_MIN = 9.5;
+    const _TX_FONT_MAX = 22;
+    const _txFontKey = "ytarchiver_tx_font_px";
+    function _applyTxFontSize(px) {
+      const v = Math.max(_TX_FONT_MIN,
+        Math.min(_TX_FONT_MAX, parseFloat(px) || 12.5));
+      document.documentElement.style.setProperty(
+        "--watch-transcript-fz", v.toFixed(1) + "px");
+      try { localStorage.setItem(_txFontKey, String(v)); } catch {}
+      // Persist to settings so the choice survives across machines /
+      // app refreshes (localStorage covers fast restart; backend
+      // settings covers the more durable case).
+      const _api = window.pywebview?.api;
+      if (_api?.settings_save) {
+        try { _api.settings_save({ transcript_font_size: v }); }
+        catch {}
+      }
+    }
+    // Apply persisted value on boot — localStorage first (zero round-trip),
+    // then a best-effort settings refresh from the backend.
+    try {
+      const _stored = parseFloat(localStorage.getItem(_txFontKey) || "");
+      if (Number.isFinite(_stored) && _stored > 0) _applyTxFontSize(_stored);
+    } catch {}
+    (async () => {
+      try {
+        const s = await window.pywebview?.api?.settings_load?.();
+        const v = parseFloat(s?.transcript_font_size);
+        if (Number.isFinite(v) && v > 0) _applyTxFontSize(v);
+      } catch {}
+    })();
+    document.getElementById("btn-tx-font-down")?.addEventListener("click", () => {
+      const cur = parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue("--watch-transcript-fz")) || 12.5;
+      _applyTxFontSize(cur - 1);
+    });
+    document.getElementById("btn-tx-font-up")?.addEventListener("click", () => {
+      const cur = parseFloat(getComputedStyle(document.documentElement)
+        .getPropertyValue("--watch-transcript-fz")) || 12.5;
+      _applyTxFontSize(cur + 1);
+    });
+
+    // .txt request: drag-resize splitter between video and transcript
+    // panels in the Watch view. Persisted via settings.transcript_pane_width
+    // so the chosen width survives restart.
+    const _txWidthKey = "ytarchiver_tx_pane_width";
+    const _TX_WIDTH_MIN = 240;
+    const _TX_WIDTH_MAX = 1400;
+    function _applyTxWidth(px) {
+      const v = Math.max(_TX_WIDTH_MIN,
+        Math.min(_TX_WIDTH_MAX, parseInt(px, 10) || 420));
+      document.documentElement.style.setProperty(
+        "--watch-tx-width", v + "px");
+      try { localStorage.setItem(_txWidthKey, String(v)); } catch {}
+    }
+    function _persistTxWidth(px) {
+      const _api = window.pywebview?.api;
+      if (_api?.settings_save) {
+        try { _api.settings_save({ transcript_pane_width: parseInt(px, 10) }); }
+        catch {}
+      }
+    }
+    try {
+      const _stored = parseInt(localStorage.getItem(_txWidthKey) || "", 10);
+      if (Number.isFinite(_stored) && _stored > 0) _applyTxWidth(_stored);
+    } catch {}
+    (async () => {
+      try {
+        const s = await window.pywebview?.api?.settings_load?.();
+        const v = parseInt(s?.transcript_pane_width, 10);
+        if (Number.isFinite(v) && v > 0) _applyTxWidth(v);
+      } catch {}
+    })();
+    const _splitter = document.getElementById("watch-splitter");
+    if (_splitter) {
+      let _dragStart = null;  // {x, startWidth, layout}
+      _splitter.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        const layout = _splitter.parentElement;
+        if (!layout) return;
+        const cur = parseFloat(getComputedStyle(document.documentElement)
+          .getPropertyValue("--watch-tx-width")) || 420;
+        _dragStart = { x: e.clientX, startWidth: cur, layout };
+        _splitter.classList.add("dragging");
+        document.body.style.cursor = "col-resize";
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (!_dragStart) return;
+        // Dragging RIGHT shrinks the transcript pane (it's on the right),
+        // dragging LEFT grows it. So: newWidth = startWidth - delta.
+        const delta = e.clientX - _dragStart.x;
+        const newWidth = _dragStart.startWidth - delta;
+        _applyTxWidth(newWidth);
+      });
+      window.addEventListener("mouseup", () => {
+        if (!_dragStart) return;
+        _dragStart = null;
+        _splitter.classList.remove("dragging");
+        document.body.style.cursor = "";
+        // Persist on drop, not on every move — avoids hammering disk
+        // with config writes during the drag.
+        const cur = parseInt(getComputedStyle(document.documentElement)
+          .getPropertyValue("--watch-tx-width"), 10);
+        if (Number.isFinite(cur) && cur > 0) _persistTxWidth(cur);
+      });
+    }
+
     document.getElementById("btn-watch-retranscribe")?.addEventListener("click", async () => {
       const v = _browseState.currentVideo;
       const api = window.pywebview?.api;
+      const btn = document.getElementById("btn-watch-retranscribe");
       if (!api?.transcribe_retranscribe || !v?.filepath) {
         window._showToast?.("No file loaded.", "warn");
         return;
@@ -6769,10 +7906,43 @@
       if (res?.ok) {
         window._showToast?.(
           `Queued ${model} re-transcription.`, "ok");
+        // .txt request: visible "Re-transcribing…" status in the
+        // Watch view while the job runs. Updates as the Whisper
+        // worker emits whisper_progress lines (parsed below in
+        // _wireRetranscribeProgress). Clears when
+        // _onRetranscribeComplete fires.
+        if (btn) {
+          btn.dataset.busy = "1";
+          btn.disabled = true;
+          btn.textContent = "Re-transcribing… 0%";
+          window._retranscribeWatchVideoId = v.video_id || "";
+        }
       } else {
         window._showToast?.(res?.error || "Re-transcribe failed.", "error");
       }
     });
+
+    // .txt request: parse whisper_progress log lines for the
+    // currently-watched video and reflect the percentage onto the
+    // Re-transcribe button. The log batch already arrives via
+    // logs.js's payload handler — we tap a window event there and
+    // skim text for "Transcribing … NN%". Cleared in
+    // _onRetranscribeComplete (defined in logs.js) which restores
+    // the button label.
+    window._retranscribeWatchUpdateProgress = function (pct) {
+      const btn = document.getElementById("btn-watch-retranscribe");
+      if (!btn || btn.dataset.busy !== "1") return;
+      const p = Math.max(0, Math.min(99, parseInt(pct, 10) || 0));
+      btn.textContent = `Re-transcribing… ${p}%`;
+    };
+    window._retranscribeWatchClear = function () {
+      const btn = document.getElementById("btn-watch-retranscribe");
+      if (!btn) return;
+      btn.dataset.busy = "";
+      btn.disabled = false;
+      btn.textContent = "Re-transcribe…";
+      window._retranscribeWatchVideoId = "";
+    };
 
     document.getElementById("btn-bookmark-now")?.addEventListener("click", async () => {
       const vEl = document.getElementById("watch-video");
@@ -6781,12 +7951,22 @@
         window._showToast?.("Native mode required.", "warn");
         return;
       }
-      const t = vEl ? vEl.currentTime : 0;
-      // Find current transcript text
-      const segs = document.querySelectorAll("#watch-transcript .seg");
+      // Issue #164: ask whether this is a timestamped bookmark or a
+      // whole-video bookmark (favorites-style). Replaces the old
+      // note-prompt flow — no notes field anymore.
+      const kind = await (window._askBookmarkKind?.());
+      if (!kind) return;
+      let t = -1;            // -1 sentinel = whole-video bookmark
       let text = "";
-      for (const s of segs) {
-        if (s.classList.contains("active")) { text = s.textContent; break; }
+      if (kind === "yes") {
+        t = vEl ? vEl.currentTime : 0;
+        const segs = document.querySelectorAll("#watch-transcript .seg");
+        for (const s of segs) {
+          if (s.classList.contains("active")) {
+            text = s.textContent;
+            break;
+          }
+        }
       }
       const res = await window.pywebview.api.bookmark_add({
         video_id: v.video_id || "",
@@ -6794,12 +7974,14 @@
         channel: v.channel || "",
         start_time: t,
         text: text.slice(0, 200),
+        note: "",
       });
       if (res?.ok) {
-        window._showToast?.("Bookmarked @ " + _formatTs(t), "ok");
-        // audit SV-4: if a Bookmarks panel is already rendered
-        // elsewhere in the UI, nudge it to refresh so the new
-        // bookmark shows up without a manual reload.
+        window._showToast?.(
+          kind === "yes"
+            ? "Bookmarked @ " + _formatTs(t)
+            : "Video bookmarked.",
+          "ok");
         try {
           if (typeof window.refreshBookmarks === "function") {
             window.refreshBookmarks();
@@ -7043,8 +8225,12 @@
           // actually drains. Using sync_start_all (not queue_resume)
           // because queue_resume alone just clears flags — without a
           // live thread, the queue would stay frozen.
+          // CRITICAL: pass `false` for add_downloads_from_config so
+          // we DON'T enqueue a full Sync Subbed pass on resume. The
+          // user's intent is "drain what's queued", not "start a
+          // brand new sync of every subscribed channel".
           if (typeof api.sync_start_all === "function") {
-            const res = await api.sync_start_all();
+            const res = await api.sync_start_all(false);
             if (res?.ok) {
               window._showToast?.("Resumed \u2014 starting queue.", "ok");
             } else {
@@ -7076,11 +8262,40 @@
       const st = await api.queue_is_paused();
       if (st?.sync) {
         if (!threadAlive && s.count > 0 && typeof api.sync_start_all === "function") {
-          const res = await api.sync_start_all();
-          window._showToast?.(res?.ok
-            ? "Sync resumed \u2014 starting queue."
-            : (res?.error || "Resume failed."),
-            res?.ok ? "ok" : "error");
+          // Issue #162: before firing sync_start_all (which runs a
+          // regular Sync Subbed pass), check whether the queue has
+          // any redownload tasks left over from a previous run that
+          // didn't drain. Those need the redownload chain worker,
+          // not the sync worker \u2014 otherwise resume turns into "do a
+          // full sync of every channel" and the redownload state on
+          // disk is silently ignored.
+          let routedRedownload = false;
+          try {
+            const snap = window._queueStateSnapshot?.();
+            const hasRedwnl = (snap?.sync || []).some(
+              t => (t?.kind || "").toLowerCase() === "redownload");
+            if (hasRedwnl && api.resume_pending_redownloads) {
+              const rr = await api.resume_pending_redownloads();
+              if (rr?.ok && rr.resumed > 0) {
+                routedRedownload = true;
+                window._showToast?.(
+                  `Resumed ${rr.resumed} redownload(s).`, "ok");
+              }
+            }
+          } catch (e) {
+            console.error("resume_pending_redownloads:", e);
+          }
+          if (!routedRedownload) {
+            // Pass false so resume only drains the existing queue \u2014
+            // does NOT enqueue a fresh Sync Subbed pass for every
+            // subscribed channel (which is what `sync_start_all()`
+            // with default `true` does).
+            const res = await api.sync_start_all(false);
+            window._showToast?.(res?.ok
+              ? "Sync resumed \u2014 starting queue."
+              : (res?.error || "Resume failed."),
+              res?.ok ? "ok" : "error");
+          }
         } else {
           await api.queue_resume("sync");
           window._showToast?.("Sync resumed.", "ok");
@@ -7093,16 +8308,41 @@
     document.getElementById("btn-cancel-sync-queue")?.addEventListener("click", async () => {
       const api = window.pywebview?.api;
       if (!api) return;
+      // If the sync queue is already paused, "Pause" and "Stop now"
+      // are useless options (nothing's actively running to kill or
+      // pause). Show only Clear + Never mind. The opposite case
+      // (queue is running) gets the full Pause / Clear / Stop now
+      // trio.
+      const _isPaused = !!(_blinkState && _blinkState.sync
+                           && _blinkState.sync.paused);
+      // Visual hierarchy on the action row (running-state):
+      //   Pause = primary green (safe, fully reversible)
+      //   Clear = ghost gray (intermediate — empties queue but current
+      //                       job is allowed to finish)
+      //   Stop now = danger red (kill subprocesses)
+      // Without `kind: "ghost"` on Clear, both Pause and Clear default
+      // to primary and render as two identical greens. Same visual
+      // collision Scott flagged on the paused-state dialog.
+      const _buttons = _isPaused
+        ? [{ label: "Clear queue", value: "clear", kind: "danger" }]
+        : [
+            { label: "Pause", value: "pause", kind: "primary" },
+            { label: "Clear (finish current)", value: "clear", kind: "ghost" },
+            { label: "Stop now", value: "stop", kind: "danger" },
+          ];
+      const _message = _isPaused
+        ? "Queue is paused. Clear empties it; Never mind leaves it as-is so you can Resume later."
+        : ("Pause: keeps the queue, resumes where it stopped.\n"
+           + "Clear: empties the queue, current channel finishes "
+           + "gracefully (can take minutes if mid yt-dlp fetch).\n"
+           + "Stop now: kills yt-dlp/ffmpeg subprocesses immediately. "
+           + "Use when Clear is taking too long.");
       const choice = await (window.askChoice
         ? askChoice({
-            title: "Stop the sync pass?",
-            message: "Pause keeps the queue. Clear Queue empties it — the " +
-                     "current channel finishes either way.",
-            buttons: [
-              { label: "Pause", value: "pause", kind: "primary" },
-              { label: "Clear Queue", value: "clear", kind: "danger" },
-            ],
-            cancel: "Cancel",
+            title: _isPaused ? "Clear the sync queue?" : "Stop the sync pass?",
+            message: _message,
+            buttons: _buttons,
+            cancel: "Never mind",
             cancelPlacement: "right",
           })
         : Promise.resolve(confirm("Clear the sync queue?") ? "clear" : null));
@@ -7112,6 +8352,13 @@
         window._showToast?.(
           n > 0 ? `Sync queue cleared (${n} pending).`
                 : "Sync cancel requested.", "warn");
+      } else if (choice === "stop") {
+        const res = await api.sync_force_stop?.();
+        const n = res?.removed || 0;
+        const k = res?.killed || 0;
+        window._showToast?.(
+          `Stopped — cleared ${n} queued, killed ${k} subprocess(es).`,
+          "warn");
       } else if (choice === "pause") {
         await api.queue_pause?.("sync");
         window._showToast?.("Sync paused \u2014 finishing current channel.", "warn");
@@ -7615,6 +8862,26 @@
         if (rvList) rvList.checked = (rvMode === "list");
         if (rvGrid) rvGrid.checked = (rvMode === "grid");
         window._applyRecentViewMode?.(rvMode);
+        // X-button behavior — "ask" | "tray" | "quit". Default "ask"
+        // so a user who never opens Settings still gets the modal.
+        const cbEl = document.getElementById("settings-close-behavior");
+        if (cbEl) {
+          const cb = (s.close_behavior || "ask").toLowerCase();
+          cbEl.value = ["ask","tray","quit"].includes(cb) ? cb : "ask";
+        }
+        // BUG FIX (2026-05-14): the custom `.yt-dd` widget mirrors a
+        // hidden <select> via its own div trigger. When JS sets
+        // sel.value programmatically there's no change event, so the
+        // visible trigger label stays stuck at whatever was selected
+        // at DOM-ready (the HTML default — `<option selected>`). User
+        // saw "Ask each time" forever even with close_behavior=quit in
+        // config. Fix: explicitly call each select's `_ytddRepaint`
+        // after settings_load completes. Belt-and-suspenders: also
+        // dispatch `change` so any listeners reacting to live selection
+        // changes also fire (matches a user clicking the option).
+        document.querySelectorAll(".settings-view .ctl-select").forEach((sel) => {
+          if (sel._ytddRepaint) sel._ytddRepaint();
+        });
         _updatePreloadHints();
         const vEl = document.getElementById("settings-ytdlp-version");
         if (vEl) vEl.textContent = "checking\u2026";
@@ -7684,6 +8951,83 @@
       if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
       else window._showToast?.(res?.error || "Refresh failed.", "error");
     });
+
+    // "Realign misplaced thumbnails" — survey + (optionally) move
+    // thumbs that ended up in a different year folder than the mp4
+    // they belong to. Always shows a dry-run preview first; the
+    // actual move only runs after explicit confirmation.
+    (function wireThumbRealign() {
+      const btn = document.getElementById("btn-thumb-realign");
+      if (!btn || btn._wired) return;
+      btn._wired = true;
+      btn.addEventListener("click", async () => {
+        const api = window.pywebview?.api;
+        if (!api?.realign_misplaced_thumbnails) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = "Scanning…";
+        let preview;
+        try {
+          preview = await api.realign_misplaced_thumbnails(true);
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+          btn.disabled = false; btn.textContent = orig;
+          return;
+        }
+        btn.disabled = false; btn.textContent = orig;
+        if (!preview?.ok) {
+          window._showToast?.(preview?.error || "Scan failed.", "error");
+          return;
+        }
+        const n = preview.misaligned || 0;
+        const dups = preview.skipped_dest_exists || 0;
+        const chans = Object.keys(preview.per_channel || {}).length;
+        if (n === 0) {
+          window._showToast?.(
+            `All thumbnails aligned (${preview.aligned.toLocaleString()} checked). Nothing to do.`,
+            "ok");
+          return;
+        }
+        const top = Object.entries(preview.per_channel || {})
+          .sort((a,b) => (b[1].misaligned||0) - (a[1].misaligned||0))
+          .slice(0, 8)
+          .map(([name, d]) => `  • ${name}: ${d.misaligned}`).join("\n");
+        const msg = `Found ${n.toLocaleString()} misplaced thumbnail(s) across ${chans} channel(s).\n\n`
+          + `Top offenders:\n${top}\n\n`
+          + `Each thumbnail will be moved next to its mp4 via same-volume rename. `
+          + (dups > 0
+              ? `${dups} thumbnail(s) have a duplicate already at the target folder — those will be SKIPPED (left in place, the existing one wins).\n\n`
+              : "")
+          + `Proceed?`;
+        const go = await window.askChoice({
+          title: "Realign misplaced thumbnails",
+          message: msg,
+          choices: [{ label: `Move ${n.toLocaleString()} thumbnail(s)`, value: "go", kind: "primary" }],
+        });
+        if (!go) return;
+        btn.disabled = true; btn.textContent = "Moving…";
+        try {
+          const res = await api.realign_misplaced_thumbnails(false);
+          if (!res?.ok) {
+            window._showToast?.(res?.error || "Move failed.", "error");
+          } else {
+            window._showToast?.(
+              `Moved ${res.moved.toLocaleString()} thumbnail(s) `
+              + `across ${Object.keys(res.per_channel || {}).length} channel(s). `
+              + (res.skipped_dest_exists > 0
+                 ? `${res.skipped_dest_exists} skipped (duplicate already at target).`
+                 : ""),
+              "ok");
+          }
+        } catch (err) {
+          window._showToast?.(String(err), "error");
+        } finally {
+          btn.disabled = false; btn.textContent = orig;
+        }
+      });
+    })();
 
     // feature F8: "Compress dry-run" — open the results modal and
     // render per-channel + grand-total projected savings at each
@@ -7825,14 +9169,23 @@
           return;
         }
         const names = channels.map(c => c.name || c.folder || "").filter(Boolean);
-        const pick = window.prompt(
-          "Type the channel name to reset sync state for (case-insensitive)"
-          + " \n\nClears: initialized, sync_complete, init_complete,"
-          + " batch_resume_index, init_batch_after, last_sync."
-          + "\nThe next sync will bootstrap the channel from scratch."
-          + "\n\nChannels:\n" + names.slice(0, 60).join(", ")
-          + (names.length > 60 ? ` ... (+${names.length-60} more)` : ""),
-          "");
+        // UI audit #1: replaced native window.prompt/confirm with
+        // the styled askTextInput + askQuestion modals so this flow
+        // doesn't jarringly fall back to the OS dialog look.
+        const head = "Clears: initialized, sync_complete, init_complete, "
+          + "batch_resume_index, init_batch_after, last_sync.\n"
+          + "The next sync will bootstrap the channel from scratch.\n\n"
+          + "Channels: " + names.slice(0, 60).join(", ")
+          + (names.length > 60 ? ` … (+${names.length-60} more)` : "");
+        const pick = await (window.askTextInput
+          ? window.askTextInput({
+              title: "Reset channel sync state",
+              message: head,
+              placeholder: "Channel name (case-insensitive)",
+              confirm: "Continue",
+              cancel: "Cancel",
+            })
+          : Promise.resolve(null));
         if (!pick || !pick.trim()) return;
         const want = pick.trim().toLowerCase();
         const ch = channels.find(c => (c.name || c.folder || "").toLowerCase() === want);
@@ -7840,11 +9193,19 @@
           window._showToast?.(`No channel matched "${pick}".`, "warn");
           return;
         }
-        if (!window.confirm(`Reset sync state for "${ch.name || ch.folder}"?`
-                            + `\n\nThis does NOT delete any videos or config`
-                            + ` — it only clears the flags that gate the`
-                            + ` fast-path so the next sync walks the whole`
-                            + ` channel again.`)) return;
+        const ok = await (window.askQuestion
+          ? window.askQuestion({
+              title: "Reset sync state",
+              message: `Reset sync state for "${ch.name || ch.folder}"?\n\n`
+                + "This does NOT delete any videos or config — it only "
+                + "clears the flags that gate the fast-path so the next "
+                + "sync walks the whole channel again.",
+              confirm: "Reset",
+              cancel: "Cancel",
+              danger: true,
+            })
+          : Promise.resolve(false));
+        if (!ok) return;
         try {
           const res = await api.subs_reset_sync_state({
             url: ch.url, folder: ch.folder, name: ch.name,
@@ -7897,7 +9258,14 @@
             const opt = document.createElement("option");
             opt.value = JSON.stringify({ name: ch.name || "",
                                           folder: ch.folder || "" });
-            opt.textContent = ch.name || ch.folder || "(unnamed)";
+            // Fall back to a clearer hint than "(unnamed)" — that
+            // text was confusing when it appeared as the FIRST item
+            // in the dropdown (looked like a placeholder for "pick
+            // a channel"). Real cases with neither name nor folder
+            // are rare; on those the fallback reads as a problem
+            // to fix, which is what we want.
+            opt.textContent = ch.name || ch.folder
+              || "(channel name missing — check config)";
             chanSel.appendChild(opt);
           }
           if (!sorted.length) {
@@ -8122,6 +9490,10 @@
           !!document.getElementById("settings-show-avg-size")?.checked,
         recent_view_mode:
           document.getElementById("settings-recent-view-grid")?.checked ? "grid" : "list",
+        // X-button: "ask" (modal) | "tray" (minimize) | "quit" (exit).
+        // Validated server-side in main.py:5618.
+        close_behavior:
+          document.getElementById("settings-close-behavior")?.value || "ask",
       };
       // Bug [68]: disable Save during in-flight call so a fast double-
       // click doesn't queue duplicate writes.
@@ -8344,17 +9716,26 @@
       }
       try {
         const info = await api.about_info();
-        body.innerHTML = `
-          <div style="line-height:1.6;">
-            <div><strong>${escapeHtml(info.app_name)}</strong> <span style="color:var(--c-dim)">${escapeHtml(info.app_version)}</span></div>
-            <div style="margin-top:10px;color:var(--c-dim);font-size:11.5px;">
-              <div>Channels subscribed: ${info.channels ?? "\u2014"}</div>
-              <div>yt-dlp: ${escapeHtml(info.ytdlp_version || "\u2014")}</div>
-              <div>Python: ${escapeHtml(info.python_version || "\u2014")}</div>
-              <div style="margin-top:8px;">Config: <code style="font-size:11px;">${escapeHtml(info.config_path)}</code></div>
-              <div>Archive root: <code style="font-size:11px;">${escapeHtml(info.output_dir || "\u2014")}</code></div>
-            </div>
-          </div>`;
+        // UI audit fix: parent .askq-body sets `white-space: pre-wrap`
+        // (so plain text askQuestion messages render with line breaks).
+        // For this rich HTML About content that creates double-spacing
+        // around every <div>. Override to `normal` and emit the markup
+        // without inter-element whitespace. Result: rows sit at the
+        // natural 1.5 line-height instead of ~2.5.
+        body.innerHTML = (
+          `<div style="line-height:1.45;white-space:normal;">`
+            + `<div><strong>${escapeHtml(info.app_name)}</strong> `
+            + `<span style="color:var(--c-dim)">${escapeHtml(info.app_version)}</span></div>`
+            + `<div style="margin-top:10px;color:var(--c-dim);font-size:11.5px;">`
+              + `<div>Channels subscribed: ${info.channels ?? "\u2014"}</div>`
+              + `<div>yt-dlp: ${escapeHtml(info.ytdlp_version || "\u2014")}</div>`
+              + `<div>Python: ${escapeHtml(info.python_version || "\u2014")}</div>`
+              + `<div style="margin-top:8px;">Config: `
+                + `<code style="font-size:11px;">${escapeHtml(info.config_path)}</code></div>`
+              + `<div>Archive root: `
+                + `<code style="font-size:11px;">${escapeHtml(info.output_dir || "\u2014")}</code></div>`
+            + `</div>`
+          + `</div>`);
       } catch (e) { body.textContent = "Error loading: " + e; }
     };
     const hide = () => { bd.style.display = "none"; };
@@ -8902,14 +10283,22 @@
     document.addEventListener("mouseover", (e) => {
       const el = e.target.closest("[title], [data-tooltip]");
       if (!el || el === currentEl) return;
-      // Move `title` to `data-tooltip` so the browser doesn't show its own.
-      let text = el.getAttribute("data-tooltip");
-      if (!text) {
-        text = el.getAttribute("title") || "";
-        if (!text) return;
-        el.setAttribute("data-tooltip", text);
+      // ALWAYS migrate any current `title` to `data-tooltip`. Earlier
+      // versions only migrated on first hover, but elements whose
+      // tooltip text changes dynamically (blink ticks rewriting
+      // pauseBtn.title every 700ms) re-added the title without going
+      // through the migration. Result: both the native browser
+      // tooltip AND our custom bubble showed at the same time —
+      // double popup. Migrating on every mouseover is cheap (a couple
+      // attribute reads + one write) and guarantees the browser
+      // tooltip never has a chance to fire.
+      const titleAttr = el.getAttribute("title");
+      if (titleAttr) {
+        el.setAttribute("data-tooltip", titleAttr);
         el.removeAttribute("title");
       }
+      const text = el.getAttribute("data-tooltip") || "";
+      if (!text) return;
       hide();
       currentEl = el;
       timer = setTimeout(() => {
@@ -9071,8 +10460,12 @@
       if (total > 0) {
         qpCount.hidden = false;
         qpCount.textContent = String(total);
+        if (qpBtn) qpBtn.hidden = false;
       } else {
         qpCount.hidden = true;
+        // Hide the whole button when nothing's pending — no point in
+        // showing a "Queue Pending" affordance with zero work to do.
+        if (qpBtn) qpBtn.hidden = true;
       }
     };
     // Refresh whenever subs render. Hook via a MutationObserver on the

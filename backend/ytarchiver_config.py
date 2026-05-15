@@ -378,16 +378,18 @@ def save_config(cfg: Dict[str, Any]) -> bool:
         return False
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        # audit SM-8: trim autorun_history on save so the config
-        # file can't grow unbounded across years of use. UI only
-        # shows the last 100 entries; keep 500 on-disk for some
-        # scroll headroom + recovery buffer. Trimming in-place on
-        # the passed dict is fine — the UI uses a fresh read of the
-        # last 100 slice per render, so in-memory state stays consistent.
+        # audit SM-8 + UI audit 2026-05-14: trim autorun_history on
+        # save so the config file can't grow unbounded across years.
+        # UI shows the last 10,000 entries; on-disk cap matches so
+        # nothing is silently dropped. For Scott's 105-channel /
+        # 2-hour autosync workload that's a couple months of scroll
+        # history at ~150 entries/day. JSON entry is ~250 bytes →
+        # ~2.5 MB worst-case in config.json. Trimming in-place on the
+        # passed dict is fine — the UI uses a fresh read per render.
         try:
             _hist = cfg.get("autorun_history")
-            if isinstance(_hist, list) and len(_hist) > 500:
-                cfg["autorun_history"] = _hist[-500:]
+            if isinstance(_hist, list) and len(_hist) > 10000:
+                cfg["autorun_history"] = _hist[-10000:]
         except Exception:
             pass
         with _config_lock:
@@ -680,8 +682,21 @@ def recent_for_ui(cfg: Dict[str, Any]):
     # guarantees the newest 200 are always shown regardless of
     # insertion order.
     _all_recent = cfg.get("recent_downloads", []) or []
+    # .txt issue: if a channel was deleted from Subs (files removed too),
+    # its videos kept showing up in Browse > Recent and yielded "file
+    # not found" on click. Filter out entries whose file is missing on
+    # disk so the Recent list reflects what actually exists.
+    def _file_exists_for(entry):
+        fp = entry.get("filepath", "") or ""
+        if not fp:
+            return True  # legacy entries without filepath — keep
+        try:
+            return os.path.isfile(fp)
+        except Exception:
+            return True
+    _existing_recent = [r for r in _all_recent if _file_exists_for(r)]
     _sorted_recent = sorted(
-        _all_recent,
+        _existing_recent,
         key=lambda r: (r.get("download_ts") or 0),
         reverse=True,
     )[:200]
@@ -772,7 +787,9 @@ def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
     the body on bullet-dots into primary/secondary/errors/took.
     """
     import re
-    entries = cfg.get("autorun_history", [])[-100:]
+    # Was [-100:]; bumped to match the on-disk cap so the UI can show
+    # the full scroll-back instead of a tiny one-day window.
+    entries = cfg.get("autorun_history", [])[-10000:]
     out = []
     alt = False
     for entry in entries:

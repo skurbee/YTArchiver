@@ -808,7 +808,8 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
 def _try_auto_captions(video_path: str, title: str, channel: str,
                         stream: LogStreamer,
                         punct_mgr=None,
-                        job_tag: str = "") -> bool:
+                        job_tag: str = "",
+                        video_id_hint: str = "") -> bool:
     """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
     into the aggregated channel Transcript.txt + hidden JSONL sidecar,
     then ingest into FTS — skip Whisper entirely.
@@ -889,14 +890,16 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     except OSError:
         pass
 
-    # Extract video id — same two-step fallback as _write_outputs: try the
-    # filename suffix first, then fall back to the FTS DB lookup for
-    # OLD-compat drop-in filenames (no `[id]` suffix).
-    vid_id = ""
-    m = re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$", os.path.splitext(os.path.basename(video_path))[0])
-    if m:
-        vid_id = m.group(1)
-    else:
+    # Extract video id — caller-supplied hint wins (sync passes the
+    # DLTRACK-derived id explicitly so it always matches the sync.py
+    # tx_done_<vid> placeholder; see issue #148). Then try the filename
+    # suffix, then the FTS DB lookup.
+    vid_id = (video_id_hint or "").strip()
+    if not vid_id:
+        m = re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$", os.path.splitext(os.path.basename(video_path))[0])
+        if m:
+            vid_id = m.group(1)
+    if not vid_id:
         try:
             from . import index as _idx
             conn = _idx._open()
@@ -1591,7 +1594,7 @@ class TranscribeManager:
 
         try:
             if not self._python311:
-                self._stream.emit_error("Whisper: Python 3.11 not found. Install from python.org.")
+                self._stream.emit_error("Transcription requires Python 3.11. Install it from python.org.")
                 return False
             m = model or self._model
             self._stream.emit_text(
@@ -1627,23 +1630,34 @@ class TranscribeManager:
             t.start()
             t.join(timeout=600) # 10 min for model download + load
             if t.is_alive():
-                self._stream.emit_error("Whisper timed out loading model.")
+                self._stream.emit_error("Transcription took too long to start.")
                 self._stop_subprocess()
                 return False
 
             line = ready_result[0]
             if not line:
-                self._stream.emit_error("Whisper did not send ready message.")
+                self._stream.emit_error("Transcription tool didn't respond. Try again.")
                 self._stop_subprocess()
                 return False
             try:
                 info = json.loads(line)
             except json.JSONDecodeError:
-                self._stream.emit_error(f"Whisper sent non-JSON: {line[:200]}")
+                # Keep raw `line` content but verbose-tag it so only
+                # Verbose-mode users see the gibberish. Simple-mode
+                # users get a cleaner one-liner.
+                self._stream.emit_error("Transcription tool sent unexpected data — try again.")
+                self._stream.emit([
+                    ["   — ", ["dim"]],
+                    [f"raw payload: {line[:200]}\n", ["dim"]],
+                ])
                 self._stop_subprocess()
                 return False
             if info.get("status") != "ready":
-                self._stream.emit_error(f"Whisper status: {info}")
+                self._stream.emit_error("Transcription tool failed to initialize.")
+                self._stream.emit([
+                    ["   — ", ["dim"]],
+                    [f"status: {info}\n", ["dim"]],
+                ])
                 self._stop_subprocess()
                 return False
 
@@ -2346,6 +2360,17 @@ class TranscribeManager:
         if job["cancel"].is_set():
             return
 
+        # Issue #141: if GPU Auto was unchecked AFTER this job was
+        # popped but BEFORE we started processing, re-park it at the
+        # front of the queue and bail. Without this guard the worker
+        # would keep firing auto-captions / Whisper for several
+        # already-popped jobs even though the user explicitly asked
+        # for queue-up behavior.
+        if not self._auto_enabled():
+            with self._jobs_lock:
+                self._jobs.insert(0, job)
+            return
+
         # Unique-per-job inplace kind. Every emit from this job's
         # lifecycle (Loading punctuation model, Adding punctuation,
         # Whisper progress ticks, final done line) carries this tag
@@ -2385,7 +2410,8 @@ class TranscribeManager:
                 _try_auto_captions(path, title, job.get("channel", ""),
                                    self._stream,
                                    punct_mgr=_punct_for_captions,
-                                   job_tag=job_tag)):
+                                   job_tag=job_tag,
+                                   video_id_hint=job.get("video_id", ""))):
             if job.get("cb"):
                 try:
                     job["cb"]({"auto_captions": True})
@@ -2508,7 +2534,7 @@ class TranscribeManager:
             except queue.Empty:
                 continue
             if line is None:
-                self._stream.emit_error("Whisper subprocess ended unexpectedly.")
+                self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
                 return
             try:
                 msg = json.loads(line.strip())
@@ -2532,7 +2558,7 @@ class TranscribeManager:
                 # and requeue this job at the front.
                 low = err.lower()
                 if ("cuda" in low and ("out of memory" in low or "oom" in low)) or "cublas" in low:
-                    self._stream.emit_error(f"Whisper CUDA error: {err}")
+                    self._stream.emit_error(f"Transcription ran out of GPU memory: {err}")
                     self._stream.emit_text(
                         " \u21A9 Falling back to CPU mode for this job.",
                         "simpleline_blue")
@@ -2552,7 +2578,7 @@ class TranscribeManager:
                         with self._jobs_lock:
                             self._jobs.insert(0, job)
                     return
-                self._stream.emit_error(f"Whisper error: {err}")
+                self._stream.emit_error(f"Transcription error: {err}")
                 return
 
         # Write output files + ingest into FTS index
@@ -2618,6 +2644,19 @@ class TranscribeManager:
             _elapsed = max(1, int(time.time() - _t_start))
             _time_str = (f"{_elapsed // 60}min {_elapsed % 60:02d}sec"
                           if _elapsed >= 60 else f"{_elapsed}sec")
+            # Issue #149: include the model name and realtime ratio so
+            # the done line reads "Transcription (Whisper small, took
+            # 55sec, 12.3x realtime)" instead of just "(took 55sec)".
+            _model_label = (self._model or "").strip()
+            _realtime_str = (f"{duration / _elapsed:.1f}x realtime"
+                             if _elapsed > 0 and duration > 0 else "")
+            _detail_parts = []
+            if _model_label:
+                _detail_parts.append(f"Whisper {_model_label}")
+            _detail_parts.append(f"took {_time_str}")
+            if _realtime_str:
+                _detail_parts.append(_realtime_str)
+            _detail_str = ", ".join(_detail_parts)
             _vid_for_marker = (job.get("video_id") or "").strip()
             _tx_tag = f"tx_done_{_vid_for_marker}" if _vid_for_marker else ""
             # _tx_tag FIRST in each tag list so logs.js `_inplaceKind`
@@ -2636,7 +2675,7 @@ class TranscribeManager:
                 [" ", _dim_tags],
                 ["\u2014 \u2713 ", _em_tags],
                 ["Transcription", _lbl_tags],
-                [f" (took {_time_str})\n", _dim_tags],
+                [f" ({_detail_str})\n", _dim_tags],
             ])
             if job.get("cb"):
                 try:
@@ -2886,7 +2925,7 @@ class TranscribeManager:
             except queue.Empty:
                 continue
             if line is None:
-                self._stream.emit_error("Whisper subprocess ended unexpectedly.")
+                self._stream.emit_error("Transcription stopped unexpectedly. Try again.")
                 return None
             try:
                 msg = json.loads(line.strip())

@@ -129,13 +129,25 @@ def compress_video(input_path: str, stream: LogStreamer,
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
-        stream.emit_error("Compress: ffmpeg not found.")
+        stream.emit_error("Video compression isn't available — the compression tool (ffmpeg) is missing.")
         return {"ok": False, "error": "ffmpeg missing"}
     if not os.path.isfile(input_path):
         return {"ok": False, "error": "input not found"}
 
     base, ext = os.path.splitext(input_path)
     temp_path = base + "_TEMP_COMPRESS" + ext
+
+    # Issue #146: per-file in-place marker so the "Encoding ...", every
+    # progress-bar update, and the final ✓ done line all REPLACE one
+    # another at the same scroll position. Without this the progress
+    # bar persisted next to the per-video block while the done line
+    # landed minutes later at log bottom, under unrelated channels.
+    # Hash the basename so any non-ascii / spaces / quotes are safe in
+    # the tag string (must match \w+ rules in logs.js _inplaceKind).
+    import hashlib as _hashlib
+    _marker_tag = "compress_done_" + _hashlib.md5(
+        os.path.basename(input_path).encode("utf-8", "replace")
+    ).hexdigest()[:12]
 
     # Determine bitrates
     mb_per_hr = get_bitrate(quality, output_res)
@@ -147,6 +159,13 @@ def compress_video(input_path: str, stream: LogStreamer,
     dur = get_video_duration(input_path, ffmpeg)
 
     orig_size = os.path.getsize(input_path)
+    # Probe the source codec too so the user can see why we're
+    # re-encoding (e.g. h264 \u2192 av1) and notice if we're wasting time
+    # re-encoding an already-av1 file. Verbose-only.
+    try:
+        src_codec = get_video_codec(input_path, ffmpeg)
+    except Exception:
+        src_codec = ""
 
     # Build ffmpeg command (matches YTArchiver.py:9488)
     cmd = [ffmpeg, "-y", "-i", input_path]
@@ -172,10 +191,53 @@ def compress_video(input_path: str, stream: LogStreamer,
     # simpleline_compress painter output (brackets/em-dashes colored,
     # body text default).
     stream.emit([
-        ["  \u2014 ", "simpleline_compress"],
-        ["Encoding ", "simpleline"],
-        [f'"{display}"', "encode_title"],
-        [f" \u2014 {quality} / {output_res}p\n", "dim"],
+        ["  \u2014 ", ["simpleline_compress", _marker_tag]],
+        ["Encoding ", ["simpleline", _marker_tag]],
+        [f'"{display}"', ["encode_title", _marker_tag]],
+        [f" \u2014 {quality} / {output_res}p\n", ["dim", _marker_tag]],
+    ])
+
+    # VERBOSE-ONLY diagnostics. All `dim`-tagged so Simple mode drops
+    # the whole line via `_line_is_verbose_only`. Per Scott's audit
+    # 2026-05-14: "verbose mode should be grossly oversaturated with
+    # information." Surface every input/decision/command so users
+    # debugging a bad encode can see exactly what ffmpeg was told.
+    _dur_str = (f"{int(dur//60):02d}:{int(dur%60):02d}"
+                if dur > 0 else "unknown")
+    _src_codec_str = src_codec or "unknown"
+    _full_path = input_path
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"source: {_full_path}\n", ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"probed: {_dur_str} duration, "
+         f"{orig_size:,} bytes ({orig_size/1024/1024:.1f} MB), "
+         f"codec={_src_codec_str}\n", ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"target: {mb_per_hr} MB/hr "
+         f"({target_total_kbps:.0f} kbps total = "
+         f"{video_kbps} kbps video + {audio_kbps} kbps audio)\n",
+         ["dim"]],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"encoder: av1_nvenc \u00b7 preset p6 \u00b7 multipass 2 \u00b7 "
+         f"rc vbr \u00b7 cq 32 \u00b7 maxrate {int(video_kbps * 1.5)}k\n",
+         ["dim"]],
+    ])
+    # Full ffmpeg command \u2014 single line, easy to copy-paste into a
+    # terminal for manual reproduction. Truncate at 600 chars in case
+    # the input path is absurdly long.
+    _cmd_str = " ".join(repr(c) if " " in c or '"' in c else c for c in cmd)
+    if len(_cmd_str) > 600:
+        _cmd_str = _cmd_str[:600] + "\u2026"
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"ffmpeg cmd: {_cmd_str}\n", ["dim"]],
     ])
 
     t0 = time.time()
@@ -185,7 +247,7 @@ def compress_video(input_path: str, stream: LogStreamer,
             startupinfo=_startupinfo, encoding="utf-8", errors="replace", bufsize=1,
         )
     except OSError as e:
-        stream.emit_error(f"ffmpeg launch failed: {e}")
+        stream.emit_error(f"Couldn't start video compression: {e}")
         return {"ok": False, "error": str(e)}
 
     last_pct = -1
@@ -219,10 +281,11 @@ def compress_video(input_path: str, stream: LogStreamer,
                 last_pct = pct
                 first_progress_emitted = True
                 stream.emit([
-                    [" ", None],
-                    ["\u2588" * (pct // 5), "encode_progress"],
-                    ["\u2591" * (20 - pct // 5), "dim"],
-                    [f" {pct}%", "encode_pct"], ["\n", None],
+                    [" ", [_marker_tag]],
+                    ["\u2588" * (pct // 5), ["encode_progress", _marker_tag]],
+                    ["\u2591" * (20 - pct // 5), ["dim", _marker_tag]],
+                    [f" {pct}%", ["encode_pct", _marker_tag]],
+                    ["\n", [_marker_tag]],
                 ])
                 if progress_cb:
                     try: progress_cb(pct)
@@ -251,9 +314,18 @@ def compress_video(input_path: str, stream: LogStreamer,
                 "reason": "ffmpeg_error"}
 
     if not os.path.isfile(temp_path):
-        stream.emit_error("Compress: output file was not created.")
+        stream.emit_error("Video compression didn't produce an output file.")
         return {"ok": False, "error": "no output"}
     new_size = os.path.getsize(temp_path)
+
+    # Verbose-only: announce that the subprocess returned ok and we're
+    # entering the safety-check phase. Helps the user follow the flow.
+    stream.emit([
+        ["    — ", ["dim"]],
+        [f"ffmpeg returncode=0, output written: "
+         f"{new_size:,} bytes ({new_size/1024/1024:.1f} MB)\n",
+         ["dim"]],
+    ])
 
     # audit C-2: ffprobe the temp file's duration and require it within
     # ~2% of the original. A partial/truncated encode that SOMEHOW
@@ -263,6 +335,12 @@ def compress_video(input_path: str, stream: LogStreamer,
     # destroying the tail.
     if dur > 0:
         new_dur = get_video_duration(temp_path, ffmpeg)
+        stream.emit([
+            ["    — ", ["dim"]],
+            [f"duration check: orig {dur:.1f}s vs new {new_dur:.1f}s "
+             f"(tolerance ±{max(3.0, dur * 0.02):.1f}s)\n",
+             ["dim"]],
+        ])
         # 2% tolerance, minimum 3 seconds absolute slack for very short clips.
         max_loss = max(3.0, dur * 0.02)
         if new_dur <= 0 or (dur - new_dur) > max_loss:
@@ -282,6 +360,11 @@ def compress_video(input_path: str, stream: LogStreamer,
     # "compressed" file wastes future re-compress runs and may
     # produce a larger-than-expected archive.
     new_codec = get_video_codec(temp_path, ffmpeg)
+    stream.emit([
+        ["    — ", ["dim"]],
+        [f"codec check: output codec = {new_codec or 'unknown'} "
+         f"(expected av1)\n", ["dim"]],
+    ])
     if new_codec and new_codec != "av1":
         stream.emit_error(
             f"Compressed output is {new_codec}, not av1 "
@@ -340,15 +423,16 @@ def compress_video(input_path: str, stream: LogStreamer,
                 pass
             return {"ok": False, "error": str(_replace_err)}
 
-    # Per-file done line. Green checkmark + white filename + dim size
-    # delta, with the saved-percent in compress color to match the
-    # classic painter emphasis (only the highlight bits colored).
+    # Per-file done line. Same _marker_tag as the progress bars so it
+    # REPLACES the bar in place (issue #146) instead of appending at
+    # log bottom after unrelated channels have scrolled past.
     stream.emit([
-        [" \u2713 ", "simpleline_green"],
-        [f"{display} ", "simpleline"],
-        [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ", "dim"],
-        [f"(\u2212{saved_pct:.0f}%)", "simpleline_compress"],
-        [f" in {took:.0f}s\n", "dim"],
+        [" \u2014 \u2713 ", ["simpleline_green", _marker_tag]],
+        ["Compressed ", ["simpleline", _marker_tag]],
+        [f"\u2014 {orig_size/1024/1024:.0f}MB \u2192 {new_size/1024/1024:.0f}MB ",
+         ["dim", _marker_tag]],
+        [f"(\u2212{saved_pct:.0f}%)", ["simpleline_compress", _marker_tag]],
+        [f" in {took:.0f}s\n", ["dim", _marker_tag]],
     ])
     return {"ok": True, "orig_bytes": orig_size, "new_bytes": new_size,
             "saved_pct": saved_pct, "took": took}

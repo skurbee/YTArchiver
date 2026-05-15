@@ -26,7 +26,7 @@ AUTORUN_OPTIONS = {
 }
 AUTORUN_LABELS = list(AUTORUN_OPTIONS.keys())
 
-AUTORUN_HISTORY_MAX = 100
+AUTORUN_HISTORY_MAX = 10000  # was 100. UI activity-log displays everything (audit 2026-05-14)
 
 
 class AutorunScheduler:

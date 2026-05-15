@@ -11,14 +11,15 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict
 
 
 # ── Version header — last updated 4.20.26 5:27pm ───────────────────────
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v58.1"
-APP_VERSION_DATE = "4.25.26 3:11am"
+APP_VERSION      = "v62.2"
+APP_VERSION_DATE = "5.15.26 12:10am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -555,6 +556,27 @@ class Api:
         cfg = self._config if self._config is not None else load_config()
         return recent_for_ui(cfg)
 
+    def clear_recent_downloads(self):
+        """Empty the recent_downloads list. Files on disk are untouched.
+
+        Wired to the Recent tab's "Clear list" button. The previous .txt
+        report noted the button did nothing — the API had been missing
+        since the pywebview port; the Tkinter version had its own
+        equivalent. Returns {ok: bool, error?: str}.
+        """
+        try:
+            from backend.ytarchiver_config import save_config as _sc
+            cfg = self._config if self._config is not None else load_config()
+            cfg["recent_downloads"] = []
+            ok = _sc(cfg)
+            if not ok:
+                return {"ok": False, "error": "Config write failed."}
+            try: self._reload_config()
+            except Exception: pass
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def _push_metadata_refresh(self):
         """Trigger a re-render of Settings > Metadata so the `XXm ago`
         timestamps update after a refresh pass completes. Without this,
@@ -655,6 +677,27 @@ class Api:
                 # Start/Pause button flips to the correct rendered state
                 # immediately. Sync path does this via sync_start_all
                 # (→ _on_queue_changed); GPU path was missing the push.
+                try: self._on_queue_changed()
+                except Exception: pass
+                try:
+                    self._log_stream.emit_text(
+                        " - GPU Auto enabled — queue will drain.",
+                        "simpleline_green")
+                except Exception:
+                    pass
+            elif kind == "gpu" and not enabled:
+                # Issue #141: emit an unambiguous log line when the user
+                # disables GPU Auto mid-sync so they understand the
+                # behavior — the in-flight transcription will complete,
+                # then new arrivals will sit in the queue until they
+                # re-enable Auto or click Start in the GPU Tasks popover.
+                try:
+                    self._log_stream.emit_text(
+                        " - GPU Auto disabled — incoming transcriptions "
+                        "will queue. (In-flight job finishes first.)",
+                        "simpleline_blue")
+                except Exception:
+                    pass
                 try: self._on_queue_changed()
                 except Exception: pass
             elif kind == "sync" and enabled:
@@ -1594,6 +1637,31 @@ class Api:
     def sync_is_running(self):
         return bool(self._sync_thread and self._sync_thread.is_alive())
 
+    def _maybe_autostart_sync(self):
+        """Auto-fire the sync worker after a queue-enqueue UI action.
+
+        Two gates:
+          1) Worker already alive → don't double-start (sync_start_all
+             would be harmless, but this skips the noise).
+          2) Queue is paused → respect the pause. Scott's UX rule:
+             "If queue is paused, enqueuing should add to the queue
+             but NOT start it." User has to resume manually.
+
+        Returns True if the worker was actually started, False otherwise.
+        Callers can include this flag in their JSON response so the JS
+        toast can say "Queued — click Resume to start" instead of the
+        default "Queued and started" wording.
+        """
+        try:
+            if self.sync_is_running():
+                return False
+            if bool(self._queues.sync_paused):
+                return False
+            self.sync_start_all(add_downloads_from_config=False)
+            return True
+        except Exception:
+            return False
+
     def sync_start_all(self, add_downloads_from_config=True):
         """Kick off the sync worker thread.
 
@@ -1727,6 +1795,35 @@ class Api:
                 except Exception: pass
                 self._log_stream.flush()
                 self._on_queue_changed()
+                # Issue #162: drain any pending redownloads that were
+                # queued WHILE this sync was running. chan_redownload
+                # appends to _redwnl_pending and returns immediately
+                # when sync is alive; the chain-worker only fires on
+                # the initial spawn. Without this hook, items sit
+                # there forever. Defer to after our finally returns
+                # so _sync_thread.is_alive() reads False when the
+                # chain worker is spawned.
+                def _maybe_drain_redwnl():
+                    try:
+                        with self._redwnl_lock:
+                            pending = list(self._redwnl_pending)
+                        if not pending:
+                            return
+                        # Fire the existing chain-worker entry point.
+                        # chan_redownload with an existing-pending
+                        # list spawns the worker if no sync is running.
+                        first = pending[0]
+                        ch = first.get("ch") or {}
+                        new_res = first.get("new_res") or "best"
+                        # Pop the head; chan_redownload re-appends.
+                        with self._redwnl_lock:
+                            if self._redwnl_pending:
+                                self._redwnl_pending.pop(0)
+                        self.chan_redownload(ch, new_res)
+                    except Exception:
+                        pass
+                try: threading.Timer(0.6, _maybe_drain_redwnl).start()
+                except Exception: pass
                 # Scheduled second push AFTER this thread's finally
                 # actually returns. Without this, _on_queue_changed
                 # runs while we're still inside _run, so
@@ -1773,6 +1870,88 @@ class Api:
         self._sync_cancel.set()
         self._on_queue_changed()
         return {"ok": True, "removed": removed}
+
+    def sync_force_stop(self):
+        """Hard stop: clear queue AND kill any in-flight child subprocesses.
+
+        Soft cancel (`sync_clear_queue`) sets the cancel event but the
+        worker only notices between subprocess output lines. yt-dlp's
+        flat-playlist call against a 10k-video channel can sit blocked
+        for 5-10 minutes on a single fetch with no output, so soft
+        cancel feels broken — the queue clears visually but you stare
+        at the running task forever.
+
+        This API also walks `psutil.Process(os.getpid()).children(recursive=True)`
+        and kills every yt-dlp / ffmpeg / ffprobe child. The worker
+        thread sees its subprocess died, returns from the call with
+        whatever partial output it got, checks `_sync_cancel` (set
+        below), and bails out of the task loop immediately.
+
+        Returns {ok, removed, killed} so the UI can toast a useful
+        message ("Stopped — 12 queued cleared, 3 subprocesses killed.").
+        """
+        removed = 0
+        try:
+            removed = self._queues.sync_clear()
+        except Exception:
+            pass
+        # Drain the redownload pending list too (same as sync_cancel
+        # does — without this a queued redownload chain would silently
+        # resume on the next loop iteration).
+        try:
+            self._redwnl_pending.clear()
+        except Exception:
+            pass
+        self._sync_cancel.set()
+        killed = 0
+        try:
+            import psutil
+            _names_to_kill = ("yt-dlp", "yt-dlp.exe",
+                              "ffmpeg", "ffmpeg.exe",
+                              "ffprobe", "ffprobe.exe")
+            _us = psutil.Process(os.getpid())
+            # recursive=True walks the whole descendant tree, so
+            # grandchildren spawned by yt-dlp itself also get cleaned up.
+            for _child in _us.children(recursive=True):
+                try:
+                    _nm = (_child.name() or "").lower()
+                except Exception:
+                    _nm = ""
+                if _nm not in _names_to_kill:
+                    continue
+                try:
+                    _child.kill()
+                    killed += 1
+                except Exception:
+                    pass
+            # Wait briefly so the worker thread can observe the dead
+            # subprocess and unwind before we report success.
+            try:
+                _gone, _alive = psutil.wait_procs(
+                    [c for c in _us.children(recursive=True)
+                     if (c.name() or "").lower() in _names_to_kill],
+                    timeout=1.5)
+                # Anything still alive after kill+wait is unusual but
+                # not fatal — log it and let the worker take care of it
+                # at its next subprocess.run boundary.
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self._log_stream.emit_error(
+                    f"force-stop: psutil walk failed: {e}")
+            except Exception:
+                pass
+        try:
+            self._log_stream.emit_text(
+                f" — Force-stop: cleared {removed} queued, "
+                f"killed {killed} subprocess(es).",
+                "simpleline_pink")
+            self._log_stream.flush()
+        except Exception:
+            pass
+        self._on_queue_changed()
+        return {"ok": True, "removed": removed, "killed": killed}
 
     def gpu_clear_queue(self):
         """Drop every queued GPU task. Current job (if any) is also
@@ -2263,8 +2442,24 @@ class Api:
                 if parent == cur or not parent:
                     break
                 cur = parent
+        # Issue #152: scan the WHOLE file and take the LAST matching
+        # header, not the first. Retranscribe appends a new header at
+        # the end of the file and removes the old one — but if title
+        # normalization differs between retranscribe (NFC + punct strip)
+        # and this classifier (lower only), the old header can survive
+        # and the classifier would return the stale "(YT_CAPTIONS_PUNCT)"
+        # source. Taking the LAST matching header in scan order is the
+        # safe play: the newest write always wins.
+        # Also use punctuation-insensitive title compare so the classifier
+        # matches even when titles drift in trailing "." between
+        # YouTube auto-caption metadata and Whisper retranscribe input.
+        import re as _re_cl
+        def _classify_norm(s):
+            v = (s or "").strip().lower()
+            return _re_cl.sub(r"[\.\?\!…]+$", "", v).strip()
+
         raw_tag = ""
-        norm_title = (title or "").strip().lower()
+        norm_title = _classify_norm(title)
         for d in search_dirs:
             try:
                 fns = [f for f in os.listdir(d)
@@ -2273,14 +2468,13 @@ class Api:
                 continue
             for fn in fns:
                 fp = os.path.join(d, fn)
+                _last_tag = ""
                 try:
                     with open(fp, "r", encoding="utf-8", errors="replace") as fh:
-                        # Scan header lines: ===(title), ..., (SOURCE)===
+                        # Scan ALL header lines, keep the last matching one.
                         for line in fh:
                             if not line.startswith("==="):
                                 continue
-                            # Extract last bracketed chunk before the closing ===
-                            # Format: "===({title}), {date}, {duration}, ({SOURCE})===\n"
                             body = line.strip().rstrip("=").lstrip("=").strip()
                             parts = [p.strip() for p in body.split(",")]
                             if not parts:
@@ -2290,17 +2484,16 @@ class Api:
                                 head_title = head_title[1:]
                             if head_title.endswith(")"):
                                 head_title = head_title[:-1]
-                            if head_title.strip().lower() != norm_title:
+                            if _classify_norm(head_title) != norm_title:
                                 continue
-                            # Got a matching header — last (...) is the source.
                             if len(parts) >= 2:
                                 tail = parts[-1].strip()
                                 if tail.startswith("(") and tail.endswith(")"):
-                                    raw_tag = tail[1:-1].strip()
-                            break
+                                    _last_tag = tail[1:-1].strip()
                 except OSError:
                     continue
-                if raw_tag:
+                if _last_tag:
+                    raw_tag = _last_tag
                     break
             if raw_tag:
                 break
@@ -2418,6 +2611,12 @@ class Api:
     def browse_search(self, query, channel=None, limit=200):
         """FTS5 search across all segments."""
         return index_backend.search_fts(query, channel=channel, limit=limit)
+
+    def browse_search_titles(self, query, limit=200):
+        """.txt request: global video search by title across every
+        channel. Returns hits sorted by upload date (newest first).
+        """
+        return index_backend.search_video_titles(query, limit=limit)
 
     def browse_graph(self, word, channel=None, bucket="month", normalize=False):
         """Word frequency over time for the Graph sub-mode.
@@ -3025,20 +3224,17 @@ class Api:
             f" \u2014 Queued metadata {label} for {ch_name} ({year_int}) "
             f"on Sync Tasks.", "simpleline_pink")
         self._log_stream.flush()
-        # Mirror metadata_queue_all's H-7 behavior: always auto-kick
-        # the worker when the user explicitly clicked the menu item
-        # (don't gate on autorun_sync — they asked for it by clicking).
-        try:
-            if not self.sync_is_running():
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
+        # Mirror metadata_queue_all's H-7 behavior — but the paused gate
+        # still applies (see _maybe_autostart_sync).
+        started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "year": year_int,
-                "refresh": bool(refresh)}
+                "refresh": bool(refresh),
+                "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
     # ─── Settings > Metadata tab: per-channel refresh status ─────────────
 
-    def get_channel_metadata_status(self):
+    def get_channel_metadata_status(self, force=False):
         """Return per-channel metadata refresh status for Settings > Metadata.
 
         Powers the table in settings-view-metadata (index.html:753). Each
@@ -3062,6 +3258,14 @@ class Api:
         import copy as _copy
         ch_copy = _copy.deepcopy(channels)
         try:
+            # When force=True, rescan disk for fresh n_vids/size before
+            # enriching. Otherwise enrich pulls from the cached disk
+            # scan (cheap and fast — same data shown across the app).
+            if force:
+                try:
+                    archive_scan.scan_all_channels()
+                except Exception:
+                    pass
             archive_scan.enrich_channels_with_stats(ch_copy)
         except Exception:
             pass
@@ -3081,7 +3285,7 @@ class Api:
             )
         except Exception:
             _cvids_bulk, _cvids = None, None
-        _id_lookup = _cvids_bulk(ch_copy) if _cvids_bulk else {}
+        _id_lookup = _cvids_bulk(ch_copy, force=bool(force)) if _cvids_bulk else {}
         _empty_ids = {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         rows = []
         for ch in ch_copy:
@@ -3107,6 +3311,13 @@ class Api:
                 # "K tried / Y not yet attempted" breakdown so the
                 # user knows when Fix IDs is worth re-running.
                 "id_tried_failed": _idstats.get("tried_failed", 0),
+                # Count of videos known to have been removed from
+                # YouTube since download (set by bulk_refresh_views_likes
+                # when a previously-known vid disappears from the
+                # flat-playlist response). Shown in the Metadata table
+                # so the user can tell a channel's "real" coverage
+                # vs total file count.
+                "removed_from_yt": _idstats.get("removed_from_yt", 0),
             })
         # Sort oldest-refresh-first by default so stale channels float up.
         # A missing timestamp (never refreshed) sorts as oldest (ts=0).
@@ -3153,16 +3364,14 @@ class Api:
             f" \u2014 Queued comments refresh{scope_str} for {queued} "
             f"channel(s) on Sync Tasks.", "simpleline_pink")
         self._log_stream.flush()
-        # Auto-kick the worker (H-7 pattern, same as metadata_queue_all).
-        try:
-            if not self.sync_is_running() and queued > 0:
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
+        # Auto-kick the worker \u2014 but only if the queue isn't paused.
+        # See _maybe_autostart_sync docstring.
+        started = self._maybe_autostart_sync() if queued > 0 else False
         return {"ok": True, "queued": queued, "channels": len(channels),
-                "only_recent_days": _d}
+                "only_recent_days": _d, "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
-    def metadata_backfill_ids_channel(self, identity):
+    def metadata_backfill_ids_channel(self, identity, mode="fast"):
         """Queue a one-shot video_id backfill for a single channel.
 
         Powers Settings > Metadata's per-row "Fix IDs" button. Lands
@@ -3170,25 +3379,29 @@ class Api:
         sees it in Sync Tasks and can pause / cancel like any other
         sync item. Backend dispatch routes to
         backend.metadata.backfill_video_ids.
+
+        `mode` is "fast" (default — flat-playlist catalog + duration
+        matching, ~30-60s) or "thorough" (also does per-video
+        upload_date fetch for unresolved-candidate vids, ~minutes-
+        to-hours). The JS-side picker prompts the user which to use.
         """
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
         task = dict(ch)
         task["kind"] = "videoid_backfill"
+        task["mode"] = "thorough" if mode == "thorough" else "fast"
         try:
             self._queues.sync_enqueue(task)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         self._on_queue_changed()
-        try:
-            if not self.sync_is_running():
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
-        return {"ok": True, "queued": True}
+        started = self._maybe_autostart_sync()
+        return {"ok": True, "queued": True, "started": started,
+                "paused": bool(self._queues.sync_paused),
+                "mode": task["mode"]}
 
-    def metadata_backfill_ids_all(self, only_missing=True):
+    def metadata_backfill_ids_all(self, only_missing=True, mode="fast"):
         """Queue a video_id backfill for every saved channel. Default
         `only_missing=True` skips channels whose DB already reports
         zero missing IDs — no point paying yt-dlp time for channels
@@ -3206,38 +3419,43 @@ class Api:
                           key=lambda c: (c.get("name") or "").lower())
         if not channels:
             return {"ok": False, "error": "No channels configured"}
-        try:
-            from backend.metadata import count_video_id_status as _cvids
-        except Exception:
-            _cvids = None
+        # Audit #4: use the BULK count path (single GROUP BY) instead of
+        # N per-channel COUNT queries. Previous loop did 100+ serialized
+        # queries on every click against a 9M-row table. The bulk path
+        # is keyed by lowercased channel name.
+        _bulk_status: Dict[str, Dict[str, Any]] = {}
+        if only_missing:
+            try:
+                from backend.metadata import count_video_id_status_bulk as _cvids_bulk
+                _bulk_status = _cvids_bulk(channels) or {}
+            except Exception:
+                _bulk_status = {}
         queued = 0
         skipped = 0
         for ch in channels:
-            if only_missing and _cvids:
-                try:
-                    st = _cvids(ch)
-                    if st.get("total", 0) > 0 and st.get("missing", 0) == 0:
-                        skipped += 1
-                        continue
-                except Exception:
-                    pass
+            if only_missing and _bulk_status:
+                _key = (ch.get("name") or ch.get("folder") or "").lower()
+                st = _bulk_status.get(_key) or {}
+                if st.get("total", 0) > 0 and st.get("missing", 0) == 0:
+                    skipped += 1
+                    continue
             try:
                 task = dict(ch)
                 task["kind"] = "videoid_backfill"
+                task["mode"] = "thorough" if mode == "thorough" else "fast"
                 if self._queues.sync_enqueue(task):
                     queued += 1
             except Exception as e:
                 self._log_stream.emit_error(
                     f"Backfill enqueue failed for {ch.get('name')}: {e}")
         self._on_queue_changed()
-        try:
-            if not self.sync_is_running() and queued > 0:
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
+        started = self._maybe_autostart_sync() if queued > 0 else False
         return {"ok": True, "queued": queued,
                 "skipped_up_to_date": skipped,
-                "channels": len(channels)}
+                "channels": len(channels),
+                "started": started,
+                "paused": bool(self._queues.sync_paused),
+                "mode": "thorough" if mode == "thorough" else "fast"}
 
     def metadata_refresh_views_channel(self, identity):
         """Per-channel views/likes refresh — no prompt, straight enqueue.
@@ -3265,12 +3483,9 @@ class Api:
         # emitted by sync.py already states the action, so an
         # earlier "Queued views/likes refresh for X on Sync Tasks."
         # just duplicated info one line above.
-        try:
-            if not self.sync_is_running():
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
-        return {"ok": True, "queued": True}
+        started = self._maybe_autostart_sync()
+        return {"ok": True, "queued": True, "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
     # ─── Refresh comments (separate per-channel action) ────────────────
 
@@ -3316,14 +3531,11 @@ class Api:
             f" \u2014 Queued comments refresh for {ch_name}{scope_str} "
             f"on Sync Tasks.", "simpleline_pink")
         self._log_stream.flush()
-        # Auto-kick the worker (same H-7 pattern as metadata_queue_all).
-        try:
-            if not self.sync_is_running():
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
+        started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True,
-                "only_recent_days": task.get("only_recent_days")}
+                "only_recent_days": task.get("only_recent_days"),
+                "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
     def metadata_queue_all(self, refresh=False):
         """Enqueue every saved channel as a `kind: "metadata"` sync
@@ -3362,15 +3574,13 @@ class Api:
         # clicked "Queue all metadata" / "Refresh views/likes" — the
         # old code gated this on `autorun_sync=True`, so users with
         # autorun off saw "Queued for N channels" and then nothing
-        # happened because the worker never started. Passing
-        # add_downloads_from_config=False means we only drain the
-        # already-queued metadata items, not trigger a full sync pass.
-        try:
-            if not self.sync_is_running() and queued > 0:
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
-        return {"ok": True, "queued": queued, "channels": len(channels)}
+        # happened because the worker never started. _maybe_autostart_sync
+        # ALSO respects the paused flag — if the user has the queue paused,
+        # we enqueue but don't auto-resume.
+        started = self._maybe_autostart_sync() if queued > 0 else False
+        return {"ok": True, "queued": queued, "channels": len(channels),
+                "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
     # ─── Transcript drift scan (feature H-2) ──────────────────────────
 
@@ -3453,13 +3663,10 @@ class Api:
                     "dim")
             self._log_stream.flush()
             # Kick the sync worker so retranscribe jobs drain (matches
-            # the H-7 pattern used in metadata_queue_*).
-            try:
-                if (a.get("retranscribe_queued", 0) > 0
-                        and not self.sync_is_running()):
-                    self.sync_start_all(add_downloads_from_config=False)
-            except Exception:
-                pass
+            # the H-7 pattern used in metadata_queue_*). Respects the
+            # paused flag — see _maybe_autostart_sync.
+            if a.get("retranscribe_queued", 0) > 0:
+                self._maybe_autostart_sync()
         return result
 
     # ─── Compress dry-run (feature F8) ─────────────────────────────────
@@ -3649,13 +3856,11 @@ class Api:
             except Exception as e:
                 failed.append({"name": n, "reason": str(e)})
         self._on_queue_changed()
-        # Auto-fire the worker (H-7 pattern — don't gate on autorun)
-        try:
-            if not self.sync_is_running() and queued > 0:
-                self.sync_start_all(add_downloads_from_config=False)
-        except Exception:
-            pass
-        return {"ok": True, "queued": queued, "failed": failed}
+        # Auto-fire the worker — gated on paused state.
+        started = self._maybe_autostart_sync() if queued > 0 else False
+        return {"ok": True, "queued": queued, "failed": failed,
+                "started": started,
+                "paused": bool(self._queues.sync_paused)}
 
     # ─── Channel context actions ───────────────────────────────────────
 
@@ -3698,6 +3903,132 @@ class Api:
         webbrowser.open(ch["url"])
         return {"ok": True}
 
+    def thumbnail_status_bulk(self, force=False):
+        """Issue #154: return {channel: {total, with_thumb, missing}}
+        for every subscribed channel. Drives the thumbnail % column
+        in Settings > Metadata.
+
+        Cached: subsequent calls return instantly when each channel's
+        folder fingerprint matches the persisted cache. Pass
+        `force=True` to ignore the cache and re-walk every channel
+        (wired to the "Force recheck thumbnails" button).
+        """
+        try:
+            from backend.metadata import count_thumbnail_status_bulk
+            cfg = self._config or load_config()
+            channels = cfg.get("channels", []) or []
+            return {"ok": True,
+                    "rows": count_thumbnail_status_bulk(
+                        channels, force=bool(force))}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "rows": {}}
+
+    def refetch_thumbnails(self, folder_or_name):
+        """Issue #154: spawn a background sweep that downloads any
+        missing thumbnails for one channel. Returns immediately; the
+        sweep result goes to the log.
+        """
+        name = folder_or_name if isinstance(folder_or_name, str) else (
+            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        ch = subs_backend.get_channel({"name": name})
+        if not ch:
+            return {"ok": False, "error": "Channel not found"}
+        def _run():
+            try:
+                from backend import metadata as _md
+                self._log_stream.emit_text(
+                    f" - Thumbnail refetch starting for {name}...",
+                    "simpleline")
+                res = _md.sweep_missing_thumbnails(ch, stream=self._log_stream)
+                self._log_stream.emit_text(
+                    f" - Thumbnail refetch for {name}: "
+                    f"{res.get('fetched', 0)} fetched, "
+                    f"{res.get('missing', 0)} still missing, "
+                    f"{res.get('checked', 0)} checked",
+                    "simpleline_green")
+            except Exception as _e:
+                self._log_stream.emit_error(
+                    f"Thumbnail refetch failed for {name}: {_e}")
+        threading.Thread(target=_run, daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def realign_misplaced_thumbnails(self, dry_run=True):
+        """Survey (and optionally move) thumbnails that ended up in the
+        wrong year/month folder. Same-volume os.replace so no copy/
+        delete cycle. Returns survey counts. `dry_run=True` (default)
+        just reports; pass False to actually move.
+        """
+        try:
+            from backend import metadata as _md
+            res = _md.realign_misplaced_thumbnails(
+                channels=(self._config or load_config() or {}).get("channels", []),
+                dry_run=bool(dry_run),
+                stream=self._log_stream if not dry_run else None)
+            return res
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def refetch_thumbnails_all(self):
+        """Run sweep_missing_thumbnails sequentially across every saved
+        channel. Single background thread (not the sync queue) so this
+        doesn't block scheduled syncs; thumbnails are a side-channel
+        cosmetic fetch, not a sync operation. Logs per-channel progress
+        + a final tally.
+
+        Returns immediately with `{ok, started, channels}` — the actual
+        work runs async; the user watches the log.
+        """
+        cfg = self._config or load_config()
+        channels = sorted(cfg.get("channels", []),
+                          key=lambda c: (c.get("name") or "").lower())
+        if not channels:
+            return {"ok": False, "error": "No channels configured"}
+        def _run():
+            try:
+                from backend import metadata as _md
+                total_fetched = total_missing = total_checked = 0
+                self._log_stream.emit_text(
+                    f" — Thumbnail refetch starting for "
+                    f"{len(channels)} channel(s)…",
+                    "simpleline_pink")
+                self._log_stream.flush()
+                for i, ch in enumerate(channels, 1):
+                    nm = ch.get("name") or ch.get("folder") or "?"
+                    try:
+                        self._log_stream.emit_text(
+                            f"  - [{i}/{len(channels)}] {nm}…",
+                            "simpleline")
+                        res = _md.sweep_missing_thumbnails(
+                            ch, stream=self._log_stream)
+                        total_fetched += int(res.get("fetched", 0) or 0)
+                        total_missing += int(res.get("missing", 0) or 0)
+                        total_checked += int(res.get("checked", 0) or 0)
+                        if res.get("fetched", 0) > 0 or res.get("missing", 0) > 0:
+                            self._log_stream.emit_text(
+                                f"    {res.get('fetched', 0)} fetched, "
+                                f"{res.get('missing', 0)} still missing, "
+                                f"{res.get('checked', 0)} checked",
+                                "simpleline_green")
+                    except Exception as _per_ch_e:
+                        self._log_stream.emit_error(
+                            f"Thumbnail refetch failed for {nm}: "
+                            f"{_per_ch_e}")
+                self._log_stream.emit_text(
+                    f" — Thumbnail refetch complete: "
+                    f"{total_fetched} fetched, "
+                    f"{total_missing} still missing, "
+                    f"{total_checked} checked across "
+                    f"{len(channels)} channel(s).",
+                    "simpleline_pink")
+                self._log_stream.flush()
+            except Exception as _e:
+                self._log_stream.emit_error(
+                    f"Bulk thumbnail refetch failed: {_e}")
+        threading.Thread(target=_run, daemon=True,
+                         name="thumb-refetch-all").start()
+        return {"ok": True, "started": True,
+                "channels": len(channels)}
+
     def channel_transcription_stats(self, folder_or_name):
         """Return {total, transcribed, pending, failed} counts for a channel
         from the FTS DB. Used by the edit panel to show coverage at a glance.
@@ -3710,6 +4041,50 @@ class Api:
             return {"ok": True, **stats}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    def transcribe_retranscribe_channel(self, folder_or_name, model=""):
+        """Queue every video in a channel for Whisper retranscribe.
+
+        .txt request: right-click a channel → re-transcribe entire
+        channel with model selection. Swaps the running Whisper model
+        first (one-off, NOT persisted to Settings), then enqueues every
+        video in the channel that has a transcript file.
+        """
+        name = folder_or_name if isinstance(folder_or_name, str) else (
+            folder_or_name.get("name") or folder_or_name.get("folder", ""))
+        if not name:
+            return {"ok": False, "error": "Channel name required"}
+        try:
+            from backend import index as _idx
+            rows = _idx.list_videos_for_channel(name, sort="newest",
+                                                  limit=10000) or []
+        except Exception as e:
+            return {"ok": False, "error": f"Could not list videos: {e}"}
+        if not rows:
+            return {"ok": False, "error": "No videos found for channel"}
+        # Swap Whisper model just for this batch when one was supplied.
+        if model:
+            try:
+                self.transcribe_swap_model(model, persist=False)
+            except Exception:
+                pass
+        queued = 0
+        skipped = 0
+        for row in rows:
+            fp = row.get("filepath") or ""
+            t = row.get("title") or ""
+            vid = row.get("video_id") or ""
+            if not fp or not os.path.isfile(fp):
+                skipped += 1
+                continue
+            res = self.transcribe_retranscribe(fp, t, vid)
+            if isinstance(res, dict) and res.get("ok"):
+                queued += 1
+            else:
+                skipped += 1
+        return {"ok": True, "queued": queued, "skipped": skipped,
+                "total": len(rows), "channel": name,
+                "model": model or "default"}
 
     def chan_fetch_art(self, folder_or_name, force=False):
         """Download channel avatar + banner for one channel.
@@ -4117,6 +4492,52 @@ class Api:
         return {"ok": True, "queued": queued, "skipped": skipped,
                 "combined": bool(combined)}
 
+    def resume_pending_redownloads(self):
+        """Issue #162: scan queues.sync for redownload-kind tasks (left
+        there by a previous run that exited before draining them) and
+        re-route each through chan_redownload so the chain worker
+        spawns and resumes from `_redownload_progress.json`. Without
+        this, clicking the popover Resume button after a restart fired
+        `sync_start_all` and started a regular Sync Subbed pass —
+        the redownload state was never picked up.
+
+        Returns {ok, resumed: N, skipped: M}.
+        """
+        resumed = 0
+        skipped = 0
+        try:
+            # Snapshot the queue so we can iterate without mutation races.
+            tasks_snapshot = list(self._queues.sync)
+        except Exception:
+            tasks_snapshot = []
+        # Remove the redownload items from the live queue FIRST. The
+        # chan_redownload path will re-enqueue them via sync_enqueue +
+        # _redwnl_pending. Skipping this would leave stale rows in the
+        # popover for the lifetime of the chain worker.
+        for t in tasks_snapshot:
+            kind = (t.get("kind") or "").lower()
+            if kind != "redownload":
+                continue
+            res = (t.get("redownload_res") or "").strip().lower() or "best"
+            name = t.get("name") or t.get("folder", "")
+            url = t.get("url", "")
+            if not name:
+                skipped += 1
+                continue
+            try:
+                self._queues.sync_remove(url or name)
+            except Exception:
+                pass
+            try:
+                r = self.chan_redownload({"name": name}, res)
+                if isinstance(r, dict) and r.get("ok"):
+                    resumed += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+        return {"ok": True, "resumed": resumed, "skipped": skipped}
+
     def chan_redownload_progress_peek(self, folder_or_name):
         """Check whether a channel has a saved redownload-in-progress file.
         Returns {ok, pending: bool, resolution, done_ids_count} so the UI
@@ -4377,8 +4798,28 @@ class Api:
         _sync_alive = bool(self._sync_thread and self._sync_thread.is_alive())
         if _sync_alive:
             _cur = self._queues.current_sync or {}
+            # Issue #162: previously a regular-sync-in-flight refused
+            # the redownload outright. Now we surface a clearer error
+            # AND enqueue it on the redownload chain so a follow-up
+            # "Start" click can drain it after the current sync ends.
+            # (A fully-automatic hand-off would require sync_start_all
+            # to drain _redwnl_pending on completion — left for a
+            # follow-up since it crosses two worker abstractions.)
             if (_cur.get("kind") or "").lower() != "redownload":
-                return {"ok": False, "error": "Sync pipeline already running"}
+                with self._redwnl_lock:
+                    self._redwnl_pending.append({
+                        "ch": dict(ch),
+                        "folder": folder,
+                        "new_res": new_res,
+                        "scope_label": "",
+                        "rd_task": dict(ch, kind="redownload",
+                                         redownload_res=new_res),
+                    })
+                try: self._on_queue_changed()
+                except Exception: pass
+                return {"ok": False,
+                        "error": "Sync pipeline running — redownload queued. "
+                                 "It will start when the current sync ends."}
             # Fall through into the enqueue path below.
 
         # Narrow to a year / month subfolder when requested. The
@@ -5000,7 +5441,120 @@ class Api:
             # cards). Default "grid" for new users — the thumbnail view
             # reads more naturally at a glance.
             "recent_view_mode": (cfg.get("recent_view_mode") or "grid"),
+            # X-button behavior — "ask" (default modal), "tray"
+            # (minimize silently), or "quit" (exit silently). Read by
+            # _on_closing at main.py:7552; also written by the close
+            # modal's "Remember my choice" checkbox via confirm_close.
+            "close_behavior": (cfg.get("close_behavior") or "ask"),
         }
+
+    def confirm_close(self, choice, remember=False):
+        """Frontend hook for the close-to-tray dialog. `choice` is
+        either "quit" (destroy window + run shutdown) or "tray" (hide).
+        `remember` persists the choice as close_behavior so the dialog
+        stops appearing.
+
+        BUG FIX (2026-05-13): destroying the window from inside this
+        js_api method deadlocks pywebview. The JS thread is waiting
+        for this Python method to return, but `window.destroy()` needs
+        the main GUI thread to be free to actually shut the window —
+        and the GUI thread is the same thread servicing the JS bridge
+        call. Result: full freeze, task-manager kill required.
+        Fix: defer the destroy/hide to a background thread so this
+        method returns immediately. The JS bridge response delivers,
+        the GUI thread becomes free, and the deferred action runs
+        cleanly.
+        """
+        choice = (choice or "").lower()
+        if choice not in ("quit", "tray"):
+            return {"ok": False, "error": "Invalid choice"}
+        if remember:
+            try:
+                from backend.ytarchiver_config import save_config as _sc
+                cfg = self._config or load_config()
+                cfg["close_behavior"] = choice
+                _sc(cfg)
+                self._reload_config()
+            except Exception:
+                pass
+
+        # NUCLEAR OPTION (2026-05-13): repeated soft fixes haven't
+        # held. The user wants Quit to actually quit, period. This
+        # path now does the minimum possible amount of work before
+        # invoking Win32 TerminateProcess on ourselves — which is
+        # the strongest possible "kill this process" call short of
+        # pulling power. TerminateProcess does NOT need the target
+        # thread to cooperate; it can be invoked from any thread
+        # and the OS kills the process unconditionally.
+        #
+        # The price: in-flight downloads / writes may leave temp
+        # files behind. But the user is clicking Quit. They expect
+        # the app to exit. Cleanup hygiene is secondary to that.
+        # Subsequent launches will rotate temp folders via the
+        # startup cleanup_temps sweep anyway.
+        import ctypes as _ctypes
+
+        # Fire TWO independent kill paths. If one is somehow blocked
+        # by GIL contention or scheduler weirdness, the other should
+        # still fire.
+
+        def _kill_via_thread():
+            import time as _t
+            _t.sleep(0.10)  # let the API response return to JS
+            try:
+                # Best-effort: persist queue state so we don't lose
+                # in-flight enqueue work. Bounded by a 200ms join.
+                save_t = threading.Thread(
+                    target=lambda: self._queues.save_now(),
+                    daemon=True)
+                save_t.start()
+                save_t.join(timeout=0.2)
+            except Exception:
+                pass
+            # Kill the process. TerminateProcess with current
+            # process handle (-1 == GetCurrentProcess()) is
+            # equivalent to TerminateProcess(GetCurrentProcess(), 0)
+            # but doesn't need an extra call.
+            try:
+                _ctypes.windll.kernel32.TerminateProcess(
+                    _ctypes.c_void_p(-1), 0)
+            except Exception:
+                pass
+            # Belt-and-suspenders if TerminateProcess somehow
+            # didn't kill us.
+            try:
+                _ctypes.windll.kernel32.ExitProcess(0)
+            except Exception:
+                pass
+            import os as _os
+            _os._exit(0)
+
+        if choice == "tray":
+            # Tray path stays soft — we want the window hidden but
+            # the process alive. Dispatch on a bg thread to avoid
+            # the JS-bridge deadlock pattern.
+            def _hide():
+                import time as _t
+                _t.sleep(0.05)
+                try: self._window.hide()
+                except Exception: pass
+            try:
+                threading.Thread(target=_hide, daemon=True).start()
+            except Exception:
+                pass
+        else:
+            # Quit path: schedule the killer. Two threads in case
+            # one gets starved.
+            try:
+                threading.Thread(target=_kill_via_thread, daemon=True).start()
+            except Exception:
+                pass
+            try:
+                threading.Thread(target=_kill_via_thread, daemon=True).start()
+            except Exception:
+                pass
+
+        return {"ok": True, "action": choice}
 
     def settings_save(self, data):
         if not config_is_writable():
@@ -5046,6 +5600,28 @@ class Api:
         # Recent tab view mode — only accept known values.
         if data.get("recent_view_mode") in ("list", "grid"):
             cfg["recent_view_mode"] = data["recent_view_mode"]
+        # .txt: transcript viewer text size (px). Bounded so a bad
+        # value (e.g. NaN) can't render the Watch view unreadable.
+        if "transcript_font_size" in data:
+            try:
+                _tx_fs = float(data["transcript_font_size"])
+                if _tx_fs >= 8 and _tx_fs <= 40:
+                    cfg["transcript_font_size"] = _tx_fs
+            except Exception:
+                pass
+        # .txt: transcript pane width (CSS flex-basis, in px). Adjustable
+        # via drag-splitter between video and transcript panels.
+        if "transcript_pane_width" in data:
+            try:
+                _tx_pw = int(data["transcript_pane_width"])
+                if _tx_pw >= 200 and _tx_pw <= 1400:
+                    cfg["transcript_pane_width"] = _tx_pw
+            except Exception:
+                pass
+        # .txt: close-button behavior — "ask" (default modal),
+        # "quit" (exit immediately), or "tray" (minimize to tray).
+        if data.get("close_behavior") in ("ask", "quit", "tray"):
+            cfg["close_behavior"] = data["close_behavior"]
         from backend.ytarchiver_config import save_config as _sc
         if not _sc(cfg):
             return {"ok": False, "error": "Save failed"}
@@ -5813,14 +6389,17 @@ class Api:
             def _die():
                 time.sleep(0.6)
                 try:
-                    # Best-effort: if the function is in scope it runs
-                    # the full close sequence. If not (import order,
-                    # shutdown teardown, etc.) we still os._exit so
-                    # the user's restart request doesn't stall.
+                    # Run the full close sequence (queue persist,
+                    # subprocess kills, port release) before exiting.
+                    # `_shutdown_cleanup` is defined inside main() and
+                    # bound to this Api instance via `_register_shutdown`
+                    # at startup. If that wiring is somehow missing
+                    # (unusual init order), we still os._exit so the
+                    # restart doesn't hang.
                     try:
-                        _shutdown_cleanup()  # type: ignore[name-defined]
-                    except NameError:
-                        pass
+                        _cb = getattr(self, "_shutdown_cleanup_fn", None)
+                        if callable(_cb):
+                            _cb()
                     except Exception as _ce:
                         print(f"[app_restart] shutdown_cleanup: {_ce}")
                     if self._window:
@@ -6553,12 +7132,28 @@ class Api:
                 "error": "Write-gate off"}
 
     def sync_one_channel(self, identity):
-        """Sync just one channel (used by context-menu 'Sync now')."""
-        if self.sync_is_running():
-            return {"ok": False, "error": "Sync already running"}
+        """Sync just one channel (used by context-menu 'Sync now').
+
+        Issue #155: if a sync is already running, enqueue this channel
+        on the existing sync worker rather than erroring out. The user
+        expects right-click → Sync now to "just add it to the queue"
+        whether or not sync is idle.
+        """
         ch = subs_backend.get_channel(identity or {})
         if not ch:
             return {"ok": False, "error": "Channel not found"}
+        if self.sync_is_running():
+            # Hand off to the live sync worker as a queued item. The
+            # worker picks up new channels off self._queues.sync between
+            # current passes.
+            try:
+                added = bool(self._queues.sync_enqueue(ch))
+            except Exception as e:
+                return {"ok": False, "error": f"Could not queue: {e}"}
+            try: self._on_queue_changed()
+            except Exception: pass
+            ch_name = ch.get("name") or ch.get("folder", "")
+            return {"ok": True, "queued": added, "name": ch_name}
         if not sync_backend.find_yt_dlp():
             return {"ok": False, "error": "yt-dlp not found"}
         self._sync_cancel.clear()
@@ -6934,22 +7529,59 @@ def main():
             winstate.save_window_state({"maximized": False})
         except Exception:
             pass
-    # X-button = real quit. Matches YTArchiver.py:34224 on_closing behavior —
-    # clicking the window's X unconditionally shuts down (saves state, releases
-    # mutex, kills subprocesses). Earlier builds tried to hide-to-tray here,
-    # but that left orphan processes ("ghosts") whenever the Windows tray icon
-    # wasn't pinned, with no way for the user to reopen or quit them.
-    # Users who WANT to minimise to tray use the tray's "Hide" menu item, or
-    # the system minimise button — not X.
+    # X-button behavior is config-driven (.txt close-to-tray request):
+    #   "quit"  — shut down immediately (legacy behavior)
+    #   "tray"  — minimize to tray, keep app running
+    #   "ask"   — prompt with a Quit / Close-to-tray dialog (default)
+    # When in "ask" mode the closing event is blocked; the modal in the
+    # frontend then calls api.confirm_close(choice, remember) which
+    # either hides the window or destroys it (re-entering this handler
+    # with _truly_quit flag set so it actually exits).
     _truly_quit = {"flag": False}
+    # Expose to api so the JS-side modal can drive the decision back.
+    api._close_state = _truly_quit
     def _on_closing():
+        # _truly_quit flag set by the tray "Quit" menu or by the in-app
+        # confirm dialog — let it through unconditionally.
+        if _truly_quit.get("flag"):
+            try:
+                winstate.save_window_state({})
+                _shutdown_cleanup()
+            except Exception:
+                pass
+            return True
         try:
-            winstate.save_window_state({})
-            _truly_quit["flag"] = True
-            _shutdown_cleanup()
+            cfg = api._config or load_config()
+        except Exception:
+            cfg = {}
+        behavior = (cfg.get("close_behavior") or "ask").lower()
+        if behavior == "quit":
+            try:
+                winstate.save_window_state({})
+                _truly_quit["flag"] = True
+                _shutdown_cleanup()
+            except Exception:
+                pass
+            return True
+        if behavior == "tray":
+            try: window.hide()
+            except Exception: pass
+            return False
+        # behavior == "ask" — show the modal and block the close
+        # while we wait for the user to pick. Dispatch evaluate_js
+        # from a background thread so it can never block the GUI
+        # thread that's currently servicing this closing event.
+        def _show_modal():
+            try:
+                window.evaluate_js(
+                    "window._showCloseDialog && window._showCloseDialog()")
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_show_modal, daemon=True).start()
         except Exception:
             pass
-        return True # always allow close
+        return False
 
     def _shutdown_cleanup():
         """Flush disk writes + kill child processes on real shutdown.
@@ -7036,6 +7668,17 @@ def main():
             except Exception: pass
         except Exception:
             pass
+
+    # Bind the cleanup function to the Api instance so Api.app_restart
+    # can invoke the full close sequence (queue persist, subprocess
+    # kills, port release). Before this wiring, app_restart referenced
+    # `_shutdown_cleanup` from the wrong scope; the resulting NameError
+    # was silently swallowed and the restart skipped every cleanup
+    # step. See backend audit #1 (2026-05-13).
+    try:
+        api._shutdown_cleanup_fn = _shutdown_cleanup
+    except Exception:
+        pass
 
     try:
         window.events.resized += _on_resized

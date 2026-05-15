@@ -241,16 +241,16 @@ def start_server() -> int:
 
 
 def stop_server() -> None:
-    """Shut the server down cleanly. Idempotent — safe to call from
-    shutdown paths even if the server never started.
+    """Shut the server down cleanly. Idempotent.
 
-    audit D-56: without this, the listening socket was held until the
-    Python process exited. On clean webview shutdown paths that
-    returned from webview.start() without hitting os._exit (rare but
-    possible under dev-reload), port 9855's neighbor (this file-
-    server's picked port) would linger, and a re-launch would fail to
-    bind. Calling shutdown() stops the serve_forever loop; server_close
-    frees the socket immediately.
+    BUG FIX (2026-05-13): `httpd.shutdown()` blocks until ALL active
+    handler threads return. The WebView keeps long-lived streaming
+    requests open (video files, thumbnails), so shutdown() would
+    wait indefinitely — Quit froze the whole app. Fix: just close
+    the listening socket so no NEW requests come in. The handler
+    threads are daemons; they die when the Python process exits.
+    Run the close on a 1s-timeout background thread so even
+    server_close() can't deadlock the caller.
     """
     global _server_port, _server_thread, _httpd
     with _lock:
@@ -258,11 +258,14 @@ def stop_server() -> None:
         _httpd = None
         _server_port = 0
         _server_thread = None
-    if httpd is not None:
-        try: httpd.shutdown()
-        except Exception: pass
+    if httpd is None:
+        return
+    def _close():
         try: httpd.server_close()
         except Exception: pass
+    t = threading.Thread(target=_close, daemon=True)
+    t.start()
+    t.join(timeout=1.0)
 
 
 def get_port() -> int:

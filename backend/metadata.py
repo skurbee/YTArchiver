@@ -423,12 +423,15 @@ def _scan_channel_videos(folder: Path) -> List[Tuple[str, str, Optional[int], Op
     _vid_looks_fake = lambda s: s.isalpha() # all-letters → not a YT id
     # Pre-load videos-table rows for this channel folder so we can
     # fill in missing video_ids without N queries.
+    # Use the read-only connection so this scan doesn't contend with
+    # sync's register_video writers on `_db_lock` — critical because
+    # this function is called from the parallel thumbnail walker.
     fp_to_id: Dict[str, str] = {}
     try:
         from . import index as _idx
-        conn = _idx._open()
+        conn = _idx._reader_open() or _idx._open()
         if conn is not None:
-            with _idx._db_lock:
+            with _idx._reader_lock:
                 rows = conn.execute(
                     "SELECT filepath, video_id FROM videos "
                     "WHERE filepath LIKE ?",
@@ -588,11 +591,17 @@ def fetch_single_video_metadata(channel: Dict[str, Any],
         # Pink em-dash + checkmark + pink "Metadata", then white
         # "downloaded". user spec: color the subject, not the
         # verb — "(pink)— (pink)Metadata (white)downloaded".
+        # Issues #139/#144/#148: tag with meta_done_<vid> so the
+        # emit REPLACES the placeholder sync.py reserved under this
+        # video's block rather than landing at log bottom after later
+        # channels' rows have scrolled in.
+        _md_marker = f"meta_done_{video_id}" if video_id else ""
+        _md_tag = lambda *extra: [t for t in (_md_marker, *extra) if t]
         stream.emit([
-            [" ", "dim"],
-            ["\u2014 \u2713 ", "meta_bracket"],
-            ["Metadata ", "simpleline_pink"],
-            ["downloaded\n", "simpleline"],
+            [" ", _md_tag("dim")],
+            ["\u2014 \u2713 ", _md_tag("meta_bracket")],
+            ["Metadata ", _md_tag("simpleline_pink")],
+            ["downloaded\n", _md_tag("simpleline")],
         ])
     return {"ok": True, "fetched": True}
 
@@ -658,13 +667,13 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
 
     folder = _folder_for_channel(channel)
     if folder is None:
-        stream.emit_error("Metadata: output_dir is not configured.")
+        stream.emit_error("Archive folder isn't configured. Set it in Settings → General.")
         return {"ok": False, "error": "no output_dir"}
     folder.mkdir(parents=True, exist_ok=True)
 
     yt = find_yt_dlp()
     if not yt:
-        stream.emit_error("Metadata: yt-dlp not found.")
+        stream.emit_error("Can't refresh video info — the download tool (yt-dlp) isn't installed.")
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
@@ -684,11 +693,18 @@ def fetch_metadata_for_videos(channel: Dict[str, Any],
     groups = _group_by_metadata_path(name, str(folder),
                                      split_years, split_months, wanted)
 
+    # Simple-mode users see human-readable "Refreshing N video(s)..."
+    # Verbose-mode users additionally see the technical "fast-fetch
+    # N id(s)" label (dim-tagged so Simple mode filters it).
     stream.emit([
         ["  \u2014 ", "meta_bracket"],
         [f"{name} ", "simpleline"],
         ["\u2014 ", "meta_bracket"],
-        [f"fast-fetch {len(ids)} id(s)\n", "simpleline"],
+        [f"refreshing {len(ids)} video(s)\u2026\n", "simpleline"],
+    ])
+    stream.emit([
+        ["    \u2014 ", ["dim"]],
+        [f"fast-fetch {len(ids)} id(s)\n", ["dim"]],
     ])
 
     total = sum(len(g["videos"]) for g in groups.values())
@@ -1082,6 +1098,25 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         "--lazy-playlist",
         "--no-warnings",
         "--skip-download",
+        # CRITICAL (2026-05-14): without `skip=webpage`, yt-dlp ≥2026.x
+        # returns "NA" for view_count / like_count / comment_count on
+        # every entry in a channel's `/videos` tab. The library parses
+        # the initial webpage payload by default and that payload no
+        # longer carries per-video stats. `skip=webpage` forces yt-dlp
+        # to use the InnerTube playlist endpoint instead, which DOES
+        # include view_count. Without this, bulk_refresh_views_likes
+        # was silently skipping every video because the "new" count
+        # was None and `_view_new != _view_old` short-circuited to
+        # False. Empirically: 0% of vids had view counts without it;
+        # 83% return real exact view counts with it.
+        #
+        # `skip=authcheck` is required IN COMBINATION when cookies are
+        # passed (--cookies-from-browser firefox in our case). Without
+        # it yt-dlp errors out: "Playlists that require authentication
+        # may not extract correctly without a successful webpage
+        # download". This pair is the supported workaround per
+        # yt-dlp's own suggestion.
+        "--extractor-args", "youtubetab:skip=webpage,authcheck",
         # TAB-separated so titles (which can contain pipes / commas)
         # never collide with the field separator. Title is included so
         # the caller can fall back to title-matching for legacy archive
@@ -1098,17 +1133,34 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         *_find_cookie_source(),
         ch_url,
     ]
+    # CAPTURE stderr instead of throwing it away. Earlier this was
+    # `DEVNULL`, which meant when bulk-stats came back empty we had
+    # zero diagnostic — the user just saw "Bulk-stats returned no data"
+    # without any clue why. Now we drain stderr on a side thread and,
+    # if the call returns empty, the caller can emit the captured
+    # stderr as a verbose-only `dim` line so the user (in Verbose mode)
+    # can see the real yt-dlp error.
     out: Dict[str, Dict[str, Any]] = {}
+    _stderr_buf: List[str] = []
     try:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", errors="replace", bufsize=1,
             startupinfo=_startupinfo, env=_utf8_env(),
         )
     except OSError as e:
-        stream.emit_error(f"Metadata: could not start stats fetch: {e}")
+        stream.emit_error(f"Couldn't start fetching video stats: {e}")
         return {}
+    def _drain_stderr():
+        try:
+            for line in proc.stderr:
+                if line:
+                    _stderr_buf.append(line.rstrip())
+        except Exception:
+            pass
+    _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_thread.start()
     # Progress tick during the catalog fetch — on large channels (10k+
     # videos) this can take 30-60s and the caller's "Resolving video
     # IDs for X..." line otherwise looks frozen the whole time. Emit
@@ -1196,7 +1248,82 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         stream.emit_dim(f" (stats read error: {e})")
         try: proc.terminate()
         except Exception: pass
+    # If the call returned nothing useful, surface whatever yt-dlp put
+    # on stderr as a verbose-only line so users in Verbose mode can
+    # actually debug the failure. Simple mode users still just see the
+    # higher-level "Initial check unsuccessful..." line emitted by the
+    # caller. Cap at 6 lines so a yt-dlp traceback doesn't flood the
+    # log; if the user needs more they can re-run with Verbose mode and
+    # check the streamed stderr in the terminal.
+    if not out and _stderr_buf:
+        try:
+            _stderr_thread.join(timeout=0.5)
+        except Exception:
+            pass
+        _trimmed = [ln for ln in _stderr_buf if ln.strip()][:6]
+        for _ln in _trimmed:
+            stream.emit([
+                ["   — yt-dlp: ", ["dim"]],
+                [_ln + "\n", ["dim"]],
+            ])
+
+    # AUTO-RETRY for @handle URLs that fail bulk-stats. Discovered
+    # 2026-05-15: yt-dlp 2026.03.17 + `youtubetab:skip=webpage,authcheck`
+    # can't resolve some channel @handles (ColdFusion specifically:
+    # "Failed to resolve url" error), but the same channel works via
+    # the canonical /channel/UC.../videos URL form. The skip=webpage
+    # arg is REQUIRED for bulk view counts (without it every entry's
+    # view_count is "NA"), so we can't just drop the arg. Instead:
+    # when the call returns empty AND the URL is the @handle form,
+    # spend 1 extra yt-dlp call to resolve the channel_id, then retry
+    # the bulk-stats call against /channel/UC.../videos. Saves the
+    # 25+ minute per-video fallback for ColdFusion (and any other
+    # channel where the handle path fails).
+    if not out and "/@" in (ch_url or ""):
+        canonical = _resolve_channel_id_url(yt, ch_url)
+        if canonical and canonical != ch_url:
+            stream.emit([
+                ["   — ", ["dim"]],
+                [f"retrying bulk-stats with canonical channel URL "
+                 f"({canonical})\n", ["dim"]],
+            ])
+            # Recursive call into ourselves with the canonical URL.
+            # Will not recurse twice because the canonical URL doesn't
+            # contain /@ — so the retry guard above won't fire again.
+            return _flat_playlist_bulk_stats(
+                yt, canonical, stream, cancel_event, pause_event,
+                queues=queues, progress_cb=progress_cb)
     return out
+
+
+def _resolve_channel_id_url(yt: str, handle_url: str) -> str:
+    """Convert a `/@handle` channel URL to the canonical
+    `/channel/UC.../videos` form by asking yt-dlp for one video's
+    channel_id. Returns empty string on failure.
+
+    Costs one yt-dlp invocation (~2-4s) — used only as a one-off retry
+    when bulk-stats fails for the handle form. Most channels never hit
+    this path because their @handle resolves cleanly.
+    """
+    if not handle_url or not yt:
+        return ""
+    try:
+        proc = subprocess.run(
+            [yt, "--skip-download", "--no-warnings",
+             "--print", "%(channel_id)s",
+             "--playlist-end", "1",
+             *_find_cookie_source(),
+             handle_url],
+            capture_output=True, text=True, timeout=20,
+            encoding="utf-8", errors="replace",
+            startupinfo=_startupinfo, env=_utf8_env(),
+        )
+        cid = (proc.stdout or "").strip().split("\n", 1)[0].strip()
+        if cid and cid.startswith("UC") and len(cid) >= 20:
+            return f"https://www.youtube.com/channel/{cid}/videos"
+    except Exception:
+        pass
+    return ""
 
 
 def bulk_refresh_views_likes(channel: Dict[str, Any],
@@ -1228,13 +1355,13 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     """
     folder = _folder_for_channel(channel)
     if folder is None:
-        stream.emit_error("Metadata: output_dir is not configured.")
+        stream.emit_error("Archive folder isn't configured. Set it in Settings → General.")
         return {"ok": False, "error": "no output_dir"}
     folder.mkdir(parents=True, exist_ok=True)
 
     yt = find_yt_dlp()
     if not yt:
-        stream.emit_error("Metadata: yt-dlp not found.")
+        stream.emit_error("Can't refresh video info — the download tool (yt-dlp) isn't installed.")
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
@@ -1311,13 +1438,33 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
         # side lines (the warning + the orphaned Refreshing... line).
         stream.emit([
             [" \u26A0 ", ["meta_bracket", "views_refresh_progress"]],
-            [f"Bulk-stats returned no data for {name} — "
-             f"channel may be empty / private / geo-locked.\n",
+            [f"Initial check unsuccessful for {name} — "
+             f"trying per-video lookup...\n",
              ["simpleline", "views_refresh_progress"]],
+        ])
+        # Verbose-only diagnostic. `dim` tag is in VERBOSE_ONLY_TAGS, so
+        # Simple mode hides this line entirely while Verbose users still
+        # see the technical context. Per Scott (2026-05-14): "Simple
+        # mode should be easily readable for someone who knows literally
+        # nothing about nothing."
+        stream.emit([
+            ["   — ", ["dim", "views_refresh_progress"]],
+            [f"Bulk-stats returned no data for {name} — "
+             f"channel may be empty / private / geo-locked, or yt-dlp "
+             f"hit a transient YouTube block.\n",
+             ["dim", "views_refresh_progress"]],
         ])
         return {"ok": False, "error": "bulk_empty",
                 "fetched": 0, "refreshed": 0, "errors": 0, "skipped": 0,
                 "bulk_fetched": 0}
+
+    # Verbose-only: announce the bulk-stats walk landed and how many
+    # videos it found. Helps the user follow the multi-phase flow.
+    stream.emit([
+        ["   — ", ["dim"]],
+        [f"bulk-stats: {len(bulk):,} videos retrieved from YouTube "
+         f"catalog (took {time.time() - t0:.1f}s)\n", ["dim"]],
+    ])
 
     # Enumerate on-disk videos so we only refresh ones we actually
     # have files for (mirrors fetch_channel_metadata's disk-driven
@@ -1413,6 +1560,79 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
              ["simpleline", "views_refresh_progress"]],
         ])
 
+    # \u2500\u2500 Removed-from-YT detection (cheap, runs every bulk refresh) \u2500\u2500
+    # Walk the resolved on-disk list: any local file whose video_id
+    # is NOT in the flat-playlist response was deleted / privated /
+    # unlisted by the channel since download. Stamp the row so the UI
+    # can show a red \u2717 on the per-video tile + a channel-level "N
+    # gone from YT" counter. Inverse: any file currently marked
+    # removed whose vid HAS returned to the catalog gets the
+    # timestamp cleared (uploader restored / unprivated the video).
+    try:
+        _now_rm = time.time()
+        _newly_removed: List[str] = []
+        _newly_restored: List[str] = []
+        from . import index as _idx
+        _conn_rm = _idx._open()
+        if _conn_rm is not None:
+            _pat = str(folder) + "%"
+            _db_state: Dict[str, Tuple[Optional[str], Optional[float]]] = {}
+            with _idx._db_lock:
+                for _row in _conn_rm.execute(
+                        "SELECT filepath, video_id, removed_from_yt_ts "
+                        "FROM videos WHERE filepath LIKE ?", (_pat,)):
+                    _db_state[os.path.normpath(_row[0])] = (
+                        _row[1], _row[2])
+            for (_v, _t, _y, _m, _fp) in on_disk:
+                if not _v:
+                    continue
+                _key = os.path.normpath(_fp)
+                _db_vid, _db_removed_ts = _db_state.get(_key, (None, None))
+                _is_in_catalog = (_v in bulk)
+                if not _is_in_catalog and _db_removed_ts is None:
+                    _newly_removed.append(_fp)
+                elif _is_in_catalog and _db_removed_ts is not None:
+                    _newly_restored.append(_fp)
+            if _newly_removed or _newly_restored:
+                with _idx._db_lock:
+                    for _fp in _newly_removed:
+                        try:
+                            _conn_rm.execute(
+                                "UPDATE videos SET removed_from_yt_ts=? "
+                                "WHERE filepath=? COLLATE NOCASE",
+                                (_now_rm, _fp))
+                        except Exception:
+                            pass
+                    for _fp in _newly_restored:
+                        try:
+                            _conn_rm.execute(
+                                "UPDATE videos SET removed_from_yt_ts=NULL "
+                                "WHERE filepath=? COLLATE NOCASE",
+                                (_fp,))
+                        except Exception:
+                            pass
+                    _conn_rm.commit()
+                if _newly_removed:
+                    stream.emit([
+                        [" \u26a0 ", ["meta_bracket", "views_refresh_progress"]],
+                        [f"{len(_newly_removed)} video(s) no longer on "
+                         f"YouTube (removed / privated since last sync).\n",
+                         ["simpleline", "views_refresh_progress"]],
+                    ])
+                if _newly_restored:
+                    stream.emit([
+                        [" \u2713 ", ["meta_bracket", "views_refresh_progress"]],
+                        [f"{len(_newly_restored)} previously-removed video(s) "
+                         f"are back on YouTube.\n",
+                         ["simpleline", "views_refresh_progress"]],
+                    ])
+    except Exception as _rm_e:
+        try:
+            stream.emit_error(
+                f"removed-from-YT detection failed for {name}: {_rm_e}")
+        except Exception:
+            pass
+
     on_disk_ids = {v[0] for v in on_disk if v[0]}
 
     # Load existing metadata across all on-disk JSONLs, keyed by id.
@@ -1474,6 +1694,17 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
                 and _comment_new != _comment_old):
             _changed = True
 
+        # "No flat data" detection (2026-05-14 fix): if flat-playlist
+        # returned None for view_count BUT we have a stored value, we
+        # can't tell whether it changed. The old code silently treated
+        # this as "same" and skipped — meaning bulk refresh was a no-op
+        # for any video yt-dlp's flat-playlist didn't return counts for.
+        # Now we route it through the per-video fetch path so we
+        # actually get current counts. ~17% of videos still need this
+        # even with the `youtubetab:skip=webpage` extractor arg
+        # (members-only, very recent uploads, etc.).
+        _no_flat_data = (_view_new is None and _view_old is not None)
+
         # Always update the stats in-place — even if unchanged, bump
         # `fetched_at` so the "last refreshed" timestamp is accurate.
         if _view_new is not None:
@@ -1484,7 +1715,33 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
             old["comment_count"] = _comment_new
         old["fetched_at"] = datetime.now().isoformat()
 
-        if _changed and full_fetch_on_change:
+        # VERBOSE-ONLY per-video diff trace. Compact one-liner showing
+        # the old→new counts and the decision. With 1000s of videos
+        # per channel this floods the log — that's intentional in
+        # Verbose mode (Scott: "grossly oversaturated with information").
+        # Simple mode hides via `dim` tag.
+        def _fmt_cnt(n):
+            return "—" if n is None else f"{n:,}"
+        if _no_flat_data:
+            _decision = "no flat data → full fetch"
+        elif _changed and full_fetch_on_change:
+            _decision = "changed → full fetch"
+        elif _changed:
+            _decision = "changed → in-place update"
+        else:
+            _decision = "unchanged → skip"
+        stream.emit([
+            ["    — ", ["dim"]],
+            [f"{vid} · views {_fmt_cnt(_view_old)}→{_fmt_cnt(_view_new)} · "
+             f"likes {_fmt_cnt(_like_old)}→{_fmt_cnt(_like_new)} · "
+             f"{_decision}\n", ["dim"]],
+        ])
+
+        if _no_flat_data:
+            # Force a full per-video fetch — only path that can give
+            # us a current view count for this vid.
+            changed_ids.append(vid)
+        elif _changed and full_fetch_on_change:
             changed_ids.append(vid)
         elif _changed:
             updated_in_place += 1
@@ -1703,7 +1960,542 @@ def bulk_refresh_views_likes(channel: Dict[str, Any],
     }
 
 
-def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _thumbnail_exists_for(thumb_dir: str, video_id: str) -> bool:
+    """True iff any thumbnail file in `thumb_dir` carries `[video_id]`."""
+    if not thumb_dir or not video_id or not os.path.isdir(thumb_dir):
+        return False
+    bracket = f"[{video_id}]"
+    try:
+        for fn in os.listdir(thumb_dir):
+            if bracket in fn and fn.lower().endswith(
+                    (".jpg", ".jpeg", ".png", ".webp")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def sweep_missing_thumbnails(channel: Dict[str, Any], stream=None
+                              ) -> Dict[str, int]:
+    """Issue #147/#158: scan a channel folder for .mp4 files that lack a
+    thumbnail in `.Thumbnails/` and download any missing ones from the
+    URLs cached in metadata.jsonl. Use after a sync pass to catch
+    thumbnails that yt-dlp's bulk download missed (rate-limited, racy,
+    transient network blips). Returns {checked, fetched, missing}.
+    """
+    folder = _folder_for_channel(channel)
+    if not folder or not folder.exists():
+        return {"checked": 0, "fetched": 0, "missing": 0}
+    checked = fetched = still_missing = 0
+    # _scan_channel_videos returns (vid_id, title, year, month, filepath).
+    # Group by (year, month) so each metadata.jsonl is read exactly once
+    # per bucket. The jsonl path depends on the channel's split_years +
+    # split_months config — feed those plus the year/month into
+    # `_get_metadata_jsonl_path` so it builds the right path. (Earlier
+    # version passed the channel dict where `split_years: bool` was
+    # expected and `sub` where the channel root was expected — single-
+    # channel refetch threw "missing 1 required positional argument:
+    # 'split_months'". Fixed by passing args correctly.)
+    ch_root = str(folder)
+    name = channel.get("name") or channel.get("folder") or ""
+    split_years = bool(channel.get("split_years", False))
+    split_months = bool(channel.get("split_months", False))
+    # Pre-walk every .Thumbnails dir under the channel root once and
+    # collect the full vid-id set. This means we treat thumbs as
+    # "exists" if ANY .Thumbnails dir in the channel has them — not
+    # just the one next to the mp4. Bug surfaced on The PrimeTime
+    # where most thumbs lived in 2025/.Thumbnails/ but their mp4s
+    # had been re-foldered to 2023/ and 2024/ — the refetcher kept
+    # re-downloading thumbs that already existed in a sibling year.
+    _id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+    _all_thumb_vids: set = set()
+    try:
+        for _dp, _dns, _fns in os.walk(ch_root):
+            if os.path.basename(_dp) != ".Thumbnails":
+                continue
+            for _fn in _fns:
+                if not _fn.lower().endswith(
+                        (".jpg", ".jpeg", ".png", ".webp")):
+                    continue
+                _m = _id_re.search(_fn)
+                if _m:
+                    _all_thumb_vids.add(_m.group(1))
+    except Exception:
+        pass
+    by_bucket: Dict[Tuple[Optional[int], Optional[int]],
+                    List[Tuple[str, str]]] = {}
+    for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
+        if not vid_id:
+            continue
+        by_bucket.setdefault((_y, _m), []).append((path, vid_id))
+    for (yr, mo), items in by_bucket.items():
+        jp, sub = _get_metadata_jsonl_path(
+            name, ch_root, split_years, split_months, yr, mo)
+        thumb_dir = _ensure_thumbnails_dir(sub)
+        meta = _read_metadata_jsonl(jp) if jp else {}
+        for path, vid_id in items:
+            checked += 1
+            # Already covered somewhere in the channel? Skip the
+            # re-download. (Was: only checked thumb_dir adjacent to
+            # the mp4, missing channel-wide reorgs.)
+            if vid_id in _all_thumb_vids:
+                continue
+            entry = meta.get(vid_id) or {}
+            url = entry.get("thumbnail_url") or ""
+            title = entry.get("title") or os.path.splitext(
+                os.path.basename(path))[0]
+            if not url:
+                still_missing += 1
+                continue
+            try:
+                _download_thumbnail(url, thumb_dir, title, vid_id,
+                                     stream=stream)
+                if _thumbnail_exists_for(thumb_dir, vid_id):
+                    fetched += 1
+                    _all_thumb_vids.add(vid_id)
+                    # Mark the DB flag so Settings > Metadata's
+                    # Thumbnails column reflects the new state on its
+                    # next query without re-walking.
+                    try:
+                        from . import index as _idx
+                        _c = _idx._open()
+                        if _c is not None:
+                            with _idx._db_lock:
+                                _c.execute(
+                                    "UPDATE videos SET has_thumbnail=1 "
+                                    "WHERE video_id=?", (vid_id,))
+                                _c.commit()
+                    except Exception:
+                        pass
+                else:
+                    still_missing += 1
+            except Exception:
+                still_missing += 1
+    return {"checked": checked, "fetched": fetched,
+            "missing": still_missing}
+
+
+def realign_misplaced_thumbnails(channels: Optional[List[Dict[str, Any]]] = None,
+                                  dry_run: bool = True,
+                                  stream=None) -> Dict[str, Any]:
+    """Survey + (optionally) move thumbnails that ended up in a different
+    year/month folder than the mp4 they belong to.
+
+    Mechanism: each thumbnail filename carries a `[video_id]` tag.
+    For every `.Thumbnails/*.{jpg,jpeg,webp,png}` under each channel
+    folder, look up the mp4 with that video_id in the index DB; if
+    the mp4's parent folder differs from the thumbnail's parent
+    folder (the one ABOVE its `.Thumbnails/` dir), the thumb is
+    misplaced and should live next to the mp4.
+
+    Same-volume rename via `os.replace` so no copy/delete cycle and
+    no risk of corruption.
+
+    `dry_run=True` (default) just reports; `dry_run=False` actually
+    moves files. Returns:
+      {
+        scanned, aligned, misaligned, moved, skipped_dest_exists,
+        orphan_no_db, per_channel: {name: {misaligned, moved, ...}}
+      }
+    """
+    from . import index as _idx
+    out_dir = (load_config() or {}).get("output_dir") or ""
+    if not out_dir:
+        return {"ok": False, "error": "no output_dir"}
+
+    # Build vid → mp4_parent map from the DB (only rows where the
+    # file actually exists). One query.
+    vid_to_mp4_parent: Dict[str, str] = {}
+    try:
+        conn = _idx._reader_open() or _idx._open()
+        if conn is not None:
+            with _idx._reader_lock:
+                for fp, vid in conn.execute(
+                        "SELECT filepath, video_id FROM videos "
+                        "WHERE video_id IS NOT NULL AND video_id<>''"):
+                    if fp and vid and os.path.isfile(fp):
+                        vid_to_mp4_parent[vid] = os.path.normpath(
+                            os.path.dirname(fp))
+    except Exception as e:
+        if stream:
+            try: stream.emit_error(f"Couldn't read the archive index for thumbnail repair: {e}")
+            except Exception: pass
+        return {"ok": False, "error": str(e)}
+
+    if channels is None:
+        channels = (load_config() or {}).get("channels", []) or []
+
+    id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+    scanned = aligned = misaligned = moved = skipped_dest = orphan = 0
+    per_channel: Dict[str, Dict[str, int]] = {}
+
+    for ch in channels:
+        name = ch.get("name") or ch.get("folder") or ""
+        folder = ch.get("folder_override") or ch.get("folder") or name
+        if not folder:
+            continue
+        ch_root = os.path.join(out_dir, folder)
+        if not os.path.isdir(ch_root):
+            continue
+        pc = {"misaligned": 0, "moved": 0, "skipped_dest_exists": 0,
+              "orphan_no_db": 0}
+        for dp, _dns, fns in os.walk(ch_root):
+            if os.path.basename(dp) != ".Thumbnails":
+                continue
+            thumb_parent = os.path.normpath(os.path.dirname(dp))
+            for fn in fns:
+                if not fn.lower().endswith(
+                        (".jpg", ".jpeg", ".webp", ".png")):
+                    continue
+                m = id_re.search(fn)
+                if not m:
+                    continue
+                scanned += 1
+                vid = m.group(1)
+                mp4_parent = vid_to_mp4_parent.get(vid)
+                if mp4_parent is None:
+                    orphan += 1
+                    pc["orphan_no_db"] += 1
+                    continue
+                if thumb_parent.lower() == mp4_parent.lower():
+                    aligned += 1
+                    continue
+                # Misaligned. Compute target.
+                misaligned += 1
+                pc["misaligned"] += 1
+                target_dir = os.path.join(mp4_parent, ".Thumbnails")
+                target_path = os.path.join(target_dir, fn)
+                source_path = os.path.join(dp, fn)
+                if os.path.exists(target_path):
+                    # Duplicate already at destination — skip the move
+                    # to avoid losing data. User can manually consolidate.
+                    skipped_dest += 1
+                    pc["skipped_dest_exists"] += 1
+                    continue
+                if dry_run:
+                    continue
+                # Actually move. Ensure target dir exists.
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                    os.replace(source_path, target_path)
+                    moved += 1
+                    pc["moved"] += 1
+                    # Confirm flag for this vid (it should already
+                    # be 1 if a prior walk ran, but ensure correctness
+                    # so the Thumbnails column stays accurate).
+                    try:
+                        from . import index as _idx2
+                        _c2 = _idx2._open()
+                        if _c2 is not None:
+                            with _idx2._db_lock:
+                                _c2.execute(
+                                    "UPDATE videos SET has_thumbnail=1 "
+                                    "WHERE video_id=?", (vid,))
+                                _c2.commit()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    if stream:
+                        try:
+                            stream.emit_error(
+                                f"realign: failed to move "
+                                f"{source_path} → {target_path}: {e}")
+                        except Exception: pass
+        if any(v > 0 for v in pc.values()):
+            per_channel[name] = pc
+
+    if stream and not dry_run:
+        try:
+            stream.emit_text(
+                f" — Realigned {moved} misplaced thumbnail(s) across "
+                f"{len(per_channel)} channel(s). "
+                f"({skipped_dest} skipped — duplicate at target.)",
+                "simpleline_pink")
+            stream.flush()
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "scanned": scanned,
+        "aligned": aligned,
+        "misaligned": misaligned,
+        "moved": moved,
+        "skipped_dest_exists": skipped_dest,
+        "orphan_no_db": orphan,
+        "per_channel": per_channel,
+        "dry_run": bool(dry_run),
+    }
+
+
+def _thumb_cache_path() -> str:
+    """Path to the persisted thumbnail-coverage cache."""
+    from .ytarchiver_config import APP_DATA_DIR
+    return os.path.join(str(APP_DATA_DIR), "thumbnail_status_cache.json")
+
+
+def _load_thumb_cache() -> Dict[str, Dict[str, Any]]:
+    """Load the persisted thumbnail-status cache. Returns {} on miss
+    or corruption. Shape: {channel_name_lower: {fingerprint, total,
+    with_thumb, missing, ts}}.
+    """
+    p = _thumb_cache_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_thumb_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    """Persist the thumbnail-status cache. Atomic via tmp+replace."""
+    p = _thumb_cache_path()
+    tmp = p + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, p)
+    except OSError:
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+def _channel_fingerprint(folder: Path) -> float:
+    """Max mtime across the channel folder + one level of subdirs.
+    Adding a new download bumps the immediate parent dir's mtime, so
+    a one-level walk is enough to detect new content. Mirrors the
+    fingerprint pattern used by sweep_new_videos.
+    """
+    if not folder.exists():
+        return 0.0
+    try:
+        mx = folder.stat().st_mtime
+    except OSError:
+        return 0.0
+    try:
+        for entry in os.scandir(folder):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    m = entry.stat(follow_symlinks=False).st_mtime
+                    if m > mx:
+                        mx = m
+                    # One more level deep (covers year/month splits).
+                    for sub in os.scandir(entry.path):
+                        try:
+                            if sub.is_dir(follow_symlinks=False):
+                                ms = sub.stat(
+                                    follow_symlinks=False).st_mtime
+                                if ms > mx:
+                                    mx = ms
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return mx
+
+
+def count_thumbnail_status_bulk(channels: List[Dict[str, Any]],
+                                  force: bool = False
+                                  ) -> Dict[str, Dict[str, Any]]:
+    """Issue #154: count thumbnail coverage per channel. Returns
+    {channel_lower: {total, with_thumb, missing}}.
+
+    CACHED + INCREMENTAL (2026-05-13): results are persisted to
+    `thumbnail_status_cache.json` keyed by channel name. On the next
+    call we compare the channel folder's recursive mtime fingerprint
+    against the cached value — unchanged channels return cached
+    results instantly, changed channels get re-walked.
+
+    `force=True` ignores the cache and re-walks every channel. Wire
+    this from a "Force recheck" button when the user wants fresh
+    numbers (e.g. after manually adding thumbnails outside the app).
+
+    Parallelized via ThreadPoolExecutor for the channels that DO
+    need a fresh walk — 8 workers because each is mostly waiting on
+    pooled-drive I/O latency, not CPU.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    cache = {} if force else _load_thumb_cache()
+    out: Dict[str, Dict[str, Any]] = {}
+    needs_walk: List[Tuple[Dict[str, Any], Path, str, float]] = []
+
+    # FAST PATH (2026-05-14): when `force=False`, query the DB column
+    # `has_thumbnail` instead of walking disk. The column is populated
+    # by the prior disk walk + by `sweep_missing_thumbnails` so it's
+    # the source of truth most of the time. Falls back to the disk
+    # walk for any channel that has ANY row with has_thumbnail=NULL
+    # (means we haven't done the one-time backfill yet).
+    if not force:
+        try:
+            from . import index as _idx
+            conn = _idx._reader_open() or _idx._open()
+            if conn is not None:
+                with _idx._reader_lock:
+                    # Per-channel: total, sum(has_thumbnail), count NULL.
+                    # NULL count > 0 → channel needs a backfill walk.
+                    db_stats = {}
+                    for r in conn.execute(
+                            "SELECT channel, COUNT(*) AS total, "
+                            "  SUM(CASE WHEN has_thumbnail=1 THEN 1 ELSE 0 END) AS with_thumb, "
+                            "  SUM(CASE WHEN has_thumbnail IS NULL THEN 1 ELSE 0 END) AS unknown "
+                            "FROM videos GROUP BY channel"):
+                        nm = (r[0] or "").lower()
+                        db_stats[nm] = {
+                            "total": int(r[1] or 0),
+                            "with_thumb": int(r[2] or 0),
+                            "unknown": int(r[3] or 0),
+                        }
+                # Apply to channels that have a fully-populated column.
+                # Channels with ANY NULL fall through to the disk walk.
+                for ch in (channels or []):
+                    nm = (ch.get("name") or ch.get("folder") or "").lower()
+                    if not nm:
+                        continue
+                    s = db_stats.get(nm)
+                    if s and s["total"] > 0 and s["unknown"] == 0:
+                        out[nm] = {
+                            "total": s["total"],
+                            "with_thumb": s["with_thumb"],
+                            "missing": max(0, s["total"] - s["with_thumb"]),
+                        }
+        except Exception:
+            pass
+
+    # Pass 1: figure out which channels can use the cache.
+    for ch in (channels or []):
+        folder = _folder_for_channel(ch)
+        name = (ch.get("name") or ch.get("folder") or "").lower()
+        if not folder or not folder.exists() or not name:
+            continue
+        if name in out:
+            # Already filled by the DB fast path above.
+            continue
+        fp = _channel_fingerprint(folder)
+        cached = cache.get(name)
+        if (not force and cached
+                and cached.get("fingerprint") == fp
+                and "total" in cached):
+            out[name] = {
+                "total": cached.get("total", 0),
+                "with_thumb": cached.get("with_thumb", 0),
+                "missing": cached.get("missing", 0),
+            }
+            continue
+        needs_walk.append((ch, folder, name, fp))
+
+    if not needs_walk:
+        return out
+
+    # Pass 2: walk the stale/missing channels in parallel.
+    #
+    # Bug fix (2026-05-14): the previous algorithm checked each mp4
+    # against the .Thumbnails dir SITTING NEXT TO IT, missing thumbs
+    # that lived elsewhere in the same channel (e.g. The PrimeTime
+    # had 2025/.Thumbnails/ containing thumbs for files now in 2023/
+    # and 2024/ after reorg — counter reported "42% thumbnails" when
+    # disk actually held a 1:1 thumb-for-mp4 match). Now we collect
+    # EVERY `[vid_id]` from EVERY .Thumbnails/ in the channel folder
+    # once, then check membership per-mp4.
+    def _count_one(item):
+        ch, folder, name, fp = item
+        total = with_thumb = 0
+        # Collect every video_id present in any .Thumbnails/ under
+        # this channel folder. One folder walk; cheap.
+        all_thumb_vids: set = set()
+        try:
+            id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+            for dp, _dns, fns in os.walk(str(folder)):
+                if os.path.basename(dp) != ".Thumbnails":
+                    continue
+                for fn in fns:
+                    if not fn.lower().endswith(
+                            (".jpg", ".jpeg", ".png", ".webp")):
+                        continue
+                    m = id_re.search(fn)
+                    if m:
+                        all_thumb_vids.add(m.group(1))
+        except Exception:
+            pass
+        # Persist the per-vid has_thumbnail flag so the next call
+        # hits the SQL fast path instead of re-walking. Bulk UPDATE
+        # by `video_id` (channel-scoped to avoid cross-channel
+        # collisions if two channels happen to share an id).
+        rows_for_db: List[Tuple[int, str]] = []
+        try:
+            for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
+                total += 1
+                has = 1 if (vid_id and vid_id in all_thumb_vids) else 0
+                if vid_id:
+                    rows_for_db.append((has, vid_id))
+                if has:
+                    with_thumb += 1
+        except Exception:
+            pass
+        # Write the flag back to the DB. One transaction per channel.
+        try:
+            if rows_for_db:
+                from . import index as _idx
+                _conn = _idx._open()
+                if _conn is not None:
+                    with _idx._db_lock:
+                        _conn.executemany(
+                            "UPDATE videos SET has_thumbnail=? "
+                            "WHERE video_id=?",
+                            rows_for_db)
+                        _conn.commit()
+        except Exception:
+            pass
+        return (name, fp, {
+            "total": total,
+            "with_thumb": with_thumb,
+            "missing": max(0, total - with_thumb),
+        })
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_count_one, item) for item in needs_walk]
+        for fut in as_completed(futures):
+            try:
+                name, fp, stats = fut.result()
+                out[name] = stats
+                # Update cache with fresh values + fingerprint.
+                cache[name] = {
+                    "fingerprint": fp,
+                    "total": stats["total"],
+                    "with_thumb": stats["with_thumb"],
+                    "missing": stats["missing"],
+                    "ts": time.time(),
+                }
+            except Exception:
+                pass
+
+    _save_thumb_cache(cache)
+    return out
+
+
+# TTL cache for the Video-IDs GROUP-BY query. The query itself is
+# usually <1s on a 92k-row table, but caching the result means the
+# Metadata page is instant on every visit instead of running a fresh
+# scan each open. TTL is short (60s) because the videos table churns
+# every time sync downloads a video — long TTL would surface stale
+# numbers right when the user is most likely looking.
+_VIDEO_ID_CACHE_TTL_SEC = 60.0
+_video_id_cache_state: Dict[str, Any] = {"ts": 0.0, "rows": {}}
+# Audit #6: guard concurrent reads/writes from multiple worker threads
+# (Settings > Metadata page loads from JS bridge thread; bulk refresh
+# pipeline running on the sync worker; etc.). Reads + writes are
+# fast (dict copy), so a single Lock is fine — no need for RLock.
+_video_id_cache_lock = threading.Lock()
+
+
+def count_video_id_status_bulk(channels: List[Dict[str, Any]],
+                                  force: bool = False
+                                  ) -> Dict[str, Dict[str, Any]]:
     """Single-query batch version of count_video_id_status.
 
     Returns {channel_name: {total, with_id, missing, tried_failed}}
@@ -1721,9 +2513,29 @@ def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict
     out: Dict[str, Dict[str, Any]] = {}
     if not channels:
         return out
+    # TTL cache shortcut: if the same data was computed recently AND
+    # the caller didn't ask for a force-refresh, return the cached
+    # rows. Avoids hitting the DB on every Metadata-page open.
+    if not force:
+        try:
+            with _video_id_cache_lock:
+                now = time.time()
+                age = now - float(_video_id_cache_state.get("ts") or 0)
+                cached_rows = _video_id_cache_state.get("rows") or {}
+                if cached_rows and age < _VIDEO_ID_CACHE_TTL_SEC:
+                    # Return a shallow copy so callers can't mutate
+                    # cached state from outside the lock.
+                    return dict(cached_rows)
+        except Exception:
+            pass
     try:
         from . import index as _idx
-        conn = _idx._open()
+        # Issue #153 follow-on: route through the read-only `_reader_conn`
+        # so this Settings > Metadata table query never waits behind
+        # sync's `register_video` writers on `_db_lock`. WAL handles
+        # cross-connection serialization. Falls back to the shared
+        # `_conn` if the reader isn't available.
+        conn = _idx._reader_open() or _idx._open()
         if conn is None:
             return out
         # Use GROUP BY on the raw `channel` column (NOT LOWER(channel))
@@ -1732,9 +2544,10 @@ def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict
         # took 30+ seconds per call. Case-folding for cross-case
         # matching happens in Python below — typically no-op since
         # channel names rarely vary in case across rows.
-        with _idx._db_lock:
+        with _idx._reader_lock:
             try:
                 _has_tried_col = True
+                _has_removed_col = True
                 rows = conn.execute(
                     "SELECT channel, "
                     "  COUNT(*) AS total, "
@@ -1742,18 +2555,35 @@ def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict
                     "           THEN 1 ELSE 0 END) AS with_id, "
                     "  SUM(CASE WHEN (video_id IS NULL OR video_id = '') "
                     "           AND id_backfill_tried_ts IS NOT NULL "
-                    "           THEN 1 ELSE 0 END) AS tried "
+                    "           THEN 1 ELSE 0 END) AS tried, "
+                    "  SUM(CASE WHEN removed_from_yt_ts IS NOT NULL "
+                    "           THEN 1 ELSE 0 END) AS removed "
                     "FROM videos GROUP BY channel"
                 ).fetchall()
             except Exception:
-                _has_tried_col = False
-                rows = conn.execute(
-                    "SELECT channel, "
-                    "  COUNT(*) AS total, "
-                    "  SUM(CASE WHEN video_id IS NOT NULL AND video_id != '' "
-                    "           THEN 1 ELSE 0 END) AS with_id "
-                    "FROM videos GROUP BY channel"
-                ).fetchall()
+                # Older DB without removed_from_yt_ts column.
+                _has_removed_col = False
+                try:
+                    _has_tried_col = True
+                    rows = conn.execute(
+                        "SELECT channel, "
+                        "  COUNT(*) AS total, "
+                        "  SUM(CASE WHEN video_id IS NOT NULL AND video_id != '' "
+                        "           THEN 1 ELSE 0 END) AS with_id, "
+                        "  SUM(CASE WHEN (video_id IS NULL OR video_id = '') "
+                        "           AND id_backfill_tried_ts IS NOT NULL "
+                        "           THEN 1 ELSE 0 END) AS tried "
+                        "FROM videos GROUP BY channel"
+                    ).fetchall()
+                except Exception:
+                    _has_tried_col = False
+                    rows = conn.execute(
+                        "SELECT channel, "
+                        "  COUNT(*) AS total, "
+                        "  SUM(CASE WHEN video_id IS NOT NULL AND video_id != '' "
+                        "           THEN 1 ELSE 0 END) AS with_id "
+                        "FROM videos GROUP BY channel"
+                    ).fetchall()
         # Merge case-variant channels in Python (e.g. "MyChan" + "mychan"
         # → one entry under "mychan"). Sums the counts so duplicates from
         # case-drifted rows aren't lost.
@@ -1763,6 +2593,8 @@ def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict
             total = int(r[1] or 0)
             with_id = int(r[2] or 0)
             tried = int(r[3] or 0) if _has_tried_col and len(r) > 3 else 0
+            removed = (int(r[4] or 0) if _has_removed_col and len(r) > 4
+                       else 0)
             cur = out.get(ch_low)
             if cur is None:
                 out[ch_low] = {
@@ -1770,14 +2602,23 @@ def count_video_id_status_bulk(channels: List[Dict[str, Any]]) -> Dict[str, Dict
                     "with_id": with_id,
                     "missing": max(0, total - with_id),
                     "tried_failed": tried,
+                    "removed_from_yt": removed,
                 }
             else:
                 cur["total"] += total
                 cur["with_id"] += with_id
                 cur["missing"] = max(0, cur["total"] - cur["with_id"])
                 cur["tried_failed"] += tried
+                cur["removed_from_yt"] = cur.get("removed_from_yt", 0) + removed
     except Exception:
         return {}
+    # Refresh the TTL cache so the next page-load gets instant data.
+    try:
+        with _video_id_cache_lock:
+            _video_id_cache_state["ts"] = time.time()
+            _video_id_cache_state["rows"] = out
+    except Exception:
+        pass
     return out
 
 
@@ -1809,11 +2650,16 @@ def count_video_id_status(channel: Dict[str, Any]) -> Dict[str, Any]:
         return {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
     try:
         from . import index as _idx
-        conn = _idx._open()
+        # Use the read-only connection so this single-channel fallback
+        # doesn't contend with writers on `_db_lock`. Called from the
+        # Settings > Metadata bulk loader when the GROUP-BY path can't
+        # cover a specific channel (case drift between config name +
+        # DB column).
+        conn = _idx._reader_open() or _idx._open()
         if conn is None:
             return {"total": 0, "with_id": 0, "missing": 0, "tried_failed": 0}
         _pat = str(folder) + "%"
-        with _idx._db_lock:
+        with _idx._reader_lock:
             _total = conn.execute(
                 "SELECT COUNT(*) FROM videos WHERE filepath LIKE ?",
                 (_pat,)).fetchone()[0]
@@ -1889,51 +2735,277 @@ def _norm_title_for_match(s: str) -> str:
     return s.strip()
 
 
+def _probe_file_duration(filepath: str) -> Optional[float]:
+    """Single-file ffprobe call returning duration in seconds. None on
+    any error. Used by _probe_durations_bulk to fill `videos.duration_s`
+    for files that came from the tkinter-era importer (which never
+    probed duration, leaving NULL across the board).
+    """
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1", filepath],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            startupinfo=_startupinfo, env=_utf8_env(),
+            timeout=10, encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    raw = (proc.stdout or "").strip()
+    try:
+        v = float(raw)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _probe_durations_bulk(filepaths: List[str], stream: LogStreamer,
+                          cancel_event: Optional[threading.Event] = None,
+                          pause_event: Optional[threading.Event] = None,
+                          max_workers: int = 6,
+                          ) -> Dict[str, Optional[float]]:
+    """Probe duration for a batch of files in parallel.
+
+    Reason this exists: backfill_video_ids' duration-match strategy
+    needs `local_dur` to disambiguate same-day same-title YT
+    candidates. The tkinter-era importer never populated
+    `videos.duration_s`, so on migrated archives every duration is
+    NULL — strategies that compare against duration get zero data
+    and fail silently. This helper fills the gap with one ffprobe
+    call per file, ~70ms each, parallelized 6-wide → ~12s for 1000
+    files. Results write back to `videos.duration_s` so subsequent
+    runs skip the probe entirely (the SELECT in the caller pulls
+    them out of the DB).
+    """
+    out: Dict[str, Optional[float]] = {}
+    if not filepaths:
+        return out
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _t0 = time.time()
+    _total = len(filepaths)
+    try:
+        stream.emit([[f"  — Probing duration for {_total:,} file(s)"
+                     f" via ffprobe…\n",
+                     ["simpleline", "backfill_progress"]]])
+    except Exception:
+        pass
+    _last_tick = time.time()
+    _done = 0
+    with ThreadPoolExecutor(max_workers=max_workers,
+                            thread_name_prefix="dur-probe") as ex:
+        fut_to_fp = {ex.submit(_probe_file_duration, fp): fp
+                     for fp in filepaths}
+        for fut in as_completed(fut_to_fp):
+            fp = fut_to_fp[fut]
+            try:
+                out[fp] = fut.result()
+            except Exception:
+                out[fp] = None
+            _done += 1
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            _now = time.time()
+            if (_now - _last_tick) >= 1.5 and _done < _total:
+                try:
+                    stream.emit([[f"  — Probing duration "
+                                 f"[{_done:,}/{_total:,}]…\n",
+                                 ["simpleline", "backfill_progress"]]])
+                except Exception:
+                    pass
+                _last_tick = _now
+    # Persist probed durations to the DB so the next pass doesn't
+    # re-probe the same files. One transaction, write only the
+    # successful probes (None values stay NULL — re-probing them is
+    # cheap and might succeed if the file was being written during
+    # the first attempt).
+    try:
+        from . import index as _idx
+        _conn = _idx._open()
+        if _conn is not None:
+            with _idx._db_lock:
+                for _fp, _d in out.items():
+                    if _d is None or _d <= 0:
+                        continue
+                    try:
+                        _conn.execute(
+                            "UPDATE videos SET duration_s=? "
+                            "WHERE filepath=? COLLATE NOCASE "
+                            "AND (duration_s IS NULL OR duration_s<=0)",
+                            (_d, _fp))
+                    except Exception:
+                        pass
+                _conn.commit()
+    except Exception:
+        pass
+    try:
+        _resolved_n = sum(1 for v in out.values() if v and v > 0)
+        stream.emit([[f"  — Probed {_resolved_n:,}/{_total:,} duration(s)"
+                     f" in {time.time() - _t0:.1f}s\n",
+                     ["simpleline", "backfill_progress"]]])
+    except Exception:
+        pass
+    return out
+
+
+def _fetch_per_video_upload_dates(yt: str, vids: List[str],
+                                   stream: LogStreamer,
+                                   cancel_event: Optional[threading.Event] = None,
+                                   pause_event: Optional[threading.Event] = None,
+                                   max_workers: int = 4,
+                                   queues=None,
+                                   ) -> Dict[str, str]:
+    """For each vid, run a per-video yt-dlp extraction to get the real
+    upload_date (YYYYMMDD). Flat-playlist returns "NA" for upload_date,
+    so this is the slow-but-thorough path that THOROUGH backfill mode
+    uses to enable date-confirmed matching for unresolved files.
+
+    Parallelized 4-wide to stay under YouTube's rate-limit. ~3s/vid
+    sequentially → ~0.75s/vid wall-clock with 4 workers. Caller
+    chooses the candidate shortlist; this helper just iterates.
+
+    Returns {vid: "YYYYMMDD" or ""}. Failures are recorded as "" so
+    the caller can tell "tried but didn't get a date" from "never tried".
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    out: Dict[str, str] = {}
+    if not vids:
+        return out
+    _total = len(vids)
+    _t0 = time.time()
+
+    def _fetch_one(vid: str) -> Tuple[str, str]:
+        url = f"https://www.youtube.com/watch?v={vid}"
+        cmd = [yt, "--skip-download", "--no-warnings",
+               "--print", "%(upload_date)s",
+               *_find_cookie_source(), url]
+        try:
+            proc = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                startupinfo=_startupinfo, env=_utf8_env(),
+                timeout=30, encoding="utf-8", errors="replace")
+        except Exception:
+            return (vid, "")
+        raw = (proc.stdout or "").strip()
+        # Accept first valid YYYYMMDD on any line (yt-dlp may emit
+        # multiple lines for live/upcoming videos).
+        for line in raw.splitlines():
+            line = line.strip()
+            if line and len(line) == 8 and line.isdigit():
+                return (vid, line)
+        return (vid, "")
+
+    _last_tick = time.time()
+    _done = 0
+    try:
+        stream.emit([[f"  — Fetching upload_date for {_total:,} candidate"
+                     f"(s) (thorough pass)…\n",
+                     ["simpleline", "backfill_progress"]]])
+    except Exception:
+        pass
+    with ThreadPoolExecutor(max_workers=max_workers,
+                            thread_name_prefix="ud-fetch") as ex:
+        fut_to_vid = {ex.submit(_fetch_one, v): v for v in vids}
+        for fut in as_completed(fut_to_vid):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            if pause_event is not None and pause_event.is_set():
+                # Worker threads don't honor pause mid-call (they're
+                # blocking on subprocess.run), but the AS_COMPLETED
+                # loop can hold off scheduling new work — practical
+                # effect is a brief delay before pause takes hold.
+                while (pause_event.is_set()
+                       and not (cancel_event is not None
+                                and cancel_event.is_set())):
+                    time.sleep(0.25)
+            try:
+                vid, date = fut.result()
+                out[vid] = date
+            except Exception:
+                pass
+            _done += 1
+            _now = time.time()
+            if (_now - _last_tick) >= 2.0 and _done < _total:
+                _ok = sum(1 for v in out.values() if v)
+                try:
+                    stream.emit([[f"  — Thorough fetch "
+                                 f"[{_done:,}/{_total:,}] · "
+                                 f"{_ok:,} dates resolved…\n",
+                                 ["simpleline", "backfill_progress"]]])
+                except Exception:
+                    pass
+                _last_tick = _now
+    try:
+        _ok_n = sum(1 for v in out.values() if v)
+        stream.emit([[f"  — Per-video date fetch: {_ok_n:,}/{_total:,}"
+                     f" resolved in {time.time() - _t0:.1f}s\n",
+                     ["simpleline", "backfill_progress"]]])
+    except Exception:
+        pass
+    return out
+
+
 def backfill_video_ids(channel: Dict[str, Any],
                        stream: LogStreamer,
                        cancel_event: Optional[threading.Event] = None,
                        pause_event: Optional[threading.Event] = None,
                        queues=None,
+                       mode: str = "fast",
                        ) -> Dict[str, Any]:
     """One-shot video_id backfill with multi-strategy resolution.
+
+    `mode="fast"` (default): use yt-dlp --flat-playlist once for the
+    catalog (NA upload_date but real duration), ffprobe local files
+    for duration, then run the title + duration strategies. The
+    date-confirmed strategies still run but contribute ~0 because
+    flat-playlist returns NA dates — they're harmless. Typical
+    runtime 30-120s for a 1000-file channel.
+
+    `mode="thorough"`: after the fast pass, take every file still
+    unresolved, build a token-prefiltered shortlist of YT candidate
+    vids per file, do a per-video yt-dlp call for each candidate
+    vid (~3s sequential, ~0.75s 4-wide parallel) to fetch real
+    upload_date, then re-run the date-confirmed strategies. Adds
+    minutes-to-hours depending on unresolved count, but resolves
+    the rename-heavy + same-duration-collision case that fast
+    can't (e.g. daily late-night shows with constant ~13min run
+    time).
 
     For every on-disk file without a video_id in the DB, try in order:
 
       1. `.info.json` sidecar (zero-cost, no network)
       2. Exact normalized-title match against YouTube's current
          flat-playlist
-      3. Substring title match (local title subset of YT title, or
-         vice-versa) when the single candidate is unambiguous
-      4. Upload-date match (file mtime YYYYMMDD → YT upload_date),
+      3. Duration match (NEW): unique YT vid whose duration is
+         within ±2s of the local file's ffprobe'd duration. The
+         channel-level "EWU Bodycam" case where renamed titles
+         leave 26% via exact match alone but durations are unique
+         to the second is the textbook win for this strategy.
+      4. Substring title match (local title subset of YT title, or
+         vice-versa) — requires date confirmation, so silent on
+         fast mode but contributes in thorough mode
+      5. Upload-date match (file mtime YYYYMMDD → YT upload_date),
          disambiguated by duration when >1 candidate exists
-      5. Fuzzy title match via difflib.get_close_matches (0.80
-         cutoff, rejects ambiguous near-ties)
-      6. Stamp `id_backfill_tried_ts` so the UI can distinguish
+      6. Fuzzy title match via difflib.get_close_matches (0.80
+         cutoff, rejects ambiguous near-ties; high-confidence-no-
+         date escape at 0.95)
+      7. Stamp `id_backfill_tried_ts` so the UI can distinguish
          "tried but genuinely unresolvable" from "not yet attempted"
 
-    This is the dedicated fix for archives where title-rename,
-    suffix-add, or emoji-drift on the channel side has silently
-    broken the cheap exact-match path. Counts so small that
-    exact-match alone gets <20% (e.g. late-night TV channels with
-    systematic " | The Late Show" suffix additions).
-
-    Returns {ok, resolved, resolved_by_info_json, resolved_by_exact,
-             resolved_by_substring, resolved_by_date,
-             resolved_by_fuzzy, already_set, ambiguous,
-             unresolved_now_tried, took}.
+    Returns {ok, resolved, resolved_by, already_set, ambiguous,
+             unresolved_now_tried, took, mode}.
     """
     folder = _folder_for_channel(channel)
     if folder is None:
-        stream.emit_error("Backfill: output_dir is not configured.")
+        stream.emit_error("Archive folder isn't configured. Set it in Settings → General.")
         return {"ok": False, "error": "no output_dir"}
     yt = find_yt_dlp()
     if not yt:
-        stream.emit_error("Backfill: yt-dlp not found.")
+        stream.emit_error("Can't look up missing video IDs — the download tool (yt-dlp) isn't installed.")
         return {"ok": False, "error": "yt-dlp missing"}
     name = channel.get("name") or channel.get("folder") or "?"
     ch_url = (channel.get("url") or "").strip()
     if not ch_url:
-        stream.emit_error(f"Backfill: {name} has no URL.")
+        stream.emit_error(f"{name} has no channel URL on file — can't look up missing video IDs.")
         return {"ok": False, "error": "no url"}
 
     stream.emit([["  \u2014 ", "meta_bracket"],
@@ -1963,6 +3035,11 @@ def backfill_video_ids(channel: Dict[str, Any],
     norm_title_to_vid: Dict[str, str] = {}
     # Map vid → duration (seconds) for disambiguation
     vid_to_duration: Dict[str, Optional[float]] = {}
+    # Inverse: integer-seconds duration → list of vids. The
+    # duration-match strategy (Strategy 3) hits this. Bucketed at
+    # 1-second resolution; the match function then sweeps ±2s
+    # buckets to handle re-encode drift.
+    duration_bucket_to_vids: Dict[int, List[str]] = {}
 
     for _vid, _stats in bulk.items():
         _raw_title = _stats.get("title") or ""
@@ -1988,6 +3065,9 @@ def backfill_video_ids(channel: Dict[str, Any],
         if _upload and len(_upload) == 8 and _upload.isdigit():
             date_to_cands.setdefault(_upload, []).append(
                 (_vid, _nt, _dur_f))
+        if _dur_f is not None and _dur_f > 0:
+            duration_bucket_to_vids.setdefault(
+                int(round(_dur_f)), []).append(_vid)
 
     # ── Scan on-disk videos + resolution passes ──────────────────────
 
@@ -2012,11 +3092,85 @@ def backfill_video_ids(channel: Dict[str, Any],
     already_set = 0
     ambiguous_hits = 0
     unresolved = 0
-    resolved_by = {"info_json": 0, "exact": 0, "substring": 0,
-                   "date": 0, "fuzzy": 0}
+    resolved_by = {"info_json": 0, "exact": 0, "duration": 0,
+                   "substring": 0, "date": 0, "fuzzy": 0,
+                   "thorough_substring": 0, "thorough_date": 0,
+                   "thorough_fuzzy": 0}
     to_backfill: List[Tuple[str, str, str]] = []  # (filepath, vid, how)
     # Files that failed every strategy — stamp the tried timestamp.
     tried_failed_paths: List[str] = []
+
+    # ── Local duration backfill (always runs in both modes) ──────────
+    # Tkinter-era archives have NULL duration_s on every migrated row,
+    # which kills the new duration-match strategy AND strategy 4's
+    # multi-candidate disambiguation. ffprobe what's missing — write
+    # back to the DB so subsequent runs skip the probe.
+    _files_without_vid = [_fp for (_v, _t, _y, _m, _fp) in on_disk
+                          if not _v]
+    _files_needing_probe = [_fp for _fp in _files_without_vid
+                            if _local_durations.get(os.path.normpath(_fp))
+                            is None]
+    if _files_needing_probe:
+        _probed = _probe_durations_bulk(_files_needing_probe, stream,
+                                         cancel_event=cancel_event,
+                                         pause_event=pause_event)
+        for _fp, _d in _probed.items():
+            if _d is not None and _d > 0:
+                _local_durations[os.path.normpath(_fp)] = _d
+
+    # Helper used by Strategy 3 (duration match). Returns the unique
+    # YT vid whose duration is within ±2s of the local file's, OR ""
+    # if zero / multiple candidates exist (with title-similarity
+    # tiebreak for the multi case when there's a clear winner).
+    def _find_duration_match(local_dur: Optional[float],
+                              needle_nt: str) -> str:
+        if local_dur is None or local_dur <= 0:
+            return ""
+        # Sweep ±2 second buckets around the local duration.
+        _center = int(round(local_dur))
+        cands: List[str] = []
+        for _off in (-2, -1, 0, 1, 2):
+            for _v in duration_bucket_to_vids.get(_center + _off, []):
+                _ydur = vid_to_duration.get(_v)
+                if _ydur is None:
+                    continue
+                if abs(_ydur - local_dur) <= 2.0:
+                    cands.append(_v)
+        if not cands:
+            return ""
+        # De-dup (a vid could land in two adjacent buckets via int
+        # rounding) but keep order so the "first match" path is stable.
+        seen: set = set()
+        uniq: List[str] = []
+        for _v in cands:
+            if _v not in seen:
+                seen.add(_v)
+                uniq.append(_v)
+        if len(uniq) == 1:
+            return uniq[0]
+        # Multiple duration-near-ties. Only accept if there's a clear
+        # title-similarity winner — otherwise fall through to other
+        # strategies. Scott's "I'd rather have missing info than
+        # incorrect info" rule applies here too.
+        if not needle_nt:
+            return ""
+        from difflib import SequenceMatcher
+        scored = []
+        for _v in uniq:
+            _yt = _norm_title_for_match(bulk.get(_v, {}).get("title") or "")
+            if not _yt:
+                continue
+            _r = SequenceMatcher(None, needle_nt, _yt).ratio()
+            scored.append((_v, _r))
+        if not scored:
+            return ""
+        scored.sort(key=lambda r: r[1], reverse=True)
+        # Need top ≥ 0.50 AND ≥ 0.15 clear of #2.
+        if scored[0][1] < 0.50:
+            return ""
+        if len(scored) >= 2 and (scored[0][1] - scored[1][1]) < 0.15:
+            return ""
+        return scored[0][0]
 
     def _days_diff(d1: str, d2: str) -> Optional[int]:
         """Return |d1 - d2| in days for two YYYYMMDD strings. None on
@@ -2306,7 +3460,21 @@ def backfill_video_ids(channel: Dict[str, Any],
                 resolved_by["exact"] += 1
                 continue
 
-        # Strategy 3: substring (date-checked)
+        # Strategy 3 (NEW): duration match. Flat-playlist gives us
+        # CLEAN per-second durations on every YT video; ffprobe gives
+        # us clean local durations. When the local duration uniquely
+        # matches one YT video within ±2s, accept — no date check
+        # needed. For the EWU Bodycam case (~1 full + few shorts/day,
+        # wildly different durations) this is the textbook win.
+        _local_dur = _local_durations.get(os.path.normpath(_fp))
+        if _local_dur is not None and _local_dur > 0:
+            _by_dur = _find_duration_match(_local_dur, _nt)
+            if _by_dur:
+                to_backfill.append((_fp, _by_dur, "duration"))
+                resolved_by["duration"] += 1
+                continue
+
+        # Strategy 4: substring (date-checked)
         if _nt:
             _sub = _find_substring_match(_nt, _local_day)
             if _sub:
@@ -2314,15 +3482,14 @@ def backfill_video_ids(channel: Dict[str, Any],
                 resolved_by["substring"] += 1
                 continue
 
-        # Strategy 4: date (single-candidate, or duration-disambiguated)
-        _local_dur = _local_durations.get(os.path.normpath(_fp))
+        # Strategy 5: date (single-candidate, or duration-disambiguated)
         _by_date = _find_date_match(_fp, _local_dur)
         if _by_date:
             to_backfill.append((_fp, _by_date, "date"))
             resolved_by["date"] += 1
             continue
 
-        # Strategy 5: fuzzy difflib (date-checked)
+        # Strategy 6: fuzzy difflib (date-checked)
         if _nt:
             _fuzzy = _find_fuzzy_match(_nt, _local_day)
             if _fuzzy:
@@ -2336,6 +3503,131 @@ def backfill_video_ids(channel: Dict[str, Any],
         else:
             unresolved += 1
         tried_failed_paths.append(_fp)
+
+    # ── Thorough mode: per-video upload_date fetch for unresolved ────
+    # Only runs when mode == "thorough" AND there's something the
+    # fast pass couldn't resolve. Builds a candidate-vid union from
+    # the token shortlists of each unresolved file's normalized title,
+    # then fetches per-video upload_date for those (typically far
+    # fewer than the full catalog). With real upload_dates in hand,
+    # re-runs strategies 4-6 only for the unresolved files.
+    _thorough_attempted = False
+    if (mode == "thorough" and tried_failed_paths
+            and not (cancel_event is not None and cancel_event.is_set())):
+        _thorough_attempted = True
+        # Snapshot unresolved files' data (we no longer have the
+        # _t, _y, _m, _fp tuple at this point).
+        _unresolved_meta: List[Tuple[str, str, str]] = []
+        # Re-derive (filepath, norm_title, local_day) for each.
+        _unres_set = set(tried_failed_paths)
+        for (_v0, _t0, _y0, _m0, _fp0) in on_disk:
+            if _fp0 not in _unres_set:
+                continue
+            _nt0 = _norm_title_for_match(_t0)
+            try:
+                import datetime as _dt
+                _ld0 = _dt.datetime.fromtimestamp(
+                    os.path.getmtime(_fp0)).strftime("%Y%m%d")
+            except Exception:
+                _ld0 = ""
+            _unresolved_meta.append((_fp0, _nt0, _ld0))
+
+        # Union of token-shortlists across all unresolved files.
+        # Each unresolved file contributes up to ~20 candidates;
+        # heavy token overlap keeps the union much smaller than
+        # (#unresolved * 20).
+        _candidate_vids: set = set()
+        for (_fp0, _nt0, _ld0) in _unresolved_meta:
+            if not _nt0:
+                continue
+            _toks = [t for t in _nt0.split() if len(t) >= 3]
+            if len(_toks) < 2:
+                continue
+            from collections import Counter as _Counter
+            _c: _Counter = _Counter()
+            for _tok in _toks:
+                if _tok in token_to_vids:
+                    for _vc in token_to_vids[_tok]:
+                        _c[_vc] += 1
+            # Threshold ≥ 2 shared tokens (same as substring/fuzzy
+            # prefilter). Cap at top 20 per file to avoid runaway
+            # candidate sets on titles with many common tokens.
+            _shortlist = [v for v, n in _c.most_common(20) if n >= 2]
+            _candidate_vids.update(_shortlist)
+        # Also include vids that share a duration bucket with any
+        # unresolved file's local duration — captures the case
+        # where Strategy 3 had a multi-match and bailed without a
+        # clear title winner. Adds dates so Strategy 5 might bite.
+        for (_fp0, _nt0, _ld0) in _unresolved_meta:
+            _ld = _local_durations.get(os.path.normpath(_fp0))
+            if _ld is None or _ld <= 0:
+                continue
+            _ctr = int(round(_ld))
+            for _off in (-2, -1, 0, 1, 2):
+                _candidate_vids.update(
+                    duration_bucket_to_vids.get(_ctr + _off, []))
+        # Strip vids that already have an upload_date (no point
+        # re-fetching).
+        _candidate_vids = {v for v in _candidate_vids
+                           if not (bulk.get(v, {}).get("upload_date") or "")
+                              .strip().isdigit()
+                           or len((bulk.get(v, {}).get("upload_date")
+                                   or "").strip()) != 8}
+        _cand_list = sorted(_candidate_vids)
+        if _cand_list:
+            _yt = find_yt_dlp()
+            _fetched = _fetch_per_video_upload_dates(
+                _yt, _cand_list, stream,
+                cancel_event=cancel_event, pause_event=pause_event,
+                queues=queues)
+            # Patch upload_date back into `bulk` and rebuild
+            # date_to_cands so the date-checked strategies have
+            # data to work with.
+            for _vid, _date in _fetched.items():
+                if _date and len(_date) == 8 and _date.isdigit():
+                    if _vid in bulk:
+                        bulk[_vid]["upload_date"] = _date
+                    date_to_cands.setdefault(_date, []).append(
+                        (_vid,
+                         _norm_title_for_match(
+                             bulk.get(_vid, {}).get("title") or ""),
+                         vid_to_duration.get(_vid)))
+
+            # Re-run strategies 4-6 for unresolved files with new dates.
+            _still_unresolved: List[str] = []
+            for (_fp0, _nt0, _ld0) in _unresolved_meta:
+                if cancel_event is not None and cancel_event.is_set():
+                    _still_unresolved.append(_fp0)
+                    continue
+                _ldur = _local_durations.get(os.path.normpath(_fp0))
+                # Strategy 4 retry (substring + real date)
+                if _nt0:
+                    _sub2 = _find_substring_match(_nt0, _ld0)
+                    if _sub2:
+                        to_backfill.append((_fp0, _sub2, "thorough_substring"))
+                        resolved_by["thorough_substring"] += 1
+                        continue
+                # Strategy 5 retry (date + duration)
+                _by_date2 = _find_date_match(_fp0, _ldur)
+                if _by_date2:
+                    to_backfill.append((_fp0, _by_date2, "thorough_date"))
+                    resolved_by["thorough_date"] += 1
+                    continue
+                # Strategy 6 retry (fuzzy + real date)
+                if _nt0:
+                    _fz2 = _find_fuzzy_match(_nt0, _ld0)
+                    if _fz2:
+                        to_backfill.append((_fp0, _fz2, "thorough_fuzzy"))
+                        resolved_by["thorough_fuzzy"] += 1
+                        continue
+                _still_unresolved.append(_fp0)
+            # Update counters now that some unresolved files got
+            # resolved via the thorough pass.
+            _newly_resolved_thorough = (resolved_by["thorough_substring"]
+                                        + resolved_by["thorough_date"]
+                                        + resolved_by["thorough_fuzzy"])
+            unresolved = max(0, unresolved - _newly_resolved_thorough)
+            tried_failed_paths = _still_unresolved
 
     resolved = sum(resolved_by.values())
 
@@ -2373,7 +3665,7 @@ def backfill_video_ids(channel: Dict[str, Any],
                         pass
                 conn.commit()
     except Exception as _e:
-        stream.emit_error(f"Backfill DB write failed: {_e}")
+        stream.emit_error(f"Couldn't save the recovered video IDs: {_e}")
 
     took = time.time() - t0
     _parts = []
@@ -2384,12 +3676,19 @@ def backfill_video_ids(channel: Dict[str, Any],
             _breakdown_bits.append(f"{resolved_by['info_json']} .info.json")
         if resolved_by["exact"]:
             _breakdown_bits.append(f"{resolved_by['exact']} exact")
+        if resolved_by["duration"]:
+            _breakdown_bits.append(f"{resolved_by['duration']} duration")
         if resolved_by["substring"]:
             _breakdown_bits.append(f"{resolved_by['substring']} substring")
         if resolved_by["date"]:
             _breakdown_bits.append(f"{resolved_by['date']} date+dur")
         if resolved_by["fuzzy"]:
             _breakdown_bits.append(f"{resolved_by['fuzzy']} fuzzy")
+        _thorough_total = (resolved_by["thorough_substring"]
+                           + resolved_by["thorough_date"]
+                           + resolved_by["thorough_fuzzy"])
+        if _thorough_total:
+            _breakdown_bits.append(f"{_thorough_total} thorough")
         if _breakdown_bits:
             _parts.append("(" + ", ".join(_breakdown_bits) + ")")
     if already_set:
@@ -2436,6 +3735,8 @@ def backfill_video_ids(channel: Dict[str, Any],
         "unresolved": unresolved,
         "unresolved_now_tried": len(tried_failed_paths),
         "took": took,
+        "mode": mode,
+        "thorough_attempted": _thorough_attempted,
     }
 
 
@@ -2626,13 +3927,13 @@ def fetch_channel_metadata(channel: Dict[str, Any],
 
     folder = _folder_for_channel(channel)
     if folder is None:
-        stream.emit_error("Metadata: output_dir is not configured.")
+        stream.emit_error("Archive folder isn't configured. Set it in Settings → General.")
         return {"ok": False, "error": "no output_dir"}
     folder.mkdir(parents=True, exist_ok=True)
 
     yt = find_yt_dlp()
     if not yt:
-        stream.emit_error("Metadata: yt-dlp not found.")
+        stream.emit_error("Can't refresh video info — the download tool (yt-dlp) isn't installed.")
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
@@ -2764,12 +4065,42 @@ def fetch_channel_metadata(channel: Dict[str, Any],
     missing_meta = sum(1 for vid in on_disk_ids if vid not in have_meta)
     missing_thumb = sum(1 for vid in on_disk_ids if vid not in have_thumb)
     _perm_failed = sum(1 for vid in on_disk_ids if vid in _failed_fetch)
+    # FIX (2026-05-14): the ratio used to read `len(have_meta)/len(on_disk_ids)`
+    # which was misleading because `have_meta` includes orphan files for
+    # videos no longer on disk. Example seen with ColdFusion:
+    #   `metadata: 513/512 (0 missing)` \u2014 513 metadata files but only
+    #    512 unique video IDs on disk; 1 orphan metadata file.
+    #   `thumbnails: 497/512 (20 missing)` \u2014 497 thumbs but only 492
+    #    match current videos (5 orphan); display claimed 20 missing
+    #    but 512-497=15 didn't math.
+    # Now X = covered (videos WITH the asset), Y = total on-disk videos,
+    # so X/Y is a real coverage ratio and X + missing = Y always holds.
+    # Orphan files get their own callout when present.
+    n_videos = len(on_disk_ids)
+    covered_meta = n_videos - missing_meta
+    covered_thumb = n_videos - missing_thumb
+    orphan_meta = max(0, len(have_meta) - covered_meta)
+    orphan_thumb = max(0, len(have_thumb) - covered_thumb)
+    def _coverage_str(label: str, covered: int, total: int,
+                       missing: int, orphan: int) -> str:
+        s = f"{label}: {covered:,}/{total:,}"
+        if missing and orphan:
+            s += f" ({missing:,} missing, {orphan:,} stale)"
+        elif missing:
+            s += f" ({missing:,} missing)"
+        elif orphan:
+            s += f" \u2713 ({orphan:,} stale)"
+        else:
+            s += " \u2713"
+        return s
+    _meta_str = _coverage_str("metadata", covered_meta, n_videos,
+                               missing_meta, orphan_meta)
+    _thumb_str = _coverage_str("thumbnails", covered_thumb, n_videos,
+                                missing_thumb, orphan_thumb)
     _parts = [
         f"{len(on_disk):,} on disk \u00b7 "
-        f"metadata: {len(have_meta):,}/{len(on_disk_ids):,} "
-        f"({missing_meta} missing) \u00b7 "
-        f"thumbnails: {len(have_thumb):,}/{len(on_disk_ids):,} "
-        f"({missing_thumb} missing)"
+        f"{_meta_str} \u00b7 "
+        f"{_thumb_str}"
     ]
     if _perm_failed:
         _parts.append(f"{_perm_failed:,} previously failed (skipped)")

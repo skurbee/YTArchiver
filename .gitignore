@@ -8,6 +8,11 @@ dist/
 
 # Claude Code hooks / deploy flag
 .claude/
+CLAUDE.md
+Map.md
+
+# Old monolith snapshot, kept locally for reference
+Classic Tkinter ver/
 
 # OS
 .DS_Store

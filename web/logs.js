@@ -57,6 +57,8 @@
     // Priority order for per-job / per-row markers.
     const priorityPrefixes = [
       "tx_done_",
+      "meta_done_",
+      "compress_done_",
       "whisper_job_",
       "sync_row_",
       "dlrow_",
@@ -110,15 +112,33 @@
   // "preload". Sweep slot carries disk-scan / indexing progress;
   // preload slot carries the browse-tab preload progress. They can
   // both run in parallel, so both slots may be visible at once.
+  // Auto-dismiss timers keyed by slot, so a long-lived "Browse preload
+  // complete: …" doesn't stick on-screen forever. Cleared whenever new
+  // text comes in, so progress updates aren't pre-emptively hidden.
+  const _indicatorTimers = {};
   window._setIndicator = function (slot, text) {
     const el = document.getElementById("browse-preload-slot-" + slot);
     if (!el) return;
+    if (_indicatorTimers[slot]) {
+      clearTimeout(_indicatorTimers[slot]);
+      _indicatorTimers[slot] = null;
+    }
     if (!text) {
       el.hidden = true;
       el.textContent = "";
     } else {
       el.hidden = false;
       el.textContent = text;
+      // Terminal "complete" lines fade after 45s. Active progress
+      // ("Preloading …", "Scanning …") stays visible.
+      if (/\bcomplete\b/i.test(text)) {
+        _indicatorTimers[slot] = setTimeout(() => {
+          if (!el) return;
+          el.hidden = true;
+          el.textContent = "";
+          _indicatorTimers[slot] = null;
+        }, 45000);
+      }
     }
   };
   // Back-compat shim for any caller still using the pre-split name.
@@ -346,15 +366,32 @@
     // `tertiary` is the new 3rd count cell added for consolidated [Dwnld]
     // rows — `N metadata`. Classic rows (Trnscr, Metdta, etc.) leave it
     // empty so the grid just renders a blank cell there.
+    // Em-dash separators between cells. To keep [Metdta] rows clean
+    // (their secondary/tertiary cells are empty), only emit the dash
+    // when the cell to the RIGHT has content \u2014 that way an empty
+    // secondary doesn't print "\u2014 \u2014" floating in the middle. Grid
+    // columns still exist (so vertical alignment across row kinds
+    // stays consistent); only the dash glyph appears conditionally.
+    const dash = (hasNext) =>
+      cell(hasNext ? "\u2014" : "", "hist-col-dash", false);
+    const _hasSecondary = !!(c.secondary && String(c.secondary).trim());
+    const _hasTertiary  = !!(c.tertiary  && String(c.tertiary).trim());
+    const _hasErrors    = !!(c.errors    && String(c.errors).trim());
+    const _hasTook      = !!(c.took      && String(c.took).trim());
+
     line.appendChild(cell(`[${c.kind || ""}]`, "hist-col-kind", true));
     line.appendChild(cell(c.time_date || "", "hist-col-time", false));
-    line.appendChild(cell("\u2014", "hist-col-dash", false));
+    line.appendChild(dash(true));  // always show before channel
     line.appendChild(cell(c.channel || "", "hist-col-channel", false));
-    line.appendChild(cell("\u2014", "hist-col-dash", false));
+    line.appendChild(dash(true));  // always show before primary
     line.appendChild(cell(c.primary || "", "hist-col-num", true));
+    line.appendChild(dash(_hasSecondary));
     line.appendChild(_buildHistCell(c.secondary || "", "hist-col-num", false, tagCls));
+    line.appendChild(dash(_hasTertiary));
     line.appendChild(_buildHistCell(c.tertiary || "", "hist-col-num", false, tagCls));
+    line.appendChild(dash(_hasErrors));
     line.appendChild(_buildHistCell(c.errors || "", "hist-col-num", false, tagCls));
+    line.appendChild(dash(_hasTook));
     line.appendChild(cell(c.took || "", "hist-col-took", false));
     return line;
   }
@@ -382,15 +419,31 @@
    * audit E-18: mirror the main-log cap/keep behavior so the activity
    * log doesn't grow unbounded. User windows often stay open for days;
    * without a cap this DOM node accumulates until the layout engine
-   * starts struggling. cap=4000 / keep=2500 gives 1500 lines of
-   * headroom between trims.
+   * starts struggling.
+   *
+   * 2026-05-14: bumped cap from 4000/2500 → 30000/25000. With 105+
+   * channels syncing multiple times a day, plus per-channel metadata
+   * rows + thumbnail refetch rows, 2500 lines = maybe one day of
+   * activity. User asked for "way larger" — 30k holds weeks of
+   * structured rows without the layout engine breaking a sweat
+   * (rows are static text + classes, no event listeners).
    */
   window.appendActivityLog = function (entry) {
     const el = document.getElementById("activity-log");
     if (!el) return;
     wireUserScrollDetection(el);
-    el.appendChild(buildActivityRow(entry));
-    const cap = 4000, keep = 2500;
+    const row = buildActivityRow(entry);
+    el.appendChild(row);
+    // Issue #159: don't trust entry.alt — the backend can lose track
+    // after long sessions, leaving same-color rows adjacent. Compute
+    // parity from the actual prior row in the DOM each append.
+    try {
+      const prev = row.previousElementSibling;
+      const prevAlt = prev && prev.classList.contains("hist_row_alt");
+      if (prevAlt) row.classList.remove("hist_row_alt");
+      else row.classList.add("hist_row_alt");
+    } catch (_e) { /* non-fatal */ }
+    const cap = 30000, keep = 25000;
     if (el.childElementCount > cap) {
       const toRemove = el.childElementCount - keep;
       for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
@@ -614,6 +667,25 @@
             continue;
           }
           const line = buildLine(segs);
+          // .txt request: when a whisper_pct segment goes by AND a
+          // Watch-view retranscribe is in flight, surface the
+          // percentage onto the retranscribe button. Cheap — we just
+          // skim the segment tags and text for the active job.
+          try {
+            if (window._retranscribeWatchVideoId) {
+              for (const _sg of segs) {
+                if (!Array.isArray(_sg) || _sg.length < 2) continue;
+                const _tag = _sg[1];
+                const tags = Array.isArray(_tag) ? _tag : [_tag];
+                if (!tags.includes("whisper_pct")) continue;
+                const _m = String(_sg[0] || "").match(/(\d+)\s*%/);
+                if (_m && window._retranscribeWatchUpdateProgress) {
+                  window._retranscribeWatchUpdateProgress(_m[1]);
+                }
+                break;
+              }
+            }
+          } catch (_pe) { /* non-fatal */ }
           const inplaceKind = _inplaceKind(segs);
           if (inplaceKind) {
             line.dataset.inplace = inplaceKind;
@@ -753,14 +825,31 @@
         tr.dataset.pendingRedownload = "1";
         if (r._redownload_res) tr.dataset.redownloadRes = r._redownload_res;
       }
+      // Per-cell tooltips for the mark columns. The header already
+      // explains the legend, but cell-level tips give a 1-line spec to
+      // the exact value the user is hovering. UI audit 2026-05-14:
+      // Scott didn't know what "A ✓" meant without context.
+      const _markTip = (label, v) => {
+        const s = String(v || "").trim();
+        if (s.startsWith("A ")) return `${label}: auto-${label.toLowerCase()} is ON and the channel is fully ${label.toLowerCase()}d`;
+        if (s.startsWith("✓") || s.startsWith("✓")) return `${label}: complete (auto-${label.toLowerCase()} is OFF — done manually)`;
+        if (s.includes("-")) return `${label}: ${s.match(/-(\d+)/)?.[1] || "?"} videos behind`;
+        if (s === "—" || s === "—") return `${label}: not configured for this channel`;
+        return label;
+      };
+      const _compressTip = (v) => {
+        const s = String(v || "").trim();
+        if (s.startsWith("✓") || s.startsWith("✓")) return "Compress: ON (videos will be re-encoded to AV1 to save space)";
+        return "Compress: OFF";
+      };
       tr.innerHTML = `
         <td class="col-folder">${escapeHtml(r.folder)}${dot}</td>
         <td>${escapeHtml(r.res)}</td>
         <td>${escapeHtml(r.min)}</td>
         <td>${escapeHtml(r.max)}</td>
-        <td class="col-mark">${escapeHtml(r.compress)}</td>
-        <td class="col-mark">${escapeHtml(r.transcribe)}</td>
-        <td class="col-mark">${escapeHtml(r.metadata)}</td>
+        <td class="col-mark" title="${escapeHtml(_compressTip(r.compress))}">${escapeHtml(r.compress)}</td>
+        <td class="col-mark" title="${escapeHtml(_markTip("Transcribe", r.transcribe))}">${escapeHtml(r.transcribe)}</td>
+        <td class="col-mark" title="${escapeHtml(_markTip("Metadata", r.metadata))}">${escapeHtml(r.metadata)}</td>
         <td>${escapeHtml(r.last_sync)}</td>
         <td>${escapeHtml(r.n_vids)}</td>
         <td>${escapeHtml(r.size)}</td>
@@ -881,12 +970,15 @@
     // Row click selection — supports Ctrl/Shift multi-select
     const allRows = [...tbody.querySelectorAll("tr")];
 
-    // Show/hide Clear list + Delete File buttons based on rows
+    // Show/hide Clear list + Delete File buttons based on rows.
+    // Use the [hidden] attribute (audit #6) instead of inline
+    // style.display so they respect the global [hidden] rule and
+    // don't fight CSS specificity.
     const hasItems = allRows.length > 0;
     const clearBtn = document.getElementById("btn-clear-recent");
     const delBtn = document.getElementById("btn-delete-file");
-    if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
-    if (delBtn) delBtn.style.display = "none"; // revealed when a row is selected
+    if (clearBtn) clearBtn.hidden = !hasItems;
+    if (delBtn) delBtn.hidden = true; // revealed when a row is selected
 
     let lastClickedIdx = -1;
     allRows.forEach((tr, idx) => {
@@ -907,7 +999,7 @@
         lastClickedIdx = idx;
         const any = tbody.querySelectorAll("tr.row-selected").length;
         if (delBtn) {
-          delBtn.style.display = any ? "" : "none";
+          delBtn.hidden = !any;
           delBtn.textContent = any > 1 ? `Delete ${any} files` : "Delete File";
         }
       });
@@ -971,11 +1063,12 @@
 
     // Button visibility — Clear list follows "has items", Delete File is
     // hidden in grid mode since there's no card-selection UX.
+    // Use [hidden] attribute (audit #6) for the same reasons as above.
     const hasItems = rows.length > 0;
     const clearBtn = document.getElementById("btn-clear-recent");
     const delBtn = document.getElementById("btn-delete-file");
-    if (clearBtn) clearBtn.style.display = hasItems ? "" : "none";
-    if (delBtn) delBtn.style.display = "none";
+    if (clearBtn) clearBtn.hidden = !hasItems;
+    if (delBtn) delBtn.hidden = true;
   }
 
   /** Render the queue popovers for Sync Tasks + GPU Tasks. */
@@ -1007,6 +1100,15 @@
     sync: _queueState.sync.slice(),
     gpu: _queueState.gpu.slice(),
   });
+  // Issue #155 helper: is ANY sync task currently running on the worker?
+  // Used by the Subs context menu to decide between "Sync now" and
+  // "Add to Sync queue" labels.
+  window._anySyncRunning = () => {
+    for (const t of _queueState.sync) {
+      if ((t?.status || "") === "running") return true;
+    }
+    return false;
+  };
   // Convenience: does `channelName` have a sync queued? (running or queued)
   window._queueHasSyncForChannel = (channelName) => {
     const n = (channelName || "").toLowerCase();
@@ -1484,6 +1586,13 @@
   function _buildVideoCard(v, onVideoClick) {
     const card = document.createElement("div");
     card.className = "video-card";
+    // Flag visually + via data attr so CSS can fade the card, add a
+    // strikethrough on the title, and overlay a corner badge.
+    if (v.removed_from_yt) {
+      card.classList.add("video-card-removed");
+      card.dataset.removedFromYt = "1";
+      card.title = "No longer on YouTube — uploader removed / privated / unlisted this video. Your local file is preserved.";
+    }
     card.dataset.filepath = v.filepath || "";
     card.dataset.videoId = v.video_id || "";
     card.dataset.title = v.title || "";
@@ -1496,10 +1605,14 @@
       ? `<img class="video-thumb-img" src="${v.thumbnail_url}" alt=""
               loading="lazy" decoding="async" />`
       : "";
+    const removedBadge = v.removed_from_yt
+      ? '<span class="video-removed-badge" title="No longer on YouTube">✗ Removed from YT</span>'
+      : "";
     card.innerHTML = `
       <div class="video-thumb" style="${hasThumb ? '' : `background: ${gradientFor(v.title)};`}">
         ${imgTag}
         ${hasThumb ? '' : '<span>&#9654;</span>'}
+        ${removedBadge}
         <span class="video-duration-badge"></span>
       </div>
       <div class="video-card-body">
@@ -1812,6 +1925,10 @@
    * static/app.js:1209-1221. */
   window._onRetranscribeComplete = async function (payload) {
     try {
+      // .txt request: clear the "Re-transcribing… NN%" button state
+      // when the job completes (success OR failure — either way the
+      // worker emitted a final event).
+      try { window._retranscribeWatchClear?.(); } catch {}
       const { video_id, filepath } = payload || {};
       const wv = document.getElementById("view-watch");
       if (!wv || wv.style.display === "none") return;
@@ -2004,8 +2121,11 @@
       banner.appendChild(dot);
       // Raw like "WHISPER small" or "WHISPER:small" — pull everything
       // after the first whitespace/colon as the model label.
+      // Strip internal "+NO-PUNCT" diagnostic \u2014 users don't need to see
+      // that tag in the displayed model name (issue #151).
       const parts = (raw || "").trim().split(/[\s:]+/);
-      const model = parts.length > 1 ? parts.slice(1).join(" ") : "";
+      let model = parts.length > 1 ? parts.slice(1).join(" ") : "";
+      model = model.replace(/\+no-?punct/gi, "").trim();
       const txt = document.createElement("span");
       txt.textContent = model
         ? `Whisper transcription \u2014 ${model.toLowerCase()} model`
@@ -2221,6 +2341,32 @@
     if (!vEl) return;
     const fp = video.filepath || "";
     const api = window.pywebview?.api;
+    // Race-token check: capture _watchOpenToken at entry so we can
+    // detect "user navigated away during URL fetch". Before this fix
+    // Scott reported a video starting playback in the background after
+    // he clicked Back during the load — the late `browse_video_url`
+    // response would still set vEl.src + call play(), starting playback
+    // in a hidden Watch view with no way to stop it short of returning
+    // to the same video and pausing manually.
+    const _entryToken = (typeof window._watchOpenToken === "number")
+      ? window._watchOpenToken : 0;
+    // Show a "Loading…" state on the placeholder while we await
+    // browse_video_url. Without this the user sees a blank box
+    // (or the previous video's stale state) between clicking the
+    // thumbnail and the <video> element revealing — which feels
+    // broken on a cold archive walk where the API can take a beat.
+    // Rebuild the placeholder contents wholesale because the error
+    // path further down also rewrites innerHTML and can leave the
+    // sub-elements gone.
+    if (ph && fp) {
+      ph.style.display = "";
+      ph.innerHTML =
+        '<div class="watch-play-icon" style="visibility:hidden;">▶</div>' +
+        '<div class="watch-placeholder-text" style="font-size:13px;color:var(--c-text);">'
+        + '<span class="spinner-inline"></span>Loading…</div>';
+      // Hide the <video> element so its previous src doesn't flash.
+      vEl.style.display = "none";
+    }
     let url = null;
     let errorDetail = "";
     if (fp && api?.browse_video_url) {
@@ -2232,10 +2378,43 @@
     } else if (!fp) {
       errorDetail = "No video selected";
     }
+    // CRITICAL: drop the late response on the floor if the user has
+    // navigated away. Symptoms before this guard: clicking Back during
+    // load → video starts playing in the hidden Watch view, audio plays
+    // in the background, no UI affordance to stop it. Two checks:
+    //   1. Token mismatch = user opened a different video.
+    //   2. View no longer "watch" = user backed out / changed sub-view.
+    const _stillOnSameVideo = (
+      typeof window._watchOpenToken !== "number"
+      || window._watchOpenToken === _entryToken);
+    const _stillOnWatchView = (
+      !window._browseState
+      || window._browseState.view === "watch");
+    if (!_stillOnSameVideo || !_stillOnWatchView) {
+      // Make sure the element is fully torn down — without this, a
+      // stale src from a previous load might still be in the element
+      // and play when we navigate back. _stopWatchVideo already runs
+      // in showView leaving-watch but it can't catch an in-flight
+      // _loadVideoSource that resolves AFTER it ran.
+      try {
+        vEl.pause();
+        vEl.removeAttribute("src");
+        if (typeof vEl.load === "function") vEl.load();
+      } catch { /* noop */ }
+      return;
+    }
     if (url) {
       vEl.src = url;
       vEl.style.display = "";
-      if (ph) ph.style.display = "none";
+      if (ph) {
+        ph.style.display = "none";
+        // Reset placeholder DOM back to its default empty-state
+        // structure so the NEXT empty/error state has the icon and
+        // standard label to work with again.
+        ph.innerHTML =
+          '<div class="watch-play-icon">▶</div>' +
+          '<div class="watch-placeholder-text">Select a video to play</div>';
+      }
       // Volume: default 20% (matches OLD YTArchiver). Persists across
       // video switches via localStorage so the user's slider adjustment
       // survives — re-applied on every new video load so the HTMLMediaElement
@@ -2327,10 +2506,22 @@
     } catch (_e) { /* fallback: skip, don't throw */ }
   };
 
-  // ── Karaoke: bind a single timeupdate handler per video load ──
+  // ── Karaoke: requestAnimationFrame loop (.txt millisecond timestamps)
+  //
+  // Previously `timeupdate` fired every ~250ms — fine at 1x, but at 2x
+  // playback the highlight lagged a full word behind and short words
+  // were skipped entirely. The rAF loop runs at the display refresh
+  // rate (60fps) regardless of playback speed, so the active-word
+  // marker tracks Whisper's millisecond-precision timestamps cleanly
+  // even at fast forward.
 
-  let _karaokeHandler = null;
+  let _karaokeHandler = null;   // legacy: kept around for compat
+  let _karaokeRafId = null;
   function _unbindKaraoke(vEl) {
+    if (_karaokeRafId !== null) {
+      try { cancelAnimationFrame(_karaokeRafId); } catch {}
+      _karaokeRafId = null;
+    }
     if (vEl && _karaokeHandler) {
       vEl.removeEventListener("timeupdate", _karaokeHandler);
     }
@@ -2343,7 +2534,7 @@
     let lastSegIdx = -1;
     let lastWordEl = null;
 
-    _karaokeHandler = () => {
+    const _tick = () => {
       const t = vEl.currentTime;
       if (t == null) return;
       // Binary-search segments for the one containing t
@@ -2391,8 +2582,13 @@
           lastWordEl = newWordEl;
         }
       }
+      // Schedule the next frame as long as the video is still loaded.
+      // The unbind path cancels the in-flight rAF so this never leaks.
+      if (vEl.isConnected) {
+        _karaokeRafId = requestAnimationFrame(_tick);
+      }
     };
-    vEl.addEventListener("timeupdate", _karaokeHandler);
+    _karaokeRafId = requestAnimationFrame(_tick);
   }
 
   function _findSegIdx(segEls, t) {

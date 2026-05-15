@@ -2,7 +2,6 @@
 
 Download, organize, transcribe, search, compress, and browse entire channels
 
->(patches will pause for a bit, will continue to report issues until I can get them patched)
 
 
 

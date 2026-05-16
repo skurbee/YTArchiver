@@ -1711,6 +1711,70 @@ body {
   background: var(--c-log-row-alt);
 }
 
+/* Content-driven empty-cell collapse. When secondary or tertiary
+   carries no value (very common on [Metdta] rows where tertiary is
+   reserved for the [Dwnld] consolidated-row's "N metadata" count and
+   nothing else uses it), collapse the empty cell AND its leading
+   em-dash separator to 0 width. Without this, width-constrained rows
+   show a wide blank gap in the middle with the row's flow visually
+   broken by stray dashes around the empty cell. The original "dash
+   only when next has content" JS logic eliminates the GLYPH but
+   doesn't shrink the grid track, so the gap persisted. Column count
+   stays at 14 so other per-kind grid overrides still align. */
+.activity-log .log-line.hist-no-secondary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before secondary — collapse */
+    0       /* secondary — collapse */
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+.activity-log .log-line.hist-no-tertiary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before tertiary — collapse */
+    0       /* tertiary — collapse */
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+/* Compound: both empty (e.g. [Metdta] comments-refresh row when
+   _fetched==0 and tertiary unused). */
+.activity-log .log-line.hist-no-secondary.hist-no-tertiary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before secondary — collapse */
+    0       /* secondary — collapse */
+    0       /* dash before tertiary — collapse */
+    0       /* tertiary — collapse */
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+
 /* [ReDwnl] rows have only 3 count cells (replaced / skipped / errors
    in primary / secondary / tertiary) and no 4th `errors`-slot value.
    Collapse that reserved column to 0 so "took" snaps tight to the

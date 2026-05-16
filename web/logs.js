@@ -351,7 +351,16 @@
     // reserve their minmax widths and push adjacent cells out.
     const _kindSlug = String(c.kind || "").replace(/[^A-Za-z0-9]/g, "");
     const _kindCls = _kindSlug ? " hist-row-" + _kindSlug : "";
-    line.className = "log-line" + (entry.alt ? " hist_row_alt" : "") + _kindCls;
+    // Content-driven empty-cell markers — let CSS collapse the column +
+    // its leading dash to 0 when there's nothing in it, so width-
+    // constrained [Metdta] rows (which leave tertiary empty) don't show
+    // a wide gap with floating dashes in the middle.
+    const _noSecondary = !c.secondary || !String(c.secondary).trim();
+    const _noTertiary  = !c.tertiary  || !String(c.tertiary).trim();
+    const _emptyCls = (_noSecondary ? " hist-no-secondary" : "") +
+                      (_noTertiary  ? " hist-no-tertiary"  : "");
+    line.className = "log-line" + (entry.alt ? " hist_row_alt" : "") +
+                     _kindCls + _emptyCls;
     // `row_id` lets the backend retroactively update a previously-
     // emitted row (e.g. a [Dwnld] row that fired with `0 transcribed`
     // while Whisper was still running — the transcribe-complete hook

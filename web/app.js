@@ -10282,11 +10282,10 @@
     pop.style.left = left + "px";
   }
 
-  // ─── Seed logs with test data ────────────────────────────────────────
+  // ─── Seed logs from the Python bridge ───────────────────────────────
   //
-  // Dual mode:
-  // - pywebview (desktop app) → Python bridge via window.pywebview.api
-  // - browser preview → fetch sample.json (same data, static)
+  // pywebview-only — the Phase 0 browser-preview fallback that fetched
+  // sample.json was retired once the real backends were wired up.
   async function seedLogs() {
     // Give pywebview a brief window to register its API before falling back.
     const pywebviewReady = () =>
@@ -10442,54 +10441,9 @@
           await api.startup_ready();
         });
       } else {
-        // Browser preview fallback
-        console.info("[logs] pywebview not detected — loading sample.json");
-        const res = await fetch("./sample.json?t=" + Date.now(), { cache: "no-store" });
-        const data = await res.json();
-        console.info("[logs] sample.json loaded:", Object.keys(data),
-                     "activity=" + (data.activity?.length),
-                     "main=" + (data.main?.length));
-
-        try { window.renderActivityLog(data.activity); }
-        catch (e) { console.error("renderActivityLog failed:", e); }
-
-        try { window.renderMainLog(data.main); }
-        catch (e) { console.error("renderMainLog failed:", e); }
-
-        if (data.subs) {
-          try { window.renderSubsTable(data.subs, data.subs_total); }
-          catch (e) { console.error("renderSubsTable failed:", e); }
-          try { window._primeBrowse(data.subs); }
-          catch (e) { console.error("_primeBrowse failed:", e); }
-          try { window._populateIndexTable?.(data.subs); }
-          catch (e) { console.error("_populateIndexTable failed:", e); }
-        }
-        if (data.recent) {
-          try { window.renderRecentTable(data.recent); }
-          catch (e) { console.error("renderRecentTable failed:", e); }
-        }
-        if (data.queues) {
-          try { window.renderQueues(data.queues); }
-          catch (e) { console.error("renderQueues failed:", e); }
-        }
-
-        const subsMini = data.main.slice(-4);
-        for (const segs of subsMini) window.appendMiniLog("subs-mini-log", segs);
-        for (const segs of subsMini) window.appendMiniLog("browse-mini-log", segs);
-        for (const segs of subsMini) window.appendMiniLog("recent-mini-log", segs);
-        for (const segs of subsMini) window.appendMiniLog("settings-mini-log", segs);
-
-        // Simulate Python stream: append one line every 400ms
-        let idx = 0;
-        const streamLines = data.stream || [];
-        const interval = setInterval(() => {
-          if (idx >= streamLines.length) {
-            clearInterval(interval);
-            return;
-          }
-          window.appendMainLog(streamLines[idx]);
-          idx++;
-        }, 400);
+        // pywebview never came up — log and bail. Phase 0's sample.json
+        // browser fallback was removed; the app is desktop-only now.
+        console.warn("[seed] pywebview bridge not detected — UI will stay empty");
       }
     } catch (e) {
       console.error("seedLogs failed:", e);

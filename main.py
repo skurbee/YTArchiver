@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v62.8"
-APP_VERSION_DATE = "5.15.26 9:49pm"
+APP_VERSION      = "v62.9"
+APP_VERSION_DATE = "5.15.26 10:00pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -68,15 +68,10 @@ ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 INDEX = WEB / "index.html"
 
-# Import sample log generator (synthesized test data, Phase 0 only) + real config loader
+# Phase 0 demo-data shim (backend/sample_logs.py + web/sample.json) was
+# removed once real backends were wired up. No-config / DEMO_MODE paths
+# now just return empty results — the UI handles those cleanly.
 sys.path.insert(0, str(ROOT))
-from backend.sample_logs import (
-    generate_activity_log_history,
-    stream_main_log_sample,
-    generate_subs_channels,
-    generate_recent_downloads,
-    generate_queues,
-)
 from backend.ytarchiver_config import (
     load_config,
     save_config,
@@ -114,8 +109,6 @@ class Api:
 
     def __init__(self):
         self._window = None
-        self._stream_thread = None
-        self._stream_stop = threading.Event()
         self._config = None
         self._log_stream = LogStreamer(None)
         self._sync_thread = None
@@ -465,7 +458,7 @@ class Api:
         """
         if self._config is not None:
             return autorun_history_entries_for_ui(self._config)
-        return generate_activity_log_history()
+        return []
 
     def autorun_history_clear(self):
         """Empty config['autorun_history'] and persist. Called by the
@@ -491,14 +484,9 @@ class Api:
     def get_initial_main_log(self):
         """Return a big batch of main-log lines for initial render.
 
-        audit D-36: gated on a `YTARCHIVER_DEMO_MODE=1` env var so the
-        fictional sample log lines (FilmFan / GameReviews etc.) never
-        leak into a real user's session. In production the caller gets
-        an empty list; JS renders a clean blank log until real content
-        arrives via the push pipeline.
+        Always empty in production — JS renders a clean blank log until
+        real content arrives via the push pipeline.
         """
-        if os.environ.get("YTARCHIVER_DEMO_MODE") == "1":
-            return stream_main_log_sample(initial=True)
         return []
 
     def get_subs_channels(self):
@@ -513,12 +501,6 @@ class Api:
             cfg_copy = _copy.deepcopy(self._config)
             archive_scan.enrich_channels_with_stats(cfg_copy.get("channels", []))
             return channels_for_subs_ui(cfg_copy)
-        # audit D-36: only serve fake channel data in DEMO mode. A
-        # user whose real config has no channels yet gets an empty
-        # list, not fictional "FilmFan / GameReviews" rows.
-        if os.environ.get("YTARCHIVER_DEMO_MODE") == "1":
-            rows, total = generate_subs_channels()
-            return rows, total
         return [], "0 channels · 0 videos · 0 GB"
 
     def get_index_summary(self):
@@ -7328,40 +7310,6 @@ class Api:
         self._sync_thread.start()
         self._on_queue_changed()
         return {"ok": True, "started": True}
-
-    def start_main_log_stream(self):
-        """Kick off a background thread that pushes live log lines."""
-        if self._stream_thread and self._stream_thread.is_alive():
-            return False
-        self._stream_stop.clear()
-        self._stream_thread = threading.Thread(
-            target=self._stream_worker, daemon=True
-        )
-        self._stream_thread.start()
-        return True
-
-    def stop_main_log_stream(self):
-        self._stream_stop.set()
-        return True
-
-    def _stream_worker(self):
-        """Push simulated live log lines to JS every ~400ms."""
-        for line in stream_main_log_sample(initial=False):
-            if self._stream_stop.is_set():
-                break
-            self._push_main_log_line(line)
-            time.sleep(0.4)
-
-    def _push_main_log_line(self, segments):
-        """Call JS window.appendMainLog(segments) from Python."""
-        if not self._window:
-            return
-        import json as _json
-        payload = _json.dumps(segments)
-        try:
-            self._window.evaluate_js(f"window.appendMainLog({payload})")
-        except Exception:
-            pass
 
 
 def _format_last_sync_label(ts_str):

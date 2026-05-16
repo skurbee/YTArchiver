@@ -1133,6 +1133,8 @@
                         title="Re-download this video at a different resolution">Redownload&hellip;</button>
                 <button class="btn btn-ghost btn-thin" id="btn-watch-retranscribe"
                         title="Force re-transcribe this video (deletes current transcript)">Re-transcribe&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-watch-refresh-meta"
+                        title="Re-fetch views, likes, description, and top comments for this video">Refresh metadata</button>
                 <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Speed:</label>
                 <select class="ctl-select" id="watch-speed"
                         title="Playback speed">
@@ -1157,7 +1159,7 @@
                    to expand. -->
               <div class="watch-meta-drawer" id="watch-meta-drawer">
                 <div class="watch-meta-head" id="watch-meta-head">
-                  <span class="watch-meta-arrow" id="watch-meta-arrow">&#x25B8;</span>
+                  <span class="watch-meta-arrow" id="watch-meta-arrow">&#x25BE;</span>
                   <span class="watch-meta-title">Description &amp; comments</span>
                   <span class="watch-meta-stats" id="watch-meta-stats"></span>
                 </div>
@@ -1187,13 +1189,13 @@
                         id="btn-tx-font-down" title="Smaller text">Aa&minus;</button>
                 <button class="btn btn-ghost btn-thin tx-font-btn"
                         id="btn-tx-font-up" title="Larger text">Aa&plus;</button>
-                <!-- Click target bumped to standard `btn-thin` sizing
-                     (was 10px font + 2x6 padding ≈ 14px tall, below the
-                     guideline). Tooltip stays the same. -->
-                <button class="btn btn-ghost btn-thin"
-                        id="btn-watch-shortcuts"
-                        title="Keyboard shortcuts:&#10;Space &mdash; play/pause&#10;← / → &mdash; seek 5s&#10;↑ / ↓ &mdash; volume&#10;B &mdash; bookmark&#10;M &mdash; mute toggle&#10;Ctrl+F &mdash; focus Find"
-                        aria-label="Keyboard shortcuts">?</button>
+                <!-- Hover-only hint: tooltip lists keyboard shortcuts.
+                     Renders as a dim circle so it doesn't read as a
+                     clickable action button next to Aa-/Aa+. -->
+                <span class="tx-hint"
+                      id="btn-watch-shortcuts"
+                      title="Keyboard shortcuts:&#10;Space &mdash; play/pause&#10;← / → &mdash; seek 5s&#10;↑ / ↓ &mdash; volume&#10;B &mdash; bookmark&#10;M &mdash; mute toggle&#10;Ctrl+F &mdash; focus Find"
+                      aria-label="Keyboard shortcuts">?</span>
                 <div class="spacer"></div>
                 <label class="find-label">Find:</label>
                 <input type="text" class="ctl-input find-input" id="watch-find"

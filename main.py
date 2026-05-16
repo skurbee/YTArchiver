@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v63.6"
-APP_VERSION_DATE = "5.16.26 12:26pm"
+APP_VERSION      = "v63.7"
+APP_VERSION_DATE = "5.16.26 1:24pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2666,6 +2666,58 @@ class Api:
                                     return {"ok": True, "meta": entries[video_id],
                                             "source": os.path.join(dp, fn)}
             return {"ok": False, "error": "Metadata not found"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def browse_refresh_video_metadata(self, payload):
+        """Refresh views/likes/description/comments for a single video.
+
+        Drives the Watch view's "Refresh metadata" button — synchronous
+        per-video fetch via yt-dlp, write straight back to the channel's
+        aggregated Metadata.jsonl, and return the new entry so the
+        drawer can re-render without a Back-and-reopen round-trip.
+
+        payload: {filepath, video_id?, title?, channel?}
+        Returns: {ok, meta?, error?}
+        """
+        try:
+            filepath = (payload or {}).get("filepath") or ""
+            video_id = (payload or {}).get("video_id") or ""
+            title    = (payload or {}).get("title") or ""
+            channel  = (payload or {}).get("channel") or ""
+            if not video_id and filepath:
+                import re as _re
+                m = _re.search(r"\[([A-Za-z0-9_-]{11})\]",
+                               os.path.basename(filepath))
+                if m:
+                    video_id = m.group(1)
+            if not video_id:
+                return {"ok": False, "error": "No video_id"}
+            if not filepath or not os.path.isfile(filepath):
+                return {"ok": False, "error": "Video file not found"}
+            cfg = self._config or load_config()
+            ch_dict = None
+            for ch in cfg.get("channels", []):
+                if (ch.get("name") or "") == channel:
+                    ch_dict = ch
+                    break
+            if ch_dict is None:
+                return {"ok": False, "error": f"Channel '{channel}' not in config"}
+            from backend.metadata import fetch_single_video_metadata
+            res = fetch_single_video_metadata(
+                ch_dict, video_id, filepath, title,
+                self._log_stream, emit_inline_log=False, refresh=True)
+            if not res.get("ok"):
+                return {"ok": False,
+                        "error": res.get("error") or "fetch failed",
+                        "transient": bool(res.get("transient"))}
+            # Re-read the entry we just wrote so the caller gets the
+            # canonical on-disk shape (matches browse_get_video_metadata).
+            ret = self.browse_get_video_metadata({
+                "filepath": filepath, "video_id": video_id,
+                "title": title, "channel": channel,
+            })
+            return ret if ret.get("ok") else {"ok": True, "meta": res.get("entry")}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

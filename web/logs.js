@@ -2230,6 +2230,10 @@
   // `.{ch_name} Metadata.jsonl` via the `browse_get_video_metadata` Api.
   // Matches YTArchiver.py:26750 _fetch_video_metadata display: description,
   // view_count, like_count, upload_date, top 50 comments.
+  // Exposed via window.loadWatchMetadataDrawer so the Refresh-metadata
+  // button (wired in app.js) can re-render the drawer in place after a
+  // per-video re-fetch, instead of forcing a Back-and-reopen.
+  window.loadWatchMetadataDrawer = (video) => _loadWatchMetadataDrawer(video);
   async function _loadWatchMetadataDrawer(video) {
     const drawer = document.getElementById("watch-meta-drawer");
     if (!drawer) return;
@@ -2387,9 +2391,11 @@
     const arrow = document.getElementById("watch-meta-arrow");
     const drawer = document.getElementById("watch-meta-drawer");
     if (!head || !body || !arrow || !drawer) return;
-    // Start collapsed — transcript should be the dominant surface.
-    drawer.classList.add("collapsed");
-    body.style.display = "none";
+    // Start expanded so description + comments are visible on first
+    // load. Body has its own max-height scroll, so this doesn't crowd
+    // out the transcript pane.
+    body.style.display = "";
+    arrow.innerHTML = "▾";
     head.addEventListener("click", () => {
       const collapsed = drawer.classList.toggle("collapsed");
       body.style.display = collapsed ? "none" : "";

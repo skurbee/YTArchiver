@@ -8086,6 +8086,46 @@
       window._showToast?.(`Redownload queued at ${pick}.`, "ok");
     });
 
+    // Per-video metadata refresh: synchronous yt-dlp fetch for THIS video
+    // (views/likes/description/top comments), write back to the channel's
+    // aggregated Metadata.jsonl, then re-render the drawer in place. Faster
+    // and more targeted than queuing a full-channel views/likes refresh
+    // when you just want fresh counts for the video you're watching.
+    document.getElementById("btn-watch-refresh-meta")?.addEventListener("click", async () => {
+      const v = _browseState.currentVideo || window._watchCurrentVideo;
+      if (!v?.filepath && !v?.video_id) {
+        window._showToast?.("No video loaded.", "warn");
+        return;
+      }
+      const btn = document.getElementById("btn-watch-refresh-meta");
+      const api = window.pywebview?.api;
+      if (!api?.browse_refresh_video_metadata) {
+        window._showToast?.("Refresh unavailable in browser-preview mode.", "warn");
+        return;
+      }
+      const _origText = btn ? btn.textContent : "";
+      if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
+      try {
+        const res = await api.browse_refresh_video_metadata({
+          filepath: v.filepath || "",
+          video_id: v.video_id || "",
+          title: v.title || "",
+          channel: v.channel || "",
+        });
+        if (res?.ok) {
+          window._showToast?.("Metadata refreshed.", "ok");
+          window.loadWatchMetadataDrawer?.(v);
+        } else {
+          const msg = res?.error || "Refresh failed.";
+          window._showToast?.(msg, res?.transient ? "warn" : "error");
+        }
+      } catch (e) {
+        window._showToast?.(`Refresh failed: ${e.message || e}`, "error");
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = _origText; }
+      }
+    });
+
     // Re-transcribe current video — matches OLD YTArchiver.py:28357
     // `_on_retranscribe`: show the 4-option Whisper model picker and
     // queue a GPU task. No separate "are you sure" confirm — the model

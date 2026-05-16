@@ -3597,14 +3597,22 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _a_primary = "comments refresh failed"
                 else:
                     _a_primary = "no videos in scope"
-                # "X unchanged" goes in tertiary (matches the views/likes
-                # refresh column convention so the activity-log columns
-                # stay vertically aligned across [Metdta] rows).
-                _a_tertiary = f"{_unchanged} unchanged" if _unchanged else ""
+                # Comments rows: put "X unchanged" in SECONDARY (not
+                # tertiary) so the row reads "comments refreshed -
+                # unchanged - errors - took" with no empty column gap.
+                # Different from views/likes refresh, which keeps
+                # unchanged in tertiary because secondary there
+                # can carry "N new" on a mixed-result refresh pass.
+                # Comments has no "new" concept so secondary was
+                # always empty — that was the awkward gap.
+                # Show "0 unchanged" too when fetched > 0 so the
+                # column stays populated row-to-row.
+                _a_secondary = (f"{_unchanged} unchanged"
+                                if _fetched > 0 else "")
                 emit_metadata_activity_row(
                     stream, ch_name,
-                    primary=_a_primary, secondary="",
-                    tertiary=_a_tertiary,
+                    primary=_a_primary, secondary=_a_secondary,
+                    tertiary="",
                     errors=_errors_c, elapsed=time.time() - _task_t0,
                     green=(_errors_c == 0))
             except Exception as _ce:

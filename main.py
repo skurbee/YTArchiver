@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v62.7"
-APP_VERSION_DATE = "5.15.26 5:46pm"
+APP_VERSION      = "v62.8"
+APP_VERSION_DATE = "5.15.26 9:49pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2076,6 +2076,58 @@ class Api:
             ])
             self._log_stream.flush()
             return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def sync_defer_current(self):
+        """Send the currently-running sync task to the END of the queue,
+        then cancel the running pass so the next queued item picks up.
+        Different from sync_skip_current \u2014 `skip` drops the task; `defer`
+        keeps it but reorders it for later. Used by the right-click
+        "Skip this job" action where the user wants "do this one later,
+        not lose it".
+
+        Strips the `_pass_start_ts` cursor so the deferred task starts a
+        fresh pass when it eventually runs again \u2014 otherwise its first
+        re-entry would skip every video already refreshed in this aborted
+        pass and produce an empty "no videos in scope" result.
+        """
+        try:
+            cur = self._queues.current_sync
+            if cur:
+                deferred = dict(cur)
+                deferred.pop("_pass_start_ts", None)
+                # Use the queue's normal enqueue (de-dupes on (kind,url),
+                # appends at end). If the task is somehow already queued
+                # again, the existing entry wins and we just skip \u2014 same
+                # net effect.
+                self._queues.sync_enqueue(deferred)
+                self._log_stream.emit([
+                    ["[Sync] ", "sync_bracket"],
+                    [(f"Deferred {deferred.get('name') or deferred.get('url') or 'current job'}"
+                      " \u2014 sent to end of queue\n"), "simpleline"],
+                ])
+            # Now skip the in-flight run so the next queued item starts.
+            return self.sync_skip_current()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def gpu_defer_current(self):
+        """Send the currently-running GPU task to the END of the GPU
+        queue, then cancel the running job. See sync_defer_current
+        rationale.
+        """
+        try:
+            cur = self._queues.current_gpu
+            if cur:
+                deferred = dict(cur)
+                self._queues.gpu_enqueue(deferred)
+                self._log_stream.emit([
+                    ["[GPU] ", "trans_bracket"],
+                    [(f"Deferred {deferred.get('title') or deferred.get('path') or 'current job'}"
+                      " \u2014 sent to end of queue\n"), "simpleline"],
+                ])
+            return self.gpu_skip_current()
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

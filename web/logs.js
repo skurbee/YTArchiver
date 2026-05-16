@@ -1283,48 +1283,69 @@
         const api = window.pywebview?.api;
         const items = [];
         const taskLabel = (t.name || t.title || t.url || "this task").toString().slice(0, 60);
-        // "Skip this job" — only meaningful for the currently-running item.
-        // Old app: messagebox.askyesno("Skip Current", "Cancel the current job
-        // and move to the next one in queue?")
+        // "Skip this job" — only meaningful for the currently-running
+        // item. Semantics: send the running task to the END of the queue
+        // and let the next queued item run. The deferred task isn't lost —
+        // it gets a fresh attempt after everything else finishes.
+        // Different from "Cancel task" (which drops it).
         if (statusCls === "running") {
           items.push({ label: "Skip this job",
             action: async () => {
               const ok = await (window.askConfirm
-                ? window.askConfirm("Skip current job",
-                    "Cancel the current job and move to the next one in queue?",
-                    { confirm: "Skip", danger: true })
+                ? window.askConfirm("Skip this job",
+                    `Send "${taskLabel}" to the end of the queue and move on to the next job?`,
+                    { confirm: "Skip", danger: false })
                 : Promise.resolve(confirm(
-                    "Cancel the current job and move to the next one in queue?")));
+                    `Send "${taskLabel}" to the end of the queue and move on?`)));
               if (!ok) return;
-              if (queueKind === "sync") api?.sync_skip_current?.();
-              else api?.gpu_skip_current?.();
+              if (queueKind === "sync") api?.sync_defer_current?.();
+              else api?.gpu_defer_current?.();
             }});
         }
+        // "Move to top" — only offered when there's something above the
+        // task to overtake. Showing it on idx === 0 (running task or already-
+        // first queued task) was confusing because the click silently did
+        // nothing.
+        if (idx > 0) {
+          items.push(
+            { label: "Move to top",
+              action: () => {
+                const [taken] = _queueState[queueKind].splice(idx, 1);
+                _queueState[queueKind].unshift(taken);
+                paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
+                if (queueKind === "sync" && api?.queues_sync_reorder)
+                  api.queues_sync_reorder(taken?.url || taken?.name || "", 0);
+                else if (queueKind === "gpu" && api?.queues_gpu_reorder)
+                  api.queues_gpu_reorder(taken?.id || taken?.path || taken?.name || "", 0);
+              }},
+          );
+        }
+        // "Cancel task" (running) drops the in-flight job entirely so the
+        // next queued item runs. The running row hides its X close button
+        // by design (clicking it would silently drop the wrong queue entry
+        // because the running item lives in current_sync, not in the queue
+        // lists), so we route the cancel through the same skip_current API
+        // that "Skip" uses but WITHOUT a re-enqueue.
+        // "Remove from queue" (non-running) is a standard row delete via
+        // the existing X-button click handler.
         items.push(
-          { label: "Move to top",
-            action: () => {
-              if (idx <= 0) return;
-              const [taken] = _queueState[queueKind].splice(idx, 1);
-              _queueState[queueKind].unshift(taken);
-              paintTaskList(body, _queueState[queueKind], emptyText, queueKind);
-              if (queueKind === "sync" && api?.queues_sync_reorder)
-                api.queues_sync_reorder(taken?.url || taken?.name || "", 0);
-              else if (queueKind === "gpu" && api?.queues_gpu_reorder)
-                api.queues_gpu_reorder(taken?.id || taken?.path || taken?.name || "", 0);
-            }},
-          // Old app: messagebox.askyesno("Remove from Queue", ...) line 20382
           { label: statusCls === "running" ? "Cancel task" : "Remove from queue",
             cls: "danger",
             action: async () => {
               const title = statusCls === "running" ? "Cancel task" : "Remove from queue";
               const msg = statusCls === "running"
-                ? `Cancel "${taskLabel}"?\n\nThe current job will stop.`
+                ? `Cancel "${taskLabel}" and remove it from the queue?\n\nThe current job will stop and won't run again unless re-queued.`
                 : `Remove "${taskLabel}" from the queue?`;
               const ok = await (window.askConfirm
                 ? window.askConfirm(title, msg, { confirm: title, danger: true })
                 : Promise.resolve(confirm(msg)));
               if (!ok) return;
-              row.querySelector(".queue-task-close")?.click();
+              if (statusCls === "running") {
+                if (queueKind === "sync") api?.sync_skip_current?.();
+                else api?.gpu_skip_current?.();
+              } else {
+                row.querySelector(".queue-task-close")?.click();
+              }
             }},
         );
         if (window.showContextMenu) window.showContextMenu(ev.clientX, ev.clientY, items);

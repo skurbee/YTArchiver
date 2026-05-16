@@ -25,6 +25,7 @@ Not yet in scope (need separate sessions):
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -40,6 +41,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from .ytarchiver_config import load_config, save_config, ARCHIVE_FILE, config_is_writable
 from .log_stream import LogStreamer
 from . import utils as _utils
+
+
+def _hide_sidecar_win(video_path: str) -> None:
+    """Set Windows HIDDEN attribute on a video's .info.json sidecar so
+    Explorer shows only the video + Transcript.txt in archive folders.
+    Mirrors the _hide_file_win pattern in transcribe.py / metadata.py."""
+    if os.name != "nt" or not video_path:
+        return
+    try:
+        sidecar = os.path.splitext(video_path)[0] + ".info.json"
+        if os.path.isfile(sidecar):
+            ctypes.windll.kernel32.SetFileAttributesW(sidecar, 0x02)
+    except Exception:
+        pass
 
 
 # YouTube ID regex — 11 chars of [A-Za-z0-9_-] surrounded by brackets
@@ -223,6 +238,13 @@ _MERGE_RE = re.compile(
     # path — yt-dlp always terminates the merger line with `"` + EOL.
     r'\[(?:Merger|ffmpeg|FixupM3u8)\]\s+(?:Merging|Remuxing|Converting)[^"]*"(.+)"\s*$')
 _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format")
+# Video-ID capture from `[youtube] VIDID:`, `[info] VIDID:`, `[download] VIDID:`
+# lines yt-dlp prints throughout the lifecycle of a single video.
+# 11-char `[A-Za-z0-9_-]` ID followed by `:`. Deliberately excludes
+# `[youtube:tab]` (channel/playlist enumeration) which has a `:` inside
+# the brackets — `\]` after the tag name keeps `[youtube:tab]` from
+# matching.
+_VIDID_RE = re.compile(r"\[(?:youtube|info|download)\]\s+([A-Za-z0-9_-]{11}):")
 
 # Module-level download-row counter. The `dlrow_<N>` inplace kind must be
 # globally unique across the whole sync run (NOT per-channel), otherwise
@@ -548,6 +570,15 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
         # local source. Sidecars are <30 KB each — negligible footprint
         # against multi-GB video files.
         "--write-info-json",
+        # Suppress yt-dlp's channel/playlist-level info.json drops. With
+        # --write-info-json alone, yt-dlp writes a sidecar for every
+        # IE Result it processes — including the channel home page and
+        # its /videos, /streams, /shorts tabs. Those entries have no
+        # upload_date, so the `%(upload_date>%Y|Unknown Year)s` template
+        # writes them into per-channel `Unknown Year/Unknown Month/`
+        # subfolders. Useless to the archive (they don't reference any
+        # video) and they polluted every channel's tree.
+        "--no-write-playlist-metafiles",
         # After each video completes, emit one line we can parse to map
         # title→id (filenames don't carry the ID in drop-in mode). Matches
         # YTArchiver.py:17281 DLTRACK line.
@@ -717,6 +748,20 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
     # entry per merged .mp4, cleared at channel end with the other
     # per-channel state.
     _path_to_display_title: Dict[str, str] = {}
+    # Parallel lookup: video_id -> dlrow counter. Path-based matching can
+    # fail when yt-dlp's filename sanitization substitutes characters
+    # differently across the Destination and Merger lines (e.g. `:` in a
+    # title becomes `：` U+FF1A or `?` depending on yt-dlp version and
+    # output codepage). The vid is always emitted clean in `[youtube]
+    # VIDID:` lines and again in the DLTRACK record, so it's a more
+    # reliable join key. Filled at Destination time from `current_vid_id`
+    # (tracked from preceding `[youtube]`/`[info]`/`[download]` lines),
+    # consulted at DLTRACK as a fallback when path-match misses.
+    _vid_to_counter: Dict[str, int] = {}
+    # Most-recently-seen video id from yt-dlp output. Always brackets
+    # the Destination line that triggers the dlrow creation, so it's the
+    # correct id to associate with the new dlrow.
+    current_vid_id: str = ""
     # dlrow_N values that have already been CLOSED by a DLTRACK ✓ done
     # emit. yt-dlp sometimes dribbles a final "[download] 100% of X in
     # Y" progress line AFTER the DLTRACK has fired — if we let it
@@ -897,6 +942,28 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
             if not s:
                 continue
 
+            # Track video_id across the lifecycle of the current video so
+            # the Destination handler below can store it alongside the
+            # dlrow counter. yt-dlp prints `[youtube] VIDID:`, `[info]
+            # VIDID:`, and `[download] VIDID:` lines BEFORE the Destination
+            # line, so by the time Destination fires, current_vid_id is
+            # the correct id for that video. Used by DLTRACK's path-match
+            # fallback when filename character substitution (`:` -> `：`
+            # etc) causes the path lookup to miss.
+            #
+            # `[download] Destination: foo.mp4` is a known false positive:
+            # the word `Destination` is exactly 11 letters and matches
+            # the [A-Za-z0-9_-]{11} class. Real YT video IDs are base64-
+            # url, which is letters + digits + `-_` — they almost always
+            # contain at least one non-letter. Rejecting all-alpha
+            # candidates filters the "Destination" footgun without
+            # rejecting legitimate IDs in practice.
+            _vid_m = _VIDID_RE.search(s)
+            if _vid_m:
+                _vid_cand = _vid_m.group(1)
+                if not _vid_cand.isalpha():
+                    current_vid_id = _vid_cand
+
             # Issue #157: yt-dlp emits informational chatter that looks
             # error-ish to users — [info] subtitle writes, [Merger] /
             # [Remuxer] / [FixupM3u8] lines, "Deleting original file"
@@ -1018,6 +1085,7 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                         _prev = _title_announced.get(final_path)
                         if _prev is not True:
                             _title_announced[final_path] = True
+                            _hide_sidecar_win(final_path)
                             downloaded += 1
                             # Issue #140: TuneShine read downloaded=0
                             # for entire channel-length syncs because
@@ -1094,6 +1162,15 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                     if os.path.basename(_k).lower() == _bn:
                                         _dlrow_n = _v
                                         break
+                            if _dlrow_n is None and vid:
+                                # Filename-substitution fallback: when path
+                                # comparison fails (e.g. yt-dlp rendered `:`
+                                # as `：` in one line and `?` in another),
+                                # match by video_id. yt-dlp guarantees the
+                                # same id appears in both the [youtube]
+                                # VIDID: line and the DLTRACK record, so this
+                                # is the most reliable join key.
+                                _dlrow_n = _vid_to_counter.get(vid)
                             if _dlrow_n is None:
                                 _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
                                 # Path-match fell through to orphan. The
@@ -1371,6 +1448,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                     _DLROW_COUNTER += 1
                     _path_to_counter[final_path] = _DLROW_COUNTER
                     _path_to_display_title[final_path] = display_title
+                    # Parallel join key by video_id — sidesteps filename-
+                    # character-substitution mismatches (`:` titles becoming
+                    # `：` or `?` in the file path) that defeat path-based
+                    # lookups in the DLTRACK handler below.
+                    if current_vid_id:
+                        _vid_to_counter[current_vid_id] = _DLROW_COUNTER
                     _dl_kind = f"dlrow_{_DLROW_COUNTER}"
                     stream.emit([
                         [" ", ["dim", _dl_kind]],

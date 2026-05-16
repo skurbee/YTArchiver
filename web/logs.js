@@ -2149,6 +2149,13 @@
     frag.appendChild(body);
     tr.appendChild(frag);
     _bindKaraoke(vEl, tr, segEls);
+    // Build (or refresh) the WebVTT caption track for the video overlay.
+    // Uses the same per-word timing the karaoke loop reads from the DOM,
+    // but delivered as VTTCues so the browser handles fullscreen display
+    // for free — no custom-controls rebuild needed when the user goes
+    // fullscreen on the <video> element.
+    _setCueTrackFromTranscript(vEl, transcript);
+    _applyCaptionPrefs(vEl);
   };
 
   /** Build the source-banner div for the Watch view transcript panel.
@@ -2681,6 +2688,99 @@
     }
     return best;
   }
+
+  // ─── Video overlay captions (karaoke word-by-word) ─────────────────
+  //
+  // Uses the native TextTrack API + VTTCues so the browser draws the
+  // caption itself. Benefits over a custom DOM overlay:
+  //   • Fullscreen "just works" — native <video> fullscreen shows the
+  //     cue track, an absolute-positioned sibling div would not.
+  //   • Styling via `video::cue` with attribute selectors lets us
+  //     swap size/background by flipping data-cap-* attributes on the
+  //     <video> element — no per-cue restyle, no track rebuild.
+  //
+  // One TextTrack per video element, recycled across video changes:
+  //   tracks created via addTextTrack can't be detached, so we stash
+  //   the ref on the element and clear cues on each new transcript.
+  function _ensureCapTrack(vEl) {
+    if (!vEl) return null;
+    if (vEl._capTrack) return vEl._capTrack;
+    let t;
+    try {
+      t = vEl.addTextTrack("captions", "Overlay transcript", "en");
+    } catch { return null; }
+    vEl._capTrack = t;
+    // Default to hidden until prefs apply (avoids a flash of unstyled
+    // cues on first load when the user has the feature off).
+    t.mode = "hidden";
+    return t;
+  }
+
+  function _setCueTrackFromTranscript(vEl, transcript) {
+    const t = _ensureCapTrack(vEl);
+    if (!t) return;
+    // Clear prior cues — addTextTrack accumulates if you call it again,
+    // and we want a clean slate per video.
+    while (t.cues && t.cues.length) {
+      try { t.removeCue(t.cues[0]); } catch { break; }
+    }
+    if (!Array.isArray(transcript)) return;
+    const Cue = window.VTTCue || window.TextTrackCue;
+    if (!Cue) return;
+    for (const seg of transcript) {
+      const words = (Array.isArray(seg.words) && seg.words.length)
+        ? seg.words
+        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
+      if (words) {
+        for (const w of words) {
+          const s = Number(w.s);
+          const e = Number(w.e);
+          const text = (w.w || "").trim();
+          if (!text) continue;
+          if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+          if (e <= s) continue;
+          try { t.addCue(new Cue(s, e, text)); } catch {}
+        }
+      } else {
+        // Coarse fallback for transcripts without per-word timing
+        // (e.g. unpunctuated YT captions where each "segment" is the
+        // whole displayed line). One cue per segment is the right
+        // granularity here — the karaoke loop also degrades to
+        // segment-level highlighting in this case.
+        const s = Number(seg.s);
+        const e = Number(seg.e);
+        const text = (seg.t || seg.text || "").trim();
+        if (!text || !Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
+        try { t.addCue(new Cue(s, e, text)); } catch {}
+      }
+    }
+  }
+
+  // Read the cached prefs (set by app.js when the user changes the
+  // toolbar selects, and on boot from settings_load) and apply them
+  // to a freshly-rendered <video>. Called from renderWatchView so the
+  // mode/size/bg survive video changes.
+  function _applyCaptionPrefs(vEl) {
+    if (!vEl) return;
+    const p = window._captionPrefs || {};
+    const size = p.size || "off";
+    const bg = p.bg || "translucent";
+    vEl.dataset.capSize = (size === "off") ? "" : size;
+    vEl.dataset.capBg = bg;
+    const t = vEl._capTrack;
+    if (t) t.mode = (size === "off") ? "hidden" : "showing";
+  }
+
+  // Public setter — app.js calls this when the user changes a toolbar
+  // select. We update the cache + apply to the currently-loaded video.
+  window.setCaptionPref = function (key, value) {
+    window._captionPrefs = window._captionPrefs || {};
+    if (key === "size" || key === "bg") {
+      window._captionPrefs[key] = value;
+    }
+    const vEl = document.getElementById("watch-video");
+    if (vEl) _applyCaptionPrefs(vEl);
+  };
 
   function escapeHtml(s) {
     return String(s)

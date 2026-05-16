@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v63.7"
-APP_VERSION_DATE = "5.16.26 1:24pm"
+APP_VERSION      = "v64.2"
+APP_VERSION_DATE = "5.16.26 4:29pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2447,15 +2447,28 @@ class Api:
         if not jsonl_path and video_id:
             try:
                 from backend import index as _idx
-                conn = _idx._open()
+                # Reader path (no _db_lock) so this lookup doesn't queue
+                # behind the startup sweep's FTS-ingest writes — same
+                # reason get_segments was migrated.
+                #
+                # ORDER BY s.id DESC picks the MOST-RECENT-INGEST's
+                # jsonl_path so the classifier resolves to the same
+                # Transcript.txt directory that get_segments will pull
+                # transcript text from. Without this match (plain
+                # LIMIT 1 picks any matching segment row arbitrarily)
+                # the classifier could land on a stale ingest's
+                # directory, miss the active Transcript.txt header,
+                # and return source=unknown — losing the
+                # Whisper/YT-captions banner above the transcript.
+                conn = _idx._reader_open() or _idx._open()
                 if conn is not None:
-                    with _idx._db_lock:
-                        row = conn.execute(
-                            "SELECT s.jsonl_path, v.filepath "
-                            "FROM videos v LEFT JOIN segments s "
-                            " ON s.video_id = v.video_id "
-                            "WHERE v.video_id=? LIMIT 1",
-                            (video_id,)).fetchone()
+                    row = conn.execute(
+                        "SELECT s.jsonl_path, v.filepath "
+                        "FROM videos v LEFT JOIN segments s "
+                        " ON s.video_id = v.video_id "
+                        "WHERE v.video_id=? "
+                        "ORDER BY s.id DESC LIMIT 1",
+                        (video_id,)).fetchone()
                     if row:
                         jsonl_path = row[0] or ""
                         if not jsonl_path and row[1]:

@@ -1401,8 +1401,67 @@
       // otherwise a lone magnifying glass sits in the header with
       // nothing to filter.
       if (findWrap) findWrap.style.display = "none";
+      // Paint loading state into the watch view BEFORE any async
+      // transcript fetch resolves. Every code path that opens Watch
+      // (video-grid click, search result click, Forward gesture,
+      // _openVideoInWatch helper, …) routes through showView, so
+      // landing the loading paint here covers them all instead of
+      // each handler duplicating it (and forgetting to, in the
+      // grid-click / search-click paths — Scott reported the blank
+      // placeholder text "Video Title" / "Channel · upload date ·
+      // duration" surviving for several seconds when the transcript
+      // fetch was slow).
+      _paintWatchLoadingState(_browseState.currentVideo);
     }
   }
+
+  // Repaint the Watch pane with a "Loading…" treatment for every slot
+  // that the slow transcript fetch will eventually fill: title, meta,
+  // <video> placeholder, transcript pane, and the description/comments
+  // drawer body. Idempotent — safe to call repeatedly.
+  function _paintWatchLoadingState(video) {
+    try {
+      const titleEl = document.getElementById("watch-title");
+      const metaEl = document.getElementById("watch-meta");
+      if (titleEl) titleEl.textContent = (video && video.title) || "Loading…";
+      if (metaEl) {
+        const parts = [];
+        if (video?.channel) parts.push(video.channel);
+        if (video?.uploaded) parts.push(video.uploaded);
+        if (video?.duration) parts.push(video.duration);
+        if (video?.views) parts.push(video.views + " views");
+        metaEl.textContent = parts.join(" · ") || "Loading…";
+      }
+      const vEl = document.getElementById("watch-video");
+      const ph = document.getElementById("watch-video-placeholder");
+      if (ph && video && video.filepath) {
+        ph.style.display = "";
+        ph.innerHTML =
+          '<div class="watch-play-icon" style="visibility:hidden;">▶</div>'
+          + '<div class="watch-placeholder-text" '
+          + 'style="font-size:13px;color:var(--c-text);">'
+          + '<span class="spinner-inline"></span>Loading…</div>';
+        if (vEl) vEl.style.display = "none";
+      }
+      const tr = document.getElementById("watch-transcript");
+      if (tr) {
+        tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic; padding: 12px;">'
+          + '<span class="spinner-inline"></span>Loading transcript…</div>';
+      }
+      // Drawer is open by default (v63.7) — without resetting it the
+      // user sees the previous video's description and comments until
+      // renderWatchView triggers _loadWatchMetadataDrawer.
+      const descEl = document.getElementById("watch-meta-description");
+      const commentsEl = document.getElementById("watch-meta-comments");
+      const countEl = document.getElementById("watch-meta-comments-count");
+      const statsEl = document.getElementById("watch-meta-stats");
+      if (statsEl) statsEl.textContent = "";
+      if (descEl) descEl.textContent = "Loading…";
+      if (commentsEl) commentsEl.innerHTML = "";
+      if (countEl) countEl.textContent = "";
+    } catch (_e) { /* non-fatal */ }
+  }
+  window._paintWatchLoadingState = _paintWatchLoadingState;
 
   // ─── Search viewer pane — shows context around a clicked hit ────────
   // Mirrors YTArchiver.py:29598 PanedWindow viewer. Loads N segments
@@ -3351,48 +3410,10 @@
     _browseState.currentVideo = video;
     showView("watch");
 
-    // BUG FIX 2026-05-14: paint title/meta/loading state IMMEDIATELY.
-    // Previously these stayed at the literal HTML placeholders ("Video
-    // Title", "Channel · upload date · duration") until the slow
-    // `browse_get_transcript` API call resolved — meaning a user who
-    // clicked a freshly-downloaded video saw the empty-state placeholders
-    // for seconds with no indication anything was loading. The video
-    // element also stayed at "Select a video to play". Now we set
-    // everything to the real video info up-front, and the video area
-    // gets a spinner-equivalent "Loading…" treatment via _loadVideoSource
-    // being kicked off pre-transcript.
-    try {
-      const titleEl = document.getElementById("watch-title");
-      const metaEl = document.getElementById("watch-meta");
-      if (titleEl) titleEl.textContent = video.title || "Loading…";
-      if (metaEl) {
-        const parts = [];
-        if (video.channel) parts.push(video.channel);
-        if (video.uploaded) parts.push(video.uploaded);
-        if (video.duration) parts.push(video.duration);
-        if (video.views) parts.push(video.views + " views");
-        metaEl.textContent = parts.join(" · ") || "Loading…";
-      }
-      // Show "Loading…" placeholder in the video area immediately.
-      const vEl = document.getElementById("watch-video");
-      const ph = document.getElementById("watch-video-placeholder");
-      if (ph && video.filepath) {
-        ph.style.display = "";
-        ph.innerHTML =
-          '<div class="watch-play-icon" style="visibility:hidden;">▶</div>' +
-          '<div class="watch-placeholder-text" '
-          + 'style="font-size:13px;color:var(--c-text);">'
-          + '<span class="spinner-inline"></span>Loading…</div>';
-        if (vEl) vEl.style.display = "none";
-      }
-      // Clear stale transcript pane so it doesn't show the previous
-      // video's text while the new one's transcript loads.
-      const tr = document.getElementById("watch-transcript");
-      if (tr) {
-        tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic; padding: 12px;">'
-          + '<span class="spinner-inline"></span>Loading transcript…</div>';
-      }
-    } catch (_e) { /* non-fatal */ }
+    // Loading-state paint now happens inside showView("watch") above,
+    // so every entry path (video-grid click, search-result click,
+    // Forward gesture, this helper) gets identical treatment without
+    // each handler having to remember to call it.
 
     const api = window.pywebview?.api;
     let transcript = null;
@@ -8178,6 +8199,63 @@
       const cur = parseFloat(getComputedStyle(document.documentElement)
         .getPropertyValue("--watch-transcript-fz")) || 12.5;
       _applyTxFontSize(cur + 1);
+    });
+
+    // Word-overlay captions on the <video> element. Two toolbar selects
+    // drive the feature: size (off/small/medium/large — off disables)
+    // and background style (translucent/outline/none). State lives in
+    // window._captionPrefs (read by logs.js _applyCaptionPrefs on each
+    // video load) and is mirrored to localStorage + settings.
+    const _capSizeKey = "ytarchiver_caption_size";
+    const _capBgKey   = "ytarchiver_caption_bg";
+    const _CAP_SIZES = new Set(["off", "small", "medium", "large"]);
+    const _CAP_BGS   = new Set(["translucent", "outline", "none"]);
+    function _applyCapSize(size) {
+      const v = _CAP_SIZES.has(size) ? size : "off";
+      window.setCaptionPref?.("size", v);
+      const sel = document.getElementById("watch-cap-size");
+      if (sel && sel.value !== v) sel.value = v;
+      try { localStorage.setItem(_capSizeKey, v); } catch {}
+      const _api = window.pywebview?.api;
+      if (_api?.settings_save) {
+        try { _api.settings_save({ caption_overlay_size: v }); } catch {}
+      }
+    }
+    function _applyCapBg(bg) {
+      const v = _CAP_BGS.has(bg) ? bg : "translucent";
+      window.setCaptionPref?.("bg", v);
+      const sel = document.getElementById("watch-cap-bg");
+      if (sel && sel.value !== v) sel.value = v;
+      try { localStorage.setItem(_capBgKey, v); } catch {}
+      const _api = window.pywebview?.api;
+      if (_api?.settings_save) {
+        try { _api.settings_save({ caption_overlay_bg: v }); } catch {}
+      }
+    }
+    // Boot — localStorage first (zero round-trip), settings_load second
+    // (durable). Match the transcript-font-size persistence pattern.
+    try {
+      const _sz = localStorage.getItem(_capSizeKey);
+      if (_sz && _CAP_SIZES.has(_sz)) _applyCapSize(_sz);
+      const _bg = localStorage.getItem(_capBgKey);
+      if (_bg && _CAP_BGS.has(_bg)) _applyCapBg(_bg);
+    } catch {}
+    (async () => {
+      try {
+        const s = await window.pywebview?.api?.settings_load?.();
+        if (s?.caption_overlay_size && _CAP_SIZES.has(s.caption_overlay_size)) {
+          _applyCapSize(s.caption_overlay_size);
+        }
+        if (s?.caption_overlay_bg && _CAP_BGS.has(s.caption_overlay_bg)) {
+          _applyCapBg(s.caption_overlay_bg);
+        }
+      } catch {}
+    })();
+    document.getElementById("watch-cap-size")?.addEventListener("change", (ev) => {
+      _applyCapSize(ev.target.value);
+    });
+    document.getElementById("watch-cap-bg")?.addEventListener("change", (ev) => {
+      _applyCapBg(ev.target.value);
     });
 
     // .txt request: drag-resize splitter between video and transcript

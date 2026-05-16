@@ -3416,6 +3416,47 @@ body {
   font-size: 12px;
   font-weight: 600;
 }
+/* ═══ Video overlay captions (karaoke word-by-word) ═══
+   Implemented via native <video> TextTracks + VTTCue. The browser
+   renders cues, so fullscreen carries the overlay for free. Size
+   and background are swapped by toggling data-cap-* attributes on
+   the <video> element — no track rebuild needed.
+   `::cue` only honors a narrow set of properties (color, opacity,
+   visibility, font-*, line-height, text-shadow, text-decoration,
+   white-space, background-*) — every rule below stays within that. */
+.watch-video-el[data-cap-size="small"]::cue {
+  font-size: 16px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+.watch-video-el[data-cap-size="medium"]::cue {
+  font-size: 26px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+.watch-video-el[data-cap-size="large"]::cue {
+  font-size: 40px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+/* Empty value (set when size=off) = no rule applies = browser default
+   styling, but the track mode is "hidden" so nothing renders anyway. */
+.watch-video-el[data-cap-bg="translucent"]::cue {
+  background: rgba(0, 0, 0, 0.72);
+}
+.watch-video-el[data-cap-bg="outline"]::cue {
+  background: transparent;
+  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000,
+               -1px  1px 0 #000, 1px  1px 0 #000,
+                0    0   4px #000;
+}
+.watch-video-el[data-cap-bg="none"]::cue {
+  background: transparent;
+}
+
 /* Hover-only keyboard-shortcuts hint in the transcript header. Styled
    as a dim circle so it reads as informational, not as a third button
    sitting next to Aa-/Aa+. cursor:help triggers the OS help cursor on

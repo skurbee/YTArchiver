@@ -1270,10 +1270,43 @@ def find_thumbnail(video_filepath: str,
 
 def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = None,
                  title: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return ordered segments for a video."""
-    conn = _open()
+    """Return ordered segments for a video.
+
+    Uses `_reader_open()` (lock-free reader connection) so the user's
+    Watch-view click doesn't queue behind sweep_new_videos' FTS-ingest
+    transactions during startup. Same migration list_videos_for_channel
+    and the Recent tab already had — this path was missed, which made
+    clicks during startup-sweep hang for many seconds at a time.
+    SQLite WAL mode lets the reader connection read concurrently with
+    the writer's ongoing transaction; falls back to _open() only if
+    the reader connection somehow failed to initialize.
+    """
+    conn = _reader_open() or _open()
     if conn is None:
         return []
+    # When only video_id is supplied (the Watch-view click path —
+    # frontend doesn't know which jsonl_path), pick a canonical
+    # jsonl_path for this video first: the one with the
+    # most-recently-ingested rows (highest MAX(id)). Without this, a
+    # video that's been ingested under more than one jsonl_path (e.g.,
+    # a combined `.Channel Transcript.txt` AND a year-split
+    # `.Channel 2024 Transcript.txt` both containing the same video)
+    # would surface duplicated segments — every line shown twice in
+    # the transcript pane, two karaoke cues stacked at the same
+    # playback time. The dedup is silent; if the user has dupe data
+    # we still play the most-recent ingest (which is what they'd
+    # naturally expect after a retranscribe).
+    if video_id and not jsonl_path:
+        try:
+            canon = conn.execute(
+                "SELECT jsonl_path FROM segments WHERE video_id=? "
+                "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
+                (video_id,)
+            ).fetchone()
+            if canon and canon[0]:
+                jsonl_path = canon[0]
+        except Exception:
+            pass
     where = []
     args: List[Any] = []
     if video_id:
@@ -1291,16 +1324,15 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
     # a jsonl_path (combined transcripts) with a different video_id.
     q = ("SELECT start_time, end_time, text, words FROM segments "
          f"WHERE {' AND '.join(where)} ORDER BY start_time")
-    with _db_lock:
-        cur = conn.execute(q, args)
-        out = []
-        import json as _j
-        for s, e, t, w in cur.fetchall():
-            try:
-                words = _j.loads(w) if w else []
-            except (json.JSONDecodeError, ValueError):
-                words = []
-            out.append({"s": s, "e": e, "t": t, "w": words})
+    cur = conn.execute(q, args)
+    out = []
+    import json as _j
+    for s, e, t, w in cur.fetchall():
+        try:
+            words = _j.loads(w) if w else []
+        except (json.JSONDecodeError, ValueError):
+            words = []
+        out.append({"s": s, "e": e, "t": t, "w": words})
     return out
 
 

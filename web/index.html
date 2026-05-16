@@ -1145,6 +1145,21 @@
                   <option value="1.5">1.5×</option>
                   <option value="2">2×</option>
                 </select>
+                <label class="ctl-label ctl-label-thin" style="margin-left:10px;"
+                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay transcript:</label>
+                <select class="ctl-select" id="watch-cap-size"
+                        title="Overlay text size — Off hides the overlay">
+                  <option value="off" selected>Off</option>
+                  <option value="small">Small</option>
+                  <option value="medium">Medium</option>
+                  <option value="large">Large</option>
+                </select>
+                <select class="ctl-select" id="watch-cap-bg"
+                        title="Overlay background style">
+                  <option value="translucent" selected>Translucent</option>
+                  <option value="outline">Outline</option>
+                  <option value="none">None</option>
+                </select>
                 <div class="spacer"></div>
                 <label class="checkbox-label" title="Keep transcript scrolled to current line">
                   <input type="checkbox" id="watch-autofollow" checked />

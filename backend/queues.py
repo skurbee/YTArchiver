@@ -628,6 +628,12 @@ class QueueState:
             # check metadata part of these tasks in queue are supposed
             # to be colored pink LIKE THEY WERE IN PREVIOUS VERSION."
             return f"Metadata check \u2014 {name}"
+        if kind == "metadata_comments":
+            # Comments-refresh task. Leading "Metadata" word so
+            # colorizeTaskName picks the pink qv-meta class \u2014 these
+            # were showing as "Download X" (green) before, which
+            # misled users into thinking videos were being downloaded.
+            return f"Metadata comments \u2014 {name}"
         if kind == "videoid_backfill":
             # Fix IDs task — share the Metadata color family (pink)
             # since it's a metadata-kind repair, not a download. Label

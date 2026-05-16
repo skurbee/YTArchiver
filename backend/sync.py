@@ -360,7 +360,7 @@ def _new_pass_id() -> str:
 
 
 def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
-                   name: str, summary: Optional[str] = None,
+                   name, summary=None,
                    name_tag: str = "simpleline_green",
                    summary_tag: str = "simpleline",
                    pass_id: str = "") -> None:
@@ -377,6 +377,11 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
     summary=None → "live" row (just `[N/total] Name`).
     summary=str → "done" row (appends ` — summary`). Pad with spaces
                    so the em-dash column aligns roughly at col 34.
+
+    Rich-segment form: `name` and/or `summary` may be a list of
+    `[text, tag]` pairs for multi-color output. When `summary` is a list,
+    the " — " prefix is NOT auto-added — include the separator and the
+    trailing newline yourself in the segments.
     """
     # Fall back to the thread-local stashed by sync_all / sync_one_channel
     # if the caller didn't pass one explicitly.
@@ -385,14 +390,33 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
     marker = (f"sync_row_{pass_id}_{idx}" if pass_id
               else f"sync_row_{idx}")
     segs = _bracket_segments(f"{idx}/{total}", extra_tag=marker)
+    if isinstance(name, str):
+        _name_disp_len = len(name)
+        _name_in = [[name, name_tag]]
+    else:
+        _name_in = list(name)
+        _name_disp_len = sum(len(s[0]) for s in _name_in)
+
+    def _mk_tag(t):
+        return [t, marker] if isinstance(t, str) else list(t) + [marker]
+
     if summary is None:
-        segs.append([f"{name}\n", [name_tag, marker]])
+        for s_txt, s_tag in _name_in:
+            segs.append([s_txt, _mk_tag(s_tag)])
+        segs.append(["\n", [name_tag, marker]])
     else:
         # Pad the channel name to align the em-dash at a consistent column
         name_col = 34
-        padded = name if len(name) >= name_col else name + " " * (name_col - len(name))
-        segs.append([padded, [name_tag, marker]])
-        segs.append([f" \u2014 {summary}\n", [summary_tag, marker]])
+        pad = " " * max(0, name_col - _name_disp_len)
+        for s_txt, s_tag in _name_in:
+            segs.append([s_txt, _mk_tag(s_tag)])
+        if pad:
+            segs.append([pad, [name_tag, marker]])
+        if isinstance(summary, str):
+            segs.append([f" \u2014 {summary}\n", [summary_tag, marker]])
+        else:
+            for s_txt, s_tag in summary:
+                segs.append([s_txt, _mk_tag(s_tag)])
     stream.emit(segs)
 
 
@@ -3575,22 +3599,41 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 _unchanged = int(_res.get("unchanged", 0) or 0)
                 sum_comments_refreshed += _fetched
                 sum_err += _errors_c
-                _parts = []
+                # Rich row: pink brackets/dashes/parens/dots, white body
+                # text, red errors. Scope shown inline next to the
+                # channel name when the task was scoped (last Nd).
+                _scope_d = ch.get("only_recent_days")
+                if _scope_d:
+                    _name_segs = [
+                        [ch_name, "simpleline"],
+                        [" (", "meta_bracket"],
+                        [f"last {_scope_d}d", "simpleline"],
+                        [")", "meta_bracket"],
+                    ]
+                else:
+                    _name_segs = [[ch_name, "simpleline"]]
+                _chunks = []
                 if _fetched:
-                    _parts.append(f"{_fetched} comments refreshed")
+                    _chunks.append([f"{_fetched} comments refreshed",
+                                    "simpleline"])
                 if _unchanged:
-                    _parts.append(f"{_unchanged} unchanged")
+                    _chunks.append([f"{_unchanged} OK", "simpleline"])
                 if _errors_c:
-                    _parts.append(f"{_errors_c} errors")
-                if not _parts:
-                    _parts.append("no videos in scope")
-                _summary = " \u00b7 ".join(_parts)
-                _summary_tag = ("red" if _errors_c else
-                                "simpleline_pink" if _fetched else "dim")
-                _sync_row_emit(stream, i, total, ch_name,
-                               summary=_summary,
-                               name_tag="simpleline",
-                               summary_tag=_summary_tag)
+                    _chunks.append([f"{_errors_c} Errors", "red"])
+                if not _chunks:
+                    _chunks.append(["no videos in scope", "dim"])
+                _sum_segs = [[" \u2014 ", "meta_bracket"]]
+                for _j, _c in enumerate(_chunks):
+                    if _j > 0:
+                        _sum_segs.append([" \u00b7 ", "meta_bracket"])
+                    _sum_segs.append(_c)
+                _sum_segs.append([" \u00b7 ", "meta_bracket"])
+                _sum_segs.append(["(", "meta_bracket"])
+                _sum_segs.append([f"took {_fmt_duration(time.time() - _task_t0)}",
+                                  "simpleline"])
+                _sum_segs.append([")\n", "meta_bracket"])
+                _sync_row_emit(stream, i, total, _name_segs,
+                               summary=_sum_segs)
                 if _fetched:
                     _a_primary = f"{_fetched} comments refreshed"
                 elif _errors_c:

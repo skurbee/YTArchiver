@@ -162,8 +162,11 @@
             <rect x="9" y="3" width="3" height="10" rx="0.5"/>
           </svg>
         </button>
-        <!-- Clear-log dropdown moved to Row 3 (next to Auto-sync
-             selection) per 2026-04-23 layout feedback. See below. -->
+        <!-- Clear-log dropdown lives next to Pause so the Auto-sync
+             label/select pair in Row 3 reads as one unit (was: Clear
+             sat between them, breaking the visual pairing). -->
+        <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
+                title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
 
         <div class="spacer"></div>
 
@@ -191,16 +194,11 @@
       <!-- Horizontal separator matching ttk.Separator between btn_frame and autorun_frame -->
       <div class="section-separator"></div>
 
-      <!-- Row 3: Auto-sync dropdown + Clear + log mode dropdown -->
+      <!-- Row 3: Auto-sync label/dropdown + countdown -->
       <div class="controls-row controls-row-thin">
         <label class="ctl-label ctl-label-thin" title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
         <select class="ctl-select" id="auto-sync-select"
                 title="How often to auto-run Sync Subbed">
-          <!-- Display text uses full words for consistency
-               (the previous mix of "30 min" + "1 hr" + "24 hr" was
-               flagged in the UI audit). `value=` stays as the
-               backend-expected key so AUTORUN_OPTIONS dict-lookup
-               and config-file round-trip still work. -->
           <option value="Off">Off</option>
           <option value="30 min">30 minutes</option>
           <option value="1 hr">1 hour</option>
@@ -210,16 +208,6 @@
           <option value="12 hr">12 hours</option>
           <option value="24 hr">24 hours</option>
         </select>
-
-        <!-- Clear-log dropdown &mdash; placed directly after the Auto-sync
-             select so the two controls read as a paired group. The
-             autorun-countdown span follows the Clear button instead
-             of preceding it; its 140px min-width was otherwise
-             reserving dead space even when auto-sync is Off, which
-             pushed Clear all the way to the right edge. -->
-        <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
-                style="margin-left:8px;"
-                title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
 
         <span class="status-text autorun-countdown" id="autorun-countdown"></span>
 

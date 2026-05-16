@@ -9002,11 +9002,17 @@
       if (anyPending) visState = "pending";
       pauseBtn.dataset.pauseState = visState;
       pauseBtn.classList.toggle("pause-pending", anyPending);
-      pauseBtn.title = anyPending
+      // Write to data-tooltip (not title) — the 700ms blink tick was
+      // re-adding `title` mid-hover, after the custom tooltip system
+      // had already migrated it. Both ended up visible at once. Bypass
+      // the migration step by setting data-tooltip directly here.
+      const _pauseTip = anyPending
         ? "Pause queued — current job will finish first. Click to cancel pause."
         : (anyPaused
             ? "Resume all queues"
             : "Pause all queues (current jobs finish first)");
+      pauseBtn.setAttribute("data-tooltip", _pauseTip);
+      pauseBtn.removeAttribute("title");
       const svg = pauseBtn.querySelector("svg");
       if (svg) {
         const want = anyPaused ? "play" : "bars";

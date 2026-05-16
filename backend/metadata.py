@@ -3780,10 +3780,6 @@ def refresh_channel_comments(channel: Dict[str, Any],
         return {"ok": False, "error": "yt-dlp missing"}
 
     name = channel.get("name") or channel.get("folder") or "?"
-    _scope = f" (last {only_recent_days}d)" if only_recent_days else ""
-    stream.emit([["  \u2014 ", "meta_bracket"],
-                 [f"Refreshing comments for {name}{_scope}...\n",
-                  "simpleline"]])
 
     on_disk = _scan_channel_videos(folder)
     fp_by_id: Dict[str, str] = {}
@@ -3948,27 +3944,8 @@ def refresh_channel_comments(channel: Dict[str, Any],
         pass
 
     took = time.time() - t0
-    # Lazy import to avoid circular (sync.py imports metadata).
-    from .sync import _fmt_duration as _dur
-    took_str = _dur(took)
-    # Color discipline: when ANY comments refreshed, keep the
-    # success portion pink and only the errors count goes red.
-    # A single deleted/private video shouldn't paint the whole
-    # line red when 80 others succeeded.
-    base_color = "simpleline_pink" if fetched > 0 else "red"
-    segs = [
-        [" \u2014 ", "meta_bracket"],
-        [f"{name}: comments refreshed — ", base_color],
-        [f"{fetched} ok", base_color],
-    ]
-    if unchanged:
-        segs.append([", ", base_color])
-        segs.append([f"{unchanged} unchanged", base_color])
-    if errors:
-        segs.append([", ", base_color])
-        segs.append([f"{errors} errors", "red"])
-    segs.append([f" (took {took_str})\n", base_color])
-    stream.emit(segs)
+    # Per-channel summary is rendered by the sync loop's `_sync_row_emit`
+    # done-row in rich single-line form. No inline emit here.
     return {"ok": True, "fetched": fetched, "errors": errors,
             "unchanged": unchanged, "skipped": 0, "took": took}
 

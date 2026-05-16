@@ -1155,9 +1155,12 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                 pass
                             _video_url = f"https://www.youtube.com/watch?v={vid}"
                             # Title line — always emit (OLD does this in both modes).
-                            # simple mode: single dense line with title/channel/size
-                            # "— ✓ <title> — <channel> (NNN MB)"
+                            # simple mode: single dense line with title/size
+                            # "— ✓ <title> (NNN MB)"
                             # verbose mode: same line + Path/URL/Duration subfields
+                            # (Channel name is already shown in the [Dwnld]
+                            # header line above the block, so repeating it
+                            # here was just extra noise.)
                             # Inplace: reuse the `dlrow_<N>` kind that the
                             # Downloading emit used, so the ✓ done line
                             # REPLACES the Downloading line in simple mode
@@ -1226,7 +1229,6 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                                 [" ", ["dim", _done_kind]],
                                 ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],
                                 [f"{_display}", ["simpleline", _done_kind]],
-                                [f" \u2014 {name}", ["simpleline", _done_kind]],
                                 [f"{_size_tag}\n", ["dim", _done_kind]],
                             ])
                             # Path / URL / Duration — verbose-only sub-details
@@ -3302,6 +3304,22 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
     except Exception:
         _initial_total = 0
     while True:
+        # Clear stale cancel+skip flags from a previous iteration's
+        # mid-channel skip request. sync_skip_current sets BOTH flags so
+        # the in-flight yt-dlp dies and the worker advances. After the
+        # cancelled channel's sync_channel returns, the flags are still
+        # set; if we don't clear them BEFORE sync_pop, the cancel-check
+        # below (line ~3353) would re-trigger on the next-popped channel
+        # and silently drop it as "skipped" — bug Scott reported as
+        # "Cancel task on #1 removes #2, #1 stays" (actually #1's
+        # in-flight job ended AND #2 was dropped without running).
+        # NOTE: the cancel-check inside _wait_if_paused still handles
+        # the "user paused, then clicked Cancel while paused" case —
+        # in that path the flags get set AFTER this clear runs.
+        if (cancel_event is not None and cancel_event.is_set()
+                and skip_event is not None and skip_event.is_set()):
+            cancel_event.clear()
+            skip_event.clear()
         # Pop next channel off the queue. When the queue is empty, we're
         # done — this is how the loop terminates, naturally supporting
         # both fresh passes (queue was fully enqueued above) and resume

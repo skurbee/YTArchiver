@@ -3628,16 +3628,37 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     ]
                 else:
                     _name_segs = [[ch_name, "simpleline"]]
+                # Fixed-width column layout so rows stack vertically:
+                # the count is right-aligned to 4 chars, "OK" is always
+                # shown (even when 0) so the column never disappears,
+                # and the no-scope/failure messages pad to the same
+                # combined width as the count+OK pair so the trailing
+                # "(took …)" cell lands at the same column across all
+                # row variants.
+                _COUNT_W = 4   # right-aligned count width — fits 9999
+                _OK_W    = 4
+                # Width of "{count:>W} comments refreshed · {ok:>W} OK"
+                _NORMAL_PREFIX_W = (_COUNT_W + len(" comments refreshed")
+                                    + len(" · ")
+                                    + _OK_W + len(" OK"))
                 _chunks = []
-                if _fetched:
-                    _chunks.append([f"{_fetched} comments refreshed",
+                if _fetched > 0:
+                    _chunks.append([f"{_fetched:>{_COUNT_W}} comments refreshed",
                                     "simpleline"])
-                if _unchanged:
-                    _chunks.append([f"{_unchanged} OK", "simpleline"])
-                if _errors_c:
+                    _chunks.append([f"{_unchanged:>{_OK_W}} OK", "simpleline"])
+                elif _errors_c:
+                    _msg = "comments refresh failed"
+                    _chunks.append([_msg + " " * max(0, _NORMAL_PREFIX_W - len(_msg)),
+                                    "red"])
+                else:
+                    _msg = "no videos in scope"
+                    _chunks.append([_msg + " " * max(0, _NORMAL_PREFIX_W - len(_msg)),
+                                    "dim"])
+                # Errors alongside successes: append after the OK cell.
+                # Pushes (took …) right for this one row only — acceptable
+                # since errors are rare and worth standing out.
+                if _errors_c and _fetched > 0:
                     _chunks.append([f"{_errors_c} Errors", "red"])
-                if not _chunks:
-                    _chunks.append(["no videos in scope", "dim"])
                 _sum_segs = [[" \u2014 ", "meta_bracket"]]
                 for _j, _c in enumerate(_chunks):
                     if _j > 0:
@@ -3657,17 +3678,18 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _a_primary = "comments refresh failed"
                 else:
                     _a_primary = "no videos in scope"
-                # Comments rows: put "X unchanged" in SECONDARY (not
-                # tertiary) so the row reads "comments refreshed -
-                # unchanged - errors - took" with no empty column gap.
-                # Different from views/likes refresh, which keeps
-                # unchanged in tertiary because secondary there
-                # can carry "N new" on a mixed-result refresh pass.
-                # Comments has no "new" concept so secondary was
-                # always empty — that was the awkward gap.
-                # Show "0 unchanged" too when fetched > 0 so the
-                # column stays populated row-to-row.
-                _a_secondary = (f"{_unchanged} unchanged"
+                # Comments rows: put "X OK" in SECONDARY (not tertiary)
+                # so the row reads "comments refreshed - OK - errors -
+                # took" with no empty column gap. Wording matches the
+                # log row above ("OK") rather than the older
+                # "unchanged" wording. Different from views/likes
+                # refresh, which keeps unchanged in tertiary because
+                # secondary there can carry "N new" on a mixed-result
+                # refresh pass. Comments has no "new" concept so
+                # secondary was always empty — that was the awkward
+                # gap. Show "0 OK" too when fetched > 0 so the column
+                # stays populated row-to-row.
+                _a_secondary = (f"{_unchanged} OK"
                                 if _fetched > 0 else "")
                 emit_metadata_activity_row(
                     stream, ch_name,

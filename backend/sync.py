@@ -363,7 +363,8 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
                    name, summary=None,
                    name_tag: str = "simpleline_green",
                    summary_tag: str = "simpleline",
-                   pass_id: str = "") -> None:
+                   pass_id: str = "",
+                   bracket_tag: str = "sync_bracket") -> None:
     """Emit a single `[N/total] Name — summary` line that replaces in-
     place across re-emissions for the same channel index WITHIN ONE
     sync pass.
@@ -389,7 +390,8 @@ def _sync_row_emit(stream: "LogStreamer", idx: int, total: int,
         pass_id = getattr(_ROW_EMIT_PASS_ID, "id", "") or ""
     marker = (f"sync_row_{pass_id}_{idx}" if pass_id
               else f"sync_row_{idx}")
-    segs = _bracket_segments(f"{idx}/{total}", extra_tag=marker)
+    segs = _bracket_segments(f"{idx}/{total}", extra_tag=marker,
+                             bracket_tag=bracket_tag)
     if isinstance(name, str):
         _name_disp_len = len(name)
         _name_in = [[name, name_tag]]
@@ -3411,17 +3413,6 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                            summary=f"cooldown until {cooldown_label}",
                            name_tag="dim", summary_tag="dim")
             continue
-        # Emit the "live" row for this channel (header only, no summary).
-        # sync_channel does its work; afterwards we emit the "done" row
-        # with the same sync_row_<i> marker so it replaces the header in
-        # place, giving the user a single consolidated line per channel.
-        ch_name = ch.get("name", "?")
-        _last_live.update({"i": i, "total": total, "name": ch_name})
-        _sync_row_emit(stream, i, total, ch_name)
-        # If user hit Pause between the cooldown check and now, honor it
-        # before kicking off yt-dlp.
-        _wait_if_paused()
-
         # Kind dispatch. Download items (the default / no `kind` key)
         # take the full sync_channel path; metadata items take the
         # fetch_channel_metadata path. This is how metadata recheck
@@ -3429,7 +3420,28 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # Sync Tasks popover, pausable, and cancellable via the same
         # controls as downloads. rule: "every channel's
         # metadata check should show as its own sync task."
+        # Kind is computed BEFORE the live-row emit so the row's
+        # bracket / name color matches the task type — green for
+        # downloads, pink for metadata-family work.
         _ch_kind = (ch.get("kind") or "download").lower()
+        _is_meta_kind = _ch_kind in ("metadata", "metadata_comments",
+                                     "videoid_backfill")
+        _row_bracket = "meta_bracket" if _is_meta_kind else "sync_bracket"
+        _row_name_tag = ("simpleline_pink" if _is_meta_kind
+                         else "simpleline_green")
+
+        # Emit the "live" row for this channel (header only, no summary).
+        # sync_channel does its work; afterwards we emit the "done" row
+        # with the same sync_row_<i> marker so it replaces the header in
+        # place, giving the user a single consolidated line per channel.
+        ch_name = ch.get("name", "?")
+        _last_live.update({"i": i, "total": total, "name": ch_name})
+        _sync_row_emit(stream, i, total, ch_name,
+                       name_tag=_row_name_tag,
+                       bracket_tag=_row_bracket)
+        # If user hit Pause between the cooldown check and now, honor it
+        # before kicking off yt-dlp.
+        _wait_if_paused()
         _task_t0 = time.time()  # per-task timer for [Mtadta] activity row
         # Set current_sync for non-download kinds too. Without this,
         # the popover head row is empty during metadata / comments /
@@ -3467,7 +3479,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _sync_row_emit(stream, i, total, ch_name,
                                    summary="paused",
                                    name_tag="simpleline",
-                                   summary_tag="simpleline")
+                                   summary_tag="simpleline",
+                                   bracket_tag=_row_bracket)
                     _last_live["name"] = ""
                     _processed -= 1
                     continue
@@ -3510,7 +3523,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 _sync_row_emit(stream, i, total, ch_name,
                                summary=_summary,
                                name_tag="simpleline",
-                               summary_tag=_summary_tag)
+                               summary_tag=_summary_tag,
+                               bracket_tag=_row_bracket)
                 # Activity-log row — mirrors the [Dwnld] row pattern.
                 # Column layout is FIXED so values always line up
                 # vertically across rows:
@@ -3553,7 +3567,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 stream.emit_error(f"Metadata failed for {ch_name}: {_me}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
-                               name_tag="dim", summary_tag="red")
+                               name_tag="dim", summary_tag="red",
+                               bracket_tag=_row_bracket)
                 emit_metadata_activity_row(
                     stream, ch_name,
                     primary="failed", secondary="",
@@ -3590,7 +3605,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _sync_row_emit(stream, i, total, ch_name,
                                    summary="paused",
                                    name_tag="simpleline",
-                                   summary_tag="simpleline")
+                                   summary_tag="simpleline",
+                                   bracket_tag=_row_bracket)
                     _last_live["name"] = ""
                     _processed -= 1
                     continue
@@ -3633,7 +3649,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                                   "simpleline"])
                 _sum_segs.append([")\n", "meta_bracket"])
                 _sync_row_emit(stream, i, total, _name_segs,
-                               summary=_sum_segs)
+                               summary=_sum_segs,
+                               bracket_tag=_row_bracket)
                 if _fetched:
                     _a_primary = f"{_fetched} comments refreshed"
                 elif _errors_c:
@@ -3663,7 +3680,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     f"Comments refresh failed for {ch_name}: {_ce}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
-                               name_tag="dim", summary_tag="red")
+                               name_tag="dim", summary_tag="red",
+                               bracket_tag=_row_bracket)
                 emit_metadata_activity_row(
                     stream, ch_name,
                     primary="failed", secondary="",
@@ -3702,7 +3720,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     _sync_row_emit(stream, i, total, ch_name,
                                    summary="paused",
                                    name_tag="simpleline",
-                                   summary_tag="simpleline")
+                                   summary_tag="simpleline",
+                                   bracket_tag=_row_bracket)
                     _last_live["name"] = ""
                     _processed -= 1
                     continue
@@ -3726,7 +3745,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                 _sync_row_emit(stream, i, total, ch_name,
                                summary=_summary,
                                name_tag="simpleline",
-                               summary_tag=_summary_tag)
+                               summary_tag=_summary_tag,
+                               bracket_tag=_row_bracket)
                 _a_primary = (f"{_resolved} IDs backfilled" if _resolved
                               else "no IDs to backfill")
                 _a_secondary = (f"{_unresolved} unresolved"
@@ -3742,7 +3762,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
                     f"ID backfill failed for {ch_name}: {_be}")
                 _sync_row_emit(stream, i, total, ch_name,
                                summary="failed",
-                               name_tag="dim", summary_tag="red")
+                               name_tag="dim", summary_tag="red",
+                               bracket_tag=_row_bracket)
                 emit_metadata_activity_row(
                     stream, ch_name,
                     primary="failed", secondary="",

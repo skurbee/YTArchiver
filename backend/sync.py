@@ -1266,8 +1266,20 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             stream.emit_dim(
                                 f" (index register failed for {t!r}: {_re})")
                         try:
+                            # Pass size + duration through so the function
+                            # doesn't need to spawn ffprobe / re-stat the
+                            # video file. DLTRACK already gave us both
+                            # (`_size_bytes` was just computed above for
+                            # the ✓ line, `_dur_val` is `dur` from the
+                            # DLTRACK record). Skipping ffprobe matters
+                            # when Z: is contended by the boot sweep —
+                            # the subprocess can otherwise stall 5+
+                            # seconds per download.
+                            _rec_size = _size_bytes if _size_bytes else None
                             _record_recent_download(final_path, name, t, vid,
-                                                    upload_date=(ud or "").strip())
+                                                    upload_date=(ud or "").strip(),
+                                                    size_bytes=_rec_size,
+                                                    duration_secs=_dur_val)
                         except Exception as _re2:
                             # bug S-2: Recent tab goes stale silently
                             # on any cache write failure without this.
@@ -2848,7 +2860,9 @@ def pop_pending_dwnld_row(channel_name: str,
 
 def _record_recent_download(filepath: str, channel: str, title: str,
                              video_id: str = "",
-                             upload_date: str = "") -> None:
+                             upload_date: str = "",
+                             size_bytes: Optional[int] = None,
+                             duration_secs: Optional[float] = None) -> None:
     """Push a fresh entry onto config['recent_downloads'] (newest first).
 
     Keeps the list capped at 500 entries. Silently no-ops when the write
@@ -2865,6 +2879,17 @@ def _record_recent_download(filepath: str, channel: str, title: str,
       filepath str
       video_url str
       download_ts float unix timestamp
+
+    `size_bytes` and `duration_secs` are optional — when the caller
+    already knows them (the DLTRACK handler does, both come straight
+    from yt-dlp), pass them through to skip the redundant disk work.
+    Without that fast path, ffprobe is spawned to parse duration off
+    the newly-merged .mp4, which on a contended slow disk (e.g. Z:
+    DrivePool during the boot sweep) can stall the whole DLTRACK
+    handler for several seconds per download. Falls back to the old
+    behavior when either parameter is None — keeps the function safe
+    to call from any other code path that doesn't have these values
+    on hand.
     """
     if not filepath:
         return
@@ -2874,29 +2899,38 @@ def _record_recent_download(filepath: str, channel: str, title: str,
     try:
         # Raw bytes — OLD reads this as `int(size)`. Must be a plain integer
         # string, NOT a human-readable "5.2 MB".
-        size_bytes = 0
-        try:
-            size_bytes = os.path.getsize(filepath)
-        except OSError:
-            pass
+        if size_bytes is not None:
+            _size_bytes = int(size_bytes)
+        else:
+            _size_bytes = 0
+            try:
+                _size_bytes = os.path.getsize(filepath)
+            except OSError:
+                pass
 
         # Raw seconds — OLD reads this as `int(duration)`. Must be integer
         # string of seconds, NOT "3:45".
         duration_s = ""
-        try:
-            r = subprocess.run(
-                ["ffprobe", "-v", "error",
-                 "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1",
-                 filepath],
-                capture_output=True, text=True, timeout=6,
-                creationflags=(0x08000000 if os.name == "nt" else 0),
-            )
-            raw = (r.stdout or "").strip()
-            if raw:
-                duration_s = str(int(float(raw)))
-        except Exception:
-            pass
+        if duration_secs is not None and duration_secs > 0:
+            try:
+                duration_s = str(int(float(duration_secs)))
+            except (TypeError, ValueError):
+                duration_s = ""
+        if not duration_s:
+            try:
+                r = subprocess.run(
+                    ["ffprobe", "-v", "error",
+                     "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1",
+                     filepath],
+                    capture_output=True, text=True, timeout=6,
+                    creationflags=(0x08000000 if os.name == "nt" else 0),
+                )
+                raw = (r.stdout or "").strip()
+                if raw:
+                    duration_s = str(int(float(raw)))
+            except Exception:
+                pass
 
         # audit E-5: prefer yt-dlp's emitted upload_date (from DLTRACK)
         # over file mtime. On some Windows network drives + Z: drivepool
@@ -2926,7 +2960,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             "title": title or "",
             "channel": channel or "",
             "date": date_str, # YYYYMMDD — OLD shape
-            "size": str(int(size_bytes)), # raw bytes as string
+            "size": str(int(_size_bytes)), # raw bytes as string
             "duration": duration_s, # raw seconds as string
             "filepath": filepath,
             "video_url": (f"https://www.youtube.com/watch?v={video_id}"

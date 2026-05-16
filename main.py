@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v62.9"
-APP_VERSION_DATE = "5.15.26 10:00pm"
+APP_VERSION      = "v63.0"
+APP_VERSION_DATE = "5.15.26 10:37pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -2753,6 +2753,10 @@ class Api:
     # ─── Deferred livestreams ──────────────────────────────────────────
 
     def livestreams_list(self):
+        """JS bridge: return the current Deferred Livestreams drawer
+        contents. Each entry is a livestream / premiere URL that yt-dlp
+        couldn't grab yet (e.g. the stream is upcoming or in progress)
+        and is being held for a later retry."""
         try:
             from backend import livestreams as _ls
             return {"ok": True, "items": _ls.list_deferred()}
@@ -2760,6 +2764,10 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     def livestreams_drop(self, video_id):
+        """JS bridge: remove a single deferred livestream entry from
+        the drawer. Called when a deferred stream successfully
+        downloads on a later sync (so we stop showing it as pending),
+        or when the user clicks the row's `×` to dismiss it manually."""
         try:
             from backend import livestreams as _ls
             return {"ok": _ls.drop(video_id)}
@@ -2913,6 +2921,11 @@ class Api:
             return {"ok": False, "rows": [], "error": str(e)}
 
     def bookmark_add(self, payload):
+        """JS bridge: persist a new transcript bookmark. `payload` is the
+        dict the Watch-view bookmark button sends — video_id, title,
+        channel, start_time (seconds into the video), the snippet text
+        the user highlighted, and an optional note. Returns the new row
+        id so the UI can refer to this bookmark later (for edit/remove)."""
         bid = index_backend.bookmark_add(
             payload.get("video_id", ""), payload.get("title", ""),
             payload.get("channel", ""), float(payload.get("start_time", 0)),
@@ -2921,9 +2934,13 @@ class Api:
         return {"ok": bid is not None, "id": bid}
 
     def bookmark_remove(self, bm_id):
+        """JS bridge: delete a transcript bookmark by row id. Called by
+        the bookmark list's `×` button."""
         return {"ok": index_backend.bookmark_remove(int(bm_id))}
 
     def bookmark_update_note(self, bm_id, note):
+        """JS bridge: replace the free-text note on an existing bookmark.
+        Used by the inline note-edit textbox in the bookmark list."""
         return {"ok": index_backend.bookmark_update_note(int(bm_id), note or "")}
 
     def index_summary(self):

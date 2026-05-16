@@ -1,4 +1,40 @@
 <!DOCTYPE html>
+<!--
+  YT Archiver — single-page UI shell rendered inside pywebview.
+
+  Page structure (top to bottom in the source below):
+    1. <header-strip>     App title + version label
+    2. <tab-row>          Top-level tabs: Subs, Browse, Settings
+                          (Recent used to live here too, now under Browse)
+    3. <main>             Tab panels, only one visible at a time:
+       - #panel-subs         Channel subscriptions table + Sync controls
+       - #panel-browse       Library navigation: Channels grid, Search,
+                             Graph, Bookmarks, Recent. Has its own
+                             left sidebar that swaps the right pane.
+       - #panel-settings     Per-channel + global settings, sync log
+    4. Floating overlays (not in the tab flow):
+       - #welcome-modal      First-launch archive-root picker (modal)
+       - #ask-modal          Generic confirm/prompt modal used by
+                             askConfirm() / askChoice() helpers in app.js
+       - #context-menu       Right-click menu, repurposed per context
+       - .drawer-livestreams Deferred-livestreams drawer slides up
+                             from bottom-right
+       - .mini-log           Tiny "tail of activity" panel docked at the
+                             bottom of every tab so the user always
+                             sees recent log activity
+       - #sync-tasks-popup / #gpu-tasks-popup   Queue popups anchored
+                             to their respective header badges
+    5. <script src="vendor/chart.umd.min.js">  Chart.js for the
+                             Browse > Graph charts
+    6. <script src="logs.js"> + <script src="app.js">  The two JS
+                             files that wire everything together — see
+                             web/app.js header for its section map.
+
+  All styling lives in styles.css. All behavior lives in app.js + logs.js.
+  Python talks to this page via `window.pywebview.api.<method>` (defined
+  by the Api class in main.py) and via `window._logBatch(payload)`
+  which streams log lines in from the backend's LogStreamer.
+-->
 <html lang="en">
 <head>
   <meta charset="UTF-8" />

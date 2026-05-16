@@ -1256,6 +1256,28 @@ def _parse_vtt(path: str) -> list:
 # ── Python 3.11 discovery (same pattern as YTArchiver.py:8653) ─────────
 
 def find_python311() -> Optional[str]:
+    """Locate a Python 3.11 executable to run the Whisper worker.
+
+    Whisper (specifically faster-whisper + its CTranslate2 / CUDA wheels)
+    is pinned to Python 3.11 — the wheels for 3.13 don't exist on PyPI
+    yet, and we don't want to bundle CUDA into the main app. So the
+    pywebview shell runs on Python 3.13 and shells out to a separate
+    Python 3.11 process for transcription work.
+
+    Search order (first hit wins):
+      1. `%LOCALAPPDATA%\\Programs\\Python\\Python311*\\python.exe`
+         (the per-user install path the official Python installer uses
+         by default — this is where most installs land)
+      2. `C:\\Python311\\python.exe` and `C:\\Python310\\python.exe`
+         (old "all users" location, kept as a backstop)
+      3. `%PROGRAMFILES%\\Python311\\python.exe` and the WOW64 variant
+      4. Whatever `python3.11` or `python` resolves to on PATH
+      5. A hard-coded last-ditch path under `%LOCALAPPDATA%`
+
+    Returns the absolute path to `python.exe`, or `None` if nothing
+    suitable was found — callers should surface a friendly "please
+    install Python 3.11" message rather than crashing.
+    """
     import shutil as _shutil
     candidates: List[str] = []
     bases = [

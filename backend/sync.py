@@ -207,6 +207,20 @@ _RESERVED_NAMES = frozenset({
 })
 
 def sanitize_folder(name: str) -> str:
+    """Turn an arbitrary channel name into a safe Windows folder name.
+
+    Replaces Windows-illegal characters (`< > : " / \\ | ? *` and any
+    control byte 0x00-0x1F) with underscores, trims surrounding spaces
+    and trailing dots, falls back to `_unnamed` when the input is empty
+    or only consisted of illegal characters, and prefixes an underscore
+    onto any of the OS-reserved device names (CON, PRN, AUX, NUL, COM1-9,
+    LPT1-9) — Windows blocks those even as ordinary file/folder names.
+
+    Verbatim behavior port of the original tkinter app's helper at
+    YTArchiver.py:2790. Anything that touches the archive on disk
+    (sync, reorg, metadata, redownload) must go through this function
+    before constructing a folder path so the path is always creatable.
+    """
     result = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip().rstrip('. ')
     if not result:
         result = "_unnamed"
@@ -216,6 +230,19 @@ def sanitize_folder(name: str) -> str:
 
 
 def channel_folder_name(ch: Dict[str, Any]) -> str:
+    """Return the safe on-disk folder name for a channel record.
+
+    Honors the user's per-channel `folder_override` if it's set — that's
+    the "Folder override" textbox in the Subs tab settings that lets
+    the user rename a channel's folder without renaming the channel
+    itself (useful when YouTube changes a creator's display name).
+    Falls back to the channel `name` otherwise. Both routes go through
+    `sanitize_folder()` so the result is always Windows-safe.
+
+    A channel record with neither field set will resolve to `_unnamed/`,
+    which is sync.py's "this channel record is broken, don't write
+    anything new to it" graveyard folder.
+    """
     return sanitize_folder((ch.get("folder_override") or "").strip() or ch.get("name", ""))
 
 
@@ -2505,16 +2532,34 @@ _active_sync_lock = threading.Lock()
 
 
 def set_sync_active(channel_name: str) -> None:
+    """Mark `channel_name` as currently being synced.
+
+    Called at the top of `sync_channel(name=...)` so the transcribe
+    worker can tell whether a `[Trnscr]` activity row would be racing
+    a `[Dwnld]` row from the same channel — see the module-level
+    comment on `_active_sync_channels` for the full rationale.
+    """
     with _active_sync_lock:
         _active_sync_channels.add(channel_name)
 
 
 def clear_sync_active(channel_name: str) -> None:
+    """Unmark `channel_name` once its `sync_channel` call has returned.
+
+    Idempotent: discards from the set, doesn't error if the name isn't
+    there (e.g. when sync_channel exits early via cancellation).
+    """
     with _active_sync_lock:
         _active_sync_channels.discard(channel_name)
 
 
 def is_sync_active(channel_name: str) -> bool:
+    """True iff a `sync_channel` call for `channel_name` is in flight.
+
+    Threadsafe — the underlying set is read under a lock so callers from
+    the transcribe worker, the autorun scheduler, and the UI bridge get
+    a consistent view.
+    """
     with _active_sync_lock:
         return channel_name in _active_sync_channels
 

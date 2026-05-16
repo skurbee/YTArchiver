@@ -108,8 +108,37 @@ for line in sys.stdin:
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
 
-        # Split any segment longer than 30s at word boundaries (30s cap
-        # matches yt-archiver-timestamps.md memory)
+        # ── Re-segment long Whisper outputs to a 30-second cap ─────────
+        # Why this whole block exists:
+        # Whisper occasionally emits one huge segment for a long run of
+        # uninterrupted speech (a monologue, a news anchor, etc). The
+        # transcript viewer renders each segment as one karaoke "line"
+        # and highlights word-by-word during playback. A 90-second
+        # block would scroll off-screen long before its highlight
+        # finishes, making the karaoke unusable — so we split anything
+        # longer than 30s at word boundaries into multiple shorter
+        # segments. 30s matches the cap documented in the
+        # yt-archiver-timestamps.md memory note.
+        #
+        # Three branches below:
+        #   1. seg already ≤ 30s   → emit unchanged, keep per-word
+        #                            timestamps from Whisper
+        #   2. seg > 30s WITH word timestamps   → preferred path: chunk
+        #      by counting words, use the actual word start/end times
+        #      so the karaoke stays sample-accurate
+        #   3. seg > 30s with NO word timestamps   → fallback: chunk
+        #      by even time slices, lose the word-level karaoke for
+        #      that range. Rare — only when the model was run without
+        #      word_timestamps=True (shouldn't happen in this app).
+        #
+        # Variables in the chunking math:
+        #   _MAX_SEG  = 30.0 second segment cap
+        #   dur       = this segment's duration (end - start)
+        #   n_chunks  = ceil(dur / 30), minimum 2 (we already know
+        #               we're in the long-segment branch)
+        #   wpc       = words-per-chunk = len(raw_words) // n_chunks
+        #   ci        = chunk index (0..n_chunks-1)
+        #   wi0..wi1  = slice indices into the word list for this chunk
         _MAX_SEG = 30.0
         seg_data = []
         for seg in all_segments:
@@ -118,11 +147,15 @@ for line in sys.stdin:
                 continue
             dur = seg.end - seg.start
             raw_words = [w for w in (seg.words or []) if w.word.strip()]
+            # Branch 1: short enough, no chunking needed.
             if dur <= _MAX_SEG:
                 w_data = [{"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)}
                           for w in raw_words]
                 seg_data.append({"s": round(seg.start, 2), "e": round(seg.end, 2),
                                  "t": t, "w": w_data})
+            # Branch 2: too long, but we have word-level timestamps —
+            # split the word list into roughly-equal slices and use the
+            # first/last word's timestamps as the new segment bounds.
             elif raw_words:
                 n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 0 else 0))
                 wpc = max(1, len(raw_words) // n_chunks)
@@ -138,6 +171,11 @@ for line in sys.stdin:
                     seg_data.append({"s": round(chunk_ws[0].start, 2),
                                      "e": round(chunk_ws[-1].end, 2),
                                      "t": chunk_text, "w": w_data})
+            # Branch 3: too long AND no word timestamps. Fall back to
+            # splitting the text by word count and interpolating segment
+            # start/end times linearly across the duration. The chunks
+            # carry no word-level data (`"w": []`), so the UI will
+            # render them as plain text without per-word karaoke.
             else:
                 words = t.split()
                 n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 0 else 0))

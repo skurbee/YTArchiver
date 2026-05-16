@@ -1,5 +1,50 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   app.js — tab switching, splitter, log-mode toggle, Python bridge wiring
+   app.js — the single frontend script for the YTArchiver pywebview UI.
+
+   Everything user-visible besides log streaming lives here. The whole
+   file is wrapped in an IIFE (the `(function(){ ... })();` at the
+   bottom) so nothing leaks to the global scope except the handful of
+   `window.<name>` exports below.
+
+   ─── Big-picture sections, in source order ──────────────────────────
+     1. Dark dialog system — askQuestion / askConfirm / askChoice
+        Replaces the browser's confirm() / alert() / prompt() with the
+        themed modal at #ask-modal.
+     2. Right-click context menu — buildContextMenu / showContextMenu
+        Generic dropdown anchored to a click coord. Reused for queue
+        rows, channel rows, video tiles, etc.
+     3. Tab system — tab-row click handlers, panel show/hide.
+     4. Subs tab — channel list, sync button, autosync controls,
+        per-channel right-click actions, add-channel flow.
+     5. Browse tab — left sidebar (Channels / Search / Graph /
+        Bookmarks / Recent), channel grid, search results, the
+        Chart.js graphs, watch view with the embedded player.
+     6. Settings tab — every per-channel + global toggle, including
+        sync-log mode, the Metadata refresh subview, autorun, etc.
+     7. Queue popups — #sync-tasks-popup and #gpu-tasks-popup,
+        paintTaskList, reorder helpers, defer/skip wiring.
+     8. Mini logs — the tail-of-activity strip docked at the bottom
+        of each tab; mirrored from the main log via _mirrorMiniLogs.
+     9. Welcome / first-launch flow — the modal at #welcome-modal that
+        forces the user to pick an archive root before anything else.
+    10. seedLogs() — once at startup, pulls initial state (runtime
+        info, channels, recent downloads, queues) from the Python
+        bridge so the UI paints with real data instead of blank.
+    11. Missing-folder reconcile flow — if a channel folder disappears
+        (drive ejected, manually moved), prompt the user to relocate
+        or remove the subscription.
+    12. Global helpers exported as window.<name> at the bottom — these
+        are the entry points Python calls via evaluate_js, and other
+        parts of the page reference too.
+
+   ─── How Python talks to this page ──────────────────────────────────
+     - Pull: every `await window.pywebview.api.<method>(...)` call hits
+       the `Api` class in main.py.
+     - Push: backend log lines arrive via `window._logBatch(payload)`
+       (defined in logs.js, batched every ~60ms from LogStreamer).
+       Other one-off pushes use `window.<name>(...)` calls evaluated
+       from Python — see e.g. `window.renderActivityLog`,
+       `window.renderSubsTable`, `window.appendMainLog`.
    ═══════════════════════════════════════════════════════════════════════ */
 
 (function () {

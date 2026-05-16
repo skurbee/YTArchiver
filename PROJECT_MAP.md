@@ -1,13 +1,13 @@
 # YTArchiver — Project Map
 
-A guided tour of every file in this repo, what it does, and the
+A tour of every file in this repo, what it does, and the
 important functions inside it.
 ---
 
-## What YTArchiver actually is
+## What YTArchiver is
 
-YTArchiver is a Windows desktop app that maintains a local video
-archive of YouTube channels you subscribe to. You give it a list of
+YTArchiver is a desktop app that maintains a local video
+archive of YouTube channels you subscribe to. You give a list of
 channels; it periodically syncs each one, downloads any new videos
 via `yt-dlp`, transcribes them with Whisper, fetches their metadata,
 and stores everything in a structured folder tree on disk. The point

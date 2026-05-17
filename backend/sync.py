@@ -264,6 +264,10 @@ _MERGE_RE = re.compile(
     # row. Greedy `"(.+)"` with end-of-line anchor captures the whole
     # path — yt-dlp always terminates the merger line with `"` + EOL.
     r'\[(?:Merger|ffmpeg|FixupM3u8)\]\s+(?:Merging|Remuxing|Converting)[^"]*"(.+)"\s*$')
+# yt-dlp's per-track format-suffix intermediates: `video.f135.mp4`,
+# `video.f140-16.m4a`, `video.f140-drc.m4a`. Used by `_scan_recent_video`
+# to skip these when picking the most-recent merged output.
+_F_SUFFIX_RE = re.compile(r"\.f\d+(?:-[A-Za-z0-9]+)?\.[A-Za-z0-9]+$")
 _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format")
 # Video-ID capture from `[youtube] VIDID:`, `[info] VIDID:`, `[download] VIDID:`
 # lines yt-dlp prints throughout the lifecycle of a single video.
@@ -2270,6 +2274,13 @@ def _scan_recent_video(channel_dir) -> Optional[str]:
                 continue
             for fn in fns:
                 if not fn.lower().endswith(exts):
+                    continue
+                # Skip yt-dlp format-suffix intermediates (e.g. `video.f135.mp4`,
+                # `video.f140-drc.mp4`). DLTRACK can fire before the merger
+                # deletes these — scan would otherwise return the intermediate
+                # as the "most recent video" and transcribe would later fail
+                # with "file not found" when the merge cleanup runs.
+                if _F_SUFFIX_RE.search(fn):
                     continue
                 fp = os.path.join(dp, fn)
                 try:

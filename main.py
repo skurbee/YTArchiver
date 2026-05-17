@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v64.5"
-APP_VERSION_DATE = "5.16.26 9:04pm"
+APP_VERSION      = "v64.6"
+APP_VERSION_DATE = "5.17.26 8:41am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────

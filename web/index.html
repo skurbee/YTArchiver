@@ -1100,7 +1100,15 @@
             <span class="bsb-sep">·</span>
             <span class="bsb-val" id="bsb-total-channels">&mdash;</span><span class="bsb-unit">channels total</span>
           </div>
-          <div class="channel-grid" id="channel-grid"></div>
+          <div class="channel-grid" id="channel-grid">
+            <!-- Loading placeholder shown until renderChannelGrid replaces
+                 innerHTML with the actual cards. Without this the user sees
+                 a fully blank tab for ~10s during startup. -->
+            <div class="grid-loading">
+              <div class="grid-spinner"></div>
+              <span class="grid-loading-label">Loading channels&hellip;</span>
+            </div>
+          </div>
         </div>
 
         <!-- View: video grid -->
@@ -1450,14 +1458,30 @@
                     <th class="col-size right" data-sort="size">Size</th>
                   </tr>
                 </thead>
-                <tbody id="recent-table-body"></tbody>
+                <tbody id="recent-table-body">
+                  <!-- Loading placeholder; renderRecentTable clears tbody on
+                       first render so this is removed once data arrives. -->
+                  <tr class="grid-loading-row">
+                    <td colspan="5">
+                      <div class="grid-loading">
+                        <div class="grid-spinner"></div>
+                        <span class="grid-loading-label">Loading recent downloads&hellip;</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
               </table>
             </div>
 
             <!-- Grid variant &mdash; reuses the Browse video-grid CSS. Hidden
                  by default (list view is the default mode). -->
             <div class="recent-grid-frame" id="recent-grid-frame" style="display:none;">
-              <div class="video-grid" id="recent-grid"></div>
+              <div class="video-grid" id="recent-grid">
+                <div class="grid-loading">
+                  <div class="grid-spinner"></div>
+                  <span class="grid-loading-label">Loading recent downloads&hellip;</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>

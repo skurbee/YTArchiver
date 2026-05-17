@@ -1659,6 +1659,9 @@
     card.dataset.filepath = v.filepath || "";
     card.dataset.videoId = v.video_id || "";
     card.dataset.title = v.title || "";
+    // Channel name is needed by the right-click "Refresh metadata" menu
+    // so the backend can locate the channel's aggregated Metadata.jsonl.
+    card.dataset.channel = v.channel || "";
     // Use a real <img> tag for thumbnails rather than CSS
     // `background: url(...)` — the image tag is far more forgiving of
     // http://127.0.0.1 URLs through pywebview's webview, and failed loads

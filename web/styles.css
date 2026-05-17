@@ -2573,6 +2573,10 @@ body {
   line-height: 10px;
   text-align: center;
 }
+.queue-auto-wrap input[type="checkbox"]:disabled,
+.queue-auto-wrap:has(input[type="checkbox"]:disabled) {
+  cursor: help;
+}
 .queue-popover-body {
   overflow-y: auto;
   max-height: 260px;
@@ -2939,6 +2943,40 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 14px;
+}
+/* Shared "loading…" placeholder rendered inside a grid container before
+   the first real render. The grid renderers all do `el.innerHTML = ""`
+   on their first call, so this gets removed automatically — no JS
+   cleanup needed. Spans the whole row in CSS grid contexts via
+   `grid-column: 1 / -1` so it stays centered regardless of how many
+   columns the grid auto-fills to. */
+.grid-loading {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 80px 20px;
+  color: var(--c-dim);
+  font-size: 13px;
+}
+.grid-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.08);
+  border-top-color: rgba(255, 255, 255, 0.55);
+  border-radius: 50%;
+  animation: grid-spin 0.8s linear infinite;
+}
+@keyframes grid-spin {
+  to { transform: rotate(360deg); }
+}
+/* Loading row inside the Recent list table — no zebra striping, no
+   bottom border, transparent background so it reads as a placeholder
+   rather than a real row. */
+.recent-table tr.grid-loading-row td {
+  border-bottom: none;
+  background: transparent;
 }
 /* YouTube-style card: banner fills the card (lazy-loaded <img>), circular
    PFP overlaps bottom-left, name + stats in a dark gradient overlay. */

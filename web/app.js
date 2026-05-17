@@ -2135,6 +2135,29 @@
     const sel = document.getElementById("auto-sync-select");
     const cd = document.getElementById("autorun-countdown");
     if (!sel) return;
+    // When Auto-sync is enabled, the Sync Tasks "Auto" checkbox MUST stay
+    // checked — otherwise the timer fires, items get queued, and nothing
+    // runs them (reported quirk). Lock the checkbox on (and reflect the
+    // forced state to the backend) while autorun is active; unlock when
+    // it returns to Off so the checkbox behaves normally.
+    const reconcileSyncAutoLock = (autorunIsOn) => {
+      const syncCB = document.getElementById("sync-auto-checkbox");
+      if (!syncCB) return;
+      const wrap = syncCB.closest(".queue-auto-wrap");
+      if (autorunIsOn) {
+        if (!syncCB.checked) {
+          syncCB.checked = true;
+          window.pywebview?.api?.queue_auto_set?.("sync", true);
+        }
+        if (!syncCB.disabled) {
+          syncCB.disabled = true;
+          if (wrap) wrap.title = "Auto-Sync enabled";
+        }
+      } else if (syncCB.disabled) {
+        syncCB.disabled = false;
+        if (wrap) wrap.title = "";
+      }
+    };
     // Restore saved interval + push countdown
     const tick = async () => {
       const api = window.pywebview?.api;
@@ -2143,6 +2166,7 @@
         const st = await api.autorun_state();
         if (!st) return;
         if (sel.value !== st.label) sel.value = st.label;
+        reconcileSyncAutoLock(st.label !== "Off");
         if (cd) {
           // Three states, matching classic's _tick_countdown:
           // - Sync running → "waiting for queue..." (countdown paused)
@@ -6652,6 +6676,7 @@
         const filepath = card.dataset.filepath || "";
         const videoId = card.dataset.videoId || "";
         const title = card.dataset.title || "";
+        const channel = card.dataset.channel || "";
         const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
         const api = window.pywebview?.api;
         showContextMenu(e.clientX, e.clientY, [
@@ -6671,6 +6696,42 @@
             if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
           }},
           { sep: true },
+          { label: "Refresh metadata", action: async () => {
+            // Re-fetches views/likes/description/comments for this single
+            // video and writes back to the channel's aggregated
+            // Metadata.jsonl. Also covers the missing-metadata case —
+            // fetch_single_video_metadata writes a fresh entry when one
+            // doesn't exist. Same backend as Watch view's refresh button.
+            if (!api?.browse_refresh_video_metadata) {
+              window._showToast?.("Refresh unavailable.", "warn");
+              return;
+            }
+            // Fall back to the currently-selected channel when the card's
+            // dataset doesn't carry one (older renders, or grids that don't
+            // set v.channel). Without this, the backend's
+            // "Channel '' not in config" error would just look like silence.
+            const _ch = channel
+              || (window._browseState?.currentChannel?.folder || "");
+            const payload = {
+              filepath, video_id: videoId, title, channel: _ch,
+            };
+            console.log("[refresh-meta] sending", payload);
+            window._showToast?.({ msg: "Refreshing metadata…", ttlMs: 15000 });
+            try {
+              const res = await api.browse_refresh_video_metadata(payload);
+              console.log("[refresh-meta] result", res);
+              if (res?.ok) {
+                window._showToast?.("Metadata refreshed.", "ok");
+              } else {
+                const msg = res?.error || "Refresh failed.";
+                window._showToast?.(msg, res?.transient ? "warn" : "error");
+              }
+            } catch (e) {
+              console.error("[refresh-meta] threw", e);
+              window._showToast?.(
+                `Refresh failed: ${e?.message || e}`, "error");
+            }
+          }},
           { label: "Transcribe now", action: async () => {
             if (filepath && api?.transcribe_enqueue) {
               // Manual → Whisper model picker (60s countdown auto-picks default).
@@ -6721,6 +6782,7 @@
         const filepath = card.dataset.filepath || "";
         const videoId = card.dataset.videoId || "";
         const title = card.dataset.title || "";
+        const channel = card.dataset.channel || "";
         const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
         const api = window.pywebview?.api;
         showContextMenu(e.clientX, e.clientY, [
@@ -6740,6 +6802,31 @@
             if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
           }},
           { sep: true },
+          { label: "Refresh metadata", action: async () => {
+            if (!api?.browse_refresh_video_metadata) {
+              window._showToast?.("Refresh unavailable.", "warn");
+              return;
+            }
+            const payload = {
+              filepath, video_id: videoId, title, channel,
+            };
+            console.log("[refresh-meta] sending", payload);
+            window._showToast?.({ msg: "Refreshing metadata…", ttlMs: 15000 });
+            try {
+              const res = await api.browse_refresh_video_metadata(payload);
+              console.log("[refresh-meta] result", res);
+              if (res?.ok) {
+                window._showToast?.("Metadata refreshed.", "ok");
+              } else {
+                const msg = res?.error || "Refresh failed.";
+                window._showToast?.(msg, res?.transient ? "warn" : "error");
+              }
+            } catch (e) {
+              console.error("[refresh-meta] threw", e);
+              window._showToast?.(
+                `Refresh failed: ${e?.message || e}`, "error");
+            }
+          }},
           { label: "Transcribe now", action: async () => {
             if (filepath && api?.transcribe_enqueue) {
               const model = await (window._askWhisperModel?.(`"${title}"`));

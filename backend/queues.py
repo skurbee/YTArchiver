@@ -645,6 +645,10 @@ class QueueState:
             # colorizeTaskName picks the pink qv-meta class \u2014 it's a
             # transcript-side repair, not a download.
             return f"Metadata repair YT captions \u2014 {name}"
+        if kind == "punct_restore":
+            # Restore transcript punctuation task \u2014 same pink color
+            # family as the other transcript-side repair tools.
+            return f"Metadata restore punctuation \u2014 {name}"
         if kind == "redownload":
             # Classic showed active redownload as "Redownload
             # ChannelName (480p)" with a Pause/Resume state.

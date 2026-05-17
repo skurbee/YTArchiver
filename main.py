@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v65.9"
-APP_VERSION_DATE = "5.17.26 11:54am"
+APP_VERSION      = "v66.4"
+APP_VERSION_DATE = "5.17.26 3:23pm"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -3868,6 +3868,64 @@ class Api:
 
         task = {
             "kind": "repair_yt_captions",
+            "name": scope_name,
+            "folder": scope_name,
+            "url": scope_url,
+            "channel_folder": channel or None,
+            "video_id": video_id or None,
+            "dry_run": dry_run,
+        }
+        try:
+            queued = self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not queued:
+            return {"ok": True, "queued": False,
+                    "error": "Already queued for this scope"}
+        self._on_queue_changed()
+        started = self._maybe_autostart_sync()
+        return {"ok": True, "queued": True, "started": started,
+                "paused": bool(self._queues.sync_paused),
+                "scope": scope_name, "dry_run": dry_run}
+
+    # ─── Restore transcript punctuation (v66.3 follow-up to v64.7 repair) ─
+
+    def punct_restore_segments(self, payload):
+        """Queue a Restore transcript punctuation task on the sync queue.
+
+        Walks the archive's per-segment text for YT-captioned videos and
+        runs each segment through the punctuation-restoration model so
+        the right-panel transcript reads as proper sentences instead of
+        a lowercase wall of text. No YT calls — pure local CPU/GPU work.
+        Serializes on the sync queue so it doesn't compete with an
+        in-flight download / repair pass for the punct model's GPU slot.
+
+        payload keys (all optional):
+          channel: channel folder name to limit scope; "" = all channels
+          video_id: single video to punctuate (overrides channel)
+          dry_run: bool — load the model + parse but don't write
+        """
+        cfg = self._config or load_config()
+        output_dir = (cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return {"ok": False, "error": "output_dir is not configured"}
+        payload = payload or {}
+        channel = (payload.get("channel") or "").strip()
+        video_id = (payload.get("video_id") or "").strip()
+        dry_run = bool(payload.get("dry_run"))
+
+        if video_id:
+            scope_name = f"video {video_id}"
+            scope_url = f"punct:video:{video_id}"
+        elif channel:
+            scope_name = channel
+            scope_url = f"punct:channel:{channel}"
+        else:
+            scope_name = "All channels"
+            scope_url = "punct:all"
+
+        task = {
+            "kind": "punct_restore",
             "name": scope_name,
             "folder": scope_name,
             "url": scope_url,

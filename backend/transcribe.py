@@ -925,8 +925,19 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # flips to `YT+PUNCTUATION` so ArchivePlayer / Watch banner can
     # detect the upgraded quality. Silently falls back to raw captions
     # if the punct model isn't available or the call fails.
+    #
+    # Skip the pass entirely when the source VTT already arrived with
+    # sentence punctuation — modern YT auto-cap is delivered punctuated
+    # natively, and re-running the model on already-good text is wasted
+    # work. The banner that fronts the watch view is content-driven
+    # (see logs.js _buildSourceBanner) so the user still sees the
+    # "(punctuated)" qualifier; the source tag stays YT CAPTIONS which
+    # now consistently means "no punct pass ran during ingest".
     src_tag = "YT CAPTIONS"
-    if punct_mgr is not None and full_text:
+    _vtt_punct_re = re.compile(r"[.,!?;:]")
+    _already_punct = bool(
+        full_text and _vtt_punct_re.search(full_text[:800]))
+    if punct_mgr is not None and full_text and not _already_punct:
         try:
             # `job_tag` (e.g. `whisper_job_7`) makes this line
             # replace ONLY this video's prior "Loading punctuation..."

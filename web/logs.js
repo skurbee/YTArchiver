@@ -2132,7 +2132,29 @@
       const words = Array.isArray(seg.words) && seg.words.length
         ? seg.words
         : (seg.w && seg.w.length ? seg.w : null);
-      if (words) {
+      // Tokenize the segment text on whitespace. After the "Restore
+      // transcript punctuation" pass runs, seg.text/seg.t holds the
+      // punctuated paragraph form while the words array stays raw
+      // (drives the video overlay's karaoke captions which Scott wants
+      // unpunctuated). When the token count matches the words count we
+      // render the punctuated tokens but keep the per-word timestamps —
+      // user sees readable prose with full karaoke + click-to-seek.
+      // If counts ever disagree (cap-flush rollover words, manual
+      // edits, etc.) fall back to the raw words.
+      const segText = seg.t || seg.text || "";
+      const textTokens = segText.trim().split(/\s+/).filter(Boolean);
+      if (words && textTokens.length === words.length) {
+        for (let i = 0; i < words.length; i++) {
+          const wobj = words[i];
+          const span = document.createElement("span");
+          span.className = "word";
+          span.dataset.s = wobj.s ?? 0;
+          span.dataset.e = wobj.e ?? 0;
+          span.textContent = textTokens[i] + " ";
+          span.addEventListener("click", () => _seekTo(vEl, wobj.s ?? 0));
+          segEl.appendChild(span);
+        }
+      } else if (words) {
         for (const wobj of words) {
           const span = document.createElement("span");
           span.className = "word";
@@ -2145,7 +2167,7 @@
       } else {
         const span = document.createElement("span");
         span.className = "word";
-        span.textContent = (seg.t || seg.text || "") + " ";
+        span.textContent = segText + " ";
         span.addEventListener("click", () => _seekTo(vEl, seg.s ?? 0));
         segEl.appendChild(span);
       }

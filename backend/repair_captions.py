@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 from .transcribe import _parse_vtt, _replace_jsonl_entry
-from .sync import find_yt_dlp, _startupinfo
+from .sync import find_yt_dlp, _startupinfo, _find_cookie_source
 from .ytarchiver_config import TRANSCRIPTION_DB
 
 # Suppress Windows console windows on every yt-dlp subprocess call —
@@ -234,9 +234,16 @@ def _find_txt_for_jsonl(jsonl_path: Path) -> Path:
 
 def _fetch_vtt(yt_dlp: str, video_id: str,
                out_dir: Path) -> tuple[Optional[Path], Optional[str]]:
-    """Run yt-dlp to fetch a single video's auto-caption VTT."""
+    """Run yt-dlp to fetch a single video's auto-caption VTT.
+
+    Passes the same `--cookies-from-browser` (or `--cookies cookies.txt`)
+    args every other YTArchiver yt-dlp call uses. Authenticated requests
+    get higher YT quotas (fewer 429s) and unlock age-gated content that
+    would otherwise come back as "Sign in to confirm your age".
+    """
     cmd = [
         yt_dlp,
+        *_find_cookie_source(),
         "--skip-download", "--write-auto-subs",
         "--sub-lang", "en", "--sub-format", "vtt",
         "--no-warnings",
@@ -495,19 +502,49 @@ def repair_archive(*, output_dir: str, log_stream,
 
     def _wait_if_paused() -> None:
         # Match the existing sync worker's pause-wait pattern. Block in
-        # 0.5s chunks so cancel still wins quickly.
-        if pause_event is None:
+        # 0.5s chunks so cancel still wins quickly. Emit a one-shot
+        # "Paused" log line when entering pause-wait + "Resumed" when
+        # exiting, plus flip the queue's sync_paused_active flag so the
+        # Sync Tasks popover renders the pause-active state.
+        if pause_event is None or not pause_event.is_set():
             return
-        while pause_event.is_set():
-            if _cancelled():
-                return
-            pause_event.wait(timeout=0.5)
+        log_stream.emit_text(
+            " — Paused. Click Resume in Sync Tasks to continue.\n",
+            "simpleline")
+        log_stream.flush()
+        if queues is not None:
+            try: queues.set_sync_paused_active(True)
+            except Exception: pass
+        try:
+            while pause_event.is_set():
+                if _cancelled():
+                    return
+                pause_event.wait(timeout=0.5)
+        finally:
+            if queues is not None:
+                try: queues.set_sync_paused_active(False)
+                except Exception: pass
+            if not _cancelled():
+                log_stream.emit_text(" — Resumed.\n", "simpleline")
+                log_stream.flush()
 
     yt_dlp = find_yt_dlp()
     if not yt_dlp:
         log_stream.emit_error(" — Repair YT captions: yt-dlp not found.\n")
         log_stream.flush()
         return {"ok": False, "error": "yt-dlp not found"}
+
+    # Adaptive pacing: authenticated requests get a much higher YT
+    # quota, so we can run ~3x faster when cookies are configured. No
+    # cookies → fall back to the conservative 1.0s pause that's been
+    # measured to keep us under the anonymous rate limit.
+    _has_cookies = bool(_find_cookie_source())
+    _per_fetch_sleep = 0.3 if _has_cookies else _RATE_LIMIT_SLEEP_SEC
+    log_stream.emit_text(
+        f" — yt-dlp cookies: {'attached' if _has_cookies else 'none'} "
+        f"(per-fetch pacing: {_per_fetch_sleep:.1f}s)\n",
+        "simpleline")
+    log_stream.flush()
 
     root = Path(output_dir)
     if not root.exists():
@@ -690,16 +727,18 @@ def repair_archive(*, output_dir: str, log_stream,
         # Gentle rate-limit between fetches so YT doesn't 429 us. Use
         # cancel_event.wait so a Sync Tasks cancel still breaks out
         # promptly instead of having to sit through the sleep first.
+        # Per-fetch sleep adapts to cookie availability (faster when
+        # authenticated — see _per_fetch_sleep above).
         if i < len(work):
             if cancel_event is not None:
-                if cancel_event.wait(timeout=_RATE_LIMIT_SLEEP_SEC):
+                if cancel_event.wait(timeout=_per_fetch_sleep):
                     cancelled_early = True
                     log_stream.emit_text(
                         f"   Cancelled after {i}/{len(work)} videos.\n",
                         "simpleline")
                     break
             else:
-                time.sleep(_RATE_LIMIT_SLEEP_SEC)
+                time.sleep(_per_fetch_sleep)
 
     status_word = "Cancelled" if cancelled_early else "Repair done"
     log_stream.emit_text(

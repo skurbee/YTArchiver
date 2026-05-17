@@ -3215,6 +3215,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             return "Comments refresh"
         if kinds == {"videoid_backfill"}:
             return "Video ID backfill"
+        if kinds == {"repair_yt_captions"}:
+            return "Repair YT auto-captions"
         if kinds == {"metadata"}:
             # All refresh=True → views/likes refresh; all refresh=False →
             # metadata download; mixed → generic metadata pass.
@@ -3227,12 +3229,23 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         return "Sync pass"  # mixed kinds
 
     _label = _pass_label(_queue_snapshot if queues is not None else channels)
+    # Suffix word follows the work unit. Most kinds run per-channel, but
+    # repair_yt_captions is a single archive-wide task — "1 channels" is
+    # both ungrammatical and misleading. Match plural form to count too.
+    _kinds_in_queue = {(c.get("kind") or "download").lower()
+                       for c in (_queue_snapshot
+                                 if queues is not None else channels)}
+    if _kinds_in_queue == {"repair_yt_captions"}:
+        _unit = "task" if _starting_total == 1 else "tasks"
+    else:
+        _unit = "channel" if _starting_total == 1 else "channels"
     if _resume_mode:
         stream.emit([[f"=== Resuming {_label.lower()} ", "header"],
-                     [f"({_starting_total} channels remaining) ===\n", "header"]])
+                     [f"({_starting_total} {_unit} remaining) ===\n",
+                      "header"]])
     else:
         stream.emit([[f"=== {_label} starting ", "header"],
-                     [f"({_starting_total} channels) ===\n", "header"]])
+                     [f"({_starting_total} {_unit}) ===\n", "header"]])
 
     sum_dl = 0
     sum_err = 0
@@ -3437,7 +3450,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # downloads, pink for metadata-family work.
         _ch_kind = (ch.get("kind") or "download").lower()
         _is_meta_kind = _ch_kind in ("metadata", "metadata_comments",
-                                     "videoid_backfill")
+                                     "videoid_backfill",
+                                     "repair_yt_captions")
         _row_bracket = "meta_bracket" if _is_meta_kind else "sync_bracket"
         _row_name_tag = ("simpleline_pink" if _is_meta_kind
                          else "simpleline_green")
@@ -3461,7 +3475,8 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
         # blink (paintBlinkState requires a running head row to compute
         # `sync_running=true`). Cleared at the end of the iteration
         # below so the next channel doesn't inherit a stale row.
-        if _ch_kind in ("metadata", "metadata_comments", "videoid_backfill"):
+        if _ch_kind in ("metadata", "metadata_comments", "videoid_backfill",
+                        "repair_yt_captions"):
             if queues is not None:
                 try: queues.set_current_sync(ch)
                 except Exception: pass
@@ -3809,6 +3824,58 @@ def sync_all(stream: LogStreamer, cancel_event: Optional[threading.Event] = None
             if _on_metadata_changed_hook is not None:
                 try: _on_metadata_changed_hook()
                 except Exception: pass
+            continue
+        # Repair YT auto-captions task. Re-fetches each archived video's
+        # VTT, runs the fixed _parse_vtt, and rewrites the per-word array
+        # in the JSONL + segments DB. Lives on the sync queue so it
+        # serializes with downloads/metadata — multiple yt-dlp processes
+        # hitting YT in parallel would invite rate-limiting.
+        if _ch_kind == "repair_yt_captions":
+            try:
+                from . import repair_captions as _rc
+                _output_dir = (cfg.get("output_dir") or "").strip()
+                if not _output_dir:
+                    raise RuntimeError("output_dir not configured")
+                _res = _rc.repair_archive(
+                    output_dir=_output_dir,
+                    channel_folder=ch.get("channel_folder") or None,
+                    video_id=ch.get("video_id") or None,
+                    dry_run=bool(ch.get("dry_run")),
+                    log_stream=stream,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    queues=queues,
+                    scope_url=(ch.get("url") or "").strip() or None,
+                )
+                # Clear the per-video "(N/total)" decoration so the next
+                # popover render shows the clean task name again.
+                if queues is not None:
+                    try: queues.set_sync_pass_progress(0, 0)
+                    except Exception: pass
+                _ok_n = int(_res.get("succeeded", 0) or 0)
+                _skip_n = int(_res.get("skipped", 0) or 0)
+                _fail_n = int(_res.get("failed", 0) or 0)
+                _was_cancelled = bool(_res.get("cancelled"))
+                _summary = (f"{_ok_n} repaired · "
+                            f"{_skip_n} skipped · "
+                            f"{_fail_n} failed")
+                if _was_cancelled:
+                    _summary = "cancelled — " + _summary
+                _sum_tag = ("red" if _fail_n > 0 and not _was_cancelled
+                            else "simpleline_pink" if _ok_n > 0
+                            else "dim")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary=_summary,
+                               name_tag="simpleline",
+                               summary_tag=_sum_tag,
+                               bracket_tag=_row_bracket)
+            except Exception as _rpe:
+                stream.emit_error(f"Repair failed for {ch_name}: {_rpe}\n")
+                _sync_row_emit(stream, i, total, ch_name,
+                               summary="failed",
+                               name_tag="dim", summary_tag="red",
+                               bracket_tag=_row_bracket)
+            _last_live["name"] = ""
             continue
         # ── Quick-check fast path ────────────────────────────────────
         # Extra speedup on top of `--break-on-existing`: probe the first

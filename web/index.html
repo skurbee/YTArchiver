@@ -1676,9 +1676,18 @@
                 data center</i>).</li>
           </ul>
           Hits YouTube once per video, runs in the background, writes
-          to the JSONL sidecar and the segments DB. Whisper-transcribed
-          videos are skipped automatically. Refresh a video's Watch
-          view to see the repair land.
+          to the JSONL sidecar and the segments DB. Refresh a video's
+          Watch view to see the repair land. Queues as a Sync Task —
+          progress survives Pause / Resume / app restart; cancelling
+          mid-pass keeps the progress so re-running the same scope
+          picks up where you left off. Auto-skipped:
+          <ul style="margin:6px 0 6px 18px;padding:0;">
+            <li>Whisper-transcribed videos (different source).</li>
+            <li><code>YT+PUNCTUATION</code> videos where YT's current
+                VTT is still lowercase — re-parsing would strip the
+                restored capitalization + punctuation. Detected per
+                video after fetch.</li>
+          </ul>
         </div>
         <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:10px 14px;">
           <label class="edit-gl">Scope</label>
@@ -1689,13 +1698,6 @@
           <label style="font-size:12px;">
             <input type="checkbox" id="repair-yt-dryrun" />
             Fetch + parse only, don't write anything
-          </label>
-
-          <label class="edit-gl">Punctuated</label>
-          <label style="font-size:12px;">
-            <input type="checkbox" id="repair-yt-include-punctuated" />
-            Include <code>YT+PUNCTUATION</code> sources
-            <span class="edit-dim">— risky if the original VTT was lowercase</span>
           </label>
         </div>
       </div>

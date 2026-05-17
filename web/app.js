@@ -2144,18 +2144,25 @@
       const syncCB = document.getElementById("sync-auto-checkbox");
       if (!syncCB) return;
       const wrap = syncCB.closest(".queue-auto-wrap");
+      // Always sync title to the current autorun state. The prior
+      // version only cleared the tooltip when `syncCB.disabled` was
+      // true, so if the disabled flag and the title attribute ever
+      // drifted (e.g. autorun toggled mid-render, or a re-init re-
+      // enabled the checkbox without touching the label) the
+      // "Auto-Sync enabled" hint would stick around even after auto-
+      // sync went back to Off.
       if (autorunIsOn) {
         if (!syncCB.checked) {
           syncCB.checked = true;
           window.pywebview?.api?.queue_auto_set?.("sync", true);
         }
-        if (!syncCB.disabled) {
-          syncCB.disabled = true;
-          if (wrap) wrap.title = "Auto-Sync enabled";
+        if (!syncCB.disabled) syncCB.disabled = true;
+        if (wrap && wrap.title !== "Auto-Sync enabled") {
+          wrap.title = "Auto-Sync enabled";
         }
-      } else if (syncCB.disabled) {
-        syncCB.disabled = false;
-        if (wrap) wrap.title = "";
+      } else {
+        if (syncCB.disabled) syncCB.disabled = false;
+        if (wrap && wrap.title) wrap.title = "";
       }
     };
     // Restore saved interval + push countdown
@@ -10021,7 +10028,6 @@
       const bd = document.getElementById("repair-yt-backdrop");
       const chanSel = document.getElementById("repair-yt-channel");
       const dryEl = document.getElementById("repair-yt-dryrun");
-      const punctEl = document.getElementById("repair-yt-include-punctuated");
       const runBtn = document.getElementById("repair-yt-run");
       const closeBtn = document.getElementById("repair-yt-close");
       if (!btn || !bd || !chanSel || !runBtn) return;
@@ -10059,7 +10065,6 @@
       btn.addEventListener("click", async () => {
         await _loadChannels();
         if (dryEl) dryEl.checked = false;
-        if (punctEl) punctEl.checked = false;
         bd.style.display = "flex";
       });
 
@@ -10081,14 +10086,19 @@
         const payload = {
           channel: chanSel.value || "",
           dry_run: !!dryEl?.checked,
-          include_punctuated: !!punctEl?.checked,
         };
         try {
           const res = await api.repair_yt_captions(payload);
-          if (res?.ok) {
-            window._showToast?.(
-              "Repair started — progress in the main log.", "ok");
+          if (res?.ok && res.queued) {
+            const msg = res.started
+              ? "Repair queued — running now. Watch the main log."
+              : "Repair queued — will run when the sync queue resumes.";
+            window._showToast?.(msg, "ok");
             _close();
+          } else if (res?.ok && !res.queued) {
+            window._showToast?.(
+              res?.error || "A repair task with this scope is already queued.",
+              "warn");
           } else {
             window._showToast?.(res?.error || "Repair failed to start.", "warn");
           }

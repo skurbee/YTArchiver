@@ -1296,6 +1296,15 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
     # playback time. The dedup is silent; if the user has dupe data
     # we still play the most-recent ingest (which is what they'd
     # naturally expect after a retranscribe).
+    # Track whether we got jsonl_path from the canon lookup vs the
+    # caller. Canon paths came straight out of the DB and need NO
+    # normalization — re-applying os.path.normpath on a stored path
+    # that happens to mix forward/back slashes (the legacy ingest
+    # path produced this for most pre-rebuild rows) silently rewrites
+    # the input and breaks the literal `jsonl_path = ?` match, which
+    # made `get_segments` return zero rows and the watch view fall
+    # back to its hardcoded placeholder transcript.
+    _jp_from_canon = False
     if video_id and not jsonl_path:
         try:
             canon = conn.execute(
@@ -1305,6 +1314,7 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
             ).fetchone()
             if canon and canon[0]:
                 jsonl_path = canon[0]
+                _jp_from_canon = True
         except Exception:
             pass
     where = []
@@ -1312,7 +1322,9 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
     if video_id:
         where.append("video_id=?"); args.append(video_id)
     if jsonl_path:
-        where.append("jsonl_path=?"); args.append(os.path.normpath(jsonl_path))
+        where.append("jsonl_path=?")
+        args.append(jsonl_path if _jp_from_canon
+                    else os.path.normpath(jsonl_path))
     if title and not where:
         where.append("title=?"); args.append(title)
     if not where:

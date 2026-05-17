@@ -640,6 +640,11 @@ class QueueState:
             # starts with "Metadata" so colorizeTaskName picks up the
             # pink `qv-meta` class like the other metadata rows.
             return f"Metadata ID fix \u2014 {name}"
+        if kind == "repair_yt_captions":
+            # Repair YT auto-captions task. Leading "Metadata" so
+            # colorizeTaskName picks the pink qv-meta class \u2014 it's a
+            # transcript-side repair, not a download.
+            return f"Metadata repair YT captions \u2014 {name}"
         if kind == "redownload":
             # Classic showed active redownload as "Redownload
             # ChannelName (480p)" with a Pause/Resume state.

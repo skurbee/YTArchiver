@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v64.7"
-APP_VERSION_DATE = "5.17.26 9:33am"
+APP_VERSION      = "v65.9"
+APP_VERSION_DATE = "5.17.26 11:54am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -3826,47 +3826,67 @@ class Api:
     # ─── Repair YT auto-captions (v64.7 parser fix) ────────────────────
 
     def repair_yt_captions(self, payload):
-        """Re-parse YouTube auto-caption VTTs for already-archived videos
-        to regenerate the per-word `words` array in the JSONL + DB.
+        """Queue a Repair YT auto-captions task on the sync queue.
 
-        Fixes the pre-v64.7 parser bug that dropped rolled-in words and
-        let next-segment words bleed into prior segments. Spawns a
-        background thread; progress streams to the main log so the
-        modal can be closed while it runs. Returns immediately.
+        The task serializes alongside downloads, metadata refreshes,
+        and other YT-hitting work so we never run multiple yt-dlp
+        processes against YouTube in parallel. The user sees it in
+        the Sync Tasks popover and can pause/cancel like any other
+        task. Progress streams to the main log.
 
         payload keys (all optional):
           channel: channel folder name to limit scope; "" = all channels
           video_id: single video to repair (overrides channel)
           dry_run: bool — fetch + parse but don't write anything
-          include_punctuated: bool — also process YT+PUNCTUATION sources
-              (risky: if the new VTT is lowercase, the re-parsed words
-              lose the punctuation a prior punct pass restored)
+
+        Both YT CAPTIONS and YT+PUNCTUATION sources are candidates. A
+        per-video downgrade guard inside repair_captions skips any
+        YT+PUNCTUATION video where YT's current VTT is still lowercase
+        (re-parsing would strip the restored punctuation across the
+        whole transcript — worse than the bug we're fixing).
         """
-        from backend import repair_captions as _rc
         cfg = self._config or load_config()
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "output_dir is not configured"}
         payload = payload or {}
+        channel = (payload.get("channel") or "").strip()
+        video_id = (payload.get("video_id") or "").strip()
+        dry_run = bool(payload.get("dry_run"))
 
-        def _worker():
-            try:
-                _rc.repair_archive(
-                    output_dir=output_dir,
-                    channel_folder=(payload.get("channel") or None),
-                    video_id=(payload.get("video_id") or None),
-                    dry_run=bool(payload.get("dry_run")),
-                    include_punctuated=bool(payload.get("include_punctuated")),
-                    log_stream=self._log_stream,
-                )
-            except Exception as _e:
-                self._log_stream.emit_error(
-                    f" — repair_yt_captions worker crashed: {_e}\n")
-                self._log_stream.flush()
+        # The popover and downstream dispatch identify tasks by url +
+        # kind, so we build a stable, unique-per-scope synthetic url.
+        if video_id:
+            scope_name = f"video {video_id}"
+            scope_url = f"repair:video:{video_id}"
+        elif channel:
+            scope_name = channel
+            scope_url = f"repair:channel:{channel}"
+        else:
+            scope_name = "All channels"
+            scope_url = "repair:all"
 
-        threading.Thread(target=_worker, name="repair-yt-captions",
-                         daemon=True).start()
-        return {"ok": True}
+        task = {
+            "kind": "repair_yt_captions",
+            "name": scope_name,
+            "folder": scope_name,
+            "url": scope_url,
+            "channel_folder": channel or None,
+            "video_id": video_id or None,
+            "dry_run": dry_run,
+        }
+        try:
+            queued = self._queues.sync_enqueue(task)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not queued:
+            return {"ok": True, "queued": False,
+                    "error": "Already queued for this scope"}
+        self._on_queue_changed()
+        started = self._maybe_autostart_sync()
+        return {"ok": True, "queued": True, "started": started,
+                "paused": bool(self._queues.sync_paused),
+                "scope": scope_name, "dry_run": dry_run}
 
     # ─── Compress dry-run (feature F8) ─────────────────────────────────
 

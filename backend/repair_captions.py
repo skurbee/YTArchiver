@@ -33,12 +33,166 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from .transcribe import _parse_vtt, _replace_jsonl_entry
-from .sync import find_yt_dlp
+from .sync import find_yt_dlp, _startupinfo
 from .ytarchiver_config import TRANSCRIPTION_DB
+
+# Suppress Windows console windows on every yt-dlp subprocess call —
+# without this each fetch flashes a black console window that steals
+# focus from the user's foreground app.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# YouTube rate-limit knobs.
+#
+# Every per-video fetch hits YT's caption endpoint. A naive serial loop
+# at ~5s/video (network-limited) gives ~0.2 requests/second, which YT
+# was empirically still 429-ing after ~40 videos. The base sleep below
+# spaces fetches out further; the backoff schedule kicks in only when
+# YT actually returns 429 so we don't pay the cost on the happy path.
+_RATE_LIMIT_SLEEP_SEC = 1.0
+_RATE_LIMIT_BACKOFFS = (30, 90, 300)  # retries 1, 2, 3 on 429
+_RATE_LIMIT_RE = re.compile(
+    r"\b(429|Too Many Requests|rate[ -]?limited)\b", re.IGNORECASE)
+
+
+# ── Progress persistence (cross-restart resume) ────────────────────────
+#
+# A repair pass over 86k videos is a multi-day operation, so we have to
+# survive app restarts. After every video we append the video_id to a
+# per-scope text file under %APPDATA%\YTArchiver\repair_progress\. On
+# the next start of the same scope we load it as a set and skip any
+# already-processed ids. Append-only means we never write more than a
+# single short line per video — none of the "save the whole set every
+# N videos" thrashing.
+#
+# Scope = the task's `url` field ("repair:all" / "repair:channel:Vox" /
+# "repair:video:abc"), so partial runs of different scopes coexist
+# without collision.
+
+def _progress_dir() -> Path:
+    """%APPDATA%\\YTArchiver\\repair_progress\\ — lives next to the
+    transcription index DB."""
+    base = Path(TRANSCRIPTION_DB).parent
+    d = base / "repair_progress"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _scope_slug(scope_url: str) -> str:
+    """File-safe slug for the per-scope progress file. Lowercased,
+    non-alnum collapsed to underscores, capped at 80 chars."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", scope_url or "unknown")
+    return safe[:80].strip("_") or "unknown"
+
+
+def _progress_path(scope_url: str) -> Path:
+    return _progress_dir() / f"{_scope_slug(scope_url)}.txt"
+
+
+def _load_progress(scope_url: str) -> set:
+    """Return the set of video_ids already processed in prior runs of
+    this scope. Empty set on no-file / read-failure."""
+    f = _progress_path(scope_url)
+    if not f.exists():
+        return set()
+    try:
+        with open(f, "r", encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
+def _append_progress(scope_url: str, video_id: str) -> None:
+    """Mark this video as done for the given scope (append one line)."""
+    f = _progress_path(scope_url)
+    try:
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(video_id + "\n")
+    except OSError:
+        pass  # non-fatal: we'll just retry the video on resume
+
+
+def _clear_progress(scope_url: str) -> None:
+    """Remove the progress file — used after a clean full-completion."""
+    f = _progress_path(scope_url)
+    try:
+        f.unlink()
+    except OSError:
+        pass
+
+
+# ── Work-list checkpoint (skip the scan on resume) ─────────────────────
+#
+# The progress file (above) only records which video_ids were processed.
+# To resume cleanly we still had to re-scan the entire archive on every
+# restart, because the work list itself lived only in memory. For a
+# 100-channel archive that's ~70 seconds of scan time the user has to
+# sit through every time they relaunch the app. The checkpoint stores
+# the post-scan work list so the next start can skip directly to the
+# per-video loop.
+
+def _checkpoint_path(scope_url: str) -> Path:
+    return _progress_dir() / f"{_scope_slug(scope_url)}.work.json"
+
+
+def _save_checkpoint(scope_url: str, work: list) -> None:
+    """Persist the scanned work list so a future resume can skip the
+    scan. `work` is a list of (jsonl_path, video_id, title, src_tag)
+    tuples; we serialize as plain lists for JSON compatibility."""
+    if not scope_url or not work:
+        return
+    f = _checkpoint_path(scope_url)
+    payload = {
+        "scope_url": scope_url,
+        "scanned_at": datetime.now().isoformat(),
+        "work": [[str(jp), vid, t, tag] for (jp, vid, t, tag) in work],
+    }
+    tmp = str(f) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, f)
+    except OSError:
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+def _load_checkpoint(scope_url: str) -> Optional[list]:
+    """Return the cached work list as a list of tuples, or None if no
+    checkpoint exists / the file is unreadable."""
+    if not scope_url:
+        return None
+    f = _checkpoint_path(scope_url)
+    if not f.exists():
+        return None
+    try:
+        with open(f, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    out = []
+    for row in data.get("work", []):
+        if isinstance(row, list) and len(row) >= 4:
+            out.append((Path(row[0]), row[1], row[2], row[3]))
+    return out or None
+
+
+def _clear_checkpoint(scope_url: str) -> None:
+    if not scope_url:
+        return
+    try:
+        _checkpoint_path(scope_url).unlink()
+    except OSError:
+        pass
 
 
 # Source-tag values written into Transcript.txt section headers by
@@ -90,7 +244,10 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
         f"https://www.youtube.com/watch?v={video_id}",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            startupinfo=_startupinfo, creationflags=_CREATE_NO_WINDOW,
+        )
     except subprocess.TimeoutExpired:
         return None, "yt-dlp timeout"
     except FileNotFoundError:
@@ -141,19 +298,86 @@ def _update_db_words(video_id: str,
         conn.close()
 
 
+_PUNCT_CHARS_RE = re.compile(r"[.,!?;:]")
+_CAP_WORD_RE = re.compile(r"\b[A-Z][a-z]+")
+
+
+def _looks_punctuated(segments: list, sample: int = 8) -> bool:
+    """Heuristic: does this parsed transcript look like the modern punctuated
+    YT auto-cap output, or the older all-lowercase raw form?
+
+    Sentence-ending punctuation OR a multi-letter capitalized word in the
+    first N segments => punctuated. The legacy raw format has neither.
+    """
+    text = " ".join((s.get("t") or s.get("text") or "")
+                    for s in segments[:sample])
+    if not text.strip():
+        return False
+    if _PUNCT_CHARS_RE.search(text):
+        return True
+    if _CAP_WORD_RE.search(text):
+        return True
+    return False
+
+
+def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
+                            log_stream, cancel_event: Optional[threading.Event]
+                            ) -> tuple[Optional[Path], Optional[str]]:
+    """Wrap `_fetch_vtt` with 429 detection + exponential backoff.
+
+    On YT rate-limit (HTTP 429), sleep through the next backoff window
+    then retry the same video. The schedule (30s, 90s, 5min) gives YT
+    time to release the throttle; if all three retries still 429 we
+    give up on that video and let the caller log it as FAIL.
+    """
+    vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir)
+    if vtt or not err or not _RATE_LIMIT_RE.search(err):
+        return vtt, err
+    for attempt, backoff in enumerate(_RATE_LIMIT_BACKOFFS, 1):
+        log_stream.emit_text(
+            f"   YT rate limit (429) hit — backing off {backoff}s "
+            f"before retry {attempt}/{len(_RATE_LIMIT_BACKOFFS)}\n",
+            "simpleline")
+        log_stream.flush()
+        # cancel-aware sleep
+        if cancel_event is not None:
+            if cancel_event.wait(timeout=backoff):
+                return None, "cancelled during backoff"
+        else:
+            time.sleep(backoff)
+        vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir)
+        if vtt:
+            return vtt, None
+        if not err or not _RATE_LIMIT_RE.search(err):
+            return None, err  # different error, don't keep retrying
+    return None, "rate-limited (all retries exhausted)"
+
+
 def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
-                      video_id: str, dry_run: bool
+                      video_id: str, source_tag: str, dry_run: bool,
+                      log_stream,
+                      cancel_event: Optional[threading.Event] = None
                       ) -> tuple[bool, str, int, int]:
-    """Fetch+parse+write a single video. Returns (ok, msg, n_segs, n_words)."""
+    """Fetch+parse+write a single video. Returns (ok, msg, n_segs, n_words).
+
+    Downgrade guard: if the original was YT+PUNCTUATION (punctuation
+    was restored at ingest because the source VTT was lowercase) and
+    YouTube's CURRENT VTT is still lowercase, repairing would visibly
+    strip the capitalization + punctuation across the whole transcript.
+    Skip those videos rather than downgrade them.
+    """
     with tempfile.TemporaryDirectory(prefix="ytarc_repair_") as tmp:
         tmp_dir = Path(tmp)
-        vtt, err = _fetch_vtt(yt_dlp, video_id, tmp_dir)
+        vtt, err = _fetch_vtt_with_backoff(
+            yt_dlp, video_id, tmp_dir, log_stream, cancel_event)
         if not vtt:
             return False, f"fetch: {err}", 0, 0
         new_segs = _parse_vtt(str(vtt))
         if not new_segs:
             return False, "parser produced no segments", 0, 0
         total_words = sum(len(s.get("w") or []) for s in new_segs)
+        if source_tag == "YT+PUNCTUATION" and not _looks_punctuated(new_segs):
+            return False, "skipped: new VTT is lowercase (would downgrade punctuation)", 0, 0
         if dry_run:
             return True, "DRY-RUN", len(new_segs), total_words
         try:
@@ -166,36 +390,56 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
         return True, f"{db_rows} DB rows", len(new_segs), total_words
 
 
-def _collect_yt_videos(jsonl_path: Path,
-                       include_punctuated: bool) -> list:
-    """Return `[(video_id, title, source_tag), ...]` for the YT-caption
-    videos in `jsonl_path`. Each video appears at most once even though
-    JSONL stores many segments per video.
+_VID_RE = re.compile(rb'"video_id"\s*:\s*"([^"]+)"')
+_TITLE_RE = re.compile(rb'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _collect_yt_videos(jsonl_path: Path) -> list:
+    """Return `[(video_id, title, source_tag), ...]` for every YT-caption
+    video in `jsonl_path` (both raw and punct-restored). Each video appears
+    at most once even though the JSONL stores many segments per video.
+
+    Fast path: jsonl files for large channels are 20MB+ with hundreds of
+    thousands of segment rows. Full `json.loads` per line takes minutes.
+    Instead we regex video_id and title (the only fields we need) and skip
+    consecutive lines that share the same video_id — typical archives
+    group all segments of a video together, so the same-vid skip flies
+    past 99% of the file.
+
+    The downgrade-vs-repair decision is made later, per-video, inside
+    `_repair_one_video` — after we've fetched the new VTT and can inspect
+    whether YT is currently serving a punctuated version.
     """
     txt = _find_txt_for_jsonl(jsonl_path)
     if not txt.exists():
         return []
     sources = _parse_txt_sources(txt)
-    accepted = set(YT_CAPTION_TAGS)
-    if not include_punctuated:
-        accepted.discard("YT+PUNCTUATION")
+    if not sources:
+        return []
     seen: dict = {}
+    last_vid = b""
     try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                ls = line.strip()
-                if not ls:
+        with open(jsonl_path, "rb") as f:
+            for raw in f:
+                vm = _VID_RE.search(raw)
+                if not vm:
                     continue
-                try:
-                    obj = json.loads(ls)
-                except json.JSONDecodeError:
+                vid_b = vm.group(1)
+                if vid_b == last_vid:
+                    continue  # same video as the previous segment row
+                last_vid = vid_b
+                vid = vid_b.decode("ascii", errors="replace")
+                if vid in seen:
                     continue
-                vid = (obj.get("video_id") or "").strip()
-                title = (obj.get("title") or "").strip()
-                if not vid or not title or vid in seen:
+                tm = _TITLE_RE.search(raw)
+                if not tm:
                     continue
+                # Cheap JSON-escape unescaping — titles only ever contain
+                # \", \\, and Unicode literals which utf-8 decode handles.
+                title = (tm.group(1).decode("utf-8", errors="replace")
+                         .replace('\\"', '"').replace("\\\\", "\\"))
                 tag = sources.get(_norm_title(title), "")
-                if tag in accepted:
+                if tag in YT_CAPTION_TAGS:
                     seen[vid] = (title, tag)
     except OSError:
         return []
@@ -225,7 +469,10 @@ def repair_archive(*, output_dir: str, log_stream,
                    channel_folder: Optional[str] = None,
                    video_id: Optional[str] = None,
                    dry_run: bool = False,
-                   include_punctuated: bool = False) -> dict:
+                   cancel_event: Optional[threading.Event] = None,
+                   pause_event: Optional[threading.Event] = None,
+                   queues=None,
+                   scope_url: Optional[str] = None) -> dict:
     """Run the repair across the archive (or a subset).
 
     Emits progress lines to `log_stream` (a `LogStreamer`). One log line
@@ -233,7 +480,29 @@ def repair_archive(*, output_dir: str, log_stream,
 
     Scope precedence: `video_id` (one video) > `channel_folder` (one
     channel folder under `output_dir`) > everything under `output_dir`.
+
+    Both `YT CAPTIONS` and `YT+PUNCTUATION` sources are candidates; the
+    punctuation-downgrade guard inside `_repair_one_video` decides per
+    video whether to write or skip based on the actual VTT YT serves now.
+
+    Runs inline on the calling thread (the sync worker). Checks
+    `cancel_event` between videos and during the channel scan so a
+    Sync Tasks cancel can interrupt mid-pass. `pause_event` blocks
+    between videos when set — same semantics as the download path.
     """
+    def _cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _wait_if_paused() -> None:
+        # Match the existing sync worker's pause-wait pattern. Block in
+        # 0.5s chunks so cancel still wins quickly.
+        if pause_event is None:
+            return
+        while pause_event.is_set():
+            if _cancelled():
+                return
+            pause_event.wait(timeout=0.5)
+
     yt_dlp = find_yt_dlp()
     if not yt_dlp:
         log_stream.emit_error(" — Repair YT captions: yt-dlp not found.\n")
@@ -247,38 +516,140 @@ def repair_archive(*, output_dir: str, log_stream,
         log_stream.flush()
         return {"ok": False, "error": "archive root not found"}
 
-    log_stream.emit_header(
-        f"Repair YT auto-captions{' (DRY-RUN)' if dry_run else ''}\n")
-
-    # Build the work list as a flat sequence of (jsonl_path, video_id, title)
+    # Build the work list as (jsonl_path, video_id, title, source_tag).
+    # If a prior run of this same scope saved a checkpoint, load that
+    # and skip the scan entirely — for a 100-channel archive the scan
+    # is ~70 seconds the user otherwise has to sit through on every
+    # restart. The progress file filters out already-processed videos
+    # below, so the resume picks up exactly where the prior run stopped.
     work: list = []
+    used_checkpoint = False
     if video_id:
         j, t = _find_jsonl_for_video_id(root, video_id)
         if j and t:
-            work.append((j, video_id, t))
+            tag = _parse_txt_sources(_find_txt_for_jsonl(j)).get(
+                _norm_title(t), "")
+            work.append((j, video_id, t, tag))
         else:
             log_stream.emit_error(
                 f" — video_id {video_id} not found in any JSONL.\n")
-    else:
+    elif scope_url and not dry_run and _load_checkpoint(scope_url):
+        cached = _load_checkpoint(scope_url)
+        work = cached or []
+        used_checkpoint = True
+        log_stream.emit_text(
+            f" — Using cached work list from prior scan "
+            f"({len(work):,} videos). Skipping re-scan.\n",
+            "simpleline")
+        log_stream.flush()
+
+    if not used_checkpoint and not video_id:
         scope = root / channel_folder if channel_folder else root
         if not scope.exists():
             log_stream.emit_error(f" — folder not found: {scope}\n")
             log_stream.flush()
             return {"ok": False, "error": "folder not found"}
-        for j in scope.rglob(".*Transcript.jsonl"):
-            for vid, t, _tag in _collect_yt_videos(j, include_punctuated):
-                work.append((j, vid, t))
+        # `simpleline` tag so the scan progress shows in Simple mode —
+        # `dim` would have been quietly filtered out by the simple-mode
+        # gate in LogStreamer, making the scan appear hung.
+        if channel_folder:
+            # Single channel — one "scanning" line then plow through.
+            log_stream.emit_text(
+                f" — Scanning {scope.name}...\n", "simpleline")
+            log_stream.flush()
+            for j in scope.rglob(".*Transcript.jsonl"):
+                for vid, t, tag in _collect_yt_videos(j):
+                    work.append((j, vid, t, tag))
+        else:
+            # All channels — per-channel progress so the user knows the
+            # scan is alive even when a particular channel takes a while.
+            channel_dirs = sorted(p for p in scope.iterdir() if p.is_dir())
+            log_stream.emit_text(
+                f" — Scanning {len(channel_dirs)} channels for "
+                f"YT-caption videos...\n", "simpleline")
+            log_stream.flush()
+            for idx, ch_dir in enumerate(channel_dirs, 1):
+                if _cancelled():
+                    log_stream.emit_text(
+                        f"   Scan cancelled after {idx - 1} channels.\n",
+                        "simpleline")
+                    log_stream.flush()
+                    break
+                before = len(work)
+                for j in ch_dir.rglob(".*Transcript.jsonl"):
+                    for vid, t, tag in _collect_yt_videos(j):
+                        work.append((j, vid, t, tag))
+                added = len(work) - before
+                log_stream.emit_text(
+                    f"   [{idx}/{len(channel_dirs)}] {ch_dir.name}: "
+                    f"{added} candidate(s)\n", "simpleline")
+                if idx % 3 == 0:
+                    log_stream.flush()
+            log_stream.flush()
+        # Cache the scan so the next restart of this scope can skip the
+        # whole "Scanning N channels..." phase entirely.
+        if scope_url and work:
+            _save_checkpoint(scope_url, work)
+
+    # Resume-from-progress. Skip any video_ids we already processed in
+    # a prior run of this same scope. Logged so the user knows the
+    # count they're starting from. dry_run never persists or loads.
+    already_done: set = set()
+    skipped_resume = 0
+    if scope_url and not dry_run:
+        already_done = _load_progress(scope_url)
+        if already_done:
+            before_filter = len(work)
+            work = [(j, vid, t, tag) for (j, vid, t, tag) in work
+                    if vid not in already_done]
+            skipped_resume = before_filter - len(work)
+            log_stream.emit_text(
+                f" — Resuming: {skipped_resume:,} video(s) already done "
+                f"on a prior run; {len(work):,} remaining.\n",
+                "simpleline")
+            log_stream.flush()
 
     log_stream.emit_text(
-        f" — {len(work)} YT-caption video(s) to process.\n",
+        f" — {len(work):,} YT-caption video(s) to process.\n",
         "simpleline")
     log_stream.flush()
+    # Per-video lines stay `dim` (Verbose mode only — 80k+ of them
+    # would drown the Simple log). Emit a `simpleline` milestone every
+    # MILESTONE_EVERY videos so Simple-mode users still see steady
+    # progress instead of one banner followed by silent hours. Lowered
+    # from 25 to 10 — at ~5s/video that's a milestone every ~50s,
+    # which feels alive without flooding the log.
+    MILESTONE_EVERY = 10
+    # Surface "(N/total)" on the popover sync row via the existing
+    # sync_pass_progress fields. Without this the popover stays static
+    # on "Repair — All channels" for the whole multi-hour pass.
+    if queues is not None and len(work) > 0:
+        try: queues.set_sync_pass_progress(0, len(work))
+        except Exception: pass
 
     ok_count = 0
     fail_count = 0
-    for i, (j, vid, t) in enumerate(work, 1):
+    skip_count = 0  # downgrade-guard skips, tracked separately
+    cancelled_early = False
+    for i, (j, vid, t, tag) in enumerate(work, 1):
+        _wait_if_paused()
+        if _cancelled():
+            cancelled_early = True
+            log_stream.emit_text(
+                f"   Cancelled after {i - 1}/{len(work)} videos.\n", "dim")
+            break
         success, msg, n_segs, n_words = _repair_one_video(
-            yt_dlp, j, t, vid, dry_run)
+            yt_dlp, j, t, vid, tag, dry_run, log_stream, cancel_event)
+        # Record progress AFTER each outcome (success/skip/fail-non-429)
+        # so a restart picks up after the last completed video. We don't
+        # record "rate-limited (all retries exhausted)" failures — those
+        # were aborts from a sustained throttle, not the video's fault,
+        # and they should be retried on the next resume.
+        _persist_this = (scope_url and not dry_run
+                         and "rate-limited" not in (msg or "")
+                         and "cancelled" not in (msg or ""))
+        if _persist_this:
+            _append_progress(scope_url, vid)
         short = (t[:60] + "…") if len(t) > 63 else t
         prefix = f"   [{i}/{len(work)}] "
         if success:
@@ -286,20 +657,69 @@ def repair_archive(*, output_dir: str, log_stream,
             log_stream.emit_text(
                 f"{prefix}OK   {vid}  {short}  "
                 f"({n_segs} segs / {n_words} words / {msg})\n", "dim")
+        elif msg.startswith("skipped:"):
+            # Punctuation-downgrade guard tripped — not an error, just a
+            # decision to leave this video alone.
+            skip_count += 1
+            log_stream.emit_text(
+                f"{prefix}SKIP {vid}  {short}  — {msg}\n", "dim")
         else:
             fail_count += 1
             log_stream.emit_error(
                 f"{prefix}FAIL {vid}  {short}  — {msg}\n")
-        # Flush every few videos so the user sees live progress rather
-        # than one big dump at the end.
+        # Flush every few videos so the verbose-mode user sees live
+        # progress rather than one big dump at the end.
         if i % 5 == 0:
             log_stream.flush()
+        # Simple-mode milestone — visible regardless of dim filter so
+        # the user can see the repair is making progress.
+        if i % MILESTONE_EVERY == 0 or i == len(work):
+            log_stream.emit_text(
+                f" — [{i:,}/{len(work):,}] "
+                f"{ok_count:,} repaired · {skip_count:,} skipped"
+                + (f" · {fail_count:,} failed" if fail_count else "")
+                + "\n",
+                "simpleline")
+            log_stream.flush()
+        # Update the popover sync row's "(N/total)" label every video.
+        # set_sync_pass_progress is debounced (no-op when value matches)
+        # so this is cheap.
+        if queues is not None:
+            try: queues.set_sync_pass_progress(i, len(work))
+            except Exception: pass
+        # Gentle rate-limit between fetches so YT doesn't 429 us. Use
+        # cancel_event.wait so a Sync Tasks cancel still breaks out
+        # promptly instead of having to sit through the sleep first.
+        if i < len(work):
+            if cancel_event is not None:
+                if cancel_event.wait(timeout=_RATE_LIMIT_SLEEP_SEC):
+                    cancelled_early = True
+                    log_stream.emit_text(
+                        f"   Cancelled after {i}/{len(work)} videos.\n",
+                        "simpleline")
+                    break
+            else:
+                time.sleep(_RATE_LIMIT_SLEEP_SEC)
 
+    status_word = "Cancelled" if cancelled_early else "Repair done"
     log_stream.emit_text(
-        f" — Repair done: {ok_count} succeeded, {fail_count} failed"
+        f" — {status_word}: {ok_count} repaired, {skip_count} skipped, "
+        f"{fail_count} failed"
+        + (f" (+{skipped_resume:,} from prior runs)" if skipped_resume else "")
         + (" (DRY-RUN — no writes).\n" if dry_run else ".\n"),
         "simpleline_pink")
     log_stream.flush()
 
-    return {"ok": True, "succeeded": ok_count, "failed": fail_count,
-            "total": len(work)}
+    # Clean full-completion → drop both the progress and checkpoint
+    # files so the next time this scope is requested it starts fresh.
+    # If cancelled or any failures remain, keep them so resume picks
+    # up where we left off.
+    if (scope_url and not dry_run and not cancelled_early
+            and fail_count == 0):
+        _clear_progress(scope_url)
+        _clear_checkpoint(scope_url)
+
+    return {"ok": True, "succeeded": ok_count, "skipped": skip_count,
+            "failed": fail_count, "total": len(work),
+            "from_prior": skipped_resume,
+            "cancelled": cancelled_early}

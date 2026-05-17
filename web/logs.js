@@ -2108,8 +2108,13 @@
     const frag = document.createDocumentFragment();
 
     // Source banner — Whisper / YT auto-captions / unknown. Mirrors
-    // ArchivePlayer's `_ytSourceBannerHTML`.
-    const bannerEl = _buildSourceBanner(sourceInfo, video);
+    // ArchivePlayer's `_ytSourceBannerHTML`. Pass the actual transcript
+    // so the banner can verify the "(punctuation restored)" claim
+    // against real content — for legacy videos the source tag says
+    // YT+PUNCTUATION (Transcript.txt was punct-restored) but the
+    // per-segment data in the watch view was never punctuated, so the
+    // banner used to lie.
+    const bannerEl = _buildSourceBanner(sourceInfo, video, transcript);
     if (bannerEl) frag.appendChild(bannerEl);
 
     // Flatten every word across every segment into one continuous flowing
@@ -2167,9 +2172,22 @@
    * same four cases, same link wording. The "unknown, no raw" case
    * returns null so no banner appears at all (ArchivePlayer returns
    * the empty string for that case). */
-  function _buildSourceBanner(sourceInfo, video) {
+  function _buildSourceBanner(sourceInfo, video, transcript) {
     const src = (sourceInfo && sourceInfo.source) || "unknown";
     const raw = (sourceInfo && sourceInfo.raw) || "";
+
+    // Sample the first few segments' text to see if the per-segment
+    // data ACTUALLY has sentence punctuation. The source tag says
+    // YT+PUNCTUATION for Transcript.txt content, but for many legacy
+    // videos the per-segment text the watch view actually renders
+    // wasn't punctuated. Downgrade the badge in that case so the
+    // banner reflects what the user can see.
+    const _hasContentPunct = (() => {
+      if (!Array.isArray(transcript) || transcript.length === 0) return false;
+      const sample = transcript.slice(0, 8)
+        .map(s => s && (s.t || s.text || "")).join(" ");
+      return /[.,!?;:]/.test(sample);
+    })();
 
     const banner = document.createElement("div");
     banner.className = "watch-src-banner";
@@ -2206,20 +2224,22 @@
       banner.appendChild(txt);
       return banner;
     }
-    if (src === "yt_captions_punct") {
+    if (src === "yt_captions_punct" || src === "yt_captions_raw") {
       banner.classList.add("yt");
       banner.appendChild(dot);
-      banner.appendChild(document.createTextNode(
-        "YouTube auto-captions (punctuation restored) \u2014 transcript is approximate \u00b7 "));
-      banner.appendChild(buildRetranscribeLink());
-      banner.appendChild(document.createTextNode(" for improved results"));
-      return banner;
-    }
-    if (src === "yt_captions_raw") {
-      banner.classList.add("yt");
-      banner.appendChild(dot);
-      banner.appendChild(document.createTextNode(
-        "YouTube auto-captions \u2014 transcript is approximate \u00b7 "));
+      // Show "(punctuated)" whenever the rendered content actually
+      // has sentence punctuation, regardless of which source tag the
+      // file got at ingest. The legacy tag system distinguished
+      // "punct restoration pass ran" vs "didn't run" \u2014 but modern YT
+      // auto-cap arrives already punctuated and skips the restoration
+      // pass, so a yt_captions_raw video like Vox May 2026 can have
+      // fully punctuated text while a yt_captions_punct legacy video
+      // has lowercase per-segment content. Basing the badge on visible
+      // content reflects what the user sees instead of pipeline state.
+      const label = _hasContentPunct
+        ? "YouTube auto-captions (punctuated) \u2014 transcript is approximate \u00b7 "
+        : "YouTube auto-captions \u2014 transcript is approximate \u00b7 ";
+      banner.appendChild(document.createTextNode(label));
       banner.appendChild(buildRetranscribeLink());
       banner.appendChild(document.createTextNode(" for improved results"));
       return banner;

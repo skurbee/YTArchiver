@@ -1754,7 +1754,8 @@ class TranscribeManager:
                 video_id: str = "",
                 bulk_id: str = "",
                 bulk_total: int = 0,
-                bulk_index: int = 0) -> bool:
+                bulk_index: int = 0,
+                from_download: bool = False) -> bool:
         """Queue a video for transcription.
 
         `channel` is optional; if provided it's stored on the job so the
@@ -1796,6 +1797,7 @@ class TranscribeManager:
                 "bulk_id": bulk_id or "",
                 "bulk_total": int(bulk_total or 0),
                 "bulk_index": int(bulk_index or 0),
+                "from_download": bool(from_download),
             })
         # Mirror the job into the shared GPU queue so the Tasks popover
         # shows the pending work. this was flagged: auto-transcribe on
@@ -1908,6 +1910,7 @@ class TranscribeManager:
                     "bulk_total": int(j.get("bulk_total", 0) or 0),
                     "bulk_index": int(j.get("bulk_index", 0) or 0),
                     "kind": j.get("kind", "transcribe"),
+                    "from_download": bool(j.get("from_download")),
                 }
             with self._jobs_lock:
                 snapshot = [_snap(j) for j in self._jobs]
@@ -1986,6 +1989,7 @@ class TranscribeManager:
                     bulk_id=j.get("bulk_id", ""),
                     bulk_total=int(j.get("bulk_total", 0) or 0),
                     bulk_index=int(j.get("bulk_index", 0) or 0),
+                    from_download=bool(j.get("from_download")),
                 )
                 recovered += 1
             # Recovery succeeded — drop the journal file. The next
@@ -2693,12 +2697,29 @@ class TranscribeManager:
             _dim_tags = [t for t in (_tx_tag, "dim", job_tag) if t]
             _em_tags = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
             _lbl_tags = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
-            self._stream.emit([
+            _txt_tags = [t for t in (_tx_tag, "simpleline", job_tag) if t]
+            _segs = [
                 [" ", _dim_tags],
                 ["\u2014 \u2713 ", _em_tags],
                 ["Transcription", _lbl_tags],
-                [f" ({_detail_str})\n", _dim_tags],
-            ])
+            ]
+            # When this transcription wasn't part of a download flow
+            # (sync.py emits "Downloaded \u2014 <title> \u2014 <channel>" just
+            # above its done line, giving the user context), splice
+            # the title (and channel if known) into the done line so
+            # a standalone player-view / "Transcribe File" / drift
+            # retranscribe is identifiable on its own.
+            if not job.get("from_download"):
+                _seg_title = (title or "").strip()
+                _seg_channel = (channel or "").strip()
+                if _seg_title:
+                    _segs.append([" \u2014 ", _dim_tags])
+                    _segs.append([_seg_title, _txt_tags])
+                    if _seg_channel:
+                        _segs.append([" \u2014 ", _dim_tags])
+                        _segs.append([_seg_channel, _txt_tags])
+            _segs.append([f" ({_detail_str})\n", _dim_tags])
+            self._stream.emit(_segs)
             if job.get("cb"):
                 try:
                     job["cb"](result)
@@ -2880,12 +2901,25 @@ class TranscribeManager:
             _em_tag = ["whisper_bracket", _job_tag_ch] if _job_tag_ch else "whisper_bracket"
             _dim_tag = ["dim", _job_tag_ch] if _job_tag_ch else "dim"
             _lbl_tag = ["simpleline_blue", _job_tag_ch] if _job_tag_ch else "simpleline_blue"
-            self._stream.emit([
+            _txt_tag = ["simpleline", _job_tag_ch] if _job_tag_ch else "simpleline"
+            _segs_c = [
                 [" ", _dim_tag],
                 ["\u2014 \u2713 ", _em_tag],
                 ["Transcription", _lbl_tag],
-                [f" (chunked, took {_time_str_c})\n", _dim_tag],
-            ])
+            ]
+            # Same standalone-context rule as the single-pass done line
+            # above \u2014 splice title/channel when not part of a download.
+            if not job.get("from_download"):
+                _seg_title_c = (title or "").strip()
+                _seg_channel_c = (channel or "").strip()
+                if _seg_title_c:
+                    _segs_c.append([" \u2014 ", _dim_tag])
+                    _segs_c.append([_seg_title_c, _txt_tag])
+                    if _seg_channel_c:
+                        _segs_c.append([" \u2014 ", _dim_tag])
+                        _segs_c.append([_seg_channel_c, _txt_tag])
+            _segs_c.append([f" (chunked, took {_time_str_c})\n", _dim_tag])
+            self._stream.emit(_segs_c)
             if job.get("cb"):
                 try: job["cb"](merged)
                 except Exception: pass

@@ -1404,7 +1404,8 @@ def sync_channel(channel: Dict[str, Any], stream: LogStreamer,
                             transcribe_mgr.enqueue(final_path, t,
                                                     channel=name,
                                                     on_complete=cb,
-                                                    video_id=vid)
+                                                    video_id=vid,
+                                                    from_download=True)
                         # If auto_transcribe is off but compress_enabled is on,
                         # route the compress task through the SHARED GPU queue
                         # (rule: "every compress is a GPU task").

@@ -1101,14 +1101,17 @@ def _parse_vtt(path: str) -> list:
             tags = list(ctag_re.finditer(raw_line))
             if tags:
                 has_ctags = True
-                # First cue's untagged prefix is the genuine first word(s).
-                if cue_idx == 0:
-                    first_tag_pos = raw_line.find('<')
-                    if first_tag_pos > 0:
-                        prefix = _html_mod.unescape(raw_line[:first_tag_pos]).strip()
-                        for pw in prefix.split():
-                            if pw.strip():
-                                all_words.append({"w": pw.strip(), "s": cue_s})
+                # Every cue with <c> tags has an untagged prefix before the
+                # first tag — for cue 0 it's the leading words, for every
+                # continuation cue it's the newly-rolled-in word(s) for the
+                # rolling caption. Both must be captured at cue_s, otherwise
+                # the new word in each continuation cue is silently dropped.
+                first_tag_pos = raw_line.find('<')
+                if first_tag_pos > 0:
+                    prefix = _html_mod.unescape(raw_line[:first_tag_pos]).strip()
+                    for pw in prefix.split():
+                        if pw.strip():
+                            all_words.append({"w": pw.strip(), "s": cue_s})
                 for mm in tags:
                     ts = _ts_to_sec(mm.group(1))
                     word_text = _html_mod.unescape(mm.group(2)).strip()
@@ -1221,14 +1224,19 @@ def _parse_vtt(path: str) -> list:
         for seg in segments:
             seg_words = []
             back_limit = 200
+            # Strict partitioning: each word belongs to the segment whose
+            # [start, end) range contains its timestamp. Previously used a
+            # ±0.5s buffer which pulled the next segment's first 1-3 words
+            # into the prior segment, producing visible "heading to heading
+            # to" duplications at segment boundaries.
             while back_limit > 0 and widx > 0 and widx < len(all_words) \
-                    and all_words[widx]["s"] >= seg["start"] - 0.5:
+                    and all_words[widx]["s"] >= seg["start"]:
                 widx -= 1
                 back_limit -= 1
-            while widx < len(all_words) and all_words[widx]["s"] < seg["start"] - 0.5:
+            while widx < len(all_words) and all_words[widx]["s"] < seg["start"]:
                 widx += 1
             scan = widx
-            while scan < len(all_words) and all_words[scan]["s"] <= seg["end"] + 0.5:
+            while scan < len(all_words) and all_words[scan]["s"] < seg["end"]:
                 seg_words.append(all_words[scan])
                 scan += 1
             if not seg_words:

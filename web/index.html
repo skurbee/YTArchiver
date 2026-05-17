@@ -826,6 +826,18 @@
                       title="Scan a channel's .txt / .jsonl / FTS for drift and offer a repair">Scan &amp; fix&hellip;</button>
             </div>
 
+            <!-- Repair YT auto-captions for videos archived before v64.7
+                 (the parser-fix release). Re-fetches each video's VTT,
+                 re-parses with the fixed parser, rewrites the per-word
+                 array in the JSONL + DB. Whisper-transcribed videos
+                 are auto-skipped. Slow (hits YT per video) — progress
+                 streams to the main log. -->
+            <label class="edit-gl">YT auto-captions</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-repair-yt-captions"
+                      title="Re-parse YT auto-captions for videos archived before v64.7 to fix dropped words and segment-boundary duplications">Repair&hellip;</button>
+            </div>
+
             <!-- audit SM-1: reset sync state for a specific channel.
                  Clears initialized/sync_complete/batch_resume_index/
                  init_batch_after/last_sync so the next sync starts
@@ -1636,6 +1648,61 @@
         <button class="btn btn-primary" id="drift-fix-btn" disabled
                 title="Apply all three fixes: rebuild missing .txt entries, queue Whisper retranscribe for .txt-only entries, rebuild FTS if phantoms found">Fix all</button>
         <button class="btn btn-ghost" id="drift-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Repair YT auto-captions dialog. Re-parses YouTube auto-caption
+       VTTs for archived videos and rewrites the per-word array in the
+       JSONL + DB. Long-running — kicks off a background thread; progress
+       streams to the main log so the user can close the modal. -->
+  <div class="askq-backdrop" id="repair-yt-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:560px;max-width:720px;width:72vw;">
+      <div class="askq-header">
+        <span>Repair YT auto-captions</span>
+      </div>
+      <div class="askq-body" style="padding:14px 16px;">
+        <div style="font-size:12px;line-height:1.5;margin-bottom:12px;">
+          Re-parses YouTube auto-captions for videos archived before
+          <b>v64.7</b> to fix two parser bugs that dropped words and
+          duplicated phrases:
+          <ul style="margin:6px 0 6px 18px;padding:0;">
+            <li>Rolled-in words at every cue boundary (e.g.
+                <i>New</i>, <i>Convertible?</i>, <i>aggressive,</i>)
+                got silently dropped from the per-word array.</li>
+            <li>A 0.5s window slop pulled the next segment's first
+                words into the prior segment, producing duplications
+                at segment boundaries (e.g. <i>heading to heading to a
+                data center</i>).</li>
+          </ul>
+          Hits YouTube once per video, runs in the background, writes
+          to the JSONL sidecar and the segments DB. Whisper-transcribed
+          videos are skipped automatically. Refresh a video's Watch
+          view to see the repair land.
+        </div>
+        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:10px 14px;">
+          <label class="edit-gl">Scope</label>
+          <select class="ctl-select" id="repair-yt-channel"
+                  style="max-width:400px;"></select>
+
+          <label class="edit-gl">Dry-run</label>
+          <label style="font-size:12px;">
+            <input type="checkbox" id="repair-yt-dryrun" />
+            Fetch + parse only, don't write anything
+          </label>
+
+          <label class="edit-gl">Punctuated</label>
+          <label style="font-size:12px;">
+            <input type="checkbox" id="repair-yt-include-punctuated" />
+            Include <code>YT+PUNCTUATION</code> sources
+            <span class="edit-dim">— risky if the original VTT was lowercase</span>
+          </label>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-primary" id="repair-yt-run"
+                title="Start the repair. Modal closes; progress shows in the main log.">Run</button>
+        <button class="btn btn-ghost" id="repair-yt-close">Close</button>
       </div>
     </div>
   </div>

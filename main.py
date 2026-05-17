@@ -18,8 +18,8 @@ from typing import Any, Dict
 # Surfaced in the window title, /cmd/ping, and the HTML header bar.
 # Every rebuild increments by 0.1 (v45.0 -> v45.1 -> ...),
 # carrying the ten at v45.9 -> v46.0.
-APP_VERSION      = "v64.6"
-APP_VERSION_DATE = "5.17.26 8:41am"
+APP_VERSION      = "v64.7"
+APP_VERSION_DATE = "5.17.26 9:33am"
 
 
 # ── Single-instance mutex (matches YTArchiver.py:109) ──────────────────
@@ -3822,6 +3822,51 @@ class Api:
             if a.get("retranscribe_queued", 0) > 0:
                 self._maybe_autostart_sync()
         return result
+
+    # ─── Repair YT auto-captions (v64.7 parser fix) ────────────────────
+
+    def repair_yt_captions(self, payload):
+        """Re-parse YouTube auto-caption VTTs for already-archived videos
+        to regenerate the per-word `words` array in the JSONL + DB.
+
+        Fixes the pre-v64.7 parser bug that dropped rolled-in words and
+        let next-segment words bleed into prior segments. Spawns a
+        background thread; progress streams to the main log so the
+        modal can be closed while it runs. Returns immediately.
+
+        payload keys (all optional):
+          channel: channel folder name to limit scope; "" = all channels
+          video_id: single video to repair (overrides channel)
+          dry_run: bool — fetch + parse but don't write anything
+          include_punctuated: bool — also process YT+PUNCTUATION sources
+              (risky: if the new VTT is lowercase, the re-parsed words
+              lose the punctuation a prior punct pass restored)
+        """
+        from backend import repair_captions as _rc
+        cfg = self._config or load_config()
+        output_dir = (cfg.get("output_dir") or "").strip()
+        if not output_dir:
+            return {"ok": False, "error": "output_dir is not configured"}
+        payload = payload or {}
+
+        def _worker():
+            try:
+                _rc.repair_archive(
+                    output_dir=output_dir,
+                    channel_folder=(payload.get("channel") or None),
+                    video_id=(payload.get("video_id") or None),
+                    dry_run=bool(payload.get("dry_run")),
+                    include_punctuated=bool(payload.get("include_punctuated")),
+                    log_stream=self._log_stream,
+                )
+            except Exception as _e:
+                self._log_stream.emit_error(
+                    f" — repair_yt_captions worker crashed: {_e}\n")
+                self._log_stream.flush()
+
+        threading.Thread(target=_worker, name="repair-yt-captions",
+                         daemon=True).start()
+        return {"ok": True}
 
     # ─── Compress dry-run (feature F8) ─────────────────────────────────
 

@@ -17,7 +17,7 @@
 
 [project]
 name = "ytarchiver"
-version = "73.3"
+version = "73.5"
 description = "Subscription-based YouTube channel archiver with local Whisper transcription, FTS5 transcript search, and a pywebview UI."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -49,7 +49,7 @@ dev = ["pytest>=8", "ruff>=0.15"]
 [project.urls]
 Homepage = "https://github.com/skurbee/YTArchiver"
 Repository = "https://github.com/skurbee/YTArchiver"
-Changelog = "https://github.com/skurbee/YTArchiver/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/skurbee/YTArchiver/blob/main/docs/CHANGELOG.md"
 
 [tool.pytest.ini_options]
 minversion = "8.0"

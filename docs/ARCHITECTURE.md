@@ -1,7 +1,7 @@
 # YTArchiver Architecture
 
 This document describes how YTArchiver fits together. For "how do I add a
-feature", see [`../CONTRIBUTING.md`](../CONTRIBUTING.md). For "how do I
+feature", see [`CONTRIBUTING.md`](CONTRIBUTING.md). For "how do I
 build the exe", see [`BUILD.md`](BUILD.md). For the JS API surface
 specifically, see [`../backend/api_mixins/README.md`](../backend/api_mixins/README.md).
 For the frontend, see [`../web/README.md`](../web/README.md).
@@ -186,7 +186,7 @@ background thread or the UI freezes. See [`../backend/api_mixins/README.md`](../
 | 7 | `ytarchiver_config.py` decomposition (`view_format.py` extracted) |
 | 8 | `api_mixins/` contract documentation (`api_mixins/README.md`) |
 | 9 | Frontend documentation (`web/README.md`) |
-| 10 | Contributor docs (this file, `../CONTRIBUTING.md`, `BUILD.md`) |
+| 10 | Contributor docs (this file, `CONTRIBUTING.md`, `BUILD.md`) |
 | 11–13 | `web/app.js` decomposition into ~40 single-concern modules |
 | 14 | `sync/core.py` split — `sync_all` + `sync_helpers` extracted |
 | 15 | `indexControls.js` split — `metadataTab.js`, `settingsInfra.js` extracted |

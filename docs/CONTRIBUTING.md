@@ -8,7 +8,7 @@ just cloned the repo and wants to find their bearings.
 
 1. **Install Python 3.13** (required for builds; 3.11 also needed for the
    Whisper transcribe subprocess).
-2. **Install dependencies**: `pip install -r requirements.txt`
+2. **Install dependencies**: `pip install -r docs/requirements.txt`
 3. **Install external tools** on PATH:
    - `yt-dlp` (latest)
    - `ffmpeg` + `ffprobe`
@@ -25,6 +25,18 @@ YTArchiver/
 ├── main.py                 # Api class + window lifecycle + startup
 ├── YTArchiver.spec         # PyInstaller config (for builds only)
 ├── icon.ico
+├── README.md               # GitHub landing page
+├── LICENSE                 # MIT
+├── pyproject.toml          # Project metadata (Python tooling)
+├── ruff.toml               # Linter config
+├── docs/                   # Project docs
+│   ├── ARCHITECTURE.md     # System architecture
+│   ├── BUILD.md            # PyInstaller build workflow
+│   ├── CHANGELOG.md        # Release notes
+│   ├── CONTRIBUTING.md     # This file
+│   ├── PROJECT_MAP.md      # File-by-file index
+│   └── requirements.txt    # `pip install -r docs/requirements.txt`
+├── tests/                  # pytest smoke suite
 ├── backend/                # All Python backend modules
 │   ├── api_mixins/         # JS-callable methods (see api_mixins/README.md)
 │   ├── version.py          # APP_VERSION + APP_VERSION_DATE
@@ -167,7 +179,7 @@ documented in `backend/api_mixins/README.md`.
 
 ## Building the exe
 
-See [`docs/BUILD.md`](docs/BUILD.md).
+See [`BUILD.md`](BUILD.md).
 
 ## Submitting changes
 
@@ -192,8 +204,8 @@ always carry the ten: `v37.9 + 0.1 = v38.0` (never `v37.10`).
 
 ## Where to learn more
 
-- `backend/api_mixins/README.md` — the JS-callable API surface.
-- `web/README.md` — frontend architecture.
-- [`docs/BUILD.md`](docs/BUILD.md) — PyInstaller build workflow.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture.
-- [`docs/PROJECT_MAP.md`](docs/PROJECT_MAP.md) — file-by-file index.
+- `../backend/api_mixins/README.md` — the JS-callable API surface.
+- `../web/README.md` — frontend architecture.
+- [`BUILD.md`](BUILD.md) — PyInstaller build workflow.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — system architecture.
+- [`PROJECT_MAP.md`](PROJECT_MAP.md) — file-by-file index.

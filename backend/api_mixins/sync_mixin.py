@@ -339,8 +339,11 @@ class SyncMixin:
 
 
     def gpu_clear_queue(self):
-        """Drop every queued GPU task. Current job (if any) is also
-        cancelled via `transcribe_cancel_all`."""
+        """Drop every queued GPU task. Currently-running job (if any) is
+        also cancelled — subprocess killed, popover slot cleared, and
+        the pending journal rewritten so nothing resurrects on the next
+        launch.
+        """
         removed = 0
         try:
             removed = self._queues.gpu_clear()
@@ -348,6 +351,22 @@ class SyncMixin:
             _log.debug("swallowed: %s", e)
         try:
             self._transcribe.cancel_all()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        # Belt-and-suspenders: also do the same defensive cleanup as
+        # gpu_skip_current so a wedged worker can't leave a phantom
+        # "running" row in the popover or a journal entry that comes
+        # back on restart. See gpu_skip_current docstring for rationale.
+        try:
+            self._transcribe.skip_current()  # kills subprocess if any
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            self._queues.set_current_gpu(None)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            self._transcribe.drop_running_from_journal()
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._on_queue_changed()
@@ -422,9 +441,36 @@ class SyncMixin:
     def gpu_skip_current(self):
         """Skip the currently-running GPU (transcribe / compress / metadata)
         job and advance to the next one.
+
+        Belt-and-suspenders: in addition to signaling cancel + killing
+        the subprocess (the worker's normal cleanup path), we also
+        immediately clear `queues.current_gpu` and forcibly omit the
+        running job from the pending journal. If the worker is healthy
+        and reaches its own `finally` block, those overwrites are
+        redundant. If the worker is hung \u2014 which is precisely when the
+        user is clicking Cancel \u2014 the popover updates immediately AND
+        the task doesn't resurrect from the journal on next launch.
         """
         try:
+            # 1. Normal cancel \u2014 fire the cancel event + kill subprocess.
             self._transcribe.skip_current()
+            # 2. Force-clear the running-slot in the popover so the user
+            #    sees immediate feedback instead of waiting on whatever
+            #    the worker is doing. Idempotent with the worker's own
+            #    set_current_gpu(None) in its finally block.
+            try:
+                self._queues.set_current_gpu(None)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            # 3. Pre-emptively rewrite the pending journal without the
+            #    running job. If the worker recovers and reaches its
+            #    own _persist_pending(), this gets re-overwritten with
+            #    the same content. If the worker hangs forever, this
+            #    ensures the task doesn't come back on restart.
+            try:
+                self._transcribe.drop_running_from_journal()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             self._log_stream.emit([
                 ["[GPU] ", "trans_bracket"],
                 ["Skip current GPU job \u2014 moving on\n", "simpleline"],

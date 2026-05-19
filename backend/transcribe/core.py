@@ -567,6 +567,49 @@ class TranscribeManager:
 
     # ── Pending journal (survives restart) ──
 
+    def drop_running_from_journal(self):
+        """Rewrite the pending journal as if the currently-running job
+        doesn't exist. Used by `gpu_skip_current` as belt-and-suspenders
+        cleanup: if the worker reaches its normal `finally` block this
+        is redundant (the finally also rewrites the journal without
+        `current_job`); if the worker hangs and never reaches the
+        finally, this prevents the task from resurrecting on next
+        launch.
+
+        Deliberately writes the journal with only `self._jobs` (the
+        queued tail) — drops whatever's in `self._current_job`. The
+        worker is responsible for clearing `self._current_job` later
+        via its own finally; this method doesn't touch that field to
+        avoid racing the worker thread.
+        """
+        try:
+            import json as _json
+            def _snap(j: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "path": j.get("path", ""),
+                    "title": j.get("title", ""),
+                    "channel": j.get("channel", ""),
+                    "video_id": j.get("video_id", ""),
+                    "retranscribe": bool(j.get("retranscribe")),
+                    "combined_override": j.get("combined_override"),
+                    "bulk_id": j.get("bulk_id", ""),
+                    "bulk_total": int(j.get("bulk_total", 0) or 0),
+                    "bulk_index": int(j.get("bulk_index", 0) or 0),
+                    "kind": j.get("kind", "transcribe"),
+                    "from_download": bool(j.get("from_download")),
+                }
+            with self._jobs_lock:
+                snapshot = [_snap(j) for j in self._jobs]
+            # Note: current_job is INTENTIONALLY excluded.
+            p = _pending_journal_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(p) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(snapshot, f, indent=2)
+            os.replace(tmp, p)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+
     def _persist_pending(self):
         """Write current pending jobs to disk so a crash/restart recovers them."""
         try:

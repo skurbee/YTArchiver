@@ -218,7 +218,8 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                         stream: LogStreamer,
                         punct_mgr=None,
                         job_tag: str = "",
-                        video_id_hint: str = "") -> bool:
+                        video_id_hint: str = "",
+                        from_download: bool = False) -> bool:
     """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
     into the aggregated channel Transcript.txt + hidden JSONL sidecar,
     then ingest into FTS — skip Whisper entirely.
@@ -411,8 +412,13 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     _em_tag = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
     _dim_tag = [t for t in (_tx_tag, "dim", job_tag) if t]
     _lbl_tag = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
+    # Match the Whisper done line in core.py: indent under the parent
+    # " \u2014 \u2713 Title (size)" video row when this transcription is part of
+    # a sync download flow. Standalone retranscribes keep the 1-space
+    # indent so they line up with their own header.
+    _lead = "      " if from_download else " "
     stream.emit([
-        [" ", _dim_tag],
+        [_lead, _dim_tag],
         ["\u2014 \u2713 ", _em_tag],
         ["Transcription", _lbl_tag],
         [f" (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _dim_tag],

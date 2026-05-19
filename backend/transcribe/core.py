@@ -1208,7 +1208,8 @@ class TranscribeManager:
                                    self._stream,
                                    punct_mgr=_punct_for_captions,
                                    job_tag=job_tag,
-                                   video_id_hint=job.get("video_id", ""))):
+                                   video_id_hint=job.get("video_id", ""),
+                                   from_download=bool(job.get("from_download")))):
             if job.get("cb"):
                 try:
                     job["cb"]({"auto_captions": True})
@@ -1280,12 +1281,16 @@ class TranscribeManager:
         _vid_marker = (job.get("video_id") or "").strip()
         _tx_marker = f"tx_done_{_vid_marker}" if _vid_marker else ""
         _tag = lambda *extra: [t for t in (_tx_marker, job_tag, *extra) if t]
+        # Match the done line's indent so the in-place "Transcribing
+        # 25%..." -> "- v Transcription (...)" replacement
+        # doesn't visibly jump from 1-space to 6-space leading whitespace.
+        _prog_lead = "      " if job.get("from_download") else " "
         def _emit_progress(pct, suffix=""):
             # Em-dash + space in the whisper_bracket color matches the
             # other inline per-video lines (download ✓, metadata ✓,
             # etc.) so the block reads as one visual unit.
             self._stream.emit([
-                [" \u2014 ", _tag("whisper_bracket")],
+                [f"{_prog_lead}\u2014 ", _tag("whisper_bracket")],
                 ["Transcribing", _tag()],
                 [f' "{_disp_title}"', _tag()],
                 [", ", _tag()],
@@ -1467,8 +1472,15 @@ class TranscribeManager:
             _em_tags = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
             _lbl_tags = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
             _txt_tags = [t for t in (_tx_tag, "simpleline", job_tag) if t]
+            # Indent under the parent " \u2014 \u2713 Title (size)" video row when
+            # this transcription is part of a sync's download flow.
+            # Standalone transcribes (Transcribe File, drift retranscribe,
+            # Watch-view retranscribe) have no parent video line in the
+            # log, so keep the original 1-space indent \u2014 those rows also
+            # splice the title onto the end of the done line below.
+            _lead = "      " if job.get("from_download") else " "
             _segs = [
-                [" ", _dim_tags],
+                [_lead, _dim_tags],
                 ["\u2014 \u2713 ", _em_tags],
                 ["Transcription", _lbl_tags],
             ]

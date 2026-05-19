@@ -233,15 +233,18 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     # Return without marking anything; caller can retry later.
     if isinstance(entry, dict) and entry.get("_timeout"):
         if emit_inline_log:
+            # Indent — this line nests under the parent " — ✓ Title …"
+            # video row from sync.py, matching the metadata/transcription
+            # done lines below.
             stream.emit([
-                [" — ", "dim"],
+                ["      — ", "dim"],
                 ["Metadata fetch timed out (will retry next pass)\n", "dim"],
             ])
         return {"ok": False, "error": "timeout", "transient": True}
     if entry is None:
         if emit_inline_log:
             stream.emit([
-                [" — ", "dim"],
+                ["      — ", "dim"],
                 ["Metadata fetch failed\n", "red"],
             ])
         return {"ok": False, "error": "yt-dlp dump-json failed"}
@@ -276,8 +279,15 @@ def fetch_single_video_metadata(channel: dict[str, Any],
         # channels' rows have scrolled in.
         _md_marker = f"meta_done_{video_id}" if video_id else ""
         _md_tag = lambda *extra: [t for t in (_md_marker, *extra) if t]
+        # Indent — this line nests visually under the parent " — ✓ Title
+        # … (size)" video row that sync.py emits for this same video.
+        # 6 leading spaces gives a clean two-level outline:
+        #   [N/M] Channel
+        #    — ✓ Title (12 MB)
+        #         — ✓ Metadata downloaded
+        #         — ✓ Transcription (...)
         stream.emit([
-            [" ", _md_tag("dim")],
+            ["      ", _md_tag("dim")],
             ["— ✓ ", _md_tag("meta_bracket")],
             ["Metadata ", _md_tag("simpleline_pink")],
             ["downloaded\n", _md_tag("simpleline")],

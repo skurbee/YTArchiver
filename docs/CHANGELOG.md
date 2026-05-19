@@ -120,6 +120,16 @@ user-facing bug audit before pushing.
  60 seconds later. Now retries on `pywebviewready` + a short poll
  fallback, matching the pattern other UI restore paths already use.
 
+### Changed (UI polish)
+- **Sync log: nest metadata + transcription rows under the video
+ they belong to**. When a sync catches a new download, the
+ "Metadata downloaded" and "Transcription (…)" rows now indent
+ six spaces so they read as children of the parent " — ✓ Title
+ (size)" video row instead of being visually at the same level as
+ the channel header. Standalone retranscribes (Watch view,
+ Transcribe File, drift retranscribe) keep the original
+ single-space indent because they don't have a parent video row.
+
 ### Added
 - **Search result sorting** (Browse → Search): new Sort dropdown
  with Relevance (default), Newest, Oldest, By channel, By title.

@@ -867,6 +867,24 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     _mm0 = _MERGE_RE.search(s)
                     if _mm0:
                         merge_dest_path = _mm0.group(1).strip()
+                        # Cross-stamp _path_to_counter so the DLTRACK
+                        # lookup can resolve the Merger's path even when
+                        # yt-dlp sanitized the intermediate .fNNN
+                        # Destination paths differently than the merged
+                        # output (observed: title with `"` rendered as
+                        # bare-stripped in the .f137 sub-track filename
+                        # but as fullwidth `＂` in the merged .mp4
+                        # output → path-match misses → DLTRACK orphan).
+                        # The "youngest pending" entry in _title_announced
+                        # is this video (yt-dlp processes sequentially
+                        # within a subprocess) so cloning its counter
+                        # under the Merger path repairs the join.
+                        for _pp, _pv in _title_announced.items():
+                            if _pv == "pending":
+                                _existing_n = _path_to_counter.get(_pp)
+                                if _existing_n is not None:
+                                    _path_to_counter[merge_dest_path] = _existing_n
+                                break
                 stream.emit([[f" {s}\n", "dim"]])
                 continue
 
@@ -935,6 +953,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             _mm = _MERGE_RE.search(s)
             if _mm:
                 merge_dest_path = _mm.group(1).strip()
+                # Cross-stamp _path_to_counter — see the matching block
+                # in the verbose-suppress filter above for the full why.
+                # Belt-and-suspenders: this fallback capture site fires
+                # for [Merger] variants that didn't hit the suppress
+                # filter (e.g. tools that wrap yt-dlp output with
+                # additional prefixes), so it needs the same cross-stamp.
+                for _pp, _pv in _title_announced.items():
+                    if _pv == "pending":
+                        _existing_n = _path_to_counter.get(_pp)
+                        if _existing_n is not None:
+                            _path_to_counter[merge_dest_path] = _existing_n
+                        break
                 # Also cover Remuxer / FixupM3u8 — same semantic meaning.
                 # Fall through so the line still gets logged.
 
@@ -1075,12 +1105,37 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 # is the most reliable join key.
                                 _dlrow_n = _vid_to_counter.get(vid)
                             if _dlrow_n is None:
+                                # Last-resort: youngest pending counter.
+                                # yt-dlp processes videos sequentially
+                                # inside a single subprocess, so the
+                                # only `_title_announced[path] ==
+                                # "pending"` entry at DLTRACK time is
+                                # this video. Catches cases where path,
+                                # basename, AND vid lookups all missed
+                                # (e.g. Destination intermediate paths
+                                # were sanitized differently than the
+                                # Merger output, AND `[youtube] VIDID:`
+                                # wasn't captured before Destination
+                                # fired). Iterating in insertion order
+                                # picks the most recent pending entry.
+                                _pending_n = None
+                                for _pp, _pv in _title_announced.items():
+                                    if _pv == "pending":
+                                        _pn = _path_to_counter.get(_pp)
+                                        if _pn is not None:
+                                            _pending_n = _pn
+                                _dlrow_n = _pending_n
+                            if _dlrow_n is None:
                                 _done_kind = f"dlrow_orphan_{vid or id(final_path)}"
-                                # Patch A: surface the orphan loudly so
-                                # silent log corruption becomes visible.
-                                # This fallback firing means the path/
-                                # vid join missed — symptom of a real
-                                # defect, not just cosmetic noise.
+                                # Diagnostic only — Simple mode never
+                                # sees this (dim → verbose-only). The
+                                # noisy `_log.warning` that doubled this
+                                # line in Simple mode was demoted to
+                                # debug to stop scaring the user when
+                                # the failure is purely cosmetic (the
+                                # download itself succeeded; the
+                                # orphaned in-place row gets cleaned up
+                                # by the post-channel sweep).
                                 try:
                                     stream.emit_dim(
                                         f" ⚠ DLTRACK orphan: no dlrow "
@@ -1090,7 +1145,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                     _log.debug(
                                         "dlrow orphan warning emit failed: %s",
                                         _de)
-                                _log.warning(
+                                _log.debug(
                                     "DLTRACK orphan: vid=%s path=%s",
                                     vid, final_path)
                                 # Path-match fell through to orphan. The

@@ -165,6 +165,31 @@ user-facing bug audit before pushing.
  dead weight. The `[tool.pytest.ini_options]` block and the
  `pytest` dev-dependency in `pyproject.toml` were also removed.
 
+### Fixed (sync log join)
+- **DLTRACK orphan warning no longer fires when yt-dlp sanitizes
+ intermediate Destination paths differently from the merged
+ output**. When a video title contains a Windows-illegal char
+ (`"`, `:`, `?`, `|`, etc.), yt-dlp may strip it entirely from
+ the intermediate `.fNNN` track filenames but render it as a
+ fullwidth Unicode substitute (`＂`, `：`, `？`, `｜`) in the
+ final merged `.mp4`. That meant the path key stored under the
+ Destination-derived intermediate path didn't match the DLTRACK
+ lookup that used the merged-output path. Now the `[Merger]`
+ line cross-stamps `_path_to_counter` with the merged path
+ pointing to the same counter, so the DLTRACK join finds it
+ cleanly. A "youngest pending counter" last-resort fallback was
+ also added — if path, basename, AND video-ID lookups ever all
+ miss in some unforeseen edge case, the counter for the only
+ pending download is necessarily this video.
+- **If a DLTRACK orphan ever does occur, the diagnostic line is
+ now hidden in Simple mode**. The previous `[ytarchiver.backend.
+ sync.core] DLTRACK orphan: …` warning was visible in both
+ modes; demoted to a debug-level message so Simple mode users
+ don't see internal book-keeping noise when nothing actually
+ failed (the download still succeeded, just the in-place log-row
+ replacement fell back to a fresh marker). Verbose mode still
+ surfaces the diagnostic with a ⚠ prefix.
+
 ### Added
 - **Search result sorting** (Browse → Search): new Sort dropdown
  with Relevance (default), Newest, Oldest, By channel, By title.

@@ -32,26 +32,18 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 
-def _norm_title(s: str) -> str:
-    """Mirrors transcribe._norm_title — strip/lower/collapse-whitespace.
-    Kept as a local copy so drift_scan has no import-time dependency on
-    transcribe (which pulls in Whisper/ffmpeg modules at import)."""
-    s = (s or "").strip().lower()
-    # Unicode NFKC normalization handles combining-mark + width
-    # differences that commonly drift between yt-dlp's VTT path and
-    # the Whisper path.
-    try:
-        import unicodedata
-        s = unicodedata.normalize("NFKC", s)
-    except Exception:
-        pass
-    # Collapse internal whitespace runs
-    s = re.sub(r"\s+", " ", s)
-    return s
-
+# consolidated onto text_utils.normalize_title.
+# The canonical normalizer adds trailing-punct stripping ("title." ==
+# "title") which is what drift detection wants — the previous copy here
+# kept trailing punct so "title." and "title" drifted into separate keys.
+from .text_utils import normalize_title as _norm_title
 
 # Regex for .txt header: "===(title), (MM.DD.YYYY), (H:MM), (SOURCE)==="
 # Same as transcribe._HEADER_RE; copied here to stay import-independent.
@@ -64,7 +56,7 @@ _HEADER_RE = re.compile(
 _ID_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
 
 
-def _scan_txt_titles(folder_path: str) -> Dict[str, Dict[str, Any]]:
+def _scan_txt_titles(folder_path: str) -> dict[str, dict[str, Any]]:
     """Walk all `*Transcript.txt` under folder_path. Return
     {norm_title: {"raw": raw_title, "video_id": id_or_empty,
                   "txt_path": abs_path, "src_tag": "(WHISPER:large-v3)",
@@ -72,7 +64,7 @@ def _scan_txt_titles(folder_path: str) -> Dict[str, Dict[str, Any]]:
     One entry per distinct title. If the same title appears in multiple
     .txt files (shouldn't happen but possible with split-years drift),
     the first one wins."""
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     if not folder_path or not os.path.isdir(folder_path):
         return out
     for dirpath, _dirs, files in os.walk(folder_path):
@@ -105,12 +97,12 @@ def _scan_txt_titles(folder_path: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _scan_jsonl_titles(folder_path: str) -> Dict[str, Dict[str, Any]]:
+def _scan_jsonl_titles(folder_path: str) -> dict[str, dict[str, Any]]:
     """Walk all hidden `.*Transcript.jsonl` under folder_path. Return
     {norm_title: {"raw": raw_title, "video_id": id_or_empty,
                   "jsonl_path": abs_path}}
     One entry per distinct title across all .jsonl files."""
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     if not folder_path or not os.path.isdir(folder_path):
         return out
     for dirpath, _dirs, files in os.walk(folder_path):
@@ -146,12 +138,12 @@ def _scan_jsonl_titles(folder_path: str) -> Dict[str, Dict[str, Any]]:
                                 out[plain_key] = {"raw": title,
                                                   "video_id": vid_id,
                                                   "jsonl_path": fp}
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
     return out
 
 
-def _channel_folder(channel: Dict[str, Any], output_dir: str) -> Optional[str]:
+def _channel_folder(channel: dict[str, Any], output_dir: str) -> str | None:
     """Resolve the channel's on-disk folder. Mirrors the folder-name
     resolution used elsewhere (folder_override → name → sanitized)."""
     if not output_dir:
@@ -175,10 +167,13 @@ def _count_fts_phantoms() -> int:
     change the fix path."""
     try:
         from . import index as _idx
-        conn = _idx._open()
+        conn = _idx._reader_open()
         if conn is None:
             return 0
-        with _idx._db_lock:
+        # Reader path — COUNT comparison can run in parallel with any
+        # writer (sweep, ingest). Drift Scan is a diagnostic, so making
+        # it block was extra painful.
+        with _idx._reader_lock:
             # Simple total comparison. If FTS > segments, the delta is
             # the phantom count. FTS rowids that point at nothing still
             # get counted in segments_fts, so `COUNT(*)` captures them.
@@ -194,7 +189,7 @@ def _count_fts_phantoms() -> int:
         return 0
 
 
-def scan_channel(channel: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
+def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
     """Scan one channel's transcript drift.
 
     Returns:
@@ -224,8 +219,8 @@ def scan_channel(channel: Dict[str, Any], output_dir: str) -> Dict[str, Any]:
     seen_txt_paths: set = set()
     seen_jsonl_paths: set = set()
 
-    txt_without_jsonl: List[Dict[str, Any]] = []
-    jsonl_without_txt: List[Dict[str, Any]] = []
+    txt_without_jsonl: list[dict[str, Any]] = []
+    jsonl_without_txt: list[dict[str, Any]] = []
 
     for key, rec in txt_map.items():
         # Dedup by (txt_path, raw title)
@@ -333,16 +328,16 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
 
 
 def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
-                                    titles_to_recover: List[str]
-                                    ) -> Dict[str, Dict[str, Any]]:
+                                    titles_to_recover: list[str]
+                                    ) -> dict[str, dict[str, Any]]:
     """Read jsonl_path, group segments by title for each title in
     titles_to_recover, and return
     {title: {"text": concatenated_body, "video_id": id,
              "duration_s": approx_seconds}}
     Titles not found in the file are omitted. Other titles in the file
     are ignored."""
-    want = {t: True for t in (titles_to_recover or [])}
-    buckets: Dict[str, Dict[str, Any]] = {}
+    want = dict.fromkeys(titles_to_recover or [], True)
+    buckets: dict[str, dict[str, Any]] = {}
     try:
         with open(jsonl_path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -369,7 +364,7 @@ def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
                     b["video_id"] = vid
     except OSError:
         return {}
-    out: Dict[str, Dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for t, b in buckets.items():
         out[t] = {"text": " ".join(b["parts"]).strip(),
                   "duration_s": b["end"],
@@ -386,10 +381,10 @@ def _fmt_duration_hms(secs: float) -> str:
     return f"{h}:{m:02d}"
 
 
-def apply_channel(channel: Dict[str, Any], output_dir: str,
-                  scan_result: Optional[Dict[str, Any]] = None,
+def apply_channel(channel: dict[str, Any], output_dir: str,
+                  scan_result: dict[str, Any] | None = None,
                   enqueue_retranscribe_fn=None,
-                  rebuild_fts_fn=None) -> Dict[str, Any]:
+                  rebuild_fts_fn=None) -> dict[str, Any]:
     """Apply the three fixes to drift found in `channel`.
 
     If `scan_result` is None, scans the channel fresh.
@@ -436,7 +431,7 @@ def apply_channel(channel: Dict[str, Any], output_dir: str,
 
     # ─── Fix B: JSONL-without-TXT → reconstruct .txt entries ───────────
     # Group orphans by jsonl_path so we only open each file once.
-    jsonl_orphans: Dict[str, List[str]] = {}
+    jsonl_orphans: dict[str, list[str]] = {}
     for orphan in scan_result.get("jsonl_without_txt", []) or []:
         jp = orphan["jsonl_path"]
         jsonl_orphans.setdefault(jp, []).append(orphan["title"])
@@ -505,28 +500,29 @@ def apply_channel(channel: Dict[str, Any], output_dir: str,
         try:
             rebuild_fts_fn()
             actions["fts_rebuilt"] = True
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     return {"ok": True, "actions": actions, "details": details,
             "scan": scan_result}
 
 
 def _lookup_video_filepaths(channel_name: str,
-                            titles: List[str]) -> Dict[str, str]:
+                            titles: list[str]) -> dict[str, str]:
     """Return {norm_title: filepath} for each title in `titles` that
     can be found in the FTS DB's videos table under this channel.
     Titles not found are omitted. Uses COLLATE NOCASE for the title
     match and strips trailing [id] brackets for robustness."""
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     if not channel_name or not titles:
         return out
     try:
         from . import index as _idx
-        conn = _idx._open()
+        conn = _idx._reader_open()
         if conn is None:
             return out
-        with _idx._db_lock:
+        # Reader path — pure SELECT against videos.
+        with _idx._reader_lock:
             # Pre-fetch all this channel's (title, filepath) so we can
             # match in Python and handle [id] bracket variants.
             rows = conn.execute(
@@ -537,7 +533,7 @@ def _lookup_video_filepaths(channel_name: str,
                 (channel_name,)).fetchall()
         # Build a lookup map keyed by normalized title (with and without
         # [id] bracket).
-        db_map: Dict[str, str] = {}
+        db_map: dict[str, str] = {}
         for db_title, fp in rows:
             if not db_title or not fp:
                 continue
@@ -555,8 +551,8 @@ def _lookup_video_filepaths(channel_name: str,
                 pkey = _norm_title(raw_plain)
                 if pkey in db_map:
                     out[pkey] = db_map[pkey]
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return out
 
 
@@ -564,7 +560,7 @@ def rebuild_fts_index() -> bool:
     """Run the FTS5 rebuild idiom to clean up external-content phantom
     rows. Idempotent and cheap (~1s even on large DBs).
 
-    audit M-4: after the rebuild, verify the FTS table is responsive
+    after the rebuild, verify the FTS table is responsive
     (SELECT COUNT(*) works and returns >= 0) before claiming success.
     A locked DB or corrupted FTS5 index can silently no-op the
     rebuild INSERT; the read-back confirms the write actually

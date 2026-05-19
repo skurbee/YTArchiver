@@ -19,11 +19,15 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, List, Optional
+from typing import Any
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 
-Segment = List[Any] # [text, tag?]
-SegmentList = List[Segment] # one log line
+Segment = list[Any] # [text, tag?]
+SegmentList = list[Segment] # one log line
 
 
 # Tags we want to filter out in Simple mode. These are the "noisy"
@@ -78,7 +82,7 @@ def _line_is_verbose_only(segments: SegmentList) -> bool:
         # Lines with only "\n" or empty text don't contribute
         if text in (None, "", "\n"):
             continue
-        # audit M-20: whitespace-only segments (leading " ", padding
+        # whitespace-only segments (leading " ", padding
         # " \u2014 ") shouldn't flip the whole line to verbose-only
         # purely because their tag is None or non-verbose. These
         # are layout glue, not content. Skip them in the decision
@@ -102,15 +106,15 @@ class LogStreamer:
 
     def __init__(self, window=None):
         self._window = window
-        self._buffer: List[SegmentList] = []
-        self._buffer_activity: List[dict] = []
-        # audit E-17: staging buffers populated by _flush_now_locked
+        self._buffer: list[SegmentList] = []
+        self._buffer_activity: list[dict] = []
+        # staging buffers populated by _flush_now_locked
         # under self._lock; _do_flush reads them from here AFTER the
         # lock is released so evaluate_js doesn't stall workers.
-        self._pending_main: List[SegmentList] = []
-        self._pending_act: List[dict] = []
+        self._pending_main: list[SegmentList] = []
+        self._pending_act: list[dict] = []
         self._lock = threading.Lock()
-        self._flush_timer: Optional[threading.Timer] = None
+        self._flush_timer: threading.Timer | None = None
         self._last_flush = 0.0
         # Latest in-place line for whisper/encode progress replacement.
         # Key = tag that identifies the line type; value = the target line
@@ -142,7 +146,7 @@ class LogStreamer:
             return
         for fn in list(self._line_scanners):
             try: fn(text)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
 
     # ── main log ──
 
@@ -160,12 +164,12 @@ class LogStreamer:
         with self._lock:
             self._buffer.append(segments)
             if len(self._buffer) >= self.MAX_BATCH_SIZE:
-                # audit E-17: swap buffers under lock, fire JS bridge
+                # swap buffers under lock, fire JS bridge
                 # call outside the lock. Also cancel any scheduled
                 # timer so we don't double-fire.
                 if self._flush_timer is not None:
                     try: self._flush_timer.cancel()
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                     self._flush_timer = None
                 self._flush_now_locked()
                 _main = self._pending_main
@@ -178,7 +182,7 @@ class LogStreamer:
             return
         self._schedule_flush()
 
-    def emit_text(self, text: str, tag: Optional[str] = None):
+    def emit_text(self, text: str, tag: str | None = None):
         """Convenience: emit one plain-text line with optional tag."""
         line = text if text.endswith("\n") else text + "\n"
         self.emit([[line, tag]])
@@ -206,7 +210,7 @@ class LogStreamer:
     # ── batching ──
 
     def _schedule_flush(self):
-        # audit F-51: check + set _flush_timer inside the lock so two
+        # check + set _flush_timer inside the lock so two
         # concurrent emit() calls can't each create a Timer, leaving
         # orphan timers that fire into a closed window. Previously the
         # `if _flush_timer is not None: return` check happened outside
@@ -220,7 +224,7 @@ class LogStreamer:
             self._flush_timer = t
 
     def _flush(self):
-        # audit E-17: DO NOT hold self._lock while evaluate_js is
+        # DO NOT hold self._lock while evaluate_js is
         # running — pywebview's JS bridge can block for seconds under
         # load (devtools attached, huge payload, GC pause), and every
         # worker emit() stalls behind it while the lock is held. Swap
@@ -269,11 +273,20 @@ class LogStreamer:
     def flush(self):
         """Force an immediate flush. Call before shutting down the window.
 
-        audit E-17: performs the JS-bridge call OUTSIDE the lock so a
+        performs the JS-bridge call OUTSIDE the lock so a
         slow evaluate_js doesn't stall other emit() callers queueing
         up behind it.
+
+        Patch C: bounded lock-acquire to defend against a window-close
+        deadlock. If a worker thread holds _lock inside emit() while
+        the main thread calls flush() during shutdown, the main thread
+        used to wait forever. Now: 5s timeout, then bail. The flush is
+        best-effort — losing the very last batch on close is acceptable;
+        hanging the app on close is not.
         """
-        with self._lock:
+        if not self._lock.acquire(timeout=5.0):
+            return
+        try:
             if self._flush_timer is not None:
                 self._flush_timer.cancel()
                 self._flush_timer = None
@@ -282,4 +295,6 @@ class LogStreamer:
             _act = getattr(self, "_pending_act", [])
             self._pending_main = []
             self._pending_act = []
+        finally:
+            self._lock.release()
         self._do_flush(_main, _act)

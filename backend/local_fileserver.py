@@ -25,15 +25,19 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .log import get_logger
+
+_log = get_logger(__name__)
+
 
 _server_port: int = 0
 _server_thread: threading.Thread | None = None
-_httpd = None  # audit D-56: module-level handle so stop_server() can
+_httpd = None  # module-level handle so stop_server() can
                # shut the server down cleanly (server_close releases
                # the port socket; shutdown stops the serve_forever loop).
 _lock = threading.Lock()
 
-# audit C-4: allowlist of archive roots the fileserver may serve.
+# allowlist of archive roots the fileserver may serve.
 # Populated at start_server() time from the live config's channel
 # output_dirs + Z: archive root + thumbs cache. Requests outside
 # these roots are rejected with 403. Before this, the path check
@@ -64,12 +68,23 @@ def set_allowed_roots(roots: list[str]) -> None:
 
 def _is_under_allowed_root(path: str) -> bool:
     """True if `path` resolves to something under one of the registered
-    allowed roots. If no allowlist is set (dev/demo mode), returns
-    True — backward-compatible fallback so the app still works
-    before roots are wired in.
+    allowed roots.
+
+    empty allowlist now FAILS CLOSED (returns False).
+    Previously returned True as a "backward-compatible fallback" — but
+    there's a real startup race where the server binds before
+    set_allowed_roots() runs, and any local process could read any file
+    on disk through /file/... during that window. Fail-closed eliminates
+    the window. main.py must call set_allowed_roots() before relying on
+    the fileserver.
     """
     if not _allowed_roots:
-        return True
+        try:
+            _log.warning("local_fileserver: request before allowlist set — "
+                         "rejecting %r", path)
+        except Exception:
+            pass
+        return False
     try:
         p = _normalize_root(path)
     except Exception:
@@ -122,7 +137,7 @@ class _FileRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400); return None
         if not os.path.isabs(path):
             self.send_error(400); return None
-        # audit C-4: reject requests outside the archive root
+        # reject requests outside the archive root
         # allowlist (set_allowed_roots). Previously a request for
         # /file/C:/Users/*/Documents/*.pdf passed all the other
         # checks. Allowlist empty = fallback allow (backward-compat
@@ -262,7 +277,7 @@ def stop_server() -> None:
         return
     def _close():
         try: httpd.server_close()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
     t = threading.Thread(target=_close, daemon=True)
     t.start()
     t.join(timeout=1.0)

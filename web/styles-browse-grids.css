@@ -1,0 +1,388 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-browse-grids.css — Channel + Video grids in the Browse tab
+
+   Extracted from styles-browse.css (Patch 21, v72.3). Owns:
+     • .channel-grid + .channel-card (Browse landing view)
+     • .video-grid + .video-card (per-channel videos view)
+     • Year + month grouping sections / collapse animations
+     • Sentinel "scroll to load N more" lazy-load marker
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Channel grid (landing) */
+.channel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+}
+/* Shared "loading…" placeholder rendered inside a grid container before
+   the first real render. The grid renderers all do `el.innerHTML = ""`
+   on their first call, so this gets removed automatically — no JS
+   cleanup needed. Spans the whole row in CSS grid contexts via
+   `grid-column: 1 / -1` so it stays centered regardless of how many
+   columns the grid auto-fills to. */
+.grid-loading {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 80px 20px;
+  color: var(--c-dim);
+  font-size: 13px;
+}
+.grid-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.08);
+  border-top-color: rgba(255, 255, 255, 0.55);
+  border-radius: 50%;
+  animation: grid-spin 0.8s linear infinite;
+}
+@keyframes grid-spin {
+  to { transform: rotate(360deg); }
+}
+/* Loading row inside the Recent list table — no zebra striping, no
+   bottom border, transparent background so it reads as a placeholder
+   rather than a real row. */
+.recent-table tr.grid-loading-row td {
+  border-bottom: none;
+  background: transparent;
+}
+/* YouTube-style card: banner fills the card (lazy-loaded <img>), circular
+   PFP overlaps bottom-left, name + stats in a dark gradient overlay. */
+.channel-card {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  /* Border-color only on hover \u2014 the old `transform: translateY(-2px)`
+     forced Chrome/WebView2 to keep a GPU compositor layer for every
+     card, which destroyed scroll perf once the grid got big enough
+     (100+ cards). Border-color is cheap: one repaint, no layers. */
+  transition: border-color 0.12s;
+  /* Scroll perf, part 2: `content-visibility: auto` lets the browser
+     skip rendering off-screen cards entirely. `contain-intrinsic-size`
+     is tuned to the real card height at the grid's 260px min-width
+     (260 / 16 * 9 = ~146 incl. border), so cards entering/leaving
+     the viewport don't relayout. `will-change: auto` explicitly tells
+     the browser NOT to speculatively promote anything. */
+  content-visibility: auto;
+  contain-intrinsic-size: 290px 168px;
+  contain: layout paint style;
+  will-change: auto;
+}
+.channel-card:hover {
+  border-color: var(--c-accent);
+}
+/* Banner image (<img loading="lazy">) fills the card. */
+.channel-card-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+/* Big first-letter watermark when no banner AND no avatar exists. */
+.channel-letter {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 58px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.92);
+  letter-spacing: -1.5px;
+  text-shadow: 0 3px 12px rgba(0, 0, 0, 0.55);
+  z-index: 1;
+  pointer-events: none;
+}
+/* Bottom overlay: gradient + space for the name + stats. */
+.channel-card-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 28px 14px 10px 78px; /* left pad makes room for the avatar */
+  background: linear-gradient(180deg,
+    rgba(0,0,0,0) 0%,
+    rgba(0,0,0,0.55) 45%,
+    rgba(0,0,0,0.85) 100%);
+  z-index: 2;
+  pointer-events: none;
+}
+.channel-card-name {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+  margin-bottom: 2px;
+}
+.channel-card-meta {
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 12px;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Circular profile-picture overlay (bottom-left, YouTube-style). */
+.channel-avatar {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
+  background-color: var(--c-surface);
+  border: 2px solid rgba(0, 0, 0, 0.55);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.55);
+  z-index: 3;
+  pointer-events: none;
+}
+
+/* Video grid (inside a channel) */
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+/* When grouping by year, the top-level grid becomes a vertical stack of
+   <section>s, each holding its own inner grid of cards. */
+.video-grid.video-grid-grouped {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.video-grid-year-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.video-grid-year-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 4px 4px 2px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--c-text);
+  border-bottom: 1px solid var(--c-border);
+  cursor: pointer;
+  user-select: none;
+}
+.video-grid-year-head:hover .vgy-label {
+  color: var(--c-accent);
+}
+.video-grid-year-head .vgy-arrow {
+  color: var(--c-dim);
+  font-size: 11px;
+  display: inline-block;
+  width: 10px;
+}
+.video-grid-year-head .vgy-count {
+  color: var(--c-dim);
+  font-weight: 400;
+  font-size: 11.5px;
+  margin-left: auto;
+}
+.video-grid-year-inner {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+/* Lazy-load sentinel shown at the end of a partially-rendered grid */
+.video-grid-sentinel {
+  grid-column: 1 / -1;
+  padding: 20px 0;
+  text-align: center;
+  color: var(--c-dim);
+  font-size: 12px;
+  font-style: italic;
+  letter-spacing: 0.2px;
+}
+.video-grid-year-section.collapsed .video-grid-year-inner {
+  display: none;
+}
+
+/* Month sub-sections (nested inside a year section when Group by
+   month is checked). Indented slightly + smaller header so they read
+   as a sub-level beneath the year header. */
+.video-grid-month-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  grid-column: 1 / -1;
+  margin-left: 12px;
+}
+.video-grid-month-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 4px 2px 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--c-dim);
+  border-bottom: 1px dashed var(--c-border);
+  cursor: pointer;
+  user-select: none;
+}
+.video-grid-month-head:hover .vgy-label {
+  color: var(--c-accent);
+}
+/* audit E-30: target the month section's OWN inner wrapper, not
+   the year wrapper (a month section never contains a year-inner).
+   Both class names are covered defensively so whichever the HTML
+   actually uses gets hidden. */
+.video-grid-month-section.collapsed .video-grid-month-inner,
+.video-grid-month-section.collapsed .video-grid-year-inner {
+  display: none;
+}
+.video-card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  /* audit E-29: remove `transform` from the transition so :hover
+     doesn't trigger a layer thrash across dense grids. Same perf
+     trap called out in .channel-card (removed there). */
+  transition: border-color 0.12s;
+  display: flex;
+  flex-direction: column;
+}
+.video-card:hover {
+  /* audit E-29: removed transform:translateY(-2px) — each hover
+     promoted the card to its own composite layer, which on 100+
+     cards created a cascade of repaints and dropped the framerate
+     during fast cursor movement. Border-color change is enough
+     visual feedback. */
+  border-color: var(--c-accent);
+}
+.video-thumb {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: linear-gradient(135deg, #1a1d22 0%, #2a2e36 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-dim);
+  font-size: 34px;
+  overflow: hidden;
+}
+.video-thumb-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.video-thumb .video-duration-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+/* "Removed from YT" badge — corner pill on tiles where the uploader
+   deleted/privated/unlisted the video since download. Local file is
+   still playable; we just can't refresh metadata for it. */
+.video-thumb .video-removed-badge {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  background: rgba(165, 28, 28, 0.92);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  padding: 2px 6px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  z-index: 2;
+}
+/* Whole-card visual treatment for removed videos — desaturated +
+   slight dim so the user can scan the grid and spot them quickly.
+   Hover restores full opacity so the card is still browseable. */
+.video-card.video-card-removed .video-thumb {
+  filter: grayscale(0.55) brightness(0.78);
+}
+.video-card.video-card-removed:hover .video-thumb {
+  filter: grayscale(0) brightness(1);
+}
+.video-card.video-card-removed .video-card-title {
+  color: #c4a8a8;
+}
+.video-card-body {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.video-card-title {
+  color: var(--c-text);
+  font-size: 12.5px;
+  line-height: 1.3;
+  max-height: 2.6em;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+/* Channel line — sits between title and meta. Slightly dimmer than the
+   title but a shade brighter than the meta so the hierarchy reads
+   title > channel > meta (YouTube-like). Single-line with ellipsis so
+   very long channel names don't wreck the card height. */
+.video-card-channel {
+  color: var(--c-dim);
+  font-size: 11.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.85;
+}
+.video-card-meta {
+  color: var(--c-dim);
+  font-size: 11px;
+}
+
+/* Watch view — layout must fit in the .browse-view area (no overall
+   page scroll). requirement: "the spoken word ALWAYS needs to
+   be on the first page without the user having to scroll down ...
+   the transcript needs to scroll UP". To achieve that we need to
+   constrain the whole Watch layout to the viewport height and let
+   only the transcript pane scroll internally.
+
+   Chain explained:
+   - `#view-watch` (sibling of view-channels etc.) gets `height:100%`
+     and `overflow:hidden` so it exactly fills `.browse-view` instead
+     of growing with content. When this view isn't active, its inline
+     `style="display:none"` wins and none of the below applies.
+   - `.watch-layout` uses `height:100%` (was `min-height:100%`) so the
+     grid never exceeds its container. `grid-template-rows: 1fr` pins
+     the single row to the available height.
+   - `min-height:0` on the grid items is the standard fix that lets
+     a grid cell shrink below its intrinsic content height so its
+     child's `overflow:auto` kicks in.
+*/
+#view-watch {
+  height: 100%;
+  overflow: hidden;
+}

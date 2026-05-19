@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<!--
+  YT Archiver — single-page UI shell rendered inside pywebview.
+
+  Page structure (top to bottom in the source below):
+    1. <header-strip>     App title + version label
+    2. <tab-row>          Top-level tabs: Subs, Browse, Settings
+                          (Recent used to live here too, now under Browse)
+    3. <main>             Tab panels, only one visible at a time:
+       - #panel-subs         Channel subscriptions table + Sync controls
+       - #panel-browse       Library navigation: Channels grid, Search,
+                             Graph, Bookmarks, Recent. Has its own
+                             left sidebar that swaps the right pane.
+       - #panel-settings     Per-channel + global settings, sync log
+    4. Floating overlays (not in the tab flow):
+       - #welcome-modal      First-launch archive-root picker (modal)
+       - #ask-modal          Generic confirm/prompt modal used by
+                             askConfirm() / askChoice() helpers in app.js
+       - #context-menu       Right-click menu, repurposed per context
+       - .drawer-livestreams Deferred-livestreams drawer slides up
+                             from bottom-right
+       - .mini-log           Tiny "tail of activity" panel docked at the
+                             bottom of every tab so the user always
+                             sees recent log activity
+       - #sync-tasks-popup / #gpu-tasks-popup   Queue popups anchored
+                             to their respective header badges
+    5. <script src="vendor/chart.umd.min.js">  Chart.js for the
+                             Browse > Graph charts
+    6. <script src="logs.js"> + <script src="app.js">  The two JS
+                             files that wire everything together — see
+                             web/app.js header for its section map.
+
+  All styling lives in styles.css. All behavior lives in app.js + logs.js.
+  Python talks to this page via `window.pywebview.api.<method>` (defined
+  by the Api class in main.py) and via `window._logBatch(payload)`
+  which streams log lines in from the backend's LogStreamer.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>YT Archiver</title>
+  <link rel="stylesheet" href="styles.css?v=2" />
+  <link rel="stylesheet" href="styles-settings.css?v=2" />
+  <link rel="stylesheet" href="styles-download-controls.css?v=1" />
+  <link rel="stylesheet" href="styles-logs.css?v=1" />
+  <link rel="stylesheet" href="styles-tabs-data.css?v=1" />
+  <link rel="stylesheet" href="styles-browse.css?v=2" />
+  <link rel="stylesheet" href="styles-browse-grids.css?v=1" />
+  <link rel="stylesheet" href="styles-watch.css?v=1" />
+  <link rel="stylesheet" href="styles-dialogs.css?v=1" />
+</head>
+<body>
+
+  <!-- Header strip -->
+  <div class="header-strip">
+    <span class="header-title">YT ARCHIVER</span>
+    <span class="header-version" id="header-version">loading&hellip;</span>
+  </div>
+
+  <!-- Tab row. Recent was previously a top-level tab (hangover from an
+       earlier draft) but users wanted it moved under Browse alongside
+       Channels / Search / Graph / Bookmarks so all "library navigation"
+       lives in one place. See the `panel-browse` sidebar below for the
+       new location. -->
+  <div class="tab-row">
+    <div class="tab active" data-tab="download">Download</div>
+    <div class="tab" data-tab="subs">Subs</div>
+    <div class="tab browse-tab" data-tab="browse">Browse</div>
+    <div class="tab settings-tab" data-tab="settings">Settings</div>
+  </div>
+
+  <!-- @include partials/tab-download.html -->
+
+  <!-- @include partials/tab-subs.html -->
+
+  <!-- Recent tab -->
+  <!-- (Recent tab moved into Browse as a submode &mdash; see `view-recent`
+       inside panel-browse below.) -->
+
+  <!-- @include partials/tab-settings.html -->
+
+  <!-- @include partials/tab-browse.html -->
+
+  <!-- @include partials/popovers.html -->
+
+  <!-- @include partials/dialogs.html -->
+
+  <!-- @include partials/modals.html -->
+
+
+  <!-- Chart.js for Browse > Graph sub-mode (vendored locally &mdash; no CDN) -->
+  <script src="vendor/chart.umd.min.js"></script>
+  <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
+  <script src="util.js?v=1"></script>
+  <script src="bridge.js?v=1"></script>
+  <script src="browseState.js?v=1"></script>
+  <script src="toasts.js?v=1"></script>
+  <script src="modals.js?v=1"></script>
+  <script src="contextMenu.js?v=1"></script>
+  <script src="dropdown.js?v=1"></script>
+  <script src="chrome.js?v=1"></script>
+  <script src="logContextMenu.js?v=1"></script>
+  <script src="shortcuts.js?v=1"></script>
+  <script src="graphTab.js?v=1"></script>
+  <script src="queueBlink.js?v=1"></script>
+  <script src="watchActions.js?v=1"></script>
+  <script src="editChannel.js?v=1"></script>
+  <script src="browseSearch.js?v=1"></script>
+  <script src="browseContextMenus.js?v=1"></script>
+  <script src="columnSort.js?v=1"></script>
+  <script src="recentContextMenu.js?v=1"></script>
+  <script src="downloadUrl.js?v=1"></script>
+  <script src="downloadDragDrop.js?v=1"></script>
+  <script src="clearButton.js?v=1"></script>
+  <script src="autoSync.js?v=1"></script>
+  <script src="liveDrawer.js?v=1"></script>
+  <script src="columnWidth.js?v=1"></script>
+  <script src="syncSubbed.js?v=1"></script>
+  <script src="indexControls.js?v=2"></script>
+  <script src="settingsInfra.js?v=1"></script>
+  <script src="metadataTab.js?v=1"></script>
+  <script src="settingsTab.js?v=2"></script>
+  <script src="driftScanDialog.js?v=1"></script>
+  <script src="compressDryRunDialog.js?v=1"></script>
+  <script src="repairCaptionsDialog.js?v=1"></script>
+  <script src="punctRestoreDialog.js?v=1"></script>
+  <script src="aboutDialog.js?v=1"></script>
+  <script src="diagnosticsDialog.js?v=1"></script>
+  <script src="manualTranscribe.js?v=1"></script>
+  <script src="queuePopovers.js?v=1"></script>
+  <script src="browseView.js?v=1"></script>
+  <script src="browseContent.js?v=1"></script>
+  <script src="autorunHistory.js?v=1"></script>
+  <script src="logMode.js?v=1"></script>
+  <script src="scanArchive.js?v=1"></script>
+  <script src="activityLogVis.js?v=1"></script>
+  <script src="bookmarks.js?v=1"></script>
+  <script src="seedLogs.js?v=1"></script>
+  <script src="missingFolders.js?v=1"></script>
+  <script src="redownloadSampleModal.js?v=1"></script>
+  <script src="appDialogs.js?v=1"></script>
+  <script src="logs.js?v=34"></script>
+  <script src="queueRender.js?v=1"></script>
+  <script src="tables.js?v=1"></script>
+  <script src="browseGrids.js?v=1"></script>
+  <script src="watchView.js?v=1"></script>
+  <script src="uxPolish.js?v=1"></script>
+  <script src="removeChannel.js?v=1"></script>
+  <script src="queuePending.js?v=1"></script>
+  <script src="refreshSizes.js?v=1"></script>
+  <script src="smallInits.js?v=1"></script>
+  <script src="app.js?v=79"></script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+  <!-- Sync Tasks popover (button-anchored) -->
+  <div class="queue-popover" id="popover-sync-tasks" role="dialog" aria-label="Sync Tasks">
+    <div class="queue-popover-header">
+      <span class="queue-popover-title">Sync Tasks</span>
+      <div class="spacer"></div>
+      <label class="queue-auto-wrap"><input type="checkbox" id="sync-auto-checkbox" /><span>Auto</span></label>
+    </div>
+    <div class="queue-popover-body" id="sync-tasks-body">
+      <div class="queue-empty">No sync tasks queued.</div>
+    </div>
+    <div class="queue-popover-footer" id="sync-tasks-footer">
+      <button class="queue-btn queue-btn-pause" id="btn-pause-sync-queue">
+        <svg viewBox="0 0 14 14" fill="currentColor"><rect x="3" y="2" width="3" height="10" rx="0.5"/><rect x="8" y="2" width="3" height="10" rx="0.5"/></svg>
+        <span>Pause</span>
+      </button>
+      <button class="queue-btn queue-btn-cancel" id="btn-cancel-sync-queue">
+        <svg viewBox="0 0 14 14" fill="currentColor"><circle cx="7" cy="7" r="6" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M4 7h6" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span>Cancel</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- GPU Tasks popover -->
+  <div class="queue-popover" id="popover-gpu-tasks" role="dialog" aria-label="GPU Tasks">
+    <div class="queue-popover-header">
+      <span class="queue-popover-title">GPU Tasks</span>
+      <div class="spacer"></div>
+      <label class="queue-auto-wrap"><input type="checkbox" id="gpu-auto-checkbox" /><span>Auto</span></label>
+    </div>
+    <!-- Next-job model selector removed 2026-04-23 &mdash; the default
+         whisper model is set in Settings, mid-queue swap is overkill
+         for the popover. Element kept commented for future reference
+         in case the per-job swap feature is resurrected.
+         <div class="gpu-popover-modelswap" style="padding:4px 10px;display:flex;align-items:center;gap:6px;">
+           <label for="gpu-model-swap" class="edit-dim" style="font-size:11px;">Next-job model:</label>
+           <select class="ctl-select" id="gpu-model-swap" style="flex:1;">
+             <option value="tiny">tiny (fastest)</option>
+             <option value="small" selected>small</option>
+             <option value="medium">medium</option>
+             <option value="large-v3">large-v3 (best)</option>
+           </select>
+         </div>
+    -->
+
+    <div class="queue-popover-body" id="gpu-tasks-body">
+      <div class="queue-empty">No GPU tasks queued.</div>
+    </div>
+    <div class="queue-popover-footer">
+      <button class="queue-btn queue-btn-pause" id="btn-pause-gpu-queue">
+        <svg viewBox="0 0 14 14" fill="currentColor"><rect x="3" y="2" width="3" height="10" rx="0.5"/><rect x="8" y="2" width="3" height="10" rx="0.5"/></svg>
+        <span>Pause</span>
+      </button>
+      <button class="queue-btn queue-btn-cancel" id="btn-cancel-gpu-queue">
+        <svg viewBox="0 0 14 14" fill="currentColor"><circle cx="7" cy="7" r="6" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M4 7h6" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span>Cancel</span>
+      </button>
+      <div class="spacer"></div>
+      <button class="icon-btn-slim" id="btn-manual-transcribe"
+              title="Manual Transcription">&#128193;</button>
+    </div>
+  </div>
+

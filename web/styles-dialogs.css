@@ -1,0 +1,458 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-dialogs.css — Dark dialogs, toasts, redownload modal
+
+   Extracted from styles.css (Patch 18, v72.0). Contains:
+     • Dark askquestion-style dialog system (#ask-modal + variants)
+     • Toast notifications (top-right popup queue)
+     • Redownload-10-sample confirm modal
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ═══ Dark askquestion dialogs ═══ */
+.askq-backdrop {
+  position: fixed;
+  inset: 0;
+  /* 0.6 was heavy — felt like a security warning when most dialogs
+     are routine confirms. Reduced to 0.45 so the dialog still pops
+     against the dimmed bg without burying the underlying UI.
+     UI sweep 2026-05-14. */
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9500;
+  animation: askq-fade 0.12s ease-out;
+}
+.askq-dialog {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  min-width: 360px;
+  max-width: 520px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.7);
+  animation: askq-scale 0.14s ease-out;
+}
+.askq-header {
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.askq-body {
+  padding: 14px 16px;
+  color: var(--c-text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+/* Text-input field in askTextInput dialog */
+.askq-input {
+  margin: 0 16px 14px;
+  padding: 6px 10px;
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  border-radius: 3px;
+}
+.askq-input:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+.askq-buttons {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  row-gap: 6px;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.15);
+}
+/* Two-row layout: actions on top (all green / primary by default),
+   Cancel alone on the bottom (red / danger). Splitting them keeps
+   the "go" affordances cleanly grouped and prevents Cancel from
+   wrapping into a row with action buttons at narrow dialog widths.
+   Flagged via UX feedback: a 4-button dialog was rendering with
+   Cancel stranded next to two actions while the third wrapped. */
+.askq-buttons-actions {
+  padding: 10px 14px 6px;
+  border-top: 1px solid var(--c-border);
+}
+.askq-buttons-cancel {
+  padding: 0 14px 10px;
+}
+/* Inline (single-row) variant: used when a dialog has just one action
+   button + Cancel. Pads top and bottom so the row sits balanced inside
+   the footer instead of leaving a dead strip below it. */
+.askq-buttons-inline {
+  padding: 10px 14px;
+}
+.askq-buttons .btn {
+  min-width: 84px;
+  padding: 6px 14px;
+  font-size: 12px;
+}
+.askq-buttons .btn-primary {
+  background: var(--c-sync);
+  border-color: var(--c-sync-border);
+  color: var(--c-text);
+}
+.askq-buttons .btn-primary:hover { background: var(--c-sync-hover); }
+.askq-buttons .btn-danger {
+  background: var(--c-cancel);
+  border-color: #7e2020;
+  color: var(--c-text);
+}
+.askq-buttons .btn-danger:hover { background: #7e2020; }
+@keyframes askq-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes askq-scale {
+  from { transform: scale(0.96); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* Read-only disk stats row in Edit channel panel */
+.edit-diskstats {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 4px 2px;
+  font-size: 11px;
+  color: var(--c-dim);
+  font-family: var(--font-log);
+}
+.edit-diskstats .ds-label { color: var(--c-accent); }
+.edit-diskstats .ds-val { color: var(--c-text); font-weight: 600; }
+.edit-diskstats .ds-unit { color: var(--c-dim); margin-right: 2px; }
+.edit-diskstats .ds-sep { color: var(--c-border); }
+
+/* Subs header filter input */
+.subs-filter-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 170px;
+}
+.subs-filter-wrap .search-icon {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--c-dim);
+  font-size: 11px;
+  pointer-events: none;
+}
+.subs-filter-input {
+  flex: 1 1 auto;
+  font-size: 11.5px;
+  padding: 3px 22px 3px 22px;
+  height: 24px;
+}
+/* Clear (×) button — appears when the filter has text, mirrors the
+   modern-app pattern of an inline reset affordance. */
+.subs-filter-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: 0;
+  color: var(--c-dim);
+  font-size: 14px;
+  line-height: 1;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.1s, color 0.1s;
+}
+.subs-filter-clear:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--c-text);
+}
+
+/* Inline Sync button on each row */
+.subs-table td.col-action {
+  text-align: center;
+  padding: 1px 4px;
+}
+.row-sync-btn {
+  background: var(--c-sync);
+  border: 1px solid var(--c-sync-border);
+  color: var(--c-text);
+  padding: 2px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.subs-table tr:hover .row-sync-btn { opacity: 1; }
+.row-sync-btn:hover { background: var(--c-sync-hover); }
+
+/* Deferred-livestreams drawer (Download tab) */
+.deferred-livestreams {
+  margin: 2px 14px 6px;
+  padding: 4px 8px;
+  background: rgba(245, 166, 35, 0.06);
+  border: 1px solid #6b3a10;
+  border-radius: 2px;
+  font-size: 11.5px;
+}
+.deferred-livestreams[hidden] { display: none; }
+.deferred-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--c-log-sum);
+}
+.deferred-label { font-weight: 600; }
+.deferred-hint { color: var(--c-dim); font-size: 11px; }
+.deferred-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 3px;
+  color: var(--c-log-sum);
+  font-family: var(--font-log);
+  font-size: 11px;
+}
+.deferred-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.deferred-row button {
+  background: transparent;
+  border: none;
+  color: var(--c-dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 3px;
+}
+.deferred-row button:hover { color: var(--c-log-red); }
+.deferred-row button.deferred-ignore {
+  /* "Ignore" is a stronger action than × (drop) — permanently adds
+     to the skip set. Make it a touch more prominent than the tiny
+     × glyph without looking destructive. */
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--c-dim);
+  color: var(--c-text);
+}
+.deferred-row button.deferred-ignore:hover {
+  color: var(--c-log-red);
+  border-color: var(--c-log-red);
+}
+
+/* Retry dropdown wrapper — positions the menu beneath the button. */
+.deferred-retry-wrap {
+  position: relative;
+  display: inline-block;
+}
+.deferred-retry-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  background: var(--c-card, #1a1b1f);
+  border: 1px solid var(--c-border, #2a2b30);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 50;
+  min-width: 120px;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+}
+.deferred-retry-menu[hidden] { display: none; }
+.deferred-retry-menu button {
+  background: transparent;
+  border: none;
+  color: var(--c-text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 5px 10px;
+  text-align: left;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.deferred-retry-menu button:hover {
+  background: var(--c-hover, #2a2b30);
+}
+
+/* Drag-hover highlight when dragging a URL onto the Download tab */
+.tab-panel.drag-hover {
+  outline: 2px dashed var(--c-log-green);
+  outline-offset: -10px;
+}
+
+/* Column resize handle (drag right edge of header to resize).
+   Shows a thin always-visible divider so users can SEE where to grab —
+   User feedback: "very hard to see where I'm supposed to 'grab' to
+   change their width". Widens + brightens on hover. */
+.col-resizer {
+  position: absolute;
+  right: -4px; /* sticks 4px into neighbor for easier grab */
+  top: 4px;
+  bottom: 4px;
+  width: 8px;
+  cursor: col-resize;
+  user-select: none;
+  z-index: 5;
+  /* Thin vertical bar in the middle of the grab area */
+  background:
+    linear-gradient(90deg,
+      transparent 0%,
+      transparent 45%,
+      var(--c-border) 45%,
+      var(--c-border) 55%,
+      transparent 55%,
+      transparent 100%);
+  opacity: 0.8;
+  transition: background 0.1s, opacity 0.1s;
+}
+.col-resizer:hover {
+  opacity: 1;
+  background:
+    linear-gradient(90deg,
+      rgba(96, 160, 255, 0.15) 0%,
+      rgba(96, 160, 255, 0.15) 35%,
+      var(--c-accent) 35%,
+      var(--c-accent) 65%,
+      rgba(96, 160, 255, 0.15) 65%,
+      rgba(96, 160, 255, 0.15) 100%);
+}
+/* Vertical separators on the header row only (data rows stay clean). */
+.subs-table thead th + th,
+.recent-table thead th + th {
+  border-left: 1px solid var(--c-border);
+}
+
+/* ═══ Toast notifications ═══ */
+#toast-root {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 10000;
+  pointer-events: none;
+}
+.toast {
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-left: 3px solid var(--c-accent);
+  color: var(--c-text);
+  font-size: 12px;
+  padding: 10px 14px;
+  border-radius: 3px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  pointer-events: auto;
+  max-width: 380px;
+  animation: toast-in 0.18s ease-out;
+}
+.toast.ok { border-left-color: var(--c-log-green); }
+.toast.error { border-left-color: var(--c-log-red); }
+.toast.warn { border-left-color: var(--c-log-sum); }
+@keyframes toast-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* ── Dark modal used for redownload "10-sample" confirm popup ── */
+.yt-modal {
+  position: fixed; inset: 0; z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+}
+.yt-modal[hidden] { display: none; }
+.yt-modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.55);
+}
+.yt-modal-body {
+  position: relative;
+  background: var(--c-raised);
+  color: var(--c-text);
+  border: 1px solid #2a2d32;
+  border-radius: 8px;
+  padding: 22px 26px;
+  min-width: 380px;
+  max-width: 500px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+.yt-modal-title {
+  font-size: 16px; font-weight: 600; margin-bottom: 4px;
+}
+.yt-modal-sub {
+  font-size: 12px; color: var(--c-accent); margin-bottom: 14px;
+}
+.yt-modal-stats {
+  font-size: 15px; font-weight: 600;
+  color: var(--c-log-green);
+  text-align: center;
+  padding: 10px 0;
+  margin-bottom: 12px;
+}
+.yt-modal-stats.larger { color: #e0c048; }
+.yt-modal-countdown {
+  font-size: 11px; color: var(--c-accent);
+  text-align: center; margin-bottom: 14px;
+}
+.yt-modal-buttons {
+  display: flex; gap: 8px; justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.yt-modal-btn {
+  background: #26292d; color: var(--c-text);
+  border: 1px solid #33363a;
+  border-radius: 5px;
+  padding: 7px 14px; font-size: 12px;
+  cursor: pointer;
+}
+.yt-modal-btn:hover { background: #30343a; }
+.yt-modal-btn.primary {
+  background: #2e5a3c; border-color: #3b7049;
+}
+.yt-modal-btn.primary:hover { background: #37684a; }
+.yt-modal-btn.danger {
+  background: #5a2e2e; border-color: #703b3b;
+}
+.yt-modal-btn.danger:hover { background: #6a3838; }
+.yt-modal-res-picker {
+  margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid #2a2d32;
+}
+.yt-modal-res-options {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 8px 14px; margin: 10px 0 14px;
+  font-size: 12px;
+}
+.yt-modal-res-options label {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+}
+/* Inline code style for the welcome modal's path example. */
+.yt-modal-body code {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  color: var(--c-text);
+}
+.yt-modal-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.yt-modal-btn:disabled:hover {
+  background: #26292d;
+}

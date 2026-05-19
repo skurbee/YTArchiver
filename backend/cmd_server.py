@@ -27,38 +27,106 @@ from __future__ import annotations
 import http.server as _http_server
 import json
 import os
+import secrets
 import socket
 import threading
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from .log import get_logger
+
+_log = get_logger(__name__)
+
+
+# generate a per-install auth token. Same-machine
+# trust boundary was previously implicit — any local process could POST
+# to /cmd/retranscribe. Now requests must echo X-Auth-Token (or include
+# ?token=... in the URL). Token persisted to %APPDATA%\YTArchiver\
+# cmd_token so external tools (ArchivePlayer) can read it. GET endpoints
+# (/cmd/ping, /cmd/gpu-status) remain unauthenticated since they're
+# pure read-only liveness/status. POST endpoints require the token.
+_TOKEN_FILE_NAME = "cmd_token"
+_AUTH_TOKEN: str = ""
+
+
+def _appdata_dir() -> Path:
+    """Best-effort YTArchiver appdata dir; falls back to cwd."""
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if base:
+        p = Path(base) / "YTArchiver"
+    else:
+        p = Path.cwd() / ".ytarchiver"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return p
+
+
+def _load_or_create_token() -> str:
+    """Read the cmd auth token, generating one on first launch."""
+    global _AUTH_TOKEN
+    if _AUTH_TOKEN:
+        return _AUTH_TOKEN
+    tok_path = _appdata_dir() / _TOKEN_FILE_NAME
+    try:
+        if tok_path.is_file():
+            t = tok_path.read_text(encoding="utf-8").strip()
+            if t and len(t) >= 16:
+                _AUTH_TOKEN = t
+                return _AUTH_TOKEN
+    except OSError as e:
+        _log.debug("swallowed: %s", e)
+    # Generate fresh
+    _AUTH_TOKEN = secrets.token_urlsafe(32)
+    try:
+        tok_path.write_text(_AUTH_TOKEN, encoding="utf-8")
+    except OSError as e:
+        _log.debug("swallowed: %s", e)
+    return _AUTH_TOKEN
+
+
+def get_auth_token() -> str:
+    """Return the active cmd auth token (creates it if needed).
+    Callers in-process can pass this to legitimate POSTs."""
+    return _load_or_create_token()
+
+
+def get_token_path() -> str:
+    """Return the absolute path to the token file (for external
+    tools that need to read it)."""
+    return str(_appdata_dir() / _TOKEN_FILE_NAME)
 
 
 _CMD_PORT = 9855
-# audit C-5: the previous default of `os.environ.get(...)` meant a
+# the previous default of `os.environ.get(...)` meant a
 # legacy `YTARCHIVER_CMD_BIND=0.0.0.0` in the user's env would
 # silently re-open the LAN binding even after the 2026-04-23 fix.
 # Require both the env-var AND an explicit opt-in flag
 # `YTARCHIVER_CMD_ALLOW_LAN=1`. Without the second flag, non-
 # loopback bind addresses are ignored and we fall back to
-# loopback. Scott can set both if he needs the old cross-host
-# integration (ArchivePlayer on another PC).
+# loopback. Set both for cross-host integration on a LAN
+# (companion tool running on another PC).
 _env_bind = os.environ.get("YTARCHIVER_CMD_BIND", "127.0.0.1")
 _allow_lan = os.environ.get("YTARCHIVER_CMD_ALLOW_LAN", "") == "1"
 _is_loopback = _env_bind in ("127.0.0.1", "localhost", "::1")
 _CMD_BIND = _env_bind if (_is_loopback or _allow_lan) else "127.0.0.1"
 # If the user asked for LAN binding without the explicit opt-in,
-# print a one-line warning so they know why the effective bind is
-# loopback.
+# log a one-line warning so they know why the effective bind is loopback.
+# print → logger (PyInstaller --noconsole drops stdout).
 if _env_bind != "127.0.0.1" and not _allow_lan:
-    print(f"[cmd] ignoring YTARCHIVER_CMD_BIND={_env_bind} — set "
-          "YTARCHIVER_CMD_ALLOW_LAN=1 to confirm LAN exposure.")
+    _log.warning("ignoring YTARCHIVER_CMD_BIND=%s — set "
+                 "YTARCHIVER_CMD_ALLOW_LAN=1 to confirm LAN exposure.",
+                 _env_bind)
 
-# ArchivePlayer companion integration note: if the ArchivePlayer
-# project ever moves to a different host it will need to either
-# (a) run on the same machine (loopback) or (b) set both env vars
-# AND add its own auth header / token. See Scott's audit C-5 notes.
+# Companion-tool integration note: if a companion tool ever moves
+# to a different host it will need to either (a) run on the same
+# machine (loopback) or (b) set both env vars AND add its own auth
+# header / token.
 
 
-_HANDLERS: Dict[str, Dict[str, Callable]] = {"get": {}, "post": {}}
+_HANDLERS: dict[str, dict[str, Callable]] = {"get": {}, "post": {}}
 _STATE = {"started": False, "app_version": "", "srv": None, "thread": None}
 
 
@@ -68,7 +136,7 @@ def register_handler(method: str, path: str, fn: Callable):
     _HANDLERS[method.lower()][path] = fn
 
 
-def _read_body(request) -> Dict[str, Any]:
+def _read_body(request) -> dict[str, Any]:
     try:
         length = int(request.headers.get("Content-Length") or 0)
     except (TypeError, ValueError):
@@ -122,8 +190,8 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
             self.wfile.write(payload)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     def do_OPTIONS(self):
         try:
@@ -134,8 +202,8 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     def do_GET(self):
         fn = _HANDLERS["get"].get(self.path)
@@ -154,7 +222,23 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = _read_body(self)
-        fn = _HANDLERS["post"].get(self.path)
+        # POST endpoints require the X-Auth-Token
+        # header (or ?token=... query param). Generated per-install
+        # token at %APPDATA%\YTArchiver\cmd_token. Without this any
+        # local process could trigger retranscribe jobs.
+        expected = _load_or_create_token()
+        supplied = self.headers.get("X-Auth-Token", "") or ""
+        if not supplied and "?" in (self.path or ""):
+            try:
+                from urllib.parse import parse_qs, urlparse
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = (qs.get("token") or [""])[0]
+            except Exception:
+                supplied = ""
+        if not supplied or not secrets.compare_digest(supplied, expected):
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        fn = _HANDLERS["post"].get(self.path.split("?", 1)[0])
         if fn is None:
             self._json(404, {"ok": False, "error": "unknown_command",
                              "path": self.path})
@@ -182,16 +266,18 @@ def _port_busy(bind: str, port: int) -> bool:
         return False
     finally:
         try: s.close()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
 
 
 def start_server(app_version: str = "",
-                 on_log: Optional[Callable[[str], None]] = None) -> bool:
+                 on_log: Callable[[str], None] | None = None) -> bool:
     """Start the HTTP command server. Idempotent; returns True on a fresh
     start, False if already running or the port is busy."""
     if _STATE.get("started"):
         return False
     _STATE["app_version"] = app_version
+    # ensure auth token exists before first request.
+    _load_or_create_token()
     # Register built-in handlers (ping + gpu-status). Callers can add more.
     register_handler("get", "/cmd/ping", lambda _b: {
         "version": _STATE.get("app_version", ""),
@@ -203,12 +289,12 @@ def start_server(app_version: str = "",
     except OSError as e:
         if on_log:
             try: on_log(f"[cmd] Port {_CMD_PORT} busy \u2014 viewer integration disabled ({e})")
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         return False
     _STATE["srv"] = srv
     def _serve():
         try: srv.serve_forever()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
     t = threading.Thread(target=_serve, name="ytarchiver-cmd",
                          daemon=True)
     t.start()
@@ -219,8 +305,8 @@ def start_server(app_version: str = "",
             on_log(f"[cmd] Viewer-integration receiver listening on "
                    f"{_CMD_BIND}:{_CMD_PORT}"
                    f"{' (LAN-accessible)' if _CMD_BIND == '0.0.0.0' else ' (localhost only)'}")
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     return True
 
 
@@ -239,7 +325,7 @@ def stop_server():
         return
     def _close():
         try: srv.server_close()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
     import threading as _th
     t = _th.Thread(target=_close, daemon=True)
     t.start()

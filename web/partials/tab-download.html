@@ -1,0 +1,199 @@
+  <!-- Download tab -->
+  <div class="tab-panel active" id="panel-download">
+
+    <div class="controls-area">
+
+      <!-- Row 1: Video URL -->
+      <div class="controls-row">
+        <label class="ctl-label">Video URL:</label>
+        <!-- bug W-2: bind the URL input to a <datalist> populated from
+             url_history so users get autocomplete of recent downloads.
+             The backend api.url_history() returns the list. -->
+        <input type="text" class="ctl-input" id="url-input"
+               list="url-history-list"
+               placeholder="https://www.youtube.com/watch?v=..." />
+        <datalist id="url-history-list"></datalist>
+        <!-- "▶ Download" appears only when a YouTube URL is typed/pasted.
+             Matches YTArchiver.py:19706 download_btn + _validate_download_btn. -->
+        <button class="btn btn-primary btn-thin" id="btn-download-single"
+                title="Download the video from the URL above" hidden>&#9654; Download</button>
+      </div>
+      <!-- Persistent inline URL error text (YTArchiver.py:17060 url_error_var).
+           Stays visible until URL is valid or cleared &mdash; replaces transient toast. -->
+      <div class="url-error-row" id="url-error-row" hidden>
+        <span class="url-error-text" id="url-error-text"></span>
+      </div>
+
+      <!-- Video options panel (YTArchiver.py:4317-4454). Appears only when
+           a video URL is in the field. Lets user override save dir, resolution,
+           filename shape, and mtime behavior for one-off downloads. -->
+      <fieldset class="video-opts-panel" id="video-opts-panel" hidden>
+        <legend>Video options</legend>
+        <div class="vo-row">
+          <label class="vo-label">Save to:</label>
+          <input type="text" class="vo-input" id="vo-save-to"
+                 placeholder="(use default download folder)" />
+          <button class="btn btn-ghost btn-thin" id="vo-save-to-browse">Browse</button>
+        </div>
+        <div class="vo-row">
+          <label class="vo-label">Resolution:</label>
+          <select class="vo-select" id="vo-resolution">
+            <option value="best">Best available</option>
+            <option value="2160">2160p (4K)</option>
+            <option value="1440">1440p</option>
+            <option value="1080" selected>1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+            <option value="360">360p</option>
+          </select>
+        </div>
+        <div class="vo-row vo-row-checks">
+          <label class="vo-check">
+            <input type="checkbox" id="vo-date-file" checked />
+            <span>Date file to YT upload date</span>
+          </label>
+          <label class="vo-check">
+            <input type="checkbox" id="vo-add-date" />
+            <span>Add date to filename</span>
+          </label>
+        </div>
+        <div class="vo-row">
+          <label class="vo-check">
+            <input type="checkbox" id="vo-use-yt-title" checked />
+            <span>Use YT title as filename</span>
+          </label>
+          <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
+                 placeholder="Custom filename" disabled />
+        </div>
+      </fieldset>
+
+      <!-- Channel nudge: when a channel URL is pasted but not in subs, show
+           a handoff button to pre-populate the Subs Add-Channel form.
+           Mirrors YTArchiver.py:4458 channel_nudge_panel. -->
+      <div class="channel-nudge-panel" id="channel-nudge-panel" hidden>
+        <span class="channel-nudge-icon">&#x1F4FA;</span>
+        <span class="channel-nudge-text">Channel URL detected.</span>
+        <button class="btn btn-primary btn-thin" id="btn-channel-nudge-add">&#8594; Add to saved channels</button>
+      </div>
+
+      <!-- Row 2: Main actions + quick-action icons + status -->
+      <div class="controls-row">
+        <!-- data-needs-ready: greyed until Stage 1 of startup completes.
+             window._setReady(true) enables all `[data-needs-ready]` buttons. -->
+        <button class="btn btn-sync" id="btn-sync-subbed"
+                data-needs-ready disabled
+                title="Download all subscribed channels (available after startup)">
+          <svg class="btn-ico" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M3 2a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1H3zm1 2h8v1H4V4zm0 3h8v1H4V7zm0 3h5v1H4v-1z"/>
+          </svg>
+          <span>Sync Subbed</span>
+        </button>
+        <button class="btn btn-icon btn-pause" id="btn-pause"
+                title="Pause / cancel current task">
+          <svg class="btn-ico" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <rect x="4" y="3" width="3" height="10" rx="0.5"/>
+            <rect x="9" y="3" width="3" height="10" rx="0.5"/>
+          </svg>
+        </button>
+        <!-- Clear-log dropdown lives next to Pause so the Auto-sync
+             label/select pair in Row 3 reads as one unit (was: Clear
+             sat between them, breaking the visual pairing). -->
+        <button class="btn btn-ghost btn-thin" id="btn-clear-menu"
+                title="Clear log or activity history">Clear <span style="opacity:0.7;font-size:10px;">&#9662;</span></button>
+
+        <div class="spacer"></div>
+
+        <!-- Sync Tasks icon button with badge -->
+        <button class="icon-btn icon-btn-sync" id="btn-sync-tasks"
+                title="Sync Tasks &mdash; view pending downloads">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M5 2h6a1 1 0 0 1 1 1v1h1a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h1V3a1 1 0 0 1 1-1zm1 1v2h4V3H6zM4 6v8h8V6H4zm1 2h6v1H5V8zm0 2h6v1H5v-1zm0 2h4v1H5v-1z"/>
+          </svg>
+          <span class="icon-badge" id="badge-sync" hidden>0</span>
+        </button>
+
+        <!-- GPU Tasks icon button with badge -->
+        <button class="icon-btn icon-btn-gpu" id="btn-gpu-tasks"
+                title="GPU Tasks &mdash; view transcribe / encode queue">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M2 3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9v2h2v1H5v-1h2v-2H3a1 1 0 0 1-1-1V3zm1 0v7h10V3H3z"/>
+          </svg>
+          <span class="icon-badge" id="badge-gpu" hidden>0</span>
+        </button>
+
+        <span class="status-text" id="last-full-sync">Last Full Sync: &mdash;</span>
+      </div>
+
+      <!-- Horizontal separator matching ttk.Separator between btn_frame and autorun_frame -->
+      <div class="section-separator"></div>
+
+      <!-- Row 3: Auto-sync label/dropdown + countdown -->
+      <div class="controls-row controls-row-thin">
+        <label class="ctl-label ctl-label-thin" title="Run Sync Subbed automatically on an interval">Auto-sync:</label>
+        <select class="ctl-select" id="auto-sync-select"
+                title="How often to auto-run Sync Subbed">
+          <option value="Off">Off</option>
+          <option value="30 min">30 minutes</option>
+          <option value="1 hr">1 hour</option>
+          <option value="2 hr">2 hours</option>
+          <option value="4 hr">4 hours</option>
+          <option value="6 hr">6 hours</option>
+          <option value="12 hr">12 hours</option>
+          <option value="24 hr">24 hours</option>
+        </select>
+
+        <span class="status-text autorun-countdown" id="autorun-countdown"></span>
+
+        <div class="spacer"></div>
+        <!-- Startup status stack &mdash; two stacked slots so "Indexing new
+             files" and "Preloading Browse tab" can show simultaneously
+             when they run in parallel. Top slot carries
+             sweep-flavored text (Starting up / Scanning disk /
+             Indexing new files). Bottom slot carries browse-preload
+             text. Either or both hidden when idle. Backend drives via
+             window._setIndicator(slot, text|null). -->
+        <span class="preload-indicator-stack" id="browse-preload-indicator-stack">
+          <span id="browse-preload-slot-sweep" class="preload-indicator" hidden></span>
+          <span id="browse-preload-slot-preload" class="preload-indicator" hidden></span>
+        </span>
+      </div>
+
+    </div>
+
+    <!-- Deferred livestreams drawer &mdash; hidden until there's at least one -->
+    <div class="deferred-livestreams" id="deferred-livestreams" hidden>
+      <div class="deferred-head">
+        <span class="deferred-label">Deferred livestreams</span>
+        <span class="deferred-hint">(will auto-retry on next sync)</span>
+        <div class="spacer"></div>
+        <span class="status-text" id="deferred-count">0</span>
+        <!-- Retry dropdown: Now kicks an immediate sync; 24h / 1 week
+             snooze the drawer so it stops nagging until that time. -->
+        <div class="deferred-retry-wrap">
+          <button class="btn btn-ghost btn-thin" id="btn-deferred-retry"
+                  title="Retry options">Retry &#x25BE;</button>
+          <div class="deferred-retry-menu" id="deferred-retry-menu" hidden>
+            <button data-retry="now">Now</button>
+            <button data-retry="24h">in 24 hours</button>
+            <button data-retry="1w">in 1 week</button>
+          </div>
+        </div>
+        <button class="btn btn-ghost btn-thin" id="btn-deferred-clear"
+                title="Forget every deferred livestream">Clear</button>
+      </div>
+      <div class="deferred-list" id="deferred-list"></div>
+    </div>
+
+    <!-- Paned log area -->
+    <div class="log-paned" id="log-paned">
+      <div class="activity-log-frame">
+        <div class="activity-log" id="activity-log" tabindex="-1"></div>
+      </div>
+      <div class="paned-splitter" id="paned-splitter"></div>
+      <div class="main-log-frame">
+        <div class="main-log" id="main-log" tabindex="-1"></div>
+      </div>
+    </div>
+
+  </div>
+

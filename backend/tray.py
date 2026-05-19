@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 
 ICON_CANDIDATES = [
@@ -25,7 +29,7 @@ ICON_CANDIDATES = [
 ]
 
 
-def _find_icon() -> Optional[Path]:
+def _find_icon() -> Path | None:
     for p in ICON_CANDIDATES:
         if p.exists():
             return p
@@ -36,10 +40,8 @@ def _find_icon() -> Optional[Path]:
 # which defaults to LIGHT even when the app's main window is dark. To
 # force the menu dark we opt the process into dark-mode-aware popup
 # menus via `uxtheme.dll`'s undocumented ordinals 135 + 136:
-#
 # SetPreferredAppMode(ForceDark) — ordinal 135, Win10 1903+
 # FlushMenuThemes() — ordinal 136, reapplies to existing
-#
 # These are undocumented Microsoft APIs used by Explorer, Notepad,
 # VS Code, Chrome, etc. Ordinal-based calls are brittle across OS
 # builds, so this is strictly best-effort: any failure silently
@@ -81,10 +83,10 @@ def _apply_dark_menu_theme() -> bool:
 
 class TrayController:
     def __init__(self,
-                 on_show: Optional[Callable[[], None]] = None,
-                 on_hide: Optional[Callable[[], None]] = None,
-                 on_sync: Optional[Callable[[], None]] = None,
-                 on_quit: Optional[Callable[[], None]] = None,
+                 on_show: Callable[[], None] | None = None,
+                 on_hide: Callable[[], None] | None = None,
+                 on_sync: Callable[[], None] | None = None,
+                 on_quit: Callable[[], None] | None = None,
                  tooltip: str = "YT Archiver"):
         self._on_show = on_show
         self._on_hide = on_hide
@@ -98,13 +100,13 @@ class TrayController:
         self._autorun_set_label = None # callable(label) -> None
         self._tooltip = tooltip
         self._icon = None
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._started = False
         # Spin animation state
         self._base_img = None
         self._Image = None
         self._ImageDraw = None
-        self._spin_thread: Optional[threading.Thread] = None
+        self._spin_thread: threading.Thread | None = None
         self._spin_stop = threading.Event()
         self._spin_color = (80, 160, 240, 255)
         self._spin_interval = 0.18
@@ -134,7 +136,7 @@ class TrayController:
             def _make_cb(lbl):
                 def _cb(icon, item):
                     try: self._autorun_set_label(lbl)
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 return _cb
             def _make_checked(lbl):
                 def _checked(item):
@@ -180,13 +182,13 @@ class TrayController:
         try:
             if self._icon:
                 self._icon.stop()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         if self._on_quit:
             try:
                 self._on_quit()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     def start(self) -> bool:
         if self._started:
@@ -195,22 +197,24 @@ class TrayController:
             import pystray
             from PIL import Image, ImageDraw, ImageFont
         except ImportError:
-            print("[tray] pystray / Pillow not installed; tray disabled.")
+            # print → logger so PyInstaller --noconsole
+            # builds capture this rather than dropping to stdout void.
+            _log.error("pystray / Pillow not installed; tray disabled.")
             return False
         # Attach ImageFont to ImageDraw so _compose_badge can use
         # `self._ImageDraw.ImageFont.truetype(...)` without a fresh import.
-        try: setattr(ImageDraw, "ImageFont", ImageFont)
-        except Exception: pass
+        try: ImageDraw.ImageFont = ImageFont
+        except Exception as e: _log.debug("swallowed: %s", e)
 
         icon_path = _find_icon()
         if icon_path is None:
-            print("[tray] icon.ico not found; tray disabled.")
+            _log.error("icon.ico not found; tray disabled.")
             return False
 
         try:
             self._base_img = Image.open(icon_path).convert("RGBA")
         except Exception as e:
-            print(f"[tray] could not load icon: {e}")
+            _log.error("could not load icon: %s", e)
             return False
 
         self._Image = Image
@@ -229,12 +233,12 @@ class TrayController:
             try:
                 self._icon.run()
             except Exception as e:
-                # audit F-52: tray run crashed — flip _started back to
+                # tray run crashed — flip _started back to
                 # False so later callers don't try to operate on a dead
                 # icon and fail silently. Previously _started stayed
                 # True and every start_spin/set_badge/update_tooltip
                 # call hit the dead icon with swallowed exceptions.
-                print(f"[tray] icon.run crashed: {e}")
+                _log.error("icon.run crashed: %s", e)
                 self._started = False
 
         self._thread = threading.Thread(target=_run, daemon=True)
@@ -260,7 +264,7 @@ class TrayController:
         self._spin_thread.start()
 
     def stop_spin(self):
-        # audit E-42: join the spin thread (short timeout) before
+        # join the spin thread (short timeout) before
         # nulling the ref, so a rapid stop_spin → start_spin cycle
         # can't race with the old loop still writing icon.icon while
         # the new loop also writes it. Previously the two threads
@@ -271,16 +275,16 @@ class TrayController:
         if _old_thread is not None:
             try:
                 _old_thread.join(timeout=0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._spin_thread = None
         # Restore base icon (possibly with badge if a count is set)
         if self._icon and self._base_img:
             try:
                 self._icon.icon = self._compose_badge(self._base_img.copy()) \
                     if self._badge_count else self._base_img
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     def set_badge(self, count: int):
         """Overlay a small count badge on the tray icon (downloaded-this-session).
@@ -297,8 +301,8 @@ class TrayController:
             try:
                 self._icon.icon = (self._compose_badge(self._base_img.copy())
                                    if self._badge_count else self._base_img)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     def _compose_badge(self, img):
         """Draw `self._badge_count` into the bottom-right of an icon copy."""
@@ -325,10 +329,10 @@ class TrayController:
                               fill=(255, 255, 255, 255), font=font)
                 else:
                     draw.text((cx - 3, cy - 5), txt, fill=(255, 255, 255, 255))
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         return img
 
     def _spin_loop(self):
@@ -366,8 +370,8 @@ class TrayController:
                     img = self._compose_badge(img)
                 if self._icon:
                     self._icon.icon = img
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             frame += 1
             self._spin_stop.wait(self._spin_interval)
 
@@ -375,8 +379,8 @@ class TrayController:
         if self._icon:
             try:
                 self._icon.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._started = False
 
     def set_tooltip(self, text: str):
@@ -384,5 +388,5 @@ class TrayController:
         if self._icon:
             try:
                 self._icon.title = text
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)

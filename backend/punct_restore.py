@@ -8,7 +8,7 @@ punctuated form back to:
   - the `text` field of the matching line in the JSONL sidecar
 
 The `words` array is left untouched — its per-word timestamps drive the
-overlay-captions karaoke, which Scott prefers to keep in raw-lowercase
+overlay-captions karaoke, which is intentionally kept in raw-lowercase
 form (short captions with commas/periods mid-utterance read awkwardly).
 The watch-view right-panel renderer aligns the punctuated text with the
 raw word timestamps to preserve karaoke + click-to-seek there.
@@ -20,22 +20,28 @@ parity across the two tools.
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 import threading
-import time
 from pathlib import Path
-from typing import Optional
 
+from .log import get_logger
+from .repair_captions import (
+    YT_CAPTION_TAGS,
+    _append_progress,
+    _clear_checkpoint,
+    _clear_progress,
+    _find_txt_for_jsonl,
+    _load_checkpoint,
+    _load_progress,
+    _norm_title,
+    _parse_txt_sources,
+    _save_checkpoint,
+)
 from .transcribe import PunctuationManager, _replace_jsonl_entry
 from .ytarchiver_config import TRANSCRIPTION_DB
-from .repair_captions import (
-    _norm_title, _parse_txt_sources, _find_txt_for_jsonl,
-    _load_progress, _append_progress, _clear_progress,
-    _load_checkpoint, _save_checkpoint, _clear_checkpoint,
-    YT_CAPTION_TAGS,
-)
+
+_log = get_logger(__name__)
 
 
 # Same "is this already punctuated?" heuristic the YT repair uses.
@@ -146,13 +152,13 @@ def _enumerate_yt_videos(jsonl_path: Path) -> list:
 
 
 def restore_punctuation_archive(*, output_dir: str, log_stream,
-                                 channel_folder: Optional[str] = None,
-                                 video_id: Optional[str] = None,
+                                 channel_folder: str | None = None,
+                                 video_id: str | None = None,
                                  dry_run: bool = False,
-                                 cancel_event: Optional[threading.Event] = None,
-                                 pause_event: Optional[threading.Event] = None,
+                                 cancel_event: threading.Event | None = None,
+                                 pause_event: threading.Event | None = None,
                                  queues=None,
-                                 scope_url: Optional[str] = None) -> dict:
+                                 scope_url: str | None = None) -> dict:
     """Run the punctuation pass across the archive (or a subset).
 
     Same shape as repair_captions.repair_archive — emits progress per
@@ -163,27 +169,10 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
         return bool(cancel_event is not None and cancel_event.is_set())
 
     def _wait_if_paused() -> None:
-        if pause_event is None or not pause_event.is_set():
-            return
-        log_stream.emit_text(
-            " — Paused. Click Resume in Sync Tasks to continue.\n",
-            "simpleline")
-        log_stream.flush()
-        if queues is not None:
-            try: queues.set_sync_paused_active(True)
-            except Exception: pass
-        try:
-            while pause_event.is_set():
-                if _cancelled():
-                    return
-                pause_event.wait(timeout=0.5)
-        finally:
-            if queues is not None:
-                try: queues.set_sync_paused_active(False)
-                except Exception: pass
-            if not _cancelled():
-                log_stream.emit_text(" — Resumed.\n", "simpleline")
-                log_stream.flush()
+        # routes through pause_helpers.wait_while_paused.
+        from .pause_helpers import wait_while_paused
+        wait_while_paused(pause_event, cancel_event,
+                          stream=log_stream, queues=queues, tick=0.5)
 
     root = Path(output_dir)
     if not root.exists():
@@ -299,7 +288,7 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
     MILESTONE_EVERY = 25
     if queues is not None and len(work) > 0:
         try: queues.set_sync_pass_progress(0, len(work))
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
 
     # Open a single DB connection for the whole pass — the SQLite writes
     # are fast enough that one shared connection (with PRAGMA
@@ -351,7 +340,7 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                     _append_progress(scope_url, vid)
                 if queues is not None:
                     try: queues.set_sync_pass_progress(i, len(work))
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 continue
 
             # Run each segment's text through punctuate(). Failures fall
@@ -385,7 +374,7 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                     log_stream.flush()
                 if queues is not None:
                     try: queues.set_sync_pass_progress(i, len(work))
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 continue
 
             # Write back: DB column update + JSONL rewrite.
@@ -420,16 +409,16 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 log_stream.flush()
             if queues is not None:
                 try: queues.set_sync_pass_progress(i, len(work))
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
     finally:
         try:
             punct_mgr._stop()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         try:
             conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     status_word = "Cancelled" if cancelled_early else "Punctuation pass done"
     log_stream.emit_text(

@@ -25,10 +25,13 @@ import copy
 import json
 import os
 import threading
-import time
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
+from .log import get_logger
 from .ytarchiver_config import QUEUE_FILE, config_is_writable
+
+_log = get_logger(__name__)
 
 
 class QueueState:
@@ -36,14 +39,14 @@ class QueueState:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self.sync: List[Dict[str, Any]] = []
-        self.reorg: List[list] = []
-        self.video: List[list] = []
-        self.transcribe: List[list] = []
-        self.redownload: List[Dict[str, Any]] = []
-        self.metadata: List[Dict[str, Any]] = []
-        self.gpu: List[Dict[str, Any]] = []
-        self.order: List[list] = [] # [[kind, id], ...]
+        self.sync: list[dict[str, Any]] = []
+        self.reorg: list[list] = []
+        self.video: list[list] = []
+        self.transcribe: list[list] = []
+        self.redownload: list[dict[str, Any]] = []
+        self.metadata: list[dict[str, Any]] = []
+        self.gpu: list[dict[str, Any]] = []
+        self.order: list[list] = [] # [[kind, id], ...]
         self.gpu_paused: bool = False
         self.sync_paused: bool = False
         # Pause is requested via set_*_paused(True), but the worker may
@@ -58,10 +61,10 @@ class QueueState:
         self.sync_paused_active: bool = False
 
         # Current in-flight items (not yet re-queued, but shown in popover)
-        self.current_sync: Optional[Dict[str, Any]] = None
-        self.current_gpu: Optional[Dict[str, Any]] = None
-        self.current_redownload: Optional[Dict[str, Any]] = None
-        self.current_metadata: Optional[Dict[str, Any]] = None
+        self.current_sync: dict[str, Any] | None = None
+        self.current_gpu: dict[str, Any] | None = None
+        self.current_redownload: dict[str, Any] | None = None
+        self.current_metadata: dict[str, Any] | None = None
 
         # Sync-pass progress: when "Sync Subbed" runs, we don't enqueue 103
         # individual channel items into `self.sync` — we iterate them
@@ -73,23 +76,38 @@ class QueueState:
         self.sync_pass_total: int = 0
 
         # Debounced save scheduler
-        self._save_timer: Optional[threading.Timer] = None
+        self._save_timer: threading.Timer | None = None
         self._save_interval_sec = 2.0
 
-        # Listeners notified on any state change (UI push)
-        self._listeners: List[Callable[[], None]] = []
+        # resuming items pulled from the persisted file
+        # (in-flight when the app last shut down). Caller reads via
+        # `get_loaded_resuming()` after `load()` to decide how to
+        # requeue them. Empty until load() runs.
+        self._loaded_resuming: dict[str, Any] = {}
 
-        # audit D-35: register atexit hook so a crash/kill within the
+        # Listeners notified on any state change (UI push)
+        self._listeners: list[Callable[[], None]] = []
+
+        # register atexit hook so a crash/kill within the
         # 2s debounce window still flushes. Idempotent — atexit only
         # fires once per process, and _atexit_flush is a no-op when
         # nothing is pending.
         try:
             import atexit as _atx
             _atx.register(self._atexit_flush)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     # ── listener registration ───────────────────────────────────────
+
+    def get_loaded_resuming(self) -> dict[str, Any]:
+        """Patch 1 (v66.5): items that were in-flight when the app
+        last shut down. Caller (main.py boot) reads after `load()` to
+        decide how to requeue them (typically: append to the tail of
+        their respective queues with a "restored" tag). Returns a
+        copy; safe to consume."""
+        with self._lock:
+            return dict(self._loaded_resuming or {})
 
     def add_listener(self, fn: Callable[[], None]):
         self._listeners.append(fn)
@@ -98,15 +116,15 @@ class QueueState:
         for fn in list(self._listeners):
             try:
                 fn()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     # ── load/save ────────────────────────────────────────────────────
 
     def load(self) -> bool:
         """Load queue state from ytarchiver_queue.json. Returns True on success.
 
-        Mirrors OLD YTArchiver.py:34103 _load_queue_state: if the JSON is
+        _load_queue_state: if the JSON is
         corrupt, rename the file to .bak so next launch starts fresh instead
         of soft-locking on the same parse error every time.
         """
@@ -140,6 +158,34 @@ class QueueState:
             self.order = list(data.get("order", []))
             self.gpu_paused = bool(data.get("gpu_paused", False))
             self.sync_paused = bool(data.get("sync_paused", False))
+
+            # resuming-dict handling. New-format files
+            # (schema_version 2+) keep in-flight items in a separate
+            # `resuming` dict; old-format files put them at the front
+            # of the regular queue lists. We surface `resuming` so the
+            # caller (main.py startup) can emit a restore notice and
+            # decide how to requeue.
+            schema_v = int(data.get("_schema_version", 1) or 1)
+            resuming_raw = data.get("resuming") or {}
+            if schema_v >= 2 and isinstance(resuming_raw, dict):
+                # New format: resuming items are NOT in the regular
+                # lists; pull them out and stash for the caller.
+                self._loaded_resuming = dict(resuming_raw)
+            else:
+                # Old format: any item at queue[0] that we'd consider
+                # "in-flight" (matched by being a dict with our shape)
+                # is actually a resuming item. Move it to _loaded_resuming
+                # and drop from the list. Mirrors the prior load behavior
+                # but cleanly.
+                self._loaded_resuming = {}
+                for key in ("sync", "redownload", "metadata", "gpu"):
+                    lst = getattr(self, key, None)
+                    if lst and isinstance(lst, list) and lst and isinstance(lst[0], dict):
+                        # Heuristic: first item is a dict → treat as in-flight
+                        # (matches old write pattern that prepended currents).
+                        self._loaded_resuming[key] = lst[0]
+                        # Don't pop — leave for backwards-compat. Caller
+                        # can decide via _loaded_resuming what to do.
         self._notify()
         return True
 
@@ -160,7 +206,7 @@ class QueueState:
                 "gpu_paused": self.gpu_paused,
                 "sync_paused": self.sync_paused,
             }
-            # audit C-11: in-flight items now persist in a separate
+            # in-flight items now persist in a separate
             # `resuming` dict instead of being inserted at the front of
             # the regular queue lists. Old behavior re-popped the same
             # item on next boot and treated it as a normal queued job,
@@ -170,7 +216,7 @@ class QueueState:
             # can emit a visible "restart notice" and requeue them in
             # a controlled way rather than letting them race the fresh
             # boot state.
-            resuming: Dict[str, Any] = {}
+            resuming: dict[str, Any] = {}
             if self.current_sync is not None:
                 resuming["sync"] = copy.deepcopy(self.current_sync)
             if self.current_redownload is not None:
@@ -181,18 +227,15 @@ class QueueState:
                 resuming["gpu"] = copy.deepcopy(self.current_gpu)
             if resuming:
                 payload["resuming"] = resuming
-            # Also keep the legacy-style front-insertion so existing
-            # load() code paths (and any third-party tools reading the
-            # file) see in-flight items in the queue. The new
-            # `resuming` key is additive; load() uses it when present.
-            if self.current_sync is not None:
-                payload["sync"].insert(0, copy.deepcopy(self.current_sync))
-            if self.current_redownload is not None:
-                payload["redownload"].insert(0, copy.deepcopy(self.current_redownload))
-            if self.current_metadata is not None:
-                payload["metadata"].insert(0, copy.deepcopy(self.current_metadata))
-            if self.current_gpu is not None:
-                payload["gpu"].insert(0, copy.deepcopy(self.current_gpu))
+                payload["_schema_version"] = 2
+            # removed the legacy-style front-insertion
+            # that was being written ALONGSIDE the `resuming` dict.
+            # The duplicate write made every in-flight item appear
+            # TWICE on the next launch — once in `resuming` and once
+            # at the front of the regular queue list. `load()` would
+            # pick one path, and the OTHER would silently leak as a
+            # phantom queue item. Now writes are clean: items are in
+            # exactly ONE place.
         try:
             tmp = str(QUEUE_FILE) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -205,7 +248,7 @@ class QueueState:
     def save_debounced(self):
         """Schedule a save for _save_interval_sec from now (coalesces bursts).
 
-        audit D-35: an atexit hook is registered at construction
+        an atexit hook is registered at construction
         (see __init__) so that if the app is killed or crashes during
         the 2-second debounce window, pending changes still flush to
         disk. Without this, close-during-queue-edit silently lost the
@@ -221,7 +264,7 @@ class QueueState:
         with self._lock:
             if self._save_timer is not None:
                 try: self._save_timer.cancel()
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
                 self._save_timer = None
             t = threading.Timer(self._save_interval_sec, self._do_debounced_save)
             t.daemon = True
@@ -243,14 +286,14 @@ class QueueState:
                 self._save_timer = None
             if t is not None:
                 try: t.cancel()
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
             self.save_now()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     # ── sync queue ──────────────────────────────────────────────────
 
-    def sync_enqueue(self, channel: Dict[str, Any]) -> bool:
+    def sync_enqueue(self, channel: dict[str, Any]) -> bool:
         """Add a channel to the sync queue if not already present.
         Dedupe is keyed on (kind, url) so a "Download X" and a
         separate "Metadata check X" can coexist — they're different
@@ -269,12 +312,12 @@ class QueueState:
         self.save_debounced()
         return True
 
-    def sync_pop(self) -> Optional[Dict[str, Any]]:
+    def sync_pop(self) -> dict[str, Any] | None:
         with self._lock:
             if not self.sync:
                 return None
             ch = self.sync.pop(0)
-            # audit E-15: remove only the FIRST matching order entry
+            # remove only the FIRST matching order entry
             # (not all of them). Same URL can legitimately have multiple
             # sync jobs queued (e.g. a Download task and a separate
             # Metadata-recheck task — `sync_enqueue` dedupes on
@@ -393,7 +436,7 @@ class QueueState:
 
     # ── gpu queue ───────────────────────────────────────────────────
 
-    def gpu_enqueue(self, item: Dict[str, Any]) -> bool:
+    def gpu_enqueue(self, item: dict[str, Any]) -> bool:
         """Queue a transcription/encode job for the GPU lane. Dedupes
         by `path` to prevent double-entries on startup when both
         QueueState.load() (which restores gpu from disk) and the
@@ -411,7 +454,7 @@ class QueueState:
         self.save_debounced()
         return True
 
-    def gpu_pop(self) -> Optional[Dict[str, Any]]:
+    def gpu_pop(self) -> dict[str, Any] | None:
         with self._lock:
             if not self.gpu:
                 return None
@@ -489,7 +532,7 @@ class QueueState:
 
     # ── current-task tracking ───────────────────────────────────────
 
-    def set_current_sync(self, ch: Optional[Dict[str, Any]]):
+    def set_current_sync(self, ch: dict[str, Any] | None):
         with self._lock:
             self.current_sync = copy.deepcopy(ch) if ch else None
         self._notify()
@@ -504,14 +547,14 @@ class QueueState:
             self.sync_pass_total = max(0, int(total))
         self._notify()
 
-    def set_current_gpu(self, item: Optional[Dict[str, Any]]):
+    def set_current_gpu(self, item: dict[str, Any] | None):
         with self._lock:
             self.current_gpu = copy.deepcopy(item) if item else None
         self._notify()
 
     # ── UI payload ──────────────────────────────────────────────────
 
-    def to_ui_payload(self) -> Dict[str, Any]:
+    def to_ui_payload(self) -> dict[str, Any]:
         """Return the shape the queue popovers expect (see web/logs.js renderQueues)."""
         with self._lock:
             sync_list = []
@@ -561,8 +604,8 @@ class QueueState:
             # Coalesce queued items by bulk_id. First pass: count items per
             # bulk_id. Second pass: emit one row per bulk (or per-item if
             # no bulk_id).
-            bulk_counts: Dict[str, int] = {}
-            bulk_channels: Dict[str, str] = {}
+            bulk_counts: dict[str, int] = {}
+            bulk_channels: dict[str, str] = {}
             for t in self.gpu:
                 bid = str(t.get("bulk_id") or "")
                 if bid:
@@ -612,7 +655,7 @@ class QueueState:
             }
 
     @staticmethod
-    def _task_label_sync(ch: Dict[str, Any], running: bool) -> str:
+    def _task_label_sync(ch: dict[str, Any], running: bool) -> str:
         """Pos 1 (running) uses present-continuous, other slots use the plain verb.
         Branches on `kind` so the popover shows meaningful labels for
         non-download sync-queue items (metadata recheck, etc.).
@@ -664,8 +707,8 @@ class QueueState:
         return f"{verb} {name}"
 
     @staticmethod
-    def _task_label_gpu(t: Dict[str, Any], running: bool,
-                        bulk_context: Optional[Dict[str, Any]] = None) -> str:
+    def _task_label_gpu(t: dict[str, Any], running: bool,
+                        bulk_context: dict[str, Any] | None = None) -> str:
         # `bulk_context` is reserved for future coalesce-label overrides
         # from to_ui_payload (per-video label remains the same for now).
         title = t.get("title") or os.path.basename(t.get("path", "?")).rsplit(".", 1)[0]
@@ -728,8 +771,8 @@ class QueueState:
 
     # ── stats ───────────────────────────────────────────────────────
 
-    def counts(self) -> Dict[str, int]:
-        # audit E-16: include transcribe + video counts so the UI
+    def counts(self) -> dict[str, int]:
+        # include transcribe + video counts so the UI
         # badge totals don't silently undercount. Old counts() only
         # returned sync/gpu/redownload/metadata/reorg, so items on
         # transcribe/video lists were invisible to any caller using

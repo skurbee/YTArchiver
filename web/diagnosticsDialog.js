@@ -1,0 +1,83 @@
+/**
+ * web/diagnosticsDialog.js — Diagnostics modal (dep status + paths + logs).
+ *
+ * Exposed as window.initDiagnosticsDialog; app.js boot calls it once.
+ */
+(function () {
+  "use strict";
+
+  const askConfirm = window.askConfirm;
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  // ─── Diagnostics dialog ──────────────────────────────────────────────
+  function initDiagnosticsDialog() {
+    const bd = document.getElementById("diag-backdrop");
+    const openBtn = document.getElementById("btn-diagnostics");
+    const closeBtn = document.getElementById("diag-close");
+    const refreshBtn = document.getElementById("diag-refresh");
+    const rowsEl = document.getElementById("diag-rows");
+    const summaryEl = document.getElementById("diag-summary");
+    if (!bd) return;
+
+    async function run() {
+      // early bail if rowsEl is missing (DOM out of sync
+      // during hot reload, partial render, etc). Old code hit a
+      // TypeError on rowsEl.innerHTML and the dialog never opened.
+      if (!rowsEl) return;
+      rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Running self-check\u2026</div>';
+      if (summaryEl) summaryEl.textContent = "";
+      const api = window.pywebview?.api;
+      if (!api?.diagnostics_run) {
+        rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Native mode required.</div>';
+        return;
+      }
+      try {
+        const res = await api.diagnostics_run();
+        if (!res?.ok || !Array.isArray(res.rows)) {
+          rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Self-check failed.</div>';
+          return;
+        }
+        const frag = document.createDocumentFragment();
+        let okN = 0, failN = 0;
+        for (const r of res.rows) {
+          const row = document.createElement("div");
+          row.className = "diag-row" + (r.ok ? " diag-ok" : " diag-fail");
+          row.innerHTML = `
+            <span class="diag-dot"></span>
+            <span class="diag-name"></span>
+            <span class="diag-detail"></span>
+          `;
+          row.querySelector(".diag-name").textContent = r.name;
+          row.querySelector(".diag-detail").textContent = r.detail || "";
+          frag.appendChild(row);
+          if (r.ok) okN++; else failN++;
+        }
+        rowsEl.innerHTML = "";
+        rowsEl.appendChild(frag);
+        summaryEl.textContent = failN === 0
+          ? `All ${okN} checks passed`
+          : `${okN} ok \u2014 ${failN} problem${failN === 1 ? "" : "s"}`;
+      } catch (e) {
+        rowsEl.innerHTML = `<div class="browse-empty" style="padding:16px;">Error: ${escapeHtml(String(e))}</div>`;
+      }
+    }
+
+    const show = () => { bd.style.display = "flex"; run(); };
+    const hide = () => { bd.style.display = "none"; };
+    openBtn?.addEventListener("click", show);
+    closeBtn?.addEventListener("click", hide);
+    refreshBtn?.addEventListener("click", run);
+    bd.addEventListener("click", (e) => { if (e.target === bd) hide(); });
+    // BUG FIX 2026-05-15 (audit): Esc was a no-op on this dialog. Wire
+    // it through to match the rest of the modal system.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && bd.style.display !== "none") hide();
+    });
+  }
+
+  window.initDiagnosticsDialog = initDiagnosticsDialog;
+})();

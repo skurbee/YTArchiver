@@ -17,20 +17,22 @@ import re
 import subprocess
 import threading
 import time
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from collections.abc import Callable
+from typing import Any
 
 from .sync import (
-    _find_cookie_source, find_yt_dlp,
-    channel_folder_name as _ch_folder_name,
+    _find_cookie_source,
+    find_yt_dlp,
 )
 
 # YTArchiver uses .mp4/.mkv/.webm + a few audio/edge cases for local scans
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
-from .ytarchiver_config import load_config
-from .net import block_if_down
+from .log import get_logger
 from .log_stream import LogStreamer
+from .net import block_if_down
 from .utils import utf8_subprocess_env as _utf8_env
+
+_log = get_logger(__name__)
 
 
 _YT_ID_RE = re.compile(r'\b([A-Za-z0-9_-]{11})\b')
@@ -45,7 +47,7 @@ def _progress_path(folder: str) -> str:
     return os.path.join(folder, "_redownload_progress.json")
 
 
-def _load_progress(folder: str, ch_url: str, new_res: str) -> Set[str]:
+def _load_progress(folder: str, ch_url: str, new_res: str) -> set[str]:
     try:
         pf = _progress_path(folder)
         if not os.path.isfile(pf):
@@ -54,12 +56,12 @@ def _load_progress(folder: str, ch_url: str, new_res: str) -> Set[str]:
             data = json.load(f)
         if data.get("resolution") == new_res and data.get("ch_url") == ch_url:
             return set(data.get("done_ids", []))
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return set()
 
 
-def _save_progress(folder: str, ch_url: str, new_res: str, done: Set[str]) -> None:
+def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> None:
     try:
         os.makedirs(folder, exist_ok=True)
         pf = _progress_path(folder)
@@ -68,8 +70,8 @@ def _save_progress(folder: str, ch_url: str, new_res: str, done: Set[str]) -> No
             json.dump({"ch_url": ch_url, "resolution": new_res,
                        "done_ids": list(done)}, f)
         os.replace(tmp, pf)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
 
 
 def _clear_progress(folder: str) -> None:
@@ -77,11 +79,11 @@ def _clear_progress(folder: str) -> None:
         pf = _progress_path(folder)
         if os.path.isfile(pf):
             os.remove(pf)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
 
 
-def _extract_id_from_filename(name: str) -> Optional[str]:
+def _extract_id_from_filename(name: str) -> str | None:
     """YTArchiver names videos like 'Title [VIDEOID].ext'. Extract VIDEOID if so."""
     # Look for bracketed 11-char token at the end of the filename (before ext).
     stem = os.path.splitext(name)[0]
@@ -94,12 +96,12 @@ def _extract_id_from_filename(name: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _scan_local_files(folder: str) -> Dict[str, str]:
+def _scan_local_files(folder: str) -> dict[str, str]:
     """Walk channel folder, return {filename: fullpath} for all video files.
 
     Skips temp subdirs (_BACKLOG_TEMP, _TEMP_COMPRESS) to match YTArchiver.
     """
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     if not os.path.isdir(folder):
         return out
     for dp, dns, fns in os.walk(folder):
@@ -115,9 +117,9 @@ def _scan_local_files(folder: str) -> Dict[str, str]:
 
 
 def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
-                      pause_ev: Optional[threading.Event],
+                      pause_ev: threading.Event | None,
                       stream: LogStreamer,
-                      queues=None) -> Dict[str, str]:
+                      queues=None) -> dict[str, str]:
     """Run yt-dlp --flat-playlist to enumerate the channel. Returns {title: id}."""
     yt_dlp = find_yt_dlp() or "yt-dlp"
     enum_cmd = [
@@ -138,14 +140,14 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Couldn't start the download tool: {e}\n", "red"]])
         return {}
-    result: Dict[str, str] = {}
+    result: dict[str, str] = {}
     last_page = 0
     try:
         for raw in proc.stdout:
             if cancel_ev.is_set():
                 proc.terminate()
                 break
-            # audit E-9: honor pause_ev during the catalog walk. Without
+            # honor pause_ev during the catalog walk. Without
             # this, a paused user has to wait until the full playlist
             # enumeration completes (minutes on a 10k-video channel)
             # before the pause actually acts. Mirrors the pause-wait
@@ -153,12 +155,12 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             if pause_ev is not None and pause_ev.is_set():
                 if queues is not None:
                     try: queues.set_sync_paused_active(True)
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 while (pause_ev.is_set() and not cancel_ev.is_set()):
                     time.sleep(0.25)
                 if queues is not None:
                     try: queues.set_sync_paused_active(False)
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
             if cancel_ev.is_set():
                 proc.terminate()
                 break
@@ -183,11 +185,11 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             proc.wait(timeout=300)
         except Exception:
             try: proc.kill()
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
     return result
 
 
-def _build_metadata_index(folder: str) -> Dict[str, Any]:
+def _build_metadata_index(folder: str) -> dict[str, Any]:
     """Load all aggregated `.{ch} Metadata.jsonl` files under `folder`
     into three indices for fast matching:
         by_title: {title.lower(): video_id}
@@ -202,13 +204,13 @@ def _build_metadata_index(folder: str) -> Dict[str, Any]:
     out = {"by_title": {}, "by_date": {}, "by_id": {}}
     if not folder or not os.path.isdir(folder):
         return out
-    # audit M-22: count JSONL-parse failures per file so a corrupt
+    # count JSONL-parse failures per file so a corrupt
     # metadata file doesn't silently drop half its entries from the
     # match index. If any file has notable corruption, emit a dim
     # warning so the user can investigate before redownload runs
     # against an incomplete match set.
-    _bad_by_file: Dict[str, int] = {}
-    _total_by_file: Dict[str, int] = {}
+    _bad_by_file: dict[str, int] = {}
+    _total_by_file: dict[str, int] = {}
     for dp, _dns, fns in os.walk(folder):
         for fn in fns:
             if not (fn.startswith(".") and fn.endswith("Metadata.jsonl")):
@@ -250,10 +252,10 @@ def _build_metadata_index(folder: str) -> Dict[str, Any]:
     return out
 
 
-def _match_files_to_ids(local_files: Dict[str, str],
-                         yt_title_to_id: Dict[str, str],
-                         meta_index: Optional[Dict[str, Any]] = None
-                         ) -> List[Dict[str, str]]:
+def _match_files_to_ids(local_files: dict[str, str],
+                         yt_title_to_id: dict[str, str],
+                         meta_index: dict[str, Any] | None = None
+                         ) -> list[dict[str, str]]:
     """Build list of {filename, filepath, video_id, title} for matched files.
 
     Matching priority (stop at first hit):
@@ -276,7 +278,7 @@ def _match_files_to_ids(local_files: Dict[str, str],
     by title had mostly rename-drift + rare multi-video days), the
     redownload pipeline silently skipped 16 files.
     """
-    matched: List[Dict[str, str]] = []
+    matched: list[dict[str, str]] = []
     # Bug [22]: NFC-normalize before lowercasing so non-ASCII titles
     # match across composed/decomposed Unicode forms. yt-dlp emits NFC
     # but some filesystems (notably macOS HFS+) store filenames as NFD;
@@ -347,12 +349,18 @@ def _match_files_to_ids(local_files: Dict[str, str],
                 matched.append({"filename": fname, "filepath": fpath,
                                 "video_id": vid, "title": t_orig or stem})
                 continue
-        # 5. Substring fallback in YT catalog (existing behavior)
-        for t_lower, (t_orig, vid) in yt_lower.items():
-            if t_lower in low or low in t_lower:
-                matched.append({"filename": fname, "filepath": fpath,
-                                "video_id": vid, "title": t_orig})
-                break
+        # the previous step-5 substring fallback
+        # ("if t_lower in low or low in t_lower") matched too aggressively
+        # on common-prefix titles like "Episode 1" vs "Episode 11" and
+        # caused _download_one to overwrite files with the WRONG video's
+        # content. The 4 strategies above are safe; falling through here
+        # means we genuinely couldn't identify the file — skip it.
+        # Log so the user sees previously-silent skips.
+        try:
+            _log.warning("redownload: no safe match for %r — skipping",
+                         fname)
+        except Exception:
+            pass
     return matched
 
 
@@ -384,7 +392,7 @@ def _find_ffprobe() -> str:
     return "ffprobe"
 
 
-def _ffprobe_height(filepath: str) -> Optional[int]:
+def _ffprobe_height(filepath: str) -> int | None:
     """Return the video stream's height, or None if ffprobe isn't usable."""
     try:
         r = subprocess.run(
@@ -399,8 +407,78 @@ def _ffprobe_height(filepath: str) -> Optional[int]:
         out = (r.stdout or "").strip().splitlines()
         if out:
             return int(out[0])
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    return None
+
+
+def _height_from_metadata_jsonl(filepath: str) -> int | None:
+    """Patch 20 (v67.8): read the video's height from the aggregated
+    .Metadata.jsonl sidecar that already lives next to the file, instead
+    of spawning ffprobe (~50-200 ms × N at the start of every redownload).
+
+    The .Metadata.jsonl is written by sync/backfill and carries every
+    YT-side field, including `height` (when bulk_refresh_views_likes has
+    visited the video) or — older entries — `formats[0].height`.
+
+    Returns None if no jsonl is present or no height field is found.
+    Caller falls back to ffprobe on None.
+    """
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        fp = _P(filepath)
+        # The video's Metadata.jsonl lives at the channel-folder level.
+        # Walk up the tree looking for `.<channel> Metadata.jsonl` (the
+        # canonical no-split name) or any sibling `.* Metadata.jsonl`.
+        # We try the parent first (year/month split layout) then up one
+        # more (year split) then the channel root.
+        for _d in (fp.parent, fp.parent.parent, fp.parent.parent.parent):
+            if not _d.is_dir():
+                continue
+            try:
+                cand = list(_d.glob("*Metadata.jsonl")) + \
+                       list(_d.glob(".*Metadata.jsonl"))
+            except Exception:
+                cand = []
+            if not cand:
+                continue
+            # Pull video_id from filename `[id]` bracket
+            import re as _re
+            m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", fp.name)
+            if not m:
+                return None
+            target_vid = m.group(1)
+            for jsonl in cand:
+                try:
+                    with jsonl.open("r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or '"video_id"' not in line:
+                                continue
+                            if target_vid not in line:
+                                continue
+                            try:
+                                obj = _json.loads(line)
+                            except Exception:
+                                continue
+                            if (obj.get("video_id") or "") != target_vid:
+                                continue
+                            h = obj.get("height")
+                            if isinstance(h, (int, float)) and h > 0:
+                                return int(h)
+                            # Older entries may have height inside formats[0]
+                            fmts = obj.get("formats") or []
+                            if fmts and isinstance(fmts, list):
+                                fh = fmts[0].get("height") if isinstance(fmts[0], dict) else None
+                                if isinstance(fh, (int, float)) and fh > 0:
+                                    return int(fh)
+                            return None
+                except Exception:
+                    continue
+            return None  # We found a jsonl but it didn't have this video
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return None
 
 
@@ -412,7 +490,11 @@ def _already_at_target(filepath: str, new_res: str) -> bool:
         target = int(new_res)
     except Exception:
         return False
-    h = _ffprobe_height(filepath)
+    # try .Metadata.jsonl first — it's a single line
+    # read vs spawning ffprobe (~50-200ms). Fall back to ffprobe on miss.
+    h = _height_from_metadata_jsonl(filepath)
+    if h is None:
+        h = _ffprobe_height(filepath)
     if h is None:
         return False
     # Allow small deltas (e.g. 1078 is effectively 1080)
@@ -420,7 +502,7 @@ def _already_at_target(filepath: str, new_res: str) -> bool:
 
 
 def _download_one(video_id: str, new_res: str, out_dir: str,
-                  stream: LogStreamer, cancel_ev: threading.Event) -> Optional[str]:
+                  stream: LogStreamer, cancel_ev: threading.Event) -> str | None:
     """Download a single video ID at the target resolution into a temp dir
     keyed by `video_id`. Returns the temp filepath on success, None on
     failure/cancel. The caller `os.replace`s it onto the original filename
@@ -458,7 +540,7 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         yt_dlp,
         "--newline", "--no-quiet",
         "--mtime",
-        # audit F-21: resume partials on restart (same rationale as
+        # resume partials on restart (same rationale as
         # the sync path). Redownload stages into _REDOWNLOAD_TEMP
         # and the full partial is there to resume from.
         "--continue",
@@ -506,12 +588,12 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
                      [f" Couldn't start the download tool for {video_id}: {e}\n",
                       "red"]])
         return None
-    dest: Optional[str] = None
+    dest: str | None = None
     _cancelled = False
     for raw in proc.stdout:
         if cancel_ev.is_set():
             try: proc.terminate()
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
             _cancelled = True
             break
         line = raw.rstrip()
@@ -523,13 +605,25 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     try: proc.wait(timeout=10)
     except Exception:
         try: proc.kill()
-        except Exception: pass
-    # bug H-3: on cancel mid-download, the .part / intermediate files
+        except Exception as e: _log.debug("swallowed: %s", e)
+    # Patch C: surface non-zero returncode so silent failures are
+    # visible. yt-dlp emits its actual error message on stderr, which
+    # was being merged into stdout via STDOUT redirection above (line
+    # 502) — the body of that output has already been consumed and
+    # potentially emitted as dim lines, but the user never saw a
+    # summary indicator that "this download failed." Now: if rc != 0
+    # AND we weren't cancelled by the user, log an error so the
+    # surrounding UI knows to surface a toast/badge.
+    if (not _cancelled) and proc.returncode is not None and proc.returncode != 0:
+        stream.emit_error(
+            f"yt-dlp exited with code {proc.returncode} for "
+            f"{video_id} — see lines above for details.")
+    # on cancel mid-download, the .part / intermediate files
     # sit in _REDOWNLOAD_TEMP/ forever because the end-of-run rmdir only
     # clears empty dirs. Sweep everything we might have written before
     # returning so cancels don't leak GBs per use.
     if _cancelled:
-        # audit M-28: broaden the cancel cleanup to catch every
+        # broaden the cancel cleanup to catch every
         # file yt-dlp may have produced — .mkv/.mp4 merge
         # intermediates, .tmp, .ytdl (resume state), .frag (HLS
         # fragments) — not just `video_id*`+`.part`. Redownload
@@ -588,11 +682,10 @@ def _fmt_mb(size_bytes: float) -> str:
 def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        stream: LogStreamer,
                        cancel_ev: threading.Event,
-                       pause_ev: Optional[threading.Event] = None,
-                       confirm_cb: Optional[Callable[[float, str, str, int],
-                                                     str]] = None,
+                       pause_ev: threading.Event | None = None,
+                       confirm_cb: Callable[[float, str, str, int], str] | None = None,
                        queues=None,
-                       ) -> Dict[str, Any]:
+                       ) -> dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
     Caller is responsible for threading + queue bookkeeping.
@@ -616,25 +709,25 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # Pause-on-entry — makes the Resume from a restored pause clean.
     if pause_ev is not None and pause_ev.is_set() and not cancel_ev.is_set():
         stream.emit([
-            [f"  \u23F8 ", "pauselog"],
+            ["  \u23F8 ", "pauselog"],
             ["Redownload paused \u2014 click Resume.\n", "pauselog"],
         ])
         if queues is not None:
             try: queues.set_sync_paused_active(True)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         while pause_ev.is_set() and not cancel_ev.is_set():
             time.sleep(0.25)
         if queues is not None:
             try: queues.set_sync_paused_active(False)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         if not cancel_ev.is_set():
             stream.emit([
-                [f"  \u25B6 ", "simpleline_redwnl"],
+                ["  \u25B6 ", "simpleline_redwnl"],
                 ["Redownload resumed.\n", "simpleline"],
             ])
 
     # 1. Local scan
-    # Issue #162: when folder is missing or unreadable, distinguish
+    # when folder is missing or unreadable, distinguish
     # "really no videos" from "wrong folder path". The previous
     # message "No video files found" tripped the user up on channels
     # that obviously had hundreds of files \u2014 the root cause was a
@@ -673,15 +766,15 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     if not yt_titles:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [" YouTube catalog fetch failed.\n", "red"]])
-        # audit M-29: clear the progress file so the next attempt
+        # clear the progress file so the next attempt
         # doesn't resume against a stale catalog-vs-progress mapping.
         # Leaving the old progress around meant the retry tried to
         # skip videos whose IDs came from a different catalog view,
         # producing silent mismatches.
         try:
             _clear_progress(folder)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         return {"ok": False, "done": 0, "errors": 1, "total": 0}
 
     # 3. Match. Load the aggregated `.{ch} Metadata.jsonl` files under
@@ -708,7 +801,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # we're not resuming AND the job is big enough that "first 10" is a
     # useful preview. Matches OLD at YTArchiver.py:10683-10692.
     sample_done = bool(done) or total_to_do <= _SAMPLE_SIZE or confirm_cb is None
-    sample_results: List[Any] = []  # list of (orig_size, new_size) tuples
+    sample_results: list[Any] = []  # list of (orig_size, new_size) tuples
     if not sample_done:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [f" Matched {total_to_do} file(s). Checking the "
@@ -783,10 +876,10 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # later entries.
             _clear_active()
             stream.emit([
-                [f"  \u23F8 ", "pauselog"],
+                ["  \u23F8 ", "pauselog"],
                 ["Redownload paused \u2014 click Resume.\n", "pauselog"],
             ])
-            # audit M-30: emit a subtle paused-activity tick every
+            # emit a subtle paused-activity tick every
             # 60s so a long pause doesn't look like a crashed worker.
             # Without this, pausing for 30 min showed no log activity
             # and users thought the app died.
@@ -794,7 +887,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             _last_tick = _paused_since
             if queues is not None:
                 try: queues.set_sync_paused_active(True)
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
             while pause_ev.is_set() and not cancel_ev.is_set():
                 time.sleep(0.25)
                 _now = time.time()
@@ -802,18 +895,18 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     _mins = int((_now - _paused_since) // 60)
                     try:
                         stream.emit([
-                            [f"  \u23F8 ", "pauselog"],
+                            ["  \u23F8 ", "pauselog"],
                             [f"Still paused ({_mins}m)\u2026\n", "dim"],
                         ])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                     _last_tick = _now
             if queues is not None:
                 try: queues.set_sync_paused_active(False)
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
             if not cancel_ev.is_set():
                 stream.emit([
-                    [f"  \u25B6 ", "simpleline_redwnl"],
+                    ["  \u25B6 ", "simpleline_redwnl"],
                     ["Redownload resumed.\n", "simpleline"],
                 ])
         vid = item["video_id"]
@@ -896,7 +989,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 new_size = os.path.getsize(new_fp)
             except OSError:
                 pass
-            # audit C-4: if the new file is drastically smaller than the
+            # if the new file is drastically smaller than the
             # original (<10% of size), it's almost certainly a broken
             # download (geo-blocked fallback, "video unavailable" stub,
             # members-only error page). Real down-resolution downloads
@@ -931,7 +1024,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     and os.path.isfile(fp)):
                 _ident = False
                 try:
-                    # audit E-8: replaced full-file chunked compare (10GB+
+                    # replaced full-file chunked compare (10GB+
                     # double disk read for every size-match) with a header
                     # + tail sample. If both 1MB windows match, treat the
                     # files as identical. The full-compare used to burn
@@ -1142,7 +1235,6 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # to the live UI. Fires on both full completion AND cancel
     # (partial). Mirrors classic YTArchiver's
     # _record_redownload_finish (YTArchiver.py:22678).
-    #
     # Both emit paths are required: append_history_entry() writes to
     # config['autorun_history'] so the row survives restart, but does
     # NOT push to the running UI. stream.emit_activity() pushes to
@@ -1152,8 +1244,9 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     # channel's redownload" immediately after completion, despite
     # the other recently-completed channels' rows being visible.
     try:
-        from . import autorun as _ar
         from datetime import datetime as _dt
+
+        from . import autorun as _ar
         _now = _dt.now()
         _ts = (_now.strftime("%-I:%M%p") if os.name != "nt"
                else _now.strftime("%I:%M%p").lstrip("0")).lower()
@@ -1190,10 +1283,10 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 "took": _dur,
                 "row_tag": "hist_redwnl" if n_done > 0 else "",
             })
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
 
     return {"ok": True, "done": n_done, "skipped": n_skipped, "errors": n_err,
             "total": len(matched)}

@@ -28,6 +28,11 @@ PROJECT_ROOT = Path(os.path.abspath(SPECPATH))
 datas = [
     (str(PROJECT_ROOT / 'web'), 'web'),
     (str(PROJECT_ROOT / 'backend' / 'whisper_worker.py'), 'backend'),
+    # Patch fix (v68.2): punct_worker.py runs as a subprocess (path
+    # only — no static import), so PyInstaller's Analysis pass can't
+    # detect it. Bundle it explicitly so PunctuationManager's
+    # is_available() check finds it at runtime.
+    (str(PROJECT_ROOT / 'backend' / 'punct_worker.py'), 'backend'),
 ]
 # Optional: icon.ico (only if present)
 icon_path = PROJECT_ROOT / 'icon.ico'

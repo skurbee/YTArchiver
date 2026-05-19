@@ -1,0 +1,778 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-tabs-data.css — Subs + Recent tabs + per-row context menus
+
+   Extracted from styles.css (Patch 18, v72.0). Contains:
+     • Subs tab: channel table, column widths, mark cells
+     • Recent tab: downloads list, grid view, filter input
+     • Subs context menu (right-click on a row)
+     • Queue popovers (Sync Tasks + GPU Tasks dropdown panels)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ═══ Subs tab ═══ */
+.subs-area {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 14px 14px 0;
+  overflow: hidden;
+}
+.subs-header-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 4px;
+}
+.subs-section-label {
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+.subs-table-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--c-log-bg);
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  overflow-y: auto;
+  overflow-x: hidden; /* the user: no horizontal scrollbar on subs list.
+                          Folder-name column ellipsises instead. */
+}
+.subs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-log);
+  font-size: 12px;
+  color: var(--c-text);
+  table-layout: fixed;
+}
+.subs-table thead {
+  position: sticky;
+  top: 0;
+  background: var(--c-log-bg);
+  z-index: 1;
+}
+.subs-table thead::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 1px;
+  background: var(--c-border);
+  pointer-events: none; /* don't eat clicks on col-resizer handle */
+}
+.subs-table th {
+  text-align: right;
+  padding: 6px 8px 8px;
+  color: var(--c-dim);
+  font-weight: 400;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+/* Sort direction arrow injected via `th.dataset.arrow` in wireTableSort. */
+.subs-table th[data-arrow]::after,
+.recent-table th[data-arrow]::after {
+  content: attr(data-arrow);
+  color: var(--c-accent);
+  margin-left: 4px;
+  font-size: 10px;
+  vertical-align: 1px;
+}
+.subs-table th[data-arrow=""]::after,
+.recent-table th[data-arrow=""]::after {
+  content: "";
+}
+.subs-table th.col-folder {
+  text-align: left;
+  padding-left: 10px;
+}
+.subs-table td {
+  padding: 2px 8px;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  /* Audit fix: was `clip`, which hard-cuts long values (e.g. a wide
+     "Last Sync" string in a narrowed column). Ellipsis is the
+     standard affordance — tells the user there's more to see. */
+  text-overflow: ellipsis;
+}
+.subs-table td.col-folder {
+  text-align: left;
+  padding-left: 10px;
+  color: var(--c-text);
+  /* Ellipsis long folder names so the table never widens past its frame. */
+  text-overflow: ellipsis;
+  max-width: 0; /* table-layout:fixed + max-width:0 = proper ellipsis in a td */
+}
+/* Redownload-pending dot: chartreuse circle trailing the channel
+   name when `_redownload_progress.json` exists for that channel. */
+.sub-redwnl-dot {
+  color: var(--c-log-redwnl);
+  font-size: 9px;
+  vertical-align: middle;
+  margin-left: 4px;
+  line-height: 1;
+}
+/* Alternating row colors — matches YTArchiver.py:4958 odd/even tag pattern.
+   Use :nth-child(even) on tbody so hover + selection overrides still work. */
+.subs-table tbody tr:nth-child(even) td {
+  background: var(--c-log-row-alt);
+}
+.subs-table td.col-mark {
+  text-align: center;
+  color: var(--c-accent);
+}
+.subs-table col.col-folder { width: 28%; }
+.subs-table col.col-num { width: 6%; }
+.subs-table col.col-mark { width: 9%; }
+.subs-table col.col-date { width: 10%; }
+.subs-table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.025);
+}
+.subs-table tbody tr.row-selected td {
+  background: rgba(96, 160, 255, 0.12);
+}
+
+/* Hide the Avg filesize column when the Settings toggle
+   "Show Avg filesize in subs tab" is off. The Avg column is the last
+   one in both the <thead> and each <tbody> row (see index.html ~line
+   271 + logs.js renderSubsTable). Also hides the matching <col> so
+   the remaining columns expand to fill the reclaimed width. */
+.subs-table.hide-avg-col thead th:last-child,
+.subs-table.hide-avg-col tbody td:last-child,
+.subs-table.hide-avg-col colgroup col:last-child {
+  display: none;
+}
+
+.add-channel-box {
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--c-border);
+}
+.add-channel-row {
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+.add-channel-row .ctl-label { min-width: auto; }
+
+/* Edit-channel inline panel — 4-column label/value grid for clarity */
+.edit-channel-box {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding: 8px 12px 10px;
+  border-top: 1px solid var(--c-border);
+  background: rgba(255, 255, 255, 0.015);
+  font-size: 12px;
+}
+.edit-channel-box > .subs-section-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  color: var(--c-accent);
+}
+
+/* Flex-row Edit-channel form.
+   Layout model: `.edit-form` stacks `.edit-row`s vertically; each row
+   holds one or more `.edit-field`s side-by-side. Every `.edit-field`
+   carries its own label AND value inline (label left, value right)
+   so labels can NEVER drift from their values — no grid-cell tricks.
+
+   Hidden panels (video-nudge, compress-group) are standalone rows
+   that `display:none` cleanly without reshuffling any other field. */
+.edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.edit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: center;
+}
+.edit-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.edit-field-grow {
+  flex: 1 1 240px;          /* input + label grows; 240 is the wrap point */
+}
+.edit-field-grow > input.ctl-input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.edit-field-full {
+  flex: 1 1 100%;
+}
+.edit-gl {
+  color: var(--c-accent);
+  font-size: 11.5px;
+  white-space: nowrap;
+  text-align: left;
+}
+.edit-nudge-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  font-size: 12px;
+}
+.edit-nudge-row[hidden] { display: none !important; }
+
+/* Legacy grid selectors — kept as no-ops so residual markup /
+   class-references elsewhere don't trip on missing rules. */
+.edit-grid { display: contents; }
+.edit-gl-spacer, .edit-gv-inline, .edit-gv-span, .edit-gl-row-start {
+  /* Fall back to flex container behavior if anything still uses them. */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Progressive disclosure: in Add mode with no input yet, hide everything
+   except the first row (Folder Name + Channel URL). The `.edit-form` is
+   flex-column with 1st child = row 1, so children 2+ are the hidable
+   rows (nudge, resolution+duration, range, folder-org+options,
+   compress-group). Flips off when the user types.
+   Matches YTArchiver.py:16903 _set_add_details_visible. */
+.edit-channel-box.collapsed .edit-form > *:nth-child(n+2),
+.edit-channel-box.collapsed .edit-diskstats,
+.edit-channel-box.collapsed .edit-actions,
+.edit-channel-box.collapsed .edit-compress-group {
+  display: none;
+}
+.edit-options { gap: 20px; }
+
+.edit-grid .ctl-input,
+.edit-grid .ctl-select {
+  padding: 3px 7px;
+  font-size: 12px;
+  height: 24px;
+  min-width: 0;
+}
+.edit-grid > input.ctl-input {
+  width: 100%;
+}
+.edit-res { width: 84px; flex: 0 0 84px; }
+.edit-num {
+  width: 56px;
+  flex: 0 0 56px;
+  text-align: center;
+}
+.edit-date-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.edit-date-group[hidden] { display: none; }
+.edit-date-part {
+  text-align: center;
+  flex: 0 0 auto;
+  padding: 3px 4px !important;
+}
+.edit-date-group > #edit-date-year { width: 56px; }
+.edit-date-group .edit-date-mm { width: 36px; }
+
+/* Compress expansion: Res / Quality / Batch dropdowns shown when checked */
+.edit-compress-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 2px;
+  padding-left: 10px;
+  border-left: 1px solid var(--c-border);
+}
+.edit-compress-group[hidden] { display: none; }
+.edit-compress-group .edit-dim { font-size: 11.5px; }
+.edit-batch {
+  width: 54px;
+  flex: 0 0 54px;
+}
+.edit-grid .icon-btn-slim { width: 26px; height: 26px; }
+.edit-grid .edit-dim { color: var(--c-dim); font-size: 11.5px; }
+
+/* Compact inline radio */
+.radio-label-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--c-text);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.radio-label-inline input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  display: none;
+}
+.radio-label-inline .radio-circle {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid var(--c-accent);
+  background: transparent;
+  position: relative;
+  flex: 0 0 11px;
+}
+.radio-label-inline input[type="radio"]:checked + .radio-circle::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--c-text);
+}
+
+.edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--c-border);
+}
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--c-text);
+  cursor: pointer;
+  user-select: none;
+  line-height: 1;
+}
+.checkbox-label input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--c-accent);
+  border-radius: 2px;
+  background: var(--c-input);
+  position: relative;
+  margin: 0;
+  cursor: pointer;
+  flex: 0 0 12px;
+}
+.checkbox-label input[type="checkbox"]:checked::after {
+  content: "\2713";
+  position: absolute;
+  inset: 0;
+  text-align: center;
+  line-height: 10px;
+  color: var(--c-log-green);
+  font-size: 11px;
+  font-weight: 700;
+}
+.edit-hint {
+  color: var(--c-dim);
+  font-size: 11px;
+  font-style: italic;
+}
+.edit-row-actions {
+  margin-top: 6px;
+  gap: 6px;
+}
+.edit-row-actions .btn { padding: 4px 11px; font-size: 11.5px; }
+.btn-cancel-red {
+  background: var(--c-cancel);
+  border-color: #7e2020;
+  color: var(--c-text);
+}
+.btn-cancel-red:hover { background: #7e2020; }
+
+/* ═══ Recent tab ═══ */
+.recent-area {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 14px 14px 0;
+  overflow: hidden;
+}
+.recent-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.recent-label {
+  color: var(--c-dim);
+  font-size: 12px;
+}
+.btn-warn {
+  background: var(--c-warn);
+  border-color: #8a4e1c;
+  color: var(--c-text);
+}
+/* audit E-28: hover LIGHTER than base, matching other warn/danger
+   buttons. Previous hover (#5a2f0d) was darker than base (#6b3a10),
+   which visually read as "pressed" or "disabled" on hover rather
+   than the expected brighten. */
+.btn-warn:hover { background: #7e4616; }
+.recent-table-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--c-log-bg);
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  overflow: auto;
+}
+.recent-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-log);
+  font-size: 12px;
+  color: var(--c-text);
+  table-layout: fixed;
+}
+.recent-table thead {
+  position: sticky;
+  top: 0;
+  background: var(--c-log-bg);
+  z-index: 1;
+}
+.recent-table th {
+  text-align: left;
+  padding: 6px 10px 8px;
+  color: var(--c-dim);
+  font-weight: 400;
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--c-border);
+}
+.recent-table th.right { text-align: right; }
+.recent-table th:hover { color: var(--c-text); }
+.recent-table td {
+  padding: 2px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.recent-table td.right { text-align: right; }
+.recent-table col.col-title { width: auto; }
+.recent-table col.col-channel { width: 160px; }
+.recent-table col.col-time { width: 100px; }
+.recent-table col.col-length { width: 72px; }
+.recent-table col.col-size { width: 72px; }
+/* audit F-45: use the palette token (see :root --c-log-row-odd). */
+.recent-table tbody tr:nth-child(odd) td { background: var(--c-log-row-odd); }
+.recent-table tbody tr:nth-child(even) td { background: var(--c-log-bg); }
+.recent-table tbody tr:hover td { background: rgba(255,255,255,0.04); }
+.recent-table tbody tr.row-selected td { background: rgba(96,160,255,0.12); }
+
+/* Recent tab grid-card view — opt-in via Settings > "Recent view: Grid".
+   Uses the same .video-grid layout as the channel video grid (cards
+   auto-fill at 240px min-width). Wrapper gives it a scroll container
+   so long recent-download lists don't push the page chrome. */
+.recent-grid-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--c-log-bg);
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  overflow: auto;
+  padding: 12px;
+}
+
+/* ═══ Subs context menu (and general right-click menus) ═══ */
+.ctx-menu {
+  position: fixed;
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 4px 0;
+  min-width: 180px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  /* audit H-24: was 10000, sitting above the modal backdrop
+     (.yt-modal / .askq-backdrop at 9999). A right-click inside a
+     confirm dialog drew the context menu on top of the dialog,
+     trapping the user. Dropped to 9500 so modals always overlay. */
+  z-index: 9500;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  user-select: none;
+}
+.ctx-menu-item {
+  padding: 6px 14px;
+  color: var(--c-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-menu-item:hover { background: var(--c-btn); }
+.ctx-menu-item.dim { color: var(--c-dim); }
+.ctx-menu-item.danger { color: var(--c-log-red, #d36e6e); }
+.ctx-menu-item.danger:hover {
+  background: rgba(211, 110, 110, 0.12);
+  color: var(--c-log-red, #d36e6e);
+}
+.ctx-menu-item.disabled { color: var(--c-dim); cursor: default; }
+.ctx-menu-item.disabled:hover { background: transparent; }
+.ctx-menu-sep {
+  height: 1px;
+  background: var(--c-border);
+  margin: 4px 0;
+}
+.ctx-submenu-wrap {
+  position: relative;
+}
+.ctx-submenu-wrap::after {
+  content: "\25B8";
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--c-dim);
+  font-size: 9px;
+}
+.ctx-submenu {
+  position: absolute;
+  left: 100%;
+  top: -4px;
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 4px 0;
+  min-width: 160px;
+  display: none;
+}
+.ctx-submenu-wrap:hover > .ctx-submenu { display: block; }
+
+/* ═══ Queue popovers (Sync Tasks, GPU Tasks) ═══
+   Anchored to the icon button, like a dropdown. Not a centered modal. */
+.queue-popover {
+  position: fixed;
+  display: none;
+  flex-direction: column;
+  min-width: 360px;
+  max-width: 520px;
+  max-height: 70vh;
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+  z-index: 9000;
+  overflow: hidden;
+  font-family: var(--font-ui);
+}
+.queue-popover.open { display: flex; }
+.queue-popover-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  height: 28px;
+}
+.queue-popover-title {
+  color: var(--c-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.queue-auto-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--c-text);
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.queue-model-swap-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--c-dim);
+  font-size: 11px;
+  user-select: none;
+}
+.queue-model-swap-wrap > span {
+  margin-right: 2px;
+}
+.ctl-select.ctl-select-thin {
+  padding: 1px 16px 1px 6px;
+  font-size: 11px;
+  height: 20px;
+}
+.queue-auto-wrap input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--c-accent);
+  border-radius: 2px;
+  background: transparent;
+  display: inline-block;
+  position: relative;
+  margin: 0;
+  vertical-align: middle;
+  cursor: pointer;
+}
+.queue-auto-wrap input[type="checkbox"]:checked::after {
+  content: "\2713";
+  position: absolute;
+  inset: 0;
+  color: var(--c-log-green);
+  font-size: 11px;
+  line-height: 10px;
+  text-align: center;
+}
+.queue-auto-wrap input[type="checkbox"]:disabled,
+.queue-auto-wrap:has(input[type="checkbox"]:disabled) {
+  cursor: help;
+}
+.queue-popover-body {
+  overflow-y: auto;
+  max-height: 260px;
+  padding: 4px 0;
+  background: var(--c-raised);
+}
+.queue-popover-body .queue-task-row {
+  display: grid;
+  grid-template-columns: 22px 14px 1fr auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-family: var(--font-log);
+  font-size: 12px;
+  color: var(--c-text);
+  cursor: grab;
+  border-left: 2px solid transparent;
+}
+.queue-popover-body .queue-task-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.queue-popover-body .queue-task-row.drag-src {
+  opacity: 0.35;
+  cursor: grabbing;
+}
+.queue-popover-body .queue-task-row.drag-target-above {
+  border-top: 2px solid var(--c-log-green);
+  padding-top: 2px;
+}
+.queue-popover-body .queue-task-row.drag-target-below {
+  border-bottom: 2px solid var(--c-log-green);
+  padding-bottom: 2px;
+}
+.queue-popover-body .queue-task-row.running {
+  border-left-color: var(--c-log-green);
+}
+.queue-popover-body .queue-task-row.paused {
+  border-left-color: var(--c-log-sum);
+}
+.queue-task-index {
+  color: var(--c-dim);
+  font-size: 11px;
+  text-align: right;
+}
+.queue-task-state {
+  color: var(--c-log-green);
+  font-size: 11px;
+  text-align: center;
+  line-height: 1;
+}
+.queue-task-state.paused { color: var(--c-log-sum); }
+.queue-task-state.queued { color: var(--c-dim); }
+
+/* Cycling dots on the active task row. Pure CSS keyframes cycle through
+   three content values so there's no JS timer churn. Matches
+   YTArchiver.py:20131 _active_label dot cycle. */
+@keyframes queue-dots-kf {
+  0%, 33% { content: "\00B7 \00B7 \00B7"; }
+  34%, 66% { content: "\00B7 \00B7 "; }
+  67%, 100% { content: "\00B7 "; }
+}
+.queue-task-dots {
+  display: inline-block;
+  min-width: 18px;
+  color: var(--c-log-green);
+  font-weight: 700;
+  letter-spacing: 1px;
+  margin-left: 6px;
+}
+.queue-task-dots::after {
+  content: "\00B7 \00B7 \00B7";
+  animation: queue-dots-kf 1.2s steps(1, end) infinite;
+}
+.queue-task-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-task-name em {
+  color: var(--c-log-blue);
+  font-style: normal;
+}
+.queue-task-name.downloading em { color: var(--c-log-green); }
+.queue-task-name.transcribing em { color: var(--c-log-blue); }
+.queue-task-name.metadata em { color: var(--c-log-pink); }
+
+/* Queue-verb colour tokens (match activity-log tag palette) */
+.queue-task-name .qv-sync { color: var(--c-log-green); font-weight: 500; }
+.queue-task-name .qv-trans { color: var(--c-log-blue); font-weight: 500; }
+.queue-task-name .qv-meta { color: var(--c-log-pink); font-weight: 500; }
+.queue-task-name .qv-redwnl { color: var(--c-log-redwnl); font-weight: 500; }
+.queue-task-name .qv-compress { color: var(--c-log-compress);font-weight: 500; }
+.queue-task-name .qv-reorg { color: var(--c-log-reorg); font-weight: 500; }
+.queue-task-close {
+  background: transparent;
+  border: none;
+  color: var(--c-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.queue-task-close:hover { color: var(--c-log-red); }
+.queue-empty {
+  padding: 18px 14px;
+  color: var(--c-dim);
+  font-style: italic;
+  text-align: center;
+  font-size: 12px;
+}
+.queue-popover-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--c-surface);
+  border-top: 1px solid var(--c-border);
+}
+.queue-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--c-btn);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-size: 11.5px;
+  font-family: var(--font-ui);
+  padding: 4px 10px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.queue-btn svg { width: 11px; height: 11px; }
+.queue-btn:hover { background: var(--c-primary); }
+.queue-btn-cancel {
+  background: #5a1818;
+  border-color: #7a2020;
+}
+.queue-btn-cancel:hover { background: #6b1e1e; }
+.queue-btn-thin {
+  font-size: 11px;
+  padding: 3px 8px;
+  margin-left: auto;
+}
+

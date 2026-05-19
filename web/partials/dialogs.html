@@ -1,0 +1,228 @@
+  <!-- Settings moved to a top-level tab (#panel-settings). The old modal
+       backdrop was removed so the former ⚙ Settings button in the Subs
+       header no longer has anywhere to open. -->
+
+
+  <!-- About dialog -->
+  <div class="askq-backdrop" id="about-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:420px;">
+      <div class="askq-header">About YT Archiver</div>
+      <div class="askq-body" id="about-body">Loading&hellip;</div>
+      <div class="askq-buttons">
+        <button class="btn btn-primary" id="about-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- feature F8: Compress dry-run results dialog. Shows projected
+       disk savings per-channel + grand totals at each quality tier for
+       a user-chosen output resolution. Read-only; does not trigger any
+       compression. -->
+  <div class="askq-backdrop" id="compress-dry-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+      <div class="askq-header">
+        <span>Compress savings &mdash; dry run</span>
+        <span class="status-text" id="compress-dry-summary" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" style="padding:10px 16px;">
+        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
+          <label class="edit-gl" style="flex:0 0 auto;">Output resolution:</label>
+          <select class="ctl-select" id="compress-dry-res" style="width:auto;">
+            <option value="480">480p</option>
+            <option value="720" selected>720p</option>
+            <option value="1080">1080p</option>
+            <option value="1440">1440p</option>
+            <option value="2160">2160p</option>
+          </select>
+          <!-- Re-run action gets the primary (green) treatment so the
+               "do something" affordance is visually obvious (UI audit). -->
+          <button class="btn btn-primary btn-thin" id="compress-dry-recalc">Recompute</button>
+        </div>
+        <div id="compress-dry-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
+          <div class="browse-empty" style="padding:16px;">Computing&hellip;</div>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="compress-dry-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Transcript drift scan/fix modal (feature H-2) -->
+  <div class="askq-backdrop" id="drift-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:620px;max-width:900px;width:80vw;">
+      <div class="askq-header">
+        <span>Transcript drift &mdash; scan &amp; fix</span>
+        <span class="status-text" id="drift-summary" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" style="padding:10px 16px;">
+        <div class="edit-gv-inline" style="gap:6px;margin-bottom:10px;">
+          <label class="edit-gl" style="flex:0 0 auto;">Channel:</label>
+          <select class="ctl-select" id="drift-channel" style="flex:1;max-width:400px;"></select>
+          <!-- Primary action for this modal — green so the "go" is obvious. -->
+          <button class="btn btn-primary btn-thin" id="drift-scan-btn">Scan</button>
+        </div>
+        <div id="drift-body" style="max-height:55vh;overflow-y:auto;font-size:12px;">
+          <div class="browse-empty" style="padding:16px;">Pick a channel and click Scan.</div>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <!-- Primary (green) "Fix all" so the user can spot the action
+             after the scan completes. Stays disabled until the scan
+             finishes and surfaces something fixable. -->
+        <button class="btn btn-primary" id="drift-fix-btn" disabled
+                title="Apply all three fixes: rebuild missing .txt entries, queue Whisper retranscribe for .txt-only entries, rebuild FTS if phantoms found">Fix all</button>
+        <button class="btn btn-ghost" id="drift-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Repair YT auto-captions dialog. Re-parses YouTube auto-caption
+       VTTs for archived videos and rewrites the per-word array in the
+       JSONL + DB. Long-running — kicks off a background thread; progress
+       streams to the main log so the user can close the modal. -->
+  <div class="askq-backdrop" id="repair-yt-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:420px;max-width:520px;width:60vw;">
+      <div class="askq-header">
+        <span>Repair YT auto-captions</span>
+      </div>
+      <div class="askq-body" style="padding:12px 14px;">
+        <div style="font-size:12px;line-height:1.4;margin-bottom:10px;color:var(--c-dim,#94a3b8);"
+             title="Re-parses YouTube auto-captions for already-archived videos to fix the pre-v64.7 parser bugs (dropped rolled-in words; segment-boundary duplications). Hits YouTube once per video, queues as a Sync Task, pausable/cancellable/resumable. Whisper-transcribed videos are auto-skipped, as are YT+PUNCTUATION videos where the new VTT comes back lowercase (would downgrade punctuation).">
+          Re-parses YT captions to fix the pre-v64.7 word-drop and
+          segment-boundary duplication bugs. Queues as a Sync Task.
+          <span style="text-decoration: underline dotted; cursor: help;">Details</span>
+        </div>
+        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:8px 12px;">
+          <label class="edit-gl">Scope</label>
+          <select class="ctl-select" id="repair-yt-channel"
+                  style="max-width:360px;"></select>
+
+          <label class="edit-gl">Dry-run</label>
+          <label style="font-size:12px;">
+            <input type="checkbox" id="repair-yt-dryrun" />
+            Fetch + parse only, don't write
+          </label>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-primary" id="repair-yt-run"
+                title="Start the repair. Modal closes; progress shows in the main log.">Run</button>
+        <button class="btn btn-ghost" id="repair-yt-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Restore transcript punctuation dialog. Walks per-segment text
+       for YT-captioned videos, runs each through the punctuation model,
+       writes the punctuated form back to DB + JSONL. -->
+  <div class="askq-backdrop" id="punct-restore-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:420px;max-width:520px;width:60vw;">
+      <div class="askq-header">
+        <span>Restore transcript punctuation</span>
+      </div>
+      <div class="askq-body" style="padding:12px 14px;">
+        <div style="font-size:12px;line-height:1.4;margin-bottom:10px;color:var(--c-dim,#94a3b8);"
+             title="Walks per-segment text for YT-captioned videos in scope, runs each segment through the PunctuationManager (the same punct-restoration worker the Whisper path uses), and writes the punctuated form back to segments.text + the JSONL. The per-word array used by the video overlay is left as raw lowercase so the overlay captions stay readable in short chunks. Already-punctuated videos are skipped automatically.">
+          Adds sentence punctuation + capitalization to legacy
+          YT-captioned transcripts. Queues as a Sync Task.
+          <span style="text-decoration: underline dotted; cursor: help;">Details</span>
+        </div>
+        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap:8px 12px;">
+          <label class="edit-gl">Scope</label>
+          <select class="ctl-select" id="punct-restore-channel"
+                  style="max-width:360px;"></select>
+
+          <label class="edit-gl">Dry-run</label>
+          <label style="font-size:12px;">
+            <input type="checkbox" id="punct-restore-dryrun" />
+            Load model + parse, don't write
+          </label>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-primary" id="punct-restore-run"
+                title="Start the punctuation pass. Modal closes; progress shows in the main log.">Run</button>
+        <button class="btn btn-ghost" id="punct-restore-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Diagnostics dialog -->
+  <div class="askq-backdrop" id="diag-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:560px;max-width:720px;width:72vw;">
+      <div class="askq-header">
+        <span>Diagnostics</span>
+        <span class="status-text" id="diag-summary" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" id="diag-body"
+           style="padding:0;max-height:55vh;overflow-y:auto;">
+        <div class="diag-rows" id="diag-rows">
+          <div class="browse-empty" style="padding:16px;">Running self-check&hellip;</div>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="diag-close">Close</button>
+        <!-- Re-run is the primary action when the user wants to retry
+             a failed check. Painted green to match the rest of the app. -->
+        <button class="btn btn-primary" id="diag-refresh">Re-run</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Manual Transcribe dialog &mdash; supports both single-file AND folder-walk
+       modes, matching YTArchiver.py:16083 _start_manual_transcription. -->
+  <div class="askq-backdrop" id="manual-tx-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:440px;">
+      <div class="askq-header">Manual Transcribe</div>
+      <div class="askq-body">
+        <div class="edit-grid" style="grid-template-columns: auto 1fr; gap: 8px 14px;">
+          <label class="edit-gl">Video file</label>
+          <div class="edit-gv-inline" style="gap:4px;">
+            <input type="text" class="ctl-input" id="manual-tx-path" readonly style="flex:1;" placeholder="Click Browse&hellip;" />
+            <button class="btn btn-ghost btn-thin" id="manual-tx-browse">Browse&hellip;</button>
+          </div>
+          <label class="edit-gl">Or folder</label>
+          <div class="edit-gv-inline" style="gap:4px;">
+            <button class="btn btn-ghost btn-thin" id="btn-transcribe-folder"
+                    title="Pick a folder \u2014 every video/audio file under it will be queued">Pick folder &amp; queue all&hellip;</button>
+            <span class="co-hint">(recurses subfolders)</span>
+          </div>
+          <label class="edit-gl">Model</label>
+          <select class="ctl-select" id="manual-tx-model">
+            <option value="tiny">tiny (fastest)</option>
+            <option value="small" selected>small</option>
+            <option value="medium">medium</option>
+            <option value="large-v3">large-v3 (best)</option>
+          </select>
+        </div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="manual-tx-cancel">Cancel</button>
+        <button class="btn btn-primary" id="manual-tx-confirm">Queue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Autorun history full-view dialog -->
+  <div class="askq-backdrop" id="autorun-history-backdrop" style="display:none;">
+    <div class="askq-dialog" style="min-width:680px; max-width: 900px; width: 90vw;">
+      <div class="askq-header">
+        <span>Autorun history</span>
+        <span class="status-text" id="autorun-history-count" style="margin-left:auto;"></span>
+      </div>
+      <div class="askq-body" style="padding: 0; max-height: 55vh; overflow-y: auto;">
+        <div class="ah-filter-row" style="padding: 8px 12px; border-bottom: 1px solid var(--c-border);">
+          <input type="text" class="ctl-input" id="autorun-history-filter"
+                 placeholder="Filter&hellip;" style="max-width:240px;" />
+        </div>
+        <div class="ah-entries" id="autorun-history-entries"
+             style="font-family: var(--font-log); font-size: 12px; padding: 6px 0;"></div>
+      </div>
+      <div class="askq-buttons">
+        <button class="btn btn-ghost" id="autorun-history-cancel">Close</button>
+        <button class="btn btn-ghost" id="autorun-history-export">Export CSV</button>
+      </div>
+    </div>
+  </div>
+

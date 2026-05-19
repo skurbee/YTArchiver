@@ -7,12 +7,12 @@ important functions inside it.
 ## What YTArchiver is
 
 YTArchiver is a desktop app that maintains a local video
-archive of YouTube channels you subscribe to. You give a list of
+archive of YouTube channels. You give a list of
 channels; it periodically syncs each one, downloads any new videos
 via `yt-dlp`, transcribes them with Whisper, fetches their metadata,
 and stores everything in a structured folder tree on disk. The point
 is to own a permanent, offline-accessible copy of content that might
-disappear from YouTube.
+disappear in the future.
 
 A small SQLite index makes everything searchable across all channels,
 including full-text search inside transcripts. The UI shows you each
@@ -39,7 +39,7 @@ don't exist for Python 3.13 (which is what the main app uses).
 
 ## Top-level files
 
-### `main.py`  ·  ~7,500 lines
+### `main.py`  ·  ~1,400 lines
 The entry point. Defines the `Api` class, which is the single object
 exposed to JavaScript via `pywebview`. Every user-facing action the
 UI can trigger — adding a channel, starting a sync, scrubbing through
@@ -144,7 +144,7 @@ have a real file). Used by the maintenance pass in Settings.
 **Key functions:** `scan_channel`, `apply_channel`,
 `rebuild_fts_index`.
 
-### `index.py`  ·  the SQLite database
+### `index.py`  ·  the SQLite database (entry module)
 THE central data store. Every downloaded video gets a row here with
 its title, channel, upload date, duration, file path, transcription
 state, and metadata-fetch state. Browse / Search / Recent / Graph
@@ -153,13 +153,59 @@ all read from this DB.
 Also stores transcript SEGMENTS (one row per Whisper segment per
 video) so full-text search can pinpoint matches inside transcripts.
 
-**Key functions:** `register_video`, `mark_video_transcribed`,
-`ingest_jsonl` (loads a transcript JSONL into the segment table),
-`list_recent_videos`, `list_videos_for_channel`, `get_segments`,
-`get_segment_context`, `search_video_titles`, `search_fts`,
-`graph_word_frequency`, `graph_multi`, `bookmark_add`/`_list`/
-`_remove`/`_update_note`, `bucket_totals`, `top_words`,
-`summary`, `sweep_new_videos`.
+This file owns the connection management (`_open` / `_reader_open`),
+schema, and the most-called read/write functions. Specialized query
+families live in sibling modules (`index_search.py`, `index_graph.py`,
+`index_bookmarks.py`, `index_maintenance.py`) which `index.py`
+re-exports for back-compat.
+
+**Key functions (still in this file):** `register_video`,
+`mark_video_transcribed`, `ingest_jsonl`, `list_recent_videos`,
+`list_videos_for_channel`, `preload_channel_videos`,
+`preload_all_channels`, `find_thumbnail`,
+`new_videos_in_last_n_days`, `channel_transcription_stats`,
+`get_segments`, `get_segment_context`, `summary`.
+
+**Connection primitives:** `_open` (writer-shared), `_reader_open`
+(parallel reader for non-mutating queries), `_open_independent`
+(fresh per-thread connection for long-running writes like sweep).
+
+### `index_search.py`  ·  FTS5 + title search
+Extracted from `index.py` (Patch 17). Owns the Browse > Search
+backend.
+
+**Key functions:** `search_video_titles` (LIKE-based titles),
+`search_fts` (FTS5 MATCH over transcript segments), `_sanitize_fts_query`.
+
+### `index_graph.py`  ·  word-frequency graphing
+Extracted from `index.py` (Patch 17). Powers Browse > Graph.
+
+**Key functions:** `bucket_totals`, `top_words`,
+`graph_word_frequency`, `graph_multi`, `graph_channel_overlay`,
+`graph_word_frequency_multi`, `backfill_upload_ts`,
+`list_all_channels_in_db`.
+
+### `index_bookmarks.py`  ·  bookmark CRUD
+Extracted from `index.py` (Patch 20).
+
+**Key functions:** `bookmark_add`, `bookmark_list`, `bookmark_remove`,
+`bookmark_update_note`.
+
+### `index_maintenance.py`  ·  archive sweep + prune + FTS rebuild
+Extracted from `index.py` (Patch 20). The startup sweep, the
+"Rescan archive" button, and the "Rebuild FTS index" button all
+live here.
+
+**Key functions:** `sweep_new_videos`, `prune_missing_videos`,
+`rebuild_fts_index`.
+
+### `html_assembler.py`  ·  build web/index.html at boot
+Extracted from inline main.py code (Patch 19). Reads
+`web/index.template.html` + every `<!-- @include partials/X.html -->`
+marker and writes the assembled `web/index.html`. Idempotent — the
+mtime check skips rewrite when nothing changed.
+
+**Key function:** `assemble_index_html(web_dir)`.
 
 ### `livestreams.py`  ·  defer "not downloadable yet" videos
 Detects when yt-dlp returns a "video unavailable / livestream not
@@ -190,11 +236,23 @@ Sync Log, mini-logs, and activity rows ride on.
 `emit_header`, `emit_activity`, `_line_is_verbose_only` (the
 simple-mode filter that hides chatty output).
 
-### `metadata.py`  ·  views / likes / comments refresh
+### `metadata/`  ·  views / likes / comments refresh  ·  package
 yt-dlp metadata refresh pipeline for already-downloaded videos. Pulls
 view counts, like counts, comments, and descriptions; writes a sidecar
 `.txt` and updates the index DB. The Settings > Metadata tab drives
 this.
+
+Package layout (all symbols re-exported via `metadata/__init__.py`):
+- `core.py` — title-match strategies + bulk-stats pipeline
+- `fetcher.py` — per-video / per-batch yt-dlp metadata fetch
+- `refresh.py` — re-export shim
+- `refresh_views.py` — `bulk_refresh_views_likes` (extracted Patch 22)
+- `refresh_comments.py` — `refresh_channel_comments` (extracted Patch 22)
+- `refresh_fetch.py` — `fetch_channel_metadata` (extracted Patch 22)
+- `_refresh_proxies.py` — lazy proxies into core.py for the three
+  refresh modules above
+- `normalize.py`, `scan.py`, `thumbnails_ops.py` — text utils,
+  metadata-row scanning, thumbnail housekeeping
 
 **Key functions:** `fetch_single_video_metadata`,
 `fetch_metadata_for_videos` (batch), `bulk_refresh_views_likes`,
@@ -264,17 +322,32 @@ applies defaults to new channel records.
 `remove_channel`, `get_channel`, `list_channels`,
 `ensure_videos_suffix`, `streams_url`.
 
-### `sync.py`  ·  the central download path  ·  ~3,200 lines
-THE single most important file in the backend. Wraps `yt-dlp` as a
+### `sync/`  ·  the central download path  ·  package
+THE single most important area of the backend. Wraps `yt-dlp` as a
 subprocess for each channel sync, parses its stdout line by line,
 emits log lines through the LogStreamer, and dispatches inline
 metadata + transcribe jobs as each video completes.
 
+Package layout (all symbols re-exported via `sync/__init__.py`):
+- `core.py` — `sync_channel`, the per-channel orchestration giant
+- `sync_all.py` — `sync_all`, the multi-channel batch coordinator
+- `sync_helpers.py` — small file/format helpers (`_hide_sidecar_win`,
+  `_sweep_orphan_vtts`, `_scan_recent_video`, `_resolve_final_mp4`,
+  `_fmt_duration`, `_fmt_size`)
+- `log_rows.py` — activity-log row emission + persistence
+  (`emit_consolidated_auto_row`, `emit_metadata_activity_row`,
+  `_sync_row_emit`, `_persist_row_history`)
+- `quickcheck.py` — fast "are there new uploads?" probe
+- `ytdlp_proc.py` — yt-dlp subprocess plumbing
+- `recent_track.py` — Recent-tab download tracking (`_record_recent_download`)
+- `active_state.py` — in-flight sync-channel tracking + metadata-changed hook
+- `display_push.py` — sync-progress JSON writes for a companion display
+
 **Key functions:**
-- `sync_channel` — the giant central function. Walks one channel,
-  spawns yt-dlp, parses every output line, manages the per-video
-  Downloading-line lifecycle, handles cookie / livestream / archive-
-  skip / Merger / DLTRACK events.
+- `sync_channel` — the central function. Walks one channel, spawns
+  yt-dlp, parses every output line, manages the per-video Downloading-
+  line lifecycle, handles cookie / livestream / archive-skip / Merger
+  / DLTRACK events.
 - `sync_all` — top-level batch sync across all subscribed channels.
 - `build_format_string` — turns a resolution preference (e.g. "1080")
   into the right yt-dlp format selector.
@@ -297,7 +370,7 @@ cancelled / crashed yt-dlp invocations.
 **Key functions:** `is_partial_file`, `cleanup_folder`,
 `startup_cleanup_temps`.
 
-### `transcribe.py`  ·  Whisper manager  ·  ~3,000 lines
+### `transcribe/`  ·  Whisper manager  ·  package
 Owns the transcription pipeline. Two paths:
 1. **Fast path:** if YouTube has captions, just download those via
    yt-dlp and parse the VTT — no Whisper needed.
@@ -305,6 +378,18 @@ Owns the transcription pipeline. Two paths:
    3.11 → faster-whisper → CUDA), then run punctuation restoration
    on the output, then write the per-video `.txt` and the merged
    channel `Transcript.txt`.
+
+Package layout (all symbols re-exported via `transcribe/__init__.py`):
+- `core.py` — `TranscribeManager` + worker loop
+- `helpers.py` — pure helpers (path/title resolution, `find_python311`,
+  `_extract_video_id`, `_bump_transcription_pending`,
+  `_resolve_transcript_paths`, `_ffprobe_duration`, chunk constants)
+- `punct_manager.py` — `PunctuationManager` subprocess wrapper
+- `transcribe_vtt.py` — fast-path: `_try_auto_captions`,
+  `_fetch_captions_via_ytdlp`, `_parse_vtt`
+- `transcribe_files.py` — file I/O: `_write_jsonl_entry`,
+  `_write_transcript_entry`, `_replace_jsonl_entry`,
+  `_replace_txt_entry`
 
 **Key classes/functions:**
 - `class TranscribeManager` — the worker thread that consumes the
@@ -388,18 +473,54 @@ The single page. Defines:
 - Tab row (Subs / Browse / Settings)
 - Three tab panels — each is a full screen of UI
 - Floating overlays (modals, context menu, drawers, popups)
-- Script tags loading Chart.js, then `logs.js`, then `app.js`
+- Script tags loading util.js / bridge.js / ~40 feature modules,
+  then `logs.js`, then the rendering modules
+  (`queueRender.js`, `tables.js`, `browseGrids.js`, `watchView.js`),
+  then `app.js`
 
 The top-of-file comment in this file lists every section so a new dev
 can navigate.
 
-### `styles.css`  ·  ~3,000 lines
-All visual styling. Dark theme. CSS variables at the top define the
-color palette so theming is centralized. Sections are grouped by tab.
+### `styles.css` + `styles-*.css`  ·  ~5,100 lines total
+All visual styling. Dark theme. CSS variables (`:root` block in
+`styles.css`) define the color palette so theming is centralized.
+Split into themed sheets that load in cascade order:
 
-### `logs.js`
-The log-rendering and log-streaming logic that's separate from the
-rest of app.js for clarity. Owns:
+- `styles.css` (~290 lines) — `:root` vars, base, header, tab row,
+  tab panels
+- `styles-settings.css` (~790 lines) — Settings page
+- `styles-download-controls.css` (~500 lines) — Download tab controls
+- `styles-logs.css` (~430 lines) — Activity log + main log + tag classes
+- `styles-tabs-data.css` (~780 lines) — Subs + Recent tables, queue popovers
+- `styles-browse.css` (~1,090 lines) — Browse tab framing + sub-modes
+- `styles-browse-grids.css` (~390 lines) — Channel + Video grids
+- `styles-watch.css` (~450 lines) — Watch view + captions + drawer
+- `styles-dialogs.css` (~460 lines) — Dark dialogs + toasts + modals
+
+### Frontend module split
+
+`app.js` was originally a 10,000+ line monolith and `logs.js` ran to
+~3,000 lines. Both have been decomposed into focused single-concern
+files. Loaded in order by `index.html` and stitched together at
+runtime through `window.*` published handles. See the **Frontend
+modules** section below for what each one does.
+
+### `app.js`  ·  ~150 lines
+The bootstrap + tab init orchestrator that's left after extraction.
+A small `boot()` function calls every feature module's init function
+in dependency order. The IIFE wrapper exposes `window._trackBootObserver`
+so feature modules can attach MutationObservers to the same beforeunload
+cleanup pool.
+
+Exports a handful of `window.<name>` functions that Python calls via
+`evaluate_js(...)` — but the heavy ones (renderSubsTable,
+renderRecentTable, renderQueues, renderWatchView, renderChannelGrid,
+renderVideoGrid, _onRetranscribeComplete, etc.) now live in the
+extracted modules.
+
+### `logs.js`  ·  ~900 lines
+After extraction, focused entirely on log rendering — the Python →
+JS log pipe. Owns:
 - `window._logBatch(payload)` — entry point Python pushes log
   segments into. Inserts log lines into the main log and mini-logs.
 - `window.appendMainLog`, `window.renderActivityLog`,
@@ -409,21 +530,68 @@ rest of app.js for clarity. Owns:
   DOM position (so a Downloading row turns into a ✓ done row at the
   same spot, instead of stacking).
 
-### `app.js`  ·  ~10,800 lines
-The single frontend script for everything else. Wrapped in an IIFE
-so it doesn't leak globals. The top-of-file comment lists all 12
-functional areas; key ones:
-- Tab system + splitter
-- Subs tab (channel list, add / edit / remove)
-- Browse tab (channel grid, search, graphs, bookmarks, recent,
-  the embedded watch view with karaoke transcript)
-- Settings tab (per-channel + global toggles, metadata refresh)
-- Queue popups + mini-logs
-- The welcome / first-launch flow
-- `seedLogs()` — startup data pull from the Python bridge
+### Frontend modules (extracted from app.js + logs.js)
 
-Exports a handful of `window.<name>` functions that Python calls via
-`evaluate_js(...)` (renderSubsTable, renderActivityLog, etc).
+Each file is a self-contained IIFE that publishes its public surface
+through `window.<name>`. The order in `index.html` matters because
+later modules read earlier modules' globals.
+
+**Foundation (loaded first):**
+- `util.js` — `escapeHtml`, `escapeAttr`, `_formatTs`,
+  `onceIdempotent`; namespaced as `YT.util.*`.
+- `bridge.js` — `window.pywebview.api` shim + `bridgeCall(method,
+  ...)` helper that tolerates calls before the bridge is ready.
+- `browseState.js` — declares `window._browseState` early so
+  extracted modules close over the same object.
+
+**Shell + chrome:**
+- `chrome.js` — header strip, tab buttons, view switcher.
+- `shortcuts.js` — global keyboard shortcuts.
+- `queueBlink.js` — pause/resume button + queue badge state machine.
+- `dropdown.js` — custom select widget used in toolbars.
+- `contextMenu.js` — generic right-click menu used everywhere.
+- `logContextMenu.js` — log-line right-click (copy / open URL / etc).
+- `toasts.js` — `window._showToast(text, kind)`.
+- `modals.js` — `askConfirm`, `askDanger`, `askQuestion`,
+  `askChoice`, `askTextInput`.
+
+**Rendering modules (the heavy ones):**
+- `queueRender.js` — Sync / GPU task popover row builder.
+  Drag-reorder, right-click skip/cancel, verb-color tagging.
+  Publishes `renderQueues`, `_queueStateSnapshot`.
+- `queuePopovers.js` — open/close behavior of the popover containers
+  themselves (anchor, outside-click close, Escape).
+- `tables.js` — Subs channel table + Recent list/grid views.
+  Publishes `renderSubsTable`, `renderRecentTable`,
+  `_applySubsFilter`, `_applyRecentFilter`, `_applyRecentViewMode`.
+- `browseGrids.js` — Channel grid (Browse landing) + Video grid
+  (inside a channel) with year/month grouping and lazy-load batching.
+  Publishes `renderChannelGrid`, `renderVideoGrid`, `_buildVideoCard`
+  (also reused by the Recent grid).
+- `watchView.js` — Embedded video player + transcript karaoke +
+  WebVTT caption overlay + metadata drawer.
+  Publishes `renderWatchView`, `loadWatchMetadataDrawer`,
+  `_onRetranscribeComplete`, `setCaptionPref`.
+
+**Per-feature controllers (one file per UI feature):**
+- `downloadUrl.js`, `downloadDragDrop.js` — download URL bar +
+  drag-and-drop ingestion.
+- `clearButton.js`, `editChannel.js`, `syncSubbed.js` — Subs tab
+  buttons.
+- `autoSync.js`, `liveDrawer.js` — autorun controls + livestreams
+  drawer.
+- `columnSort.js`, `columnWidth.js` — table column sort + resize.
+- `recentContextMenu.js`, `browseContextMenus.js` — right-click menus.
+- `browseView.js`, `browseContent.js`, `browseSearch.js` —
+  Browse-tab view switching, content rendering, search.
+- `bookmarks.js`, `watchActions.js` — Watch view actions + bookmarks.
+- `graphTab.js` — Chart.js-driven word-frequency graphs.
+- `settingsTab.js`, `indexControls.js`, `aboutDialog.js`,
+  `diagnosticsDialog.js`, `manualTranscribe.js`, `autorunHistory.js`,
+  `logMode.js`, `scanArchive.js` — Settings tab pieces.
+- `activityLogVis.js`, `seedLogs.js`, `missingFolders.js` —
+  miscellaneous helpers.
+- `appDialogs.js`, `redownloadSampleModal.js` — modal dialogs.
 
 ### `vendor/chart.umd.min.js`
 Vendored Chart.js library. Renders the bar / line charts in the
@@ -506,13 +674,15 @@ to learn codebase, read in this order:
    module, all in one place.
 3. **`main.py`** top section — the `Api` class is how the UI talks
    to everything else; skim its method names to see the surface.
-4. **`backend/sync.py`** — the heart of the app. Understand its structure
-   (build yt-dlp command, loop over stdout, handle each line type).
+4. **`backend/sync/core.py`** — the heart of the app. `sync_channel`
+   builds the yt-dlp command, loops over stdout, handles each line
+   type. (Submodules under `sync/` are mostly extracted helpers — read
+   them only when their concern matters.)
 5. **`backend/index.py`** — the database underneath everything user-
    visible. Know the `register_video` / `list_videos_for_channel` /
    `search_fts` shape.
 6. **`web/index.html`** + **`web/app.js`** header — the page
    structure + section map are at the top of each file.
-7. **`backend/transcribe.py`** + **`backend/whisper_worker.py`** —
-   the transcription pipeline, only if you need to touch it.
+7. **`backend/transcribe/core.py`** + **`backend/whisper_worker.py`**
+   — the transcription pipeline, only if you need to touch it.
 

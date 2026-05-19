@@ -20,7 +20,11 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 
 # Same derivation as YTArchiver.py lines 91-94
@@ -81,14 +85,23 @@ DEFAULT_CONFIG = {
     "last_disk_scan_ts": 0.0,
 }
 
-_config_lock = threading.RLock()  # audit F-36: reentrant so nested
+_config_lock = threading.RLock()  # reentrant so nested
 # load_config→save_config→load_config sequences don't self-deadlock.
 # Several helpers (append_pending_tx_id, remove_pending_tx_id, etc.)
 # acquire this lock and can recurse via save_config → migration trigger
 # → save_config again. A non-reentrant Lock would wedge the first such
 # path the moment it recursed.
 
-# audit E-39: periodic backup trigger. Writes a dated snapshot every
+# RMW transaction lock. The pattern
+#     cfg = load_config(); cfg["foo"] = bar; save_config(cfg)
+# was used in 127 places — each call individually thread-safe (above)
+# but the COMBINED read-modify-write was NOT atomic across threads. Two
+# concurrent appends to channels[].pending_tx_ids could lose one. The
+# `config_transaction()` context manager below wraps both operations
+# under one lock acquisition so RMW is genuinely atomic.
+_config_tx_lock = threading.RLock()
+
+# periodic backup trigger. Writes a dated snapshot every
 # _BACKUP_EVERY_N_SAVES save_config() calls so recovery windows are
 # hourly (typical users save ~1-10 times per hour in normal use)
 # rather than only-at-startup. Counter resets on process restart;
@@ -152,7 +165,7 @@ CHANNEL_DEFAULTS_ALL = {
 }
 
 
-def _migrate_pending_tx_ids(cfg: Dict[str, Any]) -> None:
+def _migrate_pending_tx_ids(cfg: dict[str, Any]) -> None:
     """First-launch-after-v47.7 migration.
 
     For every channel, if `pending_tx_ids` is missing we add it as an
@@ -170,7 +183,7 @@ def _migrate_pending_tx_ids(cfg: Dict[str, Any]) -> None:
         if "pending_tx_ids" not in ch or not isinstance(
                 ch.get("pending_tx_ids"), list):
             ch["pending_tx_ids"] = []
-            # audit D-44: previous migration unconditionally zeroed
+            # previous migration unconditionally zeroed
             # transcription_pending and flipped transcription_complete=True
             # for EVERY channel missing pending_tx_ids — which silently
             # wiped real in-flight pending counts when someone upgraded
@@ -191,6 +204,8 @@ def append_pending_tx_id(channel_name: str, video_id: str) -> None:
     has auto_transcribe=False. No-op if the ID is already in the list
     (idempotent — repeated sync passes can't double-count).
 
+    uses config_transaction for atomic RMW.
+
     Silent on any error: the counter is user-visible but not
     load-bearing, so we never raise into the sync pipeline."""
     if not channel_name or not video_id:
@@ -198,32 +213,30 @@ def append_pending_tx_id(channel_name: str, video_id: str) -> None:
     try:
         if not config_is_writable():
             return
-        cfg = load_config()
-        changed = False
-        for ch in cfg.get("channels", []) or []:
-            if (ch.get("name") or "") != channel_name:
-                continue
-            ids = ch.get("pending_tx_ids")
-            if not isinstance(ids, list):
-                ids = []
-                ch["pending_tx_ids"] = ids
-            if video_id in ids:
-                return
-            ids.append(video_id)
-            ch["transcription_pending"] = len(ids)
-            ch["transcription_complete"] = False
-            changed = True
-            break
-        if changed:
-            save_config(cfg)
-    except Exception:
-        pass
+        with config_transaction() as cfg:
+            for ch in cfg.get("channels", []) or []:
+                if (ch.get("name") or "") != channel_name:
+                    continue
+                ids = ch.get("pending_tx_ids")
+                if not isinstance(ids, list):
+                    ids = []
+                    ch["pending_tx_ids"] = ids
+                if video_id in ids:
+                    return
+                ids.append(video_id)
+                ch["transcription_pending"] = len(ids)
+                ch["transcription_complete"] = False
+                break
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
 
 
 def remove_pending_tx_id(video_id: str) -> bool:
     """Drop a completed transcription's video ID from whichever
     channel's pending list it's in. Called from the transcribe
     worker's completion path.
+
+    uses config_transaction for atomic RMW.
 
     Returns True if any list actually changed (useful for telemetry).
     Silent on error; never raises.
@@ -233,26 +246,24 @@ def remove_pending_tx_id(video_id: str) -> bool:
     try:
         if not config_is_writable():
             return False
-        cfg = load_config()
         changed = False
-        for ch in cfg.get("channels", []) or []:
-            ids = ch.get("pending_tx_ids")
-            if not isinstance(ids, list):
-                continue
-            if video_id in ids:
-                ids.remove(video_id)
-                ch["transcription_pending"] = len(ids)
-                if not ids:
-                    ch["transcription_complete"] = True
-                changed = True
-        if changed:
-            save_config(cfg)
+        with config_transaction() as cfg:
+            for ch in cfg.get("channels", []) or []:
+                ids = ch.get("pending_tx_ids")
+                if not isinstance(ids, list):
+                    continue
+                if video_id in ids:
+                    ids.remove(video_id)
+                    ch["transcription_pending"] = len(ids)
+                    if not ids:
+                        ch["transcription_complete"] = True
+                    changed = True
         return changed
     except Exception:
         return False
 
 
-def load_config() -> Dict[str, Any]:
+def load_config() -> dict[str, Any]:
     """Load the real YTArchiver config. Falls back to defaults if missing.
 
     Recovery path: if the primary file is corrupt, try the most recent
@@ -273,7 +284,7 @@ def load_config() -> Dict[str, Any]:
         # idempotency would silently corrupt state.
         if not merged.get("_migration_v2_pending_tx_ids"):
             _migrate_pending_tx_ids(merged)
-            # audit D-43: only stamp the migration flag AFTER
+            # only stamp the migration flag AFTER
             # save_config returns True. Previously we set the flag,
             # then wrapped save in except:pass — if the save failed
             # (antivirus lock, OneDrive sync), the migration re-ran
@@ -281,18 +292,29 @@ def load_config() -> Dict[str, Any]:
             # silently wiped real pending work between boots. Setting
             # the flag post-save guarantees the re-run only happens
             # if we truly never persisted.
+            # Patch A: set the flag in `merged` BEFORE save_config so
+            # a single atomic write commits both the migrated state and
+            # the flag together. Previously two save calls were used —
+            # if the second failed (antivirus, OneDrive lock), the
+            # migration would re-run next launch even though its
+            # changes were already on disk. Single-save: either both
+            # the migration and the flag land, or neither does, in
+            # which case re-running is correct.
+            merged["_migration_v2_pending_tx_ids"] = True
             try:
-                if save_config(merged):
-                    merged["_migration_v2_pending_tx_ids"] = True
-                    # Re-save once more so the flag itself lands on disk.
-                    save_config(merged)
-                else:
-                    print("[config] migration save failed; will retry next launch")
+                if not save_config(merged):
+                    # Unset the in-memory flag too so the rest of this
+                    # session knows migration didn't persist.
+                    merged.pop("_migration_v2_pending_tx_ids", None)
+                    # print → logger so PyInstaller
+                    # --noconsole builds also capture it.
+                    _log.warning("migration save failed; will retry next launch")
             except Exception as _me:
-                print(f"[config] migration save exception: {_me}")
+                merged.pop("_migration_v2_pending_tx_ids", None)
+                _log.error("migration save exception: %s", _me)
         return merged
     except (json.JSONDecodeError, OSError) as e:
-        print(f"[config] WARNING: failed to load {CONFIG_FILE}: {e}")
+        _log.warning("failed to load %s: %s", CONFIG_FILE, e)
         # Attempt recovery from the most recent dated snapshot
         try:
             backup_dir = APP_DATA_DIR / "backups"
@@ -303,7 +325,7 @@ def load_config() -> Dict[str, Any]:
                     try:
                         with snap.open("r", encoding="utf-8") as f:
                             data = json.load(f)
-                        print(f"[config] recovered from snapshot: {snap.name}")
+                        _log.warning("recovered from snapshot: %s", snap.name)
                         merged = dict(DEFAULT_CONFIG)
                         merged.update(data)
                         # Sideline the corrupt file so the next launch uses the snapshot
@@ -315,8 +337,44 @@ def load_config() -> Dict[str, Any]:
                     except (json.JSONDecodeError, OSError):
                         continue
         except Exception as _r:
-            print(f"[config] recovery attempt failed: {_r}")
+            _log.error("recovery attempt failed: %s", _r)
         return dict(DEFAULT_CONFIG)
+
+
+# atomic read-modify-write context manager. Use
+# instead of the legacy `cfg = load_config(); cfg[...] = ...; save_config(cfg)`
+# pattern when you need the read and write to be linked.
+# Usage:
+#     from backend.ytarchiver_config import config_transaction
+#     with config_transaction() as cfg:
+#         cfg["channels"][0]["last_sync"] = "2026-05-17"
+#     # Auto-saved on context exit. If an exception escapes the block,
+#     # the save is SKIPPED so a half-mutated cfg doesn't get persisted.
+import contextlib as _ctxlib  # noqa: E402 (intentional late import)
+
+
+@_ctxlib.contextmanager
+def config_transaction():
+    """Atomic load-modify-save with a single lock acquisition.
+
+    The yielded dict is the live config — mutate it in place. On normal
+    exit, save_config is called. On exception inside the block, the
+    save is skipped (best-effort: the on-disk file is unchanged).
+
+    The underlying _config_tx_lock is reentrant (RLock) so nested
+    transactions don't deadlock — but the inner transaction will see
+    the outer's mutations and its save fires when IT exits, not when
+    the outer exits.
+    """
+    with _config_tx_lock:
+        cfg = load_config()
+        try:
+            yield cfg
+        except Exception:
+            # Don't persist partial mutations — re-raise to caller.
+            raise
+        else:
+            save_config(cfg)
 
 
 def config_file_exists() -> bool:
@@ -332,14 +390,15 @@ def config_is_writable() -> bool:
     return True
 
 
-def backup_config_on_start(keep: int = 10) -> Optional[str]:
+def backup_config_on_start(keep: int = 10) -> str | None:
     """Copy the current config.json to a dated snapshot in
     %APPDATA%\\YTArchiver\\backups\\config_YYYY-MM-DD_HHMMSS.json.
 
     Keeps only the most recent `keep` snapshots. Non-fatal on any error.
     Returns the path written, or None on skip/failure.
     """
-    import shutil, datetime as _dt
+    import datetime as _dt
+    import shutil
     try:
         if not CONFIG_FILE.exists():
             return None
@@ -359,45 +418,45 @@ def backup_config_on_start(keep: int = 10) -> Optional[str]:
         return None
 
 
-def save_config(cfg: Dict[str, Any]) -> bool:
+def save_config(cfg: dict[str, Any]) -> bool:
     """Save config back to disk. Gated by config_is_writable().
 
-    audit C-8: fsyncs the temp file before os.replace so a power loss
+    fsyncs the temp file before os.replace so a power loss
     or BSOD between write and rename can't commit a zero-byte /
     truncated file over the real one. Also cheap (<10ms per save for
     a typical config).
 
-    audit E-39: triggers a dated snapshot every _BACKUP_EVERY_N_SAVES
+    triggers a dated snapshot every _BACKUP_EVERY_N_SAVES
     saves so the recovery chain is minutes/hours old rather than
     hours/days. backup_config_on_start still handles the at-launch
     snapshot.
     """
     global _save_counter
     if not config_is_writable():
-        print("[config] write blocked")
+        _log.warning("write blocked")
         return False
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         # audit SM-8 + UI audit 2026-05-14: trim autorun_history on
         # save so the config file can't grow unbounded across years.
         # UI shows the last 10,000 entries; on-disk cap matches so
-        # nothing is silently dropped. For Scott's 105-channel /
-        # 2-hour autosync workload that's a couple months of scroll
-        # history at ~150 entries/day. JSON entry is ~250 bytes →
+        # nothing is silently dropped. At ~150 entries/day on a
+        # ~100-channel / 2-hour-interval workload that's a couple
+        # months of scroll history. JSON entry is ~250 bytes →
         # ~2.5 MB worst-case in config.json. Trimming in-place on the
         # passed dict is fine — the UI uses a fresh read per render.
         try:
             _hist = cfg.get("autorun_history")
             if isinstance(_hist, list) and len(_hist) > 10000:
                 cfg["autorun_history"] = _hist[-10000:]
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         with _config_lock:
             # Write-via-temp for atomicity (matches tkinter app's save_config)
             tmp = CONFIG_FILE.with_suffix(".json.tmp")
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
-                # audit C-8: flush + fsync before closing so the
+                # flush + fsync before closing so the
                 # os.replace below commits a file whose contents are
                 # physically on disk (not just in the OS write cache).
                 try:
@@ -406,24 +465,24 @@ def save_config(cfg: Dict[str, Any]) -> bool:
                 except OSError:
                     pass
             tmp.replace(CONFIG_FILE)
-        # audit E-39: periodic snapshot. Runs outside the lock because
+        # periodic snapshot. Runs outside the lock because
         # backup_config_on_start does its own I/O. Non-fatal on failure.
         _save_counter += 1
         if _save_counter >= _BACKUP_EVERY_N_SAVES:
             _save_counter = 0
             try:
                 backup_config_on_start(keep=20)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         return True
     except OSError as e:
-        print(f"[config] ERROR: failed to save: {e}")
+        _log.error("failed to save: %s", e)
         return False
 
 
 # ── Helpers the UI actually needs ───────────────────────────────────────
 
-def channels_for_subs_ui(cfg: Dict[str, Any]):
+def channels_for_subs_ui(cfg: dict[str, Any]):
     """
     Transform config['channels'] into the row dict format the Subs table
     renderer expects. Returns (rows, total_label).
@@ -448,7 +507,7 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         mode = ch.get("mode", "")
         # YTArchiver stores min/max as SECONDS on disk (180 = 3 minutes).
         # Display in minutes to match the original UI + user expectation.
-        # audit F-35: sub-minute durations used to floor to "0m" which the
+        # sub-minute durations used to floor to "0m" which the
         # renderer then dashed to "—", hiding a real filter. Now:
         # values between 1-59 seconds show as "<1m" so the user knows
         # the filter is set (just non-zero rather than invisible).
@@ -462,7 +521,7 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         if 0 < max_d < 60 and max_mins == 0:
             max_mins = -1
         # Last-sync shown as relative ("10hr ago") to match YTArchiver.py:5307.
-        # audit D-55: parser now tolerates both the legacy naive-string
+        # parser now tolerates both the legacy naive-string
         # format AND an epoch-float value. Epoch is DST-safe and compares
         # directly to time.time(); new code writing last_sync can emit
         # either. Naive strings get best-effort parsing but are marked
@@ -471,7 +530,7 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
         # relative-time display).
         ls_raw_val = ch.get("last_sync")
         ls_str = "Never"
-        _diff_secs: Optional[float] = None
+        _diff_secs: float | None = None
         if isinstance(ls_raw_val, (int, float)) and ls_raw_val > 0:
             _diff_secs = max(0.0, time.time() - float(ls_raw_val))
         elif isinstance(ls_raw_val, str) and ls_raw_val.strip():
@@ -556,8 +615,8 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
                             _data = _j.load(_f)
                         _pending_redwnl_res = (
                             _data.get("resolution") or "").strip()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
             except Exception:
                 _pending_redwnl = False
 
@@ -602,58 +661,19 @@ def channels_for_subs_ui(cfg: Dict[str, Any]):
     return rows, total_label
 
 
-def _fmt_time_ago(ts) -> str:
-    """Mirror YTArchiver.py:32677 _fmt_time_ago."""
-    # Treat None / 0 / empty string as missing, not as Unix epoch.
-    # Without this, missing download_ts rendered as "54 years ago".
-    if not ts:
-        return ""
-    try:
-        diff = time.time() - float(ts)
-    except (TypeError, ValueError):
-        return ""
-    if diff <= 0: return ""
-    if diff < 60: return "just now"
-    if diff < 3600: return f"{int(diff // 60)}m ago"
-    if diff < 86400: return f"{int(diff // 3600)}h ago"
-    return f"{int(diff // 86400)}d ago"
+# formatters moved to backend/view_format.py.
+# Re-imported here so existing callers (recent_for_ui, etc.) and any
+# external `from .ytarchiver_config import _fmt_size` callers still work.
+# _extract_video_id moved to backend/view_format.py.
+from .view_format import (
+    _extract_video_id,  # noqa: F401
+    _fmt_dur,
+    _fmt_size,
+    _fmt_time_ago,
+)
 
 
-def _fmt_size(raw) -> str:
-    """Mirror YTArchiver.py:32686 _fmt_size. Accepts int or numeric string."""
-    try:
-        b = int(raw)
-    except (TypeError, ValueError):
-        return ""
-    if b >= 1_073_741_824: return f"{b / 1_073_741_824:.1f} GB"
-    if b >= 1_048_576: return f"{b / 1_048_576:.0f} MB"
-    if b >= 1_024: return f"{b / 1_024:.0f} KB"
-    return f"{b} B"
-
-
-def _fmt_dur(raw) -> str:
-    """Mirror YTArchiver.py:32697 _fmt_dur. Accepts int seconds or string."""
-    try:
-        s = int(raw)
-    except (TypeError, ValueError):
-        return ""
-    if s <= 0:
-        return ""
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
-
-
-def _extract_video_id(video_url: str) -> str:
-    """Parse the v=XXXX param from a YouTube URL."""
-    if not video_url:
-        return ""
-    import re
-    m = re.search(r'[?&]v=([A-Za-z0-9_-]{11})', video_url)
-    return m.group(1) if m else ""
-
-
-def recent_for_ui(cfg: Dict[str, Any]):
+def recent_for_ui(cfg: dict[str, Any]):
     """Transform config['recent_downloads'] into UI-ready rows.
 
     Real entries stored by YTArchiver contain `size` in raw bytes (as str),
@@ -668,7 +688,8 @@ def recent_for_ui(cfg: Dict[str, Any]):
     # Pull thumbnail resolver lazily — avoids import-cycle risk since
     # backend.index already imports this module for some helpers.
     try:
-        from .index import find_thumbnail as _find_thumb, _file_url as _thumb_url
+        from .index import _file_url as _thumb_url
+        from .index import find_thumbnail as _find_thumb
     except Exception:
         _find_thumb = None
         _thumb_url = None
@@ -719,8 +740,8 @@ def recent_for_ui(cfg: Dict[str, Any]):
                 tp = _find_thumb(fp, vid)
                 if tp:
                     thumbnail_url = _thumb_url(tp)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
         # size_bytes — raw int for the grid meta line (also used by the JS
         # `_fmtBytes` helper if it wants to re-format).
@@ -729,7 +750,7 @@ def recent_for_ui(cfg: Dict[str, Any]):
 
         # uploaded — prefer explicit `date` (YYYYMMDD) on the entry, fall
         # back to `download_ts` so the grid card still shows something.
-        # audit F-34: validate YYYYMMDD parses as a real calendar date
+        # validate YYYYMMDD parses as a real calendar date
         # before accepting it — otherwise "99999999" stored on a
         # corrupted entry renders as "9999-99-99" and confuses the UI.
         uploaded_disp = ""
@@ -775,7 +796,7 @@ def recent_for_ui(cfg: Dict[str, Any]):
     return out
 
 
-def autorun_history_entries_for_ui(cfg: Dict[str, Any]):
+def autorun_history_entries_for_ui(cfg: dict[str, Any]):
     """
     Parse config['autorun_history'] into structured cells for the grid-aligned
     activity-log renderer.

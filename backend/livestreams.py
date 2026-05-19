@@ -14,10 +14,9 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .ytarchiver_config import APP_DATA_DIR
-
 
 _JOURNAL = APP_DATA_DIR / "ytarchiver_livestream_defer.json"
 _IGNORE_JOURNAL = APP_DATA_DIR / "ytarchiver_livestream_ignore.json"
@@ -25,7 +24,7 @@ _DRAWER_STATE = APP_DATA_DIR / "ytarchiver_livestream_drawer.json"
 _lock = threading.Lock()
 
 
-def _load() -> List[Dict[str, Any]]:
+def _load() -> list[dict[str, Any]]:
     if not _JOURNAL.exists():
         return []
     try:
@@ -36,7 +35,7 @@ def _load() -> List[Dict[str, Any]]:
         return []
 
 
-def _save(items: List[Dict[str, Any]]) -> bool:
+def _save(items: list[dict[str, Any]]) -> bool:
     try:
         APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
         tmp = str(_JOURNAL) + ".tmp"
@@ -103,7 +102,7 @@ def ignore(video_id: str) -> bool:
     return True
 
 
-_ignore_cache: Optional[set] = None
+_ignore_cache: set | None = None
 _ignore_cache_loaded = False
 
 
@@ -164,7 +163,7 @@ def snooze_drawer(seconds: float) -> bool:
         return False
 
 
-def drawer_state() -> Dict[str, Any]:
+def drawer_state() -> dict[str, Any]:
     """Return {snooze_until_ts, now_ts, visible} for the UI to decide
     whether to render the drawer. `visible=False` means a snooze is
     active and the drawer should stay hidden regardless of how many
@@ -186,7 +185,7 @@ def drawer_state() -> Dict[str, Any]:
     }
 
 
-def list_deferred() -> List[Dict[str, Any]]:
+def list_deferred() -> list[dict[str, Any]]:
     with _lock:
         return _load()
 
@@ -210,7 +209,7 @@ def count() -> int:
 # ── Livestream-line detector for yt-dlp stdout ─────────────────────────
 
 # Patterns yt-dlp uses when a video is live / scheduled / premiere.
-# audit E-41: stricter phrases so ordinary upload titles containing
+# stricter phrases so ordinary upload titles containing
 # "is live" (e.g. "Tom's wedding is live now!") don't silently defer.
 # yt-dlp's actual live-detection messages are full-sentence, not
 # fragment matches — this list uses the longer authoritative phrases

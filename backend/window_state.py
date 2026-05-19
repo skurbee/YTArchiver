@@ -17,12 +17,15 @@ Schema:
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
+from .log import get_logger
 from .ytarchiver_config import load_config, save_config
 
+_log = get_logger(__name__)
 
-DEFAULT_STATE: Dict[str, Any] = {
+
+DEFAULT_STATE: dict[str, Any] = {
     "x": None,
     "y": None,
     "width": 1100,
@@ -34,7 +37,7 @@ DEFAULT_STATE: Dict[str, Any] = {
 }
 
 
-def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_geometry(state: dict[str, Any]) -> dict[str, Any]:
     """Reject obviously-invalid saved geometry and fall back to defaults.
 
     Windows parks minimized windows at (-32000, -32000). If pywebview's
@@ -83,7 +86,7 @@ def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
         out["width"] = DEFAULT_STATE["width"]
     if h < 300 or h > 20000:
         out["height"] = DEFAULT_STATE["height"]
-    # audit E-43: if monitor config has changed since the save (dock
+    # if monitor config has changed since the save (dock
     # unplug, presentation mode turned off a secondary display,
     # DPI re-scale), clamp the saved x/y to the union of currently-
     # connected monitor work areas so the window never restores off-
@@ -93,7 +96,7 @@ def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
         try:
             import ctypes as _ct
             from ctypes import wintypes as _wt
-            _rects: List[Tuple[int, int, int, int]] = []
+            _rects: list[tuple[int, int, int, int]] = []
             _MON_CB = _ct.WINFUNCTYPE(
                 _ct.c_int, _ct.c_void_p, _ct.c_void_p,
                 _ct.POINTER(_wt.RECT), _ct.c_double)
@@ -126,12 +129,12 @@ def _sanitize_geometry(state: Dict[str, Any]) -> Dict[str, Any]:
                     L, T, R, B = _rects[0]
                     out["x"] = max(L, min(L + 40, R - _w))
                     out["y"] = max(T, min(T + 40, B - _h))
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     return out
 
 
-def load_window_state() -> Dict[str, Any]:
+def load_window_state() -> dict[str, Any]:
     cfg = load_config()
     state = dict(DEFAULT_STATE)
     saved = cfg.get("window_state") or {}
@@ -140,7 +143,7 @@ def load_window_state() -> Dict[str, Any]:
     return _sanitize_geometry(state)
 
 
-def save_window_state(partial: Dict[str, Any]) -> bool:
+def save_window_state(partial: dict[str, Any]) -> bool:
     """Merge `partial` into the saved state and persist (gated).
 
     Sanitizes geometry before persisting — a transient (-32000, -32000)

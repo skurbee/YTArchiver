@@ -24,14 +24,18 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
+from .log import get_logger
 from .log_stream import LogStreamer
+
+_log = get_logger(__name__)
 
 
 _COMPRESS_PRESETS = {
-    # bug H-9: 2160 (4K) and 1440 (1440p) used to be missing, causing
+    # 2160 (4K) and 1440 (1440p) used to be missing, causing
     # silent fallback to 1080p bitrates — 4K output at Generous would
     # get ~1200 MB/hr when it needs ~2600+. Padding with AV1-appropriate
     # bitrates (AV1 NVENC on RTX 40-series, roughly 2x efficient vs HEVC).
@@ -48,11 +52,11 @@ _COMPRESS_PRESETS = {
 _FFMPEG_TIME_RE = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})")
 _FFPROBE_DURATION_RE = re.compile(r"Duration:\s*(\d{2}):(\d{2}):(\d{2})")
 
-_startupinfo = None
-if os.name == "nt":
-    _startupinfo = subprocess.STARTUPINFO()
-    _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    _startupinfo.wShowWindow = 0
+# startupinfo + creationflags now come from
+# subprocess_util — same source of truth as sync.py and transcribe.py.
+from .subprocess_util import make_startupinfo as _make_startupinfo
+
+_startupinfo = _make_startupinfo()
 
 
 def get_bitrate(quality: str, output_res: str) -> int:
@@ -62,7 +66,7 @@ def get_bitrate(quality: str, output_res: str) -> int:
                             .get(quality, 700)
 
 
-def find_ffmpeg() -> Optional[str]:
+def find_ffmpeg() -> str | None:
     p = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if p:
         return p
@@ -75,8 +79,33 @@ def find_ffmpeg() -> Optional[str]:
     return None
 
 
-def get_video_duration(filepath: str, ffmpeg: str) -> float:
-    """Probe duration in seconds via ffmpeg -i."""
+# Patch D: cache `ffmpeg -i` output by (filepath, mtime). The compress
+# pipeline calls get_video_duration() then get_video_codec() back-to-
+# back on the same file (lines ~181, 188 plus post-compress at 359,
+# 384). Each call previously spawned its own ffmpeg subprocess (~300-
+# 500ms each). With the cache, second/third/fourth probe of the same
+# file is instant. Cache key includes mtime so a file modified between
+# probes invalidates correctly.
+_probe_cache: dict[tuple[str, float], tuple[float, str]] = {}
+_probe_cache_lock = threading.Lock()
+
+
+def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
+    """Run `ffmpeg -i filepath` once and parse stderr for duration +
+    video codec. Returns (duration_seconds, codec_lowercase). Returns
+    (0.0, "") on probe failure.
+
+    Cached by (filepath, mtime) — see _probe_cache above.
+    """
+    try:
+        _mt = os.path.getmtime(filepath)
+    except OSError:
+        _mt = 0.0
+    _key = (filepath, _mt)
+    with _probe_cache_lock:
+        _cached = _probe_cache.get(_key)
+        if _cached is not None:
+            return _cached
     try:
         proc = subprocess.run(
             [ffmpeg, "-i", filepath],
@@ -84,11 +113,30 @@ def get_video_duration(filepath: str, ffmpeg: str) -> float:
             startupinfo=_startupinfo,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return 0.0
-    m = _FFPROBE_DURATION_RE.search(proc.stderr)
-    if not m:
-        return 0.0
-    return (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+        result = (0.0, "")
+        with _probe_cache_lock:
+            _probe_cache[_key] = result
+        return result
+    stderr = proc.stderr or ""
+    dur = 0.0
+    m = _FFPROBE_DURATION_RE.search(stderr)
+    if m:
+        dur = float(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+    codec = ""
+    import re as _re
+    m2 = _re.search(r"Video:\s*([a-z0-9]+)", stderr, _re.IGNORECASE)
+    if m2:
+        codec = m2.group(1).lower()
+    result = (dur, codec)
+    with _probe_cache_lock:
+        _probe_cache[_key] = result
+    return result
+
+
+def get_video_duration(filepath: str, ffmpeg: str) -> float:
+    """Probe duration in seconds via ffmpeg -i.
+    Patch D: delegates to the shared _probe_video_info cache."""
+    return _probe_video_info(filepath, ffmpeg)[0]
 
 
 def get_video_codec(filepath: str, ffmpeg: str) -> str:
@@ -97,35 +145,25 @@ def get_video_codec(filepath: str, ffmpeg: str) -> str:
     probe failure. Used post-compress to verify NVENC actually
     produced AV1 and didn't silently fall back to another codec on
     driver hiccup.
-    """
-    try:
-        proc = subprocess.run(
-            [ffmpeg, "-i", filepath],
-            capture_output=True, text=True, timeout=15,
-            startupinfo=_startupinfo,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
-    # ffmpeg emits lines like:
-    #   Stream #0:0(und): Video: av1 (Main), yuv420p(tv, bt709), ...
-    # We want the token right after "Video: ".
-    import re as _re
-    m = _re.search(r"Video:\s*([a-z0-9]+)", proc.stderr, _re.IGNORECASE)
-    if not m:
-        return ""
-    return m.group(1).lower()
+    Patch D: delegates to the shared _probe_video_info cache."""
+    return _probe_video_info(filepath, ffmpeg)[1]
 
 
 def compress_video(input_path: str, stream: LogStreamer,
                    quality: str = "Average",
                    output_res: str = "720",
-                   cancel_event: Optional[threading.Event] = None,
+                   cancel_event: threading.Event | None = None,
                    replace_original: bool = True,
-                   progress_cb: Optional[Callable[[int], None]] = None
-                   ) -> Dict[str, Any]:
+                   progress_cb: Callable[[int], None] | None = None,
+                   dry_run: bool = False,
+                   ) -> dict[str, Any]:
     """
     Encode one video with av1_nvenc at quality+res preset.
     Returns {ok, orig_bytes, new_bytes, saved_pct, took}.
+
+    `dry_run=True` logs the intended action without touching any files
+    (no ffmpeg spawn, no `_TEMP_COMPRESS` temp, no `os.replace`). Useful
+    for previewing a batch run before committing to it.
     """
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -133,11 +171,48 @@ def compress_video(input_path: str, stream: LogStreamer,
         return {"ok": False, "error": "ffmpeg missing"}
     if not os.path.isfile(input_path):
         return {"ok": False, "error": "input not found"}
+    if dry_run:
+        orig_size = os.path.getsize(input_path)
+        mb_per_hr = get_bitrate(quality, output_res)
+        stream.emit([
+            ["[dry-run] ", ["dim"]],
+            [f"would compress {os.path.basename(input_path)} ", None],
+            [f"(quality={quality}, res={output_res}, "
+             f"target ~{mb_per_hr} MB/hr, "
+             f"orig {orig_size/1024/1024:.1f} MB) ", ["dim"]],
+            [f"→ replace_original={replace_original}\n", ["dim"]],
+        ])
+        return {"ok": True, "dry_run": True,
+                "input": input_path, "orig_bytes": orig_size,
+                "quality": quality, "output_res": output_res}
 
     base, ext = os.path.splitext(input_path)
     temp_path = base + "_TEMP_COMPRESS" + ext
+    # write a .lock sidecar next to the temp file so a
+    # concurrent startup_cleanup_temps pass (e.g. second-instance launch)
+    # doesn't nuke this in-flight encode. _LockGuard removes it via
+    # __del__ when the function returns (CPython refcount semantics —
+    # same pattern as sync.py's _ExecGuard). Inert if directory isn't
+    # writable.
+    lock_path = temp_path + ".lock"
+    try:
+        with open(lock_path, "w", encoding="utf-8") as _lk:
+            _lk.write(str(int(time.time())))
+    except OSError:
+        lock_path = ""
 
-    # Issue #146: per-file in-place marker so the "Encoding ...", every
+    class _LockGuard:
+        __slots__ = ("_path",)
+        def __init__(self, p: str): self._path = p
+        def __del__(self):
+            try:
+                if self._path:
+                    os.remove(self._path)
+            except OSError:
+                pass
+    _lock_guard = _LockGuard(lock_path)  # noqa: F841 — held for cleanup
+
+    # per-file in-place marker so the "Encoding ...", every
     # progress-bar update, and the final ✓ done line all REPLACE one
     # another at the same scroll position. Without this the progress
     # bar persisted next to the per-video block while the done line
@@ -198,9 +273,9 @@ def compress_video(input_path: str, stream: LogStreamer,
     ])
 
     # VERBOSE-ONLY diagnostics. All `dim`-tagged so Simple mode drops
-    # the whole line via `_line_is_verbose_only`. Per Scott's audit
-    # 2026-05-14: "verbose mode should be grossly oversaturated with
-    # information." Surface every input/decision/command so users
+    # the whole line via `_line_is_verbose_only`. Design intent:
+    # verbose mode should be densely informative — surface every
+    # input/decision/command so users
     # debugging a bad encode can see exactly what ffmpeg was told.
     _dur_str = (f"{int(dur//60):02d}:{int(dur%60):02d}"
                 if dur > 0 else "unknown")
@@ -246,6 +321,13 @@ def compress_video(input_path: str, stream: LogStreamer,
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             startupinfo=_startupinfo, encoding="utf-8", errors="replace", bufsize=1,
         )
+        # register ffmpeg with PROCESS_REGISTRY so
+        # shutdown's kill_all() reaps it even if the encode is mid-flight.
+        try:
+            from .process_runner import PROCESS_REGISTRY
+            PROCESS_REGISTRY.register(proc)
+        except Exception:
+            pass
     except OSError as e:
         stream.emit_error(f"Couldn't start video compression: {e}")
         return {"ok": False, "error": str(e)}
@@ -289,7 +371,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                 ])
                 if progress_cb:
                     try: progress_cb(pct)
-                    # audit F-12: previously silently eaten; surface so
+                    # previously silently eaten; surface so
                     # a broken UI hook shows up in logs instead of
                     # mysteriously going silent mid-encode.
                     except Exception as _cb_e:
@@ -299,8 +381,15 @@ def compress_video(input_path: str, stream: LogStreamer,
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.terminate()
+    # unregister from PROCESS_REGISTRY now that the
+    # encode has exited.
+    try:
+        from .process_runner import PROCESS_REGISTRY
+        PROCESS_REGISTRY.unregister(proc)
+    except Exception:
+        pass
 
-    # audit C-1: check ffmpeg returncode BEFORE accepting the output.
+    # check ffmpeg returncode BEFORE accepting the output.
     # A mid-encode crash (NVENC driver reset, OOM, etc.) leaves a short
     # temp file that was smaller than the original — with no returncode
     # check, the "smaller than orig" safety below would PROMOTE the
@@ -327,7 +416,7 @@ def compress_video(input_path: str, stream: LogStreamer,
          ["dim"]],
     ])
 
-    # audit C-2: ffprobe the temp file's duration and require it within
+    # ffprobe the temp file's duration and require it within
     # ~2% of the original. A partial/truncated encode that SOMEHOW
     # passes the returncode check (Windows hard-kill, ffmpeg oddity)
     # could still be a 2-minute stub of a 60-minute video. Without this
@@ -353,7 +442,7 @@ def compress_video(input_path: str, stream: LogStreamer,
                     "reason": "duration_mismatch",
                     "orig_dur": dur, "new_dur": new_dur}
 
-    # audit C-3: verify the output codec is actually AV1. If NVENC
+    # verify the output codec is actually AV1. If NVENC
     # silently falls back to HEVC/H.264 (driver crash, session
     # collision, unsupported input colorspace), ffmpeg can return
     # rc=0 + correct duration but wrong codec. Promoting a non-AV1
@@ -394,12 +483,18 @@ def compress_video(input_path: str, stream: LogStreamer,
     saved_pct = 100.0 * (1 - new_size / orig_size)
 
     if replace_original:
-        # audit E-10: retry the replace a couple of times on transient
+        # retry the replace a couple of times on transient
         # Windows file locks (VLC preview, antivirus, Explorer preview-
         # pane, Thumbnail cache). AV1 encodes cost minutes of GPU time;
         # throwing away the output because another process held the
         # target for 2 seconds is bad economics.
-        _replace_err: Optional[Exception] = None
+        _replace_err: Exception | None = None
+        # Patch C: add randomized jitter to the retry sleep so multiple
+        # processes (VLC preview, antivirus, Explorer thumbnail cache)
+        # don't collide on every retry by ticking on the same wall-
+        # clock interval. Jitter range is small (0..1s) so total retry
+        # window is still bounded.
+        import random as _random
         for _try in range(3):
             try:
                 os.replace(temp_path, input_path)
@@ -408,11 +503,11 @@ def compress_video(input_path: str, stream: LogStreamer,
             except OSError as e:
                 _replace_err = e
                 if _try < 2:
-                    time.sleep(2.0)
+                    time.sleep(2.0 + _random.uniform(0, 1.0))
         if _replace_err is not None:
             stream.emit_error(
                 f"Could not replace original after 3 attempts: {_replace_err}")
-            # bug H-2: on replace-failure (file locked by VLC preview /
+            # on replace-failure (file locked by VLC preview /
             # antivirus / cross-drive), the temp file used to sit in
             # _TEMP_COMPRESS/ forever — `temp_cleanup.py` treats non-
             # empty temp dirs as "in use" and skips them. Clean up now
@@ -446,12 +541,14 @@ _QUALITY_LADDER = ["Generous", "Average", "Below Average"]
 def compress_videos_batch(paths, stream: LogStreamer,
                           quality: str = "Average",
                           output_res: str = "720",
-                          cancel_event: Optional[threading.Event] = None,
+                          cancel_event: threading.Event | None = None,
                           redo_on_larger: bool = True,
                           batch_size: int = 0,
                           batch_num: int = 1,
                           batch_total: int = 1,
-                          channel_name: str = "") -> Dict[str, Any]:
+                          channel_name: str = "",
+                          dry_run: bool = False,
+                          ) -> dict[str, Any]:
     """Compress a list of videos sequentially.
 
     If `redo_on_larger` is True and the encoded output is ≥ the original
@@ -479,6 +576,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 chunk, stream, quality=quality, output_res=output_res,
                 cancel_event=cancel_event, redo_on_larger=redo_on_larger,
                 batch_size=0, batch_num=i + 1, batch_total=n_splits,
+                dry_run=dry_run,
             )
             agg["done"] += r.get("done", 0)
             agg["grew"] += r.get("grew", 0)
@@ -544,7 +642,8 @@ def compress_videos_batch(paths, stream: LogStreamer,
         _emit_active(i, len(paths), os.path.basename(path))
         res = compress_video(path, stream, quality=quality,
                               output_res=output_res,
-                              cancel_event=cancel_event)
+                              cancel_event=cancel_event,
+                              dry_run=dry_run)
         if res.get("ok"):
             n_done += 1
             sum_orig += res.get("orig_bytes", 0)
@@ -572,7 +671,8 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 ])
                 res2 = compress_video(path, stream, quality=retry_q,
                                        output_res=output_res,
-                                       cancel_event=cancel_event)
+                                       cancel_event=cancel_event,
+                                       dry_run=dry_run)
                 if res2.get("ok"):
                     n_done += 1
                     sum_orig += res2.get("orig_bytes", 0)
@@ -629,7 +729,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
                 "took": took,
                 "row_tag": "hist_compress" if n_done > 0 else "",
             })
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     return {"ok": True, "done": n_done, "grew": n_grew, "errors": n_err,
             "saved_pct": saved}

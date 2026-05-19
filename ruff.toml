@@ -1,0 +1,51 @@
+# ruff config — Python linter + formatter.
+#
+# Run:  ruff check .
+# Fix:  ruff check --fix .
+# Fmt:  ruff format .
+
+# Match Python 3.13 (the build interpreter).
+target-version = "py313"
+line-length = 100
+
+# Don't touch frozen / vendored / separate-clone dirs.
+extend-exclude = [
+    "Classic Tkinter ver",
+    "GitHub Desktop",
+]
+
+[lint]
+# Sensible default rules + a few hand-picked extras.
+# - E,W: pycodestyle errors + warnings
+# - F:   pyflakes (undefined names, unused imports, F401 star imports)
+# - I:   isort (import order)
+# - B:   bugbear (likely bugs)
+# - UP:  pyupgrade (modern syntax suggestions)
+# - C4:  comprehensions (cleaner list/dict comp)
+# - PIE: misc lints (Pie)
+select = ["E", "W", "F", "I", "B", "UP", "C4", "PIE"]
+
+# Allow long lines in comments + docstrings — the patch-history comments
+# scattered through the codebase aren't worth a reflow pass.
+ignore = [
+    "E501",   # line-too-long: project has many wide docstrings + URLs
+    "E731",   # lambda-assignment: we use lambdas as ad-hoc helpers
+    "E741",   # ambiguous-variable-name (l, I, O): legacy code uses these
+    "B007",   # unused loop control variable: common style here
+    "B008",   # function-call-in-default-argument: deliberate for some helpers
+    "B024",   # abstract-base-class-without-abstract-method: not our pattern
+    "B904",   # raise-without-from-inside-except: most exception handling is at boundary
+    "UP015",  # redundant-open-modes: harmless and explicit
+    "UP032",  # f-string: many .format() calls are intentional for clarity
+]
+
+# Star imports are intentional in backend/{sync,transcribe,metadata}/__init__.py
+# (they're the re-export shims that surface each core.py's __all__).
+[lint.per-file-ignores]
+"backend/sync/__init__.py" = ["F401", "F403"]
+"backend/transcribe/__init__.py" = ["F401", "F403"]
+"backend/metadata/__init__.py" = ["F401", "F403"]
+"backend/api_mixins/_shared.py" = ["F401", "F403"]
+
+[lint.isort]
+known-first-party = ["backend"]

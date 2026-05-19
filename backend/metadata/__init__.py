@@ -1,0 +1,24 @@
+"""
+backend.metadata package — yt-dlp metadata pipeline entry point.
+
+Originally a single `backend/metadata.py` (~4,200 lines). Split into:
+
+    metadata/core.py            — primary entry points
+    metadata/scan.py            — iter_channel_jsonls + scan helpers
+    metadata/normalize.py       — title-normalization shims
+    metadata/fetcher.py         — per-video metadata fetches
+    metadata/refresh.py         — bulk_refresh_views_likes pipeline
+    metadata/thumbnails_ops.py  — sweep/realign thumbnail status
+
+This `__init__.py` re-exports every previously-public symbol so external
+callers (api_mixins, sync, main) keep using `from backend.metadata
+import bulk_refresh_views_likes` unchanged.
+"""
+from __future__ import annotations
+
+from .core import *  # noqa: F401,F403
+
+# Explicit underscore-name re-exports — external callers reach in.
+from .core import (  # noqa: F401
+    _read_metadata_jsonl,
+)

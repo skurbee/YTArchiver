@@ -1,0 +1,478 @@
+  <!-- Browse tab &mdash; YouTube-style 3-view flow -->
+  <div class="tab-panel" id="panel-browse">
+
+    <div class="browse-area">
+
+      <!-- LEFT sidebar: Library sub-modes -->
+      <div class="browse-sidebar">
+        <div class="library-label">LIBRARY</div>
+        <div class="submode-btn active" data-submode="channels">Channels</div>
+        <div class="submode-btn" data-submode="recent">Recent</div>
+        <div class="submode-btn" data-submode="search">Search</div>
+        <div class="submode-btn" data-submode="graph">Graph</div>
+        <div class="submode-btn" data-submode="bookmarks">Bookmarks</div>
+        <div class="library-stats">
+          <!-- Placeholder '&mdash;' until api.browse_stats populates
+               real counts. NEVER hardcode realistic-looking numbers
+               here: on first paint users would see counts that don't
+               reflect their actual archive (audit E-25 + UI sweep). -->
+          <div><span id="stat-segments">&mdash;</span> segments</div>
+          <div><span id="stat-videos">&mdash;</span> videos</div>
+          <div><span id="stat-channels">&mdash;</span> channels</div>
+        </div>
+      </div>
+
+      <!-- MAIN content area (sub-view stack: channels → videos → watch) -->
+      <div class="browse-main">
+
+        <!-- Toolbar (contents change with view) -->
+        <div class="browse-main-toolbar" id="browse-main-toolbar">
+          <button class="back-btn" id="browse-back-btn" style="display:none;">&#8592; Back</button>
+          <span class="browse-main-title" id="browse-main-title">Channels</span>
+          <div class="spacer"></div>
+          <div class="browse-sort-wrap" id="browse-sort-wrap" style="display:none;">
+            <label class="ctl-label ctl-label-thin">Sort:</label>
+            <select class="ctl-select" id="browse-sort">
+              <option value="newest">Newest</option>
+              <option value="oldest">Oldest</option>
+              <option value="most_viewed">Most Viewed</option>
+            </select>
+            <label class="ctl-label ctl-label-thin" style="margin-left:6px;" title="Group videos under year headers">
+              <input type="checkbox" id="browse-group-year" style="vertical-align:-1px;margin-right:3px;" />Group by year
+            </label>
+            <!-- Visible only when the channel folder has year/month
+                 structure on disk (`<year>/<MM Month>/...`). Wires
+                 into the same grouping path as Group by year but
+                 adds a second level of month headers under each year.
+                 `id="browse-group-month-wrap"` is toggled visible in
+                 loadVideosFor() based on whether split_months is set
+                 in the channel config. -->
+            <label class="ctl-label ctl-label-thin" id="browse-group-month-wrap"
+                   style="margin-left:6px; display:none;" title="Sub-group videos by month under each year">
+              <input type="checkbox" id="browse-group-month" style="vertical-align:-1px;margin-right:3px;" />Group by month
+            </label>
+          </div>
+          <div class="browse-find-wrap">
+            <span class="search-icon">&#128269;</span>
+            <input type="text" class="ctl-input find-input" id="browse-filter" placeholder="Filter&hellip;" />
+          </div>
+        </div>
+
+        <!-- View: channel grid -->
+        <div class="browse-view" id="view-channels">
+          <div class="browse-summary-bar" id="browse-summary-bar" hidden>
+            <span class="bsb-label">This week:</span>
+            <span class="bsb-val" id="bsb-new-videos">&mdash;</span><span class="bsb-unit">new videos</span>
+            <span class="bsb-sep">·</span>
+            <span class="bsb-val" id="bsb-new-channels">&mdash;</span><span class="bsb-unit">channels with new</span>
+            <span class="bsb-sep">·</span>
+            <span class="bsb-val" id="bsb-total-channels">&mdash;</span><span class="bsb-unit">channels total</span>
+          </div>
+          <div class="channel-grid" id="channel-grid">
+            <!-- Loading placeholder shown until renderChannelGrid replaces
+                 innerHTML with the actual cards. Without this the user sees
+                 a fully blank tab for ~10s during startup. -->
+            <div class="grid-loading">
+              <div class="grid-spinner"></div>
+              <span class="grid-loading-label">Loading channels&hellip;</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- View: video grid -->
+        <div class="browse-view" id="view-videos" style="display:none;">
+          <div class="video-grid" id="video-grid"></div>
+        </div>
+
+        <!-- View: watch -->
+        <div class="browse-view" id="view-watch" style="display:none;">
+          <div class="watch-layout">
+            <div class="watch-video-wrap">
+              <video class="watch-video-el" id="watch-video" controls preload="metadata"
+                     playsinline
+                     style="display:none;width:100%;background:#000;border-radius:4px;"></video>
+              <div class="watch-video-placeholder" id="watch-video-placeholder">
+                <div class="watch-play-icon">&#9654;</div>
+                <div class="watch-placeholder-text">Select a video to play</div>
+              </div>
+              <h2 class="watch-title" id="watch-title">Video Title</h2>
+              <div class="watch-meta" id="watch-meta">Channel · upload date · duration</div>
+              <div class="watch-actions">
+                <button class="btn btn-ghost btn-thin" id="btn-open-external"
+                        title="Open in system default player (VLC etc.)">Open in player</button>
+                <button class="btn btn-ghost btn-thin" id="btn-bookmark-now"
+                        title="Bookmark current segment (B)">Bookmark</button>
+                <!-- Redownload + Re-transcribe, matches the grid-card right-
+                     click actions. Same flows, just buttons on the Watch view
+                     so you don't have to go back to the grid. -->
+                <button class="btn btn-ghost btn-thin" id="btn-watch-redownload"
+                        title="Re-download this video at a different resolution">Redownload&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-watch-retranscribe"
+                        title="Force re-transcribe this video (deletes current transcript)">Re-transcribe&hellip;</button>
+                <button class="btn btn-ghost btn-thin" id="btn-watch-refresh-meta"
+                        title="Re-fetch views, likes, description, and top comments for this video">Refresh metadata</button>
+                <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Speed:</label>
+                <select class="ctl-select" id="watch-speed"
+                        title="Playback speed">
+                  <option value="0.5">0.5×</option>
+                  <option value="0.75">0.75×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select>
+                <label class="ctl-label ctl-label-thin" style="margin-left:10px;"
+                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay transcript:</label>
+                <select class="ctl-select" id="watch-cap-size"
+                        title="Overlay text size — Off hides the overlay">
+                  <option value="off" selected>Off</option>
+                  <option value="small">Small</option>
+                  <option value="medium">Medium</option>
+                  <option value="large">Large</option>
+                </select>
+                <select class="ctl-select" id="watch-cap-bg"
+                        title="Overlay background style">
+                  <option value="translucent" selected>Translucent</option>
+                  <option value="outline">Outline</option>
+                  <option value="none">None</option>
+                </select>
+                <div class="spacer"></div>
+                <label class="checkbox-label" title="Keep transcript scrolled to current line">
+                  <input type="checkbox" id="watch-autofollow" checked />
+                  <span>Follow playback</span>
+                </label>
+              </div>
+              <!-- Metadata drawer &mdash; description + views/likes/comments.
+                   Mirrors YTArchiver.py:31164 _player_drawer_frame. Lives
+                   inside the video column so the 2-col grid can cap at
+                   100% height without clipping it. Collapsed by default
+                   so the transcript stays prominent; click the header
+                   to expand. -->
+              <div class="watch-meta-drawer" id="watch-meta-drawer">
+                <div class="watch-meta-head" id="watch-meta-head">
+                  <span class="watch-meta-arrow" id="watch-meta-arrow">&#x25BE;</span>
+                  <span class="watch-meta-title">Description &amp; comments</span>
+                  <span class="watch-meta-stats" id="watch-meta-stats"></span>
+                </div>
+                <div class="watch-meta-body" id="watch-meta-body">
+                  <div class="watch-meta-description" id="watch-meta-description"></div>
+                  <div class="watch-meta-comments-header">
+                    <span id="watch-meta-comments-count"></span>
+                  </div>
+                  <div class="watch-meta-comments" id="watch-meta-comments"></div>
+                </div>
+              </div>
+            </div>
+            <!-- .txt request: drag-resize splitter between the video
+                 column and the transcript pane. Stored width persists
+                 via settings.transcript_pane_width. -->
+            <div class="watch-splitter" id="watch-splitter"
+                 title="Drag to resize transcript pane"></div>
+            <div class="watch-transcript-wrap">
+              <div class="watch-transcript-header">
+                <span>Transcript</span>
+                <!-- Use matching unicode minus (U+2212) + plus (U+002B
+                     would render too thin next to U+2212). Both use the
+                     same width / weight glyph for visual balance.
+                     Previously: U+2212 minus + ASCII plus rendered
+                     unevenly. -->
+                <button class="btn btn-ghost btn-thin tx-font-btn"
+                        id="btn-tx-font-down" title="Smaller text">Aa&minus;</button>
+                <button class="btn btn-ghost btn-thin tx-font-btn"
+                        id="btn-tx-font-up" title="Larger text">Aa&plus;</button>
+                <!-- Hover-only hint: tooltip lists keyboard shortcuts.
+                     Renders as a dim circle so it doesn't read as a
+                     clickable action button next to Aa-/Aa+. -->
+                <span class="tx-hint"
+                      id="btn-watch-shortcuts"
+                      title="Keyboard shortcuts:&#10;Space &mdash; play/pause&#10;← / → &mdash; seek 5s&#10;↑ / ↓ &mdash; volume&#10;B &mdash; bookmark&#10;M &mdash; mute toggle&#10;Ctrl+F &mdash; focus Find"
+                      aria-label="Keyboard shortcuts">?</span>
+                <div class="spacer"></div>
+                <label class="find-label">Find:</label>
+                <input type="text" class="ctl-input find-input" id="watch-find"
+                       title="Enter = next match, Shift+Enter = previous match" />
+                <!-- Match-count indicator + prev/next buttons. Matches
+                     YTArchiver.py:29682 Ctrl+F → Enter navigation. -->
+                <span class="find-count" id="watch-find-count"></span>
+                <button class="btn btn-ghost btn-thin find-nav"
+                        id="watch-find-prev"
+                        title="Previous match (Shift+Enter)" tabindex="-1">&#x25B2;</button>
+                <button class="btn btn-ghost btn-thin find-nav"
+                        id="watch-find-next"
+                        title="Next match (Enter)" tabindex="-1">&#x25BC;</button>
+              </div>
+              <div class="watch-transcript" id="watch-transcript"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- View: Search (FTS5 transcript search) -->
+        <div class="browse-view" id="view-search" style="display:none;">
+          <div class="search-panel">
+            <!-- Un-indexed warning banner &mdash; matches YTArchiver.py:24756
+                 _update_index_warning. Shown when videos on disk haven't
+                 been ingested into the FTS index yet. -->
+            <div class="unindexed-warning" id="search-unindexed-warning" hidden>
+              <span class="unindexed-warning-icon">&#x26A0;</span>
+              <span class="unindexed-warning-text" id="search-unindexed-text"></span>
+              <button class="btn btn-ghost btn-thin" id="search-rescan-btn"
+                      title="Walk every channel folder and ingest any new transcripts into the FTS index">Rescan now</button>
+            </div>
+            <div class="search-inputs">
+              <input type="text" class="ctl-input search-main-input" id="search-query"
+                     placeholder="Search videos &mdash; title or transcript" />
+              <div class="search-in-group" id="search-in-group"
+                   title="Choose what to match against. Uncheck Transcripts to do title-only search; the AND/OR/NOT operators apply to the transcript leg only.">
+                <label class="search-in-opt">
+                  <input type="checkbox" id="search-in-transcripts" checked />
+                  <span>Transcripts</span>
+                </label>
+                <label class="search-in-opt">
+                  <input type="checkbox" id="search-in-titles" checked />
+                  <span>Video Title</span>
+                </label>
+              </div>
+              <div class="search-channel-multi" id="search-channel-multi">
+                <button type="button" class="ctl-select search-channel-trigger"
+                        id="search-channel-trigger"
+                        title="Scope the search to specific channels. Default: all channels.">
+                  <span class="search-channel-label" id="search-channel-label">All channels</span>
+                  <span class="search-channel-caret">&#x25BE;</span>
+                </button>
+                <div class="search-channel-panel" id="search-channel-panel" hidden>
+                  <label class="search-channel-opt search-channel-all-row">
+                    <input type="checkbox" id="search-channel-all" checked />
+                    <span>All channels</span>
+                  </label>
+                  <div class="search-channel-divider"></div>
+                  <div class="search-channel-list" id="search-channel-list">
+                    <!-- one label per channel, populated by JS -->
+                  </div>
+                </div>
+              </div>
+              <button class="btn btn-sync btn-thin" id="btn-search-run">Search</button>
+            </div>
+            <!-- Hidden compatibility shim: legacy code paths read this
+                 #search-scope <select> to set scope ("titles" /
+                 "channel" / "all"). Kept invisible so _drillIntoSearch
+                 from the Graph view and any third-party caller still
+                 work; the new UI doesn't surface it. -->
+            <select id="search-scope" hidden>
+              <option value="all" selected>all</option>
+              <option value="channel">channel</option>
+              <option value="titles">titles</option>
+            </select>
+            <div class="search-filters">
+              <span class="search-hint-label">Match:</span>
+              <button class="search-op-btn" data-op="AND"
+                      title="Both words must appear (e.g. cat AND dog)">AND</button>
+              <button class="search-op-btn" data-op="OR"
+                      title="Either word can appear (e.g. red OR blue)">OR</button>
+              <button class="search-op-btn" data-op="NOT"
+                      title="Exclude the next word (e.g. concert NOT classical)">NOT</button>
+              <button class="search-op-btn" data-op='"&hellip;"'
+                      title='Wrap in quotes for exact phrase match (e.g. "the quick brown fox")'>"exact phrase"</button>
+              <button class="search-op-btn" data-op="*"
+                      title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
+              <span class="search-hint-label" style="margin-left:10px;">Year:</span>
+              <input type="text" class="ctl-input" id="search-year-from" placeholder="from"
+                     class="search-year-input"
+                     title="Limit to segments from this year onward" />
+              <input type="text" class="ctl-input" id="search-year-to" placeholder="to"
+                     class="search-year-input"
+                     title="Limit to segments through this year" />
+              <span class="search-hint-label" style="margin-left:10px;">Sort:</span>
+              <select class="ctl-select" id="search-sort"
+                      title="How to order the result list">
+                <option value="relevance" selected>Relevance</option>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="channel">By channel</option>
+                <option value="title">By title (A→Z)</option>
+              </select>
+              <div class="spacer"></div>
+              <span class="status-text" id="search-count">&mdash;</span>
+            </div>
+            <!-- Split panel: results list on the left, context viewer right.
+                 Mirrors YTArchiver.py:29598 PanedWindow with tree + viewer.
+                 Click a result row → right pane shows ~600 chars before +
+                 highlighted hit + 600 after. Up/Down "Load more" expand. -->
+            <div class="search-split">
+              <div class="search-results" id="search-results">
+                <!-- audit E-25: same placeholder rationale as the
+                     Browse-header stat. -->
+                <div class="browse-empty">Enter a query to search <span id="search-stat-segments">&mdash;</span> transcript segments.</div>
+              </div>
+              <div class="search-viewer" id="search-viewer">
+                <div class="search-viewer-head">
+                  <span class="search-viewer-title" id="search-viewer-title">Select a result to read</span>
+                  <span class="search-viewer-meta" id="search-viewer-meta"></span>
+                </div>
+                <button class="btn btn-ghost btn-thin search-viewer-loadmore"
+                        id="search-viewer-earlier" hidden
+                        title="Load more context above">&#x25B2; Load earlier</button>
+                <div class="search-viewer-body" id="search-viewer-body"
+                     tabindex="0"></div>
+                <button class="btn btn-ghost btn-thin search-viewer-loadmore"
+                        id="search-viewer-later" hidden
+                        title="Load more context below">&#x25BC; Load later</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- View: Graph (word frequency chart) -->
+        <div class="browse-view" id="view-graph" style="display:none;">
+          <div class="graph-panel">
+            <!-- Same un-indexed warning banner as Search &mdash; graph draws from
+                 the same FTS index so stale ingest affects both equally. -->
+            <div class="unindexed-warning" id="graph-unindexed-warning" hidden>
+              <span class="unindexed-warning-icon">&#x26A0;</span>
+              <span class="unindexed-warning-text" id="graph-unindexed-text"></span>
+              <button class="btn btn-ghost btn-thin" id="graph-rescan-btn"
+                      title="Walk every channel folder and ingest any new transcripts into the FTS index">Rescan now</button>
+            </div>
+            <!-- Row 1: word, channel, bucket, plot button -->
+            <div class="graph-controls">
+              <label class="ctl-label" title="Comma-separate to compare multiple words">Word:</label>
+              <input type="text" class="ctl-input" id="graph-word" value=""
+                     placeholder="Word, or comma-separated: cat, dog, bird"
+                     title="Enter one word, or comma-separate to compare: cat, dog, bird" />
+              <label class="ctl-label">Channel:</label>
+              <select class="ctl-select" id="graph-channel"><option>All</option></select>
+              <label class="ctl-label">Bucket:</label>
+              <select class="ctl-select" id="graph-bucket">
+                <option value="month">Month</option>
+                <option value="year">Year</option>
+                <option value="week">Week</option>
+              </select>
+              <button class="btn btn-ghost btn-thin" id="btn-graph-run">Plot</button>
+            </div>
+            <!-- Row 2: chart type + normalize + export. Mirrors YTArchiver.py
+                 Graph sub-mode: Line / Bar / Word Cloud types, normalize-
+                 by-1000-segments toggle, click-graph-to-drill-into-search. -->
+            <div class="graph-controls graph-controls-row2">
+              <label class="ctl-label">Chart:</label>
+              <div class="graph-chart-type-group" role="group">
+                <button class="chart-type-btn active" data-type="line"
+                        title="Line chart \u2014 best for showing trends over time">Line</button>
+                <button class="chart-type-btn" data-type="bar"
+                        title="Bar chart \u2014 best for comparing discrete buckets">Bar</button>
+                <button class="chart-type-btn" data-type="wordcloud"
+                        title="Word cloud \u2014 shows the N most-spoken words across the selected scope">Word cloud</button>
+              </div>
+              <label class="vo-check" style="margin-left:16px;">
+                <input type="checkbox" id="graph-normalize"
+                       title="Divide each bucket's count by the total segments in that bucket (x1000) so channels of different sizes are comparable." />
+                <span>Normalize (per 1000 segments)</span>
+              </label>
+              <div class="spacer"></div>
+              <button class="btn btn-ghost btn-thin" id="btn-graph-export-csv"
+                      title="Save the current plot data as CSV">Export CSV</button>
+              <span class="co-hint" id="graph-drill-hint">Click a point to drill into search</span>
+            </div>
+            <div class="graph-canvas-wrap">
+              <canvas id="graph-canvas" width="800" height="360"></canvas>
+              <div class="graph-empty" id="graph-empty">Pick a word + channel + bucket, then Plot.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- View: Bookmarks (saved moments) -->
+        <div class="browse-view" id="view-bookmarks" style="display:none;">
+          <div class="bookmarks-panel">
+            <div class="bookmarks-toolbar">
+              <span class="subs-section-label">Bookmarked moments</span>
+              <div class="spacer"></div>
+              <button class="btn btn-ghost btn-thin" id="btn-bookmarks-export"
+                      title="Download all bookmarks as a CSV file (title, channel, timestamp, segment text)">Export CSV</button>
+            </div>
+            <div class="bookmarks-list" id="bookmarks-list">
+              <div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to bookmark it.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- View: Recent. Moved from the now-removed top-level Recent
+             tab into Browse so all library navigation lives in one
+             place. Same DOM ids (recent-table / recent-table-body /
+             recent-filter / recent-mini-log) so the existing JS keeps
+             working without rewire. -->
+        <div class="browse-view" id="view-recent" style="display:none;">
+          <div class="recent-area">
+            <div class="recent-header">
+              <span class="recent-label">Recently downloaded videos</span>
+              <div class="subs-filter-wrap" style="margin-left:10px;">
+                <span class="search-icon" aria-hidden="true">&#128269;</span>
+                <input type="text" class="ctl-input subs-filter-input" id="recent-filter"
+                       placeholder="Filter by title / channel&hellip;" />
+              </div>
+              <div class="spacer"></div>
+              <button class="btn btn-ghost btn-thin" id="btn-delete-file" hidden>Delete File</button>
+              <button class="btn btn-warn btn-thin" id="btn-clear-recent" hidden
+                      title="Clear the recent downloads list (files on disk are not deleted)">Clear list</button>
+            </div>
+
+            <!-- Two mutually-exclusive views: the legacy table and the
+                 new thumbnail grid. JS flips the display based on the
+                 `recent_view_mode` setting. Only one renders at a time so
+                 sort / filter / selection handlers don't collide. -->
+            <div class="recent-table-frame" id="recent-list-frame">
+              <table class="recent-table" id="recent-table">
+                <colgroup>
+                  <col class="col-title"/>
+                  <col class="col-channel"/>
+                  <col class="col-time"/>
+                  <col class="col-length"/>
+                  <col class="col-size"/>
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th class="col-title" data-sort="title">Title</th>
+                    <th class="col-channel" data-sort="channel">Channel</th>
+                    <th class="col-time" data-sort="time">Downloaded</th>
+                    <th class="col-length right" data-sort="duration">Length</th>
+                    <th class="col-size right" data-sort="size">Size</th>
+                  </tr>
+                </thead>
+                <tbody id="recent-table-body">
+                  <!-- Loading placeholder; renderRecentTable clears tbody on
+                       first render so this is removed once data arrives. -->
+                  <tr class="grid-loading-row">
+                    <td colspan="5">
+                      <div class="grid-loading">
+                        <div class="grid-spinner"></div>
+                        <span class="grid-loading-label">Loading recent downloads&hellip;</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Grid variant &mdash; reuses the Browse video-grid CSS. Hidden
+                 by default (list view is the default mode). -->
+            <div class="recent-grid-frame" id="recent-grid-frame" style="display:none;">
+              <div class="video-grid" id="recent-grid">
+                <div class="grid-loading">
+                  <div class="grid-spinner"></div>
+                  <span class="grid-loading-label">Loading recent downloads&hellip;</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Index view removed from Browse (moved to Settings > Index
+             sub-tab per project convention). -->
+
+
+      </div>
+
+    </div>
+
+    <div class="mini-log-frame">
+      <div class="main-log mini-log" id="browse-mini-log" tabindex="-1"></div>
+    </div>
+  </div>
+

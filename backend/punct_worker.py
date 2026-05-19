@@ -15,7 +15,12 @@ Protocol:
               or { "status": "error", "text": "reason" }
 """
 
-import sys, json, io, re, os, logging
+import io
+import json
+import logging
+import os
+import re
+import sys
 
 _out = sys.stdout
 sys.stdout = io.StringIO()
@@ -31,8 +36,8 @@ for _name in ("transformers", "huggingface_hub", "safetensors",
     logging.getLogger(_name).setLevel(logging.ERROR)
 
 try:
-    from transformers import pipeline as tf_pipeline
     import torch
+    from transformers import pipeline as tf_pipeline
 
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = tf_pipeline("ner", "oliverguhr/fullstop-punctuation-multilang-large",

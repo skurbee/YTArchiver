@@ -22,11 +22,14 @@ Protocol:
               or { "status": "error", "text": "reason" }
 """
 
-import sys, json, os, io
+import io
+import json
+import os
+import sys
 
 # Save real stdout for our JSON protocol, redirect stdout/stderr to suppress
 # prints from huggingface_hub downloads, tqdm bars, or import warnings.
-# audit D-54: keep a handle to the REAL stderr so crashes during model
+# keep a handle to the REAL stderr so crashes during model
 # load or transcription land somewhere the parent can read. Previously
 # the io.StringIO capture was restored to sys.__stderr__ on line 49, but
 # the parent spawned this subprocess with stderr=DEVNULL anyway, so
@@ -119,7 +122,6 @@ for line in sys.stdin:
         # longer than 30s at word boundaries into multiple shorter
         # segments. 30s matches the cap documented in the
         # yt-archiver-timestamps.md memory note.
-        #
         # Three branches below:
         #   1. seg already ≤ 30s   → emit unchanged, keep per-word
         #                            timestamps from Whisper
@@ -130,7 +132,6 @@ for line in sys.stdin:
         #      by even time slices, lose the word-level karaoke for
         #      that range. Rare — only when the model was run without
         #      word_timestamps=True (shouldn't happen in this app).
-        #
         # Variables in the chunking math:
         #   _MAX_SEG  = 30.0 second segment cap
         #   dur       = this segment's duration (end - start)

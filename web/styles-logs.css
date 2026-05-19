@@ -1,0 +1,429 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-logs.css — Log rendering styles
+
+   Extracted from styles.css (Patch 18, v72.0). The "crown jewel":
+     • Activity log (per-channel autorun history, alt-row striped)
+     • Main log (sync output, ~40 color tags)
+     • Mini logs (per-tab tail-of-activity strips)
+     • Tag classes that match LogStreamer's tag names (whisper_progress,
+       encode_progress, simpleline_pink, etc.)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LOG AREAS — THE CROWN JEWEL
+   Faithful translation of YTArchiver's log widgets:
+   - activity log = autorun_history_text (bg C_INPUT, 8 hist tags, row alt)
+   - main log = log_box (bg C_LOG_BG, 40+ tags)
+   - mini log = subs_mini_log etc. (shares tags with main log)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.log-paned {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0 14px 14px;
+  min-height: 0;
+  overflow: hidden;
+}
+.activity-log-frame {
+  /* Default to ~5 rows when the log first becomes populated. The
+     user can drag the splitter to grow it; that choice persists via
+     window_state_save. (Was 240px ≈ 15 rows, which opened to a huge
+     unfilled void after a single entry — UI audit 2026-05-14.) The
+     old "huge void on tall monitors" concern doesn't apply anymore
+     because `frame.hidden` is toggled by syncActivityLogVisibility
+     when the log is empty. */
+  flex: 0 0 90px;
+  background: var(--c-input);
+  overflow: hidden;
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  min-height: 40px;
+}
+.paned-splitter {
+  flex: 0 0 6px;
+  min-height: 6px;
+  background: var(--c-bg);
+  cursor: ns-resize;
+  position: relative;
+}
+/* audit F-41: keyboard affordance. JS (panel.js / equivalent) sets
+   tabindex=0 on the splitter so it can receive focus; this outline
+   makes the focused state visible for keyboard-only users. */
+.paned-splitter:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: -2px;
+}
+.paned-splitter::after {
+  content: "";
+  position: absolute;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 2px;
+  background: var(--c-border);
+  border-radius: 1px;
+}
+.paned-splitter:hover::after {
+  background: var(--c-accent);
+}
+.main-log-frame {
+  flex: 1 1 auto;
+  background: var(--c-log-bg);
+  overflow: hidden;
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  min-height: 60px;
+  display: flex;
+  flex-direction: column;
+  position: relative; /* anchor for .log-jump-latest */
+}
+
+/* Floating "↓ Latest" affordance shown while the log is scrolled up.
+   Dynamically shown by logs.js wireUserScrollDetection. */
+.log-jump-latest {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  z-index: 4;
+  padding: 3px 10px;
+  font-family: var(--font-ui, system-ui, sans-serif);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #eaeaea;
+  background: rgba(35, 110, 64, 0.92);
+  border: 1px solid #2f7f4a;
+  border-radius: 3px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  user-select: none;
+}
+.log-jump-latest:hover {
+  background: rgba(45, 135, 78, 1);
+}
+
+/* Scrollable log containers */
+.activity-log, .main-log {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-family: var(--font-log);
+  font-size: 12px; /* Consolas 9 pt ≈ 12px at 96dpi */
+  line-height: 16px;
+  color: var(--c-log-txt);
+  white-space: nowrap;
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.activity-log {
+  background: var(--c-input);
+  color: var(--c-text);
+  padding: 0;
+}
+.main-log {
+  background: var(--c-log-bg);
+  padding: 6px 8px;
+}
+
+/* Log line = one row */
+.log-line {
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: clip;
+}
+
+/* Activity log uses a grid so columns align vertically and adapt to width.
+   Columns: [Kind] time — channel(flex) — primary secondary tertiary errors took
+
+   `tertiary` is the 3rd count cell (e.g. "N metadata") added for
+   consolidated [Dwnld] rows. Classic single-count rows (Trnscr,
+   Metdta, Manual, etc.) leave it empty and the grid just renders a
+   blank slot there. */
+.activity-log .log-line {
+  display: grid;
+  /* Flexible widths: fixed minimums keep short values readable at any
+     window size, `fr` portions let the row stretch up to `max-width`
+     below. Channel column gets the biggest share (3fr) since names
+     are the most variable-length field. `max-width` caps the row so
+     ultrawide monitors don't render absurdly-spaced cells. "there's supposed to be a maximum width though, so it doesn't
+     start looking stupid at large widths." Bumped from 1400px \u2192 1800px
+     when adding the new `tertiary` count column so each count cell
+     has enough room for "1 transcribed" / "1 metadata" without ellipsis. */
+  /* Column minimums tuned tight to the actual text width at 12px font
+     so the row can compress further before losing trailing columns.
+     Before: counts at 120px mins totalled ~910px for the row.
+     Now: counts at 86px and took at 66px shave ~120px off, letting
+     the log stay intact down to ~790px window width. */
+  grid-template-columns:
+    minmax(58px, auto) /* [Kind] */
+    minmax(92px, auto) /* time,date */
+    8px /* em-dash */
+    minmax(110px, 1fr) /* channel — was 2.5fr, evened to 1fr */
+    8px /* em-dash */
+    minmax(98px, 1fr) /* primary (N downloaded) */
+    8px /* em-dash */
+    minmax(98px, 1fr) /* secondary (N transcribed) */
+    8px /* em-dash */
+    minmax(98px, 1fr) /* tertiary (N metadata) */
+    8px /* em-dash */
+    minmax(60px, 1fr) /* errors — was 0.8fr, evened to 1fr */
+    8px /* em-dash */
+    minmax(66px, 1fr); /* took */
+  max-width: 1800px;
+  justify-content: stretch;
+  align-items: center;
+  column-gap: 4px;
+  padding: 0 8px;
+  height: 18px;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.activity-log .log-line.hist_row_alt {
+  background: var(--c-log-row-alt);
+}
+
+/* Content-driven empty-cell collapse. When secondary or tertiary
+   carries no value (very common on [Metdta] rows where tertiary is
+   reserved for the [Dwnld] consolidated-row's "N metadata" count and
+   nothing else uses it), collapse the empty cell AND its leading
+   em-dash separator to 0 width. Without this, width-constrained rows
+   show a wide blank gap in the middle with the row's flow visually
+   broken by stray dashes around the empty cell. The original "dash
+   only when next has content" JS logic eliminates the GLYPH but
+   doesn't shrink the grid track, so the gap persisted. Column count
+   stays at 14 so other per-kind grid overrides still align. */
+.activity-log .log-line.hist-no-secondary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before secondary — collapse */
+    0       /* secondary — collapse */
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+.activity-log .log-line.hist-no-tertiary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before tertiary — collapse */
+    0       /* tertiary — collapse */
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+/* Compound: both empty (e.g. [Metdta] comments-refresh row when
+   _fetched==0 and tertiary unused). */
+.activity-log .log-line.hist-no-secondary.hist-no-tertiary {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    0       /* dash before secondary — collapse */
+    0       /* secondary — collapse */
+    0       /* dash before tertiary — collapse */
+    0       /* tertiary — collapse */
+    8px
+    minmax(60px, 1fr)
+    8px
+    minmax(66px, 1fr);
+}
+
+/* [ReDwnl] rows have only 3 count cells (replaced / skipped / errors
+   in primary / secondary / tertiary) and no 4th `errors`-slot value.
+   Collapse that reserved column to 0 so "took" snaps tight to the
+   counts instead of floating out to the right by 60px+. The empty
+   errors <span> still occupies its grid cell — sized to 0 via this
+   override — which is the simplest way to avoid DOM restructuring. */
+.activity-log .log-line.hist-row-ReDwnl {
+  grid-template-columns:
+    minmax(58px, auto)
+    minmax(92px, auto)
+    8px
+    minmax(110px, 1fr)  /* channel — evened to 1fr (was 2.5fr) */
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    8px
+    minmax(98px, 1fr)
+    8px
+    0           /* errors slot collapsed */
+    8px
+    minmax(66px, 1fr);
+}
+
+/* [Metdta] rows use the DEFAULT grid template (no override).
+   The user's ask: "i don't care if the columns don't have
+   'consistent' data per column, just that each functions columns
+   are vertically aligned". An empty tertiary cell produces a
+   blank slot between secondary and errors, but "errors" now
+   lands at the same x-position as Dwnld's "errors" column,
+   which is what the user was flagging in the screenshot.
+   Previous overrides that collapsed tertiary to 0 pushed
+   every cell after it to different x-positions per row-kind. */
+/* (override deliberately absent — default .log-line grid applies) */
+
+.activity-log .log-line > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  line-height: 18px;
+  display: inline-block;
+  text-align: center;
+}
+.activity-log .log-line > span.hist-col-num { font-variant-numeric: tabular-nums; }
+.activity-log .log-line > span.hist-col-dash { color: var(--c-dim); }
+.activity-log .log-line > span.hist-col-took { color: var(--c-dim); }
+
+/* Custom scrollbar — dark, slim, with auto-hide feel.
+   Matches YTArchiver.py:4533 _auto_scrollbar: invisible by default,
+   appears when you hover the log. Uses overlay-style via scrollbar-gutter
+   so layout doesn't reflow. */
+.activity-log,
+.main-log {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: transparent transparent;
+}
+.activity-log:hover,
+.main-log:hover {
+  scrollbar-color: var(--c-border) transparent;
+}
+.activity-log::-webkit-scrollbar,
+.main-log::-webkit-scrollbar {
+  width: 10px;
+  background: transparent;
+}
+.activity-log::-webkit-scrollbar-thumb,
+.main-log::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 2px;
+  min-height: 24px;
+  transition: background 0.15s;
+}
+.activity-log:hover::-webkit-scrollbar-thumb,
+.main-log:hover::-webkit-scrollbar-thumb {
+  background: var(--c-border);
+}
+.activity-log::-webkit-scrollbar-thumb:hover,
+.main-log::-webkit-scrollbar-thumb:hover {
+  background: var(--c-accent);
+}
+.activity-log::-webkit-scrollbar-track,
+.main-log::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ═══ Tag classes (matching tkinter tag_configure definitions) ═══ */
+
+/* Activity log tags */
+.t-hist_blue { color: var(--c-log-blue); }
+.t-hist_green { color: var(--c-log-green); }
+.t-hist_amber { color: var(--c-log-sum); }
+.t-hist_pink { color: var(--c-log-pink); }
+.t-hist_redwnl { color: var(--c-log-redwnl); }
+.t-hist_compress { color: var(--c-log-compress); }
+.t-hist_reorg { color: var(--c-log-reorg); }
+.t-hist_skipped { color: var(--c-log-sum, #e8c157); } /* amber */
+.t-hist_error { color: var(--c-log-red); }
+
+/* Main log base colors */
+.t-green { color: var(--c-log-green); }
+.t-dim { color: var(--c-log-dim); }
+.t-red { color: var(--c-log-red); }
+
+/* Main log headers (bold) */
+.t-header { color: var(--c-log-head); font-weight: 700; }
+.t-tx_sep { color: #ffffff; font-weight: 700; }
+.t-tx_head { color: var(--c-log-blue); font-weight: 700; }
+.t-update_sep { color: var(--c-log-update); font-weight: 700; }
+.t-update_head { color: var(--c-log-update); font-weight: 700; }
+
+.t-summary { color: var(--c-log-sum); font-style: italic; }
+.t-livestream { color: var(--c-livestream); font-weight: 700; }
+
+.t-filterskip { color: var(--c-log-sum); }
+.t-filterskip_dim { color: var(--c-log-filterskip-dim); }
+
+.t-scanline { color: var(--c-text); }
+.t-dlprogress { color: var(--c-text); }
+.t-dlprogress_pct { color: var(--c-log-green); }
+
+.t-simplestatus { color: var(--c-log-head); font-weight: 700; }
+.t-simplestatus_green { color: var(--c-log-green); font-weight: 700; }
+.t-simplestatus_white { color: var(--c-text); font-weight: 700; }
+.t-simplestatus_redwnl { color: var(--c-log-redwnl); font-weight: 700; }
+.t-simplestatus_compress { color: var(--c-log-compress); font-weight: 700; }
+.t-simplestatus_reorg { color: var(--c-log-reorg); font-weight: 700; }
+
+.t-simpleline { color: var(--c-text); }
+/* In-place "Loading· " status line during startup sweep. Rendered dim so
+   it reads as a transient status, not archived log output. Ticks via
+   backend timer in main.py _run_startup_sequence. */
+.t-startup_loading {
+  color: var(--c-dim);
+  font-style: italic;
+}
+.t-simpleline_green { color: var(--c-log-green); }
+.t-simpleline_blue { color: var(--c-log-blue); }
+.t-simpleline_pink { color: var(--c-log-pink); }
+.t-simpleline_redwnl { color: var(--c-log-redwnl); }
+.t-simpleline_compress { color: var(--c-log-compress); }
+.t-simpleline_reorg { color: var(--c-log-reorg); }
+
+.t-transcribe_using { color: var(--c-log-blue); }
+.t-metadata_using { color: var(--c-text); }
+.t-simpledownload { color: var(--c-log-green); }
+.t-pauselog { color: var(--c-log-head); }
+.t-pausestatus { color: var(--c-log-head); }
+
+/* Whisper progress */
+.t-whisper_progress { color: var(--c-log-blue); }
+.t-whisper_pct { color: var(--c-log-green); font-weight: 700; }
+.t-whisper_dots { color: var(--c-log-blue); }
+.t-whisper_prefix { color: var(--c-text); }
+.t-whisper_bracket { color: var(--c-log-blue); }
+.t-whisper_title { color: var(--c-text); }
+
+/* Transcribe / encode tags */
+.t-transcribe_prefix { color: var(--c-text); }
+.t-transcribe_title { color: var(--c-text); }
+.t-encode_progress { color: var(--c-log-blue); }
+.t-encode_prefix { color: var(--c-text); }
+.t-encode_title { color: var(--c-text); }
+.t-encode_pct { color: var(--c-log-green); font-weight: 700; }
+.t-encode_dots { color: var(--c-log-blue); }
+.t-encode_suffix { color: var(--c-log-blue); }
+
+/* Bracket overlays for [N/N] prefixes */
+.t-sync_bracket { color: var(--c-log-green); }
+.t-trans_bracket { color: var(--c-log-blue); }
+.t-meta_bracket { color: var(--c-log-pink); }
+.t-redwnl_bracket { color: var(--c-log-redwnl); }
+.t-compress_bracket { color: var(--c-log-compress); }
+.t-reorg_bracket { color: var(--c-log-reorg); }
+.t-trans_dots { color: var(--c-log-blue); }
+
+.t-dl_white { color: #ffffff; }
+

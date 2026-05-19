@@ -23,11 +23,13 @@ from __future__ import annotations
 import json
 import os
 import time
-import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
+from .log import get_logger
 from .ytarchiver_config import DISK_CACHE_FILE, load_config
+
+_log = get_logger(__name__)
 
 
 # Matches YTArchiver.py:134 _CHANNEL_VIDEO_EXTS
@@ -56,7 +58,7 @@ def _is_partial(fn: str) -> bool:
         return True
     # yt-dlp intermediate: stem's last dot-segment is `f<digits>` or
     # `f<digits>-<digits>` (format code, optionally with DRC/track index).
-    # audit E-38: require additional signals before classifying as a
+    # require additional signals before classifying as a
     # yt-dlp partial so legitimate video titles ending in `.f<digits>`
     # aren't silently excluded. The .f<digits> suffix tail is ONLY
     # trustworthy as a yt-dlp partial marker when there's ALSO a
@@ -81,7 +83,7 @@ def _is_partial(fn: str) -> bool:
 
 # ── Cache reading (fast path) ──────────────────────────────────────────
 
-def load_disk_cache() -> Dict[str, Dict[str, Any]]:
+def load_disk_cache() -> dict[str, dict[str, Any]]:
     """Load ytarchiver_disk_cache.json if present. Returns {} on any error."""
     if not DISK_CACHE_FILE.exists():
         return {}
@@ -95,7 +97,7 @@ def load_disk_cache() -> Dict[str, Dict[str, Any]]:
     return {}
 
 
-def save_disk_cache(cache: Dict[str, Dict[str, Any]]) -> bool:
+def save_disk_cache(cache: dict[str, dict[str, Any]]) -> bool:
     """Atomic write back to ytarchiver_disk_cache.json. Returns True on success.
     Mirrors YTArchiver.py:2991 _save_disk_cache.
     """
@@ -110,7 +112,7 @@ def save_disk_cache(cache: Dict[str, Dict[str, Any]]) -> bool:
         return False
 
 
-def update_disk_cache_for_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
+def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
     """Re-walk the channel folder, update its cache entry, save, and return
     the new stats. Mirrors YTArchiver.py:3136 _update_disk_cache_for_channel.
     """
@@ -135,8 +137,8 @@ def update_disk_cache_for_channel(channel: Dict[str, Any]) -> Dict[str, Any]:
             "size_gb": total_bytes / (1024 ** 3)}
 
 
-def stats_for_channel(channel: Dict[str, Any], cache: Optional[Dict[str, Any]] = None
-                      ) -> Dict[str, Any]:
+def stats_for_channel(channel: dict[str, Any], cache: dict[str, Any] | None = None
+                      ) -> dict[str, Any]:
     """Return stats for one channel: {n_vids, size_gb, size_bytes, cached, stale_secs}."""
     if cache is None:
         cache = load_disk_cache()
@@ -158,7 +160,7 @@ def stats_for_channel(channel: Dict[str, Any], cache: Optional[Dict[str, Any]] =
     }
 
 
-def enrich_channels_with_stats(channels: list, cache: Optional[Dict[str, Any]] = None) -> list:
+def enrich_channels_with_stats(channels: list, cache: dict[str, Any] | None = None) -> list:
     """Attach n_vids / size_gb to each channel dict in-place. Returns the list."""
     if cache is None:
         cache = load_disk_cache()
@@ -201,8 +203,8 @@ def invalidate_channel(ch_url: str) -> bool:
                 None)
             if ch is not None:
                 update_disk_cache_for_channel(ch)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     import threading as _th
     _th.Thread(target=_rescan, daemon=True).start()
@@ -238,7 +240,7 @@ def heal_malformed_cache_entries() -> int:
     return len(dropped)
 
 
-def archive_totals(cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def archive_totals(cache: dict[str, Any] | None = None) -> dict[str, Any]:
     """Aggregate totals across every channel in the cache."""
     if cache is None:
         cache = load_disk_cache()
@@ -261,7 +263,7 @@ def archive_totals(cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 # ── Fallback filesystem walk ───────────────────────────────────────────
 
-def _channel_folder_name(ch: Dict[str, Any]) -> str:
+def _channel_folder_name(ch: dict[str, Any]) -> str:
     """Best-guess folder name for a channel (matches YTArchiver's default).
 
     Priority matches the original (YTArchiver.py:2799):
@@ -275,7 +277,7 @@ def _channel_folder_name(ch: Dict[str, Any]) -> str:
             or "").strip()
 
 
-def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, int]:
+def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, int]:
     """Walk a channel's folder, return (num_vids, total_bytes).
 
     Mirrors YTArchiver.py:3012 _scan_channel_disk_info for the two counts we need.
@@ -318,9 +320,9 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
             print(f"[archive_scan] {folder_name}: skipped {zero_byte} "
                   f"0-byte phantom video file(s) (likely interrupted "
                   f"downloads — safe to delete or re-sync)")
-        except Exception:
-            pass
-    # audit D-50: subtract any rows the FTS DB has flagged as
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    # subtract any rows the FTS DB has flagged as
     # duplicates for this channel. list_videos_for_channel filters
     # `is_duplicate_of IS NULL`, so after a prune the Browse grid
     # shows (n_vids - duplicates) while this function returned
@@ -328,12 +330,14 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
     # and Browse grid disagreeing silently. Now both views agree.
     try:
         from . import index as _idx
-        _conn = _idx._open()
+        _conn = _idx._reader_open()
         if _conn is not None:
             ch_name = (channel.get("name") or channel.get("folder")
                        or "").strip()
             if ch_name:
-                with _idx._db_lock:
+                # Reader path — duplicate-count is a pure SELECT and
+                # shouldn't queue behind sweep / ingest writes.
+                with _idx._reader_lock:
                     _dup_row = _conn.execute(
                         "SELECT COUNT(*) FROM videos "
                         "WHERE channel=? COLLATE NOCASE "
@@ -342,12 +346,12 @@ def scan_channel_folder(base_dir: Path, channel: Dict[str, Any]) -> Tuple[int, i
                 if _dup_row:
                     _n_dup = int(_dup_row[0] or 0)
                     n_vids = max(0, n_vids - _n_dup)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return (n_vids, total)
 
 
-def scan_all_channels(progress_cb=None) -> Dict[str, Dict[str, Any]]:
+def scan_all_channels(progress_cb=None) -> dict[str, dict[str, Any]]:
     """Walk the entire archive. Slow — use only when cache is missing/stale.
 
     progress_cb(current_ch_name: str, done: int, total: int) — optional.
@@ -358,15 +362,15 @@ def scan_all_channels(progress_cb=None) -> Dict[str, Dict[str, Any]]:
         return {}
     base_dir = Path(base_str)
     channels = cfg.get("channels", [])
-    result: Dict[str, Dict[str, Any]] = {}
+    result: dict[str, dict[str, Any]] = {}
     now = time.time()
     total = len(channels)
     for i, ch in enumerate(channels):
         if progress_cb:
             try:
                 progress_cb(ch.get("name", ""), i, total)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         n_vids, size_bytes = scan_channel_folder(base_dir, ch)
         url = ch.get("url", "").strip()
         if url:
@@ -380,7 +384,7 @@ def scan_all_channels(progress_cb=None) -> Dict[str, Dict[str, Any]]:
 
 # ── Index tab summary ──────────────────────────────────────────────────
 
-def index_summary() -> Dict[str, Any]:
+def index_summary() -> dict[str, Any]:
     """Return stats for the Browse > Index sub-mode.
 
     Provides per-card counters plus a per-channel table.
@@ -423,21 +427,16 @@ def index_summary() -> Dict[str, Any]:
 
 
 def _fmt_size(b: int) -> str:
-    if b <= 0:
-        return "\u2014"
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    i = 0
-    v = float(b)
-    while v >= 1024 and i < len(units) - 1:
-        v /= 1024
-        i += 1
-    return f"{v:.1f} {units[i]}" if i >= 2 else f"{int(v)} {units[i]}"
+    """Patch 2 (v66.6): delegates to utils.format_bytes (was an
+    identical inline copy)."""
+    from .utils import format_bytes
+    return format_bytes(b, dash_if_zero=True)
 
 
-def index_db_stats() -> Dict[str, Any]:
+def index_db_stats() -> dict[str, Any]:
     """Slow index-DB-side stats: segments count, hours of indexed video,
     and the FTS DB file size. Split out from index_summary() because
-    on a large archive (Scott: 9M+ segments, 16GB DB) the COUNT(*) +
+    on a large archive (9M+ segments, 16GB DB) the COUNT(*) +
     JOIN aggregate run for many seconds — long enough to hang the
     boot sequence if it ran inline. Settings panel calls this async.
 
@@ -456,9 +455,13 @@ def index_db_stats() -> Dict[str, Any]:
                 index_db_bytes = _DB.stat().st_size
             except OSError:
                 pass
-        _conn = _idx._open()
+        _conn = _idx._reader_open()
         if _conn is not None:
-            with _idx._db_lock:
+            # Reader path — index stats are pure aggregate SELECTs and
+            # shouldn't queue behind sweep / ingest writes. Even the
+            # giant Settings → Index "Stats" panel renders independently
+            # of any background indexing.
+            with _idx._reader_lock:
                 _row = _conn.execute("SELECT COUNT(*) FROM segments").fetchone()
                 if _row:
                     segments_count = int(_row[0] or 0)
@@ -482,8 +485,8 @@ def index_db_stats() -> Dict[str, Any]:
                     ")").fetchone()
                 if _row:
                     hours += float(_row[0] or 0) / 3600.0
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return {
         "segments": segments_count,
         "hours": round(hours, 1) if hours > 0 else 0,

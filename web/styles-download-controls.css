@@ -1,0 +1,504 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-download-controls.css — Download tab controls + buttons
+
+   Extracted from styles-settings.css (Patch 23, v72.5). The control
+   strip at the top of the Download tab — URL field, format pickers,
+   action buttons. Was bundled with Settings styles because the form
+   widgets are the same, but it's a distinct visual concern.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ═══ Controls area (top of download tab) ═══ */
+.controls-area {
+  padding: 14px 14px 6px;
+  flex: 0 0 auto;
+}
+.controls-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.controls-row-buttons {
+  gap: 6px;
+}
+
+/* Persistent URL-error row (YTArchiver.py:17060 url_error_label) */
+.url-error-row {
+  display: block;
+  margin: -4px 0 8px 80px;
+}
+.url-error-text {
+  color: var(--c-log-red, #e66);
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* Video options panel (YTArchiver.py:4317-4454 video_panel) — appears when
+   a video URL is in the field. Collapsible so Download tab stays clean. */
+.video-opts-panel {
+  margin: 6px 0 10px;
+  padding: 8px 12px 10px;
+  background: var(--c-bg-soft, #12151a);
+  border: 1px solid var(--c-border, #2a2f38);
+  border-radius: 6px;
+}
+.video-opts-panel legend {
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 8px;
+}
+.vo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.vo-row-checks { gap: 24px; }
+.vo-label {
+  color: var(--c-dim);
+  font-size: 11px;
+  min-width: 68px;
+}
+.vo-input {
+  flex: 1;
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 3px;
+}
+.vo-input:focus {
+  outline: none;
+  border-color: var(--c-accent);
+}
+.vo-select {
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.vo-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--c-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.vo-check input[type="checkbox"] {
+  cursor: pointer;
+}
+.vo-custom-name {
+  flex: 1;
+  min-width: 120px;
+}
+.vo-custom-name[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Channel options panel (inline on Download tab — mirrors video-opts-panel
+   but for a saved channel). YTArchiver.py:4245 chan_opts LabelFrame. */
+.channel-opts-panel {
+  margin: 6px 0 10px;
+  padding: 8px 12px 10px;
+  background: var(--c-bg-soft, #12151a);
+  border: 1px solid var(--c-border, #2a2f38);
+  border-radius: 6px;
+}
+.channel-opts-panel legend {
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 8px;
+}
+.co-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.co-label {
+  color: var(--c-dim);
+  font-size: 11px;
+  min-width: 68px;
+}
+.co-sep { color: var(--c-dim); }
+.co-hint { color: var(--c-dim); font-size: 11px; font-style: italic; }
+.co-mode-text { color: var(--c-text); font-size: 12px; }
+
+/* Channel nudge panel (YTArchiver.py:4458 channel_nudge_panel) */
+.channel-nudge-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 10px 80px;
+  padding: 6px 10px;
+  background: rgba(245, 160, 35, 0.08);
+  border: 1px solid rgba(245, 160, 35, 0.3);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.channel-nudge-icon { font-size: 14px; }
+.channel-nudge-text { color: var(--c-text); }
+.channel-nudge-panel .btn { margin-left: auto; }
+.ctl-label {
+  color: var(--c-accent);
+  font-size: 12px;
+  min-width: 70px;
+}
+.ctl-input {
+  flex: 1;
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 9px;
+  border-radius: 2px;
+  outline: none;
+}
+.ctl-input:focus {
+  border-color: var(--c-accent);
+}
+.ctl-input::placeholder {
+  color: var(--c-dim);
+}
+
+/* Flash an input green after an auto-fill (e.g. URL probe -> Name field) */
+.ctl-input.edit-autofilled {
+  animation: edit-autofill-flash 1.8s ease-out;
+}
+@keyframes edit-autofill-flash {
+  0% { background: rgba(58, 138, 86, 0.35); border-color: #3a8a56; }
+  100% { background: var(--c-input); border-color: var(--c-border); }
+}
+
+/* Honor the HTML `hidden` attribute everywhere — several rules below
+   override display with inline-flex/grid, which clobbers the browser's
+   `[hidden] { display: none }` user-agent stylesheet. */
+[hidden] { display: none !important; }
+
+.btn {
+  background: var(--c-btn);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  padding: 6px 14px;
+  font-size: 12px;
+  border-radius: 2px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  transition: background 0.08s, border-color 0.08s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.btn:hover { background: var(--c-primary); }
+
+.btn-ico {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+}
+
+.btn-sync {
+  background: var(--c-sync);
+  border-color: var(--c-sync-border);
+  font-weight: 600;
+  padding: 7px 18px;
+}
+.btn-sync:hover { background: var(--c-sync-hover); }
+
+/* Primary action button — green like Sync Subbed and the askChoice
+   primary so "this is the go button" is consistent across the app.
+   Previously this class painted the same grey as a regular .btn,
+   which gave NO visual hierarchy on Save / Confirm / Apply buttons
+   throughout the app. UI audit #16. */
+.btn-primary {
+  background: var(--c-sync);
+  border-color: var(--c-sync-border);
+  color: var(--c-text);
+  font-weight: 600;
+}
+.btn-primary:hover {
+  background: var(--c-sync-hover);
+  border-color: #216e52;
+}
+.btn-primary:disabled,
+.btn-primary[disabled] {
+  background: var(--c-primary);
+  border-color: var(--c-border);
+  font-weight: 400;
+}
+
+.btn-ghost {
+  background: var(--c-btn);
+  color: var(--c-accent);
+}
+.btn-ghost:hover { color: var(--c-text); }
+
+.btn-icon {
+  min-width: 36px;
+  padding: 6px 10px;
+  background: var(--c-btn);
+}
+
+/* Big Pause button (Download tab) — GLOBAL pause/resume for both queues.
+   Per 2026-04-23 UX feedback: the old transparent/ghost style while
+   running made the button look disabled or inactive — easy to miss
+   as a clickable control. Now:
+     running → solid blue (clearly "this does something")
+     paused  → solid green (inviting "click to resume")
+     disabled → inherits default .btn:disabled (opacity 0.4)
+   data-pause-state is set by paintBlinkState() in app.js. */
+.btn-pause {
+  background: #234866;
+  border-color: #3c6690;
+  color: var(--c-text);
+  transition: background 0.12s, border-color 0.12s;
+}
+.btn-pause:hover { background: #2f5b80; border-color: #4c7cab; }
+/* Resume state uses the same green as the Sync Subbed button
+   (var(--c-sync) = #145c40) so the two primary-action greens
+   on the top bar stay visually consistent. Previously used
+   #3a5a3a — a washed-out green that didn't match. */
+.btn-pause[data-pause-state="paused"] {
+  background: var(--c-sync);
+  border-color: var(--c-sync-hover);
+}
+.btn-pause[data-pause-state="paused"]:hover {
+  background: var(--c-sync-hover);
+  border-color: #216e52;
+}
+/* Pause-pending: user clicked Pause but the worker is still mid-
+   operation (e.g. the long re-fetch loop in a metadata refresh).
+   Blink the button between paused-green and the running-blue so
+   the click is acknowledged. Stops automatically when the backend
+   flips pausedActive → true and JS removes this class. */
+.btn-pause.pause-pending {
+  animation: pause-pending-blink 1s ease-in-out infinite;
+}
+.popover-footer-btn.pause-pending {
+  animation: pause-pending-blink 1s ease-in-out infinite;
+}
+@keyframes pause-pending-blink {
+  0%, 100% {
+    background: var(--c-sync);
+    border-color: var(--c-sync-hover);
+  }
+  50% {
+    background: #234866;
+    border-color: #3c6690;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn-pause.pause-pending,
+  .popover-footer-btn.pause-pending {
+    animation: none;
+    /* Solid teal-ish so the state still differs from "paused" without motion. */
+    background: #1a5a6b;
+    border-color: #267585;
+  }
+}
+/* audit E-27: keep pointer-events enabled on disabled buttons so
+   hover tooltips still fire (they usually explain WHY the button is
+   disabled — kills discoverability otherwise). Clicks are still
+   blocked via the native `disabled` attribute on <button> elements;
+   the `.disabled` class mirrors that behavior via JS handlers. */
+.btn.disabled, .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  /* pointer-events: none;  -- removed, see above. */
+}
+
+.btn-thin {
+  padding: 4px 12px;
+  font-size: 11.5px;
+}
+
+/* Sync Tasks + GPU Tasks icon-only buttons with notification badge */
+.icon-btn {
+  position: relative;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--c-border);
+  border-radius: 2px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-text);
+  transition: background 0.08s, border-color 0.08s;
+}
+.icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+/* Idle is the default — same grey as other buttons (matches YTArchiver:21074).
+   The coloured bg only appears while the corresponding queue is running. */
+.icon-btn-sync,
+.icon-btn-gpu {
+  background: var(--c-btn);
+  border-color: var(--c-border);
+  transition: background 0.12s;
+}
+.icon-btn-sync:hover,
+.icon-btn-gpu:hover { background: var(--c-primary); }
+
+/* Blink states — driven by window.setQueueState() from backend */
+.icon-btn-sync[data-blink-state="on"] { background: #3a5a3a; border-color: #4a6a4a; }
+.icon-btn-sync[data-blink-state="paused"] { background: #3a5a3a; border-color: #4a6a4a; }
+.icon-btn-gpu[data-blink-state="on"] { background: #6b1a1a; border-color: #8a2a2a; }
+.icon-btn-gpu[data-blink-state="paused"] { background: #6b1a1a; border-color: #8a2a2a; }
+.icon-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background: #c62828;
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  padding: 0 3px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--c-bg);
+}
+.icon-btn-sync .icon-badge { background: #2e7d46; }
+
+.status-text {
+  color: var(--c-dim);
+  font-size: 11.5px;
+  margin-left: 12px;
+  white-space: nowrap;
+}
+
+/* Horizontal separator matching ttk.Separator */
+.section-separator {
+  height: 1px;
+  background: var(--c-border);
+  margin: 4px 0 8px;
+  flex: 0 0 auto;
+}
+
+/* Auto-sync dropdown + thin row */
+.controls-row-thin {
+  margin-bottom: 6px;
+}
+.autorun-countdown {
+  min-width: 140px;
+  margin-left: 8px;
+}
+
+/* Startup status stack — two slots (sweep on top, preload on bottom)
+   that render stacked so parallel phases are both visible at once.
+   Individual slots inherit the dim/italic style; the stack container
+   handles layout. Right-aligned in the Auto-sync controls row. */
+.preload-indicator-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0;
+  line-height: 1.25;
+}
+.preload-indicator {
+  font-size: 11.5px;
+  font-style: italic;
+  color: var(--c-dim);
+  white-space: nowrap;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctl-label-thin {
+  min-width: auto;
+  font-size: 11.5px;
+}
+.ctl-select {
+  background: var(--c-input);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 2px;
+  outline: none;
+  min-width: 84px;
+}
+.ctl-select:focus {
+  border-color: var(--c-accent);
+}
+
+.spacer { flex: 1; }
+
+/* Index tab control row (rescan / rebuild FTS / refresh) */
+.index-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 6px 0 10px;
+  background: var(--c-bg-soft, #12151a);
+  border: 1px solid var(--c-border, #2a2f38);
+  border-radius: 6px;
+}
+.index-controls .btn-thin {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.index-controls #idx-last-built {
+  font-size: 11px;
+  color: var(--c-dim);
+  white-space: nowrap;
+}
+
+.log-mode-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.log-mode-label {
+  color: var(--c-dim);
+  font-size: 12px;
+}
+.radio-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--c-text);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.radio-label input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  display: none;
+}
+.radio-circle {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid var(--c-accent);
+  background: transparent;
+  position: relative;
+}
+.radio-label input[type="radio"]:checked + .radio-circle::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--c-text);
+}
+

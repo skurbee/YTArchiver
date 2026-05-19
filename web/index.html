@@ -43,7 +43,15 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>YT Archiver</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=2" />
+  <link rel="stylesheet" href="styles-settings.css?v=2" />
+  <link rel="stylesheet" href="styles-download-controls.css?v=1" />
+  <link rel="stylesheet" href="styles-logs.css?v=1" />
+  <link rel="stylesheet" href="styles-tabs-data.css?v=1" />
+  <link rel="stylesheet" href="styles-browse.css?v=2" />
+  <link rel="stylesheet" href="styles-browse-grids.css?v=1" />
+  <link rel="stylesheet" href="styles-watch.css?v=1" />
+  <link rel="stylesheet" href="styles-dialogs.css?v=1" />
 </head>
 <body>
 
@@ -64,7 +72,6 @@
     <div class="tab browse-tab" data-tab="browse">Browse</div>
     <div class="tab settings-tab" data-tab="settings">Settings</div>
   </div>
-
   <!-- Download tab -->
   <div class="tab-panel active" id="panel-download">
 
@@ -572,10 +579,10 @@
     </div>
   </div>
 
+
   <!-- Recent tab -->
   <!-- (Recent tab moved into Browse as a submode &mdash; see `view-recent`
        inside panel-browse below.) -->
-
   <!-- Settings tab: left-sidebar layout, multiple sub-views.
        [General] &mdash; paths, defaults, log mode, whisper model
        [Performance] &mdash; startup tuning (disk scan, browse preload)
@@ -1331,10 +1338,10 @@
                       title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
               <span class="search-hint-label" style="margin-left:10px;">Year:</span>
               <input type="text" class="ctl-input" id="search-year-from" placeholder="from"
-                     style="width:64px;font-size:11px;padding:2px 6px;"
+                     class="search-year-input"
                      title="Limit to segments from this year onward" />
               <input type="text" class="ctl-input" id="search-year-to" placeholder="to"
-                     style="width:64px;font-size:11px;padding:2px 6px;"
+                     class="search-year-input"
                      title="Limit to segments through this year" />
               <div class="spacer"></div>
               <span class="status-text" id="search-count">&mdash;</span>
@@ -1895,7 +1902,65 @@
 
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally &mdash; no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
-  <script src="logs.js?v=30"></script>
-  <script src="app.js?v=64"></script>
+  <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
+  <script src="util.js?v=1"></script>
+  <script src="bridge.js?v=1"></script>
+  <script src="browseState.js?v=1"></script>
+  <script src="toasts.js?v=1"></script>
+  <script src="modals.js?v=1"></script>
+  <script src="contextMenu.js?v=1"></script>
+  <script src="dropdown.js?v=1"></script>
+  <script src="chrome.js?v=1"></script>
+  <script src="logContextMenu.js?v=1"></script>
+  <script src="shortcuts.js?v=1"></script>
+  <script src="graphTab.js?v=1"></script>
+  <script src="queueBlink.js?v=1"></script>
+  <script src="watchActions.js?v=1"></script>
+  <script src="editChannel.js?v=1"></script>
+  <script src="browseSearch.js?v=1"></script>
+  <script src="browseContextMenus.js?v=1"></script>
+  <script src="columnSort.js?v=1"></script>
+  <script src="recentContextMenu.js?v=1"></script>
+  <script src="downloadUrl.js?v=1"></script>
+  <script src="downloadDragDrop.js?v=1"></script>
+  <script src="clearButton.js?v=1"></script>
+  <script src="autoSync.js?v=1"></script>
+  <script src="liveDrawer.js?v=1"></script>
+  <script src="columnWidth.js?v=1"></script>
+  <script src="syncSubbed.js?v=1"></script>
+  <script src="indexControls.js?v=2"></script>
+  <script src="settingsInfra.js?v=1"></script>
+  <script src="metadataTab.js?v=1"></script>
+  <script src="settingsTab.js?v=2"></script>
+  <script src="driftScanDialog.js?v=1"></script>
+  <script src="compressDryRunDialog.js?v=1"></script>
+  <script src="repairCaptionsDialog.js?v=1"></script>
+  <script src="punctRestoreDialog.js?v=1"></script>
+  <script src="aboutDialog.js?v=1"></script>
+  <script src="diagnosticsDialog.js?v=1"></script>
+  <script src="manualTranscribe.js?v=1"></script>
+  <script src="queuePopovers.js?v=1"></script>
+  <script src="browseView.js?v=1"></script>
+  <script src="browseContent.js?v=1"></script>
+  <script src="autorunHistory.js?v=1"></script>
+  <script src="logMode.js?v=1"></script>
+  <script src="scanArchive.js?v=1"></script>
+  <script src="activityLogVis.js?v=1"></script>
+  <script src="bookmarks.js?v=1"></script>
+  <script src="seedLogs.js?v=1"></script>
+  <script src="missingFolders.js?v=1"></script>
+  <script src="redownloadSampleModal.js?v=1"></script>
+  <script src="appDialogs.js?v=1"></script>
+  <script src="logs.js?v=34"></script>
+  <script src="queueRender.js?v=1"></script>
+  <script src="tables.js?v=1"></script>
+  <script src="browseGrids.js?v=1"></script>
+  <script src="watchView.js?v=1"></script>
+  <script src="uxPolish.js?v=1"></script>
+  <script src="removeChannel.js?v=1"></script>
+  <script src="queuePending.js?v=1"></script>
+  <script src="refreshSizes.js?v=1"></script>
+  <script src="smallInits.js?v=1"></script>
+  <script src="app.js?v=79"></script>
 </body>
 </html>

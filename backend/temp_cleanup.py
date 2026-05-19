@@ -11,35 +11,52 @@ Also callable post-sync / post-redownload as a defensive sweep.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import time
-from typing import List
 
+from .fs_search import is_partial_artifact
+from .log import get_logger
 from .log_stream import LogStreamer
-from .ytarchiver_config import load_config
 from .sync import channel_folder_name as _cfn
+from .ytarchiver_config import load_config
+
+_log = get_logger(__name__)
 
 
-_PARTIAL_FRAG_RE = re.compile(r'\.f\d{1,4}(?:-\d+)?\.[a-z0-9]{3,4}$', re.IGNORECASE)
 _STALE_TEMP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP")
 
+# minimum age before a temp dir is considered "stale".
+# Without this, startup_cleanup_temps (called on app launch) or a second
+# instance launching during a long compress pass would nuke an in-flight
+# _TEMP_COMPRESS mid-write, silently failing the encode. Compress now
+# writes a .lock sidecar inside _TEMP_COMPRESS at encode start and
+# removes it on completion — presence of .lock means "active", skip
+# regardless of age.
+_MIN_TEMP_AGE_SEC = 30 * 60  # 30 minutes
 
-def is_partial_file(name: str) -> bool:
-    """Return True if `name` looks like a yt-dlp / ffmpeg temp artifact."""
-    low = name.lower()
-    if low.endswith((".part", ".temp", ".ytdl")):
-        return True
-    if ".part." in low or ".temp." in low:
-        return True
-    if "_temp_compress" in low:
-        return True
-    if _PARTIAL_FRAG_RE.search(name):
-        return True
-    base, ext = os.path.splitext(name)
-    if ext.lower() in (".webm", ".m4a", ".mp4") and re.search(r'\.f\d{1,4}(?:-\d+)?$', base):
+
+def _dir_is_active(full: str) -> bool:
+    """True if the directory contains a .lock sidecar (active encode).
+    Also returns True if the directory itself is newer than
+    _MIN_TEMP_AGE_SEC — protects against the race where a new encode
+    just started and hasn't written its .lock yet.
+    """
+    try:
+        if os.path.exists(os.path.join(full, ".lock")):
+            return True
+        age = time.time() - os.path.getmtime(full)
+        if age < _MIN_TEMP_AGE_SEC:
+            return True
+    except OSError:
+        # If we can't stat it, err on the side of NOT deleting.
         return True
     return False
+
+
+# Consolidated into fs_search.is_partial_artifact (identical logic).
+# Kept as a thin alias so anything that imports `is_partial_file` from
+# this module continues to work.
+is_partial_file = is_partial_artifact
 
 
 def cleanup_folder(folder: str) -> int:
@@ -47,21 +64,37 @@ def cleanup_folder(folder: str) -> int:
     if not folder or not os.path.isdir(folder):
         return 0
     cleaned = 0
-    failed: List[str] = []
+    failed: list[str] = []
     for dp, dns, fns in os.walk(folder):
-        # Drop any stale temp working dirs
+        # Drop any stale temp working dirs (skip ones still in active use)
         drop = [d for d in dns if d in _STALE_TEMP_DIRS]
         for d in drop:
             full = os.path.join(dp, d)
+            if _dir_is_active(full):
+                # Don't recurse into an active temp dir either — its
+                # partial files belong to the running encode.
+                dns.remove(d)
+                continue
             try:
                 shutil.rmtree(full, ignore_errors=True)
                 cleaned += 1
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             dns.remove(d)
         for f in fns:
             if is_partial_file(f):
                 fp = os.path.join(dp, f)
+                # age-gate partial-file removal so an
+                # in-flight compress / yt-dlp download isn't deleted
+                # out from under itself. Windows file locks usually
+                # protect this, but on a network-fast share or a
+                # release-after-write window the race is real.
+                try:
+                    age = time.time() - os.path.getmtime(fp)
+                    if age < _MIN_TEMP_AGE_SEC:
+                        continue
+                except OSError:
+                    continue
                 try:
                     os.remove(fp)
                     cleaned += 1

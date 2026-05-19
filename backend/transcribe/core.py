@@ -24,7 +24,6 @@ Output file layout (must match YTArchiver.py for drop-in replacement):
 
 from __future__ import annotations
 
-import ctypes
 import glob
 import json
 import os
@@ -34,18 +33,25 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
-from .log_stream import LogStreamer
+from ..log_stream import LogStreamer
 
+# startupinfo now comes from subprocess_util (one
+# source of truth shared with compress.py and sync.py).
+from ..subprocess_util import make_startupinfo as _make_startupinfo
 
-_startupinfo = None
-if os.name == "nt":
-    _startupinfo = subprocess.STARTUPINFO()
-    _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    _startupinfo.wShowWindow = 0
+__all__ = [
+    "ytarchiver_config_output_dir",
+    "find_python311",
+    "PunctuationManager",
+    "TranscribeManager",
+]
+
+_startupinfo = _make_startupinfo()
 
 
 # ── OLD YTArchiver-compatible transcript file helpers ──────────────────
@@ -54,1440 +60,59 @@ if os.name == "nt":
 # names or formats — OLD's scan/match logic depends on them exactly.
 
 # Shared with metadata.py + reorg.py — see backend.utils.MONTH_FOLDERS.
-from .utils import MONTH_FOLDERS as _MONTH_NAMES
 
-
-def _hide_file_win(path: str) -> None:
-    """Set the Windows HIDDEN attribute on `path` so the JSONL sidecar
-    doesn't clutter Explorer views. Matches YTArchiver.py:8499."""
-    if os.name == "nt":
-        try:
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02) # FILE_ATTRIBUTE_HIDDEN
-        except Exception:
-            pass
-
-
-def _get_transcript_filename(ch_name: str, folder_path: str,
-                             split_years: bool, split_months: bool,
-                             combined: bool,
-                             year: Optional[int] = None,
-                             month: Optional[int] = None) -> Tuple[str, str]:
-    """Mirror of YTArchiver.py:11771 _get_transcript_filename.
-    Returns (txt_path, subfolder)."""
-    if combined or (not split_years):
-        return (os.path.join(folder_path, f"{ch_name} Transcript.txt"), folder_path)
-
-    if split_years and split_months and year and month:
-        month_num = int(month) if isinstance(month, str) and str(month).isdigit() else month
-        month_name_full = _MONTH_NAMES.get(month_num, f"{month_num:02d} Unknown")
-        month_name = month_name_full.split(" ", 1)[1] # "January"
-        yr_short = str(year)[-2:] # "24"
-        subfolder = os.path.join(folder_path, str(year), month_name_full)
-        fname = f"{ch_name} {month_name} {yr_short} Transcript.txt"
-        return (os.path.join(subfolder, fname), subfolder)
-
-    if split_years and year:
-        subfolder = os.path.join(folder_path, str(year))
-        fname = f"{ch_name} {year} Transcript.txt"
-        return (os.path.join(subfolder, fname), subfolder)
-
-    return (os.path.join(folder_path, f"{ch_name} Transcript.txt"), folder_path)
-
-
-def _get_jsonl_sidecar(txt_path: str) -> str:
-    """Hidden JSONL sidecar next to a transcript .txt file.
-    Returns .../.{ch_name} ... Transcript.jsonl — matches YTArchiver.py:8490."""
-    dirname = os.path.dirname(txt_path)
-    basename = os.path.basename(txt_path)
-    root_name, _ = os.path.splitext(basename)
-    return os.path.join(dirname, "." + root_name + ".jsonl")
-
-
-def _format_upload_date(date_str: str) -> str:
-    """YYYYMMDD -> (MM.DD.YYYY). Matches YTArchiver.py:11757."""
-    if len(date_str) == 8 and date_str.isdigit():
-        return f"({date_str[4:6]}.{date_str[6:8]}.{date_str[:4]})"
-    return f"({date_str})" if date_str else "(Unknown date)"
-
-
-def _format_duration_hms(secs: float) -> str:
-    """Duration in H:MM:SS (or M:SS). Matches YTArchiver.py's _format_duration_hms."""
-    try:
-        total = int(round(float(secs)))
-    except Exception:
-        return ""
-    if total <= 0:
-        return ""
-    h, rem = divmod(total, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def _generate_distributed_words(text: str, start: float, end: float) -> List[dict]:
-    """Evenly distribute word-level timestamps across a segment.
-    Used when the upstream source didn't provide real word-level timings.
-    Matches YTArchiver.py:8478 _generate_distributed_words."""
-    words = (text or "").split()
-    if not words:
-        return []
-    dur = max(end - start, 0.01)
-    step = dur / len(words)
-    return [{"w": w,
-             "s": round(start + i * step, 3),
-             "e": round(start + (i + 1) * step, 3)}
-            for i, w in enumerate(words)]
-
-
-def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
-                       segments: List[dict]) -> None:
-    """Append long-form JSONL entries for one video. Matches YTArchiver.py:8508.
-
-    Each line:
-      {"video_id":..., "title":..., "start":..., "end":...,
-       "text":..., "words":[{"w","s","e"}, ...]}
-
-    Note: segments from NEW's internal format use short keys {s,e,t,w}. This
-    helper accepts EITHER short-form or long-form keys and always writes
-    long-form to disk.
-    """
-    try:
-        _jsonl_dir = os.path.dirname(jsonl_path)
-        if _jsonl_dir:
-            os.makedirs(_jsonl_dir, exist_ok=True)
-
-        # Build lines in memory so a disk failure mid-write doesn't leave
-        # half-a-line on disk.
-        new_lines = []
-        for seg in segments:
-            # Accept either short-form (s/e/t/w) or long-form (start/end/text/words)
-            s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
-            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
-            t = seg.get("text") if "text" in seg else seg.get("t", "")
-            raw_words = seg.get("words") if "words" in seg else seg.get("w")
-            entry = {
-                "video_id": video_id or "",
-                "title": title,
-                "start": round(float(s or 0), 2),
-                "end": round(float(e or 0), 2),
-                "text": t or "",
-            }
-            if raw_words:
-                # Normalize word records to long-form too (OLD uses "w"/"s"/"e" inside
-                # the words array, same as our short-form — already correct)
-                entry["words"] = [
-                    {"w": w.get("w") if isinstance(w, dict) else str(w),
-                     "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
-                     "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
-                    for w in raw_words
-                ]
-            else:
-                entry["words"] = _generate_distributed_words(
-                    entry["text"], entry["start"], entry["end"])
-            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-
-        # Repair a truncated last line from a previous crash (YTArchiver.py:8538).
-        if os.path.isfile(jsonl_path):
-            try:
-                with open(jsonl_path, "rb") as _chk:
-                    _chk.seek(0, 2)
-                    _fsize = _chk.tell()
-                    if _fsize > 0:
-                        _read_back = min(_fsize, 8192)
-                        _chk.seek(_fsize - _read_back)
-                        _tail = _chk.read().decode("utf-8", errors="replace")
-                        _last_nl = _tail.rfind("\n", 0, len(_tail) - 1)
-                        _last_line = _tail[_last_nl + 1:].strip() if _last_nl >= 0 else _tail.strip()
-                        if _last_line:
-                            try:
-                                json.loads(_last_line)
-                            except (json.JSONDecodeError, ValueError):
-                                _trunc_pos = (_fsize - _read_back + _last_nl + 1) if _last_nl >= 0 else 0
-                                if _trunc_pos > 0:
-                                    with open(jsonl_path, "r+b") as _fix:
-                                        _fix.seek(_trunc_pos)
-                                        _fix.truncate()
-            except Exception:
-                pass
-
-        with open(jsonl_path, "a", encoding="utf-8") as f:
-            f.writelines(new_lines)
-        _hide_file_win(jsonl_path)
-    except Exception as _jse:
-        # audit C-13: previously swallowed silently; now surfaces to a
-        # module-level print AT LEAST so the .txt/.jsonl desync is
-        # diagnosable. The stream/log isn't available here (function
-        # is pure-write and not caller-threaded), but a print lands in
-        # the console for PyInstaller builds run with a console window
-        # attached and in developer runs.
-        print(f"[transcribe] _write_jsonl_entry failed for "
-              f"{os.path.basename(jsonl_path)}: {_jse}")
-
-
-def _write_transcript_entry(txt_path: str, title: str,
-                            upload_date: str, duration_secs: float,
-                            source_tag: str, text: str) -> bool:
-    """Append one formatted block to the aggregated Transcript.txt.
-    Format (YTArchiver.py:15458):
-      ===(title), (MM.DD.YYYY), (H:MM:SS), (SOURCE)===
-      {text}
-      [triple newline]
-    """
-    try:
-        os.makedirs(os.path.dirname(txt_path), exist_ok=True)
-        date_fmt = _format_upload_date(upload_date or "")
-        dur_raw = _format_duration_hms(duration_secs or 0) or ""
-        dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
-        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
-        entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
-        with open(txt_path, "a", encoding="utf-8") as f:
-            f.write(entry)
-        return True
-    except Exception:
-        return False
-
-
-# Header pattern for the per-entry "===(title), (date), (duration), (source)==="
-# line in the aggregated Transcript.txt. Captures title (group 1), date
-# (group 2), duration (group 3), source tag (group 4). Matches OLD
-# YTArchiver.py:28997 `_HEADER_RE`.
-_HEADER_RE = re.compile(
-    r'^===\(([^)]*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
-    re.MULTILINE)
-
-
-def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
-                         new_segments: List[dict]) -> set:
-    """Surgically swap this video's entries in the aggregated .jsonl.
-
-    Matches OLD YTArchiver.py:29093 `_replace_jsonl_entry` — used by the
-    retranscribe flow to replace the old auto-captions / older-Whisper
-    entries with the newly-transcribed ones WITHOUT blowing away the
-    other videos that share the aggregated file.
-
-    Matches on BOTH title AND video_id — catches the case where a title
-    drifted between transcriptions (e.g. YouTube normalized "huge
-    change.." → "huge change..." after the first auto-caption pass).
-    Returns the set of distinct titles that were removed so the caller
-    can feed them into `_replace_txt_entry` for the same cleanup on the
-    .txt side.
-    """
-    # Clear Windows hidden/readonly so we can write (re-hidden by
-    # _write_jsonl_entry on append).
-    if os.name == "nt":
-        try:
-            _norm = os.path.normpath(jsonl_path)
-            ctypes.windll.kernel32.SetFileAttributesW(_norm, 0x80) # NORMAL
-        except Exception:
-            pass
-        try:
-            import stat
-            os.chmod(jsonl_path, stat.S_IWRITE | stat.S_IREAD)
-        except Exception:
-            pass
-
-    old_lines: List[str] = []
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            old_lines = f.readlines()
-    except FileNotFoundError:
-        pass
-
-    kept: List[str] = []
-    removed_titles: set = set()
-    vid_norm = (video_id or "").strip()
-    tit_key = _norm_title(title)
-    for line in old_lines:
-        ls = line.strip()
-        if not ls:
-            continue
-        try:
-            obj = json.loads(ls)
-            seg_title = (obj.get("title") or "").strip()
-            seg_vid = (obj.get("video_id") or "").strip()
-            # Match by normalized title (punctuation-insensitive) OR by
-            # video_id. Either signal means this segment belongs to the
-            # video being re-transcribed and should be swapped out.
-            if (seg_title and _norm_title(seg_title) == tit_key) or \
-               (vid_norm and seg_vid == vid_norm):
-                if seg_title:
-                    removed_titles.add(seg_title)
-                continue # drop this line
-        except Exception:
-            pass
-        kept.append(line if line.endswith("\n") else line + "\n")
-
-    # Atomic write of the kept lines.
-    tmp = jsonl_path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(kept)
-        os.replace(tmp, jsonl_path)
-    except OSError as _oe:
-        # audit C-12: previously returned early WITHOUT re-appending the
-        # new segments, silently leaving the OLD entry on disk while the
-        # caller thought retranscribe succeeded. Now we re-raise so the
-        # caller's emit_error in _write_outputs surfaces the failure and
-        # the user can see that their retranscribe didn't land.
-        try: os.remove(tmp)
-        except OSError: pass
-        print(f"[transcribe] _replace_jsonl_entry atomic replace failed: {_oe}")
-        raise
-
-    # Append the new segments (and re-hide the file on Windows).
-    _write_jsonl_entry(jsonl_path, video_id, title, new_segments)
-    return removed_titles
-
-
-def _replace_txt_entry(txt_path: str, title: str, new_text: str,
-                       source_tag: str,
-                       extra_titles_to_remove=None) -> bool:
-    """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
-    the aggregated Transcript.txt. Matches OLD YTArchiver.py:29020
-    `_replace_txt_entry`.
-
-    `extra_titles_to_remove` is the set returned by `_replace_jsonl_entry`
-    — additional titles discovered via video_id match. Passing them here
-    lets the .txt pass remove stale title-drifted entries consistently.
-
-    `source_tag` can be "(WHISPER:small)" or the bare model name; stored
-    verbatim as the 4th bracketed field on the header line so the
-    ArchivePlayer / Browse source banner can detect it.
-
-    Returns True on success. Appends the new entry inheriting the OLD
-    entry's date + duration so provenance is preserved across
-    re-transcriptions.
-    """
-    try:
-        try:
-            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except FileNotFoundError:
-            content = ""
-
-        # Build purge set as NORMALIZED keys (NFC + lowercase +
-        # whitespace-collapsed + trailing-punct stripped). Without this
-        # the check below misses "Title." vs "Title" variants that the
-        # retranscribe flow legitimately needs to swap out — which is
-        # what caused the triple-block duplication in v47.6 and older.
-        purge = {_norm_title(t) for t in (extra_titles_to_remove or ())}
-        purge.add(_norm_title(title))
-        purge.discard("")
-
-        # Remove each matching entry (header line through the next header
-        # or EOF). Iterate from the end so earlier match positions stay
-        # valid as we slice. Capture date+duration from the FIRST removed
-        # entry so the new block inherits the provenance.
-        matches = list(_HEADER_RE.finditer(content))
-        new_content = content
-        found_old = False
-        date_fmt = "(Unknown date)"
-        dur_fmt = "(Unknown length)"
-        captured = False
-        for i in range(len(matches) - 1, -1, -1):
-            m = matches[i]
-            entry_key = _norm_title(m.group(1))
-            if entry_key not in purge:
-                continue
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
-            if not captured:
-                # Matches group indices of _HEADER_RE: (title, date, dur, src)
-                date_fmt = m.group(2)
-                dur_fmt = m.group(3)
-                captured = True
-            new_content = new_content[:m.start()] + new_content[end:]
-            found_old = True
-
-        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
-        new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"
-
-        new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
-        new_content += new_entry
-
-        os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
-        tmp = txt_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        os.replace(tmp, txt_path)
-        return True
-    except Exception:
-        return False
-
-
-def _norm_title(s: str) -> str:
-    """Normalize a title for comparison: NFC unicode, strip, collapse
-    internal whitespace, lowercase, strip trailing `.?!` punctuation.
-
-    The trailing-punctuation strip is critical for the retranscribe
-    path: Whisper's stored title is "title." with a period while
-    YouTube captions wrote the same video as "title" without one, so
-    `_replace_txt_entry` / `_replace_jsonl_entry` failed their exact-
-    match check and appended duplicate blocks instead of surgically
-    swapping. This normalization brings both sides to the same key.
-    """
-    import unicodedata as _ud
-    if not s:
-        return ""
-    t = _ud.normalize("NFC", s).strip().lower()
-    # Collapse internal whitespace to single spaces.
-    t = re.sub(r"\s+", " ", t)
-    # Strip trailing . ? ! punctuation (possibly stacked).
-    t = re.sub(r"[.?!]+$", "", t).rstrip()
-    return t
-
-
-def _scan_existing_transcript_titles(folder_path: str, ch_name: str) -> dict:
-    """Return `{norm_title: (raw_title, video_id_or_empty)}` for every
-    entry in ANY Transcript.txt under `folder_path`.
-
-    Earlier this only considered files whose name started with `ch_name`,
-    which missed aggregate files whose filename drifted from the channel
-    name (rename, special-char stripping, per-year split with different
-    prefix, etc.). The scan is now permissive: ANY `*Transcript.txt`
-    under the channel folder contributes its titles. Unicode-normalized
-    keys mean trailing-whitespace / combining-mark differences stop
-    producing false "needs transcribing" matches.
-
-    Mirrors YTArchiver.py:11800 but uses dict output so callers can do
-    both title-match and videoID-match lookups.
-    """
-    existing: dict = {}
-    # audit E-48: use the full _HEADER_RE (defined above at module
-    # level) which captures all four groups with proper delimiter
-    # handling, instead of the prior non-greedy pattern that truncated
-    # titles containing `), (`. A title like "Episode 3 (cont), (2024
-    # edition)" used to register under the wrong normalized key
-    # ("Episode 3 (cont") so the pre-dedupe check missed it and
-    # re-transcribed → duplicate entries.
-    id_pattern = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
-    if not folder_path or not os.path.isdir(folder_path):
-        return existing
-    for dirpath, _dirs, files in os.walk(folder_path):
-        for f in files:
-            if not f.endswith("Transcript.txt"):
-                continue
-            try:
-                with open(os.path.join(dirpath, f), "r", encoding="utf-8") as fh:
-                    content = fh.read()
-                for m in _HEADER_RE.finditer(content):
-                    raw = (m.group(1) or "").strip()
-                    if not raw:
-                        continue
-                    vid_id = ""
-                    im = id_pattern.search(raw)
-                    if im:
-                        vid_id = im.group(1)
-                    # Store TWO variants so callers can match either:
-                    # title-with-[id] OR title-without-[id].
-                    raw_plain = id_pattern.sub("", raw).strip() or raw
-                    existing[_norm_title(raw)] = (raw, vid_id)
-                    existing[_norm_title(raw_plain)] = (raw, vid_id)
-            except Exception:
-                pass
-    return existing
-
-
-def _lookup_channel(channel_name: str) -> Optional[Dict[str, Any]]:
-    """Look up a channel dict in config by name. Lightweight: just for
-    resolving split_years/split_months when writing transcripts."""
-    if not channel_name:
-        return None
-    try:
-        from . import ytarchiver_config as _cfg
-        cfg = _cfg.load_config()
-        for ch in cfg.get("channels", []):
-            if (ch.get("name") or "") == channel_name or \
-               (ch.get("folder") or ch.get("folder_override") or "") == channel_name:
-                return ch
-    except Exception:
-        pass
-    return None
-
-
-def _resolve_transcript_paths(video_path: str, title: str,
-                              channel_name: str,
-                              combined_override: Optional[bool] = None
-                              ) -> Optional[Tuple[str, str, int, int, str]]:
-    """Figure out (txt_path, jsonl_path, upload_ts_year, upload_ts_month,
-    upload_date_yyyymmdd) for a given video.
-
-    Uses the video file's mtime (which yt-dlp --mtime sets to the YT upload
-    date) for the year/month selection + upload-date display string.
-
-    `combined_override`: if True, write to a single channel-root transcript
-    even if split_years is on (user picked "Combined" in the first-time
-    dialog). If False, force per-year even if split_years is off. If None,
-    follow the channel's split_years setting (OLD-compatible default).
-
-    Returns None if we can't resolve (no channel config, no folder, etc.).
-    """
-    ch = _lookup_channel(channel_name) or {}
-    # Channel folder derivation — same rule as backend.sync.channel_folder_name
-    try:
-        from .sync import channel_folder_name as _cfn
-        folder_name = _cfn(ch) if ch else (channel_name or "")
-    except Exception:
-        folder_name = channel_name or ""
-    # Base folder is the parent chain above the video
-    # (video is at {base}/{folder}/.../ )
-    try:
-        base_root = (ytarchiver_config_output_dir() or "").strip()
-    except Exception:
-        base_root = ""
-    if not base_root:
-        # Fall back: walk up from the video file to find the channel folder
-        folder_path = None
-        vp_parent = os.path.dirname(os.path.abspath(video_path))
-        while vp_parent:
-            if os.path.basename(vp_parent) == folder_name:
-                folder_path = vp_parent
-                break
-            parent = os.path.dirname(vp_parent)
-            if parent == vp_parent:
-                break
-            vp_parent = parent
-        if folder_path is None:
-            folder_path = os.path.dirname(os.path.dirname(os.path.abspath(video_path)))
-    else:
-        folder_path = os.path.join(base_root, folder_name)
-    split_years = bool(ch.get("split_years"))
-    split_months = bool(ch.get("split_months"))
-    # mtime → upload date
-    try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(video_path))
-        upload_date = mtime.strftime("%Y%m%d")
-        year, month = mtime.year, mtime.month
-    except OSError:
-        upload_date = ""
-        now = datetime.now()
-        year, month = now.year, now.month
-    # combined rule:
-    # override True → always combined
-    # override False → always per-year
-    # override None → legacy default: combined iff not split_years
-    if combined_override is True:
-        _combined = True
-    elif combined_override is False:
-        _combined = False
-    else:
-        _combined = not split_years
-    txt_path, _subfolder = _get_transcript_filename(
-        channel_name or folder_name, folder_path,
-        split_years, split_months, combined=_combined,
-        year=year, month=month)
-    jsonl_path = _get_jsonl_sidecar(txt_path)
-    return (txt_path, jsonl_path, year, month, upload_date)
-
-
-def ytarchiver_config_output_dir() -> str:
-    """Safe helper to read output_dir without a hard import-time dependency
-    — some modules import transcribe at collection time."""
-    try:
-        from . import ytarchiver_config as _cfg
-        return (_cfg.load_config().get("output_dir") or "").strip()
-    except Exception:
-        return ""
-
-
-def _bump_transcription_pending(channel_name: str, delta: int) -> None:
-    """Increment (or decrement, with negative delta) the channel's
-    `transcription_pending` counter. When the counter reaches 0 and there
-    are 0 further queued jobs, sets `transcription_complete=True`.
-
-    Mirrors YTArchiver.py:14629-14630, :15530-15531 update sites. Silent on
-    any error — counter drift is cosmetic (Subs-tab indicator), not
-    destructive.
-    """
-    if not channel_name:
-        return
-    try:
-        from . import ytarchiver_config as _cfg
-        if not _cfg.config_is_writable():
-            return
-        cfg = _cfg.load_config()
-        changed = False
-        for ch in cfg.get("channels", []):
-            name = ch.get("name") or ""
-            folder = ch.get("folder") or ch.get("folder_override") or ""
-            if name == channel_name or folder == channel_name:
-                cur = int(ch.get("transcription_pending", 0) or 0)
-                new = max(0, cur + int(delta))
-                if new != cur:
-                    ch["transcription_pending"] = new
-                    changed = True
-                if new == 0 and delta < 0:
-                    # Only flip `complete` when we just finished a job, not
-                    # when we re-initialize to 0.
-                    ch["transcription_complete"] = True
-                    changed = True
-                elif delta > 0 and ch.get("transcription_complete"):
-                    # Queued a new job on a previously-complete channel →
-                    # re-mark as incomplete until the new job finishes.
-                    ch["transcription_complete"] = False
-                    changed = True
-                break
-        if changed:
-            _cfg.save_config(cfg)
-    except Exception:
-        pass
-
-
-# Chunked-transcription thresholds (mirror YTArchiver.py:11151)
-# Videos longer than this are split with ffmpeg before sending to Whisper
-# so RAM doesn't blow up. 30s overlap between chunks avoids mid-sentence
-# truncation; duplicate segments in the overlap zone are dropped on merge.
-_CHUNK_DURATION_SECS = 7200 # 2 hours per chunk
-_CHUNK_OVERLAP_SECS = 30
-_CHUNK_MIN_DURATION = 7800 # below this, do a single-pass transcribe
-
-# Module-level counter for per-job unique inplace tags. Every
-# transcription run (auto-captions or Whisper) gets a fresh
-# `whisper_job_<N>` tag that stamps every log emit in that job's
-# lifecycle, so progress/done lines replace each other within a job
-# but stay independent of other jobs. See `_transcribe_one`.
-_JOB_COUNTER = 0
-
-
-def _ffprobe_duration(filepath: str) -> Optional[float]:
-    """Return the file's duration in seconds via ffprobe, or None."""
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error",
-             "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             filepath],
-            capture_output=True, text=True, timeout=20,
-            creationflags=(0x08000000 if os.name == "nt" else 0),
-        )
-        val = (r.stdout or "").strip()
-        return float(val) if val else None
-    except Exception:
-        return None
-
-
-# ── Auto-captions fast-path helper ─────────────────────────────────────
-
-def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
-                              fetched_paths_out: List[str]) -> Optional[str]:
-    """Probe yt-dlp for captions and write a .vtt next to the video.
-
-    Mirrors YTArchiver.py:11641 `_fetch_auto_captions`: tries without cookies
-    first (fast — skips Firefox DB read), falls back to with-cookies on 403 /
-    empty result. Adds any written file to `fetched_paths_out` so the caller
-    can clean up after parsing.
-
-    Returns the path to the written .vtt (auto-caption preferred over manual
-    subs so we get <c>-tag word timing), or None if no captions exist or
-    yt-dlp is unavailable.
-    """
-    yt = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
-    if not yt:
-        return None
-    vid_id = ""
-    m = re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$",
-                  os.path.splitext(os.path.basename(video_path))[0])
-    if m:
-        vid_id = m.group(1)
-    else:
-        try:
-            from . import index as _idx
-            conn = _idx._open()
-            if conn is not None:
-                with _idx._db_lock:
-                    row = conn.execute(
-                        "SELECT video_id FROM videos WHERE filepath=? "
-                        "COLLATE NOCASE LIMIT 1",
-                        (os.path.normpath(video_path),)).fetchone()
-                if row and row[0]:
-                    vid_id = row[0]
-        except Exception:
-            pass
-    if not vid_id:
-        return None # can't probe without a video ID
-
-    base = os.path.splitext(video_path)[0]
-    temp_base = base + ".__cap_probe"
-    video_url = f"https://www.youtube.com/watch?v={vid_id}"
-
-    def _glob_vtts() -> List[str]:
-        return glob.glob(temp_base + "*.vtt")
-
-    def _cleanup():
-        for _p in glob.glob(temp_base + "*"):
-            try: os.remove(_p)
-            except OSError: pass
-
-    def _run(use_cookies: bool) -> bool:
-        cmd = [
-            yt, "--skip-download",
-            "--write-sub", "--write-auto-sub",
-            "--sub-lang", "en", "--sub-format", "vtt",
-            "-o", temp_base + ".%(ext)s",
-            "--no-playlist",
-            "--force-overwrites",
-        ]
-        if use_cookies:
-            try:
-                from .sync import _find_cookie_source
-                cmd += list(_find_cookie_source())
-            except Exception:
-                cmd += ["--cookies-from-browser", "firefox"]
-        cmd.append(video_url)
-        try:
-            # Capture stderr instead of /dev/nulling it so yt-dlp's
-            # explanation for a failed caption fetch (cookies expired,
-            # member-only, region-lock, etc.) surfaces in the log
-            # instead of silently vanishing. User's view goes from
-            # "why did Whisper run on this video?" to a clear dim line
-            # pointing at the root cause. Only emit when the stderr
-            # looks like an auth/cookie issue — generic "no captions
-            # available" is noise.
-            r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE,
-                               timeout=120, startupinfo=_startupinfo)
-            try:
-                err_text = (r.stderr or b"").decode(
-                    "utf-8", errors="replace")
-            except Exception:
-                err_text = ""
-            if err_text and use_cookies:
-                _lower = err_text.lower()
-                if any(p in _lower for p in (
-                        "sign in to confirm",
-                        "cookies are missing",
-                        "cookies are invalid",
-                        "failed to extract any player response",
-                        "this video is private",
-                        "this video is members",
-                )):
-                    try:
-                        # First matching error line, trimmed.
-                        first_err = next(
-                            (ln.strip() for ln in err_text.splitlines()
-                             if ln.strip().lower().startswith(("error", "warning"))),
-                            err_text.strip().splitlines()[0])[:160]
-                        stream.emit([
-                            [" \u26A0 Caption fetch blocked: ", "dim"],
-                            [f"{first_err}\n", "dim"],
-                        ])
-                    except Exception:
-                        pass
-            return True
-        except Exception:
-            return False
-
-    # Pass 1: cookieless
-    _run(False)
-    vtts = _glob_vtts()
-    if not vtts:
-        _cleanup()
-        # Pass 2: with cookies (some channels require auth for captions)
-        _run(True)
-        vtts = _glob_vtts()
-    if not vtts:
-        _cleanup()
-        return None
-
-    # Prefer auto-generated VTT — it has <c> tags with per-word timestamps.
-    pick = vtts[0]
-    if len(vtts) > 1:
-        for vf in vtts:
-            try:
-                with open(vf, "r", encoding="utf-8") as fh:
-                    sample = fh.read(2000)
-                if "<c>" in sample or "<c " in sample:
-                    pick = vf
-                    break
-            except Exception:
-                pass
-    # Track every fetched file (including unpicked alternates) for cleanup.
-    fetched_paths_out.extend(vtts)
-    return pick
-
-
-def _try_auto_captions(video_path: str, title: str, channel: str,
-                        stream: LogStreamer,
-                        punct_mgr=None,
-                        job_tag: str = "",
-                        video_id_hint: str = "") -> bool:
-    """If yt-dlp wrote a .en.vtt (or similar) next to the video, parse it
-    into the aggregated channel Transcript.txt + hidden JSONL sidecar,
-    then ingest into FTS — skip Whisper entirely.
-
-    `job_tag` is the per-job unique inplace kind (e.g. `whisper_job_7`)
-    that stamps every emit from this transcription so progress/done
-    lines replace EACH OTHER within the job but never stomp another
-    job's lines. reported a high-video-count channel's 2-video transcription
-    lines disappearing entirely — root cause was all emits sharing
-    the generic `whisper_*` kind, so video 2's "Loading punctuation…"
-    replaced video 1's "— ✓ Transcription" done line.
-
-    `punct_mgr` is an optional PunctuationManager. When provided AND
-    the model loads successfully, the parsed caption text gets run
-    through the punctuation-restoration pass (matches OLD YTArchiver.py:
-    15437-15439 `_punctuate_text(text)` call) and the stored source
-    tag becomes `(YT+PUNCTUATION)` instead of `(YT CAPTIONS)` so the
-    Watch-view source banner shows "punctuation restored". Segments
-    in the .jsonl also get punctuated per-segment (matches NEW's
-    Whisper punct pass for consistent .jsonl quality).
-
-    Output matches YTArchiver.py:15449-15478 exactly. Returns True on
-    success; False if no usable auto-sub file exists."""
-    base = os.path.splitext(video_path)[0]
-    candidates = [
-        f"{base}.en.vtt", f"{base}.en-US.vtt", f"{base}.en-GB.vtt",
-        f"{base}.en-us.vtt", f"{base}.en-gb.vtt", f"{base}.vtt",
-        f"{base}.en.ttml", f"{base}.en.srt",
-    ]
-    vtt = next((p for p in candidates if os.path.isfile(p)), None)
-
-    # Fallback: if sync didn't get a .vtt (e.g. auto-transcribe was off at
-    # sync time, or yt-dlp's caption fetch failed transiently), try yt-dlp
-    # directly here — matches OLD's `_fetch_auto_captions` (YTArchiver.py:11641)
-    # which runs a cookieless probe first, then retries with cookies on 403.
-    _fetched_temp: List[str] = []
-    if not vtt:
-        vtt = _fetch_captions_via_ytdlp(video_path, stream, _fetched_temp)
-        if vtt:
-            candidates.append(vtt) # let the downstream cleanup delete it
-
-    if not vtt:
-        return False
-
-    t0 = time.time()
-    try:
-        segs = _parse_vtt(vtt)
-    except Exception as _ve:
-        # bug L-6: surface the parse failure before bailing. Old code
-        # silently returned False, causing the caller to emit "No
-        # auto-captions available — using Whisper..." even though the
-        # captions WERE present, just unparseable. A dim warning here
-        # makes the distinction visible without derailing the fallback.
-        try:
-            stream.emit_dim(
-                f" (auto-captions parse failed: {_ve} \u2014 "
-                f"falling back to Whisper)")
-        except Exception:
-            pass
-        # Clean up any temp files we fetched before bailing.
-        for _p in _fetched_temp:
-            try: os.remove(_p)
-            except OSError: pass
-        return False
-    if not segs:
-        for _p in _fetched_temp:
-            try: os.remove(_p)
-            except OSError: pass
-        return False
-
-    # Resolve aggregated transcript paths for this channel (matches OLD layout).
-    paths = _resolve_transcript_paths(video_path, title, channel)
-    if paths is None:
-        return False
-    txt_path, jsonl_path, _year, _month, upload_date = paths
-    try:
-        os.makedirs(os.path.dirname(txt_path), exist_ok=True)
-    except OSError:
-        pass
-
-    # Extract video id — caller-supplied hint wins (sync passes the
-    # DLTRACK-derived id explicitly so it always matches the sync.py
-    # tx_done_<vid> placeholder; see issue #148). Then try the filename
-    # suffix, then the FTS DB lookup.
-    vid_id = (video_id_hint or "").strip()
-    if not vid_id:
-        m = re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$", os.path.splitext(os.path.basename(video_path))[0])
-        if m:
-            vid_id = m.group(1)
-    if not vid_id:
-        try:
-            from . import index as _idx
-            conn = _idx._open()
-            if conn is not None:
-                with _idx._db_lock:
-                    row = conn.execute(
-                        "SELECT video_id FROM videos WHERE filepath=? "
-                        "COLLATE NOCASE LIMIT 1",
-                        (os.path.normpath(video_path),)).fetchone()
-                if row and row[0]:
-                    vid_id = row[0]
-        except Exception:
-            pass
-
-    # Append formatted entry to the aggregated .txt + hidden .jsonl.
-    full_text = " ".join(s["t"] for s in segs if s.get("t")).strip()
-    duration = segs[-1]["e"] if segs else 0
-
-    # Punctuation restoration — mirrors OLD YTArchiver.py:15437-15439.
-    # YT auto-captions arrive as a run-on stream of lowercase words;
-    # running them through the punct model restores casing + commas
-    # + periods so the .txt reads like a real transcript. Source tag
-    # flips to `YT+PUNCTUATION` so ArchivePlayer / Watch banner can
-    # detect the upgraded quality. Silently falls back to raw captions
-    # if the punct model isn't available or the call fails.
-    #
-    # Skip the pass entirely when the source VTT already arrived with
-    # sentence punctuation — modern YT auto-cap is delivered punctuated
-    # natively, and re-running the model on already-good text is wasted
-    # work. The banner that fronts the watch view is content-driven
-    # (see logs.js _buildSourceBanner) so the user still sees the
-    # "(punctuated)" qualifier; the source tag stays YT CAPTIONS which
-    # now consistently means "no punct pass ran during ingest".
-    src_tag = "YT CAPTIONS"
-    _vtt_punct_re = re.compile(r"[.,!?;:]")
-    _already_punct = bool(
-        full_text and _vtt_punct_re.search(full_text[:800]))
-    if punct_mgr is not None and full_text and not _already_punct:
-        try:
-            # `job_tag` (e.g. `whisper_job_7`) makes this line
-            # replace ONLY this video's prior "Loading punctuation..."
-            # or similar, and get replaced ONLY by this video's final
-            # "— ✓ Transcription" done line. Without it, any other
-            # video's whisper_* emit would stomp this line.
-            _tag_list = ["transcribe_using"]
-            if job_tag:
-                _tag_list.append(job_tag)
-            else:
-                _tag_list.append("whisper_progress")
-            stream.emit([[" Adding punctuation...\n", _tag_list]])
-            punct_text = punct_mgr.punctuate(full_text)
-            if punct_text and punct_text != full_text:
-                full_text = punct_text
-                # Per-segment punct so the JSONL (and therefore FTS /
-                # Watch-view karaoke text) is punctuated consistently.
-                # Matches NEW's Whisper flow's per-segment pass.
-                for seg in segs:
-                    t = (seg.get("t") or "").strip()
-                    if t:
-                        try:
-                            pt = punct_mgr.punctuate(t)
-                            if pt:
-                                seg["t"] = pt
-                        except Exception:
-                            pass
-                src_tag = "YT+PUNCTUATION"
-        except Exception as _pe:
-            stream.emit_dim(f" (punctuation skipped: {_pe})")
-
-    _write_transcript_entry(txt_path, title, upload_date, duration,
-                            src_tag, full_text)
-    _write_jsonl_entry(jsonl_path, vid_id, title, segs)
-
-    # Clean up the .vtt sidecar — OLD deletes these immediately after parsing.
-    for _p in candidates:
-        if os.path.isfile(_p):
-            try: os.remove(_p)
-            except OSError: pass
-
-    # FTS ingest — use the new aggregated .jsonl path
-    try:
-        from . import index as _idx
-        _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
-        _idx.mark_video_transcribed(video_path)
-    except Exception:
-        pass
-    # Decrement transcription_pending / set transcription_complete on 0.
-    _bump_transcription_pending(channel, -1)
-    # Drop this video's ID from the authoritative pending list so the
-    # Subs "-X" indicator shrinks. `vid_id` was extracted earlier in
-    # this function for jsonl + FTS writes.
-    if vid_id:
-        try:
-            from . import ytarchiver_config as _cfg
-            _cfg.remove_pending_tx_id(vid_id)
-        except Exception:
-            pass
-
-    took = time.time() - t0
-    realtime = f"{duration/took:.1f}x" if took > 0 and duration > 0 else ""
-    # Per-video done line. Stamp every segment with the per-job
-    # `job_tag` (unique per video) so this line REPLACES this
-    # video's in-progress lines AND gets left alone by other
-    # videos' transcriptions. ALSO stamp with `tx_done_<vid>` so the
-    # done line lands at the placeholder sync.py reserved under the
-    # channel's block rather than at the bottom of the log.
-    # `_inplaceKind` prioritizes `tx_done_` over `whisper_job_`.
-    # audit SR-2 (user screenshot): on multi-video channels,
-    # the "Transcription queued…" placeholder persisted next to the
-    # auto-captions ✓ done line because `_tx_tag` was LAST in each
-    # tag list here — `_inplaceKind` resolved the emit to
-    # `whisper_job_<N>` (the first match) and the tx_done_<vid>
-    # marker got missed, so the placeholder didn't replace.
-    # The Whisper-done path at _transcribe_one already put _tx_tag
-    # FIRST (see comment at line 2529) but the auto-captions path
-    # kept the old order. Mirror it so both paths correctly replace
-    # the sync.py placeholder.
-    _tx_tag = f"tx_done_{vid_id}" if vid_id else ""
-    _em_tag = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
-    _dim_tag = [t for t in (_tx_tag, "dim", job_tag) if t]
-    _lbl_tag = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
-    stream.emit([
-        [" ", _dim_tag],
-        ["\u2014 \u2713 ", _em_tag],
-        ["Transcription", _lbl_tag],
-        [f" (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _dim_tag],
-    ])
-    return True
-
-
-def _ts_to_sec(ts: str) -> float:
-    """Convert 'HH:MM:SS.mmm' or 'MM:SS.mmm' to float seconds.
-    Mirrors YTArchiver.py:8245-8252."""
-    ts = ts.replace(",", ".").strip()
-    parts = ts.split(":")
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + float(parts[1])
-    return 0.0
-
-
-def _parse_vtt(path: str) -> list:
-    """Full-fidelity port of YTArchiver.py:8223 `_parse_vtt_to_segments`.
-
-    Three steps:
-      1. Parse raw cues from the VTT and extract per-word <c>-tag timestamps
-         (the YouTube auto-caption markup: `word<00:00:00.480><c> next</c>`).
-      2. Merge rolling-caption overlap where each new cue repeats the tail of
-         the previous cue plus a few new words — flush at 30s cap.
-      3. Attach per-word timestamps back onto the merged segments; fall back
-         to distributed timings when no <c> tags were present (manual subs).
-
-    Returns a list of short-key segments: [{s, e, t, w: [{w, s, e}, ...]}, ...]
-    — compatible with `_write_jsonl_entry` and `_try_auto_captions`.
-    """
-    import html as _html_mod
-    import re as _re
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            raw = f.read()
-    except OSError:
-        return []
-
-    # ── Step 1: Parse raw cues (text + original raw lines for <c> extraction) ──
-    raw_cues = [] # (start, end, joined_text, [raw_content_lines])
-    lines = raw.split("\n")
-    current_start = None
-    current_end = None
-    current_text = []
-    current_raw = []
-    ts_line_re = _re.compile(r'(\d[\d:.]+)\s*-->\s*(\d[\d:.]+)')
-    for line in lines:
-        line = line.strip()
-        m = ts_line_re.match(line)
-        if m:
-            if current_text and current_start is not None:
-                raw_cues.append((current_start, current_end,
-                                 " ".join(current_text), list(current_raw)))
-            current_start = _ts_to_sec(m.group(1))
-            current_end = _ts_to_sec(m.group(2))
-            current_text = []
-            current_raw = []
-            continue
-        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") \
-                or line.startswith("Kind:") or line.startswith("Language:"):
-            continue
-        if _re.match(r'^\d+$', line):
-            continue
-        if 'align:' in line or 'position:' in line:
-            continue
-        current_raw.append(line)
-        cleaned = _re.sub(r'<[^>]+>', '', line)
-        cleaned = _html_mod.unescape(cleaned)
-        cleaned = _re.sub(r'\s+', ' ', cleaned).strip()
-        if cleaned:
-            current_text.append(cleaned)
-    if current_text and current_start is not None:
-        raw_cues.append((current_start, current_end,
-                         " ".join(current_text), list(current_raw)))
-    if not raw_cues:
-        return []
-
-    # ── Step 1b: Extract per-word timestamps from <c> tags ──
-    ctag_re = _re.compile(r'<(\d[\d:.]+)><c[^>]*>(.*?)</c>')
-    all_words = []
-    has_ctags = False
-    for cue_idx, (cue_s, cue_e, _, raw_lines) in enumerate(raw_cues):
-        for raw_line in raw_lines:
-            tags = list(ctag_re.finditer(raw_line))
-            if tags:
-                has_ctags = True
-                # Every cue with <c> tags has an untagged prefix before the
-                # first tag — for cue 0 it's the leading words, for every
-                # continuation cue it's the newly-rolled-in word(s) for the
-                # rolling caption. Both must be captured at cue_s, otherwise
-                # the new word in each continuation cue is silently dropped.
-                first_tag_pos = raw_line.find('<')
-                if first_tag_pos > 0:
-                    prefix = _html_mod.unescape(raw_line[:first_tag_pos]).strip()
-                    for pw in prefix.split():
-                        if pw.strip():
-                            all_words.append({"w": pw.strip(), "s": cue_s})
-                for mm in tags:
-                    ts = _ts_to_sec(mm.group(1))
-                    word_text = _html_mod.unescape(mm.group(2)).strip()
-                    for w in word_text.split():
-                        if w.strip():
-                            all_words.append({"w": w.strip(), "s": ts})
-    # No <c> tags (manual subs): distribute word starts across cue duration.
-    if not has_ctags:
-        for cue_s, cue_e, text, _ in raw_cues:
-            dur = cue_e - cue_s
-            words_in_cue = text.strip().split()
-            n = len(words_in_cue)
-            for wi, w in enumerate(words_in_cue):
-                all_words.append({
-                    "w": w,
-                    "s": round(cue_s + dur * wi / max(n, 1), 3),
-                })
-    # Compute end times (each word ends when the next begins).
-    all_words.sort(key=lambda w: w["s"])
-    for i in range(len(all_words) - 1):
-        all_words[i]["e"] = round(all_words[i + 1]["s"], 3)
-    if all_words:
-        # audit E-49: set the last word's end to the end of the cue
-        # that actually contains its start, not the globally-last cue
-        # end. Otherwise the final word's highlight bar stretches all
-        # the way to video end (sometimes seconds longer than the word
-        # really spans) in the Watch-view karaoke.
-        _last_start = all_words[-1]["s"]
-        _last_end = round(raw_cues[-1][1], 3)  # safe fallback
-        for _cs, _ce, _txt, _raw in raw_cues:
-            if _cs <= _last_start <= _ce:
-                _last_end = round(_ce, 3)
-        all_words[-1]["e"] = _last_end
-        for w in all_words:
-            w["s"] = round(w["s"], 3)
-
-    # ── Step 2: Merge overlapping rolling cues, flush at 30s cap ──
-    MAX_SEG_SECS = 30.0
-    segments = []
-    seg_start = raw_cues[0][0]
-    seg_end = raw_cues[0][1]
-    seg_text = raw_cues[0][2]
-    for i in range(1, len(raw_cues)):
-        _s, _e, _t, _ = raw_cues[i]
-        is_overlap = False
-        if seg_text and _t:
-            seg_words_list = seg_text.split()
-            new_words_list = _t.split()
-            max_overlap = min(len(seg_words_list),
-                              len(new_words_list) - 1, 20)
-            for ol in range(max_overlap, 0, -1):
-                if seg_words_list[-ol:] == new_words_list[:ol]:
-                    extra = " ".join(new_words_list[ol:])
-                    is_overlap = True
-                    if (_e - seg_start) > MAX_SEG_SECS:
-                        if seg_text.strip():
-                            segments.append({
-                                "start": seg_start, "end": seg_end,
-                                "text": seg_text.strip()})
-                        seg_start = _s
-                        seg_end = _e
-                        seg_text = _t
-                    else:
-                        if extra:
-                            seg_text += " " + extra
-                        seg_end = _e
-                    break
-            # Catch near-zero-duration "echo" cues that just repeat the tail.
-            if not is_overlap and (_e - _s) < 0.1:
-                is_overlap = True
-                seg_end = max(seg_end, _e)
-        if not is_overlap:
-            if seg_text.strip():
-                segments.append({
-                    "start": seg_start, "end": seg_end,
-                    "text": seg_text.strip()})
-            seg_start = _s
-            seg_end = _e
-            seg_text = _t
-    if seg_text.strip():
-        segments.append({"start": seg_start, "end": seg_end,
-                         "text": seg_text.strip()})
-
-    # ── Step 2b: Split any segment that still exceeds the cap ──
-    capped = []
-    for seg in segments:
-        dur = seg["end"] - seg["start"]
-        if dur <= MAX_SEG_SECS:
-            capped.append(seg)
-            continue
-        words = seg["text"].split()
-        n = max(2, int(dur / MAX_SEG_SECS) + (1 if dur % MAX_SEG_SECS > 0 else 0))
-        cdur = dur / n
-        wper = max(1, len(words) // n)
-        for ci in range(n):
-            w0 = ci * wper
-            w1 = w0 + wper if ci < n - 1 else len(words)
-            ct = " ".join(words[w0:w1])
-            if not ct:
-                continue
-            cs = round(seg["start"] + ci * cdur, 2)
-            ce = round(min(seg["end"], seg["start"] + (ci + 1) * cdur), 2)
-            capped.append({"start": cs, "end": ce, "text": ct})
-    segments = capped
-
-    # ── Step 3: Attach per-word timestamps back onto the merged segments ──
-    out = []
-    if all_words:
-        widx = 0
-        for seg in segments:
-            seg_words = []
-            back_limit = 200
-            # Strict partitioning: each word belongs to the segment whose
-            # [start, end) range contains its timestamp. Previously used a
-            # ±0.5s buffer which pulled the next segment's first 1-3 words
-            # into the prior segment, producing visible "heading to heading
-            # to" duplications at segment boundaries.
-            while back_limit > 0 and widx > 0 and widx < len(all_words) \
-                    and all_words[widx]["s"] >= seg["start"]:
-                widx -= 1
-                back_limit -= 1
-            while widx < len(all_words) and all_words[widx]["s"] < seg["start"]:
-                widx += 1
-            scan = widx
-            while scan < len(all_words) and all_words[scan]["s"] < seg["end"]:
-                seg_words.append(all_words[scan])
-                scan += 1
-            if not seg_words:
-                seg_words = _generate_distributed_words(
-                    seg["text"], seg["start"], seg["end"])
-            out.append({
-                "s": round(seg["start"], 2),
-                "e": round(seg["end"], 2),
-                "t": seg["text"],
-                "w": seg_words,
-            })
-            widx = scan
-    else:
-        for seg in segments:
-            out.append({
-                "s": round(seg["start"], 2),
-                "e": round(seg["end"], 2),
-                "t": seg["text"],
-                "w": _generate_distributed_words(
-                    seg["text"], seg["start"], seg["end"]),
-            })
-    return out
-
-
-# ── Python 3.11 discovery (same pattern as YTArchiver.py:8653) ─────────
-
-def find_python311() -> Optional[str]:
-    """Locate a Python 3.11 executable to run the Whisper worker.
-
-    Whisper (specifically faster-whisper + its CTranslate2 / CUDA wheels)
-    is pinned to Python 3.11 — the wheels for 3.13 don't exist on PyPI
-    yet, and we don't want to bundle CUDA into the main app. So the
-    pywebview shell runs on Python 3.13 and shells out to a separate
-    Python 3.11 process for transcription work.
-
-    Search order (first hit wins):
-      1. `%LOCALAPPDATA%\\Programs\\Python\\Python311*\\python.exe`
-         (the per-user install path the official Python installer uses
-         by default — this is where most installs land)
-      2. `C:\\Python311\\python.exe` and `C:\\Python310\\python.exe`
-         (old "all users" location, kept as a backstop)
-      3. `%PROGRAMFILES%\\Python311\\python.exe` and the WOW64 variant
-      4. Whatever `python3.11` or `python` resolves to on PATH
-      5. A hard-coded last-ditch path under `%LOCALAPPDATA%`
-
-    Returns the absolute path to `python.exe`, or `None` if nothing
-    suitable was found — callers should surface a friendly "please
-    install Python 3.11" message rather than crashing.
-    """
-    import shutil as _shutil
-    candidates: List[str] = []
-    bases = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python"),
-        r"C:\Python311",
-        r"C:\Python310",
-        os.path.expandvars(r"%PROGRAMFILES%\Python311"),
-        os.path.expandvars(r"%PROGRAMFILES(X86)%\Python311"),
-    ]
-    for base in bases:
-        candidates.extend(glob.glob(os.path.join(base, "Python311*", "python.exe")))
-        p = os.path.join(base, "python.exe")
-        if os.path.isfile(p):
-            candidates.append(p)
-    if candidates:
-        return candidates[0]
-    for name in ("python3.11", "python"):
-        found = _shutil.which(name)
-        if found:
-            return found
-    # Final fallback — common location
-    fallback = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe")
-    return fallback if os.path.isfile(fallback) else None
-
+from ..log import get_logger
+
+_log = get_logger(__name__)
+
+
+# path + format + hide helpers moved to
+# transcribe_paths.py. Re-imported here so internal calls and external
+# `from backend.transcribe import _foo` callers keep working.
+from ..transcribe_paths import (
+    _get_jsonl_sidecar,
+    _get_transcript_filename,
+)
+
+# ── Patch 19 phase T1 (v68.9): file writers moved to transcribe_files.py ─
+# Internal callers (_transcribe_one, _write_outputs, retranscribe flows)
+# expect these names in this module's namespace.
+from .transcribe_files import (
+    _HEADER_RE,
+    _replace_jsonl_entry,
+    _replace_txt_entry,
+    _write_jsonl_entry,
+    _write_transcript_entry,
+)
+
+# Patch 16 (v71.8): pure helpers + PunctuationManager extracted to
+# helpers.py + punct_manager.py. Re-imported here so this module's
+# namespace + the package __init__ surface keep the previously-public
+# names visible.
+from .helpers import (  # noqa: F401
+    _CHUNK_DURATION_SECS,
+    _CHUNK_MIN_DURATION,
+    _CHUNK_OVERLAP_SECS,
+    _bump_transcription_pending,
+    _extract_video_id,
+    _ffprobe_duration,
+    _lookup_channel,
+    _norm_title,
+    _resolve_transcript_paths,
+    _scan_existing_transcript_titles,
+    find_python311,
+    ytarchiver_config_output_dir,
+)
+from .punct_manager import PunctuationManager  # noqa: F401
+
+
+# ── Patch 19 phase T2 (v68.9): VTT path moved to transcribe_vtt.py ───
+from .transcribe_vtt import (  # noqa: F401  (re-exports for backend.transcribe surface)
+    _parse_vtt,
+    _try_auto_captions,
+)
 
 # ── Manager ────────────────────────────────────────────────────────────
-
-class PunctuationManager:
-    """Persistent punctuation-restoration subprocess. Cheap when idle.
-
-    Call `punctuate(text)` with the raw whisper output; returns the
-    capitalised / punctuated version. Subprocess boots on first call
-    and stays alive between calls.
-    """
-
-    def __init__(self, stream: LogStreamer):
-        self._stream = stream
-        self._proc: Optional[subprocess.Popen] = None
-        # audit D-11: reentrant lock so punctuate()'s exception handler
-        # can call _stop() without self-deadlocking. Old non-reentrant
-        # Lock caused a wedged punct model to freeze every subsequent
-        # transcribe (the exception handler in punctuate tried to
-        # re-acquire the lock it already held via the outer with block).
-        self._lock = threading.RLock()
-        self._starting = False
-        self._worker_script = Path(__file__).resolve().parent / "punct_worker.py"
-        self._python311: Optional[str] = None
-        # Set by `_transcribe_one` before each punctuate() call so the
-        # "Loading punctuation model..." emit carries the current
-        # video's per-job inplace tag. Without it that line shares the
-        # generic "whisper" kind and can get stomped by other jobs.
-        self._job_tag: str = ""
-        # Bug [43]: track whether the most recent punctuate() call hit
-        # the per-call timeout, separately from other failures. Lets
-        # callers append "+TIMEOUT" to the source tag so the user can
-        # see at-a-glance why the transcript is unpunctuated.
-        self.last_was_timeout: bool = False
-
-    def is_available(self) -> bool:
-        return self._worker_script.exists() and (self._python311 or find_python311()) is not None
-
-    def _start(self) -> bool:
-        with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return True
-            if self._starting:
-                return False
-            self._starting = True
-        try:
-            py = self._python311 or find_python311()
-            if not py:
-                self._stream.emit_error("Punctuation: Python 3.11 not found.")
-                return False
-            self._python311 = py
-            # Per-job tag so this line joins the current video's
-            # inplace family and gets replaced by "Adding
-            # punctuation..." → then by the final "— ✓ Transcription"
-            # done line. Falls back to the generic kind if no tag
-            # was set.
-            _tags = ["transcribe_using"]
-            _tags.append(self._job_tag if self._job_tag else "whisper_progress")
-            self._stream.emit([[
-                " Loading punctuation model...\n", _tags]])
-            env = os.environ.copy()
-            self._proc = subprocess.Popen(
-                [py, str(self._worker_script)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, bufsize=1, startupinfo=_startupinfo, env=env,
-            )
-            # Wait for ready
-            ready: List[Optional[str]] = [None]
-            def _read():
-                try:
-                    ready[0] = self._proc.stdout.readline().strip()
-                except Exception:
-                    pass
-            t = threading.Thread(target=_read, daemon=True)
-            t.start()
-            t.join(timeout=300)
-            if t.is_alive():
-                self._stream.emit_error("Punctuation model timed out loading.")
-                self._stop()
-                return False
-            line = ready[0]
-            if not line:
-                return False
-            info = json.loads(line)
-            if info.get("status") != "ready":
-                self._stream.emit_error(f"Punct start: {info}")
-                self._stop()
-                return False
-            self._stream.emit_text(f" \u2014 \u2713 Punctuation model loaded ({info.get('device', '?').upper()}).",
-                                    "simpleline_green")
-            return True
-        except Exception as e:
-            self._stream.emit_error(f"Failed to start punctuation: {e}")
-            self._stop()
-            return False
-        finally:
-            with self._lock:
-                self._starting = False
-
-    def _stop(self):
-        with self._lock:
-            if self._proc is not None:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
-                self._proc = None
-
-    def punctuate(self, text: str, timeout_sec: float = 60.0) -> str:
-        """Run text through the punctuation model. Returns original text on failure.
-
-        audit D-11: timeout_sec is now actually honored. The stdout
-        readline happens in a daemon thread with join(timeout); if the
-        subprocess wedges, the call returns the raw text and kills the
-        subprocess so the NEXT call restarts it clean. Previously the
-        blocking readline could hang forever, wedging every subsequent
-        transcription because the lock was held the whole time.
-        """
-        if not text or len(text.split()) < 3:
-            return text
-        # Bug [43]: reset timeout flag at the start of each call so the
-        # caller can read it after this call returns.
-        self.last_was_timeout = False
-        if self._proc is None or self._proc.poll() is not None:
-            if not self._start():
-                return text
-        try:
-            req = json.dumps({"text": text}) + "\n"
-            with self._lock:
-                self._proc.stdin.write(req)
-                self._proc.stdin.flush()
-                # Read in a helper thread so we can bound the wait.
-                _result: Dict[str, Any] = {"line": None, "err": None}
-                def _reader():
-                    try:
-                        _result["line"] = self._proc.stdout.readline()
-                    except Exception as _re:
-                        _result["err"] = _re
-                _t = threading.Thread(target=_reader, daemon=True)
-                _t.start()
-                _t.join(timeout_sec)
-                if _t.is_alive():
-                    # Wedged — kill subprocess to unblock the reader
-                    # thread (its readline will return empty once stdout
-                    # closes) and treat as failed pass.
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                    self._proc = None
-                    self.last_was_timeout = True
-                    self._stream.emit_dim(
-                        f" (punctuation timed out after {timeout_sec:.0f}s)")
-                    return text
-                line = (_result.get("line") or "").strip()
-            if not line:
-                return text
-            resp = json.loads(line)
-            if resp.get("status") == "ok":
-                return resp.get("text", text) or text
-            return text
-        except Exception as e:
-            self._stream.emit_dim(f" (punctuation skipped: {e})")
-            # Subprocess may be wedged — kill so next call restarts cleanly.
-            # Safe to call _stop() now that self._lock is an RLock.
-            self._stop()
-            return text
-
 
 def _pending_journal_path() -> Path:
     """Where the pending-transcribe journal lives.
@@ -1496,7 +121,7 @@ def _pending_journal_path() -> Path:
     We keep a global one at APPDATA/ytarchiver_pending_transcribe.json so
     the manager can recover ALL queued work across channels on restart.
     """
-    from .ytarchiver_config import APP_DATA_DIR
+    from ..ytarchiver_config import APP_DATA_DIR
     return APP_DATA_DIR / "ytarchiver_pending_transcribe.json"
 
 
@@ -1514,36 +139,40 @@ class TranscribeManager:
     def __init__(self, stream: LogStreamer, model: str = "large-v3"):
         self._stream = stream
         self._model = model
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
-        self._line_queue: Optional[queue.Queue] = None
+        self._line_queue: queue.Queue | None = None
         self._starting = False
-        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_thread: threading.Thread | None = None
         self._python311 = find_python311()
-        self._worker_script = Path(__file__).resolve().parent / "whisper_worker.py"
+        # Patch 19 fix (v68.2): this file moved from backend/transcribe.py
+        # to backend/transcribe/legacy.py. The worker script is bundled
+        # at <bundle>/backend/whisper_worker.py per the PyInstaller spec,
+        # so go up one more level.
+        self._worker_script = Path(__file__).resolve().parent.parent / "whisper_worker.py"
         # Optional punctuation model — lazy-loaded, reused across jobs.
         self._punct = PunctuationManager(stream)
         self._punctuate_enabled = True
 
         # Queue of jobs. Each job = {path, title, cb, cancel_event}
-        self._jobs: List[Dict[str, Any]] = []
+        self._jobs: list[dict[str, Any]] = []
         self._jobs_lock = threading.Lock()
-        # audit D-10: flipped True when OOM forces a subprocess into
+        # flipped True when OOM forces a subprocess into
         # CPU mode. After the next successful transcribe completes,
         # we reset WHISPER_DEVICE back to "cuda" and force a restart
         # so subsequent jobs try GPU again. Without this flag, one
         # OOM early in a session stuck every later video in slow CPU
         # transcription for the rest of the run.
         self._cpu_fallback_active = False
-        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_thread: threading.Thread | None = None
         self._cancel_all = threading.Event()
         self._paused = threading.Event()
-        self._current_job: Optional[Dict[str, Any]] = None
+        self._current_job: dict[str, Any] | None = None
         # Per-batch stats for autorun_history [Trnscr] rows. Mirrors
         # YTArchiver.py:22575 _record_transcription — one row per channel
         # with done/err counts + elapsed time. Flushed when the worker
         # drains. Keyed by channel name.
-        self._batch_stats: Dict[str, Dict[str, Any]] = {}
+        self._batch_stats: dict[str, dict[str, Any]] = {}
         # Reference to the shared QueueState. Attached by the app wrapper
         # after construction (main.py can't pass it in __init__ because
         # QueueState is constructed later). When None, the manager
@@ -1564,7 +193,7 @@ class TranscribeManager:
         self._queues = queues
         self._cfg_loader = cfg_loader
 
-    def get_channel_batch_stats(self, channel_name: str) -> Dict[str, int]:
+    def get_channel_batch_stats(self, channel_name: str) -> dict[str, int]:
         """Synchronous snapshot of this channel's transcription batch
         stats. Used by sync_channel at end-of-pass to fold transcribed
         counts into the consolidated activity-log [Dwnld] row — auto-
@@ -1582,7 +211,7 @@ class TranscribeManager:
         duplicate [Trnscr] row for the same transcriptions.
         """
         try: self._batch_stats.pop(channel_name, None)
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
 
     def _auto_enabled(self) -> bool:
         """True if the GPU Auto checkbox says "go". When False, the
@@ -1611,19 +240,21 @@ class TranscribeManager:
         """
         if not new_model:
             return False
+        if new_model == self._model:
+            return True  # already on this model; nothing to do
         self._model = new_model
         # Kill the current subprocess so the next job triggers a restart
         # with the new WHISPER_MODEL env var baked in.
         try:
             self._stop_subprocess()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         self._stream.emit_text(
             f" \u2014 Whisper model queued to swap to '{new_model}' "
             f"on next job.", "simpleline_blue")
         return True
 
-    def start_subprocess(self, model: Optional[str] = None) -> bool:
+    def start_subprocess(self, model: str | None = None) -> bool:
         """Start the persistent whisper worker. Returns True when ready."""
         with self._proc_lock:
             if self._proc is not None and self._proc.poll() is None:
@@ -1647,7 +278,7 @@ class TranscribeManager:
             env["WHISPER_DEVICE"] = "cuda"
             env["WHISPER_COMPUTE"] = "float16"
 
-            # audit D-54: capture stderr so crashes during model load
+            # capture stderr so crashes during model load
             # or transcription land somewhere diagnosable. Previously
             # stderr was piped to DEVNULL, making CUDA driver stderr
             # messages invisible — the only crash signal was the
@@ -1660,13 +291,37 @@ class TranscribeManager:
                 text=True, bufsize=1, startupinfo=_startupinfo, env=env,
             )
 
+            # drain stderr on a background thread. Without
+            # this, whisper subprocess can DEADLOCK when it writes enough
+            # stderr (per-segment warnings, model load messages) to fill
+            # the OS pipe buffer (~64KB on Windows) — whisper blocks on
+            # write while we read only stdout. The drain thread keeps the
+            # buffer empty AND captures the last 200 lines into a ring
+            # buffer for inclusion in error reports.
+            from collections import deque as _deque
+            self._stderr_buffer = _deque(maxlen=200)
+            _stderr_proc = self._proc
+            _stderr_sink = self._stderr_buffer
+            def _drain_stderr():
+                try:
+                    for ln in iter(_stderr_proc.stderr.readline, ""):
+                        if not ln:
+                            break
+                        _stderr_sink.append(ln.rstrip())
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            self._stderr_drain_thread = threading.Thread(
+                target=_drain_stderr, daemon=True,
+                name="yta-whisper-stderr")
+            self._stderr_drain_thread.start()
+
             # Wait for "ready" (model load can take minutes on first download)
-            ready_result: List[Optional[str]] = [None]
+            ready_result: list[str | None] = [None]
             def _read_ready():
                 try:
                     ready_result[0] = self._proc.stdout.readline().strip()
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             t = threading.Thread(target=_read_ready, daemon=True)
             t.start()
             t.join(timeout=600) # 10 min for model download + load
@@ -1729,12 +384,12 @@ class TranscribeManager:
                             q.put(ln)
                         except Exception:
                             break
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 try:
                     q.put(None)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             self._reader_thread = threading.Thread(target=_reader, daemon=True)
             self._reader_thread.start()
             return True
@@ -1758,8 +413,8 @@ class TranscribeManager:
                         self._proc.terminate()
                     except Exception:
                         self._proc.kill()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             self._proc = None
             self._line_queue = None
 
@@ -1767,8 +422,8 @@ class TranscribeManager:
 
     def enqueue(self, path: str, title: str = "",
                 channel: str = "",
-                combined: Optional[bool] = None,
-                on_complete: Optional[Callable] = None,
+                combined: bool | None = None,
+                on_complete: Callable | None = None,
                 retranscribe: bool = False,
                 video_id: str = "",
                 bulk_id: str = "",
@@ -1794,8 +449,7 @@ class TranscribeManager:
         `retranscribe=True` marks this as a RE-transcription — the worker
         will call `_replace_jsonl_entry` + `_replace_txt_entry` instead
         of the normal append-only writers, so the old entry in the
-        aggregated files gets surgically swapped (matches OLD
-        YTArchiver.py:16369 `_run_retranscribe_job`). `video_id` is used
+        aggregated files gets surgically swapped (matches `_run_retranscribe_job`). `video_id` is used
         by the replace-jsonl pass to catch title-drifted duplicates.
         """
         path = str(path)
@@ -1824,7 +478,6 @@ class TranscribeManager:
         # popover stayed empty, so there was no visible record of the
         # transcription being queued. `kind=transcribe` + `title`
         # matches the shape `_task_label_gpu` reads.
-        #
         # `bulk_id`/`bulk_total` carry a coalesce hint — when N videos from
         # the same channel are queued in one "Queue Pending" / "Transcribe
         # All" click, they all share a bulk_id and the popover collapses
@@ -1840,20 +493,34 @@ class TranscribeManager:
                     "bulk_total": int(bulk_total or 0),
                     "bulk_index": int(bulk_index or 0),
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         # Bump `transcription_pending` for the channel so the Subs-tab
         # auto-indicator stays in sync with OLD's behavior (YTArchiver.py:
         # 14629 and friends set this counter during sync → transcribe flow).
         _bump_transcription_pending(channel, 1)
         self._persist_pending()
+        # Auto-clear a launch-time pause when a NEW job arrives AND the
+        # GPU Auto checkbox is on. The launch-time pause is meant to
+        # stop RESTORED items from auto-firing, not to block fresh
+        # user-initiated work. Without this clear, every new retranscribe
+        # / right-click "Re-transcribe" sat in the queue until the user
+        # manually clicked Start — confusing because Auto was on.
+        try:
+            if (self._auto_enabled() and self._paused.is_set()
+                    and self._queues is not None
+                    and getattr(self._queues, "gpu_paused", False)):
+                self._paused.clear()
+                self._queues.set_gpu_paused(False)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         self._ensure_worker()
         return True
 
     def compress_enqueue(self, path: str, title: str = "",
                          channel: str = "", quality: str = "Average",
                          output_res: str = "720",
-                         on_complete: Optional[Callable] = None) -> bool:
+                         on_complete: Callable | None = None) -> bool:
         """Queue a video for AV1 NVENC compression via the same GPU
         worker that handles transcription.
 
@@ -1892,8 +559,8 @@ class TranscribeManager:
                     "path": path,
                     "channel": channel,
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._persist_pending()
         self._ensure_worker()
         return True
@@ -1904,7 +571,7 @@ class TranscribeManager:
         """Write current pending jobs to disk so a crash/restart recovers them."""
         try:
             import json as _json
-            # audit E-50: serialize ALL job fields needed to rehydrate
+            # serialize ALL job fields needed to rehydrate
             # correctly on restart. Before this, only (path, title,
             # channel) were written — so a killed-mid-retranscribe job
             # came back as a regular transcribe (retranscribe flag
@@ -1914,7 +581,7 @@ class TranscribeManager:
             # to catch title-drifted stale entries) and for
             # combined_override / bulk_id which affect path resolution
             # and batch tracking.
-            def _snap(j: Dict[str, Any]) -> Dict[str, Any]:
+            def _snap(j: dict[str, Any]) -> dict[str, Any]:
                 return {
                     "path": j.get("path", ""),
                     "title": j.get("title", ""),
@@ -1942,8 +609,8 @@ class TranscribeManager:
             with open(tmp, "w", encoding="utf-8") as f:
                 _json.dump(snapshot, f, indent=2)
             os.replace(tmp, p)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     def load_pending(self) -> int:
         """Load any jobs left behind from a previous session. Returns count.
@@ -1965,7 +632,7 @@ class TranscribeManager:
 
             # Cache existing-title sets per channel so we don't re-walk the
             # folder N times.
-            _title_cache: Dict[str, set] = {}
+            _title_cache: dict[str, set] = {}
             def _already_transcribed(video_path: str, title: str, channel: str) -> bool:
                 # Legacy per-video .jsonl from an earlier build
                 base = os.path.splitext(video_path)[0]
@@ -1994,7 +661,7 @@ class TranscribeManager:
                     continue
                 if _already_transcribed(path, j.get("title", ""), j.get("channel", "")):
                     continue
-                # audit E-50: rehydrate all saved job fields (retranscribe,
+                # rehydrate all saved job fields (retranscribe,
                 # video_id, combined_override, bulk_*) so a restarted
                 # retranscribe stays a retranscribe and title-drifted
                 # stale entries get caught via video_id lookup.
@@ -2030,13 +697,53 @@ class TranscribeManager:
             n += 1
         return n
 
+    def remove_pending_jobs(self, predicate) -> int:
+        """Remove pending jobs from `_jobs` where predicate(job) is True.
+        Returns the count removed.
+
+        Used by the queue-popover removal handlers in queue_mixin so a
+        click on "X" drops the job from BOTH the persistent `_queues.gpu`
+        list AND this manager's `_jobs` work-list. Without this, the
+        worker_loop would still pop the user-removed item from `_jobs`
+        when its turn came, and the popover would suddenly show it as
+        the active job — the "removed task came back" bug.
+
+        Decrements `transcription_pending` for the channel so the Subs-
+        tab indicator stays accurate when removed jobs were
+        sync-originated (non-retranscribe).
+        """
+        if not callable(predicate):
+            return 0
+        removed = 0
+        with self._jobs_lock:
+            keep = []
+            for j in self._jobs:
+                try:
+                    match = bool(predicate(j))
+                except Exception:
+                    match = False
+                if match:
+                    removed += 1
+                    try:
+                        if (not j.get("retranscribe")
+                                and not j.get("_pending_decremented")):
+                            _bump_transcription_pending(
+                                j.get("channel") or "", -1)
+                            j["_pending_decremented"] = True
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                else:
+                    keep.append(j)
+            self._jobs[:] = keep
+        return removed
+
     def cancel_all(self):
         self._cancel_all.set()
         with self._jobs_lock:
             self._jobs.clear()
         if self._current_job:
             self._current_job["cancel"].set()
-        # audit E-51: also clear the shared GPU popover queue so the UI
+        # also clear the shared GPU popover queue so the UI
         # doesn't keep showing phantom "pending" rows for tasks that
         # have been cancelled. The worker's finally-path would normally
         # do this one-at-a-time, but on cancel_all the worker breaks
@@ -2044,8 +751,8 @@ class TranscribeManager:
         if self._queues is not None:
             try:
                 self._queues.gpu_clear()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     def pause(self):
         self._paused.set()
@@ -2078,7 +785,7 @@ class TranscribeManager:
         Fires the per-job cancel event so _transcribe_one returns promptly;
         worker loop then picks up the next job. No-op if nothing running.
 
-        audit D-18: also force-restart the whisper subprocess so the GPU
+        also force-restart the whisper subprocess so the GPU
         actually frees up for the next job. Previously the cancel event
         was set but whisper kept chugging on the current file until
         completion (just discarding the result) — GPU stayed pinned for
@@ -2089,12 +796,12 @@ class TranscribeManager:
         if job and "cancel" in job:
             try:
                 job["cancel"].set()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             try:
                 self._stop_subprocess(force=True)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
     def _ensure_worker(self):
         if self._worker_thread is None or not self._worker_thread.is_alive():
@@ -2144,15 +851,15 @@ class TranscribeManager:
                     try:
                         self._queues.set_gpu_paused_active(True)
                         _signaled_paused_active = True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 time.sleep(0.25)
             # Either we exited because cancel fired or because both
             # _paused and Auto-disabled cleared. Drop the active flag
             # if we set it.
             if _signaled_paused_active and self._queues is not None:
                 try: self._queues.set_gpu_paused_active(False)
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
             if self._cancel_all.is_set():
                 break
             with self._jobs_lock:
@@ -2175,8 +882,8 @@ class TranscribeManager:
                         "path": job.get("path", ""),
                         "channel": job.get("channel", ""),
                     })
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             # Track per-channel stats so we can emit a [Trnscr] history
             # row when the worker drains. Matches OLD's _record_transcription.
             ch_name = (job.get("channel") or "").strip() or "\u2014"
@@ -2211,7 +918,7 @@ class TranscribeManager:
                     stats["err"] += 1
                 else:
                     stats["done"] += 1
-                # bug C-2: if a transcribe job crashed or early-returned
+                # if a transcribe job crashed or early-returned
                 # without reaching the success-path decrement, the pending
                 # counter would leak (-1, -2, -3 stuck on the Subs row
                 # forever). Any non-retranscribe transcribe job that didn't
@@ -2225,12 +932,12 @@ class TranscribeManager:
                             _bump_transcription_pending(ch_for_decrement, -1)
                         _vid = job.get("video_id") or ""
                         if _vid:
-                            from . import ytarchiver_config as _cfg
+                            from .. import ytarchiver_config as _cfg
                             _cfg.remove_pending_tx_id(_vid)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 self._current_job = None
-                # audit D-10 / audit H-11: if the previous job had been
+                # audit D-10 / if the previous job had been
                 # forced into CPU mode via OOM fallback, reset the env
                 # back to CUDA regardless of whether the fallback job
                 # itself succeeded or crashed. Before, the reset was
@@ -2253,34 +960,34 @@ class TranscribeManager:
                             "\u2014 giving GPU another try).")
                         self._stream.emit_text(
                             " " + _reset_label, "simpleline_blue")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 # Clear the "running" slot on completion so the popover
                 # returns to idle (or shows the next queued item as the
                 # next iteration sets its own current_gpu).
                 if self._queues is not None:
                     try:
                         self._queues.set_current_gpu(None)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 self._persist_pending()
 
         # Flush per-channel batch stats to autorun_history + activity log.
         # One row per channel processed in this worker session.
         try:
             self._flush_batch_stats()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         self._stream.flush()
 
-    def _compress_one(self, job: Dict[str, Any]):
+    def _compress_one(self, job: dict[str, Any]):
         """Run one compress job from the GPU queue — delegates to
         backend.compress.compress_video(). Shares the same worker
         thread as transcribe so only one GPU task runs at a time."""
         if job["cancel"].is_set():
             return
         try:
-            from . import compress as _cmp
+            from .. import compress as _cmp
         except Exception as e:
             self._stream.emit_error(f"Compress: import failed: {e}")
             return
@@ -2297,7 +1004,7 @@ class TranscribeManager:
             return
         if job.get("cb"):
             try: job["cb"](res)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
 
     def _flush_batch_stats(self):
         """Emit [Trnscr] autorun_history rows for MANUAL transcribe-only
@@ -2314,12 +1021,12 @@ class TranscribeManager:
         if not self._batch_stats:
             return
         try:
-            from . import autorun as _ar
+            from .. import autorun as _ar
         except Exception:
             self._batch_stats.clear()
             return
         try:
-            from . import sync as _sync
+            from .. import sync as _sync
         except Exception:
             _sync = None
         from datetime import datetime as _dt
@@ -2369,8 +1076,8 @@ class TranscribeManager:
                         kind="Dwnld",
                         row_id=str(pending.get("row_id") or ""),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 continue
 
             # No recent [Dwnld] row for this channel — emit a
@@ -2382,8 +1089,8 @@ class TranscribeManager:
                     _ar.format_history_entry("Trnscr", ch_name,
                                              primary, secondary="",
                                              errors=err, took_sec=elapsed))
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             try:
                 self._stream.emit_activity({
                     "kind": "Trnscr",
@@ -2396,16 +1103,16 @@ class TranscribeManager:
                                  else f"took {int(elapsed)//60}m {int(elapsed)%60}s",
                     "row_tag": "hist_blue" if done > 0 else "",
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
 
-    def _transcribe_one(self, job: Dict[str, Any]):
+    def _transcribe_one(self, job: dict[str, Any]):
         path = job["path"]
         title = job["title"]
         if job["cancel"].is_set():
             return
 
-        # Issue #141: if GPU Auto was unchecked AFTER this job was
+        # if GPU Auto was unchecked AFTER this job was
         # popped but BEFORE we started processing, re-park it at the
         # front of the queue and bail. Without this guard the worker
         # would keep firing auto-captions / Whisper for several
@@ -2424,9 +1131,13 @@ class TranscribeManager:
         # "Loading punctuation..." would stomp video 1's done line
         # when two videos for the same channel get transcribed in
         # sequence. Store on the job so `punct_mgr` can pick it up.
-        global _JOB_COUNTER
-        _JOB_COUNTER += 1
-        job_tag = f"whisper_job_{_JOB_COUNTER}"
+        # _JOB_COUNTER lives in helpers.py (Patch 16 split). The `global`
+        # keyword doesn't reach across modules, so we mutate the
+        # counter through the module reference. Functionally
+        # equivalent to the old `global _JOB_COUNTER; _JOB_COUNTER += 1`.
+        from . import helpers as _h
+        _h._JOB_COUNTER += 1
+        job_tag = f"whisper_job_{_h._JOB_COUNTER}"
         job["job_tag"] = job_tag
 
         # ── Auto-captions fast-path ──
@@ -2434,14 +1145,12 @@ class TranscribeManager:
         # (English captions), parse it straight into .jsonl + .txt — way
         # faster than running Whisper and usually just as good for recent
         # podcast / news-type content.
-        #
         # Skipped for retranscribe jobs: when the user explicitly asks to
         # Re-transcribe with Whisper, the whole point is to REPLACE the
         # auto-captions transcript with a Whisper one. Taking the VTT
         # fast-path here would just regenerate the auto-captions entry.
-        #
         # Passes `self._punct` so the fetched captions get the same
-        # punctuation-restoration pass OLD YTArchiver.py:15437 runs.
+        # punctuation-restoration pass runs.
         # Captions written WITH punct get the `YT+PUNCTUATION` source
         # tag; captions written without get plain `YT CAPTIONS`.
         _punct_for_captions = self._punct if self._punctuate_enabled else None
@@ -2450,7 +1159,7 @@ class TranscribeManager:
         # this video's inplace family.
         if _punct_for_captions is not None:
             try: _punct_for_captions._job_tag = job_tag
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         if (not job.get("retranscribe") and
                 _try_auto_captions(path, title, job.get("channel", ""),
                                    self._stream,
@@ -2460,8 +1169,8 @@ class TranscribeManager:
             if job.get("cb"):
                 try:
                     job["cb"]({"auto_captions": True})
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             return
 
         # Auto-captions path missed — either no .vtt available, yt-dlp
@@ -2492,7 +1201,7 @@ class TranscribeManager:
                     f"+ CUDA drivers.")
                 if job.get("cb"):
                     try: job["cb"]({"ok": False, "reason": "whisper_start_failed"})
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 return
 
         # ── Chunked path for long videos (>~2 hours) ──
@@ -2504,9 +1213,8 @@ class TranscribeManager:
             self._transcribe_chunked(job, duration)
             return
 
-        # Progress line — ports OLD YTArchiver.py:11340 but rewritten
+        # Progress line — ports but rewritten
         # per 2026-04-23 user feedback notes on the 3rd screenshot:
-        #
         #  * "[1/1]" counter → replaced with a colored em-dash. A 1/1
         #    placeholder for the never-built batch feature was
         #    clutter; the line now reads naturally as a continuation
@@ -2523,7 +1231,6 @@ class TranscribeManager:
         #    ticks also can replace each other within this video's
         #    family (belt-and-suspenders — `_inplaceKind` prefers the
         #    `tx_done_` prefix so that path wins anyway).
-        #
         # Title truncated to match OLD's _trunc_pad_title visual width.
         _disp_title = title[:40].rstrip()
         _t_start = time.time() # for the " — ✓ Transcription (took Xs)" line below
@@ -2559,7 +1266,7 @@ class TranscribeManager:
         result = None
         while True:
             if job["cancel"].is_set() or self._cancel_all.is_set():
-                # audit E-52: tag the cancel line with this job's
+                # tag the cancel line with this job's
                 # inplace family so it REPLACES the last progress
                 # tick in place. Old behavior emitted an untagged
                 # red line that landed at the log tail while the
@@ -2608,7 +1315,7 @@ class TranscribeManager:
                         " \u21A9 Falling back to CPU mode for this job.",
                         "simpleline_blue")
                     self._stop_subprocess(force=True)
-                    # audit D-10: previously we set WHISPER_DEVICE=cpu
+                    # previously we set WHISPER_DEVICE=cpu
                     # globally and NEVER reset it, so one early OOM
                     # degraded every subsequent transcribe in the session
                     # to slow CPU mode. Now we flag on the instance and
@@ -2631,7 +1338,7 @@ class TranscribeManager:
             channel = job.get("channel") or ""
             # Run punctuation pass over the raw text (and each segment's t)
             if self._punctuate_enabled:
-                # bug L-7: track whether punct succeeded so the source
+                # track whether punct succeeded so the source
                 # tag can reflect reality. Previously a failed punct
                 # pass left the tag as "(WHISPER:model)" even though
                 # the text was unpunctuated — users assumed punctuation
@@ -2689,7 +1396,7 @@ class TranscribeManager:
             _elapsed = max(1, int(time.time() - _t_start))
             _time_str = (f"{_elapsed // 60}min {_elapsed % 60:02d}sec"
                           if _elapsed >= 60 else f"{_elapsed}sec")
-            # Issue #149: include the model name and realtime ratio so
+            # include the model name and realtime ratio so
             # the done line reads "Transcription (Whisper small, took
             # 55sec, 12.3x realtime)" instead of just "(took 55sec)".
             _model_label = (self._model or "").strip()
@@ -2742,10 +1449,10 @@ class TranscribeManager:
             if job.get("cb"):
                 try:
                     job["cb"](result)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
 
-    def _transcribe_chunked(self, job: Dict[str, Any], total_duration: float):
+    def _transcribe_chunked(self, job: dict[str, Any], total_duration: float):
         """Port of YTArchiver.py:11139 _whisper_transcribe_chunked.
 
         ffmpeg splits the audio into 2h windows with 30s of overlap; each
@@ -2769,8 +1476,8 @@ class TranscribeManager:
             [f"{hours:.1f}h, {n_chunks} sections\n", "simpleline"],
         ])
 
-        all_text_parts: List[str] = []
-        all_segments: List[Dict[str, Any]] = []
+        all_text_parts: list[str] = []
+        all_segments: list[dict[str, Any]] = []
         chunk_dir = _tf.mkdtemp(prefix="yt_whisper_chunk_")
         try:
             for ci in range(n_chunks):
@@ -2782,12 +1489,12 @@ class TranscribeManager:
                 if self._paused.is_set() and not cancel.is_set():
                     if self._queues is not None:
                         try: self._queues.set_gpu_paused_active(True)
-                        except Exception: pass
+                        except Exception as e: _log.debug("swallowed: %s", e)
                     while self._paused.is_set() and not cancel.is_set():
                         time.sleep(0.5)
                     if self._queues is not None:
                         try: self._queues.set_gpu_paused_active(False)
-                        except Exception: pass
+                        except Exception as e: _log.debug("swallowed: %s", e)
                 if cancel.is_set():
                     break
 
@@ -2825,7 +1532,7 @@ class TranscribeManager:
                                                       _log_prefix=section_prefix)
                 t_elapsed = time.time() - t_start
                 try: os.remove(chunk_path)
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
 
                 if not result:
                     self._stream.emit([
@@ -2867,7 +1574,7 @@ class TranscribeManager:
                 "segments": all_segments,
             }
             # Optional punctuation pass on the merged text (same as single-pass).
-            # audit D-19: also iterate each segment and punctuate its text
+            # also iterate each segment and punctuate its text
             # so the .jsonl (source of Watch-view karaoke + FTS search)
             # reads consistently punctuated. Previously only the merged
             # concatenated text got punctuated, leaving .jsonl segments
@@ -2890,10 +1597,10 @@ class TranscribeManager:
                                     _pt = self._punct.punctuate(_t)
                                     if _pt:
                                         _seg["t"] = _pt
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                                except Exception as e:
+                                    _log.debug("swallowed: %s", e)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             self._write_outputs(path, merged, title=title, channel=channel,
                                 combined_override=job.get("combined_override"),
                                 retranscribe=bool(job.get("retranscribe")),
@@ -2941,23 +1648,23 @@ class TranscribeManager:
             self._stream.emit(_segs_c)
             if job.get("cb"):
                 try: job["cb"](merged)
-                except Exception: pass
+                except Exception as e: _log.debug("swallowed: %s", e)
         finally:
             try: shutil.rmtree(chunk_dir, ignore_errors=True)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
 
-    def _transcribe_single_file(self, path: str, job: Dict[str, Any],
-                                 _log_prefix: str = "") -> Optional[Dict[str, Any]]:
+    def _transcribe_single_file(self, path: str, job: dict[str, Any],
+                                 _log_prefix: str = "") -> dict[str, Any] | None:
         """Send one file to the persistent whisper subprocess and collect the
         result. Used by the chunked path to do each section. Returns the
         parsed JSON from the worker (keys: text, segments) or None.
 
-        audit D-20: emits in-place progress ticks tagged with the
+        emits in-place progress ticks tagged with the
         current job's `job_tag` + the section prefix. Before this,
         chunked transcription looked frozen: a 6-hour video would
         show 3 "Section N/M done" lines over 2 hours of wall time
         with zero feedback in between. Now each chunk displays its
-        own progress bar. audit D-17: also honors pause INSIDE
+        own progress bar. also honors pause INSIDE
         the read loop so a 2-hour chunk can be paused mid-run.
         """
         if self._proc is None or self._proc.poll() is not None:
@@ -2976,7 +1683,7 @@ class TranscribeManager:
         while True:
             if job["cancel"].is_set() or self._cancel_all.is_set():
                 return None
-            # audit D-17: pause also polled inside the read loop so a
+            # pause also polled inside the read loop so a
             # long chunk mid-transcription can actually pause, not
             # just at chunk boundaries. Signal "actually paused" so the
             # Resume button stops blinking once we land in the wait.
@@ -2985,14 +1692,14 @@ class TranscribeManager:
                     and not self._cancel_all.is_set()):
                 if self._queues is not None:
                     try: self._queues.set_gpu_paused_active(True)
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
                 while (self._paused.is_set()
                        and not job["cancel"].is_set()
                        and not self._cancel_all.is_set()):
                     time.sleep(0.5)
                 if self._queues is not None:
                     try: self._queues.set_gpu_paused_active(False)
-                    except Exception: pass
+                    except Exception as e: _log.debug("swallowed: %s", e)
             if job["cancel"].is_set() or self._cancel_all.is_set():
                 return None
             try:
@@ -3035,9 +1742,9 @@ class TranscribeManager:
                     f"{msg.get('text', 'unknown')}")
                 return None
 
-    def _write_outputs(self, video_path: str, result: Dict[str, Any],
+    def _write_outputs(self, video_path: str, result: dict[str, Any],
                        title: str = "", channel: str = "",
-                       combined_override: Optional[bool] = None,
+                       combined_override: bool | None = None,
                        retranscribe: bool = False,
                        video_id_hint: str = ""):
         """Write a transcript entry to the aggregated {ch} Transcript.txt
@@ -3064,7 +1771,7 @@ class TranscribeManager:
             title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", title) or title
         if not channel:
             # Channel = parent folder name (or parent-of-parent when year-split).
-            # audit D-9: bound the "looks like a year/month folder" test
+            # bound the "looks like a year/month folder" test
             # so channels with names starting with a digit (e.g.
             # "5 Minute Crafts", or similar) don't get their
             # grandparent misidentified as the channel. Require
@@ -3106,7 +1813,7 @@ class TranscribeManager:
         text = (result.get("text") or "").strip()
         segs = result.get("segments", []) or []
 
-        # audit C-7: refuse to write an "empty-but-successful" transcript.
+        # refuse to write an "empty-but-successful" transcript.
         # Whisper can return rc=0 with `text=""` when audio is pure
         # silence, corrupted, or the model produced no output at all.
         # Before this guard, the empty result was written to disk and
@@ -3124,32 +1831,9 @@ class TranscribeManager:
                 "transcribed. Audio may be silent or unreadable.")
 
         # Extract video id — OLD-compat filenames don't carry the `[id]`
-        # suffix so we can't rely on the filename alone. Try in order:
-        # 0. caller-supplied hint (retranscribe flow passes the id from
-        # the Browse/watch view where it's already known)
-        # 1. `[videoId]` suffix on filename (legacy + mixed archives)
-        # 2. FTS DB `videos` table keyed by filepath (populated by sync's
-        # DLTRACK line — this is the reliable path for drop-in mode)
-        vid_id = (video_id_hint or "").strip()
-        if not vid_id:
-            stem = os.path.splitext(os.path.basename(video_path))[0]
-            m = re.search(r"\[([A-Za-z0-9_-]{11})\]\s*$", stem)
-            if m:
-                vid_id = m.group(1)
-            else:
-                try:
-                    from . import index as _idx
-                    conn = _idx._open()
-                    if conn is not None:
-                        with _idx._db_lock:
-                            row = conn.execute(
-                                "SELECT video_id FROM videos WHERE filepath=? "
-                                "COLLATE NOCASE LIMIT 1",
-                                (os.path.normpath(video_path),)).fetchone()
-                        if row and row[0]:
-                            vid_id = row[0]
-                except Exception:
-                    pass
+        # suffix. Order: hint -> filename `[id]` -> FTS `videos` table.
+        # consolidated into _extract_video_id helper.
+        vid_id = _extract_video_id(video_path, hint=video_id_hint or "")
 
         # Source tag: use the manager's active model so the Transcript.txt
         # header carries the right "(WHISPER:<model>)" tag even when
@@ -3158,7 +1842,7 @@ class TranscribeManager:
         # Without this, the Watch view banner shows just "Whisper
         # transcription" with no model name. this was flagged
         model_name = (result.get("model") or self._model or "").strip()
-        # bug L-7: when punctuation was attempted but failed, append
+        # when punctuation was attempted but failed, append
         # "+NO-PUNCT" to the source tag so the Watch banner accurately
         # reflects that the transcript is unpunctuated. Otherwise the
         # user sees "Whisper:large-v3" and assumes punct is present.
@@ -3176,8 +1860,8 @@ class TranscribeManager:
         try:
             self._stream.emit_dim(
                 f" (writing transcript source_tag={source_tag!r})")
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
         duration = segs[-1].get("end", segs[-1].get("e", 0)) if segs else 0
 
@@ -3186,7 +1870,7 @@ class TranscribeManager:
             # Mirrors YTArchiver.py:16462-16474: jsonl FIRST so its
             # video_id-based purge can report back any title-drifted
             # stale entries for the txt pass to also clean up.
-            # audit H-10: two-step replace was non-atomic — if .jsonl
+            # two-step replace was non-atomic — if .jsonl
             # succeeded but .txt failed (lock, permission) the video
             # ended up with new segments + old text, permanently
             # inconsistent. Mitigation: try .jsonl first; if it
@@ -3194,7 +1878,7 @@ class TranscribeManager:
             # remains intact on BOTH files. If .jsonl succeeds but
             # .txt fails, surface a prominent error and attempt a
             # roll-back by re-reading the backup we captured first.
-            _jsonl_backup: Optional[bytes] = None
+            _jsonl_backup: bytes | None = None
             try:
                 with open(jsonl_path, "rb") as _jb:
                     _jsonl_backup = _jb.read()
@@ -3240,7 +1924,7 @@ class TranscribeManager:
         # (harmless for the other videos sharing it — their lines in
         # the .jsonl are untouched and get re-inserted as-is).
         try:
-            from . import index as _idx
+            from .. import index as _idx
             _idx.ingest_jsonl(video_path, jsonl_path, title, channel)
             _idx.mark_video_transcribed(video_path)
         except Exception as e:
@@ -3262,16 +1946,16 @@ class TranscribeManager:
             # Drain the authoritative pending-ID list too.
             if vid_id:
                 try:
-                    from . import ytarchiver_config as _cfg
+                    from .. import ytarchiver_config as _cfg
                     _cfg.remove_pending_tx_id(vid_id)
-                except Exception:
-                    pass
-            # bug C-2: mark decrement-done so the worker-loop's
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            # mark decrement-done so the worker-loop's
             # exception finally doesn't decrement AGAIN on the success
             # path. The finally's decrement exists only for error paths
             # (Whisper crash, OOM, venv missing) that used to leak the
             # counter and leave the Subs row stuck at `-N`.
-            # audit A-1: the flag-set moved to the CALLERS because
+            # the flag-set moved to the CALLERS because
             # _write_outputs doesn't take `job` as a parameter —
             # referencing it here raised NameError on every Whisper
             # transcription. See the two `job["_pending_decremented"]

@@ -27,13 +27,17 @@ Schema matches YTArchiver.py's CHANNEL_DEFAULTS (line 173):
 from __future__ import annotations
 
 import os
-import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse
 
+from .log import get_logger
 from .ytarchiver_config import (
-    load_config, save_config, CHANNEL_DEFAULTS_ALL,
+    CHANNEL_DEFAULTS_ALL,
+    load_config,
+    save_config,
 )
+
+_log = get_logger(__name__)
 
 
 def normalize_channel_url(url: str) -> str:
@@ -72,7 +76,7 @@ def normalize_channel_url(url: str) -> str:
     return url
 
 
-def streams_url(url: str) -> Optional[str]:
+def streams_url(url: str) -> str | None:
     """Return the `/streams` tab URL for a channel, or None for non-channel URLs.
 
     Mirrors YTArchiver.py:17303 `_get_streams_url`. Used by sync to do a
@@ -121,7 +125,7 @@ def ensure_videos_suffix(url: str) -> str:
     return base
 
 
-def validate_channel_url(url: str) -> Tuple[bool, str]:
+def validate_channel_url(url: str) -> tuple[bool, str]:
     """Return (ok, error_msg)."""
     url = url.strip()
     if not url:
@@ -130,7 +134,7 @@ def validate_channel_url(url: str) -> Tuple[bool, str]:
     parsed = urlparse(norm)
     if parsed.scheme not in ("http", "https"):
         return False, "URL must start with http:// or https://."
-    # audit D-6: reject youtu.be — that's the short video-URL form and
+    # reject youtu.be — that's the short video-URL form and
     # never hosts channels. Accepting it let users paste a video URL,
     # pass validation, then sync tried to walk "a channel" built from
     # one video's URL → garbage results silently.
@@ -139,7 +143,7 @@ def validate_channel_url(url: str) -> Tuple[bool, str]:
     path = parsed.path.strip("/")
     if not path:
         return False, "URL must include a channel path (/@handle, /channel/UC..., /c/name, /user/name)."
-    # audit D-7: verify the path LOOKS like a channel path, not a
+    # verify the path LOOKS like a channel path, not a
     # watch/playlist URL. Accepting /watch?v=... as "a channel" meant
     # sync enumerated a single-video URL and produced silent
     # wrong-result output.
@@ -151,7 +155,7 @@ def validate_channel_url(url: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _find_channel(channels: List[Dict[str, Any]], match: Dict[str, str]) -> Optional[int]:
+def _find_channel(channels: list[dict[str, Any]], match: dict[str, str]) -> int | None:
     """Find the index of a channel matching by url, name, or folder."""
     match_url = normalize_channel_url(match.get("url", "")) if match.get("url") else ""
     match_name = (match.get("name") or match.get("folder") or "").strip().lower()
@@ -165,7 +169,7 @@ def _find_channel(channels: List[Dict[str, Any]], match: Dict[str, str]) -> Opti
     return None
 
 
-def _apply_defaults(ch: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_defaults(ch: dict[str, Any]) -> dict[str, Any]:
     """Merge in defaults for any missing fields."""
     out = dict(CHANNEL_DEFAULTS_ALL)
     out.update(ch)
@@ -180,7 +184,7 @@ def _apply_defaults(ch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _payload_to_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _payload_to_channel(payload: dict[str, Any]) -> dict[str, Any]:
     """Map UI payload shape to YTArchiver's channel shape.
 
     min_duration / max_duration: the UI sends MINUTES (to match how the
@@ -204,7 +208,7 @@ def _payload_to_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
         "compress_enabled": bool(payload.get("compress_enabled")),
     }
     # Range mapping: subscribe (default, new uploads only) / all / fromdate
-    # bug M-6: keep `date_after` in sync with `from_date` so legacy config
+    # keep `date_after` in sync with `from_date` so legacy config
     # readers that look at the older field name don't see a blank value
     # after a UI save. Sync itself reads from_date (sync.py:399) — date_after
     # is legacy from Classic. Writing both keeps migration lossless.
@@ -242,12 +246,12 @@ class SubsError(Exception):
     pass
 
 
-def list_channels() -> List[Dict[str, Any]]:
+def list_channels() -> list[dict[str, Any]]:
     cfg = load_config()
     return list(cfg.get("channels", []))
 
 
-def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> Optional[str]:
+def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
     """Best-effort: use yt-dlp to resolve a URL to its canonical channel name.
     Returns None on failure (so UI can fall back to user-supplied name).
 
@@ -259,6 +263,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> Optional[str]
     """
     try:
         import subprocess as _sp
+
         from . import sync as _sync
         yt = _sync.find_yt_dlp()
         if not yt:
@@ -306,7 +311,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> Optional[str]
         return None
 
 
-def add_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
+def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
     """Append a new channel. Raises SubsError on invalid input or duplicate.
 
     Unspecified fields fall back to the user's configured defaults (resolution,
@@ -329,8 +334,8 @@ def add_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
             payload["min_duration"] = max(0, default_secs // 60) # minutes
         if "auto_metadata" not in payload:
             payload["auto_metadata"] = True
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     # Strip-check (not just truthy) — whitespace-only values like " " are
     # effectively blank after _payload_to_channel's .strip(). Without this,
     # " " passes the truthy guard, skips the auto-fetch, then gets stored
@@ -371,7 +376,7 @@ def add_channel(payload: Dict[str, Any]) -> Dict[str, Any]:
     return new_ch
 
 
-def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
     """Update an existing channel matched by identity (url or name/folder).
 
     If the folder name changed, rename the on-disk folder too so the user's
@@ -400,14 +405,14 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
                 try:
                     n = int(v)
                     merged[k] = n * 60 if n < 1000 else n
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             elif k == "max_duration" and isinstance(v, (int, str)):
                 try:
                     n = int(v)
                     merged[k] = n * 60 if n < 1000 else n
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             elif k == "folder_org":
                 merged["split_years"] = (v in ("years", "months"))
                 merged["split_months"] = (v == "months")
@@ -450,11 +455,12 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
 
     # Detect folder rename → move the on-disk folder
     import os as _os
+
     from . import sync as _sync
     old_name = (existing.get("name") or existing.get("folder") or "").strip()
     new_name = (updated.get("name") or updated.get("folder") or "").strip()
     if old_name and new_name and old_name != new_name:
-        # audit E-47: preflight — refuse if the new name collides with
+        # preflight — refuse if the new name collides with
         # ANY other existing channel. Without this, two channels could
         # end up with the same normalized name, which then has
         # _find_channel lookups return whichever was seen first.
@@ -476,7 +482,7 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
                     _os.rename(old_path, new_path)
                     updated["_folder_renamed"] = {"from": old_path, "to": new_path}
                 except OSError as e:
-                    # audit E-45: if the folder rename fails, REJECT the
+                    # if the folder rename fails, REJECT the
                     # whole update. Old behavior silently reverted name
                     # to old_name but still saved OTHER mutations (res,
                     # compress settings, etc.) — creating a partial-
@@ -501,8 +507,8 @@ def update_channel(identity: Dict[str, str], payload: Dict[str, Any]) -> Dict[st
     return updated
 
 
-def remove_channel(identity: Dict[str, str],
-                   delete_files: bool = False) -> Dict[str, Any]:
+def remove_channel(identity: dict[str, str],
+                   delete_files: bool = False) -> dict[str, Any]:
     """Remove a channel from the subs list.
 
     If `delete_files=True`, also recursively delete the channel's on-disk
@@ -519,14 +525,14 @@ def remove_channel(identity: Dict[str, str],
         raise SubsError(f"Channel not found: {identity}")
     ch = dict(channels[idx])
 
-    # audit E-46: delete files FIRST, then update the config. Old
+    # delete files FIRST, then update the config. Old
     # order (pop + save_config before delete) meant a crash mid-delete
     # left the config updated but the folder orphaned — the user
     # couldn't retry delete-files via the UI because the channel was
     # already gone from the subs list. Now the folder delete runs
     # first; the subs-list removal only happens after the delete
     # resolves (or was never requested).
-    result: Dict[str, Any] = {"ok": False, "deleted_folder": False}
+    result: dict[str, Any] = {"ok": False, "deleted_folder": False}
     if delete_files:
         base = (cfg.get("output_dir") or "").strip()
         if base:
@@ -552,7 +558,7 @@ def remove_channel(identity: Dict[str, str],
     return result
 
 
-def get_channel(identity: Dict[str, str]) -> Optional[Dict[str, Any]]:
+def get_channel(identity: dict[str, str]) -> dict[str, Any] | None:
     """Return a channel dict by url/name/folder. The raw on-disk schema
     stores min/max_duration as seconds; this is the unchanged disk record.
     Use `get_channel_for_ui()` to receive the UI-formatted dict (minutes).
@@ -564,7 +570,7 @@ def get_channel(identity: Dict[str, str]) -> Optional[Dict[str, Any]]:
     return dict(cfg["channels"][idx])
 
 
-def get_channel_for_ui(identity: Dict[str, str]) -> Optional[Dict[str, Any]]:
+def get_channel_for_ui(identity: dict[str, str]) -> dict[str, Any] | None:
     """Return a channel dict with min/max_duration converted to minutes
     (the unit the UI displays + edits in). Used by the Edit-channel panel.
     """

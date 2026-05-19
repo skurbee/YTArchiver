@@ -1,0 +1,358 @@
+"""
+transcribe.transcribe_files — aggregated .txt / .jsonl writers.
+
+Patch 19 phase T1 (v68.9): extracted from transcribe/legacy.py.
+
+Functions write the per-entry blocks for the aggregated
+`<channel> Transcript.txt` and the hidden `.<channel> Transcript.jsonl`
+sidecars. These are the OLD-YTArchiver-compatible file formats — bytes
+on disk must match the legacy format exactly so existing archives
+remain readable.
+
+Public surface (re-imported into legacy.py for back-compat):
+    _write_jsonl_entry      append long-form JSONL entries
+    _write_transcript_entry append a formatted .txt block
+    _replace_jsonl_entry    surgically swap one video's entries
+    _replace_txt_entry      surgically swap one video's .txt block
+    _HEADER_RE              regex matching the .txt entry header
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+from ..log import get_logger
+from ..transcribe_paths import (
+    _format_duration_hms,
+    _format_upload_date,
+    _generate_distributed_words,
+    _hide_file_win,
+)
+from ..utils import unhide_file_win as _unhide_file_win
+
+_log = get_logger(__name__)
+
+
+def _norm_title(s: str) -> str:
+    """Thin alias for text_utils.normalize_title — used by the
+    title-keyed match logic in _replace_jsonl_entry / _replace_txt_entry.
+    """
+    from ..text_utils import normalize_title
+    return normalize_title(s)
+
+
+def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
+                       segments: list[dict]) -> None:
+    """Append long-form JSONL entries for one video. Matches YTArchiver.py:8508.
+
+    Each line:
+      {"video_id":..., "title":..., "start":..., "end":...,
+       "text":..., "words":[{"w","s","e"}, ...]}
+
+    Note: segments from NEW's internal format use short keys {s,e,t,w}. This
+    helper accepts EITHER short-form or long-form keys and always writes
+    long-form to disk.
+    """
+    try:
+        _jsonl_dir = os.path.dirname(jsonl_path)
+        if _jsonl_dir:
+            os.makedirs(_jsonl_dir, exist_ok=True)
+
+        # Build lines in memory so a disk failure mid-write doesn't leave
+        # half-a-line on disk.
+        new_lines = []
+        for seg in segments:
+            # Accept either short-form (s/e/t/w) or long-form (start/end/text/words)
+            s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
+            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
+            t = seg.get("text") if "text" in seg else seg.get("t", "")
+            raw_words = seg.get("words") if "words" in seg else seg.get("w")
+            entry = {
+                "video_id": video_id or "",
+                "title": title,
+                "start": round(float(s or 0), 2),
+                "end": round(float(e or 0), 2),
+                "text": t or "",
+            }
+            if raw_words:
+                # Normalize word records to long-form too (OLD uses "w"/"s"/"e" inside
+                # the words array, same as our short-form — already correct)
+                entry["words"] = [
+                    {"w": w.get("w") if isinstance(w, dict) else str(w),
+                     "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
+                     "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
+                    for w in raw_words
+                ]
+            else:
+                entry["words"] = _generate_distributed_words(
+                    entry["text"], entry["start"], entry["end"])
+            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # atomic write via .tmp + os.replace. Previously
+        # the function opened in append mode ("a") and ALSO ran a torn-
+        # last-line repair on every call because append wasn't atomic.
+        # Now: read existing content (if any), build full new content
+        # in memory, write to .tmp, fsync, atomic replace. No torn-write
+        # repair needed because every replace lands a complete file.
+        existing = b""
+        if os.path.isfile(jsonl_path):
+            try:
+                with open(jsonl_path, "rb") as _f:
+                    existing = _f.read()
+                # Clear Windows hidden so we can write (re-hidden below).
+                _unhide_file_win(os.path.normpath(jsonl_path))
+            except OSError as e:
+                _log.debug("swallowed: %s", e)
+                existing = b""
+
+        # If the existing file's last line is missing a trailing newline
+        # (legacy torn write from before this fix), prepend one before
+        # appending the new lines so the result is still line-valid.
+        if existing and not existing.endswith(b"\n"):
+            existing = existing + b"\n"
+
+        new_bytes = existing + "".join(new_lines).encode("utf-8")
+        tmp = jsonl_path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(new_bytes)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError as e:
+                _log.debug("swallowed: %s", e)
+        os.replace(tmp, jsonl_path)
+        _hide_file_win(jsonl_path)
+    except Exception as _jse:
+        # surface to module-level log so .txt/.jsonl desync
+        # is diagnosable. Was a print() — routes via
+        # logger so PyInstaller --noconsole builds also capture it.
+        try:
+            _log.error("_write_jsonl_entry failed for %s: %s",
+                       os.path.basename(jsonl_path), _jse)
+        except Exception:
+            print(f"[transcribe] _write_jsonl_entry failed for "
+                  f"{os.path.basename(jsonl_path)}: {_jse}")
+
+
+def _write_transcript_entry(txt_path: str, title: str,
+                            upload_date: str, duration_secs: float,
+                            source_tag: str, text: str) -> bool:
+    """Append one formatted block to the aggregated Transcript.txt.
+    Format (YTArchiver.py:15458):
+      ===(title), (MM.DD.YYYY), (H:MM:SS), (SOURCE)===
+      {text}
+      [triple newline]
+    """
+    try:
+        os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+        date_fmt = _format_upload_date(upload_date or "")
+        dur_raw = _format_duration_hms(duration_secs or 0) or ""
+        dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
+        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
+        entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
+        with open(txt_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        return True
+    except Exception:
+        return False
+
+
+# Header pattern for the per-entry "===(title), (date), (duration), (source)==="
+# line in the aggregated Transcript.txt. Captures title (group 1), date
+# (group 2), duration (group 3), source tag (group 4). Matches OLD
+# YTArchiver.py:28997 `_HEADER_RE`.
+_HEADER_RE = re.compile(
+    r'^===\(([^)]*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    re.MULTILINE)
+
+
+def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
+                         new_segments: list[dict]) -> set:
+    """Surgically swap this video's entries in the aggregated .jsonl.
+
+    `_replace_jsonl_entry` — used by the
+    retranscribe flow to replace the old auto-captions / older-Whisper
+    entries with the newly-transcribed ones WITHOUT blowing away the
+    other videos that share the aggregated file.
+
+    Matches on BOTH title AND video_id — catches the case where a title
+    drifted between transcriptions (e.g. YouTube normalized "huge
+    change.." → "huge change..." after the first auto-caption pass).
+    Returns the set of distinct titles that were removed so the caller
+    can feed them into `_replace_txt_entry` for the same cleanup on the
+    .txt side.
+    """
+    # Clear Windows hidden/readonly so we can write (re-hidden by
+    # _write_jsonl_entry on append).
+    _unhide_file_win(os.path.normpath(jsonl_path))
+    if os.name == "nt":
+        try:
+            import stat
+            os.chmod(jsonl_path, stat.S_IWRITE | stat.S_IREAD)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+
+    old_lines: list[str] = []
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            old_lines = f.readlines()
+    except FileNotFoundError:
+        pass
+
+    kept: list[str] = []
+    removed_titles: set = set()
+    vid_norm = (video_id or "").strip()
+    tit_key = _norm_title(title)
+    for line in old_lines:
+        ls = line.strip()
+        if not ls:
+            continue
+        try:
+            obj = json.loads(ls)
+            seg_title = (obj.get("title") or "").strip()
+            seg_vid = (obj.get("video_id") or "").strip()
+            # Match by normalized title (punctuation-insensitive) OR by
+            # video_id. Either signal means this segment belongs to the
+            # video being re-transcribed and should be swapped out.
+            if (seg_title and _norm_title(seg_title) == tit_key) or \
+               (vid_norm and seg_vid == vid_norm):
+                if seg_title:
+                    removed_titles.add(seg_title)
+                continue # drop this line
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        kept.append(line if line.endswith("\n") else line + "\n")
+
+    # build the new segments inline and write the
+    # filtered-kept lines + new lines in ONE atomic operation. Previously
+    # this function wrote kept lines, then called _write_jsonl_entry which
+    # re-read the file from disk and rewrote it — two reads + two writes
+    # for an operation that only needs one of each.
+    new_lines: list[str] = []
+    for seg in new_segments:
+        s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
+        e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
+        t = seg.get("text") if "text" in seg else seg.get("t", "")
+        raw_words = seg.get("words") if "words" in seg else seg.get("w")
+        entry = {
+            "video_id": video_id or "",
+            "title": title,
+            "start": round(float(s or 0), 2),
+            "end": round(float(e or 0), 2),
+            "text": t or "",
+        }
+        if raw_words:
+            entry["words"] = [
+                {"w": w.get("w") if isinstance(w, dict) else str(w),
+                 "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
+                 "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
+                for w in raw_words
+            ]
+        else:
+            entry["words"] = _generate_distributed_words(
+                entry["text"], entry["start"], entry["end"])
+        new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    # If kept's last entry is missing a trailing newline, fix before append.
+    if kept and not kept[-1].endswith("\n"):
+        kept[-1] = kept[-1] + "\n"
+
+    final_bytes = ("".join(kept) + "".join(new_lines)).encode("utf-8")
+    tmp = jsonl_path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(final_bytes)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError as e:
+                _log.debug("swallowed: %s", e)
+        os.replace(tmp, jsonl_path)
+        _hide_file_win(jsonl_path)
+    except OSError as _oe:
+        # previously returned early WITHOUT re-appending the
+        # new segments, silently leaving the OLD entry on disk while the
+        # caller thought retranscribe succeeded. Now we re-raise so the
+        # caller's emit_error in _write_outputs surfaces the failure and
+        # the user can see that their retranscribe didn't land.
+        try: os.remove(tmp)
+        except OSError: pass
+        _log.error("_replace_jsonl_entry atomic replace failed: %s", _oe)
+        raise
+
+    return removed_titles
+
+
+def _replace_txt_entry(txt_path: str, title: str, new_text: str,
+                       source_tag: str,
+                       extra_titles_to_remove=None) -> bool:
+    """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
+    the aggregated Transcript.txt. `_replace_txt_entry`.
+
+    `extra_titles_to_remove` is the set returned by `_replace_jsonl_entry`
+    — additional titles discovered via video_id match. Passing them here
+    lets the .txt pass remove stale title-drifted entries consistently.
+
+    `source_tag` can be "(WHISPER:small)" or the bare model name; stored
+    verbatim as the 4th bracketed field on the header line so the
+    ArchivePlayer / Browse source banner can detect it.
+
+    Returns True on success. Appends the new entry inheriting the OLD
+    entry's date + duration so provenance is preserved across
+    re-transcriptions.
+    """
+    try:
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = ""
+
+        # Build purge set as NORMALIZED keys (NFC + lowercase +
+        # whitespace-collapsed + trailing-punct stripped). Without this
+        # the check below misses "Title." vs "Title" variants that the
+        # retranscribe flow legitimately needs to swap out — which is
+        # what caused the triple-block duplication in v47.6 and older.
+        purge = {_norm_title(t) for t in (extra_titles_to_remove or ())}
+        purge.add(_norm_title(title))
+        purge.discard("")
+
+        # Remove each matching entry (header line through the next header
+        # or EOF). Iterate from the end so earlier match positions stay
+        # valid as we slice. Capture date+duration from the FIRST removed
+        # entry so the new block inherits the provenance.
+        matches = list(_HEADER_RE.finditer(content))
+        new_content = content
+        found_old = False
+        date_fmt = "(Unknown date)"
+        dur_fmt = "(Unknown length)"
+        captured = False
+        for i in range(len(matches) - 1, -1, -1):
+            m = matches[i]
+            entry_key = _norm_title(m.group(1))
+            if entry_key not in purge:
+                continue
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
+            if not captured:
+                # Matches group indices of _HEADER_RE: (title, date, dur, src)
+                date_fmt = m.group(2)
+                dur_fmt = m.group(3)
+                captured = True
+            new_content = new_content[:m.start()] + new_content[end:]
+            found_old = True
+
+        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
+        new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"
+
+        new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
+        new_content += new_entry
+
+        os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
+        tmp = txt_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        os.replace(tmp, txt_path)
+        return True
+    except Exception:
+        return False

@@ -10,30 +10,20 @@ a metadata sweep or sync pass.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import subprocess
 import time
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any
 
-from .sync import find_yt_dlp, _find_cookie_source
-
+from .sync import _find_cookie_source, find_yt_dlp
+from .utils import hide_file_win
 
 _CHANNEL_ART_REFRESH_DAYS = 30 # YTArchiver refreshes monthly
 
 
-def _hide_folder_win(path: str) -> None:
-    if os.name != "nt":
-        return
-    try:
-        ctypes.windll.kernel32.SetFileAttributesW(os.path.normpath(path), 0x02)
-    except Exception:
-        pass
-
-
-def _pick_by_prefix(thumbs, prefix: str) -> Optional[Dict[str, Any]]:
+def _pick_by_prefix(thumbs, prefix: str) -> dict[str, Any] | None:
     """Return the largest-area thumbnail whose id starts with `prefix`."""
     best = None
     best_area = 0
@@ -63,7 +53,7 @@ def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
 
 
 def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
-                      ) -> Dict[str, Any]:
+                      ) -> dict[str, Any]:
     """Download channel avatar + banner via yt-dlp metadata dump.
 
     Files written:
@@ -92,7 +82,7 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
                 return {"ok": True, "skipped": True,
                         "avatar_path": avatar_path,
                         "banner_path": banner_path}
-            # audit D-52: when only ONE art file exists (banner failed
+            # when only ONE art file exists (banner failed
             # on initial fetch, or got deleted manually), the old skip
             # logic required BOTH to exist and would re-fetch EVERY
             # call — hammering yt-dlp for channels that simply don't
@@ -113,9 +103,9 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         os.makedirs(art_dir, exist_ok=True)
     except OSError as e:
         return {"ok": False, "error": f"mkdir failed: {e}"}
-    _hide_folder_win(art_dir)
+    hide_file_win(os.path.normpath(art_dir))
 
-    # audit E-40: strip all YouTube sub-page suffixes, not just
+    # strip all YouTube sub-page suffixes, not just
     # /videos. Channels added via a /streams, /shorts, or /about URL
     # used to fetch metadata for the wrong sub-page and came back
     # with a missing or wrong banner.
@@ -149,7 +139,12 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         return {"ok": False, "error": f"yt-dlp failed: {e}"}
 
     if proc.returncode != 0 or not (proc.stdout or "").strip():
-        return {"ok": False, "error": "yt-dlp returned empty / error"}
+        # Patch C: include stderr excerpt so the user can see WHY
+        # yt-dlp failed instead of a generic "returned empty / error".
+        _err = (proc.stderr or "").strip()[:500]
+        _detail = f": {_err}" if _err else ""
+        return {"ok": False,
+                "error": f"yt-dlp returned empty / error (rc={proc.returncode}){_detail}"}
 
     try:
         data = json.loads(proc.stdout)
@@ -163,12 +158,12 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     avatar = _pick_by_prefix(thumbs, "avatar")
     banner = _pick_by_prefix(thumbs, "banner")
 
-    # bug H-12: always include BOTH keys (null when missing) so callers
+    # always include BOTH keys (null when missing) so callers
     # can safely destructure without accidentally passing `undefined` to
     # <img src>. Previously only the successful key was present, causing
     # broken-image icons in the Browse grid when only one of avatar/
     # banner fetched successfully.
-    # audit D-52: always stamp the .last_attempt sentinel, regardless
+    # always stamp the .last_attempt sentinel, regardless
     # of whether either art download succeeded. The skip-logic above
     # uses its mtime to throttle retries; without this, channels
     # whose art genuinely doesn't exist get re-probed on every call.
@@ -201,7 +196,7 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
     return got
 
 
-def avatar_path_for(folder_path: str) -> Optional[str]:
+def avatar_path_for(folder_path: str) -> str | None:
     """Return the avatar.jpg path if present, else None."""
     if not folder_path:
         return None
@@ -209,14 +204,14 @@ def avatar_path_for(folder_path: str) -> Optional[str]:
     return p if os.path.isfile(p) else None
 
 
-def banner_path_for(folder_path: str) -> Optional[str]:
+def banner_path_for(folder_path: str) -> str | None:
     if not folder_path:
         return None
     p = os.path.join(folder_path, ".ChannelArt", "banner.jpg")
     return p if os.path.isfile(p) else None
 
 
-def banner_thumb_path_for(folder_path: str) -> Optional[str]:
+def banner_thumb_path_for(folder_path: str) -> str | None:
     """Return a cached small (max 640px wide) banner thumb if one exists.
 
     Originals are 2048x1152+ / ~350KB; decoding 100+ of them on the
@@ -231,7 +226,7 @@ def banner_thumb_path_for(folder_path: str) -> Optional[str]:
     return p if os.path.isfile(p) else None
 
 
-def avatar_thumb_path_for(folder_path: str) -> Optional[str]:
+def avatar_thumb_path_for(folder_path: str) -> str | None:
     """Return a cached avatar thumb (max 128px) if one exists."""
     if not folder_path:
         return None
@@ -267,7 +262,7 @@ def _make_thumb(src: str, dst: str, max_w: int) -> bool:
         return False
 
 
-def ensure_banner_thumb(folder_path: str, max_w: int = 640) -> Optional[str]:
+def ensure_banner_thumb(folder_path: str, max_w: int = 640) -> str | None:
     """Lazily generate banner_small.jpg from banner.jpg. Returns thumb path
     (or the original banner path as fallback if thumbnailing failed)."""
     if not folder_path:
@@ -281,7 +276,7 @@ def ensure_banner_thumb(folder_path: str, max_w: int = 640) -> Optional[str]:
     return src # fall back to the original rather than breaking rendering
 
 
-def ensure_avatar_thumb(folder_path: str, max_w: int = 128) -> Optional[str]:
+def ensure_avatar_thumb(folder_path: str, max_w: int = 128) -> str | None:
     """Lazily generate avatar_small.jpg from avatar.jpg."""
     if not folder_path:
         return None

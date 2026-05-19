@@ -21,21 +21,25 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
+from .log import get_logger
 from .ytarchiver_config import TRANSCRIPTION_DB
+
+_log = get_logger(__name__)
 
 
 _db_lock = threading.RLock()
-_conn: Optional[sqlite3.Connection] = None
-# Issue #153: a dedicated read-only connection for Browse queries so
+_conn: sqlite3.Connection | None = None
+# a dedicated read-only connection for Browse queries so
 # they never wait on `_db_lock` (held by sync register_video, FTS
 # ingest, etc.). WAL handles cross-connection serialization so this
 # connection sees the writer's committed state without blocking.
 # Wrapped in its own lock because SQLite connections aren't
 # free-threaded — readers serialize across this connection only.
-_reader_conn: Optional[sqlite3.Connection] = None
+_reader_conn: sqlite3.Connection | None = None
 _reader_lock = threading.RLock()
 # Flag set to True once `_open()` has successfully initialized the
 # schema. `_reader_open()` checks this WITHOUT grabbing `_db_lock`
@@ -48,7 +52,7 @@ _reader_lock = threading.RLock()
 _schema_inited: bool = False
 
 
-def _reader_open() -> Optional[sqlite3.Connection]:
+def _reader_open() -> sqlite3.Connection | None:
     """Open or return the long-lived read-only connection used by
     Browse-style queries. Separate from `_conn` so writer contention
     on `_db_lock` doesn't block the Browse tab during indexing.
@@ -63,7 +67,7 @@ def _reader_open() -> Optional[sqlite3.Connection]:
         # Cold-start path: schema may not exist yet. Take the slow
         # route ONCE to make sure the DB file + tables exist.
         try: _open()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
     with _reader_lock:
         if _reader_conn is not None:
             return _reader_conn
@@ -81,7 +85,7 @@ def _reader_open() -> Optional[sqlite3.Connection]:
             return None
 
 
-def _open_independent() -> Optional[sqlite3.Connection]:
+def _open_independent() -> sqlite3.Connection | None:
     """Open a FRESH SQLite connection (separate from the shared `_conn`).
 
     Long-running background work (the startup sweep especially) used to
@@ -113,7 +117,7 @@ def _open_independent() -> Optional[sqlite3.Connection]:
 
 # ── DB open / schema ────────────────────────────────────────────────────
 
-def _open() -> Optional[sqlite3.Connection]:
+def _open() -> sqlite3.Connection | None:
     """Open or return the cached connection. Returns None if DB can't be opened."""
     global _conn
     with _db_lock:
@@ -187,6 +191,21 @@ def _open() -> Optional[sqlite3.Connection]:
             # run — "OLD would skip videos that didn't have the
             # information we needed or that failed every single fetch
             # we tried. It was working great."
+            # Patch 6 (2026-05-17): schema versioning via PRAGMA user_version.
+            # The legacy ALTER-TABLE-then-ignore-OperationalError pattern below
+            # has worked but offers no path forward for non-idempotent
+            # migrations (column renames, constraint changes, data backfills).
+            # Going forward: bump SCHEMA_VERSION and add a step to _MIGRATIONS
+            # that runs once and only once at startup. Current installs are at
+            # version 1 (the implicit pre-versioning baseline after all the
+            # ALTER statements below succeed).
+            try:
+                _current_v = _conn.execute("PRAGMA user_version").fetchone()[0]
+            except Exception:
+                _current_v = 0
+            _SCHEMA_VERSION = 1
+            # Future migrations: _MIGRATIONS[2] = lambda c: c.execute("...")
+            _MIGRATIONS: dict = {}
             for stmt in (
                 "ALTER TABLE segments ADD COLUMN words TEXT DEFAULT ''",
                 "ALTER TABLE videos ADD COLUMN search_failed_ts REAL",
@@ -252,7 +271,7 @@ def _open() -> Optional[sqlite3.Connection]:
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr ON videos(channel, year)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr_mo ON videos(channel, year, month)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_video_id ON videos(video_id)",
-                # audit L-16: compound index so the cross-channel
+                # compound index so the cross-channel
                 # duplicate-detection query in prune_missing_videos
                 # ("WHERE video_id=? AND filepath != ?") uses an
                 # index instead of a full scan. Noticeable difference
@@ -263,6 +282,17 @@ def _open() -> Optional[sqlite3.Connection]:
                     _conn.execute(stmt)
                 except sqlite3.OperationalError:
                     pass
+            # run pending migrations (none currently — framework
+            # only) and bump user_version once we're at the target. Wrapped
+            # in try/except so a future migration bug can't brick startup.
+            try:
+                for _v in sorted(_MIGRATIONS):
+                    if _v > _current_v:
+                        _MIGRATIONS[_v](_conn)
+                if _current_v != _SCHEMA_VERSION:
+                    _conn.execute(f"PRAGMA user_version = {int(_SCHEMA_VERSION)}")
+            except Exception as e:
+                _log.debug("schema migration step failed: %s", e)
             _conn.commit()
             # Mark schema-ready so future _reader_open() calls can
             # skip the _db_lock-acquiring _open() call entirely.
@@ -279,10 +309,10 @@ def _open() -> Optional[sqlite3.Connection]:
 _ID_RE_IN_NAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 
 
-def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[int]]:
+def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
     """Best-effort year/month from a path like .../<channel>/<year>/<Month>/<file>.
 
-    audit E-37: walk parts TAIL-FIRST so the innermost year/month wins.
+    walk parts TAIL-FIRST so the innermost year/month wins.
     Deep archive paths like `Z:\\Archive\\2024\\Channels\\SomeCh\\2020\\
     March\\file.mp4` used to set year=2024 (from archive root), then
     overwrite to 2020 (correct) — but a base path containing a 4-digit
@@ -292,8 +322,8 @@ def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[
     parts = list(Path(filepath).parts)
     months = ["january","february","march","april","may","june",
               "july","august","september","october","november","december"]
-    year: Optional[int] = None
-    month: Optional[int] = None
+    year: int | None = None
+    month: int | None = None
     # Walk from the file back to the root, grabbing month then year on
     # the first hits. "NN Month" patterns (e.g. "01 January") also match.
     for p in reversed(parts):
@@ -315,11 +345,11 @@ def _parse_year_month_from_path(filepath: str) -> Tuple[Optional[int], Optional[
     return year, month
 
 
-def register_video(filepath: str, channel: str, title: Optional[str] = None,
+def register_video(filepath: str, channel: str, title: str | None = None,
                    tx_status: str = "pending",
-                   video_id: Optional[str] = None,
-                   duration_secs: Optional[float] = None,
-                   _conn_override: Optional[sqlite3.Connection] = None) -> bool:
+                   video_id: str | None = None,
+                   duration_secs: float | None = None,
+                   _conn_override: sqlite3.Connection | None = None) -> bool:
     """Add a newly downloaded video to the videos table.
 
     Called by sync.py each time a .mp4 lands. Browse tab + Index tab both
@@ -345,34 +375,14 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         # Strip " [ID]" suffix if present
         title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem).strip() or stem
     # Explicit video_id wins; else try the filename; else look in .info.json
-    vid_id = (video_id or "").strip() or None
-    if not vid_id:
-        m = _ID_RE_IN_NAME.search(os.path.basename(fp))
-        if m:
-            _cand = m.group(1)
-            # Reject all-alphabetic matches — a user's channel's archive has
-            # files with suffix `[a-user-channel]` (11 letters, no digit)
-            # that match the `[A-Za-z0-9_-]{11}` pattern but aren't
-            # real YouTube ids. Real ids are random picks so they
-            # essentially always include at least one digit/_/-.
-            if not _cand.isalpha():
-                vid_id = _cand
-    if not vid_id:
-        # Drop-in mode: filename no longer carries [id]. Read the
-        # .info.json sidecar yt-dlp writes alongside the video.
-        try:
-            import json as _json
-            info_json = Path(fp).with_suffix("").with_suffix(".info.json")
-            if not info_json.is_file():
-                info_json = Path(fp).parent / (Path(fp).stem + ".info.json")
-            if info_json.is_file():
-                with info_json.open("r", encoding="utf-8") as f:
-                    data = _json.load(f)
-                raw = (data.get("id") or "").strip()
-                if re.fullmatch(r"[A-Za-z0-9_-]{11}", raw):
-                    vid_id = raw
-        except Exception:
-            pass
+    # consolidated into text_utils.extract_video_id.
+    from .text_utils import extract_video_id as _extract_vid
+    vid_id = _extract_vid(
+        fp,
+        hint=(video_id or "").strip(),
+        reject_alpha_only=True,
+        info_json_fallback=True,
+    ) or None
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
     try:
@@ -394,7 +404,7 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         from contextlib import nullcontext as _nullctx
         _ctx = _nullctx() if use_override else _db_lock
         with _ctx:
-            # audit C-10: preserve `added_ts` on re-register.
+            # preserve `added_ts` on re-register.
             # INSERT OR REPLACE silently wiped it every time sweep
             # re-registered an existing video, making "new in last 7
             # days" (Dashboard) and Recent-sort by added_ts useless —
@@ -403,7 +413,7 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
             # explicit `added_ts=excluded.added_ts` would still reset;
             # instead we write added_ts=? only if the row is new, via
             # COALESCE against the existing value.
-            # audit C-8: populate duration_s so "Sort by duration" and
+            # populate duration_s so "Sort by duration" and
             # per-channel runtime totals actually work. If caller
             # passed duration_secs, use it; otherwise leave NULL /
             # preserve existing value on update (COALESCE pattern).
@@ -450,8 +460,8 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
         # Drop the browse-list cache for this channel so the next grid
         # click picks up the newly-registered video.
         try: invalidate_channel_videos(channel)
-        except Exception: pass
-        # bug M-14: if a transcript JSONL sidecar is already on disk at
+        except Exception as e: _log.debug("swallowed: %s", e)
+        # if a transcript JSONL sidecar is already on disk at
         # register-time (e.g. yt-dlp dropped a .vtt → .jsonl before
         # Whisper even queues), ingest it right now so the Watch view
         # doesn't open with an empty transcript. Without this, the user
@@ -463,8 +473,8 @@ def register_video(filepath: str, channel: str, title: Optional[str] = None,
             if os.path.isfile(_jp):
                 _display_title = title or os.path.basename(_base)
                 ingest_jsonl(fp, _jp, _display_title, channel)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         return True
     except sqlite3.Error as e:
         print(f"[index] register_video failed: {e}")
@@ -486,7 +496,7 @@ def mark_video_transcribed(filepath: str) -> bool:
             conn.commit()
         if row and row[0]:
             try: invalidate_channel_videos(row[0])
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         return True
     except sqlite3.Error:
         return False
@@ -496,7 +506,7 @@ def mark_video_transcribed(filepath: str) -> bool:
 
 def ingest_jsonl(video_filepath: str, jsonl_path: str,
                  title: str, channel: str,
-                 _conn_override: Optional[sqlite3.Connection] = None) -> int:
+                 _conn_override: sqlite3.Connection | None = None) -> int:
     """Load a .jsonl transcript into segments + FTS. Returns segment count.
 
     `_conn_override`: see register_video — caller may supply their own
@@ -543,7 +553,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         from contextlib import nullcontext as _nullctx
         _ctx = _nullctx() if use_override else _db_lock
         with _ctx:
-            # audit C-9: FTS5 external-content tables don't auto-sync
+            # FTS5 external-content tables don't auto-sync
             # when rows are deleted from the content table. Without
             # the explicit FTS delete-from-content idiom, re-ingesting
             # a .jsonl leaves orphan FTS rowids pointing at deleted
@@ -610,7 +620,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                 "VALUES (?, ?, ?)",
                 (jp, os.path.getmtime(jp), len(rows)),
             )
-            # audit D-46: flip tx_status='transcribed' on successful
+            # flip tx_status='transcribed' on successful
             # ingest so channel_transcription_stats reflects reality
             # right away. Previously only mark_video_transcribed did
             # this, and if ingest_jsonl was called without a follow-up
@@ -633,8 +643,8 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
 
 # ── Reads ───────────────────────────────────────────────────────────────
 
-def list_recent_videos(limit: int = 200, channel: Optional[str] = None
-                       ) -> List[Dict[str, Any]]:
+def list_recent_videos(limit: int = 200, channel: str | None = None
+                       ) -> list[dict[str, Any]]:
     """Return the N newest videos (by added_ts), optionally filtered by channel.
 
     Uses `_reader_conn` (read-only, separate from `_conn`) so the Recent tab
@@ -646,7 +656,7 @@ def list_recent_videos(limit: int = 200, channel: Optional[str] = None
         return []
     q = ("SELECT title, channel, filepath, video_id, size_bytes, year, month, "
          "tx_status, added_ts FROM videos ")
-    args: List[Any] = []
+    args: list[Any] = []
     if channel:
         q += "WHERE channel=? "
         args.append(channel)
@@ -671,15 +681,14 @@ def list_recent_videos(limit: int = 200, channel: Optional[str] = None
 # the video list from scratch — DB query + metadata JSONL parse +
 # thumbnail lookup per video. The cache pre-computes this at startup so
 # the second channel click onward is instant.
-#
 # Keyed by (channel_name, sort, limit, include_thumbs). Invalidated by
 # `invalidate_channel_videos(channel)` whenever a video is added / deleted
 # / re-transcribed for that channel.
-_browse_videos_cache: Dict[Tuple[str, str, int, bool], List[Dict[str, Any]]] = {}
+_browse_videos_cache: dict[tuple[str, str, int, bool], list[dict[str, Any]]] = {}
 _browse_cache_lock = threading.Lock()
 
 
-def invalidate_channel_videos(channel: Optional[str] = None) -> None:
+def invalidate_channel_videos(channel: str | None = None) -> None:
     """Drop cached video lists. `channel=None` clears everything."""
     with _browse_cache_lock:
         if channel is None:
@@ -701,16 +710,16 @@ def preload_channel_videos(channel: str,
     return len(rows)
 
 
-def preload_all_channels(channel_names: List[str],
-                         progress_cb: Optional[Any] = None,
-                         cancel_ev: Optional[Any] = None,
+def preload_all_channels(channel_names: list[str],
+                         progress_cb: Any | None = None,
+                         cancel_ev: Any | None = None,
                          sort: str = "newest",
-                         limit: int = 500) -> Dict[str, int]:
+                         limit: int = 500) -> dict[str, int]:
     """Warm the per-channel video-list cache for every subscribed channel.
 
-    Per Scott (2026-05-13): "Browse preload should ALWAYS be the bottom
-    priority — if a user is downloading or loading the metadata page,
-    that should supersede the preload."
+    Design rule: browse preload should ALWAYS be the bottom priority —
+    if a user is downloading or loading the metadata page, that should
+    supersede the preload.
 
     How we deliver on that:
     1. Reads go through `_reader_conn` (separate from the writer's
@@ -727,14 +736,14 @@ def preload_all_channels(channel_names: List[str],
     Returns {channel_name: row_count}.
     """
     import time as _t
-    out: Dict[str, int] = {}
+    out: dict[str, int] = {}
     total = len(channel_names)
     for i, ch in enumerate(channel_names):
         if cancel_ev is not None and cancel_ev.is_set():
             break
         if progress_cb is not None:
             try: progress_cb(i + 1, total, ch)
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         try:
             out[ch] = preload_channel_videos(ch, sort=sort, limit=limit)
         except Exception:
@@ -751,7 +760,7 @@ def preload_all_channels(channel_names: List[str],
 
 def list_videos_for_channel(channel: str, sort: str = "newest",
                             limit: int = 50000, include_thumbs: bool = True
-                            ) -> List[Dict[str, Any]]:
+                            ) -> list[dict[str, Any]]:
     """Videos in a channel, sorted by requested key.
 
     Returns both `added_ts` (when we registered the video in the DB) and
@@ -783,7 +792,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                     and c_thumbs == bool(include_thumbs)
                     and c_lim >= limit):
                 return list(rows[:limit]) if len(rows) > limit else list(rows)
-    # Issue #153: use the long-lived read-only connection
+    # use the long-lived read-only connection
     # (`_reader_conn`, opened on first use below) so this Browse
     # query never contends on `_db_lock` with sync's register_video
     # calls. WAL mode handles cross-connection serialization for us.
@@ -832,7 +841,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # View count enables "Most Viewed" sort in the Browse grid without
     # making yt-dlp calls here — we rely on the data Cache built up during
     # sync-time metadata fetches.
-    metadata_cache: Dict[str, Dict[str, Any]] = {}
+    metadata_cache: dict[str, dict[str, Any]] = {}
     # Secondary title-keyed index, built alongside the video_id one so
     # DB rows with a NULL video_id (common for videos indexed before
     # the video_id column was populated consistently) can still resolve
@@ -840,22 +849,20 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # videos had video_id=NULL in the index DB, so every view_count
     # lookup failed — Most Viewed sort was a no-op for all 400+
     # videos because the sort comparator saw only zeros.
-    metadata_cache_by_title: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    metadata_cache_by_title: dict[str, dict[str, dict[str, Any]]] = {}
 
-    def _norm_title(s: str) -> str:
-        """Loose normalization for title matching — lowercase + collapse
-        whitespace. Enough to bridge minor rendering differences without
-        opening up to false positives.
-        """
-        return " ".join((s or "").lower().split())
+    # route through canonical helper. Defaults strip trailing
+    # punct (".?!"), which is fine here — Most Viewed sort matching never
+    # needs to distinguish "Foo!" from "Foo".
+    from .text_utils import normalize_title as _norm_title  # type: ignore
 
     def _fetch_meta(folder_key):
         """Lazy-load the aggregated metadata JSONL for a given folder.
         Cache by folder so we don't re-parse the same file per row."""
         if folder_key in metadata_cache:
             return metadata_cache[folder_key]
-        entries: Dict[str, Any] = {}
-        by_title: Dict[str, Any] = {}
+        entries: dict[str, Any] = {}
+        by_title: dict[str, Any] = {}
         try:
             # Walk up the folder tree looking for .{channel} ... Metadata.jsonl
             cur = folder_key
@@ -888,8 +895,8 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 parent = os.path.dirname(cur)
                 if parent == cur: break
                 cur = parent
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         metadata_cache[folder_key] = entries
         metadata_cache_by_title[folder_key] = by_title
         return entries
@@ -922,7 +929,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
     # rendered as the gradient placeholder. Pre-walk the channel root
     # once, build vid → path, and use it for vid-keyed lookup. Falls
     # back to find_thumbnail for the no-vid / stem-only path.
-    _thumb_by_vid: Dict[str, str] = {}
+    _thumb_by_vid: dict[str, str] = {}
     if include_thumbs and out:
         _vid_re_local = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
         # Locate the channel root from any video's filepath. mp4s
@@ -985,9 +992,9 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         if len(s) != 8 or not s.isdigit():
             return 0.0
         try:
-            from datetime import datetime as _dt, timezone as _tz
+            from datetime import datetime as _dt
             return _dt(int(s[0:4]), int(s[4:6]), int(s[6:8]),
-                      tzinfo=_tz.utc).timestamp()
+                      tzinfo=UTC).timestamp()
         except (ValueError, OSError):
             return 0.0
 
@@ -1001,7 +1008,6 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         # 2. File mtime (yt-dlp --mtime sets this at download time)
         # 3. added_ts (DB registration — last resort, shows "1mo ago"
         # for a whole channel if the sweep ran a month ago)
-        #
         # The user reported every video showing "1mo ago" because recent
         # reorg / bulk-copy operations stomped all the mtimes to the
         # same date. Metadata upload_date is invariant across those.
@@ -1035,7 +1041,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
 
         # View count: fetch from aggregated metadata when available
         if meta:
-            # audit H-14: a corrupted JSONL entry with view_count="N/A"
+            # a corrupted JSONL entry with view_count="N/A"
             # would raise ValueError out of this cast and abort the
             # entire Browse grid render for the channel. Guard with
             # try/except and fall back to 0 so one bad row doesn't
@@ -1102,8 +1108,8 @@ def _file_url(path: str) -> str:
         from .local_fileserver import get_port, url_for
         if get_port():
             return url_for(path)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     from urllib.parse import quote
     p = os.path.abspath(path).replace("\\", "/")
     if not p.startswith("/"):
@@ -1111,7 +1117,7 @@ def _file_url(path: str) -> str:
     return "file://" + quote(p, safe="/:")
 
 
-def new_videos_in_last_n_days(days: int = 7) -> Dict[str, Any]:
+def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
     """Return {videos: N, channels: M} for videos added in the last N days.
 
     Uses the FTS DB's videos.added_ts column (Unix epoch). Silent-returns zeros
@@ -1134,12 +1140,12 @@ def new_videos_in_last_n_days(days: int = 7) -> Dict[str, Any]:
         ).fetchall()
         out["channel_list"] = [r[0] for r in rows if r[0]]
         out["channels"] = len(out["channel_list"])
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return out
 
 
-def channel_transcription_stats(channel: str) -> Dict[str, int]:
+def channel_transcription_stats(channel: str) -> dict[str, int]:
     """Return {total, transcribed, pending, failed} video counts for a channel.
 
     Matches on channel name via the videos table (NOCASE). Empty channel ->
@@ -1157,7 +1163,7 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
         # that string. Earlier this query tested 'done' — a mismatch
         # that made fully-transcribed channels read as "0 / N" in the
         # Edit-channel disk-stats footer.
-        # audit M-36: exclude duplicate rows (is_duplicate_of NOT NULL)
+        # exclude duplicate rows (is_duplicate_of NOT NULL)
         # from the counts. The Browse grid hides duplicates already,
         # so the footer "N/M transcribed" should match the visible
         # row count, not include hidden dups.
@@ -1179,13 +1185,13 @@ def channel_transcription_stats(channel: str) -> Dict[str, int]:
             out["transcribed"] = int(row[1] or 0)
             out["pending"] = int(row[2] or 0)
             out["failed"] = int(row[3] or 0)
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     return out
 
 
 def find_thumbnail(video_filepath: str,
-                    video_id: Optional[str] = None) -> Optional[str]:
+                    video_id: str | None = None) -> str | None:
     """Return the path to a .jpg / .webp thumbnail sidecar, if present.
 
     YTArchiver saves thumbnails to `<channel>/<year>/.Thumbnails/<title> [<id>].jpg`
@@ -1247,7 +1253,7 @@ def find_thumbnail(video_filepath: str,
                 continue
 
     # 4. Prefix match by stem (last resort — catches `<stem> [<id>].jpg`).
-    # audit D-48: drop the bare `startswith(stem)` fallback — it used to
+    # drop the bare `startswith(stem)` fallback — it used to
     # match unrelated thumbnails whose name coincidentally began with
     # this video's stem ("Intel reveals" stem matches "Intel reveals
     # X-ray secret.jpg"), returning the first os.listdir hit at random.
@@ -1268,8 +1274,8 @@ def find_thumbnail(video_filepath: str,
     return None
 
 
-def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = None,
-                 title: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
+                 title: str | None = None) -> list[dict[str, Any]]:
     """Return ordered segments for a video.
 
     Uses `_reader_open()` (lock-free reader connection) so the user's
@@ -1315,10 +1321,10 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
             if canon and canon[0]:
                 jsonl_path = canon[0]
                 _jp_from_canon = True
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     where = []
-    args: List[Any] = []
+    args: list[Any] = []
     if video_id:
         where.append("video_id=?"); args.append(video_id)
     if jsonl_path:
@@ -1350,7 +1356,7 @@ def get_segments(video_id: Optional[str] = None, jsonl_path: Optional[str] = Non
 
 def get_segment_context(segment_id: int, before: int = 30,
                         after: int = 30,
-                        query: str = "") -> Dict[str, Any]:
+                        query: str = "") -> dict[str, Any]:
     """Return N segments before + hit + N segments after for a search hit.
 
     `segment_id` is the rowid of the hit in the segments table. Returns:
@@ -1361,11 +1367,14 @@ def get_segment_context(segment_id: int, before: int = 30,
     Used by the Search viewer pane (YTArchiver.py:29598) to show
     ~60 segments of surrounding transcript, with the hit highlighted.
     """
-    conn = _open()
+    # `get_segment_context` is a hot path — clicking any search result
+    # in Browse > Search hits this. Use the reader connection so a
+    # running sweep / ingest can't make the search-viewer pane freeze.
+    conn = _reader_open()
     if conn is None:
         return {"ok": False, "error": "DB unavailable"}
     try:
-        with _db_lock:
+        with _reader_lock:
             # Resolve the hit row to find its jsonl_path + timeline position
             hit = conn.execute(
                 "SELECT id, video_id, title, channel, jsonl_path, start_time "
@@ -1417,7 +1426,7 @@ def get_segment_context(segment_id: int, before: int = 30,
                 except sqlite3.Error:
                     other_hits = set()
             # Assemble in chronological order
-            segments: List[Dict[str, Any]] = []
+            segments: list[dict[str, Any]] = []
             for r in reversed(rows_before):
                 rid, s, e, t = r
                 segments.append({"id": rid, "s": s, "e": e, "t": t,
@@ -1441,563 +1450,37 @@ def get_segment_context(segment_id: int, before: int = 30,
         return {"ok": False, "error": str(e)}
 
 
-def bucket_totals(bucket: str = "month",
-                  channel: Optional[str] = None) -> Dict[str, int]:
-    """Return {bucket_label: total_segments_in_bucket} so the Graph's
-    Normalize toggle can divide each bucket's count against its segment
-    volume. Matches YTArchiver.py normalize logic that divides word counts
-    by per-bucket total then multiplies by 1000.
-    """
-    conn = _open()
-    if conn is None:
-        return {}
-    group_col = "year || '-' || printf('%02d', month)" if bucket == "month" else "year"
-    sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-           " FROM segments")
-    args: List[Any] = []
-    if channel:
-        sql += " WHERE channel=?"
-        args.append(channel)
-    sql += " GROUP BY bucket"
-    try:
-        with _db_lock:
-            rows = conn.execute(sql, args).fetchall()
-    except sqlite3.Error:
-        return {}
-    return {str(r[0]): int(r[1] or 0) for r in rows if r[0] is not None}
+# Patch 17 (v71.9): search functions extracted to index_search.py.
+# Re-imported here so existing callers (api_mixins.browse_mixin, etc.)
+# continue to resolve the names against the index module's namespace.
+from .index_search import (  # noqa: F401
+    _sanitize_fts_query,
+    search_fts,
+    search_video_titles,
+)
 
-
-# Rough English stop-word list — enough to keep a 100-word cloud interesting.
-# Includes common contractions because the tokenizer allows apostrophes inside
-# words ("it's", "i'm", "don't", etc. would otherwise dominate the cloud).
-_STOP_WORDS = frozenset("""
-a about above after again against all am an and any are aren as at be because
-been before being below between both but by can cannot could did do does doing
-don down during each few for from further had has have having he her here hers
-herself him himself his how i if in into is it its itself just like me more
-most my myself no nor not now of off on once only or other our ours ourselves
-out over own same she should so some such than that the their theirs them
-themselves then there these they this those through to too under until up very
-was we were what when where which while who whom why will with would you your
-yours yourself yourselves ll ve re ain aren couldn didn doesn don hadn hasn
-haven isn mightn mustn needn shan shouldn wasn weren won wouldn also get got
-going really know one two three get thing things something anything nothing
-go way say said says see saw look right yeah okay hey uh um thats youre were
-actually literally basically thats gonna wanna kinda sorta lot lots make makes
-it's i'm don't won't can't didn't wasn't doesn't isn't aren't haven't hasn't
-weren't wouldn't shouldn't couldn't you're we're they're we've i've you've
-they've he's she's that's there's here's what's who's how's where's when's
-let's who've you'll i'll we'll they'll he'll she'll i'd you'd we'd they'd
-he'd she'd you'll ain't y'all gotta oh ooh ah ahh well alright ok
-""".split())
-
-
-def top_words(channel: Optional[str] = None, top_n: int = 120,
-              min_len: int = 3) -> List[Dict[str, Any]]:
-    """Return the top-N most-common words across all segments (optionally
-    filtered to a single channel). Skips short tokens + stop words so the
-    cloud surfaces actually-distinctive vocabulary.
-
-    Returns a list of {word, count} sorted descending by count. Used by
-    the Graph sub-mode's Word Cloud chart type.
-    """
-    conn = _open()
-    if conn is None:
-        return []
-    sql = "SELECT text FROM segments"
-    args: List[Any] = []
-    if channel:
-        sql += " WHERE channel=?"
-        args.append(channel)
-    # Cap at a large but finite number so a huge archive doesn't OOM us.
-    sql += " LIMIT 500000"
-    import re as _re
-    word_re = _re.compile(r"[a-zA-Z][a-zA-Z']{%d,}" % (min_len - 1))
-    counts: Dict[str, int] = {}
-    try:
-        with _db_lock:
-            cur = conn.execute(sql, args)
-            for (txt,) in cur:
-                if not txt:
-                    continue
-                for raw in word_re.findall(txt):
-                    w = raw.lower().rstrip("'")
-                    if w in _STOP_WORDS:
-                        continue
-                    counts[w] = counts.get(w, 0) + 1
-    except sqlite3.Error:
-        return []
-    # Top-N
-    items = sorted(counts.items(), key=lambda x: -x[1])[:int(top_n)]
-    return [{"word": w, "count": c} for w, c in items]
-
-
-def backfill_upload_ts(limit: int = 0) -> Dict[str, int]:
-    """Populate `videos.upload_ts` from file mtime for any row where it's
-    currently NULL. Called lazily the first time a Week-bucket graph is
-    requested so we don't force a full-archive stat walk at startup.
-
-    yt-dlp sets each video file's mtime to the YouTube upload date via
-    `--mtime`, so os.path.getmtime(filepath) is the authoritative upload
-    timestamp. Missing files silently skip (leave NULL) — those rows
-    won't contribute to week-bucket graphs but won't crash the query.
-
-    Returns {filled: N, skipped: M}. `limit=0` means "all rows".
-    """
-    conn = _open()
-    if conn is None:
-        return {"filled": 0, "skipped": 0}
-    filled = 0
-    skipped = 0
-    try:
-        with _db_lock:
-            sql = "SELECT rowid, filepath FROM videos WHERE upload_ts IS NULL"
-            if limit > 0:
-                sql += f" LIMIT {int(limit)}"
-            rows = conn.execute(sql).fetchall()
-        for rowid, fp in rows:
-            try:
-                if fp and os.path.isfile(fp):
-                    mtime = os.path.getmtime(fp)
-                    with _db_lock:
-                        conn.execute(
-                            "UPDATE videos SET upload_ts=? WHERE rowid=?",
-                            (mtime, rowid))
-                    filled += 1
-                else:
-                    skipped += 1
-            except OSError:
-                skipped += 1
-        with _db_lock:
-            conn.commit()
-    except sqlite3.Error:
-        pass
-    return {"filled": filled, "skipped": skipped}
-
-
-def graph_word_frequency(word: str, channel: Optional[str] = None,
-                         bucket: str = "month") -> Dict[str, Any]:
-    """Count occurrences of `word` per time bucket.
-
-    bucket ∈ {"year", "month", "week"}. Returns {labels, values}.
-
-    - "year" → group by segments.year
-    - "month" → group by "YYYY-MM" from segments.year + segments.month
-    - "week" → group by ISO-week key "YYYY-Www" from videos.upload_ts
-                (segments only store year+month, so weekly granularity
-                requires joining videos + using the file mtime which
-                yt-dlp set to the upload date via --mtime). Videos whose
-                upload_ts is NULL are skipped from the week plot; the
-                caller can trigger `backfill_upload_ts()` to populate.
-    """
-    conn = _open()
-    if conn is None or not word.strip():
-        return {"labels": [], "values": []}
-    word = word.strip()
-    if bucket == "week":
-        # audit D-45: LEFT JOIN so segments with NULL video_id (common
-        # for legacy rows and drop-in-mode archives without .info.json)
-        # still COUNT against the match totals. Without this, the
-        # inner join silently excluded them and the week graph showed
-        # undercount. We still filter out rows that resolve to NULL
-        # upload_ts (no bucket to assign) in the WHERE clause.
-        # audit E-36: raw epoch is returned here; ISO-week labels are
-        # computed in Python after fetch so week 52-53 → week 1
-        # transitions don't split spanning weeks across two labels.
-        sql = (
-            "SELECT v.upload_ts, COUNT(*) "
-            " FROM segments_fts fts "
-            " JOIN segments s ON s.id = fts.rowid "
-            " LEFT JOIN videos v ON v.video_id = s.video_id "
-            " WHERE fts.text MATCH ? "
-            " AND v.upload_ts IS NOT NULL"
-        )
-        args: List[Any] = [word]
-        if channel:
-            sql += " AND s.channel=?"
-            args.append(channel)
-        # No GROUP BY here — we aggregate in Python using isocalendar().
-    else:
-        # FTS5 MATCH to find segments containing the word
-        group_col = ("year || '-' || printf('%02d', month)"
-                     if bucket == "month" else "year")
-        sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
-               f" FROM segments_fts fts "
-               f" JOIN segments s ON s.id = fts.rowid "
-               f" WHERE fts.text MATCH ?")
-        args = [word]
-        if channel:
-            sql += " AND s.channel=?"
-            args.append(channel)
-        sql += " GROUP BY bucket ORDER BY bucket"
-    try:
-        with _db_lock:
-            rows = conn.execute(sql, args).fetchall()
-    except sqlite3.Error as e:
-        return {"labels": [], "values": [], "error": str(e)}
-    # audit E-36: for week bucket, aggregate in Python using
-    # isocalendar() so year-boundary weeks (e.g. 2024-12-30 is in
-    # ISO week 2025-W01) don't split into two half-sized bars.
-    if bucket == "week":
-        import datetime as _dt_w
-        counts_by_iso: Dict[str, int] = {}
-        for ts, cnt in rows:
-            if ts is None:
-                continue
-            try:
-                _dtobj = _dt_w.datetime.fromtimestamp(float(ts))
-                iso = _dtobj.isocalendar()
-                key = f"{iso.year:04d}-W{iso.week:02d}"
-            except Exception:
-                continue
-            counts_by_iso[key] = counts_by_iso.get(key, 0) + int(cnt)
-        _sorted = sorted(counts_by_iso.items())
-        labels = [k for k, _ in _sorted]
-        values = [v for _, v in _sorted]
-    else:
-        labels = [str(r[0]) for r in rows if r[0] is not None]
-        values = [int(r[1]) for r in rows if r[0] is not None]
-    # bug M-13: when the caller requests week-granularity data while
-    # backfill_upload_ts is still populating, the query silently returns
-    # sparse results. Surface a `backfill_pending` count so the UI can
-    # show "Still indexing... N videos pending" instead of letting the
-    # user think their channel has no recent activity.
-    backfill_pending = 0
-    if bucket == "week":
-        try:
-            with _db_lock:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
-                ).fetchone()
-            if row:
-                backfill_pending = int(row[0] or 0)
-        except sqlite3.Error:
-            pass
-    return {"labels": labels, "values": values,
-            "backfill_pending": backfill_pending}
-
-
-def graph_multi(words: List[str], channel: Optional[str] = None,
-                bucket: str = "month") -> Dict[str, Any]:
-    """Multiple word-frequency series on one x axis.
-
-    Returns { labels: [...], series: [{word, values: [...]}, ...] }
-    so the JS can draw one line per word, all sharing the merged time range.
-    """
-    words = [w.strip() for w in (words or []) if w and w.strip()]
-    if not words:
-        return {"labels": [], "series": []}
-    per_word = {}
-    label_set = set()
-    for w in words:
-        r = graph_word_frequency(w, channel=channel, bucket=bucket)
-        mapping = dict(zip(r.get("labels", []), r.get("values", [])))
-        per_word[w] = mapping
-        label_set.update(mapping.keys())
-    labels = sorted(label_set)
-    series = []
-    for w in words:
-        m = per_word[w]
-        series.append({"word": w, "values": [m.get(lbl, 0) for lbl in labels]})
-    return {"labels": labels, "series": series}
-
-
-# Alias matching main.py's original call site (Session 11)
-graph_word_frequency_multi = graph_multi
-
-
-def graph_channel_overlay(word: str, channels: List[str],
-                          bucket: str = "month") -> Dict[str, Any]:
-    """Same word across multiple channels — each channel is a series.
-
-    Returns { labels: [...], series: [{channel, values: [...]}, ...] }.
-    """
-    channels = [c for c in (channels or []) if c]
-    if not word or not channels:
-        return {"labels": [], "series": []}
-    per_ch = {}
-    label_set = set()
-    for ch in channels:
-        r = graph_word_frequency(word, channel=ch, bucket=bucket)
-        mapping = dict(zip(r.get("labels", []), r.get("values", [])))
-        per_ch[ch] = mapping
-        label_set.update(mapping.keys())
-    labels = sorted(label_set)
-    series = [{"channel": ch, "values": [per_ch[ch].get(lbl, 0) for lbl in labels]}
-              for ch in channels]
-    return {"labels": labels, "series": series}
-
-
-def graph_word_frequency_multi(words: List[str], channel: Optional[str] = None,
-                                bucket: str = "month") -> Dict[str, Any]:
-    """Run multiple word-frequency queries in one call. Returns a shape
-    ready for Chart.js with one dataset per word."""
-    out = {"labels": [], "series": []}
-    if not words:
-        return out
-    per = []
-    all_labels = set()
-    for w in words:
-        r = graph_word_frequency(w, channel=channel, bucket=bucket)
-        per.append({"word": w, "data": dict(zip(r["labels"], r["values"]))})
-        all_labels.update(r["labels"])
-    labels = sorted(all_labels)
-    out["labels"] = labels
-    for p in per:
-        out["series"].append({
-            "word": p["word"],
-            "values": [p["data"].get(l, 0) for l in labels],
-        })
-    return out
-
-
-def list_all_channels_in_db() -> List[str]:
-    """Return the distinct set of channels that appear in the segments table."""
-    conn = _open()
-    if conn is None:
-        return []
-    with _db_lock:
-        cur = conn.execute("SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE")
-        return [r[0] for r in cur.fetchall() if r[0]]
-
-
-def _sanitize_fts_query(q: str) -> str:
-    """Defensive fallback sanitizer for FTS5 MATCH queries.
-
-    The UI exposes AND/OR/NOT/"phrase"/prefix* as power-user operators.
-    If the raw query has syntax that FTS5 rejects (unbalanced quotes,
-    stray punctuation), this function is tried as a second chance:
-    strip everything that isn't word-chars / space / quote / * / - so
-    FTS5 treats it as implicit-AND across bare terms — matches OLD's
-    YTArchiver.py:29728 stripping behavior.
-    """
-    import re as _re
-    # Keep word chars, spaces, quotes, wildcard, minus (NOT). Drop everything else.
-    cleaned = _re.sub(r'[^\w\s"*\-]', " ", q or "")
-    # Collapse whitespace
-    cleaned = _re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned
-
-
-def search_video_titles(query: str,
-                          channel: Optional[Any] = None,
-                          limit: int = 200
-                          ) -> List[Dict[str, Any]]:
-    """Global title-only search across the archive's videos.
-
-    `channel` scopes the search: None / empty list → all channels;
-    a string → that one channel; a list of strings → that subset.
-    Title is LIKE-based, case-insensitive. Returns up to `limit`
-    matches sorted by upload_ts DESC (newest first). Result shape
-    mirrors search_fts so the frontend renderer can swap modes
-    without restructuring.
-    """
-    if not query or not query.strip():
-        return []
-    conn = _open()
-    if conn is None:
-        return []
-    # Allow multi-word queries to match in any order — split on
-    # whitespace and AND each word together.
-    parts = [p.strip() for p in query.strip().split() if p.strip()]
-    if not parts:
-        return []
-    where_clauses = " AND ".join(["title LIKE ? COLLATE NOCASE"] * len(parts))
-    args: List[Any] = [f"%{p}%" for p in parts]
-    # Channel scope: accept string (legacy) or list (new multi-select).
-    chan_sql = ""
-    if isinstance(channel, str) and channel.strip():
-        chan_sql = " AND channel = ?"
-        args.append(channel.strip())
-    elif isinstance(channel, (list, tuple)) and channel:
-        _names = [str(c).strip() for c in channel if str(c).strip()]
-        if _names:
-            placeholders = ",".join(["?"] * len(_names))
-            chan_sql = f" AND channel IN ({placeholders})"
-            args.extend(_names)
-    args.append(int(limit))
-    try:
-        with _db_lock:
-            cur = conn.execute(
-                f"SELECT video_id, title, channel, filepath, year, "
-                f"COALESCE(upload_ts, added_ts, 0) AS ts "
-                f"FROM videos WHERE {where_clauses}"
-                f"{chan_sql} "
-                f"AND is_duplicate_of IS NULL "
-                f"ORDER BY ts DESC LIMIT ?",
-                args)
-            rows = cur.fetchall()
-    except sqlite3.Error as e:
-        try: print(f"[search_video_titles] error: {e}")
-        except Exception: pass
-        return []
-    return [{
-        "video_id": r[0] or "",
-        "title": r[1] or "",
-        "channel": r[2] or "",
-        "filepath": r[3] or "",
-        "year": r[4],
-        "ts": r[5],
-    } for r in rows]
-
-
-def search_fts(query: str, channel: Optional[Any] = None, limit: int = 200,
-               year_from: Optional[int] = None, year_to: Optional[int] = None
-               ) -> List[Dict[str, Any]]:
-    """Run FTS5 MATCH against segments. Returns hits with context.
-
-    Query semantics: power-user operators (AND / OR / NOT / "phrase" / word*)
-    pass through to FTS5 as-is on the first attempt. If that raises a syntax
-    error (common when users paste something with unbalanced quotes or
-    parentheses), the function retries with a sanitizer that strips all
-    non-word punctuation and lets FTS5 treat the result as implicit-AND —
-    matching YTArchiver.py:29728 behavior. Empty result on second failure.
-
-    Optional `year_from` / `year_to` filter the segment by `segments.year`
-    (inclusive). Either bound may be None.
-    """
-    conn = _open()
-    if conn is None or not query.strip():
-        return []
-    q = ("SELECT s.id, s.video_id, s.title, s.channel, s.start_time, s.text, "
-         " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip "
-         " FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
-         " WHERE segments_fts MATCH ?")
-    args_suffix: List[Any] = []
-    suffix = ""
-    # Channel scope: string (legacy single-channel) or list (new
-    # multi-select). Empty list / None = all channels.
-    if isinstance(channel, str) and channel.strip():
-        suffix += " AND s.channel=?"
-        args_suffix.append(channel.strip())
-    elif isinstance(channel, (list, tuple)) and channel:
-        _names = [str(c).strip() for c in channel if str(c).strip()]
-        if len(_names) == 1:
-            suffix += " AND s.channel=?"
-            args_suffix.append(_names[0])
-        elif _names:
-            placeholders = ",".join(["?"] * len(_names))
-            suffix += f" AND s.channel IN ({placeholders})"
-            args_suffix.extend(_names)
-    # audit D-49: OR-include s.year IS NULL when a year filter is set.
-    # Legacy rows (drop-in mode, pre-path-parsing, channels where the
-    # folder layout isn't year-organized) have segments.year=NULL;
-    # without the NULL clause the filter silently excluded them even
-    # though the user's intent was "all results within this window,
-    # including ones we can't place yet". Net effect: year-filtered
-    # searches now include NULL-year rows rather than missing them.
-    if year_from is not None:
-        suffix += " AND (s.year >= ? OR s.year IS NULL)"
-        args_suffix.append(int(year_from))
-    if year_to is not None:
-        suffix += " AND (s.year <= ? OR s.year IS NULL)"
-        args_suffix.append(int(year_to))
-    suffix += " LIMIT ?"
-    args_suffix.append(limit)
-
-    def _run(q_text: str):
-        with _db_lock:
-            cur = conn.execute(q + suffix, [q_text] + args_suffix)
-            return cur.fetchall()
-
-    rows: List[Any] = []
-    try:
-        rows = _run(query)
-    except sqlite3.Error:
-        # Retry once with the sanitized query — gives user-typed input a chance
-        # to match even with stray punctuation or unbalanced quotes.
-        cleaned = _sanitize_fts_query(query)
-        if cleaned and cleaned != query:
-            try:
-                rows = _run(cleaned)
-            except sqlite3.Error as e2:
-                # Bug [52]: returning [{"error": ...}] poisoned the
-                # iterator since callers access r["segment_id"] etc.
-                # Print the error and return an empty list so the UI
-                # renders "no results" cleanly instead of crashing.
-                try: print(f"[search_fts] FTS error: {e2}")
-                except Exception: pass
-                return []
-        else:
-            try: print(f"[search_fts] Invalid FTS5 query: {query!r}")
-            except Exception: pass
-            return []
-    return [{
-        "segment_id": r[0], "video_id": r[1], "title": r[2], "channel": r[3],
-        "start_time": r[4], "text": r[5], "jsonl_path": r[6], "snippet": r[7],
-    } for r in rows]
-
-
-# ── Bookmarks ───────────────────────────────────────────────────────────
-
-def bookmark_add(video_id: str, title: str, channel: str,
-                 start_time: float, text: str, note: str = "") -> Optional[int]:
-    conn = _open()
-    if conn is None:
-        return None
-    with _db_lock:
-        cur = conn.execute(
-            "INSERT INTO bookmarks (video_id, title, channel, start_time, text, note) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (video_id, title, channel, start_time, text, note),
-        )
-        conn.commit()
-        return cur.lastrowid
-
-
-def bookmark_list(limit: int = 500) -> List[Dict[str, Any]]:
-    conn = _open()
-    if conn is None:
-        return []
-    with _db_lock:
-        cur = conn.execute(
-            "SELECT id, video_id, title, channel, start_time, text, note, created "
-            "FROM bookmarks ORDER BY created DESC LIMIT ?",
-            (limit,),
-        )
-        return [{
-            "id": r[0], "video_id": r[1], "title": r[2], "channel": r[3],
-            "start_time": r[4], "text": r[5], "note": r[6], "created": r[7],
-        } for r in cur.fetchall()]
-
-
-def bookmark_remove(bm_id: int) -> bool:
-    # audit D-47: return True only when an actual row changed. Old
-    # behavior returned True unconditionally, so a stale-id click (e.g.
-    # double-click after another session already deleted it) surfaced
-    # as "Bookmark removed" while nothing happened, then the next
-    # refresh showed the bookmark still there. Now False = nothing
-    # matched that id.
-    conn = _open()
-    if conn is None:
-        return False
-    with _db_lock:
-        cur = conn.execute("DELETE FROM bookmarks WHERE id=?", (bm_id,))
-        conn.commit()
-    return cur.rowcount > 0
-
-
-def bookmark_update_note(bm_id: int, note: str) -> bool:
-    # audit D-47: same reasoning as bookmark_remove — return False when
-    # the id didn't match anything so callers don't show misleading
-    # success toasts.
-    conn = _open()
-    if conn is None:
-        return False
-    with _db_lock:
-        cur = conn.execute(
-            "UPDATE bookmarks SET note=? WHERE id=?", (note, bm_id))
-        conn.commit()
-    return cur.rowcount > 0
+# Patch 17 (v71.9): graph functions extracted to index_graph.py.
+from .index_graph import (  # noqa: F401
+    backfill_upload_ts,
+    bucket_totals,
+    graph_channel_overlay,
+    graph_multi,
+    graph_word_frequency,
+    graph_word_frequency_multi,
+    list_all_channels_in_db,
+    top_words,
+)
 
 
 # ── Stats ───────────────────────────────────────────────────────────────
 
-def summary() -> Dict[str, Any]:
-    conn = _open()
+def summary() -> dict[str, Any]:
+    # Read-only stats — use the reader connection so a long-running
+    # sweep / ingest doesn't block these basic counts.
+    conn = _reader_open()
     if conn is None:
         return {"segments": 0, "videos": 0, "channels": 0, "bookmarks": 0}
-    with _db_lock:
+    with _reader_lock:
         seg = conn.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
         vid = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
         ch = conn.execute("SELECT COUNT(DISTINCT channel) FROM videos").fetchone()[0]
@@ -2005,470 +1488,16 @@ def summary() -> Dict[str, Any]:
     return {"segments": seg, "videos": vid, "channels": ch, "bookmarks": bm}
 
 
-# ── Startup sweep: register new video files that appeared on disk ──────
 
-def sweep_new_videos(output_dir: str, channels: list,
-                     progress_cb=None) -> dict:
-    """Walk each channel folder under `output_dir`, register any video
-    file not already in the videos table, and ingest any paired .jsonl
-    that isn't in segments yet.
-
-    Matches YTArchiver's disk-scan behavior at :3012 _scan_channel_disk_info —
-    picks up files added manually or while the app was closed.
-
-    Optional `progress_cb(idx, total, channel_name)` is invoked as each
-    channel starts so the caller can update a "Loading… N/M (channel)"
-    status line. Called on the same thread as the walk.
-
-    Returns {registered, ingested} counts.
-
-    The sweep uses its OWN sqlite3 connection (via _open_independent)
-    so its many per-file writes don't go through the shared `_db_lock`.
-    Without this, sync's DLTRACK register_video calls + transcribe's
-    FTS-ingest calls all serialized behind the sweep's lock acquisition,
-    causing visible "Downloading 100%" hangs of many minutes during
-    boot. WAL mode handles cross-connection serialization at the
-    SQLite layer instead.
-    """
-    from pathlib import Path as _Path
-    import os as _os
-
-    if not output_dir:
-        return {"registered": 0, "ingested": 0}
-    # Make sure the shared connection's schema-init has run at least
-    # once (creates tables, sets PRAGMAs at the file level).
-    _ = _open()
-    sweep_conn = _open_independent()
-    if sweep_conn is None:
-        return {"registered": 0, "ingested": 0}
-
-    _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
-                   ".wav", ".mp3", ".m4a", ".flac")
-    registered = 0
-    ingested = 0
-
-    # Cache existing filepaths to avoid hitting the DB per file. Use
-    # the sweep's private connection — readers in WAL mode never block
-    # writers, so this doesn't compete with anything.
-    existing = {r[0].lower() for r in sweep_conn.execute("SELECT filepath FROM videos").fetchall()
-                if r[0]}
-    indexed_jsonls = {r[0].lower() for r in sweep_conn.execute("SELECT path FROM indexed_files").fetchall()
-                      if r[0]}
-
-    # Per-channel folder fingerprint — lets us skip channels whose
-    # folder tree hasn't been touched since the last successful sweep.
-    # Matters because the enumeration itself (scandir of 100k entries
-    # across Z:\ DrivePool) is the slow part; even the stat-free walk
-    # takes minutes on archive. Fingerprint = recursive mtime
-    # max across the channel root + all subdirectories (year, month).
-    # Windows updates a folder's mtime when its entries change, so if
-    # a new download landed anywhere in the tree, at least one
-    # directory's mtime will be later than the last saved fingerprint.
-    # Videos getting MODIFIED in place (without adding/removing
-    # entries) wouldn't bump the mtime — fine, since sweep's job is
-    # only to catch newly-added files.
-    from .archive_scan import load_disk_cache as _load_dc, save_disk_cache as _save_dc
-    _fp_cache = _load_dc()
-    # Map channel URL → folder_fingerprint stored in the disk cache.
-    def _folder_fingerprint(ch_folder: _Path) -> float:
-        """Return max mtime across the channel folder + immediate
-        subdirs (one level deep is enough because yt-dlp always
-        writes into yyyy/... or yyyy/MM.../ and those intermediate
-        dirs always get bumped when a new file is written under them).
-        A handful of stat calls per channel — cheap."""
-        try:
-            mx = ch_folder.stat().st_mtime
-        except OSError:
-            return 0.0
-        try:
-            for entry in _os.scandir(ch_folder):
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        try:
-                            m = entry.stat(follow_symlinks=False).st_mtime
-                            if m > mx:
-                                mx = m
-                            # One extra level for year/month splits.
-                            for sub in _os.scandir(entry.path):
-                                try:
-                                    if sub.is_dir(follow_symlinks=False):
-                                        sm = sub.stat(follow_symlinks=False).st_mtime
-                                        if sm > mx:
-                                            mx = sm
-                                except OSError:
-                                    pass
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
-        except OSError:
-            pass
-        return mx
-
-    total_ch = len(channels)
-    skipped_unchanged = 0
-    for i_ch, ch in enumerate(channels):
-        ch_name = ch.get("name") or ch.get("folder", "")
-        if not ch_name:
-            continue
-        if progress_cb is not None:
-            try: progress_cb(i_ch + 1, total_ch, ch_name)
-            except Exception: pass
-        folder = _Path(output_dir) / ch_name
-        if not folder.is_dir():
-            continue
-        # Fingerprint-skip: if this channel's folder tree hasn't been
-        # touched (by file add/remove) since the last successful
-        # sweep, skip the walk entirely. Drops a 4-minute full sweep
-        # to seconds on a steady-state archive.
-        ch_url = (ch.get("url") or "").strip()
-        current_fp = _folder_fingerprint(folder)
-        last_fp_cache_entry = _fp_cache.get(ch_url, {}) if ch_url else {}
-        last_fp = float(last_fp_cache_entry.get("sweep_fingerprint", 0) or 0)
-        if current_fp > 0 and last_fp > 0 and current_fp <= last_fp:
-            skipped_unchanged += 1
-            continue
-        # Either never swept before or the folder changed — walk it.
-        # Use scandir directly so we get DirEntry objects with cached
-        # stat info — avoids a separate `os.path.getsize` disk round
-        # trip per file. Walk recursively by yielding directories
-        # from the parent scan. On a 100k-file archive across Z:\
-        # (DrivePool, network-ish latency per stat), this is the
-        # difference between a ~30s sweep and a multi-minute one.
-        import re as _re
-        _strip_id = _re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
-        stack = [str(folder)]
-        while stack:
-            dp = stack.pop()
-            try:
-                it = _os.scandir(dp)
-            except OSError:
-                continue
-            with it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
-                            continue
-                    except OSError:
-                        continue
-                    fn = entry.name
-                    low = fn.lower()
-                    if not low.endswith(_VIDEO_EXTS):
-                        continue
-                    if "_temp_compress" in low or low.endswith(".part"):
-                        continue
-                    # yt-dlp intermediate track suffix check (`.f140-7.m4a`)
-                    _stem = _os.path.splitext(fn)[0]
-                    _dot = _stem.rfind(".")
-                    if _dot >= 0:
-                        _tail = _stem[_dot + 1:]
-                        if (_tail and _tail[0].lower() == "f"
-                                and len(_tail) >= 2
-                                and _tail[1:].replace("-", "").isdigit()):
-                            continue
-                    # Check EXISTING-IN-DB first — most files in a
-                    # normal launch are already registered. No stat
-                    # call needed for them. Previously the sweep
-                    # called getsize() on every file before checking
-                    # `in existing`, wasting 99% of stat budget on a
-                    # steady-state archive.
-                    fp = _os.path.normpath(entry.path)
-                    fp_lower = fp.lower()
-                    if fp_lower in existing:
-                        # Already registered; check if a .jsonl
-                        # sidecar is present and not yet ingested.
-                        # `indexed_jsonls` check first (pure set
-                        # lookup) so we only hit the disk with
-                        # isfile() when we actually care.
-                        base = _os.path.splitext(fp)[0]
-                        jp = base + ".jsonl"
-                        jp_lower = _os.path.normpath(jp).lower()
-                        if (jp_lower not in indexed_jsonls
-                                and _os.path.isfile(jp)):
-                            title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
-                            # Pass sweep_conn so this call doesn't compete
-                            # for _db_lock — see _open_independent docstring.
-                            if ingest_jsonl(fp, jp, title, ch_name,
-                                            _conn_override=sweep_conn):
-                                ingested += 1
-                        continue
-                    # New file — need size now (both for 0-byte skip
-                    # and for register_video's size_bytes column).
-                    try:
-                        size = entry.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        continue
-                    if size == 0:
-                        continue
-                    register_video(fp, ch_name, _conn_override=sweep_conn)
-                    registered += 1
-                    # Ingest .jsonl sidecar if present.
-                    base = _os.path.splitext(fp)[0]
-                    jp = base + ".jsonl"
-                    if _os.path.isfile(jp):
-                        title = _strip_id.sub("", _os.path.basename(base)) or _os.path.basename(base)
-                        if ingest_jsonl(fp, jp, title, ch_name,
-                                        _conn_override=sweep_conn):
-                            ingested += 1
-        # Channel walk completed — stamp the fingerprint so next
-        # sweep can skip if unchanged. Stamp AFTER the walk so a
-        # crash mid-walk doesn't leave a stale "skip me" flag.
-        #
-        # issue #134: only stamp onto an already-populated entry.
-        # If the row is missing (e.g. just invalidated by a redownload
-        # before its background rescan finished), creating a fingerprint-
-        # only entry here would leave num_vids/size_bytes = 0 in the
-        # Subs table and survive restart (staleness check skips the next
-        # walk). Let `update_disk_cache_for_channel` own the initial
-        # populate; next sweep will walk this channel again, which is
-        # cheap compared to the bug.
-        if ch_url:
-            existing_row = _fp_cache.get(ch_url)
-            # bug L-1: tightened to `and` — update_disk_cache_for_channel
-            # always writes BOTH fields together, so a row with only one
-            # is itself a corruption case we don't want to cement by
-            # adding a fingerprint on top.
-            if isinstance(existing_row, dict) and (
-                    "num_vids" in existing_row
-                    and "size_bytes" in existing_row):
-                existing_row["sweep_fingerprint"] = current_fp
-
-    # Persist the updated fingerprint cache.
-    if skipped_unchanged < total_ch:
-        try:
-            _save_dc(_fp_cache)
-        except Exception:
-            pass
-
-    # Close the sweep's private connection — best-effort, don't fail the
-    # whole sweep if close raises (DB file is fine either way).
-    try:
-        sweep_conn.close()
-    except Exception:
-        pass
-
-    return {"registered": registered, "ingested": ingested,
-            "skipped_unchanged": skipped_unchanged,
-            "walked": total_ch - skipped_unchanged}
-
-
-def prune_missing_videos() -> Dict[str, int]:
-    """Delete stale/phantom video rows from the DB. Cleanup categories:
-
-      1. `missing` — filepath no longer exists on disk. Dead
-                      `(1)` duplicates, deleted files, etc.
-      2. `zero_byte` — file exists but is 0 bytes. Phantom
-                       placeholders from failed downloads (
-                       a user's channel "Intel just did an AMD" 0-byte
-                       file that my title-matcher then mis-assigned
-                       the real video's id to, producing duplicate
-                       grid rows with shared thumbnails).
-      3. `duplicate_id` — multiple rows share the same video_id.
-                          Keep the row with the largest `size_bytes`
-                          (presumed real file), drop the rest.
-
-    Segments + FTS entries tied to removed video_ids also get dropped
-    so ghost search hits don't linger. Returns per-category counts.
-    """
-    import os as _os
-    conn = _open()
-    if conn is None:
-        return {"videos_removed": 0, "segments_removed": 0,
-                "missing": 0, "zero_byte": 0, "duplicate_id": 0}
-    videos_removed = 0
-    segs_removed = 0
-    n_missing = n_zero = n_dup = n_fake_id = 0
-    affected_channels: set = set()
-    try:
-        with _db_lock:
-            # Category 0: null out all-alphabetic video_ids. These are
-            # filename-suffix parse errors (a user's channel files ending in
-            # `[a-user-channel]` that matched `[A-Za-z0-9_-]{11}` but
-            # aren't real YT ids). The row stays — it's a real file
-            # on disk — but its video_id field gets cleared so the
-            # next metadata recheck will title-resolve it properly
-            # instead of treating 13 different files as duplicates of
-            # one fake id.
-            fake_rows = conn.execute(
-                "SELECT id, channel, video_id FROM videos "
-                "WHERE video_id IS NOT NULL AND video_id != '' "
-                "AND length(video_id) = 11").fetchall()
-            fake_ids_to_null = [
-                rid for rid, _ch, _v in fake_rows if _v and _v.isalpha()
-            ]
-            if fake_ids_to_null:
-                for rid, _ch, _v in fake_rows:
-                    if _v and _v.isalpha():
-                        conn.execute(
-                            "UPDATE videos SET video_id=NULL, "
-                            "video_url=NULL WHERE id=?", (rid,))
-                        n_fake_id += 1
-                        if _ch:
-                            affected_channels.add(_ch)
-            # Category 1 + 2: missing files and 0-byte files.
-            rows = conn.execute(
-                "SELECT filepath FROM videos").fetchall()
-            to_delete_fps = []
-            for r in rows:
-                fp = (r[0] or "").strip()
-                if not fp:
-                    continue
-                if not _os.path.isfile(fp):
-                    to_delete_fps.append((fp, "missing"))
-                    continue
-                try:
-                    if _os.path.getsize(fp) == 0:
-                        to_delete_fps.append((fp, "zero_byte"))
-                except OSError:
-                    to_delete_fps.append((fp, "missing"))
-
-            for fp, cat in to_delete_fps:
-                vid_row = conn.execute(
-                    "SELECT video_id, channel FROM videos WHERE filepath=? "
-                    "COLLATE NOCASE LIMIT 1", (fp,)).fetchone()
-                vid = (vid_row[0] if vid_row else "") or ""
-                _ch = (vid_row[1] if vid_row and len(vid_row) > 1 else "") or ""
-                if _ch:
-                    affected_channels.add(_ch)
-                # Only drop segments if this is the LAST row holding
-                # that video_id — otherwise we'd orphan search hits
-                # from the surviving real-file row.
-                if vid:
-                    other = conn.execute(
-                        "SELECT COUNT(*) FROM videos WHERE video_id=? "
-                        "AND filepath != ? COLLATE NOCASE",
-                        (vid, fp)).fetchone()
-                    if not other or other[0] == 0:
-                        # audit H-9: cascade the segment delete into
-                        # the FTS external-content table so the
-                        # rowids we just orphaned can't keep
-                        # producing phantom search hits. Using
-                        # segments_fts's special 'delete' command
-                        # would require per-row text, so just drop
-                        # every fts row whose rowid is no longer in
-                        # segments. Simpler + bulletproof.
-                        _seg_ids = [r[0] for r in conn.execute(
-                            "SELECT id FROM segments WHERE video_id=?",
-                            (vid,)).fetchall()]
-                        c1 = conn.execute(
-                            "DELETE FROM segments WHERE video_id=?",
-                            (vid,))
-                        segs_removed += c1.rowcount or 0
-                        # Best-effort FTS delete. Skip silently if
-                        # the segments_fts table doesn't exist (very
-                        # old DB).
-                        if _seg_ids:
-                            try:
-                                # Chunk to stay under SQLite's bound
-                                # parameter limit (999 default).
-                                for _start in range(0, len(_seg_ids), 500):
-                                    _chunk = _seg_ids[_start:_start + 500]
-                                    _ph = ",".join("?" * len(_chunk))
-                                    conn.execute(
-                                        f"DELETE FROM segments_fts "
-                                        f"WHERE rowid IN ({_ph})",
-                                        _chunk)
-                            except Exception:
-                                pass
-                c2 = conn.execute(
-                    "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
-                    (fp,))
-                deleted_here = c2.rowcount or 0
-                videos_removed += deleted_here
-                if cat == "missing":
-                    n_missing += deleted_here
-                else:
-                    n_zero += deleted_here
-
-            # Category 3: multiple rows share the same video_id —
-            # redundant downloads of the same YouTube video. Rather
-            # than delete rows or files (files are on Z:\ which is
-            # read-only per project rule), mark the non-primary ones
-            # as duplicates via `is_duplicate_of=<primary filepath>`.
-            # The Browse grid filter hides these so it matches what
-            # YouTube shows (one entry per video), while the files
-            # stay on disk for the user to manage manually.
-            dup_vids = [r[0] for r in conn.execute(
-                "SELECT video_id FROM videos "
-                "WHERE video_id IS NOT NULL AND video_id != '' "
-                "AND is_duplicate_of IS NULL "
-                "GROUP BY video_id HAVING COUNT(*) > 1").fetchall()]
-            for vid in dup_vids:
-                rows = conn.execute(
-                    "SELECT id, filepath, size_bytes, channel FROM videos "
-                    "WHERE video_id=? AND is_duplicate_of IS NULL "
-                    "ORDER BY COALESCE(size_bytes, 0) DESC, id ASC",
-                    (vid,)).fetchall()
-                keep_fp = rows[0][1]
-                for rid, _fp, _sz, _ch in rows[1:]:
-                    c = conn.execute(
-                        "UPDATE videos SET is_duplicate_of=? WHERE id=?",
-                        (keep_fp, rid))
-                    flagged = c.rowcount or 0
-                    n_dup += flagged
-                    if _ch:
-                        affected_channels.add(_ch)
-            conn.commit()
-        # Drop the Browse grid cache for every channel that had a
-        # row removed or flagged — the cache is keyed by
-        # (channel, sort, limit, include_thumbs) and lives inside
-        # _browse_videos_cache. Without this, the grid keeps
-        # showing the pre-prune list for up to
-        # BROWSE_CACHE_TTL_SEC after the click.
-        for _ch in affected_channels:
-            try:
-                invalidate_channel_videos(_ch)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[index] prune_missing_videos failed: {e}")
-    return {"videos_removed": videos_removed,
-            "segments_removed": segs_removed,
-            "missing": n_missing, "zero_byte": n_zero,
-            "duplicate_id": n_dup,
-            "fake_id_cleared": n_fake_id}
-
-
-# ── Rebuild FTS index from scratch (rebuild button on Index tab) ────────
-
-def rebuild_fts_index() -> Dict[str, Any]:
-    """Drop segments_fts virtual table and rebuild it by reinserting every
-    row from segments. Safe to run — preserves the segments table itself.
-    Returns {ok, rows_indexed} or {ok: False, error}.
-    Use when FTS seems broken (search returns nothing despite visible segments)
-    or after a DB schema migration.
-    """
-    conn = _open()
-    if conn is None:
-        return {"ok": False, "error": "DB unavailable"}
-    try:
-        with _db_lock:
-            conn.execute("DROP TABLE IF EXISTS segments_fts")
-            conn.execute("""CREATE VIRTUAL TABLE segments_fts USING fts5(
-                text,
-                content=segments,
-                content_rowid=id
-            )""")
-            conn.execute(
-                "INSERT INTO segments_fts (rowid, text) "
-                "SELECT id, text FROM segments"
-            )
-            rows = conn.execute("SELECT COUNT(*) FROM segments_fts").fetchone()[0]
-            # bug M-4: `indexed_files` (the table used to compute the
-            # "unindexed transcripts" warning banner) is only populated
-            # by ingest_jsonl. A pure FTS rebuild would leave the banner
-            # claiming "N unindexed" even though every segment just got
-            # re-indexed. Refresh indexed_files from the segments table
-            # so the banner reflects reality.
-            conn.execute("DELETE FROM indexed_files")
-            conn.execute(
-                "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
-                "SELECT jsonl_path, 0, COUNT(*) "
-                "FROM segments WHERE jsonl_path IS NOT NULL "
-                "GROUP BY jsonl_path"
-            )
-            conn.commit()
-        return {"ok": True, "rows_indexed": int(rows)}
-    except sqlite3.Error as e:
-        return {"ok": False, "error": str(e)}
+# Patch 20 (v72.2): bookmarks + sweep/prune/rebuild extracted.
+from .index_bookmarks import (  # noqa: F401
+    bookmark_add,
+    bookmark_list,
+    bookmark_remove,
+    bookmark_update_note,
+)
+from .index_maintenance import (  # noqa: F401
+    prune_missing_videos,
+    rebuild_fts_index,
+    sweep_new_videos,
+)

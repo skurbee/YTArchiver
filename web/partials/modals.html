@@ -1,0 +1,80 @@
+  <!-- Global context menu mount point -->
+  <div id="ctx-menu-root"></div>
+
+  <!-- Toast notifications mount -->
+  <div id="toast-root"></div>
+
+  <!-- First-launch archive-root picker. Non-dismissable: the user
+       MUST choose a folder before the app becomes usable. -->
+  <!-- audit E-26: inline style="display:none" alongside the `hidden`
+       attribute so the modal stays hidden regardless of whether the
+       CSS `.yt-modal` rule uses `display: flex` or something that
+       would otherwise override the bare `hidden` attribute. JS that
+       opens the modal sets style.display explicitly. -->
+  <div id="welcome-modal" class="yt-modal" hidden style="display:none;">
+    <div class="yt-modal-backdrop"></div>
+    <div class="yt-modal-body" style="min-width:460px; max-width:560px;">
+      <div class="yt-modal-title">Pick an archive folder</div>
+      <div class="yt-modal-sub">
+        YTArchiver saves each subscribed channel as
+        <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
+        thumbnails, and transcripts are stored alongside the videos.
+      </div>
+      <div class="yt-modal-sub" style="margin-top:10px;">
+        Choose an empty folder (or an existing YTArchiver archive).
+        You can change it later in Settings.
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;
+                  margin-top:18px; margin-bottom:14px;">
+        <input type="text" id="welcome-path" class="ctl-input"
+               readonly placeholder="No folder selected"
+               style="flex:1 1 auto; min-width:0;" />
+        <button class="yt-modal-btn" id="welcome-browse">Browse&hellip;</button>
+      </div>
+      <div class="yt-modal-buttons">
+        <button class="yt-modal-btn primary" id="welcome-continue"
+                disabled>Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Redownload 10-sample confirm modal. Hidden by default; app.js
+       listens for the `yt-control` event (kind=redownload_sample) and
+       fills/shows it. Buttons call api.redownload_sample_confirm(). -->
+  <!-- audit E-26: same inline display:none belt-and-suspenders as
+       welcome-modal above. -->
+  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;">
+    <div class="yt-modal-backdrop"></div>
+    <div class="yt-modal-body">
+      <div class="yt-modal-title">Sample Complete</div>
+      <div class="yt-modal-sub" id="redwnl-sample-sub"></div>
+      <div class="yt-modal-stats" id="redwnl-sample-stats"></div>
+      <div class="yt-modal-countdown" id="redwnl-sample-countdown"></div>
+      <div class="yt-modal-buttons">
+        <button class="yt-modal-btn primary"
+                id="redwnl-sample-continue">Continue</button>
+        <button class="yt-modal-btn"
+                id="redwnl-sample-change">Change Resolution&hellip;</button>
+        <button class="yt-modal-btn danger"
+                id="redwnl-sample-cancel">Cancel</button>
+      </div>
+      <div class="yt-modal-res-picker" id="redwnl-sample-res-picker" hidden>
+        <div class="yt-modal-sub">Pick a new target:</div>
+        <div class="yt-modal-res-options">
+          <label><input type="radio" name="redwnl-sample-res" value="best"> Best</label>
+          <label><input type="radio" name="redwnl-sample-res" value="2160"> 2160p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="1440"> 1440p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="1080"> 1080p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="720"> 720p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="480"> 480p</label>
+          <label><input type="radio" name="redwnl-sample-res" value="360"> 360p</label>
+        </div>
+        <div class="yt-modal-buttons">
+          <button class="yt-modal-btn primary"
+                  id="redwnl-sample-res-ok">Apply</button>
+          <button class="yt-modal-btn"
+                  id="redwnl-sample-res-back">Back</button>
+        </div>
+      </div>
+    </div>
+  </div>

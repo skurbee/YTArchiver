@@ -20,10 +20,9 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .log_stream import LogStreamer
-
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
                ".wav", ".mp3", ".m4a", ".flac")
@@ -36,15 +35,16 @@ _SIDECAR_EXTS = (".txt", ".jsonl", ".info.json", ".jpg", ".jpeg", ".png", ".webp
 # so the two apps never create sibling folders for the same month.
 # Shared with metadata.py + transcribe.py — see backend.utils.MONTH_FOLDERS.
 from .utils import MONTH_FOLDERS as _MONTH_FOLDERS
+
 # Legacy name kept for any callers that imported it; points to the plain
 # month name (not used for new writes any more).
 _MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November", "December"]
 
 
-def _gather_video_files(root: Path) -> List[Path]:
+def _gather_video_files(root: Path) -> list[Path]:
     """Walk `root` for video-type files (skipping our temp files)."""
-    out: List[Path] = []
+    out: list[Path] = []
     for dp, _dns, fns in os.walk(root):
         for fn in fns:
             if "_TEMP_COMPRESS" in fn or fn.endswith(".part"):
@@ -58,10 +58,10 @@ _VIDEO_SIBLING_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
                        ".wav", ".mp3", ".m4a", ".flac")
 
 
-def _sidecars_for(video: Path) -> List[Path]:
+def _sidecars_for(video: Path) -> list[Path]:
     """Return any .txt/.jsonl/.info.json/.jpg files that share the video stem.
 
-    audit D-8: match on EXACT stem equality (file stem == video stem),
+    match on EXACT stem equality (file stem == video stem),
     not prefix. Old code used `p.name.startswith(stem)`, which matched
     `X_Part2.txt` to video `X.mp4` → moving X.mp4 dragged Part2's
     transcripts along for the ride. Now we compare stems exactly,
@@ -69,8 +69,8 @@ def _sidecars_for(video: Path) -> List[Path]:
     """
     stem = video.stem
     folder = video.parent
-    out: List[Path] = []
-    # audit M-2: language-suffixed caption files have a two-dot
+    out: list[Path] = []
+    # language-suffixed caption files have a two-dot
     # extension (e.g. `X.en.vtt`, `X.es.vtt`). Path.stem on those
     # returns `X.en`, so the exact-stem-equality check misses
     # them. Maintain a small whitelist of known language codes so
@@ -93,7 +93,7 @@ def _sidecars_for(video: Path) -> List[Path]:
         if p.name == stem + ".info.json":
             out.append(p)
             continue
-        # audit M-2: `X.en.vtt`, `X.es.srt`, etc. — Path.stem is
+        # `X.en.vtt`, `X.es.srt`, etc. — Path.stem is
         # `X.en`, so pop the language suffix off and re-compare.
         _sub_exts = (".vtt", ".srt", ".ass", ".ttml")
         if p.suffix.lower() in _sub_exts:
@@ -125,19 +125,35 @@ def _has_video_sibling(video: Path) -> bool:
     return False
 
 
-def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
+def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
+                dry_run: bool = False) -> bool:
     """Move a video and all of its sidecars to `target_dir`.
 
-    bug H-8: if another video file shares this stem (e.g. `X.mp4` +
+    if another video file shares this stem (e.g. `X.mp4` +
     `X.mkv`), copy shared sidecars instead of moving them — otherwise
     the sibling ends up orphaned without metadata.
+
+    `dry_run=True` logs the intended move and sidecar handling without
+    actually touching the filesystem. Returns True (success signal) so
+    the caller's counters still tick over.
     """
     if video.parent == target_dir:
+        return True
+    if dry_run:
+        scs = _sidecars_for(video)
+        sc_count = len(scs)
+        stream.emit([
+            ["[dry-run] ", ["dim"]],
+            [f"would move {video.name} ", None],
+            [f"→ {target_dir.relative_to(target_dir.parent.parent) if target_dir.parent.parent in target_dir.parents else target_dir.name}/ ",
+             ["dim"]],
+            [f"(+{sc_count} sidecar{'s' if sc_count != 1 else ''})\n", ["dim"]],
+        ])
         return True
     target_dir.mkdir(parents=True, exist_ok=True)
     dst = target_dir / video.name
     if dst.exists():
-        # audit E-13: destination collision. Before, we silently left
+        # destination collision. Before, we silently left
         # the source in place AND kept going, which for a previously-
         # interrupted reorg produced duplicate files in both folders
         # with no dedupe. Now: if dst and src look identical (same
@@ -180,7 +196,7 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer) -> bool:
     has_sibling = _has_video_sibling(video)
     try:
         shutil.move(str(video), str(dst))
-        # audit C-6: track sidecar failures so a partial orphan state
+        # track sidecar failures so a partial orphan state
         # is visible instead of silently swallowed. Each failed
         # sidecar leaves metadata behind in the old folder; the user
         # needs a line in the log to know about it.
@@ -228,7 +244,7 @@ def _cleanup_empty_dirs(root: Path):
 
 # ── Public entry points ────────────────────────────────────────────────
 
-def _date_from_info_json(video: Path) -> Optional[datetime]:
+def _date_from_info_json(video: Path) -> datetime | None:
     """Read `.info.json` sidecar and pull the YouTube upload_date field."""
     candidates = [
         video.with_suffix("").with_suffix(".info.json"),
@@ -249,8 +265,8 @@ def _date_from_info_json(video: Path) -> Optional[datetime]:
 
 
 def fix_file_dates(channel_folder: str, stream: LogStreamer,
-                   cancel_event: Optional[threading.Event] = None
-                   ) -> Dict[str, Any]:
+                   cancel_event: threading.Event | None = None
+                   ) -> dict[str, Any]:
     """Walk the channel folder and update each video file's mtime to match
     its YouTube upload date (from the .info.json sidecar).
 
@@ -277,7 +293,7 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
             break
         if not p.is_file():
             continue
-        # audit E-14: use the shared _VIDEO_EXTS constant so "Fix file
+        # use the shared _VIDEO_EXTS constant so "Fix file
         # dates" handles the same file types as the full reorg walker.
         # Previously the hard-coded 5-ext list silently skipped
         # .avi / .flv / .wmv / .m4v / .wav / .mp3 / .flac archives,
@@ -333,9 +349,10 @@ def fix_file_dates(channel_folder: str, stream: LogStreamer,
 
 def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                   stream: LogStreamer,
-                  cancel_event: Optional[threading.Event] = None,
+                  cancel_event: threading.Event | None = None,
                   use_mtime: bool = True,
-                  recheck_dates: bool = False) -> Dict[str, Any]:
+                  recheck_dates: bool = False,
+                  dry_run: bool = False) -> dict[str, Any]:
     """
     Move all videos in `channel_folder` into the requested layout.
 
@@ -346,6 +363,10 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
     When `recheck_dates=True`, re-read the real upload date from each
     video's `.info.json` sidecar before deciding the target folder (and
     update the file's mtime to match). Slower but authoritative.
+
+    `dry_run=True` logs every intended move + the final empty-dir
+    cleanup without touching the filesystem. The returned `moved` count
+    reflects how many moves WOULD have happened.
     """
     root = Path(channel_folder)
     if not root.is_dir():
@@ -462,20 +483,21 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         if video.parent == target:
             skipped += 1
             continue
-        if _move_video(video, target, stream):
+        if _move_video(video, target, stream, dry_run=dry_run):
             moved += 1
-            # audit F-28: re-stamp the moved file's mtime to the date
+            # re-stamp the moved file's mtime to the date
             # we chose for it. On StableBit DrivePool pooled drives a
             # cross-physical-drive move can reset mtime to "now", and
             # future reorg passes would then classify this file under
             # today's year instead of its upload year — silently
             # rotating files through folders.
-            try:
-                _moved_path = target / video.name
-                ts_stamp = d.timestamp()
-                os.utime(_moved_path, (ts_stamp, ts_stamp))
-            except (OSError, ValueError):
-                pass
+            if not dry_run:
+                try:
+                    _moved_path = target / video.name
+                    ts_stamp = d.timestamp()
+                    os.utime(_moved_path, (ts_stamp, ts_stamp))
+                except (OSError, ValueError):
+                    pass
             # Every 10 instead of 25 — on a ≤24-video reorg the old
             # threshold never fired, making the pass look stalled.
             if moved % 10 == 0:
@@ -483,13 +505,16 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
         else:
             errors += 1
 
-    # audit F-27: skip the empty-dirs sweep when the pass was
+    # skip the empty-dirs sweep when the pass was
     # cancelled. Half-moved state with some files in year folders and
     # others still flat is a legitimate intermediate; sweeping
     # away the emptied source folders in that state would remove
     # useful structure the user might want to resume into.
     if cancel_event is not None and cancel_event.is_set():
         stream.emit_dim(" \u2014 cancel: skipping empty-folder cleanup.")
+    elif dry_run:
+        stream.emit_dim(" \u2014 [dry-run] would sweep empty folders under "
+                        f"{root.name}/")
     else:
         _cleanup_empty_dirs(root)
 

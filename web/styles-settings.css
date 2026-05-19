@@ -1,0 +1,791 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-settings.css — Settings page + Download tab controls
+
+   Extracted from styles.css (Patch 18, v72.0). Contains:
+     • Settings page layout (centered column, sub-nav, save footer)
+     • Form controls: inputs, selects, checkboxes, dropdowns
+     • Buttons (primary / cancel / sync variants)
+     • Download tab controls area (URL field, format pickers, etc.)
+
+   Loaded AFTER styles.css so it can reference CSS variables defined
+   in :root there.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════════════
+   Settings page — modern app style.
+
+   Layout goals:
+   - Centered content column, caps at ~1100px so a 4K ultrawide
+     doesn't stretch labels half a meter from their controls.
+   - Each setting is its own row with a subtle divider below it
+     (think VS Code / Discord settings).
+   - Labels bold + medium-large, control right-aligned on the row,
+     lots of vertical breathing room.
+   - Adaptive: on narrow windows the label/control stack (container
+     query-ish via % min widths), on wide windows they sit beside.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Section title ("General", "Performance", ...) — LEFT-aligned, part
+   of the content column flow, not centered. Matches card width. */
+.settings-view > .subs-section-label {
+  display: block !important;
+  padding: 28px 28px 6px !important;
+  font-size: 22px !important;
+  font-weight: 600 !important;
+  color: var(--c-text) !important;
+  text-transform: none !important;
+  letter-spacing: 0;
+  max-width: 920px;
+  margin: 0 auto !important;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Override the global `.edit-grid { display: contents }` with a real
+   grid. Use card-on-card approach: the grid itself is a bordered
+   rounded container with rows inside, like macOS / iOS settings. */
+.settings-view .edit-grid {
+  display: grid !important;
+  /* Labels column: max-content so it never truncates. Value column:
+     1fr with min 0 so it's the one that shrinks when the window
+     narrows — the path inputs ellipsis/scroll instead of labels
+     getting clipped. */
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 24px;
+  row-gap: 0;
+  align-items: center;
+  /* width: 100% is CRITICAL — without it the grid sizes to content
+     only and leaves enormous empty gutters when the main area is
+     wider than the grid's intrinsic width. max-width then caps the
+     growth on ultrawide monitors. */
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 0 !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  /* NO overflow:hidden — the dropdown menus need to escape the card
+     when expanded. The border-radius alone gives the rounded look
+     without clipping descendants. */
+  box-sizing: border-box;
+}
+
+/* Each grid cell gets vertical padding so rows have consistent height.
+   The label cell is padded on the left, the value cell on the right,
+   so the content sits inside the card's interior margins. */
+.settings-view .edit-grid > .edit-gl {
+  padding: 16px 0 16px 22px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--c-text);
+  text-align: left;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+.settings-view .edit-grid > .edit-gv-inline,
+.settings-view .edit-grid > .edit-gv-stack,
+.settings-view .edit-grid > select,
+.settings-view .edit-grid > input {
+  padding-top: 12px;
+  padding-bottom: 12px;
+  padding-right: 22px;
+  min-width: 0;
+}
+/* Hint paragraph that spans both grid columns under a settings field.
+   Used for fields where the semantics aren't obvious (e.g. Archive
+   root only affecting NEW downloads). Audit U-14. */
+.settings-view .edit-grid > .edit-gh {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--c-dim);
+  line-height: 1.4;
+  padding: 0 22px 14px 0;
+  margin-top: -8px;
+  border-top: none;  /* override the row-divider rule above */
+}
+
+/* Thin horizontal dividers between rows. The label and value cells
+   sit in the same row, so applying border-top to ALL cells except
+   the first row gives a continuous line across both columns. */
+.settings-view .edit-grid > .edit-gl ~ .edit-gl,
+.settings-view .edit-grid > .edit-gl ~ .edit-gl + *,
+.settings-view .edit-grid > *:nth-child(n+3) {
+  border-top: 1px solid var(--c-border);
+}
+
+/* Value column — horizontal flex for inline groups (input + Browse,
+   input + unit-label, etc.), vertical stack for multi-row groups
+   (checkbox + hint under it). */
+.settings-view .edit-gv-inline {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+.settings-view .edit-gv-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: center;
+  align-items: flex-end;
+}
+/* Nested inline groups inside a stack (e.g. checkbox + label as one
+   inline, hint as another inline) each keep their own layout without
+   the parent stack flattening them. */
+.settings-view .edit-gv-stack > .edit-gv-inline {
+  width: 100%;
+  justify-content: flex-end;
+}
+
+/* Standalone <select> / <input> / custom dropdowns in the grid:
+   right-align at natural width instead of stretching the whole 1fr
+   value column. The path inputs (wrapped in .edit-gv-inline) still
+   fill the column; only single-control rows snap to the right. */
+.settings-view .edit-grid > select,
+.settings-view .edit-grid > input,
+.settings-view .edit-grid > .yt-dd {
+  justify-self: end;
+}
+.settings-view .edit-grid > .yt-dd {
+  min-width: 180px;
+  max-width: 280px;
+}
+
+/* Inputs — modern sizing with full content space (no vertical padding
+   clipping). */
+.settings-view .ctl-input {
+  font-size: 13.5px;
+  padding: 8px 12px;
+  height: 36px;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  box-sizing: border-box;
+  line-height: 1.4;
+}
+/* Native <select> elements in settings are HIDDEN. They remain in the
+   DOM for state/value so the existing save handlers still work, but
+   we render a custom div-based dropdown in their place because
+   Chromium in pywebview refuses to render the selected-value text
+   once any `appearance: none` or non-trivial padding is applied. */
+.settings-view .ctl-select {
+  display: none !important;
+}
+
+/* Custom dropdown widget — pure divs/spans, guaranteed to render.
+   `min-width: 0` on `.yt-dd` inside `.settings-view` lets the widget
+   shrink when the surrounding grid's value column is narrow. */
+.yt-dd {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 140px;
+  height: 36px;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  font-size: 13.5px;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+}
+.yt-dd:hover { border-color: #3a3e44; }
+.yt-dd.open { border-color: var(--c-accent); }
+.yt-dd-trigger {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  height: 100%;
+  min-width: 0;
+}
+.yt-dd-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--c-text);
+}
+.yt-dd-caret {
+  flex: 0 0 auto;
+  margin-left: 10px;
+  color: var(--c-accent);
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.15s;
+}
+.yt-dd.open .yt-dd-caret {
+  transform: rotate(180deg);
+}
+.yt-dd-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--c-raised);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  padding: 4px 0;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  z-index: 100;
+  max-height: 280px;
+  overflow-y: auto;
+  min-width: 160px;
+}
+.yt-dd-menu[hidden] { display: none; }
+.yt-dd-option {
+  padding: 7px 12px;
+  font-size: 13.5px;
+  color: var(--c-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.yt-dd-option:hover { background: rgba(255, 255, 255, 0.05); }
+.yt-dd-option.selected {
+  background: rgba(160, 170, 187, 0.1);
+  color: var(--c-text);
+  font-weight: 500;
+}
+.settings-view .ctl-input:focus,
+.settings-view .ctl-select:focus {
+  outline: none;
+  border-color: var(--c-accent);
+  box-shadow: 0 0 0 2px rgba(160, 170, 187, 0.15);
+}
+
+/* Text-path inputs (archive / video paths) — fill the value cell
+   but be the first thing to shrink when the window narrows.
+   min-width:0 is critical; without it the flex child refuses to
+   go below its content width and the whole grid overflows. */
+.settings-view .edit-gv-inline > .ctl-input:not(.edit-num) {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.settings-view .edit-num {
+  width: 64px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+
+/* Browse / secondary buttons inside rows */
+.settings-view .btn.btn-ghost.btn-thin {
+  padding: 6px 14px;
+  min-height: 34px;
+  font-size: 12.5px;
+  flex: 0 0 auto;
+  border-radius: 5px;
+}
+.settings-view .edit-dim {
+  font-size: 12.5px;
+  color: var(--c-dim);
+  /* Allow shrinking + wrapping so long hint lines don't overflow out
+     of their row box into the row above/below. */
+  min-width: 0;
+  flex: 0 1 auto;
+  white-space: normal;
+  line-height: 1.4;
+}
+/* Inside a vertical stack (e.g. Browse preload's checkbox + hint),
+   the hint row should naturally wrap and not try to right-align. */
+.settings-view .edit-gv-stack > .edit-gv-inline:not(:first-child) {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+.settings-view .edit-gv-stack .edit-dim {
+  text-align: right;
+  max-width: 100%;
+}
+
+/* Save-button footer aligns with the card's right edge */
+.settings-actions {
+  padding: 20px 0 28px;
+  max-width: 920px;
+  margin: 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+.settings-actions .btn {
+  padding: 9px 22px;
+  font-size: 13px;
+  min-height: 36px;
+}
+
+/* Sidebar: modern width + padding */
+.settings-sidebar {
+  min-width: 190px;
+  padding: 24px 0 20px !important;
+}
+.settings-subnav-label {
+  padding: 0 22px 10px;
+  font-size: 11px;
+  letter-spacing: 1.2px;
+}
+/* (Second .settings-subnav-btn block + !important overrides were
+   consolidated into the canonical rule above — audit #28.) */
+
+/* Metadata tab — matches the single-column card treatment used on
+   Index so the two sibling panels visually rhyme. Introduced
+   2026-04-23 alongside the bulk views-refresh rollout (see
+   index.html:748 and backend/metadata.py:bulk_refresh_views_likes). */
+.settings-view .metadata-panel {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 22px !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.metadata-hint {
+  color: var(--c-text);
+  opacity: 0.82;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 10px 12px;
+}
+.metadata-bulk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.metadata-bulk-row .spacer { flex: 1 1 auto; }
+/* Archive-wide totals strip. Five compact stat cards spaced evenly
+   across the panel width. Mirrors the dense, slightly-elevated
+   "stat tile" treatment used elsewhere in Settings so the visual
+   language is consistent. */
+.metadata-totals {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.metadata-totals .md-total-card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 8px 12px;
+  text-align: left;
+  min-width: 0;
+}
+.metadata-totals .md-total-label {
+  font-size: 10.5px;
+  color: var(--c-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-bottom: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metadata-totals .md-total-value {
+  font-size: 14px;
+  color: var(--c-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Two-line layout for percentage tiles: big percent on top, smaller
+   "X of Y" count below. Prevents the long "X/Y (Z%)" form from
+   getting clipped in a narrow tile (audit found "98,039/101,919
+   (96…" truncation at the typical Settings panel width). */
+.metadata-totals .md-total-value .md-total-primary {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metadata-totals .md-total-value .md-total-sub {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--c-dim);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Color-state variants for the percentage-bearing tiles, mirroring
+   the IDs/Thumbs/StillOnYT column colors. The CSS vars give the
+   tile a left border accent so a glance is enough to tell which
+   stats are healthy vs need attention. */
+.metadata-totals .md-total-card.is-ok { border-left: 3px solid #6f9c5f; }
+.metadata-totals .md-total-card.is-warn { border-left: 3px solid var(--c-warn-fg); }
+.metadata-totals .md-total-card.is-bad { border-left: 3px solid var(--c-bad-fg); }
+.metadata-totals .md-total-card.is-ok .md-total-value { color: var(--c-ok-fg); }
+.metadata-totals .md-total-card.is-warn .md-total-value { color: var(--c-warn-fg); }
+.metadata-totals .md-total-card.is-bad .md-total-value { color: var(--c-bad-fg); }
+.metadata-table-wrap {
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  /* No horizontal scroll — at narrow widths we want the channel
+     name column to ellipsis-truncate instead of letting the right-
+     hand Actions column scroll out of view. Hard UX rule: the
+     action button must never be hidden at any width. Squeeze the
+     most-squishable column (channel name) first; fixed-width
+     columns (counts, timestamps, action) are always visible. */
+  overflow: hidden;
+  background: var(--c-log-bg);
+}
+.metadata-table {
+  width: 100%;
+  /* `table-layout: fixed` binds column widths to their declared
+     sizes — without it, browsers auto-size based on cell content
+     and the "long channel name" overflow would grow the whole
+     table beyond its container. Fixed layout makes the channel
+     cell honor its column width strictly and truncate. */
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--c-text);
+}
+.metadata-table thead th {
+  text-align: left;
+  padding: 7px 10px;
+  background: var(--c-surface);
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-accent);
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.metadata-table thead th:hover { background: rgba(160, 170, 187, 0.10); }
+.metadata-table thead th[data-sort-active] { color: var(--c-text); }
+.metadata-table thead th[data-sort-active]::after {
+  content: " \25BE"; /* ▾ */
+  opacity: 0.6;
+  font-size: 10px;
+}
+.metadata-table thead th[data-sort-active][data-sort-dir="asc"]::after {
+  content: " \25B4"; /* ▴ */
+}
+.metadata-table tbody tr {
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.metadata-table tbody tr:last-child { border-bottom: none; }
+/* Hover state for clickable rows. The whole row is now the click
+   target (left OR right click opens the action menu) — was a tiny
+   "⋯" button before, which most users didn't see. Slightly stronger
+   highlight than the old subtle hover so the affordance is obvious. */
+.metadata-table tbody tr.md-row-clickable {
+  cursor: pointer;
+  /* No left padding shift on hover — the border-left baseline below
+     keeps the row's left edge anchored even when needs-fix paints in. */
+  border-left: 3px solid transparent;
+}
+.metadata-table tbody tr.md-row-clickable:hover {
+  background: rgba(160, 170, 187, 0.10);
+}
+/* Channels with missing video IDs get a subtle yellow left rail so
+   they stay scannable now that the warn-colored "⋯" button is gone. */
+.metadata-table tbody tr.md-row-needs-fix {
+  border-left-color: rgba(225, 178, 90, 0.55);
+}
+.metadata-table tbody tr.md-row-needs-fix:hover {
+  border-left-color: var(--c-warn-fg);
+  background: rgba(225, 178, 90, 0.08);
+}
+/* The little "›" chevron in the action column. No click handler of
+   its own — it's purely a visual cue that the row is interactive. */
+.metadata-table .md-row-chev {
+  display: inline-block;
+  color: var(--c-dim);
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 400;
+  opacity: 0.5;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.metadata-table tbody tr.md-row-clickable:hover .md-row-chev {
+  opacity: 1;
+  color: var(--c-accent);
+  transform: translateX(2px);
+}
+/* Floating right-click-style dropdown menu for the row actions in
+   the Metadata table. Positioned at the cursor via inline left/top.
+   Compact, Windows-context-menu vibe — NOT a centered modal. */
+.md-context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 200px;
+  background: #1c1f23;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--c-text);
+  user-select: none;
+  animation: md-cm-pop 0.08s ease-out;
+}
+@keyframes md-cm-pop {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.md-cm-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  color: var(--c-text);
+  padding: 6px 14px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.md-cm-item:hover,
+.md-cm-item:focus {
+  background: rgba(120, 165, 220, 0.18);
+  color: #fff;
+  outline: 0;
+}
+.md-cm-warn { color: var(--c-warn-fg); }
+.md-cm-warn:hover, .md-cm-warn:focus { color: #f0c46d; }
+/* Submenu wrapper — parent holds the head row + a hidden flyout. The
+   flyout appears to the right when the head is hovered or focused
+   inside. CSS-only show/hide, no JS state. */
+.md-cm-sub-wrap { position: relative; }
+.md-cm-has-sub { display: flex; align-items: center; }
+.md-cm-chev {
+  margin-left: auto;
+  padding-left: 14px;
+  opacity: 0.55;
+  font-weight: 600;
+}
+.md-cm-sub {
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  min-width: 150px;
+  background: #1c1f23;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.35);
+  padding: 4px 0;
+  display: none;
+}
+.md-cm-sub-wrap:hover > .md-cm-sub,
+.md-cm-sub-wrap:focus-within > .md-cm-sub {
+  display: block;
+}
+.md-cm-sub-wrap:hover > .md-cm-has-sub {
+  background: rgba(120, 165, 220, 0.18);
+  color: #fff;
+}
+
+/* Spinning loader for the Thumbnails column while the bulk disk walk
+   is in flight. Replaces the old "—" which was indistinguishable from
+   a genuinely-empty channel. */
+.metadata-table .md-thumb-loading {
+  color: var(--c-dim);
+  font-style: italic;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.metadata-table .md-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid rgba(160, 170, 187, 0.25);
+  border-top-color: var(--c-accent);
+  border-radius: 50%;
+  animation: md-spinner-rot 0.85s linear infinite;
+  vertical-align: -1px;
+  margin-right: 5px;
+}
+@keyframes md-spinner-rot {
+  to { transform: rotate(360deg); }
+}
+.metadata-table tbody td {
+  padding: 6px 10px;
+  vertical-align: middle;
+}
+/* Channel name column: the ONLY flexible column. Takes whatever
+   horizontal space remains after the fixed-width columns claim
+   theirs, and ellipsis-truncates when space is tight. No min-width
+   — the action button must never be clipped, so the name shrinks
+   down to a few characters + ellipsis if needed. */
+.metadata-table .md-col-name {
+  width: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.metadata-table .md-col-num {
+  width: 54px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--c-dim);
+}
+.metadata-table .md-col-ts {
+  width: 82px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* Video IDs column — small status icon + optional count. Green
+   when every on-disk file has a resolvable id in the DB; yellow
+   when some are missing (backfill recommended); red when none
+   are set (migrated-from-tkinter archive pre-backfill). */
+.metadata-table .md-col-onyt {
+  /* Wider than md-col-ids because the longest cell renders as
+     "405/610 (66.4%)" — needs more characters of breathing room. */
+  width: 150px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.metadata-table .md-col-ids {
+  width: 88px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+}
+.metadata-table .md-id-ok { color: var(--c-ok-fg); }
+.metadata-table .md-id-warn { color: var(--c-warn-fg); }
+.metadata-table .md-id-bad { color: var(--c-bad-fg); }
+.metadata-table .md-id-dim { color: var(--c-dim); }
+/* Neutral state: 90-99% coverage. Not orange (that's reserved for
+   channels that genuinely need attention), not green (some IDs
+   still missing). Default text color so the row doesn't shout. */
+.metadata-table .md-id-neutral { color: var(--c-text); }
+.metadata-table .md-id-ratio {
+  color: var(--c-dim);
+  font-size: 11px;
+  margin-left: 2px;
+}
+.metadata-table .md-col-act {
+  width: 38px;
+  white-space: nowrap;
+  text-align: center;
+  padding-left: 2px !important;
+  padding-right: 2px !important;
+}
+/* Single-button "⋯" menu opener for a row's action picker. Sized
+   to be a comfy 26×22 click target but still narrow enough for
+   tight panel widths. Prev: 3 visible buttons ≈ 190px of column. */
+.metadata-table .md-row-act-menu {
+  width: 26px;
+  height: 22px;
+  padding: 0 !important;
+  margin: 0 !important;
+  line-height: 18px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+/* Warning tint on the menu button when the row needs a Fix IDs
+   pass — gives a gentle visual cue without adding another column. */
+.metadata-table .md-row-act-warn {
+  color: var(--c-warn-fg);
+  border-color: rgba(225, 178, 90, 0.4);
+}
+.metadata-table .md-row-act-warn:hover {
+  border-color: var(--c-warn-fg);
+}
+.metadata-table .md-ts-never { color: var(--c-bad-fg); }
+.metadata-table .md-ts-old { color: var(--c-warn-fg); }
+.metadata-table .md-ts-fresh { color: var(--c-ok-fg); }
+.metadata-table .md-empty {
+  text-align: center;
+  color: var(--c-dim);
+  padding: 20px !important;
+  font-style: italic;
+}
+/* Live elapsed-counter + status text appended after "Loading channels..."
+   while the slow get_channel_metadata_status query is in flight. Slightly
+   dimmer + smaller so the primary "Loading channels..." text reads first. */
+.metadata-table .md-load-info {
+  font-size: 11px;
+  opacity: 0.75;
+  margin-left: 6px;
+}
+.metadata-table .md-row-act-btn {
+  display: inline-block;
+  padding: 2px 6px;
+  margin-left: 3px;
+  background: transparent;
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  border-radius: 2px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.metadata-table .md-row-act-btn:hover {
+  background: rgba(160, 170, 187, 0.12);
+  border-color: var(--c-accent);
+}
+/* Fix IDs button when the channel doesn't need fixing — visually
+   deemphasized so the user's eye is drawn to the rows that DO need
+   attention. Still clickable (user may want to force a re-check). */
+.metadata-table .md-row-act-btn.md-row-act-dim {
+  opacity: 0.5;
+}
+.metadata-table .md-row-act-btn.md-row-act-dim:hover {
+  opacity: 1;
+}
+
+/* Single-column views (Index) — match the card-container treatment */
+.settings-view .settings-index-grid {
+  width: 100%;
+  max-width: 920px;
+  margin: 16px auto 0;
+  padding: 22px !important;
+  background: var(--c-surface, #16181b);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  box-sizing: border-box;
+}
+
+.index-section-hint {
+  color: var(--c-dim);
+  font-size: 12px;
+  margin-bottom: 6px;
+  line-height: 1.5;
+}
+/* Top-of-tab "what is this for" explainer. Slightly indented + padded so
+   it reads like a tip block rather than a control row. */
+.index-section.index-explainer {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 3px;
+  padding: 10px 12px;
+}
+.index-section.index-explainer .index-section-hint {
+  margin-bottom: 0;
+  color: var(--c-text);
+  opacity: 0.82;
+}
+/* Compat: older blocks still reference .settings-tab-inner. */
+.settings-tab-inner {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+

@@ -1,0 +1,308 @@
+  <!-- Subs tab -->
+  <div class="tab-panel" id="panel-subs">
+
+    <div class="subs-area">
+
+      <!-- Parent folder moved to the Settings tab (Archive root). -->
+
+
+      <!-- Row: Subbed Channels header -->
+      <div class="subs-header-row">
+        <label class="subs-section-label">Subbed Channels:</label>
+        <div class="subs-filter-wrap">
+          <span class="search-icon" aria-hidden="true">&#128269;</span>
+          <input type="text" class="ctl-input subs-filter-input" id="subs-filter"
+                 placeholder="Filter by name&hellip;" />
+          <button class="subs-filter-clear" id="subs-filter-clear" hidden
+                  title="Clear filter (Esc)" aria-label="Clear filter">&times;</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-thin" id="btn-queue-pending"
+                title="Left-click: queue channels with pending transcriptions / metadata&#10;Right-click: queue ALL channels">&#8634; Queue Pending
+          <span class="queue-pending-count" id="queue-pending-count" hidden></span>
+        </button>
+        <span class="status-text clickable-total" id="subs-total-size"
+              title="Click to rescan all channel folder sizes">Total: &mdash;</span>
+      </div>
+
+      <!-- feature F7: bulk-actions bar. Appears only when ≥2 Subs rows
+           are selected (Ctrl/Shift-click). `_updateSubsBulkBar()` in
+           app.js toggles visibility + updates the count label. -->
+      <div class="subs-bulk-bar" id="subs-bulk-bar" hidden
+           style="display:flex;gap:6px;align-items:center;padding:4px 12px;background:rgba(96,160,255,0.08);border-bottom:1px solid #2a3140;">
+        <span class="status-text" id="subs-bulk-count" style="flex:1;">
+          0 channels selected
+        </span>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-resolution"
+                title="Change resolution for all selected">Change resolution&hellip;</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-auto-tx"
+                title="Toggle Auto-transcribe for all selected">Auto-transcribe&hellip;</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-metadata"
+                title="Queue metadata refresh for all selected">Queue metadata</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-clear"
+                title="Clear selection">Clear</button>
+        <button class="btn btn-ghost btn-thin" id="btn-bulk-delete"
+                title="Delete all selected channels"
+                style="color:#e78a8a;">Delete&hellip;</button>
+      </div>
+
+      <!-- Channel table -->
+      <div class="subs-table-frame">
+        <table class="subs-table" id="subs-table">
+          <colgroup>
+            <col class="col-folder"/>
+            <col class="col-num"/>
+            <col class="col-num"/>
+            <col class="col-num"/>
+            <col class="col-mark"/>
+            <col class="col-mark"/>
+            <col class="col-mark"/>
+            <col class="col-date"/>
+            <col class="col-num"/>
+            <col class="col-num"/>
+            <col class="col-num"/>
+          </colgroup>
+          <thead>
+            <!-- data-sort keys must match the kinds map in wireTableSort
+                 (app.js initColumnSort) for numeric sort to apply to # Vids
+                 + Size. Without them, sort defaults to string-compare and
+                 "90" sorts before "957" because it's char-by-char. -->
+            <tr>
+              <th class="col-folder" data-sort="folder">Folder</th>
+              <th data-sort="res">Res</th>
+              <th data-sort="min">Min</th>
+              <th data-sort="max">Max</th>
+              <th data-sort="compress"
+                  title="Compress videos to AV1 to save space.&#10;&#10;✓ = compression turned on for this channel.&#10;— = off.">Compress</th>
+              <th data-sort="transcribed"
+                  title="Generate Whisper transcripts for downloaded videos.&#10;&#10;A ✓ = auto-transcribe on AND every video transcribed.&#10;✓ = transcribed but auto is off (manual mode).&#10;— -N = N videos behind (will catch up next pass).&#10;— = no transcription yet.">Transcribe</th>
+              <th data-sort="metadata"
+                  title="Fetch each video's metadata (title, description, views, thumbnail).&#10;&#10;A ✓ = auto-fetch on AND complete coverage.&#10;✓ = complete but auto is off.&#10;— -N = N videos missing metadata.&#10;— = no metadata yet.">Metadata</th>
+              <th data-sort="last_sync">Last Sync</th>
+              <th data-sort="n_vids"># Vids</th>
+              <th data-sort="size">Size</th>
+              <th data-sort="avg_size" title="Average file size = total size / # videos">Avg</th>
+            </tr>
+          </thead>
+          <tbody id="subs-table-body"></tbody>
+        </table>
+      </div>
+
+      <!-- Add / Edit channel inline panel &mdash; always visible at the bottom of the Subs tab.
+           Behaves like the original YTArchiver:
+             - Default state (Add mode): Folder Name + Channel URL fields visible
+             - Typing in either field expands the rest (Resolution, Duration, Range, &hellip;)
+             - Double-click a row or right-click → Edit: same panel, all fields visible,
+               label changes to "Edit channel &mdash; <folder>".
+           Matches YTArchiver.py:4997 add_outer + _set_add_details_visible. -->
+      <div class="edit-channel-box" id="edit-channel-box">
+        <label class="subs-section-label" id="edit-channel-label">Add channel</label>
+
+        <!-- Flex-row layout (replaces the CSS grid). Each field carries
+             its own label+value as a self-contained unit, so flex rows
+             pair fields without risk of grid-cell misalignment. Hidden
+             panels (nudge, compress expansion) just `display:none` cleanly
+             without shoving subsequent labels into the wrong cell. -->
+        <div class="edit-form">
+
+          <!-- Row 1: Folder Name + Channel URL side-by-side -->
+          <div class="edit-row">
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Folder Name</label>
+              <input type="text" class="ctl-input" id="edit-folder" placeholder="Target folder name" />
+            </div>
+            <div class="edit-field edit-field-grow">
+              <label class="edit-gl">Channel URL</label>
+              <input type="text" class="ctl-input" id="edit-url" placeholder="https://www.youtube.com/@handle" />
+            </div>
+          </div>
+
+          <!-- Reverse nudge: pasted-video-URL handoff. Full-width banner,
+               hidden by default. Doesn't take grid space while hidden. -->
+          <div class="edit-nudge-row video-nudge-panel" id="edit-url-video-nudge" hidden>
+            <span>&#x1F3AC; Video URL detected.</span>
+            <button class="btn btn-primary btn-thin" id="btn-edit-url-to-download" type="button">&#8594; Send to Download tab</button>
+          </div>
+
+          <!-- Folder override: NOT a separate UI field &mdash; OLD YTArchiver
+               stores ONE folder name per channel (YTArchiver.py:5432).
+               The "Folder Name" input writes both `folder` +
+               `folder_override` on save. -->
+
+          <!-- Row 2: Resolution (+ reset/recheck/continue) + Duration -->
+          <div class="edit-row">
+            <div class="edit-field">
+              <label class="edit-gl">Resolution</label>
+              <!-- Display labels carry the `p` suffix ("720p" not "720")
+                   so users don't have to guess. `value=` stays as the
+                   bare number / keyword the backend expects. Same fix
+                   applied to the Settings default-resolution + the
+                   single-video panel. -->
+              <select class="ctl-select edit-res" id="edit-resolution">
+                <option value="audio">Audio only</option>
+                <option value="144">144p</option>
+                <option value="240">240p</option>
+                <option value="360">360p</option>
+                <option value="480">480p</option>
+                <option value="720" selected>720p</option>
+                <option value="1080">1080p</option>
+                <option value="1440">1440p</option>
+                <option value="2160">2160p (4K)</option>
+                <option value="best">Best available</option>
+              </select>
+              <button class="icon-btn-slim" title="Reset resolution to default" id="edit-res-reset">&#8635;</button>
+              <!-- Scan channel folder with ffprobe + queue redownload for
+                   below-target videos. YTArchiver.py:5155. -->
+              <button class="icon-btn-slim" title="Scan archive + queue redownload for videos below target resolution"
+                      id="edit-res-recheck" type="button">&#x2713;</button>
+              <!-- Continue Redownload &mdash; visible only when a progress file
+                   exists. YTArchiver.py:5473 _has_pending_redownload. -->
+              <button class="btn btn-primary btn-thin" id="edit-res-continue"
+                      type="button" hidden
+                      title="Resume the in-progress redownload for this channel">&#x21BB; Continue</button>
+              <!-- Cancel Redownload &mdash; same visibility rule as Continue.
+                   Drops the queued/running redownload + removes the
+                   channel's _redownload_progress.json so the Subs dot
+                   and right-click "Continue" option both clear. -->
+              <button class="btn btn-thin btn-danger" id="edit-res-cancel"
+                      type="button" hidden
+                      title="Cancel the in-progress redownload and discard progress">&#x2716; Cancel</button>
+            </div>
+            <div class="edit-field">
+              <label class="edit-gl">Duration</label>
+              <input type="text" class="ctl-input edit-num" id="edit-min-dur" value="3" placeholder="Min" />
+              <span class="edit-dim">&ndash;</span>
+              <input type="text" class="ctl-input edit-num" id="edit-max-dur" placeholder="Max" />
+              <span class="edit-dim">min</span>
+            </div>
+          </div>
+
+          <!-- Row 3: Range (full width &mdash; 3 radios + optional date) -->
+          <div class="edit-row">
+            <div class="edit-field edit-field-full" id="edit-range-group">
+              <label class="edit-gl">Range</label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="subscribe" checked />
+                <span class="radio-circle"></span>Subscribe only
+              </label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="all" />
+                <span class="radio-circle"></span>Entire channel
+              </label>
+              <label class="radio-label-inline">
+                <input type="radio" name="edit-range" value="fromdate" />
+                <span class="radio-circle"></span>From date
+              </label>
+              <div class="edit-date-group" id="edit-date-group" hidden>
+                <input type="text" class="ctl-input edit-date-part" id="edit-date-year" placeholder="YYYY" maxlength="4" inputmode="numeric" />
+                <span class="edit-dim">/</span>
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-month" placeholder="MM" maxlength="2" inputmode="numeric" />
+                <span class="edit-dim">/</span>
+                <input type="text" class="ctl-input edit-date-part edit-date-mm" id="edit-date-day" placeholder="DD" maxlength="2" inputmode="numeric" />
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 4: Folder Org + Options. Folder Org is compact
+               (single dropdown), Options is a row of 3 checkboxes.
+               The Options field grows to fill remaining space. -->
+          <div class="edit-row">
+            <div class="edit-field">
+              <label class="edit-gl">Folder Org</label>
+              <select class="ctl-select edit-res" id="edit-folder-org">
+                <option value="flat">None (flat)</option>
+                <option value="years" selected>Years</option>
+                <option value="months">Years/Months</option>
+              </select>
+            </div>
+            <div class="edit-field edit-field-grow edit-options">
+              <label class="edit-gl">Options</label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-metadata" checked />
+                <span>Auto-metadata</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-transcribe" />
+                <span>Auto-transcribe</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="edit-compress" />
+                <span>Compress</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- Compress expansion &mdash; only visible when "Compress" checked.
+               Full-width row so the dropdowns don't crowd the main row. -->
+          <div class="edit-row edit-compress-group" id="edit-compress-group" hidden>
+            <div class="edit-field">
+              <label class="edit-dim">Res</label>
+              <select class="ctl-select edit-res" id="edit-compress-res">
+                <option value="original">Original</option>
+                <option value="1080">1080p</option>
+                <option value="720">720p</option>
+                <option value="480" selected>480p</option>
+                <option value="360">360p</option>
+                <option value="240">240p</option>
+                <option value="144">144p</option>
+              </select>
+            </div>
+            <div class="edit-field">
+              <label class="edit-dim">Quality</label>
+              <select class="ctl-select edit-res" id="edit-compress-quality">
+                <option value="Generous" selected>Generous</option>
+                <option value="Average">Average</option>
+                <option value="Below Average">Below Average</option>
+              </select>
+            </div>
+            <div class="edit-field">
+              <label class="edit-dim">Batch</label>
+              <select class="ctl-select edit-batch" id="edit-compress-batch">
+                <option>5</option>
+                <option selected>10</option>
+                <option>15</option>
+                <option>20</option>
+                <option>25</option>
+                <option>30</option>
+              </select>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Read-only disk stats for this channel (hidden in Add mode) -->
+        <div class="edit-diskstats" id="edit-diskstats" hidden>
+          <span class="ds-label">On disk:</span>
+          <span class="ds-val" id="ds-videos">&mdash;</span><span class="ds-unit">videos</span>
+          <span class="ds-sep">·</span>
+          <span class="ds-val" id="ds-size">&mdash;</span>
+          <span class="ds-sep">·</span>
+          <span class="ds-label">Last sync:</span>
+          <span class="ds-val" id="ds-last-sync">&mdash;</span>
+          <span class="ds-sep" id="ds-tx-sep" hidden>·</span>
+          <span class="ds-label" id="ds-tx-label" hidden>Transcribed:</span>
+          <span class="ds-val" id="ds-tx-count" hidden>&mdash;</span>
+        </div>
+
+        <!-- Footer actions: primary on left, destructive on right -->
+        <div class="edit-actions">
+          <button class="btn btn-primary btn-thin" id="btn-edit-update" disabled>Add channel</button>
+          <button class="btn btn-ghost btn-thin" id="btn-edit-cancel">Cancel</button>
+          <button class="btn btn-ghost btn-thin" id="btn-edit-restore"
+                  title="Reset this panel to your configured defaults">Restore defaults</button>
+          <div class="spacer"></div>
+          <button class="btn btn-thin btn-cancel-red" id="btn-edit-remove">
+            <svg class="btn-ico" viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5 8h6" stroke="currentColor" stroke-width="1.5"/></svg>
+            <span>Remove</span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Mini log at bottom -->
+    <div class="mini-log-frame">
+      <div class="main-log mini-log" id="subs-mini-log" tabindex="-1"></div>
+    </div>
+  </div>
+

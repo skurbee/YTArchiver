@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -6,13 +7,23 @@ __pycache__/
 build/
 dist/
 
-# Claude Code hooks / deploy flag
+# Claude Code hooks / local-only project memory
 .claude/
 CLAUDE.md
-Map.md
 
-# Old monolith snapshot, kept locally for reference
+# Frozen reference of the old tkinter app
 Classic Tkinter ver/
+
+# Separate GitHub Desktop clone of this repo (not a submodule)
+GitHub Desktop/
+
+# Scratch artifacts that testing tends to leave behind
+probe_*.png
+_probe.ps1
+_click_*.ps1
+_extract_*.py
+audit_*.txt
+*.log
 
 # OS
 .DS_Store

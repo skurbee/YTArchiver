@@ -9,14 +9,12 @@ Matches YTArchiver.py's SEEN_FILTER_TITLES_FILE at line 102.
 from __future__ import annotations
 
 import threading
-from typing import Iterable, Set
 
 from .ytarchiver_config import SEEN_FILTER_TITLES, config_is_writable
 
-
 _lock = threading.Lock()
-_cache: Set[str] = set()
-_cache_lower: Set[str] = set()  # parallel lowercased copy for O(1) case-insensitive lookup
+_cache: set[str] = set()
+_cache_lower: set[str] = set()  # parallel lowercased copy for O(1) case-insensitive lookup
 _loaded: bool = False
 
 
@@ -44,7 +42,7 @@ def is_seen(title: str) -> bool:
         return False
     with _lock:
         _load_locked()
-        # audit M-16: case-insensitive match so channels that re-use
+        # case-insensitive match so channels that re-use
         # a title with different casing ("The Video" vs "the video")
         # don't emit duplicate [Skip] log lines for what's really
         # the same video.

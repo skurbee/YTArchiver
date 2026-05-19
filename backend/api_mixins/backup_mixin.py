@@ -1,0 +1,420 @@
+"""
+BackupMixin — extracted from the main Api class for browsability.
+
+Methods in this mixin are mixed into the Api class via multiple
+inheritance. They reference `self.<state>` which still resolves
+to the Api instance at runtime — no body changes were made
+when moving them out of main.py.
+"""
+from __future__ import annotations
+
+from ._shared import *  # noqa: F401,F403
+
+
+class BackupMixin:
+
+    # ─── Channel list export / import ──────────────────────────────────
+
+    def channels_export(self):
+        try:
+            import json as _json
+
+            import webview as _wv
+            cfg = load_config()
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            paths = self._window.create_file_dialog(
+                _wv.SAVE_DIALOG, save_filename="ytarchiver_channels.json",
+                file_types=("JSON (*.json)",),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            path = paths if isinstance(paths, str) else paths[0]
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump({
+                    "exported_from": "YTArchiver",
+                    "channels": cfg.get("channels", []),
+                }, f, indent=2)
+            return {"ok": True, "path": path, "count": len(cfg.get("channels", []))}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+    def channels_import(self):
+        try:
+            import json as _json
+
+            import webview as _wv
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            paths = self._window.create_file_dialog(
+                _wv.OPEN_DIALOG, allow_multiple=False,
+                file_types=("JSON (*.json)", "All files (*.*)"),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            path = paths if isinstance(paths, str) else paths[0]
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            imported = data.get("channels", []) if isinstance(data, dict) else data
+            if not isinstance(imported, list):
+                return {"ok": False, "error": "Not a channel list"}
+            if not config_is_writable():
+                return {"ok": False, "error": "Write-gate off"}
+            cfg = load_config()
+            existing_urls = {c.get("url") for c in cfg.get("channels", [])}
+            added = 0
+            # track WHY each entry was skipped so the UI can
+            # tell the user (previously just reported a raw count with
+            # no way to debug a partial import).
+            skipped_reasons: List[Dict[str, str]] = []
+            for ch in imported:
+                if not isinstance(ch, dict):
+                    skipped_reasons.append({
+                        "name": "(unknown)",
+                        "reason": "not a valid channel object",
+                    })
+                    continue
+                if not ch.get("url"):
+                    skipped_reasons.append({
+                        "name": ch.get("name") or "(no name)",
+                        "reason": "missing URL",
+                    })
+                    continue
+                if ch["url"] in existing_urls:
+                    skipped_reasons.append({
+                        "name": ch.get("name") or ch["url"],
+                        "reason": "already subscribed",
+                    })
+                    continue
+                # validate URL shape before adding. Old
+                # code accepted any non-empty ch["url"] so a corrupted
+                # import file with "not-a-url" values landed channels
+                # that failed at sync time with cryptic yt-dlp errors.
+                # Checking here surfaces the problem at import time
+                # when the user can act on it.
+                _u = str(ch.get("url") or "").strip().lower()
+                if not (("youtube.com/" in _u) or ("youtu.be/" in _u)):
+                    skipped_reasons.append({
+                        "name": ch.get("name") or ch["url"],
+                        "reason": "URL doesn't look like a YouTube link",
+                    })
+                    continue
+                cfg.setdefault("channels", []).append(ch)
+                existing_urls.add(ch["url"])
+                added += 1
+            cfg["channels"].sort(key=lambda c: (c.get("name") or "").lower())
+            from backend.ytarchiver_config import save_config as _sc
+            if not _sc(cfg):
+                return {"ok": False, "error": "Save failed"}
+            self._reload_config()
+            return {"ok": True, "added": added,
+                    "skipped": len(skipped_reasons),
+                    "skipped_reasons": skipped_reasons}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+    def export_full_backup(self):
+        """ZIP the user's config + queue state + cached ID list + seen-filters
+        + disk cache + livestream journal into a user-picked file.
+
+        also include the FTS transcript index DB when it's
+        small enough to fit (< 2GB). Previously the DB was
+        unconditionally skipped, which meant "full backup" restore
+        returned a usable archive browser that then had EVERY
+        transcript search return empty until the user kicked off a
+        full re-transcribe. Now the authoritative search index rides
+        along in the ZIP too — the backup is actually full.
+
+        The 2GB cap is a pragmatic stop: ZIP deflate slows dramatically
+        past that size and the ZIP64 format has its own constraints.
+        For archives where the DB exceeds the cap, the UI surfaces a
+        size warning so users can decide to export manually.
+        """
+        try:
+            import zipfile as _zf
+
+            import webview as _wv
+
+            from backend.ytarchiver_config import (
+                APP_DATA_DIR,
+                CHANNEL_ID_CACHE,
+                CONFIG_FILE,
+                DISK_CACHE_FILE,
+                QUEUE_FILE,
+                SEEN_FILTER_TITLES,
+                TRANSCRIPTION_DB,
+            )
+            candidates = [
+                CONFIG_FILE,
+                QUEUE_FILE,
+                DISK_CACHE_FILE,
+                SEEN_FILTER_TITLES,
+                CHANNEL_ID_CACHE,
+                APP_DATA_DIR / "ytarchiver_livestream_defer.json",
+                APP_DATA_DIR / "ytarchiver_pending_transcribe.json",
+            ]
+            # opt-in include of the FTS DB if it fits.
+            _fts_skipped_reason = ""
+            try:
+                if TRANSCRIPTION_DB.exists():
+                    _fts_sz = TRANSCRIPTION_DB.stat().st_size
+                    if _fts_sz < 2 * 1024 * 1024 * 1024:
+                        candidates.append(TRANSCRIPTION_DB)
+                    else:
+                        _fts_skipped_reason = (
+                            f"FTS DB skipped — too large "
+                            f"({_fts_sz / (1024**3):.1f} GB > 2 GB). "
+                            f"Back up manually if needed.")
+            except OSError:
+                pass
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            paths = self._window.create_file_dialog(
+                _wv.SAVE_DIALOG,
+                save_filename=f"ytarchiver_backup_{ts}.zip",
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            out_path = paths if isinstance(paths, str) else paths[0]
+            n = 0
+            with _zf.ZipFile(out_path, "w", _zf.ZIP_DEFLATED) as zf:
+                for p in candidates:
+                    if p.exists():
+                        zf.write(str(p), arcname=p.name)
+                        n += 1
+                # Include latest dated snapshot as well
+                backup_dir = APP_DATA_DIR / "backups"
+                if backup_dir.is_dir():
+                    snaps = sorted(backup_dir.glob("config_*.json"),
+                                   key=lambda pp: pp.stat().st_mtime, reverse=True)
+                    if snaps:
+                        zf.write(str(snaps[0]), arcname=f"backups/{snaps[0].name}")
+                        n += 1
+            _resp = {"ok": True, "path": out_path, "files": n}
+            if _fts_skipped_reason:
+                _resp["fts_skipped"] = _fts_skipped_reason
+            return _resp
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+    def import_full_backup_preview(self):
+        """Audit U-11: read-only preview of a backup ZIP before restoring.
+
+        Opens the file picker, reads the ZIP's manifest (file names +
+        sizes + modification times) WITHOUT extracting anything, and
+        returns it so the frontend can show a confirmation modal.
+        Frontend then passes the path back to import_full_backup() to
+        commit the restore. Splits the previous one-click restore into
+        a preview-then-confirm flow so the user can see what they're
+        about to overwrite.
+        """
+        try:
+            import zipfile as _zf
+
+            import webview as _wv
+
+            from backend.ytarchiver_config import APP_DATA_DIR
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            paths = self._window.create_file_dialog(
+                _wv.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
+            )
+            if not paths:
+                return {"ok": False, "cancelled": True}
+            zip_path = paths if isinstance(paths, str) else paths[0]
+            try:
+                with _zf.ZipFile(zip_path, "r") as zf:
+                    items = []
+                    total_bytes = 0
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        items.append({
+                            "name": info.filename,
+                            "size": info.file_size,
+                            "size_label": self._fmt_bytes_short(info.file_size),
+                            "modified": (
+                                f"{info.date_time[0]:04d}-"
+                                f"{info.date_time[1]:02d}-"
+                                f"{info.date_time[2]:02d} "
+                                f"{info.date_time[3]:02d}:"
+                                f"{info.date_time[4]:02d}"
+                            ),
+                        })
+                        total_bytes += info.file_size
+            except Exception as e:
+                return {"ok": False, "error": f"Not a valid ZIP: {e}"}
+            return {
+                "ok": True,
+                "zip_path": zip_path,
+                "items": items,
+                "total_bytes": total_bytes,
+                "total_label": self._fmt_bytes_short(total_bytes),
+                "snapshot_target": str(APP_DATA_DIR / "backups" /
+                                        "config_pre_restore_*.json"),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @staticmethod
+    def _fmt_bytes_short(b):
+        try: b = int(b or 0)
+        except (TypeError, ValueError): return "0 B"
+        if b < 1024: return f"{b} B"
+        if b < 1024 * 1024: return f"{b / 1024:.1f} KB"
+        if b < 1024 ** 3: return f"{b / (1024 * 1024):.1f} MB"
+        return f"{b / (1024 ** 3):.2f} GB"
+
+
+    def import_full_backup(self, zip_path=None):
+        """Restore a previously-exported backup ZIP into %APPDATA%\\YTArchiver.
+
+        Before overwriting any existing files, the current config is snapshotted
+        to backups/config_pre_restore_YYYY-MM-DD_HHMMSS.json so the user can roll
+        back. Gated by config_is_writable() — a read-only probe still
+        lists the ZIP's contents so the frontend can confirm before committing.
+
+        Audit U-11: `zip_path` may be supplied by the caller (after the
+        user confirmed the preview). When None, falls back to opening
+        the file picker directly (legacy one-click flow).
+        """
+        try:
+            import datetime as _dt
+            import shutil as _sh
+            import zipfile as _zf
+
+            import webview as _wv
+
+            from backend.ytarchiver_config import (
+                APP_DATA_DIR,
+                CONFIG_FILE,
+                config_is_writable,
+            )
+            if self._window is None:
+                return {"ok": False, "error": "No window"}
+            zip_path = (zip_path or "").strip()
+            if not zip_path:
+                paths = self._window.create_file_dialog(
+                    _wv.OPEN_DIALOG,
+                    allow_multiple=False,
+                    file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
+                )
+                if not paths:
+                    return {"ok": False, "cancelled": True}
+                zip_path = paths if isinstance(paths, str) else paths[0]
+
+            # First pass: list contents (read-only; safe even if gated off).
+            try:
+                with _zf.ZipFile(zip_path, "r") as zf:
+                    names = [n for n in zf.namelist() if not n.endswith("/")]
+            except Exception as e:
+                return {"ok": False, "error": f"Not a valid ZIP: {e}"}
+            if not names:
+                return {"ok": False, "error": "Backup is empty"}
+
+            # Whitelist — only restore files we recognise from export.
+            # also allow the FTS index DB so backups that
+            # include it can restore cleanly.
+            allowed_top = {
+                "ytarchiver_config.json",
+                "ytarchiver_queue.json",
+                "ytarchiver_disk_cache.json",
+                "ytarchiver_seen_filters.txt",
+                "ytarchiver_channel_id_cache.json",
+                "ytarchiver_livestream_defer.json",
+                "ytarchiver_pending_transcribe.json",
+                "transcription_index.db",
+            }
+
+            if not config_is_writable():
+                return {
+                    "ok": False,
+                    "write_blocked": True,
+                    "zip_path": zip_path,
+                    "names": names,
+                    "error": "Write-gate off",
+                }
+
+            # Snapshot current config BEFORE touching anything.
+            backup_dir = APP_DATA_DIR / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            ts = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            snap_path = backup_dir / f"config_pre_restore_{ts}.json"
+            if CONFIG_FILE.exists():
+                try:
+                    _sh.copy2(str(CONFIG_FILE), str(snap_path))
+                except Exception as e:
+                    return {"ok": False, "error": f"Pre-restore snapshot failed: {e}"}
+
+            # Extract whitelisted files.
+            restored = []
+            skipped = []
+            # resolve APP_DATA_DIR once for path-containment
+            # checks. Any target that doesn't resolve under it after
+            # path-join gets rejected. This blocks a crafted ZIP with
+            # "backups/../../../../Windows/File.json"-style names from
+            # writing outside APP_DATA_DIR even though each individual
+            # component looks innocuous.
+            _app_data_resolved = Path(str(APP_DATA_DIR)).resolve()
+            with _zf.ZipFile(zip_path, "r") as zf:
+                for name in names:
+                    # reject entries containing `..` OR a
+                    # drive letter / absolute path. ZipFile preserves
+                    # the raw name, which on Windows can contain
+                    # drive-qualified paths that write anywhere.
+                    _bad_chars = (".." in name.split("/")
+                                  or name.startswith("/")
+                                  or name.startswith("\\")
+                                  or (len(name) > 1 and name[1] == ":"))
+                    if _bad_chars:
+                        skipped.append(f"{name} (rejected — suspicious path)")
+                        continue
+                    # Strip any directory prefix for top-level files; keep
+                    # backups/config_*.json in its folder.
+                    if name.startswith("backups/") and name.endswith(".json"):
+                        target = APP_DATA_DIR / name
+                    else:
+                        base = os.path.basename(name)
+                        if base not in allowed_top:
+                            skipped.append(name)
+                            continue
+                        target = APP_DATA_DIR / base
+                    # final containment check — resolve the
+                    # target and require it to sit under APP_DATA_DIR.
+                    try:
+                        _t_resolved = Path(str(target)).resolve()
+                        if not str(_t_resolved).startswith(
+                                str(_app_data_resolved)):
+                            skipped.append(f"{name} (rejected — escapes APP_DATA_DIR)")
+                            continue
+                    except Exception:
+                        skipped.append(f"{name} (rejected — path resolve failed)")
+                        continue
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(name, "r") as src, open(target, "wb") as dst:
+                            dst.write(src.read())
+                        restored.append(target.name)
+                    except Exception as e:
+                        skipped.append(f"{name} ({e})")
+
+            # Force a reload of in-memory config.
+            self._reload_config()
+            return {
+                "ok": True,
+                "files_restored": len(restored),
+                "restored": restored,
+                "skipped": skipped,
+                "pre_restore_snapshot": str(snap_path) if CONFIG_FILE.exists() else None,
+                "zip_path": zip_path,
+                "needs_restart": True,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}

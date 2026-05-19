@@ -1,0 +1,453 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   styles-watch.css — Watch view + overlay captions + source banner +
+                       metadata drawer
+
+   Extracted from styles-browse.css (Patch 21, v72.3). Everything that
+   only matters once the user clicks a video card and lands on the
+   embedded player:
+     • .watch-layout (player + transcript split, splitter)
+     • Video overlay captions (WebVTT styling via video::cue)
+     • Watch-view source banner (Whisper / YT-captions tag)
+     • Watch-view metadata drawer (description + top comments)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.watch-layout {
+  display: grid;
+  /* .txt: transcript pane width is user-adjustable via the splitter
+     below. Fallback to the legacy 1fr split when the var isn't set. */
+  grid-template-columns: 1fr 6px var(--watch-tx-width, minmax(280px, 1fr));
+  grid-template-rows: 1fr;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+}
+.watch-layout > * { min-height: 0; }
+.watch-splitter {
+  background: transparent;
+  border-left: 1px solid var(--c-border);
+  border-right: 1px solid var(--c-border);
+  cursor: col-resize;
+  user-select: none;
+  transition: background 120ms ease;
+}
+.watch-splitter:hover,
+.watch-splitter.dragging {
+  background: rgba(108, 180, 238, 0.35);
+}
+/* Narrow-window graceful degradation.
+   Pre-fix: a single media query at max-width:900px set
+   grid-template-columns to 1fr but DIDN'T adjust
+   grid-template-rows, which stayed at `1fr`. With two grid children
+   in a 1-column / 1-row grid, the second child auto-flowed into an
+   implicit row whose size was squeezed by the parent's fixed
+   height:100% — hiding the video entirely behind the transcript
+   row. Reported: "video goes away entirely" at sub-900px widths.
+   Now: stack vertically with `auto 1fr` rows — video takes its
+   natural aspect-ratio height (capped at 40vh so the transcript
+   still gets breathing room), transcript fills the remainder. */
+@media (max-width: 900px) {
+  .watch-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(200px, 1fr);
+  }
+  /* Hide the drag splitter on narrow layouts where the panes stack. */
+  .watch-splitter { display: none; }
+  .watch-video-wrap {
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+}
+/* Extra-narrow — let the page scroll as a whole rather than forcing
+   a tiny 200px transcript pane. Keeps content legible when the
+   user drags the window very narrow. */
+@media (max-width: 520px) {
+  #view-watch { overflow-y: auto; }
+  .watch-layout {
+    grid-template-rows: auto auto;
+    height: auto;
+    min-height: 100%;
+  }
+  .watch-video-wrap { max-height: none; }
+}
+.watch-video-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Allow internal scroll when the metadata drawer expands beyond
+     the grid cell height (videos with long descriptions + 50+
+     comments). Without this, the expanded drawer would push the
+     column taller than its grid cell and the overflow:hidden on
+     #view-watch would clip the bottom comments. The video + title +
+     buttons stay pinned at the top; only the drawer scrolls. */
+  overflow-y: auto;
+  min-height: 0;
+}
+.watch-video-placeholder {
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--c-dim);
+}
+.watch-play-icon {
+  font-size: 48px;
+  color: rgba(255, 255, 255, 0.35);
+}
+.watch-placeholder-text {
+  font-size: 12px;
+  font-style: italic;
+}
+.watch-actions {
+  display: flex;
+  gap: 6px;
+  row-gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+  font-size: 11.5px;
+  /* Buttons wrap to a second row at narrow widths rather than forcing
+     a horizontal scrollbar. Each button keeps `white-space: nowrap`
+     (below) so individual labels never break mid-word — the old
+     "Open\nin\nplayer" / "Re-\ntranscribe…" failure mode is prevented
+     at the per-button level instead of by forbidding row wrap. */
+  flex-wrap: wrap;
+}
+.watch-actions .btn {
+  /* Stop button label wrapping mid-word. */
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.watch-title {
+  color: var(--c-text);
+  font-size: 16px;
+  margin: 4px 0 0;
+  font-weight: 600;
+}
+.watch-meta {
+  color: var(--c-dim);
+  font-size: 12px;
+}
+.watch-transcript-wrap {
+  display: flex;
+  flex-direction: column;
+  background: var(--c-log-bg);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.watch-transcript-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+/* ═══ Video overlay captions (karaoke word-by-word) ═══
+   Implemented via native <video> TextTracks + VTTCue. The browser
+   renders cues, so fullscreen carries the overlay for free. Size
+   and background are swapped by toggling data-cap-* attributes on
+   the <video> element — no track rebuild needed.
+   `::cue` only honors a narrow set of properties (color, opacity,
+   visibility, font-*, line-height, text-shadow, text-decoration,
+   white-space, background-*) — every rule below stays within that. */
+.watch-video-el[data-cap-size="small"]::cue {
+  font-size: 16px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+.watch-video-el[data-cap-size="medium"]::cue {
+  font-size: 26px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+.watch-video-el[data-cap-size="large"]::cue {
+  font-size: 40px;
+  font-family: var(--font-ui), sans-serif;
+  color: #fff;
+  line-height: 1.3;
+}
+/* Empty value (set when size=off) = no rule applies = browser default
+   styling, but the track mode is "hidden" so nothing renders anyway. */
+.watch-video-el[data-cap-bg="translucent"]::cue {
+  background: rgba(0, 0, 0, 0.72);
+}
+.watch-video-el[data-cap-bg="outline"]::cue {
+  background: transparent;
+  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000,
+               -1px  1px 0 #000, 1px  1px 0 #000,
+                0    0   4px #000;
+}
+.watch-video-el[data-cap-bg="none"]::cue {
+  background: transparent;
+}
+
+/* Hover-only keyboard-shortcuts hint in the transcript header. Styled
+   as a dim circle so it reads as informational, not as a third button
+   sitting next to Aa-/Aa+. cursor:help triggers the OS help cursor on
+   hover and the title tooltip lists the shortcuts. */
+.tx-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--c-border);
+  color: var(--c-dim);
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: help;
+  user-select: none;
+}
+.tx-hint:hover {
+  color: var(--c-text);
+  border-color: var(--c-dim);
+}
+.watch-transcript {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 10px 12px;
+  font-family: var(--font-log);
+  /* .txt request: user-adjustable transcript text size, controlled by
+     the Aa-/Aa+ buttons in the transcript header. Persisted via
+     settings.transcript_font_size; the document-level CSS var
+     `--watch-transcript-fz` is set on <html> at boot. */
+  font-size: var(--watch-transcript-fz, 12.5px);
+  line-height: 1.55;
+  color: var(--c-log-txt);
+}
+.watch-transcript .word {
+  /* .txt: smoother karaoke transition — ease-out gives a softer
+     handoff between adjacent words than a flat linear timing curve.
+     Slightly longer than 80ms feels more cohesive without lagging
+     visibly behind playback. */
+  transition: color 160ms ease-out, background 160ms ease-out;
+  padding: 0 1px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.watch-transcript .word:hover { background: rgba(255, 255, 255, 0.04); }
+.watch-transcript .word.active {
+  color: #fff;
+  background: rgba(108, 180, 238, 0.35);
+  font-weight: 600;
+  /* No transform — keeps line height stable so adjacent words don't
+     visibly jump. The color/background fade alone is the cue. */
+}
+.watch-transcript .seg.active {
+  background: rgba(108, 180, 238, 0.07);
+  border-radius: 2px;
+}
+.watch-transcript .seg {
+  display: inline;
+}
+/* seg-break only applies if some legacy caller still emits <div class="seg-break">.
+   New renderer produces a continuous flow — these are absent. */
+.watch-transcript .seg-break {
+  display: block;
+  height: 8px;
+}
+.watch-transcript .timestamp {
+  color: var(--c-log-blue);
+  font-size: 11px;
+  margin-right: 6px;
+}
+
+/* ═══ Watch-view transcript source banner ═══
+   Mirrors ArchivePlayer's `.yt-src-banner` — one badge + line of text
+   above the transcript body telling the user whether this transcript is
+   from Whisper (authoritative) or YT auto-captions (approximate). */
+.watch-src-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px 0;
+  padding: 7px 10px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--c-border);
+  color: var(--c-dim);
+}
+.watch-src-banner.whisper {
+  background: rgba(74, 158, 106, 0.08);
+  border-color: rgba(74, 158, 106, 0.28);
+  color: #bfe6cf;
+}
+.watch-src-banner.yt {
+  background: rgba(210, 160, 80, 0.08);
+  border-color: rgba(210, 160, 80, 0.28);
+  color: #e8cfa0;
+}
+.watch-src-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 8px;
+  opacity: 0.8;
+}
+.watch-retranscribe-link {
+  color: var(--c-accent);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.watch-retranscribe-link:hover { color: var(--c-log-blue); }
+
+/* Continuous transcript body — no per-segment margins, just one flowing
+   paragraph of words. Matches ArchivePlayer's `.yt-transcript-body`.
+   BUG FIX 2026-05-14: was `font-size: 13px` hardcoded — clobbered the
+   `--watch-transcript-fz` variable set by the Aa-/Aa+ buttons on the
+   parent `.watch-transcript` (symptom: the text size increase /
+   decrease buttons did nothing for the transcript). Now inherits
+   from parent so the buttons actually move the rendered text size. */
+.watch-transcript-body {
+  line-height: 1.65;
+  font-size: inherit;
+}
+
+/* ═══ Watch view metadata drawer (description + top 50 comments) ═══
+   Matches YTArchiver.py:31164 _player_drawer_frame. Collapsed by default
+   so the transcript stays front-and-center; click the header to expand. */
+.watch-meta-drawer {
+  flex: 0 0 auto;
+  margin: 8px 0 0;
+  border-top: 1px solid var(--c-border);
+  background: var(--c-bg-soft, #12151a);
+  font-family: var(--font-ui);
+}
+.watch-meta-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.watch-meta-head:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.watch-meta-arrow {
+  display: inline-block;
+  width: 12px;
+  color: var(--c-dim);
+  font-size: 11px;
+}
+.watch-meta-title {
+  color: var(--c-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.watch-meta-stats {
+  color: var(--c-dim);
+  font-size: 11.5px;
+  margin-left: auto;
+}
+.watch-meta-body {
+  padding: 0 16px 12px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.watch-meta-description {
+  color: var(--c-text);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--c-border);
+}
+/* Clickable timestamps inside descriptions + comments — seek the
+   <video> element to that moment. Styled like a link (blue, hand
+   cursor, hover underline) to match YouTube's own behavior. */
+.desc-ts {
+  color: var(--c-log-blue, #6cb4ee);
+  cursor: pointer;
+  user-select: none;
+}
+.desc-ts:hover { text-decoration: underline; }
+.watch-meta-comments-header {
+  color: var(--c-accent);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 10px 0 4px;
+}
+.watch-meta-comments {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.watch-comment {
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.watch-comment-head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 2px;
+}
+.watch-comment-author {
+  color: var(--c-log-blue, #6cb4ee);
+  font-size: 12px;
+  font-weight: 600;
+}
+.watch-comment-likes {
+  color: var(--c-dim);
+  font-size: 11px;
+  margin-left: auto;
+}
+.watch-comment-body {
+  color: var(--c-text);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Match-count indicator + nav buttons (Watch-view Find). */
+.find-count {
+  font-size: 11px;
+  color: var(--c-dim);
+  min-width: 60px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.find-nav {
+  min-width: 24px;
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1;
+}
+/* Active (current) match — brighter than inactive hits. */
+.watch-transcript .seg.find-hit {
+  background: rgba(255, 230, 130, 0.18);
+}
+.watch-transcript .seg.find-hit-active {
+  background: rgba(255, 200, 60, 0.42);
+  outline: 1px solid rgba(255, 200, 60, 0.85);
+}
+.browse-content-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px;
+}
+.browse-empty {
+  color: var(--c-dim);
+  font-style: italic;
+  font-size: 13px;
+  padding: 40px 20px;
+  text-align: center;
+}
+

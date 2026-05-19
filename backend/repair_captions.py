@@ -37,11 +37,13 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
+from .log import get_logger
+from .sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from .transcribe import _parse_vtt, _replace_jsonl_entry
-from .sync import find_yt_dlp, _startupinfo, _find_cookie_source
 from .ytarchiver_config import TRANSCRIPTION_DB
+
+_log = get_logger(__name__)
 
 # Suppress Windows console windows on every yt-dlp subprocess call —
 # without this each fetch flashes a black console window that steals
@@ -49,7 +51,6 @@ from .ytarchiver_config import TRANSCRIPTION_DB
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # YouTube rate-limit knobs.
-#
 # Every per-video fetch hits YT's caption endpoint. A naive serial loop
 # at ~5s/video (network-limited) gives ~0.2 requests/second, which YT
 # was empirically still 429-ing after ~40 videos. The base sleep below
@@ -62,7 +63,6 @@ _RATE_LIMIT_RE = re.compile(
 
 
 # ── Progress persistence (cross-restart resume) ────────────────────────
-#
 # A repair pass over 86k videos is a multi-day operation, so we have to
 # survive app restarts. After every video we append the video_id to a
 # per-scope text file under %APPDATA%\YTArchiver\repair_progress\. On
@@ -70,7 +70,6 @@ _RATE_LIMIT_RE = re.compile(
 # already-processed ids. Append-only means we never write more than a
 # single short line per video — none of the "save the whole set every
 # N videos" thrashing.
-#
 # Scope = the task's `url` field ("repair:all" / "repair:channel:Vox" /
 # "repair:video:abc"), so partial runs of different scopes coexist
 # without collision.
@@ -131,7 +130,6 @@ def _clear_progress(scope_url: str) -> None:
 
 
 # ── Work-list checkpoint (skip the scan on resume) ─────────────────────
-#
 # The progress file (above) only records which video_ids were processed.
 # To resume cleanly we still had to re-scan the entire archive on every
 # restart, because the work list itself lived only in memory. For a
@@ -166,7 +164,7 @@ def _save_checkpoint(scope_url: str, work: list) -> None:
         except OSError: pass
 
 
-def _load_checkpoint(scope_url: str) -> Optional[list]:
+def _load_checkpoint(scope_url: str) -> list | None:
     """Return the cached work list as a list of tuples, or None if no
     checkpoint exists / the file is unreadable."""
     if not scope_url:
@@ -204,10 +202,10 @@ _HEADER_RE = re.compile(
 )
 
 
-def _norm_title(s: str) -> str:
-    """Punctuation-insensitive title key. Mirrors `transcribe._norm_title`
-    so we match the txt-side header even if smart quotes / em-dashes drift."""
-    return re.sub(r"[^\w\s]", "", s or "").strip().lower()
+# consolidated onto text_utils.normalize_title_loose
+# (NFKC + lower + strip ALL punct + collapse whitespace). Previous local
+# copy was the same minus NFKC normalization.
+from .text_utils import normalize_title_loose as _norm_title
 
 
 def _parse_txt_sources(txt_path: Path) -> dict:
@@ -233,7 +231,7 @@ def _find_txt_for_jsonl(jsonl_path: Path) -> Path:
 
 
 def _fetch_vtt(yt_dlp: str, video_id: str,
-               out_dir: Path) -> tuple[Optional[Path], Optional[str]]:
+               out_dir: Path) -> tuple[Path | None, str | None]:
     """Run yt-dlp to fetch a single video's auto-caption VTT.
 
     Passes the same `--cookies-from-browser` (or `--cookies cookies.txt`)
@@ -269,7 +267,7 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
 
 
 def _update_db_words(video_id: str,
-                     new_segments: list) -> tuple[int, Optional[str]]:
+                     new_segments: list) -> tuple[int, str | None]:
     """Targeted UPDATE on the segments table — column-only, FTS untouched.
 
     Match on (video_id, start_time, end_time). The parser fix doesn't
@@ -328,8 +326,8 @@ def _looks_punctuated(segments: list, sample: int = 8) -> bool:
 
 
 def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
-                            log_stream, cancel_event: Optional[threading.Event]
-                            ) -> tuple[Optional[Path], Optional[str]]:
+                            log_stream, cancel_event: threading.Event | None
+                            ) -> tuple[Path | None, str | None]:
     """Wrap `_fetch_vtt` with 429 detection + exponential backoff.
 
     On YT rate-limit (HTTP 429), sleep through the next backoff window
@@ -363,7 +361,7 @@ def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
 def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
                       video_id: str, source_tag: str, dry_run: bool,
                       log_stream,
-                      cancel_event: Optional[threading.Event] = None
+                      cancel_event: threading.Event | None = None
                       ) -> tuple[bool, str, int, int]:
     """Fetch+parse+write a single video. Returns (ok, msg, n_segs, n_words).
 
@@ -454,7 +452,7 @@ def _collect_yt_videos(jsonl_path: Path) -> list:
 
 
 def _find_jsonl_for_video_id(root: Path, video_id: str
-                             ) -> tuple[Optional[Path], Optional[str]]:
+                             ) -> tuple[Path | None, str | None]:
     """Scan every JSONL under `root` for an entry with this video_id.
     Returns `(jsonl_path, title)` or `(None, None)`."""
     for j in root.rglob(".*Transcript.jsonl"):
@@ -473,13 +471,13 @@ def _find_jsonl_for_video_id(root: Path, video_id: str
 
 
 def repair_archive(*, output_dir: str, log_stream,
-                   channel_folder: Optional[str] = None,
-                   video_id: Optional[str] = None,
+                   channel_folder: str | None = None,
+                   video_id: str | None = None,
                    dry_run: bool = False,
-                   cancel_event: Optional[threading.Event] = None,
-                   pause_event: Optional[threading.Event] = None,
+                   cancel_event: threading.Event | None = None,
+                   pause_event: threading.Event | None = None,
                    queues=None,
-                   scope_url: Optional[str] = None) -> dict:
+                   scope_url: str | None = None) -> dict:
     """Run the repair across the archive (or a subset).
 
     Emits progress lines to `log_stream` (a `LogStreamer`). One log line
@@ -501,32 +499,12 @@ def repair_archive(*, output_dir: str, log_stream,
         return bool(cancel_event is not None and cancel_event.is_set())
 
     def _wait_if_paused() -> None:
-        # Match the existing sync worker's pause-wait pattern. Block in
-        # 0.5s chunks so cancel still wins quickly. Emit a one-shot
-        # "Paused" log line when entering pause-wait + "Resumed" when
-        # exiting, plus flip the queue's sync_paused_active flag so the
-        # Sync Tasks popover renders the pause-active state.
-        if pause_event is None or not pause_event.is_set():
-            return
-        log_stream.emit_text(
-            " — Paused. Click Resume in Sync Tasks to continue.\n",
-            "simpleline")
-        log_stream.flush()
-        if queues is not None:
-            try: queues.set_sync_paused_active(True)
-            except Exception: pass
-        try:
-            while pause_event.is_set():
-                if _cancelled():
-                    return
-                pause_event.wait(timeout=0.5)
-        finally:
-            if queues is not None:
-                try: queues.set_sync_paused_active(False)
-                except Exception: pass
-            if not _cancelled():
-                log_stream.emit_text(" — Resumed.\n", "simpleline")
-                log_stream.flush()
+        # routes through pause_helpers.wait_while_paused.
+        # Same semantics — emit Paused, wait, emit Resumed, flip queue
+        # pause-active flag in between.
+        from .pause_helpers import wait_while_paused
+        wait_while_paused(pause_event, cancel_event,
+                          stream=log_stream, queues=queues, tick=0.5)
 
     yt_dlp = find_yt_dlp()
     if not yt_dlp:
@@ -662,7 +640,7 @@ def repair_archive(*, output_dir: str, log_stream,
     # on "Repair — All channels" for the whole multi-hour pass.
     if queues is not None and len(work) > 0:
         try: queues.set_sync_pass_progress(0, len(work))
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
 
     ok_count = 0
     fail_count = 0
@@ -723,7 +701,7 @@ def repair_archive(*, output_dir: str, log_stream,
         # so this is cheap.
         if queues is not None:
             try: queues.set_sync_pass_progress(i, len(work))
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         # Gentle rate-limit between fetches so YT doesn't 429 us. Use
         # cancel_event.wait so a Sync Tasks cancel still breaks out
         # promptly instead of having to sit through the sleep first.

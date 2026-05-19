@@ -18,9 +18,12 @@ import os
 import re
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
+from .log import get_logger
 from .log_stream import LogStreamer
+
+_log = get_logger(__name__)
 
 
 # Patterns that indicate a write-failure (mirrors YTArchiver's _DISK_ERROR_RE)
@@ -41,7 +44,7 @@ _DISK_ERROR_PATTERNS = [
     # ALL workers for 5 minutes on a benign YouTube restriction.
     # Require a filesystem-specific context keyword alongside so only
     # real write failures trigger the pause.
-    # audit F-53: stricter Permission-denied pattern. Require the
+    # stricter Permission-denied pattern. Require the
     # associated path to end in a media/partial extension so yt-dlp's
     # age-gate / cookie-expired errors don't trip the watchdog (they
     # say "Permission denied" with no file path).
@@ -49,7 +52,7 @@ _DISK_ERROR_PATTERNS = [
     r"(?:writ|output|file|disk|save).*Permission denied",
     # Windows variant of the same error.
     r"Access is denied.*\.(part|temp|ytdl|mp4|mkv|webm|m4a)",
-    # audit D-12: HTTP 5xx REMOVED — it was flagging YouTube's
+    # HTTP 5xx REMOVED — it was flagging YouTube's
     # upstream errors as "DISK ERROR" and pausing every worker for
     # 5 minutes on transient 502s from YouTube. Disk and upstream
     # service outages are unrelated; mixing them in the watchdog
@@ -64,7 +67,7 @@ def _check_directory_writable(path: str) -> bool:
     """Return True if we can open and delete a probe file in `path`
     AND at least 2 GB of free space is available.
 
-    audit D-13: the bare writability probe passed at 1 MB free, which
+    the bare writability probe passed at 1 MB free, which
     let the monitor prematurely "recover" after an ENOSPC pause — the
     next multi-GB download immediately failed, tripping the pause
     again. Require meaningful free space before declaring the drive
@@ -88,8 +91,8 @@ def _check_directory_writable(path: str) -> bool:
             _free_bytes = _sh.disk_usage(path).free
             if _free_bytes < _min_free * 1024 * 1024 * 1024:
                 return False
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         return True
     except OSError:
         return False
@@ -112,8 +115,14 @@ class DiskErrorMonitor:
         self._lock = threading.Lock()
         self._active = False
         self._start_ts = 0.0
-        self._path: Optional[str] = None
-        self._retry_thread: Optional[threading.Thread] = None
+        self._path: str | None = None
+        self._retry_thread: threading.Thread | None = None
+        # Patch C: cancellable retry sleep. Without this, a manual
+        # force_check() while the retry loop is mid-sleep would fire a
+        # second "resuming" emit when the original retry wakes up.
+        # Setting this Event short-circuits the sleep so the next
+        # iteration sees self._active == False and exits cleanly.
+        self._retry_wake = threading.Event()
         self._on_pause = on_pause
         self._on_resume = on_resume
         self._get_output_dir = get_output_dir
@@ -138,6 +147,9 @@ class DiskErrorMonitor:
 
     def force_check(self) -> None:
         """Immediately probe the output dir; resume if writable."""
+        # Patch C: wake the sleeping retry-loop so it doesn't fire a
+        # duplicate "resuming" message after this manual check completes.
+        self._retry_wake.set()
         threading.Thread(target=self._retry_tick, daemon=True).start()
 
     # ── Private ─────────────────────────────────────────────────────────
@@ -153,15 +165,19 @@ class DiskErrorMonitor:
         ])
         self._stream.flush()
         try: self._on_pause()
-        except Exception: pass
+        except Exception as e: _log.debug("swallowed: %s", e)
         # Start retry thread
         self._retry_thread = threading.Thread(
             target=self._retry_loop, daemon=True)
         self._retry_thread.start()
 
     def _retry_loop(self) -> None:
+        # Patch C: use Event.wait() instead of time.sleep so a manual
+        # force_check() can interrupt the sleep. After wake-up, clear
+        # the event so subsequent iterations sleep normally.
         while self._active:
-            time.sleep(DISK_RETRY_MINUTES * 60)
+            self._retry_wake.wait(timeout=DISK_RETRY_MINUTES * 60)
+            self._retry_wake.clear()
             if not self._active:
                 return
             self._retry_tick()
@@ -183,7 +199,7 @@ class DiskErrorMonitor:
             ])
             self._stream.flush()
             try: self._on_resume()
-            except Exception: pass
+            except Exception as e: _log.debug("swallowed: %s", e)
         else:
             self._stream.emit([
                 [f" \u26a0 Disk still unwritable \u2014 retrying in "

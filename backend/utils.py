@@ -8,16 +8,24 @@ original's so `git blame`-style searches across both codebases still work.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import glob
+import json
 import os
 import re
 import shutil
 import subprocess
 import time
 import unicodedata
-from typing import Dict, Optional
+from typing import Any
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 
-def utf8_subprocess_env() -> Dict[str, str]:
+def utf8_subprocess_env() -> dict[str, str]:
     """Return a copy of os.environ with PYTHONIOENCODING forced to utf-8.
 
     On Windows, Python subprocess stdout defaults to the console's code
@@ -124,7 +132,7 @@ def format_duration_hms(secs: float) -> str:
 def format_elapsed(secs: float) -> str:
     """Compact elapsed-time format for in-line log strings.
 
-    Rules (per Scott: "always fold into Xm XXs"):
+    Rules (always fold into Xm XXs):
       < 60s      -> "Xs"            ("47s")
       < 1h       -> "Xm YYs"        ("3m 21s", zero-padded seconds)
       >= 1h      -> "Xh Ym YYs"     ("1h 5m 03s")
@@ -202,7 +210,7 @@ def check_directory_writable(path: str) -> bool:
     try:
         if not os.path.isdir(path):
             return False
-        # audit F-32: clean up any stale probe files from a previous
+        # clean up any stale probe files from a previous
         # run (crashed process, antivirus-blocked unlink, etc.) before
         # writing a new one. Without this, the archive root accumulates
         # `.yta_probe_<PID>` litter over time.
@@ -236,7 +244,7 @@ def check_disk_space(path: str, required_bytes: int) -> bool:
 
 # ── Subprocess cleanup (YTArchiver.py:2243 / 9214 / 9262) ──────────────
 
-def kill_process(proc: Optional[subprocess.Popen], timeout: float = 2.0) -> None:
+def kill_process(proc: subprocess.Popen | None, timeout: float = 2.0) -> None:
     """Terminate then kill a child process, swallowing errors.
 
     Sends SIGTERM, waits up to `timeout`, then SIGKILL. No-op if proc is
@@ -249,8 +257,8 @@ def kill_process(proc: Optional[subprocess.Popen], timeout: float = 2.0) -> None
             return
         try:
             proc.terminate()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         try:
             proc.wait(timeout=float(timeout))
             return
@@ -258,14 +266,14 @@ def kill_process(proc: Optional[subprocess.Popen], timeout: float = 2.0) -> None
             pass
         try:
             proc.kill()
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         try:
             proc.wait(timeout=1.0)
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
 
 
 # ── ffprobe: is the file already AV1/NVENC-compressed? ────────────────
@@ -312,14 +320,14 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
 
 
 def try_find_by_title(channel_folder: str, title: str,
-                      video_id: str = "") -> Optional[str]:
+                      video_id: str = "") -> str | None:
     """Locate a file under `channel_folder` whose stem matches `title`
     (case-insensitive, ignoring punctuation and year/month folder splits).
 
     Tries an exact-stem match first, then a `[videoId]` token match, then
     an ASCII-fuzzy match on the title. Returns the first hit or None.
     """
-    # audit F-33: early-return on the first exact or [id] hit instead
+    # early-return on the first exact or [id] hit instead
     # of walking the whole folder before returning. For a 5000-video
     # channel, an exact match at depth 1 used to walk every subfolder
     # before returning. Also: bail early once we have an ascii-fuzzy
@@ -328,7 +336,7 @@ def try_find_by_title(channel_folder: str, title: str,
         return None
     norm_title = norm_ascii(title)
     vid_norm = (video_id or "").strip().lower()
-    first_ascii_match: Optional[str] = None
+    first_ascii_match: str | None = None
     _title_stripped = (title or "").strip()
     for dp, _dns, fns in os.walk(channel_folder):
         for fn in fns:
@@ -352,7 +360,7 @@ def try_find_by_title(channel_folder: str, title: str,
 
 def try_locate_moved_file(original_path: str, title: str,
                           channel_folder: str,
-                          video_id: str = "") -> Optional[str]:
+                          video_id: str = "") -> str | None:
     """Given a stored `original_path` that no longer resolves, try to find
     the moved/renamed file. Checks the channel folder via `try_find_by_title`.
     Returns the recovered absolute path or None.
@@ -364,3 +372,206 @@ def try_locate_moved_file(original_path: str, title: str,
         if found:
             return found
     return None
+
+
+# ── SQLite LIKE pattern escape ─────────────────────────────────────────
+
+def sqlite_like_escape(s: str) -> str:
+    """Escape `%` and `_` for SQLite LIKE patterns; also escape `\\`.
+
+    LIKE treats `%` (any chars) and `_` (any single char) as wildcards.
+    Folder paths commonly contain underscores in channel folder names
+    (e.g. `Some_Channel`), which without escaping cause unintended
+    matches in `WHERE filepath LIKE ?` queries — `Some_Channel%`
+    would also match `SomeXChannelFoo`.
+
+    Use with `ESCAPE '\\\\'` on the LIKE clause:
+
+        pattern = sqlite_like_escape(str(folder)) + "%"
+        conn.execute(
+            "SELECT ... FROM videos WHERE filepath LIKE ? ESCAPE '\\\\'",
+            (pattern,))
+    """
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# ── Windows file attributes ────────────────────────────────────────────
+
+def hide_file_win(path) -> None:
+    """Set the Windows HIDDEN attribute on a file or folder. No-op on
+    non-Windows.
+
+    Used for sidecar files (e.g. `.{name} Metadata.jsonl`) and folders
+    (e.g. `.Thumbnails/`, `.ChannelArt/`) that should be invisible to
+    Explorer but readable by the app. Silently swallows errors; failure
+    to hide is non-fatal — it just means Explorer will show the file.
+    """
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+
+
+def unhide_file_win(path) -> None:
+    """Clear the Windows HIDDEN attribute (set FILE_ATTRIBUTE_NORMAL).
+    No-op on non-Windows.
+
+    Companion to `hide_file_win` — used before atomic rewrites of hidden
+    sidecars so `os.replace` can target the file. Re-hide after the
+    rewrite with `hide_file_win`.
+    """
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+
+
+# ── Video sidecar cleanup ──────────────────────────────────────────────
+
+def delete_video_sidecars(filepath: str) -> None:
+    """Best-effort cleanup of sidecar files next to a video.
+
+    Removes `.txt`, `.jsonl`, `.info.json`, `.description`,
+    `.live_chat.json`, `.srt`, common image thumbnails, and language-
+    coded caption variants (.*.vtt, .*.srt, .*.ttml). Used by
+    recent_delete_file and video_delete_file.
+
+    Errors per sidecar are swallowed — the primary contract is "the
+    main file is gone"; a leaked sidecar is non-fatal.
+
+    yt-dlp emits a wider sidecar set than the original
+    narrow list captured. Keep this list in sync with what yt-dlp
+    actually writes.
+    """
+    if not filepath:
+        return
+    base = os.path.splitext(filepath)[0]
+    _basic_exts = (".txt", ".jsonl", ".info.json", ".description",
+                   ".live_chat.json", ".srt",
+                   ".jpg", ".jpeg", ".webp", ".png")
+    for ext in _basic_exts:
+        sc = base + ext
+        try:
+            if os.path.isfile(sc):
+                os.remove(sc)
+        except OSError:
+            pass
+    # Language-coded caption variants (en, en-orig, en-US, es, …).
+    # Glob avoids enumerating every language code yt-dlp might emit.
+    for pat in (base + ".*.vtt", base + ".*.srt", base + ".*.ttml"):
+        try:
+            for _hit in glob.glob(pat):
+                try: os.remove(_hit)
+                except OSError: pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+
+
+# ── JSON load with safe default ────────────────────────────────────────
+
+def load_json_safe(path, default: Any = None) -> Any:
+    """Load JSON from `path`. Return `default` on any failure — missing
+    file, malformed JSON, OS error.
+
+    Use for state files where "missing or corrupt = start from defaults"
+    is the desired behavior (queue.json, channel cache, drawer state).
+    Callers that need to distinguish missing-vs-corrupt should check
+    `os.path.exists(path)` themselves before calling.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return default
+
+
+# ── Subprocess context manager ─────────────────────────────────────────
+
+@contextlib.contextmanager
+def managed_popen(*args, **kwargs):
+    """Popen variant that guarantees cleanup on exit.
+
+    Wraps subprocess.Popen so that if an exception escapes the `with`
+    block — or the block exits normally without the caller calling
+    `.wait()` — the subprocess is terminate/wait/kill'd via
+    `kill_process()` instead of leaking until garbage collection.
+
+    Same arguments as `subprocess.Popen`.
+
+    Usage:
+        with managed_popen(["yt-dlp", url], stdout=subprocess.PIPE,
+                           text=True) as proc:
+            for line in proc.stdout:
+                ...
+        # Even if the loop body raises, proc gets terminate/kill'd here.
+
+    Note: existing call sites that already pair `Popen` with a `try/
+    finally proc.wait()/kill()` pattern are equally safe — this helper
+    is the cleaner replacement for new code or refactors.
+    """
+    proc = subprocess.Popen(*args, **kwargs)
+    try:
+        yield proc
+    finally:
+        kill_process(proc)
+
+
+# ── Atomic file replace ────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def atomic_write(path, mode: str = "w", encoding: str = "utf-8"):
+    """Atomic-replace context manager.
+
+    Yields a file handle pointing to a `.tmp` sibling of `path`. On
+    successful exit, fsyncs and atomically renames over `path`. On
+    exception inside the block, removes the `.tmp` so the original is
+    untouched, then re-raises.
+
+    Usage:
+        with atomic_write("state.json") as f:
+            json.dump(data, f)
+
+    Why atomic: a crash or power loss during a plain `open(..., 'w')`
+    truncates the destination to whatever bytes happened to flush. With
+    `.tmp` + `os.replace()`, the original file remains intact until the
+    rename completes — and rename is atomic at the filesystem layer on
+    both Windows (NtSetInformationFile) and POSIX.
+    """
+    if "a" in mode:
+        raise ValueError("atomic_write does not support append mode")
+    path = os.fspath(path)
+    tmp = path + ".tmp"
+    open_kwargs: dict[str, Any] = {"mode": mode}
+    if "b" not in mode:
+        open_kwargs["encoding"] = encoding
+    f = open(tmp, **open_kwargs)
+    success = False
+    try:
+        yield f
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+        success = True
+    finally:
+        try:
+            f.close()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        if success:
+            try:
+                os.replace(tmp, path)
+            except Exception:
+                try: os.unlink(tmp)
+                except OSError: pass
+                raise
+        else:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass

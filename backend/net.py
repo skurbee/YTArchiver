@@ -14,7 +14,10 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import Optional
+
+from .log import get_logger
+
+_log = get_logger(__name__)
 
 # Hosts to probe. Must be reliable, low-latency, worldwide.
 _PROBE_HOSTS = [
@@ -25,7 +28,7 @@ _PROBE_HOSTS = [
 
 
 net_down = threading.Event() # Set when network is confirmed offline
-_monitor_thread: Optional[threading.Thread] = None
+_monitor_thread: threading.Thread | None = None
 _poll_interval_sec = 30.0
 _probe_timeout_sec = 5.0
 
@@ -48,7 +51,7 @@ def probe_once(timeout: float = _probe_timeout_sec) -> bool:
             with socket.create_connection((host, port), timeout=timeout):
                 success[0] = True
                 result_event.set()
-        except (socket.timeout, socket.gaierror, OSError):
+        except (TimeoutError, socket.gaierror, OSError):
             pass
     threads = []
     for host, port in _PROBE_HOSTS:
@@ -63,7 +66,7 @@ def probe_once(timeout: float = _probe_timeout_sec) -> bool:
 def start_monitor():
     """Start the background poller. Safe to call repeatedly.
 
-    audit F-50: runs one synchronous probe before starting the
+    runs one synchronous probe before starting the
     background thread. Without this initial probe, workers kicking off
     right after launch see net_down=False even if the network was
     already down — they try jobs that immediately fail until the first
@@ -75,8 +78,8 @@ def start_monitor():
     try:
         if not probe_once():
             net_down.set()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     _monitor_thread = threading.Thread(target=_run_monitor, daemon=True)
     _monitor_thread.start()
 
@@ -104,7 +107,7 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
     if not net_down.is_set():
         return True
     if stream:
-        # bug L-8: surface the 2-probe recovery expectation so the user
+        # surface the 2-probe recovery expectation so the user
         # doesn't think the app is hung during the ~60s it takes to
         # confirm the network is really back. Two consecutive OK probes
         # are required before we un-pause; with _poll_interval_sec ~30s
@@ -113,7 +116,7 @@ def block_if_down(stream=None, check_cancel=None) -> bool:
             " \u26a0 Network down \u2014 pausing until connection returns "
             "(~30-60s after it's back, to confirm stability)...", "red")
     waited = 0
-    # audit D-39: require 2 consecutive OK probes to clear net_down
+    # require 2 consecutive OK probes to clear net_down
     # from inside the inline wait loop, matching the background
     # monitor's stability requirement. Without this, a single blip
     # of connectivity ends the wait — flappy connections then

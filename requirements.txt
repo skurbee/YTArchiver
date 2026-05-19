@@ -1,0 +1,20 @@
+# YTArchiver — Python dependencies
+#
+# Main app (Python 3.13). The whisper + punctuation workers run in a
+# separate Python 3.11 venv with their own deps — see below.
+#
+# Install:  pip install -r requirements.txt
+
+pywebview>=6.2,<7
+pystray>=0.19,<0.20
+Pillow>=11,<13
+psutil>=7,<8
+
+# ─── Worker subprocesses (Python 3.11 venv, installed separately) ───
+# faster-whisper>=1.0    # GPU Whisper transcription (CUDA wheels)
+# torch                  # CUDA + ctranslate2 backend
+# transformers           # Punctuation restoration model
+
+# ─── External tools (not Python packages) ───
+# yt-dlp     — install separately, must be on PATH
+# ffmpeg     — install separately, must be on PATH (provides ffprobe too)

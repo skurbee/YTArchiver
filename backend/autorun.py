@@ -11,13 +11,16 @@ AUTORUN_OPTIONS ports YTArchiver.py:22210 verbatim.
 
 from __future__ import annotations
 
-import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
-from .ytarchiver_config import load_config, save_config, config_is_writable
+from .log import get_logger
+from .ytarchiver_config import config_is_writable, load_config, save_config
+
+_log = get_logger(__name__)
 
 
 AUTORUN_OPTIONS = {
@@ -42,7 +45,7 @@ class AutorunScheduler:
     def __init__(self,
                  sync_trigger: Callable[[], None],
                  stream=None,
-                 sync_busy_fn: Optional[Callable[[], bool]] = None):
+                 sync_busy_fn: Callable[[], bool] | None = None):
         self._sync_trigger = sync_trigger
         self._stream = stream
         # Optional callable: returns True if a sync is currently running.
@@ -51,8 +54,8 @@ class AutorunScheduler:
         self._sync_busy_fn = sync_busy_fn
         self._interval_mins = 0
         self._lock = threading.RLock()
-        self._timer: Optional[threading.Timer] = None
-        self._next_fire_ts: Optional[float] = None
+        self._timer: threading.Timer | None = None
+        self._next_fire_ts: float | None = None
         # True between _fire() kicking sync and notify_sync_done() firing.
         # While set, get_state() surfaces seconds_remaining=None so the UI
         # shows "Syncing..." and the timer isn't rearmed until completion.
@@ -60,11 +63,11 @@ class AutorunScheduler:
 
     # ── interval management ─────────────────────────────────────────
 
-    def set_interval_label(self, label: str) -> Dict[str, Any]:
+    def set_interval_label(self, label: str) -> dict[str, Any]:
         mins = AUTORUN_OPTIONS.get(label, 0)
         return self.set_interval_mins(mins)
 
-    def set_interval_mins(self, mins: int) -> Dict[str, Any]:
+    def set_interval_mins(self, mins: int) -> dict[str, Any]:
         with self._lock:
             self._interval_mins = int(mins or 0)
             self._cancel_timer_locked()
@@ -72,7 +75,7 @@ class AutorunScheduler:
             if self._interval_mins > 0:
                 self._schedule_next_locked()
         # Persist to config (gated).
-        # audit D-42: check save_config return so a write-gate failure
+        # check save_config return so a write-gate failure
         # surfaces to the caller instead of silently keeping the old
         # interval on disk. User sets "1 hr", restart later, finds it
         # reverted — previously no error shown.
@@ -85,7 +88,7 @@ class AutorunScheduler:
             persisted = False
         return {"ok": True, "mins": self._interval_mins, "persisted": persisted}
 
-    def get_state(self) -> Dict[str, Any]:
+    def get_state(self) -> dict[str, Any]:
         # Check sync busy state OUTSIDE the lock — the callback may
         # acquire its own locks and could deadlock if we hold this one.
         busy = False
@@ -130,12 +133,12 @@ class AutorunScheduler:
         if self._timer is not None:
             try:
                 self._timer.cancel()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             self._timer = None
         self._next_fire_ts = None
 
-    def _schedule_next_locked(self, sec: Optional[int] = None):
+    def _schedule_next_locked(self, sec: int | None = None):
         """Schedule the next _fire(). `sec` defaults to the configured
         interval; callers pass an explicit value (e.g. 60) to postpone a
         fire without changing the interval the user configured."""
@@ -158,7 +161,7 @@ class AutorunScheduler:
         # `_sync_pipeline_busy()` check at YTArchiver.py:22769 — without
         # this, autorun calls sync_start_all which errors out and the
         # timer never re-arms correctly.
-        # audit D-16: if no busy-fn was wired, treat as "busy" (safer
+        # if no busy-fn was wired, treat as "busy" (safer
         # default than "not busy", which could double-launch Sync
         # Subbed if autorun fires while a manual pass is still running).
         if self._sync_busy_fn is None:
@@ -239,7 +242,7 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     builds reversed this (insert(0)/keep first N) which scrambled
     history chronology when alternating OLD/NEW runs.
 
-    audit E-35: module-level lock wraps the load-modify-save cycle so
+    module-level lock wraps the load-modify-save cycle so
     two near-simultaneous completions (rare but possible when multiple
     sources trigger autorun notifications) can't race and drop an
     entry. Without the lock, the second load_config saw a stale cfg
@@ -257,10 +260,9 @@ def append_history_entry(entry: str, kind: str = "Auto") -> bool:
     return True
 
 
-def clear_history() -> Dict[str, Any]:
+def clear_history() -> dict[str, Any]:
     """Empty config['autorun_history'] and persist. Returns the count
-    of entries that were removed. Matches OLD YTArchiver.py:22243
-    `_clear_autorun_history` semantics — the user's "Clear" button on
+    of entries that were removed. `_clear_autorun_history` semantics — the user's "Clear" button on
     the activity-log strip clears BOTH the visible log and the saved
     history, so a relaunch doesn't resurrect the entries.
     """
@@ -299,7 +301,7 @@ def format_history_entry(kind: str, channel: str,
     """
     now = datetime.now()
     time_part = now.strftime("%I:%M%p").lstrip("0").lower()
-    # bug L-14: always strip leading zeros the same way regardless of
+    # always strip leading zeros the same way regardless of
     # platform. `%-d` is POSIX-only and was inconsistent on Windows —
     # sometimes rendering as "Apr 4" and sometimes "Apr 04" across a
     # single session. Build it explicitly.
@@ -317,8 +319,8 @@ def format_history_entry(kind: str, channel: str,
             if len(parts) == 1:
                 # Bare number — treat as count with default label
                 return int(parts[0]), default_label
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         return 0, default_label
     dl, primary_label = _split_count_label(primary, "downloaded")
 
@@ -331,14 +333,14 @@ def format_history_entry(kind: str, channel: str,
             return default
     skipped = _first_int(secondary)
     # Default secondary label is "skipped"; Metdta kind uses "existing" per
-    # OLD YTArchiver.py:22657. Honor a caller-supplied label in secondary.
+    #. Honor a caller-supplied label in secondary.
     secondary_label = "skipped"
     try:
         parts = (secondary or "").strip().split(None, 1)
         if len(parts) >= 2:
             secondary_label = parts[1].strip()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
     err = int(errors or 0)
 
     # Took label

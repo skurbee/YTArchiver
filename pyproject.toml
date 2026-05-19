@@ -17,7 +17,7 @@
 
 [project]
 name = "ytarchiver"
-version = "73.7"
+version = "73.8"
 description = "Subscription-based YouTube channel archiver with local Whisper transcription, FTS5 transcript search, and a pywebview UI."
 readme = "README.md"
 license = { file = "LICENSE" }

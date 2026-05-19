@@ -52,6 +52,19 @@
           catch (e) { console.error(`[seed] ${name} failed:`, e); }
         };
 
+        // Fire startup_ready FIRST (non-blocking — it just kicks off a
+        // daemon thread on the Python side) so Stage 2's disk-walk and
+        // the "Scanning disk" indicator can start populating in parallel
+        // with the rest of seedLogs's sequential bridge calls. Previously
+        // this ran LAST, which meant the disk-scan didn't even begin
+        // until all 6 earlier seedLogs steps had completed — visible to
+        // the user as a multi-second wait before the indicator appeared.
+        // The Python side guards re-entry via `_startup_fired`, so the
+        // duplicate call at the end is a harmless no-op.
+        step("startup_ready_early", async () => {
+          await api.startup_ready();
+        });
+
         await step("runtime_info", async () => {
           const info = await api.get_runtime_info();
           if (!info) return;

@@ -97,6 +97,28 @@ user-facing bug audit before pushing.
 - **`syncSubbed.js` `_inFlight` reference broke clicks**: the
  Sync Subbed and Pause click handlers were wrapped in an
  undefined `_inFlight(...)`. Inlined a local copy.
+- **Boot-time UI lock — video clicks froze while Settings → Index
+ stats warmed up**. `get_index_db_stats` runs three multi-second
+ aggregate queries (`COUNT(*)` on a multi-million-row segments
+ table, plus two duration `SUM`s) and was holding the shared
+ `_reader_lock` for the entire duration. That lock serializes every
+ other reader in the app — browse-grid clicks, watch-view transcript
+ loads, recent-tab actions — so launching the app appeared to lock
+ up until the stats query finished. The slow stats path now opens
+ its own dedicated read-only SQLite connection; SQLite WAL supports
+ concurrent readers across separate connections, so the UI stays
+ responsive throughout boot.
+- **"Scanning disk" indicator appeared seconds late**. The
+ `startup_ready` bridge call (which kicks off Stage 2's disk walk
+ + indicator) was the LAST step in the initial seed chain, so the
+ indicator couldn't show until six earlier sequential bridge calls
+ had returned. Moved it to fire first, in parallel with the rest of
+ the seed.
+- **"Last Full Sync" label took up to a minute to populate**. The
+ ticker's first tick ran at `DOMContentLoaded`, before pywebview
+ injected its API; the call silently returned and the next tick was
+ 60 seconds later. Now retries on `pywebviewready` + a short poll
+ fallback, matching the pattern other UI restore paths already use.
 
 ### Added
 - **Search result sorting** (Browse → Search): new Sort dropdown

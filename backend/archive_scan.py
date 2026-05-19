@@ -455,36 +455,58 @@ def index_db_stats() -> dict[str, Any]:
                 index_db_bytes = _DB.stat().st_size
             except OSError:
                 pass
-        _conn = _idx._reader_open()
-        if _conn is not None:
-            # Reader path — index stats are pure aggregate SELECTs and
-            # shouldn't queue behind sweep / ingest writes. Even the
-            # giant Settings → Index "Stats" panel renders independently
-            # of any background indexing.
-            with _idx._reader_lock:
-                _row = _conn.execute("SELECT COUNT(*) FROM segments").fetchone()
-                if _row:
-                    segments_count = int(_row[0] or 0)
-                # Hours of video — prefer the summed videos.duration_s
-                # column (populated by register_video). For rows where
-                # duration_s is NULL, fall back to the maximum
-                # segments.end_time per video so transcribed videos
-                # without explicit duration metadata still contribute.
-                _row = _conn.execute(
-                    "SELECT COALESCE(SUM(duration_s), 0) FROM videos "
-                    "WHERE duration_s IS NOT NULL").fetchone()
-                if _row:
-                    hours += float(_row[0] or 0) / 3600.0
-                _row = _conn.execute(
-                    "SELECT COALESCE(SUM(max_end), 0) FROM ("
-                    "  SELECT MAX(s.end_time) AS max_end "
-                    "  FROM segments s "
-                    "  LEFT JOIN videos v ON v.video_id = s.video_id "
-                    "  WHERE v.duration_s IS NULL OR v.video_id IS NULL "
-                    "  GROUP BY s.video_id"
-                    ")").fetchone()
-                if _row:
-                    hours += float(_row[0] or 0) / 3600.0
+        # IMPORTANT — open a fresh, dedicated read-only connection here
+        # instead of borrowing `_idx._reader_open()` + `_idx._reader_lock`.
+        # The three aggregates below take many SECONDS on a large archive
+        # (9M+ segments), and the shared `_reader_lock` serializes ALL
+        # reader queries across the app. Holding it that long blocked
+        # browse clicks (`list_videos_for_channel`), watch-view transcript
+        # loads (`get_segments`), and every other reader call — visible
+        # to the user as "can't click into any videos during loading"
+        # while the Settings → Index stats panel was warming up at boot.
+        # SQLite WAL supports many concurrent readers across separate
+        # connections, so using a private connection here lets the stats
+        # query run in parallel with the rest of the UI's reader traffic.
+        import sqlite3 as _sql
+        _own = None
+        try:
+            _own = _sql.connect(str(_DB),
+                                check_same_thread=False, timeout=30.0)
+            _own.execute("PRAGMA journal_mode=WAL")
+            _own.execute("PRAGMA query_only=ON")
+            _row = _own.execute("SELECT COUNT(*) FROM segments").fetchone()
+            if _row:
+                segments_count = int(_row[0] or 0)
+            # Hours of video — prefer the summed videos.duration_s
+            # column (populated by register_video). For rows where
+            # duration_s is NULL, fall back to the maximum
+            # segments.end_time per video so transcribed videos
+            # without explicit duration metadata still contribute.
+            _row = _own.execute(
+                "SELECT COALESCE(SUM(duration_s), 0) FROM videos "
+                "WHERE duration_s IS NOT NULL").fetchone()
+            if _row:
+                hours += float(_row[0] or 0) / 3600.0
+            _row = _own.execute(
+                "SELECT COALESCE(SUM(max_end), 0) FROM ("
+                "  SELECT MAX(s.end_time) AS max_end "
+                "  FROM segments s "
+                "  LEFT JOIN videos v ON v.video_id = s.video_id "
+                "  WHERE v.duration_s IS NULL OR v.video_id IS NULL "
+                "  GROUP BY s.video_id"
+                ")").fetchone()
+            if _row:
+                hours += float(_row[0] or 0) / 3600.0
+        finally:
+            if _own is not None:
+                try: _own.close()
+                except Exception as _ce:
+                    _log.debug("swallowed: %s", _ce)
+        # Touch _idx so the import stays meaningful for the schema-init
+        # side-effect (DB file + tables exist before the COUNT runs).
+        if not _idx._schema_inited:
+            try: _idx._open()
+            except Exception as e: _log.debug("swallowed: %s", e)
     except Exception as e:
         _log.debug("swallowed: %s", e)
     return {

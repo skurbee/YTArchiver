@@ -37,13 +37,30 @@
     if (!el) return;
     const tick = async () => {
       const api = window.pywebview?.api;
-      if (!api?.get_last_sync_label) return;
+      if (!api?.get_last_sync_label) return false;
       try {
         const r = await api.get_last_sync_label();
         if (r?.label) el.textContent = r.label;
-      } catch (e) { /* ignore */ }
+        return true;
+      } catch (e) { /* ignore */ return false; }
     };
-    tick();
+    // First tick — try immediately. If pywebview isn't ready yet
+    // (the usual case at DOMContentLoaded), the call returns false and
+    // the next attempt is up to 60s later, so the label sits at "—"
+    // for the whole minute. Retry on `pywebviewready` + a short poll
+    // fallback so the label appears within a few hundred ms of boot.
+    tick().then((ok) => {
+      if (ok) return;
+      window.addEventListener("pywebviewready", () => { tick(); },
+                              { once: true });
+      let tries = 0;
+      const poll = () => {
+        if (tries >= 20) return;
+        tries++;
+        tick().then((ok2) => { if (!ok2) setTimeout(poll, 150); });
+      };
+      setTimeout(poll, 150);
+    });
     // Same visibility gate as the deferred-livestreams ticker — the
     // label only matters when the user can see it.
     const _lastSyncTick = setInterval(() => {

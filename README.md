@@ -2,7 +2,7 @@
 
 Download, organize, transcribe, search, compress, and browse entire channels
 
-Pics on the wiki page :)
+Pics on the wiki page
 
 
 

@@ -6,8 +6,6 @@
 #   - ruff reads `[tool.ruff]` here when no top-level `ruff.toml` is
 #     present. We keep `ruff.toml` for now (it's already configured);
 #     this file just declares the project shape for other tools.
-#   - pytest reads `[tool.pytest.ini_options]` so `pytest tests/`
-#     discovers the smoke suite from the repo root.
 #   - IDEs (VS Code, PyCharm) read this for the Python version and
 #     dependency list when populating their analysis.
 #
@@ -17,7 +15,7 @@
 
 [project]
 name = "ytarchiver"
-version = "73.9"
+version = "74.0"
 description = "Subscription-based YouTube channel archiver with local Whisper transcription, FTS5 transcript search, and a pywebview UI."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -44,20 +42,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.15"]
+dev = ["ruff>=0.15"]
 
 [project.urls]
 Homepage = "https://github.com/skurbee/YTArchiver"
 Repository = "https://github.com/skurbee/YTArchiver"
 Changelog = "https://github.com/skurbee/YTArchiver/blob/main/docs/CHANGELOG.md"
-
-[tool.pytest.ini_options]
-minversion = "8.0"
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-addopts = ["-ra", "--strict-markers"]
 
 # Note: ruff settings live in `ruff.toml` at the repo root (already
 # configured). If you remove that file, copy the [tool.ruff] block here

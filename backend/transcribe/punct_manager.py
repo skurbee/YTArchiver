@@ -115,8 +115,20 @@ class PunctuationManager:
                 self._stream.emit_error(f"Punct start: {info}")
                 self._stop()
                 return False
-            self._stream.emit_text(f" \u2014 \u2713 Punctuation model loaded ({info.get('device', '?').upper()}).",
-                                    "simpleline_green")
+            # Simple mode hides this \u2014 it's diagnostic chrome, not a
+            # user-facing milestone, and it can't carry the active job's
+            # `tx_done_<vid>` marker (this subprocess is shared across
+            # jobs and doesn't know which video triggered the start).
+            # In Simple mode that meant the line landed at the log bottom
+            # and stuck around as orphan text after the actual " \u2014 \u2713
+            # Transcription (\u2026)" done line replaced its slot under the
+            # video row. Emit only in Verbose so the developer can still
+            # see "model loaded (CUDA)" when debugging.
+            if not getattr(self._stream, "simple_mode", True):
+                self._stream.emit_text(
+                    f" \u2014 \u2713 Punctuation model loaded "
+                    f"({info.get('device', '?').upper()}).",
+                    "simpleline_green")
             return True
         except Exception as e:
             self._stream.emit_error(f"Failed to start punctuation: {e}")

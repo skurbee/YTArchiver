@@ -129,6 +129,41 @@ user-facing bug audit before pushing.
  the channel header. Standalone retranscribes (Watch view,
  Transcribe File, drift retranscribe) keep the original
  single-space indent because they don't have a parent video row.
+- **Transcription done line lands at its video row even when sync
+ ends mid-Whisper**. Previously, if a long Whisper transcription was
+ still running after "Pass complete" emitted, the next progress
+ tick saw `_anySyncRunning()` flip to false, tripped the
+ pin-to-bottom heuristic, and yanked the line out of its
+ per-video slot. The "— ✓ Transcription (…)" done line then
+ followed it to the log bottom instead of replacing its
+ placeholder under the channel's video row. Pin-to-bottom now
+ honors the `tx_done_<vid>` marker — any line tied to a specific
+ video slot stays where it belongs.
+- **"Punctuation model loaded (CUDA)" log line hidden in Simple
+ mode**. It's a one-time subprocess-startup diagnostic with no
+ per-job marker, so in Simple mode it ended up orphaned at the
+ log bottom after the per-video transcription block had already
+ finished. Verbose mode still shows it.
+- **yt-dlp's transient "Retrying (1/10)" notices no longer flagged
+ as errors**. When yt-dlp hits a network hiccup mid-download
+ (partial read, server 5xx, etc.) it logs a `Got error: …
+ Retrying (N/M)…` line and tries again on its own — almost always
+ successfully. The sync's red-error classifier was matching these
+ as real failures, scaring the user with a red line and bumping
+ the per-channel error counter even when the download completed
+ fine on retry. Lines containing `Retrying (N/M)` now render
+ dimmed and don't increment the error count. A real final
+ failure (no "Retrying" suffix) still surfaces as a red error.
+
+### Removed
+- **`tests/` directory**. The import + re-export smoke suite was
+ added during the v71.x package-decomposition pass to catch the
+ bug shape that bit during file splits (missing imports, deleted
+ helpers behind re-export proxies, lost `__init__.py` symbols).
+ Now that the splits have stabilized, the suite was never run
+ automatically (no CI, no pre-commit hook) and just shipped as
+ dead weight. The `[tool.pytest.ini_options]` block and the
+ `pytest` dev-dependency in `pyproject.toml` were also removed.
 
 ### Added
 - **Search result sorting** (Browse → Search): new Sort dropdown

@@ -127,6 +127,25 @@
         return false;
       }
     } catch (_e) { /* fall through */ }
+    // ALSO never pin a line that carries a `tx_done_<vid>` marker.
+    // That marker means the line belongs to a specific per-video slot
+    // (originally seeded by sync.py as the " — ⏳ Transcription queued…"
+    // placeholder under the channel's video row). If sync finishes
+    // mid-Whisper and the next progress tick is the FIRST emit after
+    // _anySyncRunning() flips to false, the old behavior pulled the
+    // progress line out of its row-62 slot and moved it to the log
+    // bottom — and every subsequent inplace replacement (including the
+    // final "— ✓ Transcription" done line) followed it down there.
+    // The tx_done_ marker is the explicit "I belong here, not at the
+    // bottom" signal; honor it.
+    for (const seg of segments) {
+      if (!Array.isArray(seg) || seg.length < 2) continue;
+      const tag = seg[1];
+      const tags = Array.isArray(tag) ? tag : [tag];
+      for (const t of tags) {
+        if (typeof t === "string" && t.startsWith("tx_done_")) return false;
+      }
+    }
     for (const seg of segments) {
       if (!Array.isArray(seg) || seg.length < 2) continue;
       const tag = seg[1];

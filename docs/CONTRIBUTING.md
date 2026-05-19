@@ -36,7 +36,6 @@ YTArchiver/
 │   ├── CONTRIBUTING.md     # This file
 │   ├── PROJECT_MAP.md      # File-by-file index
 │   └── requirements.txt    # `pip install -r docs/requirements.txt`
-├── tests/                  # pytest smoke suite
 ├── backend/                # All Python backend modules
 │   ├── api_mixins/         # JS-callable methods (see api_mixins/README.md)
 │   ├── version.py          # APP_VERSION + APP_VERSION_DATE
@@ -196,9 +195,11 @@ always carry the ten: `v37.9 + 0.1 = v38.0` (never `v37.10`).
 
 ## Known gaps
 
-- Tests are a smoke suite only (`pytest tests/` exercises imports and
-  package re-exports). End-to-end UI testing is still manual — run
-  `python main.py` and exercise the flow you touched.
+- No automated tests. End-to-end testing is manual — run
+  `python main.py` and exercise the flow you touched. The repo used
+  to ship a small `tests/` smoke suite for import + re-export
+  checking during the package-decomposition pass; it was removed
+  once the splits stabilized.
 - `web/app.js` modularization is complete (10,218 → ~150 lines across
   ~50 focused modules). Remaining work is small-cleanup passes only.
 

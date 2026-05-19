@@ -1566,6 +1566,22 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 if any(frag in low for frag in _BENIGN_FRAGMENTS):
                     stream.emit([[f" {s}\n", "dim"]])
                     continue
+                # yt-dlp's internal retry messages. Format examples:
+                #   [download] Got error: 1048576 bytes read, 9298191
+                #     more expected. Retrying (1/10)...
+                #   [download] Got server HTTP error 429. Retrying (2/10)...
+                #   ERROR: unable to download video data: HTTPSConnection...
+                #     Retrying (3/10)...
+                # These are TRANSIENT hiccups — yt-dlp is about to try
+                # again and almost always succeeds. If all retries fail,
+                # yt-dlp emits a final error line WITHOUT "Retrying" that
+                # this branch falls through to (which IS a real error).
+                # Without this filter the user sees a scary red "Got
+                # error" line for a download that completed fine, plus
+                # the error counter bumps incorrectly.
+                if "retrying (" in low:
+                    stream.emit([[f" {s}\n", "dim"]])
+                    continue
                 # Members-only content — not an error, just a skip.
                 # Auto-archive the id
                 # so next sync skips it instantly instead of re-trying.

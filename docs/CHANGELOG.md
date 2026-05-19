@@ -6,115 +6,115 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
-## v72.x – v73.x — Continued decomposition + bug audit (2026-05-18)
+## v72.x – v73.x — Continued decomposition + bug audit
 
 Continuation of the v71.x organization series, plus a deep
 user-facing bug audit before pushing.
 
 ### Changed (structural splits)
 - **`backend/sync/core.py`** (3,199 → 2,089 lines): extracted
-  `sync_all.py` (multi-channel batch orchestrator) and
-  `sync_helpers.py` (pure file/format helpers).
+ `sync_all.py` (multi-channel batch orchestrator) and
+ `sync_helpers.py` (pure file/format helpers).
 - **`web/indexControls.js`** (1,503 → 183 lines): the mislabeled
-  three-concern merge got split — `metadataTab.js` (Settings →
-  Metadata refresh-status table), `settingsInfra.js` (Settings
-  sub-tab nav + Archive Roots), and `indexControls.js` now just
-  the Index sub-tab. Also moved the orphaned `filterCurrentView`
-  function into `browseView.js` where it's actually called.
+ three-concern merge got split — `metadataTab.js` (Settings →
+ Metadata refresh-status table), `settingsInfra.js` (Settings
+ sub-tab nav + Archive Roots), and `indexControls.js` now just
+ the Index sub-tab. Also moved the orphaned `filterCurrentView`
+ function into `browseView.js` where it's actually called.
 - **`backend/transcribe/core.py`** (2,420 → 1,960 lines): extracted
-  `helpers.py` (path/title/duration helpers, `find_python311`) and
-  `punct_manager.py` (PunctuationManager subprocess wrapper).
+ `helpers.py` (path/title/duration helpers, `find_python311`) and
+ `punct_manager.py` (PunctuationManager subprocess wrapper).
 - **`backend/index.py`** (2,508 → 1,498 lines): extracted
-  `index_search.py` (FTS5 + title search), `index_graph.py` (word
-  frequency / bucket totals), `index_bookmarks.py` (bookmark CRUD),
-  `index_maintenance.py` (sweep / prune / FTS rebuild).
+ `index_search.py` (FTS5 + title search), `index_graph.py` (word
+ frequency / bucket totals), `index_bookmarks.py` (bookmark CRUD),
+ `index_maintenance.py` (sweep / prune / FTS rebuild).
 - **`web/styles.css`** (5,075 → 288 lines): split into 8 themed
-  sheets loaded in cascade order — settings, download-controls,
-  logs, tabs-data, browse, browse-grids, watch, dialogs.
+ sheets loaded in cascade order — settings, download-controls,
+ logs, tabs-data, browse, browse-grids, watch, dialogs.
 - **`web/index.html`** is now a build artifact assembled at boot
-  from `index.template.html` + 7 partials (`tab-*.html`,
-  `popovers.html`, `dialogs.html`, `modals.html`). The
-  `backend/html_assembler.py` helper rebuilds it on every launch
-  if any partial has been modified.
+ from `index.template.html` + 7 partials (`tab-*.html`,
+ `popovers.html`, `dialogs.html`, `modals.html`). The
+ `backend/html_assembler.py` helper rebuilds it on every launch
+ if any partial has been modified.
 - **`backend/metadata/refresh.py`** (1,368 → 33 lines): now a
-  re-export shim. The three big refresh functions live in
-  `refresh_views.py`, `refresh_comments.py`, `refresh_fetch.py`;
-  lazy proxies into `core.py` live in `_refresh_proxies.py`.
+ re-export shim. The three big refresh functions live in
+ `refresh_views.py`, `refresh_comments.py`, `refresh_fetch.py`;
+ lazy proxies into `core.py` live in `_refresh_proxies.py`.
 - **`web/settingsTab.js`** (1,133 → 580 lines): 4 dialog wirings
-  extracted to their own files — `driftScanDialog.js`,
-  `compressDryRunDialog.js`, `repairCaptionsDialog.js`,
-  `punctRestoreDialog.js`.
+ extracted to their own files — `driftScanDialog.js`,
+ `compressDryRunDialog.js`, `repairCaptionsDialog.js`,
+ `punctRestoreDialog.js`.
 - **`web/app.js`** (685 → 146 lines): extracted `uxPolish.js`
-  (tooltip + defocus), `removeChannel.js`, `queuePending.js`,
-  `refreshSizes.js`, `smallInits.js`. App.js is now a clean
-  boot orchestrator.
+ (tooltip + defocus), `removeChannel.js`, `queuePending.js`,
+ `refreshSizes.js`, `smallInits.js`. App.js is now a clean
+ boot orchestrator.
 
 ### Fixed (audit + bug-hunt findings)
 - **Search blocked by sweep / ingest**: read-only queries in
-  `index_search.py` and other modules were acquiring the writer
-  lock `_db_lock`, queueing behind long-running sweeps. Swapped
-  11 read paths to use the dedicated `_reader_open` + `_reader_lock`
-  pattern. Browse Search now returns in ~50ms even while a sweep
-  is running.
+ `index_search.py` and other modules were acquiring the writer
+ lock `_db_lock`, queueing behind long-running sweeps. Swapped
+ 11 read paths to use the dedicated `_reader_open` + `_reader_lock`
+ pattern. Browse Search now returns in ~50ms even while a sweep
+ is running.
 - **Transcribe / auto-caption ID lookup blocked by sweep**: the
-  `_extract_video_id` fallback in `transcribe/helpers.py` and
-  `transcribe/transcribe_vtt.py` was on the writer lock; switched
-  to reader.
+ `_extract_video_id` fallback in `transcribe/helpers.py` and
+ `transcribe/transcribe_vtt.py` was on the writer lock; switched
+ to reader.
 - **`get_segment_context` blocked by sweep**: clicking any search
-  result hit this code path on the writer lock.
+ result hit this code path on the writer lock.
 - **Critical: `_JOB_COUNTER` was lost in the transcribe split.**
-  `TranscribeManager._transcribe_one` used `global _JOB_COUNTER`
-  but `_JOB_COUNTER` moved to `helpers.py`; every transcribe job
-  crashed with `NameError`. Fixed by mutating through the helpers
-  module reference (`_h._JOB_COUNTER += 1`).
+ `TranscribeManager._transcribe_one` used `global _JOB_COUNTER`
+ but `_JOB_COUNTER` moved to `helpers.py`; every transcribe job
+ crashed with `NameError`. Fixed by mutating through the helpers
+ module reference (`_h._JOB_COUNTER += 1`).
 - **Critical: `register_video` undefined in `index_maintenance.py`**.
-  The startup sweep called bare `register_video(...)` but the name
-  was never imported. Every new video the sweep encountered would
-  crash. Fixed to `_idx.register_video(...)`.
+ The startup sweep called bare `register_video(...)` but the name
+ was never imported. Every new video the sweep encountered would
+ crash. Fixed to `_idx.register_video(...)`.
 - **Missing `sqlite3` and `os` imports in `index_search.py` and
-  `index_graph.py`**: `except sqlite3.Error:` and `os.path.isfile`
-  would have thrown `NameError` on first error / first call.
+ `index_graph.py`**: `except sqlite3.Error:` and `os.path.isfile`
+ would have thrown `NameError` on first error / first call.
 - **Settings persistence**: 4 watch-view preferences
-  (`transcript_font_size`, `transcript_pane_width`,
-  `caption_overlay_size`, `caption_overlay_bg`) were either
-  write-only or silently dropped by `settings_save`. Now all
-  round-trip cleanly through config.
+ (`transcript_font_size`, `transcript_pane_width`,
+ `caption_overlay_size`, `caption_overlay_bg`) were either
+ write-only or silently dropped by `settings_save`. Now all
+ round-trip cleanly through config.
 - **Clear button → activity-log visibility refresh** wasn't firing
-  because of a bare-name call in a different IIFE
-  (`syncActivityLogVisibility()` → `window._syncActivityLogVisibility?.()`).
+ because of a bare-name call in a different IIFE
+ (`syncActivityLogVisibility()` → `window._syncActivityLogVisibility?.()`).
 - **Recent tab "Delete File" button stayed visible after tab
-  switch**: `chrome.js` referenced the wrong button id
-  (`recent-delete-btn` instead of `btn-delete-file`).
+ switch**: `chrome.js` referenced the wrong button id
+ (`recent-delete-btn` instead of `btn-delete-file`).
 - **`edit-res-reset` button (↻ Reset resolution to default) had no
-  handler at all** — clicking it did nothing. Now wires the
-  dropdown back to its default-selected option.
+ handler at all** — clicking it did nothing. Now wires the
+ dropdown back to its default-selected option.
 - **`initSubsContextMenu`, `initQueueAutoCheckboxes`, `initGraphView`
-  never ran** — app.js called them bare-name from its IIFE but
-  they lived in other IIFEs (silent ReferenceErrors swallowed by
-  the surrounding `try/catch`). Sub right-click menu, GPU/Sync Auto
-  checkboxes, and Graph tab were all broken. Each is now exposed
-  via `window.*` and called through that.
+ never ran** — app.js called them bare-name from its IIFE but
+ they lived in other IIFEs (silent ReferenceErrors swallowed by
+ the surrounding `try/catch`). Sub right-click menu, GPU/Sync Auto
+ checkboxes, and Graph tab were all broken. Each is now exposed
+ via `window.*` and called through that.
 - **`syncSubbed.js` `_inFlight` reference broke clicks**: the
-  Sync Subbed and Pause click handlers were wrapped in an
-  undefined `_inFlight(...)`. Inlined a local copy.
+ Sync Subbed and Pause click handlers were wrapped in an
+ undefined `_inFlight(...)`. Inlined a local copy.
 
 ### Added
 - **Search result sorting** (Browse → Search): new Sort dropdown
-  with Relevance (default), Newest, Oldest, By channel, By title.
-  Changing the dropdown re-runs the search automatically.
+ with Relevance (default), Newest, Oldest, By channel, By title.
+ Changing the dropdown re-runs the search automatically.
 - Build-time HTML assembler (`backend/html_assembler.py`) so
-  `index.html` can be split into partials while still loading as
-  a single file at runtime.
+ `index.html` can be split into partials while still loading as
+ a single file at runtime.
 
 ### Privacy / public-content cleanup
 - LICENSE copyright holder set to GitHub username.
 - CHANGELOG / docs / code comments scrubbed of personal-name
-  references and absolute paths to the developer's machine.
+ references and absolute paths to the developer's machine.
 - Companion-display integration (sync-progress JSON writer) renamed
-  to generic terms throughout the codebase; the module is now
-  `sync/display_push.py`.
+ to generic terms throughout the codebase; the module is now
+ `sync/display_push.py`.
 
-## v71.x — Internal-code-organization series (2026-05-18)
+## v71.x — Internal-code-organization series
 
 This stretch was a deep cleanup pass after the codebase had accreted
 to a single 10,200-line `web/app.js` plus large legacy.py files in
@@ -133,116 +133,115 @@ each backend package.
 
 ### Changed
 - **`web/app.js` cut from 10,218 → ~685 lines** (~93% reduction). Code
-  redistributed across 35+ focused modules under `web/`:
-  - **Boot / shell:** `chrome.js`, `shortcuts.js`, `queueBlink.js`,
-    `logContextMenu.js`, `seedLogs.js`, `missingFolders.js`
-  - **Tabs:** `downloadUrl.js`, `downloadDragDrop.js`, `clearButton.js`,
-    `editChannel.js`, `syncSubbed.js`, `autoSync.js`, `liveDrawer.js`,
-    `columnSort.js`, `columnWidth.js`, `recentContextMenu.js`,
-    `browseView.js`, `browseContent.js`, `browseSearch.js`,
-    `browseContextMenus.js`, `bookmarks.js`, `watchActions.js`
-  - **Settings:** `settingsTab.js`, `indexControls.js`, `aboutDialog.js`,
-    `diagnosticsDialog.js`, `manualTranscribe.js`, `queuePopovers.js`,
-    `autorunHistory.js`
-  - **Modals + dialogs:** `modals.js`, `toasts.js`, `dropdown.js`,
-    `appDialogs.js`, `redownloadSampleModal.js`
-  - **Shared state:** `browseState.js` (canonical `window._browseState`)
-  - **Browse helpers:** `graphTab.js`, `logMode.js`, `scanArchive.js`,
-    `activityLogVis.js`
+ redistributed across 35+ focused modules under `web/`:
+ - **Boot / shell:** `chrome.js`, `shortcuts.js`, `queueBlink.js`,
+ `logContextMenu.js`, `seedLogs.js`, `missingFolders.js`
+ - **Tabs:** `downloadUrl.js`, `downloadDragDrop.js`, `clearButton.js`,
+ `editChannel.js`, `syncSubbed.js`, `autoSync.js`, `liveDrawer.js`,
+ `columnSort.js`, `columnWidth.js`, `recentContextMenu.js`,
+ `browseView.js`, `browseContent.js`, `browseSearch.js`,
+ `browseContextMenus.js`, `bookmarks.js`, `watchActions.js`
+ - **Settings:** `settingsTab.js`, `indexControls.js`, `aboutDialog.js`,
+ `diagnosticsDialog.js`, `manualTranscribe.js`, `queuePopovers.js`,
+ `autorunHistory.js`
+ - **Modals + dialogs:** `modals.js`, `toasts.js`, `dropdown.js`,
+ `appDialogs.js`, `redownloadSampleModal.js`
+ - **Shared state:** `browseState.js` (canonical `window._browseState`)
+ - **Browse helpers:** `graphTab.js`, `logMode.js`, `scanArchive.js`,
+ `activityLogVis.js`
 - **`web/logs.js` cut from 2,921 → ~895 lines** (~69% reduction).
-  Log rendering stayed; everything else split out:
-  - `watchView.js` (~886 lines) — embedded video + transcript karaoke
-    + WebVTT caption overlay + metadata drawer. Owns `renderWatchView`,
-    `_onRetranscribeComplete`, `loadWatchMetadataDrawer`, `setCaptionPref`,
-    plus the rAF karaoke loop and all caption-track plumbing.
-  - `browseGrids.js` (~521 lines) — Channel grid (Browse landing) +
-    Video grid (inside a channel) with year/month grouping and
-    lazy-load batching. Owns `renderChannelGrid`, `renderVideoGrid`,
-    `_buildVideoCard` (shared with the Recent grid).
-  - `tables.js` (~327 lines) — Subs channel table + Recent
-    list/grid views. Owns `renderSubsTable`, `renderRecentTable`,
-    `_applySubsFilter`, `_applyRecentFilter`, `_applyRecentViewMode`.
-  - `queueRender.js` (~412 lines) — Sync / GPU task popover row
-    builder, drag-reorder, right-click skip/cancel, verb-color tagging.
-    Owns `renderQueues`, `_queueStateSnapshot`, `_anySyncRunning`,
-    `_queueHasSyncForChannel`, `_queueHasGpuForChannel`. (The
-    popover open/close behavior was already in `queuePopovers.js`.)
+ Log rendering stayed; everything else split out:
+ - `watchView.js` (~886 lines) — embedded video + transcript karaoke
+ + WebVTT caption overlay + metadata drawer. Owns `renderWatchView`,
+ `_onRetranscribeComplete`, `loadWatchMetadataDrawer`, `setCaptionPref`,
+ plus the rAF karaoke loop and all caption-track plumbing.
+ - `browseGrids.js` (~521 lines) — Channel grid (Browse landing) +
+ Video grid (inside a channel) with year/month grouping and
+ lazy-load batching. Owns `renderChannelGrid`, `renderVideoGrid`,
+ `_buildVideoCard` (shared with the Recent grid).
+ - `tables.js` (~327 lines) — Subs channel table + Recent
+ list/grid views. Owns `renderSubsTable`, `renderRecentTable`,
+ `_applySubsFilter`, `_applyRecentFilter`, `_applyRecentViewMode`.
+ - `queueRender.js` (~412 lines) — Sync / GPU task popover row
+ builder, drag-reorder, right-click skip/cancel, verb-color tagging.
+ Owns `renderQueues`, `_queueStateSnapshot`, `_anySyncRunning`,
+ `_queueHasSyncForChannel`, `_queueHasGpuForChannel`. (The
+ popover open/close behavior was already in `queuePopovers.js`.)
 - Backend `legacy.py` files renamed to `core.py` in `sync/`, `transcribe/`,
-  `metadata/` packages (the "we never finished the refactor" smell).
+ `metadata/` packages (the "we never finished the refactor" smell).
 - Inline patch-history cruft scrubbed — 406 prefix removals across 68
-  files (e.g. `Patch N (vXX.Y): foo` → `foo`, `Mirrors OLD YTArchiver.py:
-  NNNN` cross-references dropped).
+ files (e.g. `Patch N (vXX.Y): foo` → `foo`, `Mirrors OLD YTArchiver.py:
+ NNNN` cross-references dropped).
 - `docs/PROJECT_MAP.md` + `web/README.md` updated to reflect package
-  splits and the new JS module surface.
+ splits and the new JS module surface.
 
 ### Fixed
 - **Retranscribe queueing behind startup sweep** — `transcribe_retranscribe`
-  and 4 other API endpoints were using the writer `_db_lock` for simple
-  reads; switched to the dedicated reader connection so clicks no longer
-  queue behind `ingest_jsonl` writers.
+ and 4 other API endpoints were using the writer `_db_lock` for simple
+ reads; switched to the dedicated reader connection so clicks no longer
+ queue behind `ingest_jsonl` writers.
 - **Retranscribe stuck at 99% during sweep** — `sweep_new_videos` now
-  yields while a GPU job is actively running. Without the yield, sweep's
-  per-file writes on its independent connection still competed with the
-  active retranscribe for SQLite's single-writer slot at the file level.
+ yields while a GPU job is actively running. Without the yield, sweep's
+ per-file writes on its independent connection still competed with the
+ active retranscribe for SQLite's single-writer slot at the file level.
 - **`transcribe_vtt.py` undefined imports** — missing `import time`,
-  `_startupinfo`, and `_bump_transcription_pending` (extraction artifacts
-  that crashed every video on the auto-captions fast-path).
+ `_startupinfo`, and `_bump_transcription_pending` (extraction artifacts
+ that crashed every video on the auto-captions fast-path).
 - **`metadata/thumbnails_ops.py`** — `load_config()` called but not
-  imported; would crash on "Realign misplaced thumbnails."
+ imported; would crash on "Realign misplaced thumbnails."
 - **`compress.py` + `metadata/core.py`** — `Tuple` / `Callable` used in
-  type hints but not imported (lazy-eval saved at runtime, but linter and
-  any `from __future__ import annotations` removal would crash).
+ type hints but not imported (lazy-eval saved at runtime, but linter and
+ any `from __future__ import annotations` removal would crash).
 - **`sync/__init__.py` re-exports** — `_fmt_duration` and
-  `_ROW_EMIT_PASS_ID` weren't surfaced, breaking `sync_one_channel`
-  flow with `ImportError`.
+ `_ROW_EMIT_PASS_ID` weren't surfaced, breaking `sync_one_channel`
+ flow with `ImportError`.
 - **GPU launch-pause vs new task** — launch-time pause (when restored
-  queue items existed) was blocking new user-initiated tasks even with
-  the GPU Auto checkbox on. New tasks now auto-clear the launch-pause.
+ queue items existed) was blocking new user-initiated tasks even with
+ the GPU Auto checkbox on. New tasks now auto-clear the launch-pause.
 - **Removed queue item coming back as active** — `queues_gpu_remove*`
-  now also drops the matching job from `TranscribeManager._jobs`, so a
-  removed pending retranscribe can't reappear as the running task when
-  the worker pops the next item.
+ now also drops the matching job from `TranscribeManager._jobs`, so a
+ removed pending retranscribe can't reappear as the running task when
+ the worker pops the next item.
 - **Whisper model picker swap-then-no-fire** — `swap_model` was firing
-  unconditionally (killing the worker subprocess + emitting a log line)
-  even when the picked model matched the currently-loaded one. Now
-  no-op when same model.
+ unconditionally (killing the worker subprocess + emitting a log line)
+ even when the picked model matched the currently-loaded one. Now
+ no-op when same model.
 - **Watch view shows progress for wrong video** — when retranscribing
-  Video A and navigating to Video B mid-job, B's button was locked
-  showing A's percentage. Now tracked per-video via
-  `window._inflightRetranscribes` Map; button reflects only the on-screen
-  video's state.
+ Video A and navigating to Video B mid-job, B's button was locked
+ showing A's percentage. Now tracked per-video via
+ `window._inflightRetranscribes` Map; button reflects only the on-screen
+ video's state.
 - **`transcribe_retranscribe` silent failures** — wrapped the bridge
-  await chain in try/catch so a pywebview timeout surfaces as a visible
-  toast instead of an unhandled promise rejection.
+ await chain in try/catch so a pywebview timeout surfaces as a visible
+ toast instead of an unhandled promise rejection.
 
 ### Project layout
 
 ```
 YTArchiver/
-├── main.py                  # entry point
-├── backend/                 # Python — see docs/PROJECT_MAP.md
-├── web/                     # ~35 JS modules + index.html + styles.css
-├── docs/                    # architecture, build, project map
-├── tests/                   # pytest smoke suite
-├── README.md  CONTRIBUTING.md  CHANGELOG.md  LICENSE
-├── requirements.txt  ruff.toml  YTArchiver.spec
+├── main.py # entry point
+├── backend/ # Python — see docs/PROJECT_MAP.md
+├── web/ # ~35 JS modules + index.html + styles.css
+├── docs/ # architecture, build, project map
+├── tests/ # pytest smoke suite
+├── README.md CONTRIBUTING.md CHANGELOG.md LICENSE
+├── requirements.txt ruff.toml YTArchiver.spec
 └── (gitignored: CLAUDE.md, Classic Tkinter ver/, GitHub Desktop/, dist/)
 ```
 
-## Pre-v70 history (imported from separate doc 2026-05-17)
+## Pre-v70 history (imported from separate doc)
 
 The version-per-push counter ran without a structured changelog before
 the v70 cleanup series. The block below is auto-imported from the
-offline dev-history dashboard generated on 2026-05-17 — covers every
+offline dev-history dashboard generated on — covers every
 push from v0.x through v64.7. There's a small gap between v64.7 (the
 last captured push) and v70.0 (the start of the cleanup series above);
 those few days only exist in `git log`.
 
-<!-- AUTO-IMPORTED FROM Dev History HTML (2026-05-17). -->
+<!-- AUTO-IMPORTED FROM Dev History HTML. -->
 <!-- Spans v0.x through v64.7. Small gap between v64.7 and v70.0. -->
 
-### May 17, 2026
-
+---
 #### v64.7 — Fix YT auto-caption parser dropping rolled-in words and bleeding next-segment words into prior segments; add a "Repair YT auto-captions" tool to retroactively fix already-archived videos.
 
 ```
@@ -250,39 +249,39 @@ Two parser bugs were producing visible artifacts in the Watch-view
 transcript for every YouTube-auto-captioned video:
 
 1) Untagged "rollover" words at the start of each continuation cue
-   got silently dropped from the per-word array.
+ got silently dropped from the per-word array.
 
-   YouTube auto-cap VTTs deliver each new spoken word as an
-   untagged prefix before the first <c> tag in a continuation cue,
-   e.g.:
+ YouTube auto-cap VTTs deliver each new spoken word as an
+ untagged prefix before the first <c> tag in a continuation cue,
+ e.g.:
 
-       00:00:02.639 --> 00:00:06.150
-       Okay, so today we're driving to southern
-       New<00:00:02.879><c> Jersey</c>
+ 00:00:02.639 --> 00:00:06.150
+ Okay, so today we're driving to southern
+ New<00:00:02.879><c> Jersey</c>
 
-   The Step-1b prefix-extraction was gated to cue_idx == 0, so on
-   every continuation cue the lead word ("New" here) was thrown
-   away. Visible as missing words throughout the transcript:
-   `New`, `>> Convertible?`, `for`, `aggressive,`, `weeks`,
-   `the`, `receiving`, `this`, `because`, `across`, etc. Roughly
-   one word per cue boundary disappeared.
+ The Step-1b prefix-extraction was gated to cue_idx == 0, so on
+ every continuation cue the lead word ("New" here) was thrown
+ away. Visible as missing words throughout the transcript:
+ `New`, `>> Convertible?`, `for`, `aggressive,`, `weeks`,
+ `the`, `receiving`, `this`, `because`, `across`, etc. Roughly
+ one word per cue boundary disappeared.
 
-   The fix removes the gate. The same prefix logic now runs on
-   every cue with <c> tags — the leading untagged token is
-   captured at cue_s as the genuine new word.
+ The fix removes the gate. The same prefix logic now runs on
+ every cue with <c> tags — the leading untagged token is
+ captured at cue_s as the genuine new word.
 
 2) Adjacent segments duplicated each other's first words.
 
-   Step 3 attached per-word timestamps to merged segments using a
-   ±0.5s slop window (`seg.end + 0.5` / `seg.start - 0.5`). With
-   YouTube's 10-20ms-precision timestamps, that slop pulled the
-   next segment's first 1-3 words into the prior segment's array.
-   Visible as duplications at segment boundaries:
+ Step 3 attached per-word timestamps to merged segments using a
+ ±0.5s slop window (`seg.end + 0.5` / `seg.start - 0.5`). With
+ YouTube's 10-20ms-precision timestamps, that slop pulled the
+ next segment's first 1-3 words into the prior segment's array.
+ Visible as duplications at segment boundaries:
 
-       "...southern Jersey heading to | heading to a data center"
+ "...southern Jersey heading to | heading to a data center"
 
-   The fix tightens both bounds to strict `[seg.start, seg.end)`.
-   Each word now belongs to exactly one segment.
+ The fix tightens both bounds to strict `[seg.start, seg.end)`.
+ Each word now belongs to exactly one segment.
 
 New Tool: Settings → Tools → "YT auto-captions: Repair…"
 
@@ -294,10 +293,10 @@ bookmarks all preserved). Whisper-transcribed videos auto-skipped
 via the (SOURCE) tag in the Transcript.txt header.
 
 Modal offers:
-  - Scope: All channels (default) or one specific channel
-  - Dry-run: fetch + parse only, don't write
-  - Include YT+PUNCTUATION: skipped by default (re-parsing may
-    lose punctuation a prior punct pass restored)
+ - Scope: All channels (default) or one specific channel
+ - Dry-run: fetch + parse only, don't write
+ - Include YT+PUNCTUATION: skipped by default (re-parsing may
+ lose punctuation a prior punct pass restored)
 
 Refresh a video's Watch view to see the repair land — no app
 restart needed.
@@ -313,62 +312,61 @@ Three things this build.
 
 1) Transcribe "file not found" errors when DLTRACK fires mid-merge.
 
-   Caught two SNL "Weekend Update" videos in the morning sync with
-   log lines like:
+ Caught two SNL "Weekend Update" videos in the morning sync with
+ log lines like:
 
-       Transcribe: file not found:
-         …\Weekend Update： Mr. On Blast Speaks His Mind Again Without
-            Holding Back - SNL.f135.mp4
+ Transcribe: file not found:
+ …\Weekend Update： Mr. On Blast Speaks His Mind Again Without
+ Holding Back - SNL.f135.mp4
 
-   The actual merged .mp4 was on disk (17.6 MB), but transcribe got
-   handed the .f135 intermediate path — which yt-dlp's merger had
-   since deleted. Root cause was in backend/sync.py:_scan_recent_video,
-   the last-resort fallback used when [Merger] / Destination parsing
-   can't hand us a final path. It looks for the most recent
-   .mp4/.mkv/.webm in the channel folder ctime'd within 10 min — and
-   it didn't filter yt-dlp's per-track intermediates. If DLTRACK
-   fired during the brief window where both `video.f135.mp4` (about
-   to be deleted) and the merged `video.mp4` (just written) existed,
-   scan could pick the intermediate. Then merger cleanup deletes it
-   and the transcribe worker wakes up to a dead path.
+ The actual merged .mp4 was on disk (17.6 MB), but transcribe got
+ handed the .f135 intermediate path — which yt-dlp's merger had
+ since deleted. Root cause was in backend/sync.py:_scan_recent_video,
+ the last-resort fallback used when [Merger] / Destination parsing
+ can't hand us a final path. It looks for the most recent
+ .mp4/.mkv/.webm in the channel folder ctime'd within 10 min — and
+ it didn't filter yt-dlp's per-track intermediates. If DLTRACK
+ fired during the brief window where both `video.f135.mp4` (about
+ to be deleted) and the merged `video.mp4` (just written) existed,
+ scan could pick the intermediate. Then merger cleanup deletes it
+ and the transcribe worker wakes up to a dead path.
 
-   Fix: scan now skips any filename matching `.fNNN.` or `.fNNN-X.`
-   before the extension. Both Mr. On Blast and the Xi Jinping
-   Weekend Update were re-transcribed manually after the fix.
+ Fix: scan now skips any filename matching `.fNNN.` or `.fNNN-X.`
+ before the extension. Both Mr. On Blast and the Xi Jinping
+ Weekend Update were re-transcribed manually after the fix.
 
 2) Per-video "Refresh metadata" on the grid right-click menu.
 
-   The Watch view already had a "Refresh metadata" button — fetch
-   fresh views/likes/description/top comments for one video via
-   yt-dlp and write back to the channel's aggregated Metadata.jsonl.
-   Surfaced it on the right-click context menu of every video card
-   too (Browse > channel grid AND Browse > Recent grid), in the
-   "fetch / regenerate" group between Show in Explorer and
-   Transcribe now. Works for both refreshing existing metadata and
-   filling in missing entries — fetch_single_video_metadata writes
-   a fresh row when none exists.
+ The Watch view already had a "Refresh metadata" button — fetch
+ fresh views/likes/description/top comments for one video via
+ yt-dlp and write back to the channel's aggregated Metadata.jsonl.
+ Surfaced it on the right-click context menu of every video card
+ too (Browse > channel grid AND Browse > Recent grid), in the
+ "fetch / regenerate" group between Show in Explorer and
+ Transcribe now. Works for both refreshing existing metadata and
+ filling in missing entries — fetch_single_video_metadata writes
+ a fresh row when none exists.
 
-   Toast feedback: "Refreshing metadata…" while in flight, then
-   "Metadata refreshed." or the backend's error string on completion.
-   Wrapped in try/catch with console logging so any bridge-level
-   exception surfaces as an error toast instead of silent failure.
+ Toast feedback: "Refreshing metadata…" while in flight, then
+ "Metadata refreshed." or the backend's error string on completion.
+ Wrapped in try/catch with console logging so any bridge-level
+ exception surfaces as an error toast instead of silent failure.
 
 3) Loading spinners on Browse > Channels and Browse > Recent.
 
-   During the 5–10s startup window where seedLogs is still pulling
-   channel list + recent downloads from the backend, switching to
-   Browse left the user staring at a fully blank tab — no header
-   row, no message, nothing. Easy to think the app had broken.
+ During the 5–10s startup window where seedLogs is still pulling
+ channel list + recent downloads from the backend, switching to
+ Browse left the user staring at a fully blank tab — no header
+ row, no message, nothing. Easy to think the app had broken.
 
-   Added a centered CSS spinner + "Loading channels…" /
-   "Loading recent downloads…" placeholder inside the empty grid
-   containers. Renderers all start with `el.innerHTML = ""` on
-   their first call, so the placeholder is naturally cleared the
-   moment real data lands — no JS state to manage.
+ Added a centered CSS spinner + "Loading channels…" /
+ "Loading recent downloads…" placeholder inside the empty grid
+ containers. Renderers all start with `el.innerHTML = ""` on
+ their first call, so the placeholder is naturally cleared the
+ moment real data lands — no JS state to manage.
 ```
 
-### May 16, 2026
-
+---
 #### v64.5 — Settings: clearer helper text under "Video downloads".
 
 ```
@@ -393,7 +391,7 @@ download flow (player-view Re-transcribe, "Transcribe File",
 drift-scan retranscribe, Queue Pending / Transcribe All on a
 channel, folder walk), the done line just read
 
-    — ✓ Transcription (Whisper large-v3, took 49sec, 7.7x realtime)
+ — ✓ Transcription (Whisper large-v3, took 49sec, 7.7x realtime)
 
 with no clue WHICH video had just finished. Inside the download
 flow that's fine — the "Downloaded — <title> — <channel>" line is
@@ -407,7 +405,7 @@ transcribe_folder, transcribe_retranscribe, chan_transcribe_all,
 Queue Pending, drift-scan retranscribe path) keeps the default and
 gets the new augmented line:
 
-    — ✓ Transcription — Video Title — Channel Name (Whisper large-v3, took 49sec, 7.7x realtime)
+ — ✓ Transcription — Video Title — Channel Name (Whisper large-v3, took 49sec, 7.7x realtime)
 
 Title and channel render in white (matches the download done line's
 title color); em-dashes match the existing dim style. If channel is
@@ -428,28 +426,28 @@ recovers with the correct styling for the resumed job.
 Two issues reported on a comments-refresh pass:
 
 1. Rows didn't stack vertically — the count column ("9 comments
-   refreshed", "183 comments refreshed", "355 comments refreshed")
-   was left-aligned, so the label position shifted with the count
-   width and the trailing "(took …)" cell drifted left or right
-   row-to-row.
+ refreshed", "183 comments refreshed", "355 comments refreshed")
+ was left-aligned, so the label position shifted with the count
+ width and the trailing "(took …)" cell drifted left or right
+ row-to-row.
 
 2. "N OK" cell only appeared when N > 0. Most channels showed no
-   OK at all; only the one channel with non-zero unchanged
-   videos had it. Looked like the column was missing.
+ OK at all; only the one channel with non-zero unchanged
+ videos had it. Looked like the column was missing.
 
 Fix:
 
 - Count and OK counts are now right-aligned to 4 chars so the
-   "comments refreshed" and "OK" labels start at the same column
-   across every row.
+ "comments refreshed" and "OK" labels start at the same column
+ across every row.
 - "N OK" is always shown (even at 0) whenever any fetch happened
-   — matches the activity-tab row, which already had this pattern.
+ — matches the activity-tab row, which already had this pattern.
 - "no videos in scope" and "comments refresh failed" pad to the
-   same combined width as the count+OK pair, so "(took …)" lands
-   in the same column on all row variants.
+ same combined width as the count+OK pair, so "(took …)" lands
+ in the same column on all row variants.
 - Mixed result with errors: appends "N Errors" after the OK cell;
-   pushes (took …) right for that row only — accepted since errors
-   are rare enough to warrant the visual break.
+ pushes (took …) right for that row only — accepted since errors
+ are rare enough to warrant the visual break.
 
 Matching cosmetic change on the activity-tab side: secondary cell
 wording flipped from "X unchanged" → "X OK" so both surfaces use
@@ -472,13 +470,13 @@ following it), which read like a generic captions toggle rather
 than the very specific "show the current transcript word
 superimposed on the playing video" feature it actually is.
 Renamed:
-  - Toolbar label: "Captions:" → "Overlay transcript:"
-  - Size select tooltip: "Caption size" → "Overlay text size"
-  - BG select tooltip: "Caption background style" → "Overlay
-    background style"
-  - TextTrack label registered with the <video> element (visible
-    in the browser's native captions menu if the user opens it):
-    "Word captions" → "Overlay transcript"
+ - Toolbar label: "Captions:" → "Overlay transcript:"
+ - Size select tooltip: "Caption size" → "Overlay text size"
+ - BG select tooltip: "Caption background style" → "Overlay
+ background style"
+ - TextTrack label registered with the <video> element (visible
+ in the browser's native captions menu if the user opens it):
+ "Word captions" → "Overlay transcript"
 
 No functional change; CSS classes (`.tx-hint`, data-cap-size/bg),
 settings keys (`caption_overlay_size`, `caption_overlay_bg`), and
@@ -492,9 +490,9 @@ Two regressions surfaced after v64.0's reader-path migration let
 clicks succeed during the startup sweep:
 
 - Transcript text and karaoke caption both showed every line twice
-  (cues stacked at the same playback time).
+ (cues stacked at the same playback time).
 - Source banner above the transcript ("Whisper transcription" /
-  "YouTube auto-captions") was missing.
+ "YouTube auto-captions") was missing.
 
 Not caused by v64.0 — caused by pre-existing data state where a
 video has segments rows under more than one `jsonl_path` (e.g.,
@@ -510,20 +508,20 @@ meant clicks during the sweep timed out before rendering anything.
 Fix in two matching spots:
 
 - `get_segments` (backend/index.py) — when the caller passes only
-  video_id (the Watch-view click path), pick the canonical
-  jsonl_path first via `GROUP BY jsonl_path ORDER BY MAX(id) DESC
-  LIMIT 1` (the most-recent ingest), then fetch only that
-  jsonl_path's segments. Duplicates collapse; the user sees the
-  most-recent ingest's text, which is what you'd want after a
-  retranscribe.
+ video_id (the Watch-view click path), pick the canonical
+ jsonl_path first via `GROUP BY jsonl_path ORDER BY MAX(id) DESC
+ LIMIT 1` (the most-recent ingest), then fetch only that
+ jsonl_path's segments. Duplicates collapse; the user sees the
+ most-recent ingest's text, which is what you'd want after a
+ retranscribe.
 
 - `_classify_transcript_source`'s video_id→jsonl_path lookup
-  (main.py) — added `ORDER BY s.id DESC` to the LEFT JOIN so the
-  classifier resolves to the SAME jsonl_path get_segments picks.
-  Before this, plain `LIMIT 1` could land on a stale ingest's
-  directory, miss the active Transcript.txt header, and return
-  source=unknown — losing the banner. Now both functions agree
-  on which ingest is canonical.
+ (main.py) — added `ORDER BY s.id DESC` to the LEFT JOIN so the
+ classifier resolves to the SAME jsonl_path get_segments picks.
+ Before this, plain `LIMIT 1` could land on a stale ingest's
+ directory, miss the active Transcript.txt header, and return
+ source=unknown — losing the banner. Now both functions agree
+ on which ingest is canonical.
 
 Doesn't clean up the duplicate rows themselves — that's a
 separate housekeeping pass if you want to reclaim the space.
@@ -573,10 +571,10 @@ Root cause: the v63.4 loading-state paint was wired only inside
 `_browseState.currentVideo` and call `showView("watch")` directly,
 bypassing the helper:
 
-  - video-grid card click (the main browse path — main offender)
-  - search-result hit click
-  - search-jsonl segment click
-  - filtered-grid card click
+ - video-grid card click (the main browse path — main offender)
+ - search-result hit click
+ - search-jsonl segment click
+ - filtered-grid card click
 
 Fix: extracted the paint into a `_paintWatchLoadingState(video)`
 helper and called it from `showView("watch")` itself. Every path
@@ -599,8 +597,8 @@ as a caption overlaid on the playing video, in addition to (or
 instead of) the existing transcript-pane highlight. Driven by two
 new selects in the watch-actions toolbar:
 
-  Captions: [Off / Small / Medium / Large]
-  Style:    [Translucent / Outline / None]
+ Captions: [Off / Small / Medium / Large]
+ Style: [Translucent / Outline / None]
 
 Defaults are Off (Translucent), so the feature is opt-in. Sizes
 are 16/26/40px. Translucent draws the word over a 72%-opaque black
@@ -632,44 +630,44 @@ caption_overlay_bg) and localStorage. Set once, survive restart.
 Four small player-section changes:
 
 1. The Description & comments drawer now opens by default. Was
-   collapsed since it landed — the rationale at the time was "keep
-   the transcript dominant" — but in practice the extra click on
-   every video got old. The drawer body still has its own
-   `max-height: 420px` scroll so it can't crowd out the transcript
-   pane.
+ collapsed since it landed — the rationale at the time was "keep
+ the transcript dominant" — but in practice the extra click on
+ every video got old. The drawer body still has its own
+ `max-height: 420px` scroll so it can't crowd out the transcript
+ pane.
 
 2. The `?` keyboard-shortcuts hint in the transcript header was a
-   `btn btn-ghost btn-thin` and read as a clickable action sitting
-   next to Aa- / Aa+. Re-tagged as `<span class="tx-hint">` — dim
-   16px circle, `cursor: help`, no click handler. Tooltip still
-   lists the shortcuts on hover.
+ `btn btn-ghost btn-thin` and read as a clickable action sitting
+ next to Aa- / Aa+. Re-tagged as `<span class="tx-hint">` — dim
+ 16px circle, `cursor: help`, no click handler. Tooltip still
+ lists the shortcuts on hover.
 
 3. New "Refresh metadata" button in the watch-view action row, next
-   to Re-transcribe. Runs a synchronous per-video yt-dlp fetch (top
-   50 comments, view/like counts, description) and writes back to
-   the channel's aggregated `.{ch} Metadata.jsonl`, then re-renders
-   the drawer in place. Faster and more targeted than queuing a
-   full-channel views/likes refresh when you just want fresh counts
-   for the video you're watching.
+ to Re-transcribe. Runs a synchronous per-video yt-dlp fetch (top
+ 50 comments, view/like counts, description) and writes back to
+ the channel's aggregated `.{ch} Metadata.jsonl`, then re-renders
+ the drawer in place. Faster and more targeted than queuing a
+ full-channel views/likes refresh when you just want fresh counts
+ for the video you're watching.
 
-   New Api method: `browse_refresh_video_metadata({filepath,
-   video_id, title, channel})` in main.py — delegates to
-   `backend.metadata.fetch_single_video_metadata(refresh=True)` and
-   returns the canonical on-disk entry via
-   `browse_get_video_metadata`. Frontend exposes
-   `window.loadWatchMetadataDrawer` so the button handler can
-   re-trigger the existing drawer-render path instead of forcing a
-   Back-and-reopen round-trip.
+ New Api method: `browse_refresh_video_metadata({filepath,
+ video_id, title, channel})` in main.py — delegates to
+ `backend.metadata.fetch_single_video_metadata(refresh=True)` and
+ returns the canonical on-disk entry via
+ `browse_get_video_metadata`. Frontend exposes
+ `window.loadWatchMetadataDrawer` so the button handler can
+ re-trigger the existing drawer-render path instead of forcing a
+ Back-and-reopen round-trip.
 
 4. The `.watch-actions` toolbar (Open in player / Bookmark /
-   Redownload / Re-transcribe / Refresh metadata / Speed / Follow
-   playback) used to be `flex-wrap: nowrap` with `overflow-x:
-   auto` — at narrow window widths this turned into a horizontal
-   scrollbar, which felt broken. Switched to `flex-wrap: wrap` with
-   `row-gap: 6px`. Individual buttons keep their per-element
-   `white-space: nowrap` so labels never break mid-word — the old
-   "Open\nin\nplayer" failure mode is prevented at the per-button
-   level instead of by forbidding row wrap entirely.
+ Redownload / Re-transcribe / Refresh metadata / Speed / Follow
+ playback) used to be `flex-wrap: nowrap` with `overflow-x:
+ auto` — at narrow window widths this turned into a horizontal
+ scrollbar, which felt broken. Switched to `flex-wrap: wrap` with
+ `row-gap: 6px`. Individual buttons keep their per-element
+ `white-space: nowrap` so labels never break mid-word — the old
+ "Open\nin\nplayer" failure mode is prevented at the per-button
+ level instead of by forbidding row wrap entirely.
 ```
 
 #### v63.6 — Activity log: collapse empty secondary/tertiary cells.
@@ -686,15 +684,15 @@ persisted and the adjacent dashes drifted around inside it.
 Fix is content-driven:
 
 - `buildActivityRow` in web/logs.js now tags rows with
-  `hist-no-secondary` and/or `hist-no-tertiary` when those cells
-  are empty.
+ `hist-no-secondary` and/or `hist-no-tertiary` when those cells
+ are empty.
 
 - web/styles.css adds three new grid overrides keyed off those
-  classes (one each, plus the compound case). The empty count cell
-  AND its leading em-dash separator collapse to 0 width, freeing
-  their reserved space to be redistributed across the 1fr tracks
-  (channel / primary / errors / took). Column count stays at 14 so
-  per-kind overrides still line up.
+ classes (one each, plus the compound case). The empty count cell
+ AND its leading em-dash separator collapse to 0 width, freeing
+ their reserved space to be redistributed across the 1fr tracks
+ (channel / primary / errors / took). Column count stays at 14 so
+ per-kind overrides still line up.
 
 Effect: rows now read "[Metdta] time — channel — primary —
 secondary — errors — took" with no internal dead space. At
@@ -714,23 +712,23 @@ throughout — brackets included.
 Fix touches three layers:
 
 1. `_sync_row_emit` now accepts a `bracket_tag` parameter (default
-   "sync_bracket" — preserves existing behavior for download rows).
-   The tag is forwarded to `_bracket_segments` so the `[`, `/`, `]`
-   punctuation picks up the requested color.
+ "sync_bracket" — preserves existing behavior for download rows).
+ The tag is forwarded to `_bracket_segments` so the `[`, `/`, `]`
+ punctuation picks up the requested color.
 
 2. The channel-iteration loop now computes `_ch_kind` BEFORE the
-   live-row emit (was after — couldn't kind-color the live row).
-   For metadata-family kinds (metadata, metadata_comments,
-   videoid_backfill) it sets `_row_bracket = "meta_bracket"` and
-   `_row_name_tag = "simpleline_pink"`, then passes those to the
-   live-row emit. The channel name appears pink too while work is
-   in flight.
+ live-row emit (was after — couldn't kind-color the live row).
+ For metadata-family kinds (metadata, metadata_comments,
+ videoid_backfill) it sets `_row_bracket = "meta_bracket"` and
+ `_row_name_tag = "simpleline_pink"`, then passes those to the
+ live-row emit. The channel name appears pink too while work is
+ in flight.
 
 3. Every `_sync_row_emit` call site inside the three metadata-kind
-   branches (paused / done / failed for each of metadata,
-   metadata_comments, videoid_backfill — 9 sites total) now also
-   passes `bracket_tag=_row_bracket`. Without this the done row's
-   in-place replacement would revert the brackets to green.
+ branches (paused / done / failed for each of metadata,
+ metadata_comments, videoid_backfill — 9 sites total) now also
+ passes `bracket_tag=_row_bracket`. Without this the done row's
+ in-place replacement would revert the brackets to green.
 
 Done row's channel name stays white per the original spec
 ("everything else white, errors red"). Only the live (in-flight)
@@ -745,12 +743,12 @@ Four small UI cleanups landed together.
 COMMENTS-REFRESH LOG ROW — three lines collapse into one rich line.
 
 Before:
-  [1/67] Jimmy Kimmel                          — 285 comments refreshed · 1 errors
-    — Refreshing comments for Jimmy Kimmel (last 365d)...
-    — Jimmy Kimmel: comments refreshed — 285 ok, 1 errors (took 30m 2s)
+ [1/67] Jimmy Kimmel — 285 comments refreshed · 1 errors
+ — Refreshing comments for Jimmy Kimmel (last 365d)...
+ — Jimmy Kimmel: comments refreshed — 285 ok, 1 errors (took 30m 2s)
 
 After:
-  [1/67] Jimmy Kimmel (last 365d) — 285 comments refreshed · 0 OK · 1 Errors · (took 30m 2s)
+ [1/67] Jimmy Kimmel (last 365d) — 285 comments refreshed · 0 OK · 1 Errors · (took 30m 2s)
 
 The done-row replaces the live `[1/67] Jimmy Kimmel` in place once the
 channel finishes. Color discipline: `[ / ] ( ) — ·` all pink; the
@@ -794,7 +792,7 @@ with the label and select directly adjacent.
 
 ```
 Per-channel [Metdta] rows for comments refresh were rendering as
-"813 comments refreshed  —    —    —  0 errors  —  took 1h 25m"
+"813 comments refreshed — — — 0 errors — took 1h 25m"
 with an obvious empty stretch between the count and the error cell.
 Root cause: the "X unchanged" value was being placed in the
 TERTIARY column to match the views/likes refresh convention (which
@@ -843,8 +841,7 @@ next sync_pop. The cancel-during-pause path is unchanged (those
 flags get set after this clear runs).
 ```
 
-### May 15, 2026
-
+---
 #### v62.4 — Still-on-YT card rounding + transcript source classifier fixes.
 
 ```
@@ -932,23 +929,23 @@ ACTIVITY LOG
 - Alt-row color bumped from #101520 (invisible) to #1c2433.
 - Retention bumped from 100 → 10k entries (config + JS).
 - [Metdta] rows show 'N unchanged' / 'N new' in FIXED column slots
-  so values align vertically across rows regardless of which optional
-  columns are populated. Previously 'unchanged' jumped between
-  secondary and tertiary depending on whether 'new' was present.
+ so values align vertically across rows regardless of which optional
+ columns are populated. Previously 'unchanged' jumped between
+ secondary and tertiary depending on whether 'new' was present.
 - '1 errors' → '1 error' pluralization.
 
 DIALOG SYSTEM
 -------------
 - askChoice auto-compacts to a single row [Action][Cancel] when
-  there's only one action button (no more two same-size red buttons
-  stacked vertically).
+ there's only one action button (no more two same-size red buttons
+ stacked vertically).
 - X-close dialog: [Cancel] [Close to tray] [Quit] with red Quit
-  styling. Cancel button works.
+ styling. Cancel button works.
 - 'Metadata Already Downloaded' dialog no longer has two stacked
-  Cancel buttons (removed the redundant choice).
+ Cancel buttons (removed the redundant choice).
 - Modal backdrop opacity 0.6 → 0.45 (felt like a security warning).
 - Paused-state cancel dialog: 'Clear queue' on left (red), 'Never
-  mind' on right (ghost gray).
+ mind' on right (ghost gray).
 - Close dialog body text no longer indents weirdly mid-wrap.
 
 TOOLTIP SYSTEM
@@ -964,24 +961,24 @@ SUBS TABLE
 ----------
 - 'Compres' → 'Compress' (typo in column header).
 - Compress / Transcribe / Metadata column headers AND per-cell
-  cells now have hover tooltips explaining what the A / ✓ / — marks
-  mean. Cell-level tip is value-specific ("A ✓ = auto-transcribe ON
-  and channel fully transcribed", "— -5 = 5 videos behind", etc.).
+ cells now have hover tooltips explaining what the A / ✓ / — marks
+ mean. Cell-level tip is value-specific ("A ✓ = auto-transcribe ON
+ and channel fully transcribed", "— -5 = 5 videos behind", etc.).
 
 SETTINGS
 --------
 - 'When closing window' preference moved from Appearance to General.
 - Bug fix: custom dropdown widget now repaints after settings_load.
-  Setting sel.value programmatically updated the hidden <select> but
-  the visible trigger label stayed on the HTML default. Result: a
-  user with close_behavior=quit saved in config saw the dropdown
-  showing 'Ask each time' (the default selected option) instead of
-  the actual value. Same bug affected all four Settings dropdowns
-  (Default resolution, Auto-transcribe model, Log mode, When closing
-  window) but only showed up when the saved value diverged from the
-  HTML default.
+ Setting sel.value programmatically updated the hidden <select> but
+ the visible trigger label stayed on the HTML default. Result: a
+ user with close_behavior=quit saved in config saw the dropdown
+ showing 'Ask each time' (the default selected option) instead of
+ the actual value. Same bug affected all four Settings dropdowns
+ (Default resolution, Auto-transcribe model, Log mode, When closing
+ window) but only showed up when the saved value diverged from the
+ HTML default.
 - Sub-nav active tab: green-tinted bg + brighter text + 3px accent
-  border. Previously a near-invisible underline only.
+ border. Previously a near-invisible underline only.
 
 DIAGNOSTICS DIALOG
 ------------------
@@ -1012,22 +1009,22 @@ clean. No complex jargon. no backend function name calling."
 
 Audit + fixes:
 - Backend error messages cleaned of tool-name jargon (yt-dlp,
-  Whisper, ffmpeg, output_dir, bulk-stats, fast-fetch, spawn failed,
-  Backfill / Compress prefixes) for Simple mode. Technical details
-  preserved on a parallel 'dim'-tagged line visible only in Verbose.
-  18 sites rewritten.
+ Whisper, ffmpeg, output_dir, bulk-stats, fast-fetch, spawn failed,
+ Backfill / Compress prefixes) for Simple mode. Technical details
+ preserved on a parallel 'dim'-tagged line visible only in Verbose.
+ 18 sites rewritten.
 - Verbose mode beefed up in compress.py (full ffmpeg cmd, duration
-  probe result, codec verification, bitrate calcs, encoder flags),
-  reorg.py (per-video folder-routing decisions, mtime sources,
-  skip reasons), metadata.py (per-video diff trace during bulk
-  refresh — old→new view counts + decision), redownload.py (full
-  yt-dlp cmd, format selection, url, output path).
+ probe result, codec verification, bitrate calcs, encoder flags),
+ reorg.py (per-video folder-routing decisions, mtime sources,
+ skip reasons), metadata.py (per-video diff trace during bulk
+ refresh — old→new view counts + decision), redownload.py (full
+ yt-dlp cmd, format selection, url, output path).
 - yt-dlp stderr captured on bulk-stats failure (was DEVNULL'd) and
-  emitted on Verbose-only 'dim' lines so users in Verbose mode can
-  actually debug failures.
+ emitted on Verbose-only 'dim' lines so users in Verbose mode can
+ actually debug failures.
 - 'Bulk-stats returned no data for X' wording (jargon) replaced with
-  Simple-mode 'Initial check unsuccessful for X — trying per-video
-  lookup…' + Verbose-only follow-up with the technical detail.
+ Simple-mode 'Initial check unsuccessful for X — trying per-video
+ lookup…' + Verbose-only follow-up with the technical detail.
 
 METADATA REFRESH
 ----------------
@@ -1057,22 +1054,21 @@ MISC
 ----
 - .spinner-inline reusable CSS class for any inline loading state.
 - Watch action button row scrolls horizontally at narrow widths
-  instead of wrapping individual button labels mid-word.
+ instead of wrapping individual button labels mid-word.
 ```
 
-### April 25, 2026
-
+---
 #### v58.1 — Drop visible orphan progress lines (simple-mode log clean-up).
 
 ```
 Symptom: visible "Downloading #N 100%" orphan lines persisting
 between real done-lines. Example:
 
-  [4/84] Dr Insanity        — 1 new video
-   — Downloading #0 100%       <-- orphan, never replaced
-   — Downloading #1 100%       <-- orphan, never replaced
-   — ✓ Transcription ...
-   — ✓ Metadata downloaded
+ [4/84] Dr Insanity — 1 new video
+ — Downloading #0 100% <-- orphan, never replaced
+ — Downloading #1 100% <-- orphan, never replaced
+ — ✓ Transcription ...
+ — ✓ Metadata downloaded
 
 Two distinct sources, both fixed:
 
@@ -1139,17 +1135,17 @@ call site, every DB op serialized.
 FIX
 ---
 - New _open_independent() returns a fresh sqlite3.Connection
-  (separate from the shared _conn). Same WAL + synchronous PRAGMAs,
-  longer 30s timeout (vs 10s on the shared) since it'll be making
-  lots of writes back to back.
+ (separate from the shared _conn). Same WAL + synchronous PRAGMAs,
+ longer 30s timeout (vs 10s on the shared) since it'll be making
+ lots of writes back to back.
 - register_video and ingest_jsonl gained an optional _conn_override
-  parameter. When supplied, they use that connection AND skip
-  _db_lock (via contextlib.nullcontext). When not, original
-  behavior preserved (shared conn + lock).
+ parameter. When supplied, they use that connection AND skip
+ _db_lock (via contextlib.nullcontext). When not, original
+ behavior preserved (shared conn + lock).
 - sweep_new_videos opens its own connection and passes it through
-  to its register_video / ingest_jsonl calls. The shared connection's
-  schema-init still runs first via _open() so PRAGMAs and tables
-  exist. The sweep's connection is closed at the end (best-effort).
+ to its register_video / ingest_jsonl calls. The shared connection's
+ schema-init still runs first via _open() so PRAGMAs and tables
+ exist. The sweep's connection is closed at the end (best-effort).
 
 EFFECT
 ------
@@ -1175,73 +1171,73 @@ is the canonical example).
 CRITICAL — silent failure / state corruption (4)
 ------------------------------------------------
 - U-1 queue drag-drop cross-queue contamination: drag payload now
-  JSON {queueKind, idx} so a Sync row dropped on a GPU row gets
-  refused with a toast instead of corrupting the wrong queue's
-  state via wrong-index splice.
+ JSON {queueKind, idx} so a Sync row dropped on a GPU row gets
+ refused with a toast instead of corrupting the wrong queue's
+ state via wrong-index splice.
 - U-2 drag-reorder backend notify: calls queues_sync_reorder /
-  queues_gpu_reorder after the local splice. Was reordering
-  visually for one frame, then snapping back on the next backend
-  push because the backend never knew.
+ queues_gpu_reorder after the local splice. Was reordering
+ visually for one frame, then snapping back on the next backend
+ push because the backend never knew.
 - U-3 video_delete_file API added in main.py. The Browse grid
-  right-click Delete file silently failed because the bridge call
-  had no backing method. New method mirrors recent_delete_file's
-  sidecar cleanup (audit F-24 list) plus drops the index DB row.
+ right-click Delete file silently failed because the bridge call
+ had no backing method. New method mirrors recent_delete_file's
+ sidecar cleanup (audit F-24 list) plus drops the index DB row.
 - U-4 video_redownload API added in main.py. The Watch view
-  Redownload button silently failed for the same reason. New
-  method looks up the video's channel via the index DB and
-  delegates to backend/redownload.py.
+ Redownload button silently failed for the same reason. New
+ method looks up the video's channel via the index DB and
+ delegates to backend/redownload.py.
 
 HIGH — action runs but does the wrong thing / fires in wrong context (5)
 ------------------------------------------------------------------------
 - U-5 edit-channel dup check: subs_check_duplicate now takes an
-  optional exclude_identity parameter so the channel being edited
-  isn't flagged as a duplicate of itself. Frontend now runs the
-  check on Edit too; was Add-only.
+ optional exclude_identity parameter so the channel being edited
+ isn't flagged as a duplicate of itself. Frontend now runs the
+ check on Edit too; was Add-only.
 - U-6 misleading "Try anyway" override removed. Backend rejects
-  real duplicates regardless, so offering it as a button lied to
-  the user. Replaced with a hard-block info dialog that tells the
-  user to resolve the conflict.
+ real duplicates regardless, so offering it as a button lied to
+ the user. Replaced with a hard-block info dialog that tells the
+ user to resolve the conflict.
 - U-7 Whisper model hot-apply: settings_save now calls
-  TranscribeManager.swap_model when the model changed, so the next
-  job uses the new model. Was only applying after a full app
-  restart — config persisted, but the manager's loaded subprocess
-  kept using the OLD model.
+ TranscribeManager.swap_model when the model changed, so the next
+ job uses the new model. Was only applying after a full app
+ restart — config persisted, but the manager's loaded subprocess
+ kept using the OLD model.
 - U-8 modal-aware keyboard shortcut gate: when an askq backdrop is
-  open, every shortcut except Esc/Enter is blocked. Ctrl+S during
-  a confirm dialog was firing Sync Subbed mid-confirmation.
+ open, every shortcut except Esc/Enter is blocked. Ctrl+S during
+ a confirm dialog was firing Sync Subbed mid-confirmation.
 - U-9 number-key tab switch (1-4) also blocked while modal open
-  (same gate as U-8). Was leaving the modal floating over the
-  wrong tab and breaking modal exclusivity.
+ (same gate as U-8). Was leaving the modal floating over the
+ wrong tab and breaking modal exclusivity.
 
 MEDIUM — UX gaps / opaque feedback / risky defaults (4)
 -------------------------------------------------------
 - U-10 askDanger focuses Cancel by default. Enter no longer
-  triggers the destructive action. Non-danger dialogs keep
-  Confirm focused so the common-case "yes" flow stays one-key fast.
+ triggers the destructive action. Non-danger dialogs keep
+ Confirm focused so the common-case "yes" flow stays one-key fast.
 - U-11 backup restore preview. New import_full_backup_preview()
-  reads the ZIP manifest read-only and returns file list + sizes
-  + dates. Frontend renders a confirmation modal with the
-  contents BEFORE committing the restore. import_full_backup()
-  now accepts an optional zip_path argument so the
-  preview-confirmed path is passed straight in without re-opening
-  the file picker.
+ reads the ZIP manifest read-only and returns file list + sizes
+ + dates. Frontend renders a confirmation modal with the
+ contents BEFORE committing the restore. import_full_backup()
+ now accepts an optional zip_path argument so the
+ preview-confirmed path is passed straight in without re-opening
+ the file picker.
 - U-13 channels_import surfaces per-skip reasons in a modal
-  grouped by reason ("already subscribed", "missing URL",
-  "URL doesn't look like a YouTube link", etc.) instead of a bare
-  "5 skipped" count. Backend already returned skipped_reasons;
-  frontend was discarding them.
+ grouped by reason ("already subscribed", "missing URL",
+ "URL doesn't look like a YouTube link", etc.) instead of a bare
+ "5 skipped" count. Backend already returned skipped_reasons;
+ frontend was discarding them.
 - U-14 archive root + video downloads fields now have help text
-  explaining the change only affects NEW downloads, not existing
-  files. CSS .edit-gh class added for spanning hint paragraphs
-  under settings fields.
+ explaining the change only affects NEW downloads, not existing
+ files. CSS .edit-gh class added for spanning hint paragraphs
+ under settings fields.
 
 NOT A BUG (skipped)
 -------------------
 - U-12 (auto_index_* fields not loaded into General tab Settings):
-  they live in the Index sub-view, not General. They ARE loaded
-  via the Index sub-view's own loadSavedAuto() on boot, and the
-  General-tab Save handler doesn't include them in payload, so
-  there's no overwrite risk. Audit conflated the two views.
+ they live in the Index sub-view, not General. They ARE loaded
+ via the Index sub-view's own loadSavedAuto() on boot, and the
+ General-tab Save handler doesn't include them in payload, so
+ there's no overwrite risk. Audit conflated the two views.
 
 Verified: build is 31 MB (correct = pywebview bundled). Wrong-
 Python build would be 28.8 MB and pop the "requires pywebview"
@@ -1260,7 +1256,7 @@ ROOT CAUSE
 queues.sync_remove(url) and gpu_remove(task_id) used list-
 comprehension filters that dropped EVERY row matching the
 identifier:
-  self.sync = [c for c in self.sync if c.get("url") != url]
+ self.sync = [c for c in self.sync if c.get("url") != url]
 The X click is a per-row action, so even first-match would be
 wrong (would delete the FIRST duplicate when the user clicked
 the second). Index-based removal with an identity guard is the
@@ -1269,26 +1265,25 @@ correct semantic.
 FIX
 ---
 - New queues.sync_remove_at(idx, expected_url, expected_name)
-  and queues.gpu_remove_at(idx, expected_path, expected_bulk_id)
-  remove exactly the slot at that index. Identity guard refuses
-  the delete if the slot doesn't match the expected hint so a
-  race-shifted queue can't drop the wrong row.
+ and queues.gpu_remove_at(idx, expected_path, expected_bulk_id)
+ remove exactly the slot at that index. Identity guard refuses
+ the delete if the slot doesn't match the expected hint so a
+ race-shifted queue can't drop the wrong row.
 - New Api wrappers queues_sync_remove_at / queues_gpu_remove_at
-  in main.py.
+ in main.py.
 - logs.js X-click handler passes the BACKEND queue index (popover
-  display index minus the count of running rows shown above —
-  current_sync / current_gpu live in their own fields, not in
-  queues.sync / queues.gpu).
+ display index minus the count of running rows shown above —
+ current_sync / current_gpu live in their own fields, not in
+ queues.sync / queues.gpu).
 - X button hidden on the running row entirely. That row's item
-  isn't in queues.* at all, so an index-based delete on it would
-  silently drop the next-queued item. For running items the user
-  should use the right-click context menu's Skip / Cancel.
+ isn't in queues.* at all, so an index-based delete on it would
+ silently drop the next-queued item. For running items the user
+ should use the right-click context menu's Skip / Cancel.
 - Legacy URL-based remove updated to first-match-only as well so
-  the name-fallback in main.py stops multi-deleting too.
+ the name-fallback in main.py stops multi-deleting too.
 ```
 
-### April 24, 2026
-
+---
 #### v57.7 — Metadata tab loading fix + universal "Xm YYs" duration format.
 
 ```
@@ -1300,13 +1295,13 @@ Per the design rule: "always fold into Xm XXs" / "this rule should apply
 everywhere". Bare "201s" should never appear in the UI.
 
 - utils.py: new format_elapsed(secs) helper. Rules:
-  * < 60s        -> "Xs"            ("47s")
-  * < 1h         -> "Xm YYs"        ("3m 21s", zero-padded)
-  * >= 1h        -> "Xh Ym YYs"     ("1h 5m 03s")
+ * < 60s -> "Xs" ("47s")
+ * < 1h -> "Xm YYs" ("3m 21s", zero-padded)
+ * >= 1h -> "Xh Ym YYs" ("1h 5m 03s")
 - metadata.py heartbeat uses it. The "(201s)" elapsed marker on
-  the metadata-refresh in-place line becomes "(3m 21s)".
+ the metadata-refresh in-place line becomes "(3m 21s)".
 - Frontend mirrors the same formatter (JS _fmtElapsed) so the
-  Loading... counter follows the same rule.
+ Loading... counter follows the same rule.
 
 METADATA TAB LOADING (root cause)
 ---------------------------------
@@ -1314,24 +1309,24 @@ The Settings > Metadata table sometimes appeared hung at "Loading..."
 for 30+ seconds. Two issues, both fixed:
 
 1. count_video_id_status ran 3 COUNT(*) queries against the 9M+ row
-   videos table per channel. With 100+ channels that was 300+
-   serialized queries holding the FTS DB lock — visibly hung when
-   another op (sweep, ingest, startup-time backfill_upload_ts) was
-   contending for the same lock.
+ videos table per channel. With 100+ channels that was 300+
+ serialized queries holding the FTS DB lock — visibly hung when
+ another op (sweep, ingest, startup-time backfill_upload_ts) was
+ contending for the same lock.
 2. The first attempted optimization used GROUP BY LOWER(channel) —
-   which forces a full table scan because LOWER() defeats the
-   existing idx_vid_channel index. Still slow.
+ which forces a full table scan because LOWER() defeats the
+ existing idx_vid_channel index. Still slow.
 
 Fix:
 - New count_video_id_status_bulk() collapses to ONE GROUP BY
-   channel query covering every channel.
+ channel query covering every channel.
 - Critically uses GROUP BY channel (raw column) so idx_vid_channel
-  actually serves the query. Case-folding happens in Python after
-  the result lands — case-variant channel names are merged by
-  summing counts under the lowercased key.
+ actually serves the query. Case-folding happens in Python after
+ the result lands — case-variant channel names are merged by
+ summing counts under the lowercased key.
 - main.py:get_channel_metadata_status uses the bulk path, falls
-  back to the per-channel query only when a channel doesn't appear
-  in the bulk lookup (rare case-drift).
+ back to the per-channel query only when a channel doesn't appear
+ in the bulk lookup (rare case-drift).
 
 LOADING... ENHANCEMENT
 ----------------------
@@ -1339,15 +1334,15 @@ So the table doesn't sit silent during a slow query (which can
 still happen during boot when startup tasks hold the lock):
 
 - Live elapsed counter ticks every second in the empty-row td:
-  "Loading channels... (3s)"
+ "Loading channels... (3s)"
 - At > 10s: appends "querying the index DB...".
 - At > 30s: explains "a startup task (backfill / sweep / preload)
-  is likely holding the lock; this clears once the green
-  'Browse preload complete' indicator appears" — points the user
-  at the indicator that signals when it's safe.
+ is likely holding the lock; this clears once the green
+ 'Browse preload complete' indicator appears" — points the user
+ at the indicator that signals when it's safe.
 - styles.css: dim/smaller .md-load-info span so the secondary
-  status text doesn't compete with "Loading channels..." for
-  visual weight.
+ status text doesn't compete with "Loading channels..." for
+ visual weight.
 ```
 
 #### v57.5 — Move "Browse tab preload complete" off the activity log.
@@ -1362,17 +1357,17 @@ browse-preload indicator slot, replacing the live
 Implementation
 --------------
 - main.py: dropped the s.emit_text() green emit at end of stage 3.
-  Captures n_ch / n_vids from index_summary into stage-local vars
-  instead.
+ Captures n_ch / n_vids from index_summary into stage-local vars
+ instead.
 - After stage3_done.set(), wait 0.5s (longer than the animator's
-  0.4s sleep cycle) so its loop definitely sees the flag and exits
-  BEFORE we push the persistent completion text. Without this, the
-  animator's last in-flight iteration could race-overwrite the text
-  with a stale "Preloading Browse..." line.
+ 0.4s sleep cycle) so its loop definitely sees the flag and exits
+ BEFORE we push the persistent completion text. Without this, the
+ animator's last in-flight iteration could race-overwrite the text
+ with a stale "Preloading Browse..." line.
 - Removed the animator's own _push_indicator(slot, None) cleanup on
-  loop exit — caller (post-stage-3 block) now owns the final
-  indicator state. Sweep slot is hidden, preload slot gets the
-  completion text.
+ loop exit — caller (post-stage-3 block) now owns the final
+ indicator state. Sweep slot is hidden, preload slot gets the
+ completion text.
 - CSS unchanged: .preload-indicator already styled dim italic.
 ```
 
@@ -1386,73 +1381,73 @@ weren't pushed individually.
 PAUSE-PENDING FEEDBACK
 ----------------------
 - Resume button BLINKS when you click Pause but the worker is still
-  finishing its current operation (e.g. mid-channel during a
-  metadata refresh that takes minutes per channel). Goes solid
-  Resume the moment the worker actually parks at its pause-wait.
+ finishing its current operation (e.g. mid-channel during a
+ metadata refresh that takes minutes per channel). Goes solid
+ Resume the moment the worker actually parks at its pause-wait.
 - Held visible for a minimum 1.5s after the click so a fast
-  pause-handshake (yt-dlp streaming output, per-line check fires
-  within ~50ms) doesn't skip the user-visible feedback.
+ pause-handshake (yt-dlp streaming output, per-line check fires
+ within ~50ms) doesn't skip the user-visible feedback.
 - Worker hooks added across every wait site that could keep the
-  user waiting > 1 second:
-  * sync.py: _wait_if_paused (between channels)
-  * transcribe.py: outer between-jobs gate, per-chunk wait inside
-    chunked transcription, per-segment wait inside the chunk's
-    read loop
-  * metadata.py: _flat_playlist_bulk_stats catalog walk,
-    bulk_refresh_views_likes per-video re-fetch, fetch_metadata_for_videos
-    outer + inner waits, backfill_video_ids per-file,
-    refresh_channel_comments per-video
-  * redownload.py: _fetch_yt_catalog walk, pause-on-entry,
-    per-file pause between videos
+ user waiting > 1 second:
+ * sync.py: _wait_if_paused (between channels)
+ * transcribe.py: outer between-jobs gate, per-chunk wait inside
+ chunked transcription, per-segment wait inside the chunk's
+ read loop
+ * metadata.py: _flat_playlist_bulk_stats catalog walk,
+ bulk_refresh_views_likes per-video re-fetch, fetch_metadata_for_videos
+ outer + inner waits, backfill_video_ids per-file,
+ refresh_channel_comments per-video
+ * redownload.py: _fetch_yt_catalog walk, pause-on-entry,
+ per-file pause between videos
 - New "Paused at H:MMpm — <channel> (<operation>) — click Resume."
-  + "Resumed at H:MMpm." log lines for every metadata wait site
-  via _enter_pause_wait / _exit_pause_wait helpers. You can see
-  pause take effect in the activity log, not just via the button.
+ + "Resumed at H:MMpm." log lines for every metadata wait site
+ via _enter_pause_wait / _exit_pause_wait helpers. You can see
+ pause take effect in the activity log, not just via the button.
 - Fixed a related bug: metadata / metadata_comments / videoid_backfill
-  kinds were not calling set_current_sync, so the Sync Tasks popover
-  head row stayed empty during those passes — which broke the blink
-  condition (paintBlinkState requires a running head row to compute
-  sync_running=true). Now sets it for non-download kinds too.
+ kinds were not calling set_current_sync, so the Sync Tasks popover
+ head row stayed empty during those passes — which broke the blink
+ condition (paintBlinkState requires a running head row to compute
+ sync_running=true). Now sets it for non-download kinds too.
 - CSS: .btn-pause.pause-pending + .popover-footer-btn.pause-pending
-  blink animation between green and blue at 1s cycle. Honors
-  @media (prefers-reduced-motion: reduce) with a solid teal
-  fallback so the state is still distinguishable without motion.
+ blink animation between green and blue at 1s cycle. Honors
+ @media (prefers-reduced-motion: reduce) with a solid teal
+ fallback so the state is still distinguishable without motion.
 
 METADATA REFRESH HEARTBEAT
 --------------------------
 - bulk_refresh_views_likes spawns a daemon heartbeat thread that
-  re-emits the in-place "Refreshing X..." line every 3 seconds with
-  elapsed time + current sub-phase. No more silent freezes on cold
-  yt-dlp startup or during the long re-fetch loop.
+ re-emits the in-place "Refreshing X..." line every 3 seconds with
+ elapsed time + current sub-phase. No more silent freezes on cold
+ yt-dlp startup or during the long re-fetch loop.
 - Phases the heartbeat surfaces:
-    * "fetching catalog from YouTube"
-    * "matching local files"
-    * "writing updated counts"
-    * "re-fetching details for N updated videos"
-    * "refreshing metadata [N/total]"
+ * "fetching catalog from YouTube"
+ * "matching local files"
+ * "writing updated counts"
+ * "re-fetching details for N updated videos"
+ * "refreshing metadata [N/total]"
 - Catalog count is folded into the heartbeat phase string:
-    "Refreshing Bernie Sanders -- fetching catalog from YouTube
-     . 2,500 videos in catalog (54s)"
-  instead of a separate competing in-place line. One active line
-  per channel rather than two side-by-side.
+ "Refreshing Bernie Sanders -- fetching catalog from YouTube
+ . 2,500 videos in catalog (54s)"
+ instead of a separate competing in-place line. One active line
+ per channel rather than two side-by-side.
 - _flat_playlist_bulk_stats accepts a progress_cb. When provided,
-  it skips its own backfill_progress emit and calls the callback
-  instead. Other callers (backfill_video_ids) unaffected.
+ it skips its own backfill_progress emit and calls the callback
+ instead. Other callers (backfill_video_ids) unaffected.
 - Heartbeat stops cleanly before the final clear_line + summary
-  so it doesn't double-paint over the completion line.
+ so it doesn't double-paint over the completion line.
 
 INDEX STATISTICS PANEL
 ----------------------
 - Backend split: archive_scan.index_summary() returns ONLY the
-  fast basics (channels, videos, total size, transcribed %).
-  The slow FTS DB queries (COUNT(*) over millions of segments +
-  duration sum + DB file stat) moved to a separate
-  archive_scan.index_db_stats() helper.
+ fast basics (channels, videos, total size, transcribed %).
+ The slow FTS DB queries (COUNT(*) over millions of segments +
+ duration sum + DB file stat) moved to a separate
+ archive_scan.index_db_stats() helper.
 - main.py: new get_index_db_stats Api method.
 - app.js Settings panel: renders index_summary basics IMMEDIATELY,
-  then async-fetches index_db_stats and re-renders Segments /
-  Hours of video / Index DB size when ready. Shows "loading..."
-  for those rows in the interim.
+ then async-fetches index_db_stats and re-renders Segments /
+ Hours of video / Index DB size when ready. Shows "loading..."
+ for those rows in the interim.
 
 STARTUP REGRESSION FIX
 ----------------------
@@ -1478,134 +1473,134 @@ modes, edge cases, and missing error feedback.
 CRITICAL
 --------
 - recent_delete_file now checks save_config return so a successful
-  file deletion + failed config write doesn't leave a stale entry
-  in recent_downloads pointing to a missing file.
+ file deletion + failed config write doesn't leave a stale entry
+ in recent_downloads pointing to a missing file.
 - queue_auto_set returns failure when persistence fails (was
-  returning {ok: True, enabled: ...} even on silent save failure;
-  UI showed the toggle ON but the state didn't survive restart).
+ returning {ok: True, enabled: ...} even on silent save failure;
+ UI showed the toggle ON but the state didn't survive restart).
 - _try_auto_captions no longer raises NameError on VTT parse
-  failure (the fallback emit referenced self in a standalone
-  function — the outer try/except swallowed the error so users
-  silently fell through to Whisper instead of seeing the parse
-  failure).
+ failure (the fallback emit referenced self in a standalone
+ function — the outer try/except swallowed the error so users
+ silently fell through to Whisper instead of seeing the parse
+ failure).
 - Subs table refresh after channel-redownload-cancel uses the
-  correct function name (typo: _refreshSubsTable -> refreshSubsTable).
+ correct function name (typo: _refreshSubsTable -> refreshSubsTable).
 - repair_metadata_mismatches.py: phase 1 commits deferred until
-  phase 2 succeeds so a phase-2 crash rolls back cleanly instead
-  of leaving the archive half-fixed.
+ phase 2 succeeds so a phase-2 crash rolls back cleanly instead
+ of leaving the archive half-fixed.
 - cleanup_dup_transcripts.py: argparse default=True on --dry-run
-  cleaned up to make the mutually exclusive group behave as
-  advertised.
+ cleaned up to make the mutually exclusive group behave as
+ advertised.
 - transcribe_translate.py: ffmpeg failure now surfaces explicit
-  error instead of silently failing later in wave.open.
+ error instead of silently failing later in wave.open.
 
 HIGH (~20)
 ----------
 - set_batch_cooldown URL match normalizes trailing slash + scheme
-  + www variants so the 72h cooldown actually persists on
-  >100k-channel bootstrap runs (was silently no-op'ing for
-  URLs that didn't string-match exactly).
+ + www variants so the 72h cooldown actually persists on
+ >100k-channel bootstrap runs (was silently no-op'ing for
+ URLs that didn't string-match exactly).
 - whisper_worker accepts per-job language override (was hardcoded
-  to "en", forcing all transcriptions through English even for
-  non-English content).
+ to "en", forcing all transcriptions through English even for
+ non-English content).
 - transcribe pending journal persists bulk_total + bulk_index AND
-  deletes the journal after recovery so a second crash doesn't
-  re-enqueue the same jobs (previously bulk count metadata was
-  lost on restart and recovery could double-enqueue).
+ deletes the journal after recovery so a second crash doesn't
+ re-enqueue the same jobs (previously bulk count metadata was
+ lost on restart and recovery could double-enqueue).
 - get_segments uses AND across multiple filters (was OR — when
-  main.py passed both video_id AND jsonl_path, segments from
-  other videos sharing a combined transcript path got mashed in).
+ main.py passed both video_id AND jsonl_path, segments from
+ other videos sharing a combined transcript path got mashed in).
 - queue save_debounced re-arms the timer on each call so bursty
-  edits coalesce correctly into one save AFTER the burst quiets
-  (early-return on existing-timer was losing late edits).
+ edits coalesce correctly into one save AFTER the burst quiets
+ (early-return on existing-timer was losing late edits).
 - seen_filters lookup is now O(1) via a parallel lowercase set
-  (previously rebuilt the entire lowercase set on every is_seen
-  call — meaningful CPU on a thousands-entry filter file).
+ (previously rebuilt the entire lowercase set on every is_seen
+ call — meaningful CPU on a thousands-entry filter file).
 - redownload title fuzzy match NFC-normalizes both sides so
-  non-ASCII titles ("Cafe" vs "Cafe" with composed/decomposed
-  accents) match across composed/decomposed Unicode forms.
+ non-ASCII titles ("Cafe" vs "Cafe" with composed/decomposed
+ accents) match across composed/decomposed Unicode forms.
 - channel_art surfaces partial download failures (failed avatar
-  + successful banner now returns ok=True + partial=True instead
-  of silently hiding the broken-image icon in Browse).
+ + successful banner now returns ok=True + partial=True instead
+ of silently hiding the broken-image icon in Browse).
 - archive_scan logs 0-byte phantom video files (previously
-  silently dropped from counts; orphans on disk had no signal).
+ silently dropped from counts; orphans on disk had no signal).
 - compress emits the first progress sample regardless of % 5
-  boundary so fast encodes don't appear stuck at 0% all the way
-  through.
+ boundary so fast encodes don't appear stuck at 0% all the way
+ through.
 - autorun returns overdue_seconds alongside seconds_remaining so
-  overdue tasks (system asleep past fire time, blocking modal)
-  aren't masked as "0 seconds remaining".
+ overdue tasks (system asleep past fire time, blocking modal)
+ aren't masked as "0 seconds remaining".
 - net.probe_once spawns the 3 host probes in parallel so a slow
-  Cloudflare DNS doesn't block reaching youtube.com (could
-  falsely report "network down" when YouTube was reachable).
+ Cloudflare DNS doesn't block reaching youtube.com (could
+ falsely report "network down" when YouTube was reachable).
 - window_state visibility floor raised from 100x100 to 250x150 px
-  so windows don't restore as a tiny ungrabbable sliver on a
-  smaller external monitor.
+ so windows don't restore as a tiny ungrabbable sliver on a
+ smaller external monitor.
 - drift_scan dedup normalizes paths via normcase + normpath so
-  case-drift on Windows ("C:\\Path" vs "c:\\path") doesn't inflate
-  the distinct count.
+ case-drift on Windows ("C:\\Path" vs "c:\\path") doesn't inflate
+ the distinct count.
 - app.js: search-context-pagination + livestream button handlers
-  wrapped in try/catch so API rejections show a toast instead of
-  silently dying mid-flow.
+ wrapped in try/catch so API rejections show a toast instead of
+ silently dying mid-flow.
 - backfill_channel_art logs download failures + mtime-check errors
-  instead of swallowing them (no more silent FAILs with no detail).
+ instead of swallowing them (no more silent FAILs with no detail).
 - cleanup_dup_transcripts whisper_score has a deterministic
-  title-based tiebreaker so consecutive runs pick the same winner
-  for tied groups (previously dict iteration order made it
-  non-deterministic).
+ title-based tiebreaker so consecutive runs pick the same winner
+ for tied groups (previously dict iteration order made it
+ non-deterministic).
 
 MEDIUM (~10)
 -----------
 - Legacy duration migration emits a dim warning so users see the
-  sub-1-min upgrade instead of wondering why filtering changed.
+ sub-1-min upgrade instead of wondering why filtering changed.
 - Punctuation timeout flag surfaces in the result dict so the
-  source tag can distinguish timeout vs other failure vs success.
+ source tag can distinguish timeout vs other failure vs success.
 - list_videos_for_channel uses COLLATE NOCASE on the channel match
-  so duplicate filtering catches case-drifted rows.
+ so duplicate filtering catches case-drifted rows.
 - search_fts returns [] on FTS error instead of [{"error": ...}],
-  which would KeyError when callers iterated and accessed
-  r["segment_id"] on the error sentinel.
+ which would KeyError when callers iterated and accessed
+ r["segment_id"] on the error sentinel.
 - ingest_jsonl returns the actual inserted-row count, not the
-  raw segment count from the JSONL (empty-text segments were
-  inflating the reported "ingested" total).
+ raw segment count from the JSONL (empty-text segments were
+ inflating the reported "ingested" total).
 - Settings Save button disables during the in-flight save so
-  fast double-clicks don't queue duplicate writes.
+ fast double-clicks don't queue duplicate writes.
 
 WAVE 5 / POLISH
 ---------------
 - sync.py emits a fallback "#N" progress label when Destination
-  line for the counter hasn't been processed yet (instead of
-  silently dropping the tick — UI looked stuck while a video
-  was actually downloading).
+ line for the counter hasn't been processed yet (instead of
+ silently dropping the tick — UI looked stuck while a video
+ was actually downloading).
 - FTS index sync failure during transcribe is now a warning
-  (was emit_dim — invisible in Simple log mode while the
-  transcript silently went unindexed).
+ (was emit_dim — invisible in Simple log mode while the
+ transcript silently went unindexed).
 - upload_ts mtime fallback flagged in the row so the UI can
-  indicate "estimated date" instead of treating it as real.
+ indicate "estimated date" instead of treating it as real.
 - compress redo-on-larger fallback defaults to idx=0 (most
-  generous) on unknown quality instead of idx=1 (Average) which
-  silently demoted the user further down.
+ generous) on unknown quality instead of idx=1 (Average) which
+ silently demoted the user further down.
 - logs.js mini-log clones strip aria-* + role attributes so
-  screen readers don't announce the same line twice.
+ screen readers don't announce the same line twice.
 - cleanup_dup_transcripts logs malformed JSONL lines so users
-  know the file is partially corrupt instead of silently
-  preserving them as-is.
+ know the file is partially corrupt instead of silently
+ preserving them as-is.
 - app.js compress dry-run summary uses null-coalescing on
-  t.videos / t.hours so "undefined" doesn't render in the totals.
+ t.videos / t.hours so "undefined" doesn't render in the totals.
 
 STATISTICS PANEL (Settings -> Index)
 ------------------------------------
 - Segments and Hours of video now populate (were blank — backend
-  didn't provide them; frontend rendered "--" for both).
+ didn't provide them; frontend rendered "--" for both).
 - "Total size: 4.3 TB" replaced with "Index DB size: 15.8 GB"
-  (the actual .db file size). The Index Statistics panel
-  describes the searchable index, not the underlying archive —
-  showing the 4 TB archive size in this context was misleading.
+ (the actual .db file size). The Index Statistics panel
+ describes the searchable index, not the underlying archive —
+ showing the 4 TB archive size in this context was misleading.
 - Index DB size pulled from the live transcription_index.db
-  file size on disk; segments + hours from the FTS DB
-  (segments count + sum of videos.duration_s with fallback to
-  MAX(segments.end_time) per video for rows where duration_s
-  is NULL).
+ file size on disk; segments + hours from the FTS DB
+ (segments count + sum of videos.duration_s with fallback to
+ MAX(segments.end_time) per video for rows where duration_s
+ is NULL).
 ```
 
 #### v56.7 — Backfill: in-place progress + high-confidence fuzzy escape.
@@ -1660,17 +1655,17 @@ in under five minutes on the new resolver.
 BACKFILL STRATEGIES (in order)
 ------------------------------
 1. .info.json sidecar -- if yt-dlp wrote one next to the
-   video, the id field is used directly. Zero network.
+ video, the id field is used directly. Zero network.
 2. Exact normalized-title match against the current flat-
-   playlist.
+ playlist.
 3. Substring title match -- one side contains the other with
-   length ratio >= 0.7. Requires date agreement.
+ length ratio >= 0.7. Requires date agreement.
 4. Date + duration match -- file mtime day -> upload_date;
-   duration (within 2s) disambiguates same-day candidates.
+ duration (within 2s) disambiguates same-day candidates.
 5. Fuzzy title match via difflib.get_close_matches at 0.80
-   cutoff. All candidates above the cutoff are date-filtered
-   and the winner must be either the only one to pass date
-   OR be 0.05 clear of the runner-up.
+ cutoff. All candidates above the cutoff are date-filtered
+ and the winner must be either the only one to pass date
+ OR be 0.05 clear of the runner-up.
 
 Everything that fails every strategy gets an
 id_backfill_tried_ts stamp (new column) so the UI can tell
@@ -1681,12 +1676,12 @@ PROGRESS TICKS
 --------------
 Large channels used to look frozen between "Resolving video
 IDs..." and the final summary. Now:
-  * "Fetched N videos from YouTube catalog..." every 500
-    items or 5 seconds during the catalog fetch.
-  * Transition line: "Catalog has N videos, matching M local
-    file(s)..."
-  * "[N/M] matched K so far..." every 200 files or 5 seconds
-    during the match loop (only for channels > 1000 files).
+ * "Fetched N videos from YouTube catalog..." every 500
+ items or 5 seconds during the catalog fetch.
+ * Transition line: "Catalog has N videos, matching M local
+ file(s)..."
+ * "[N/M] matched K so far..." every 200 files or 5 seconds
+ during the match loop (only for channels > 1000 files).
 All three visible in Simple mode.
 
 SETTINGS > METADATA
@@ -1879,14 +1874,14 @@ white+bold instead of near-unreadable dim so "0 refreshed"
 still looks like a successful completion.
 
 More log jargon scrub across user-facing strings:
-  Bulk-refreshing X → Refreshing X
-  Flat-playlist returned no data → YouTube returned no video list
-  bulk path returned nothing → fast refresh returned nothing
-  bulk-stats spawn/read errors → generic phrasing
-  Resolving video_ids for X (flat-playlist) → Resolving video IDs for X
-  Resolved N video_id(s) by title match → Matched N video(s) by title
-  checking channel playlist for id match by title →
-    checking channel for title match
+ Bulk-refreshing X → Refreshing X
+ Flat-playlist returned no data → YouTube returned no video list
+ bulk path returned nothing → fast refresh returned nothing
+ bulk-stats spawn/read errors → generic phrasing
+ Resolving video_ids for X (flat-playlist) → Resolving video IDs for X
+ Resolved N video_id(s) by title match → Matched N video(s) by title
+ checking channel playlist for id match by title →
+ checking channel for title match
 ```
 
 #### v55.3 — Log jargon cleanup + readable 0-verb Pass complete.
@@ -1903,22 +1898,22 @@ should read that way.
 Dropped implementation-detail jargon from every user-facing
 log line. Simple-mode users shouldn't have to decode yt-dlp
 flags or internal path names:
-  "Bulk-refreshing X (flat-playlist)..." → "Refreshing X..."
-  "Resolving video_ids for X (flat-playlist)..." → "Resolving
-    video IDs for X..."
-  "Resolved N video_id(s) by title match — backfilled into
-    index." → "Matched N video(s) by title — saved their
-    YouTube IDs."
-  "Flat-playlist returned no data for X" → "YouTube returned
-    no video list for X"
-  "bulk path returned nothing" → "fast refresh returned
-    nothing"
-  "bulk-stats spawn failed" / "bulk-stats read error" →
-    neutralized to generic phrasing
-  "can't bulk-refresh" → "can't refresh"
-  "video_id" → "YouTube ID" in fallback-resolution lines
-  "checking channel playlist for id match by title" →
-    "checking channel for title match"
+ "Bulk-refreshing X (flat-playlist)..." → "Refreshing X..."
+ "Resolving video_ids for X (flat-playlist)..." → "Resolving
+ video IDs for X..."
+ "Resolved N video_id(s) by title match — backfilled into
+ index." → "Matched N video(s) by title — saved their
+ YouTube IDs."
+ "Flat-playlist returned no data for X" → "YouTube returned
+ no video list for X"
+ "bulk path returned nothing" → "fast refresh returned
+ nothing"
+ "bulk-stats spawn failed" / "bulk-stats read error" →
+ neutralized to generic phrasing
+ "can't bulk-refresh" → "can't refresh"
+ "video_id" → "YouTube ID" in fallback-resolution lines
+ "checking channel playlist for id match by title" →
+ "checking channel for title match"
 ```
 
 #### v55.2 — Clear button positioning fix.
@@ -1965,10 +1960,10 @@ Cancel alone on the bottom row (red). No more mixed-row
 wrapping on narrow dialogs.
 
 Pass-complete log line reports the right verb per kind:
-  "X refreshed" for views/likes refresh
-  "X comments refreshed" for comments
-  "X IDs backfilled" for video_id backfill
-  "X downloaded" for regular sync
+ "X refreshed" for views/likes refresh
+ "X comments refreshed" for comments
+ "X IDs backfilled" for video_id backfill
+ "X downloaded" for regular sync
 === brackets are green+bold. Per-segment tag coloring on the
 channel summary line (name + labels white, numbers pink).
 
@@ -1994,8 +1989,7 @@ Many smaller audit fixes across backend + web (29 files,
 ~5k lines of changes).
 ```
 
-### April 23, 2026
-
+---
 #### v53.9 — 60-bug audit sweep + 3 new features.
 
 ```
@@ -2009,93 +2003,93 @@ withdrawn.
 
 CRITICAL (3):
 
-  C-1  sync_channel's last_sync + initialized + sync_complete
-       writes referenced an undefined 'now' inside a
-       try/except-pass. The NameError was swallowed silently
-       every time a sync actually downloaded anything — so
-       those flags never persisted, and every subsequent sync
-       re-walked the channel catalog from scratch instead of
-       using --break-on-existing. One-line fix
-       (now = datetime.now() before the write), massive impact.
+ C-1 sync_channel's last_sync + initialized + sync_complete
+ writes referenced an undefined 'now' inside a
+ try/except-pass. The NameError was swallowed silently
+ every time a sync actually downloaded anything — so
+ those flags never persisted, and every subsequent sync
+ re-walked the channel catalog from scratch instead of
+ using --break-on-existing. One-line fix
+ (now = datetime.now() before the write), massive impact.
 
-  C-2  transcription_pending counter leaked to -N on any
-       Whisper error path (OOM, missing Python 3.11 venv,
-       ffmpeg failure, etc.). Added a try/finally in the
-       transcribe worker loop that drains unconditionally,
-       with a `_pending_decremented` sentinel on the job dict
-       so the success path doesn't double-decrement.
+ C-2 transcription_pending counter leaked to -N on any
+ Whisper error path (OOM, missing Python 3.11 venv,
+ ffmpeg failure, etc.). Added a try/finally in the
+ transcribe worker loop that drains unconditionally,
+ with a `_pending_decremented` sentinel on the job dict
+ so the success path doesn't double-decrement.
 
-  C-3  livestreams.drop() was only wired to the UI Ignore
-       button, so the deferred-livestreams journal grew
-       unbounded. Now fires automatically in sync's post-
-       download hook when a previously-deferred stream
-       successfully downloads.
+ C-3 livestreams.drop() was only wired to the UI Ignore
+ button, so the deferred-livestreams journal grew
+ unbounded. Now fires automatically in sync's post-
+ download hook when a previously-deferred stream
+ successfully downloads.
 
 HIGH (12):
 
-  H-1  Edit-channel compress dropdowns (batch size, quality
-       level, output resolution) were write-only: save path
-       captured them, load path didn't, so opening and saving
-       any channel stomped stored values with HTML defaults.
-       Fixed the load path to populate all three from the
-       channel dict and added batch_size to the save payload.
+ H-1 Edit-channel compress dropdowns (batch size, quality
+ level, output resolution) were write-only: save path
+ captured them, load path didn't, so opening and saving
+ any channel stomped stored values with HTML defaults.
+ Fixed the load path to populate all three from the
+ channel dict and added batch_size to the save payload.
 
-  H-2  Compress: orphan temp file left in _TEMP_COMPRESS/ when
-       os.replace failed (file locked by VLC preview, AV, etc.).
-       temp_cleanup.py skips non-empty temp dirs, so it
-       accumulated indefinitely. Now cleaned up inline.
+ H-2 Compress: orphan temp file left in _TEMP_COMPRESS/ when
+ os.replace failed (file locked by VLC preview, AV, etc.).
+ temp_cleanup.py skips non-empty temp dirs, so it
+ accumulated indefinitely. Now cleaned up inline.
 
-  H-3  Redownload: cancelled mid-download left .part /
-       intermediate files in _REDOWNLOAD_TEMP/. End-of-run
-       rmdir only clears empty dirs. Added a cancel-branch
-       sweep that force-removes anything matching the video_id
-       or ending in .part.
+ H-3 Redownload: cancelled mid-download left .part /
+ intermediate files in _REDOWNLOAD_TEMP/. End-of-run
+ rmdir only clears empty dirs. Added a cancel-branch
+ sweep that force-removes anything matching the video_id
+ or ending in .part.
 
-  H-4  Metadata summary now reports 'N refreshed' and 'N errors'
-       alongside 'N new' (both were silently dropped), and tags
-       the summary red when errors > 0.
+ H-4 Metadata summary now reports 'N refreshed' and 'N errors'
+ alongside 'N new' (both were silently dropped), and tags
+ the summary red when errors > 0.
 
-  H-5  chan_cancel_redownload invalidated the cache but didn't
-       push refreshSubsTable, so the chartreuse continue-
-       redownload dot stayed visible until a tab switch. Now
-       pushes immediately.
+ H-5 chan_cancel_redownload invalidated the cache but didn't
+ push refreshSubsTable, so the chartreuse continue-
+ redownload dot stayed visible until a tab switch. Now
+ pushes immediately.
 
-  H-6  withdrawn — metadata.py:712 downloads thumbnails
-       unconditionally after every fetch, so refresh mode
-       already re-downloads missing thumbnails. Agent misread.
+ H-6 withdrawn — metadata.py:712 downloads thumbnails
+ unconditionally after every fetch, so refresh mode
+ already re-downloads missing thumbnails. Agent misread.
 
-  H-7  metadata_queue_all auto-fires the sync worker
-       regardless of the autorun_sync flag. Previously gated
-       on autorun=True, so users with autorun off saw
-       "Queued metadata for N channels" and then nothing
-       happened — tasks sat parked forever.
+ H-7 metadata_queue_all auto-fires the sync worker
+ regardless of the autorun_sync flag. Previously gated
+ on autorun=True, so users with autorun off saw
+ "Queued metadata for N channels" and then nothing
+ happened — tasks sat parked forever.
 
-  H-8  Reorg shared-sidecar bug: when two primary videos share
-       a stem (X.mp4 + X.mkv, produced by aborted+retried
-       yt-dlp downloads), moving one's sidecars orphaned the
-       other. Added a _has_video_sibling check; when present,
-       shared sidecars are copied rather than moved so both
-       destinations get their metadata.
+ H-8 Reorg shared-sidecar bug: when two primary videos share
+ a stem (X.mp4 + X.mkv, produced by aborted+retried
+ yt-dlp downloads), moving one's sidecars orphaned the
+ other. Added a _has_video_sibling check; when present,
+ shared sidecars are copied rather than moved so both
+ destinations get their metadata.
 
-  H-9  Compress presets extended with 1440 + 2160 entries.
-       Previously any res not in the preset table silently
-       fell back to 1080p bitrates — 4K output was under-
-       bitrated by ~40%.
+ H-9 Compress presets extended with 1440 + 2160 entries.
+ Previously any res not in the preset table silently
+ fell back to 1080p bitrates — 4K output was under-
+ bitrated by ~40%.
 
-  H-10 Retranscribe with empty segments (JSONL write failed,
-       FTS ingest failed, Whisper produced nothing) used to
-       leave the stale transcript on screen alongside a
-       "complete" toast. Now re-renders with a placeholder +
-       warning toast.
+ H-10 Retranscribe with empty segments (JSONL write failed,
+ FTS ingest failed, Whisper produced nothing) used to
+ leave the stale transcript on screen alongside a
+ "complete" toast. Now re-renders with a placeholder +
+ warning toast.
 
-  H-11 Recent-tab delete refreshes the table immediately so
-       deleted rows vanish instead of lingering until tab
-       switch.
+ H-11 Recent-tab delete refreshes the table immediately so
+ deleted rows vanish instead of lingering until tab
+ switch.
 
-  H-12 channel_art return always includes avatar_path +
-       banner_path keys (null when missing), so downstream
-       <img> renders don't break when only one of the two
-       was successfully fetched.
+ H-12 channel_art return always includes avatar_path +
+ banner_path keys (null when missing), so downstream
+ <img> renders don't break when only one of the two
+ was successfully fetched.
 
 MEDIUM (14): queue auto-toggle push, subs_undo cache
 invalidation, activity-log Clear UI notify, FTS rebuild
@@ -2108,8 +2102,8 @@ guessing, thumbnail-only refetches counted separately, Graph
 Week bucket surfaces backfill_pending, register_video ingests
 JSONL inline so Watch doesn't open empty.
 
-  M-12 withdrawn — range↔mode mapping already consistent at
-  both the save and load paths.
+ M-12 withdrawn — range↔mode mapping already consistent at
+ both the save and load paths.
 
 LOW (15): heal guard 'or'→'and', stable [i/total] denominator
 across pauses, live-detect ID-extract warning, extended
@@ -2121,8 +2115,8 @@ auto-index counter migrated to `downloads_since_last_index`,
 platform-stable activity-log day format, sample-confirm
 countdown pauses on mouse hover.
 
-  L-9 / L-11 withdrawn — existing confirmation + spin-stop
-  logic was already correct.
+ L-9 / L-11 withdrawn — existing confirmation + spin-stop
+ logic was already correct.
 
 SUPPLEMENTAL (9): 8 previously-silent try/except-pass blocks
 with real side effects now emit dim diagnostic lines so
@@ -2134,83 +2128,83 @@ that channel (no more rmtree racing yt-dlp). Empty-result
 first syncs no longer stamp initialized=True and lock the
 channel into fast-path mode forever.
 
-  S-7 withdrawn — `write_blocked` is already surfaced to the UI
-  in three places (app.js:4249, 4696, 6422).
+ S-7 withdrawn — `write_blocked` is already surfaced to the UI
+ in three places (app.js:4249, 4696, 6422).
 
 DOWNLOAD-TAB / FIRST-LAUNCH (12):
 
-  W-1  Single-video downloads previously vanished after
-       landing on disk — the DLTRACK line was emitted but
-       never parsed. Now the post-run hook parses it and
-       calls register_video + _record_recent_download +
-       livestreams.drop + pushes a Recent-tab refresh, so
-       downloaded videos appear in Browse / Recent / Search
-       immediately like channel-sync downloads do.
+ W-1 Single-video downloads previously vanished after
+ landing on disk — the DLTRACK line was emitted but
+ never parsed. Now the post-run hook parses it and
+ calls register_video + _record_recent_download +
+ livestreams.drop + pushes a Recent-tab refresh, so
+ downloaded videos appear in Browse / Recent / Search
+ immediately like channel-sync downloads do.
 
-  W-2  url_history (saved all along) now populates a <datalist>
-       autocomplete dropdown under the Download-tab URL input.
+ W-2 url_history (saved all along) now populates a <datalist>
+ autocomplete dropdown under the Download-tab URL input.
 
-  W-3  About + Diagnostics dialogs had no UI buttons to open
-       them. Added under Settings → Tools → "Info & Self-check".
+ W-3 About + Diagnostics dialogs had no UI buttons to open
+ them. Added under Settings → Tools → "Info & Self-check".
 
-  W-4  set_parent_folder verifies write access
-       (mkdir/rmdir probe) before committing the path —
-       unwritable paths no longer silently break future syncs.
+ W-4 set_parent_folder verifies write access
+ (mkdir/rmdir probe) before committing the path —
+ unwritable paths no longer silently break future syncs.
 
-  W-5  Tray → Show Window also calls Win32
-       SetForegroundWindow on Windows so a hidden-behind-
-       other-apps window comes to the front.
+ W-5 Tray → Show Window also calls Win32
+ SetForegroundWindow on Windows so a hidden-behind-
+ other-apps window comes to the front.
 
-  W-6  Download tab "Save to" warns if the picked path is
-       outside the archive root (files there wouldn't appear
-       in Browse/Search since the scanner only walks
-       output_dir).
+ W-6 Download tab "Save to" warns if the picked path is
+ outside the archive root (files there wouldn't appear
+ in Browse/Search since the scanner only walks
+ output_dir).
 
-  W-7  Single-video downloads now surface known yt-dlp error
-       patterns (members-only, private, region-locked, cookies
-       missing) as a visible toast instead of burying the
-       error in the dim stdout dump.
+ W-7 Single-video downloads now surface known yt-dlp error
+ patterns (members-only, private, region-locked, cookies
+ missing) as a visible toast instead of burying the
+ error in the dim stdout dump.
 
-  W-8  Download-tab resolution / YT-title / date-file /
-       add-date preferences persist across sessions via
-       localStorage.
+ W-8 Download-tab resolution / YT-title / date-file /
+ add-date preferences persist across sessions via
+ localStorage.
 
-  W-9  _should_batch_limit semantics documented in-place so
-       future edits don't get confused by the flag names.
+ W-9 _should_batch_limit semantics documented in-place so
+ future edits don't get confused by the flag names.
 
-  W-10 channels_import returns skipped_reasons[] so the user
-       knows which entries were rejected and why.
+ W-10 channels_import returns skipped_reasons[] so the user
+ knows which entries were rejected and why.
 
-  W-11 GPU Tasks popover gains a mid-queue whisper-model-swap
-       dropdown (the JS was fully coded but the <select>
-       element didn't exist in HTML).
+ W-11 GPU Tasks popover gains a mid-queue whisper-model-swap
+ dropdown (the JS was fully coded but the <select>
+ element didn't exist in HTML).
 
-  W-12 Dead initParentFolderPicker legacy code replaced with
-       a noop shim.
+ W-12 Dead initParentFolderPicker legacy code replaced with
+ a noop shim.
 
 NEW FEATURES:
 
-  F5  Watch view jump-to-next-hit. Opening a video from a
-      search result passes the query through; the transcript
-      Find box auto-populates; Enter / Shift+Enter cycles
-      between hits in this specific video. Saves the round-
-      trip back to search results.
+ F5 Watch view jump-to-next-hit. Opening a video from a
+ search result passes the query through; the transcript
+ Find box auto-populates; Enter / Shift+Enter cycles
+ between hits in this specific video. Saves the round-
+ trip back to search results.
 
-  F7  Subs tab bulk operations. Ctrl/Shift-click multi-select
-      + a bulk-actions bar appears when ≥2 rows are selected:
-      Change resolution, Toggle auto-transcribe, Queue metadata
-      refresh, Delete (with keep-files / delete-files choice).
-      Backed by three new API methods (subs_bulk_update,
-      subs_bulk_delete, subs_bulk_queue_metadata) all
-      whitelisted so no load-bearing fields can be wiped.
+ F7 Subs tab bulk operations. Ctrl/Shift-click multi-select
+ + a bulk-actions bar appears when ≥2 rows are selected:
+ Change resolution, Toggle auto-transcribe, Queue metadata
+ refresh, Delete (with keep-files / delete-files choice).
+ Backed by three new API methods (subs_bulk_update,
+ subs_bulk_delete, subs_bulk_queue_metadata) all
+ whitelisted so no load-bearing fields can be wiped.
 
-  F8  Compress dry-run savings. Settings → Tools → Compress →
-      "Dry-run savings…" opens a modal showing per-channel
-      and grand-total projected disk savings at each quality
-      tier for a user-chosen output resolution. Reads duration
-      + size from the index DB; zero compression actually
-      runs. Answers "is it worth enabling compress globally?"
-      before committing.
+ F8 Compress dry-run savings. Settings → Tools → Compress →
+ "Dry-run savings…" opens a modal showing per-channel
+ and grand-total projected disk savings at each quality
+ tier for a user-chosen output resolution. Reads duration
+ + size from the index DB; zero compression actually
+ runs. Answers "is it worth enabling compress globally?"
+ before committing.
 
 --------------------------------------------------------------------------------
 ```
@@ -2235,28 +2229,28 @@ found the fingerprint-only row and skipped it. Subs table read 0/0
 and rendered em-dash forever.
 
 Fix: three layers.
-  1. archive_scan.invalidate_channel now pops AND spawns a daemon
-     thread that calls update_disk_cache_for_channel to refill the
-     row with fresh num_vids / size_bytes — mirrors the classic
-     _invalidate_channel_disk_cache behaviour.
-  2. backend.index.sweep_new_videos only stamps the fingerprint
-     onto rows that already contain num_vids or size_bytes. A
-     missing row is left missing so the "needs scan" detector picks
-     it up; a one-off extra walk next sweep is preferable to
-     permanent invisible corruption.
-  3. New archive_scan.heal_malformed_cache_entries() runs at boot
-     inside stage-2 disk walk. It drops rows that lack
-     num_vids / size_bytes (anything that was already corrupted by
-     the old behaviour) and forces do_walk = True when any were
-     dropped, bypassing the 24 h staleness gate. The Subs table is
-     also pushed a refreshSubsTable() at the end of stage-2 so the
-     numbers show up immediately instead of waiting for the user
-     to switch tabs. Verified on the user's live cache: the four
-     malformed entries were dropped + rebuilt correctly
-     (SenatorSanders → 1394 videos / 33.2 GB,
-      BranchEducation → 41 / 9.7 GB,
-      decoderpod     → 60 / 26.9 GB,
-      doomscrollpodcast → 46 / 25.4 GB).
+ 1. archive_scan.invalidate_channel now pops AND spawns a daemon
+ thread that calls update_disk_cache_for_channel to refill the
+ row with fresh num_vids / size_bytes — mirrors the classic
+ _invalidate_channel_disk_cache behaviour.
+ 2. backend.index.sweep_new_videos only stamps the fingerprint
+ onto rows that already contain num_vids or size_bytes. A
+ missing row is left missing so the "needs scan" detector picks
+ it up; a one-off extra walk next sweep is preferable to
+ permanent invisible corruption.
+ 3. New archive_scan.heal_malformed_cache_entries() runs at boot
+ inside stage-2 disk walk. It drops rows that lack
+ num_vids / size_bytes (anything that was already corrupted by
+ the old behaviour) and forces do_walk = True when any were
+ dropped, bypassing the 24 h staleness gate. The Subs table is
+ also pushed a refreshSubsTable() at the end of stage-2 so the
+ numbers show up immediately instead of waiting for the user
+ to switch tabs. Verified on the user's live cache: the four
+ malformed entries were dropped + rebuilt correctly
+ (SenatorSanders → 1394 videos / 33.2 GB,
+ BranchEducation → 41 / 9.7 GB,
+ decoderpod → 60 / 26.9 GB,
+ doomscrollpodcast → 46 / 25.4 GB).
 
 Issue #135 — Rescan archive button placement.
 Reported: the "Rescan archive" button in the Browse toolbar feels
@@ -2277,15 +2271,15 @@ rest, doesn't update anything visibly.
 Root cause: the backend was actually refreshing (every on-disk
 video re-hit, counts merged in, JSONL rewritten), but none of the
 UI surfaces reflected it.
-  - The sync task row summary line read only `fetched` from the
-    result dict and said "up to date" when `fetched == 0`, ignoring
-    `refreshed` entirely.
-  - Per-video log line used the static label "Metadata" regardless
-    of refresh state, so on-screen it was indistinguishable from a
-    normal scan.
-  - The confirm dialog claimed "this skips channels/videos that
-    already have fresh metadata" — the exact opposite of what
-    refresh does.
+ - The sync task row summary line read only `fetched` from the
+ result dict and said "up to date" when `fetched == 0`, ignoring
+ `refreshed` entirely.
+ - Per-video log line used the static label "Metadata" regardless
+ of refresh state, so on-screen it was indistinguishable from a
+ normal scan.
+ - The confirm dialog claimed "this skips channels/videos that
+ already have fresh metadata" — the exact opposite of what
+ refresh does.
 
 Fix: sync.py now reads `_refreshed` alongside `_fetched` and emits
 "N refreshed" as the summary (pink tag) when fetched is zero but
@@ -2299,8 +2293,7 @@ yt-dlp call per video so it's slow on large archives.
 --------------------------------------------------------------------------------
 ```
 
-### April 22, 2026
-
+---
 #### v53.7 — Watch view narrow-width graceful stacking.
 
 ```
@@ -2319,19 +2312,19 @@ transcript which occupied the explicit 1fr row.
 
 Fix: two proper stacking tiers for narrow widths.
 
-  @media (max-width: 900px)
-    grid-template-columns: 1fr
-    grid-template-rows: auto minmax(200px, 1fr)
-    .watch-video-wrap {
-      max-height: 40vh;  /* cap video so transcript gets space */
-      overflow-y: auto;
-    }
+ @media (max-width: 900px)
+ grid-template-columns: 1fr
+ grid-template-rows: auto minmax(200px, 1fr)
+ .watch-video-wrap {
+ max-height: 40vh; /* cap video so transcript gets space */
+ overflow-y: auto;
+ }
 
-  @media (max-width: 520px)
-    #view-watch { overflow-y: auto }
-    grid-template-rows: auto auto
-    height: auto;  min-height: 100%
-    .watch-video-wrap { max-height: none }
+ @media (max-width: 520px)
+ #view-watch { overflow-y: auto }
+ grid-template-rows: auto auto
+ height: auto; min-height: 100%
+ .watch-video-wrap { max-height: none }
 
 At the 900px tier, the video renders at its natural aspect-ratio
 height (capped at 40vh) above a transcript that fills the
@@ -2349,50 +2342,50 @@ per-entry Ignore button.
 
 Log line cleanup (backend/sync.py)
 - Pre-fix: dumped 140 chars of yt-dlp's raw stderr verbatim:
-    [Live] Deferred is_upcoming: [download] Title is live! does
-    not pass filter (!is_live & !is_upcoming & duration>?180 & …
+ [Live] Deferred is_upcoming: [download] Title is live! does
+ not pass filter (!is_live & !is_upcoming & duration>?180 & …
 - Post-fix: one readable line:
-    [Live] Deferred — <clean title> (upcoming premiere | currently live).
+ [Live] Deferred — <clean title> (upcoming premiere | currently live).
 - current_title (the most recent Destination-line filename stem)
-  often still carried yt-dlp's `.fNNN-N` format-selector suffix,
-  so the drawer showed titles like "Foo.f140-4". Strip it before
-  storing in the deferred journal.
+ often still carried yt-dlp's `.fNNN-N` format-selector suffix,
+ so the drawer showed titles like "Foo.f140-4". Strip it before
+ storing in the deferred journal.
 - Also split the log wording by detected state: "is_upcoming" /
-  "premieres in" / "scheduled" / "starts in" / "will begin" →
-  "upcoming premiere"; anything else → "currently live".
+ "premieres in" / "scheduled" / "starts in" / "will begin" →
+ "upcoming premiere"; anything else → "currently live".
 
 Ignore support (backend/livestreams.py)
 - Added permanent-ignore set at
-  %APPDATA%\\YTArchiver\\ytarchiver_livestream_ignore.json.
+ %APPDATA%\\YTArchiver\\ytarchiver_livestream_ignore.json.
 - ignore(video_id) adds the ID + drops from deferred.
 - defer() now checks is_ignored() first and silently no-ops for
-  ignored IDs, so future sync passes can't re-add them.
+ ignored IDs, so future sync passes can't re-add them.
 
 Drawer snooze (backend/livestreams.py)
 - snooze_drawer(seconds) stamps snooze_until_ts to
-  ytarchiver_livestream_drawer.json.
+ ytarchiver_livestream_drawer.json.
 - drawer_state() returns {snooze_until_ts, now_ts, visible}.
 - UI's refreshDeferredLivestreams() polls drawer_state first —
-  keeps drawer hidden while snooze is active; 30s poll interval
-  picks up snooze expiry automatically.
+ keeps drawer hidden while snooze is active; 30s poll interval
+ picks up snooze expiry automatically.
 
 New js_api methods (main.py)
-  livestreams_ignore(video_id)
-  livestreams_snooze(seconds)
-  livestreams_drawer_state()
+ livestreams_ignore(video_id)
+ livestreams_snooze(seconds)
+ livestreams_drawer_state()
 
 UI changes (web/index.html, web/app.js, web/styles.css)
 - "Retry all" button → "Retry ▾" dropdown:
-    Now         — kicks Sync Subbed (existing)
-    in 24 hours — snoozes drawer 24h
-    in 1 week   — snoozes drawer 7d
+ Now — kicks Sync Subbed (existing)
+ in 24 hours — snoozes drawer 24h
+ in 1 week — snoozes drawer 7d
 - Each drawer row gets a new "Ignore" button alongside × (drop).
-  Confirm dialog before permanently skipping. Differentiated by:
-    × = forget for now (yt-dlp may re-detect + re-add on next sync)
-    Ignore = permanent skip (won't re-add regardless)
+ Confirm dialog before permanently skipping. Differentiated by:
+ × = forget for now (yt-dlp may re-detect + re-add on next sync)
+ Ignore = permanent skip (won't re-add regardless)
 - Styling: dropdown menu positioned under the Retry button, card
-  background + border, hover highlight. Ignore button has a thin
-  border to distinguish it from the × glyph.
+ background + border, hover highlight. Ignore button has a thin
+ border to distinguish it from the × glyph.
 ```
 
 #### v53.5 — Same-batch control ordering + live [ReDwnl] activity push.
@@ -2402,20 +2395,20 @@ UI changes (web/index.html, web/app.js, web/styles.css)
 the "=== Redownload complete ===" footer section even though
 `_clear_active()` was being called right before the footer. Root
 cause was the _logBatch filter in logs.js:
-    - It ran control segments in a pre-pass against committed DOM
-      ONLY, then dropped them.
-    - When `_clear_active()` and the last iteration's
-      `_emit_active()` landed in the same 60ms LogStreamer batch,
-      the sequence was:
-        [clear_line redwnl_active]  (from _emit_active's 1st step)
-        [new active line]           (from _emit_active's 2nd step)
-        [clear_line redwnl_active]  (from _clear_active)
-        [footer line]
-    - Pre-pass ran both clear_line controls against DOM before any
-      of the batch's new lines had rendered. The second clear saw
-      nothing (new active wasn't in DOM yet), dropped itself.
-    - Render pass then appended the new active line. Footer
-      followed. Active line stuck.
+ - It ran control segments in a pre-pass against committed DOM
+ ONLY, then dropped them.
+ - When `_clear_active()` and the last iteration's
+ `_emit_active()` landed in the same 60ms LogStreamer batch,
+ the sequence was:
+ [clear_line redwnl_active] (from _emit_active's 1st step)
+ [new active line] (from _emit_active's 2nd step)
+ [clear_line redwnl_active] (from _clear_active)
+ [footer line]
+ - Pre-pass ran both clear_line controls against DOM before any
+ of the batch's new lines had rendered. The second clear saw
+ nothing (new active wasn't in DOM yet), dropped itself.
+ - Render pass then appended the new active line. Footer
+ followed. Active line stuck.
 
 Fix: rewrote _logBatch to process payload.main in a single
 linear pass. Each item is either a control (execute, skip render)
@@ -2450,64 +2443,64 @@ Rolls up the morning's redownload-related fixes.
 
 Match improvements (backend/redownload.py)
 - Added _build_metadata_index() that loads the channel's
-  aggregated .{ch} Metadata.jsonl files into three lookup tables:
-  by_title, by_date (keyed by YYYYMMDD upload_date), by_id.
+ aggregated .{ch} Metadata.jsonl files into three lookup tables:
+ by_title, by_date (keyed by YYYYMMDD upload_date), by_id.
 - _match_files_to_ids now has a 5-tier priority:
-    (1) [VIDEOID] token in filename
-    (2) Exact title match in current YT catalog
-    (3) Exact title match in LOCAL metadata
-        — catches videos YouTube has renamed since download; local
-          filename still reflects the old title stored in our JSONL
-    (4) Mtime-date match against local metadata's by_date index
-        — yt-dlp's --mtime stamps file mtime = YT upload date, so
-          YYYYMMDD -> video_id is a bijection for ≤1-video-per-day
-          channels. Higher-frequency channels fall back to substring
-          match within that day's candidates only.
-    (5) Substring fallback against current YT catalog (existing)
+ (1) [VIDEOID] token in filename
+ (2) Exact title match in current YT catalog
+ (3) Exact title match in LOCAL metadata
+ — catches videos YouTube has renamed since download; local
+ filename still reflects the old title stored in our JSONL
+ (4) Mtime-date match against local metadata's by_date index
+ — yt-dlp's --mtime stamps file mtime = YT upload date, so
+ YYYYMMDD -> video_id is a bijection for ≤1-video-per-day
+ channels. Higher-frequency channels fall back to substring
+ match within that day's candidates only.
+ (5) Substring fallback against current YT catalog (existing)
 - Reported symptom: "25/41 matched is terrible" for a low-frequency
-  channel. The 16 missing files were rename-drifts caught by tier 3.
+ channel. The 16 missing files were rename-drifts caught by tier 3.
 
 Loop gap fixes (backend/redownload.py)
 - Two code paths in the main redownload loop were `continue`-ing
-  without emitting any log line:
-    - "vid in done" (resumed-pass entries already redownloaded in
-      a prior session)
-    - _download_one returning None (download failure)
+ without emitting any log line:
+ - "vid in done" (resumed-pass entries already redownloaded in
+ a prior session)
+ - _download_one returning None (download failure)
 - Each silent continue left a gap in the [N/total] sequence.
-  Reported: numbers jumped 1294 -> 1300 -> 1314 with no log
-  between.
+ Reported: numbers jumped 1294 -> 1300 -> 1314 with no log
+ between.
 - Both now emit a visible [N/total] one-liner: dim
-  "— already done." for resumed-skip, red "— download failed."
-  for errors. Each also calls _emit_active() so the sticky
-  active-status line stays at the log bottom.
+ "— already done." for resumed-skip, red "— download failed."
+ for errors. Each also calls _emit_active() so the sticky
+ active-status line stays at the log bottom.
 
 Completion dot clear (main.py)
 - redownload_channel deletes _redownload_progress.json on
-  successful completion, which is what drives the chartreuse
-  pending-redownload dot in the Subs table. But the Subs table
-  snapshot was already cached client-side and no signal was
-  pushed to refresh it — dot persisted until the user manually
-  switched tabs.
+ successful completion, which is what drives the chartreuse
+ pending-redownload dot in the Subs table. But the Subs table
+ snapshot was already cached client-side and no signal was
+ pushed to refresh it — dot persisted until the user manually
+ switched tabs.
 - _run_redownload_one's finally block now calls
-  evaluate_js("if (window.refreshSubsTable) window.refreshSubsTable();")
-  so the UI re-fetches subs data and the dot clears immediately.
+ evaluate_js("if (window.refreshSubsTable) window.refreshSubsTable();")
+ so the UI re-fetches subs data and the dot clears immediately.
 
 Activity-log layout (backend/ytarchiver_config.py, web/logs.js,
 web/styles.css)
 - [ReDwnl] history rows have 3 counts (replaced · skipped ·
-  errors) while [Dwnld] has 4 (downloaded · transcribed ·
-  metadata · errors). The grid template has 4 count columns;
-  for [ReDwnl] the 3rd column (tertiary, reserved for [Dwnld]'s
-  metadata count) was empty at minmax(98px, 1fr) — creating a
-  visible ~98px gap between "skipped" and "errors".
+ errors) while [Dwnld] has 4 (downloaded · transcribed ·
+ metadata · errors). The grid template has 4 count columns;
+ for [ReDwnl] the 3rd column (tertiary, reserved for [Dwnld]'s
+ metadata count) was empty at minmax(98px, 1fr) — creating a
+ visible ~98px gap between "skipped" and "errors".
 - Parser's 4-bullet branch now has a `kind == "ReDwnl"` check
-  that packs all 3 counts into primary / secondary / tertiary
-  and leaves the errors cell empty (instead of the reverse).
+ that packs all 3 counts into primary / secondary / tertiary
+ and leaves the errors cell empty (instead of the reverse).
 - buildActivityRow adds a `hist-row-{kind}` class per row.
 - Added a CSS override for .hist-row-ReDwnl that collapses the
-  unused `errors` column from minmax(60px, 0.8fr) to 0. With
-  that the "took" cell snaps tight to the counts instead of
-  floating out by 60px+.
+ unused `errors` column from minmax(60px, 0.8fr) to 0. With
+ that the "took" cell snaps tight to the counts instead of
+ floating out by 60px+.
 ```
 
 #### v53.0 — Fix _inplaceKind priority scan + orphan-fallback clear.
@@ -2557,8 +2550,7 @@ transcribe.py tag lists to put _tx_tag first as belt-and-
 suspenders for any client still running the old _inplaceKind.
 ```
 
-### April 21, 2026
-
+---
 #### v52.9 — Most Viewed sort: title-match fallback for NULL video_id rows. (Also rolls up v52.8's frontend view_count preserve fix.)
 
 ```
@@ -2607,8 +2599,8 @@ Two related issues, both about activity-log persistence.
 
 (1) Duplicate [Dwnld] rows in the activity log. the user screenshotted
 a single download that produced two rows:
-    [Dwnld] 10:21pm, Apr 21 — Seth Meyers — 1 downloaded  0 transcribed  ✓ metadata  0 errors  took 17s
-    [Dwnld] 10:21pm, Apr 21 — Seth Meyers — 1 downloaded  ✓ transcribed  ✓ metadata  0 errors  took 58s
+ [Dwnld] 10:21pm, Apr 21 — Seth Meyers — 1 downloaded 0 transcribed ✓ metadata 0 errors took 17s
+ [Dwnld] 10:21pm, Apr 21 — Seth Meyers — 1 downloaded ✓ transcribed ✓ metadata 0 errors took 58s
 These should be ONE row transitioning from "0 transcribed" to
 "✓ transcribed" as Whisper finishes.
 
@@ -2644,7 +2636,7 @@ Fixed by adding a `time.time()` start tracker at the top of
 after the `=== Redownload complete ===` footer. Fires on both
 paths — full completion AND cancel. Format matches classic's
 output exactly:
-    [ReDwnl] 11:26pm, Apr 21 — Channel — 23 replaced · 0 skipped · 0 errors · took 45s
+ [ReDwnl] 11:26pm, Apr 21 — Channel — 23 replaced · 0 skipped · 0 errors · took 45s
 
 When `n_done > 0` the row tag is `hist_redwnl` (chartreuse) per
 existing `_hist_tag_for_kind` logic.
@@ -2723,196 +2715,196 @@ NEW FEATURE: Cancel Redownload button
 Red ✖ Cancel button appears next to ↻ Continue Redownload in the
 edit channel panel whenever a channel has a pending redownload.
 Confirms via dialog, then:
-  1. Fires _sync_cancel if the channel's redownload is currently
-     running (pipeline exits at next chunk boundary).
-  2. Drops any queued entries for this channel from the internal
-     _redwnl_pending list.
-  3. Removes from queues.sync so the Sync Tasks popover row
-     disappears.
-  4. Deletes _redownload_progress.json so the Subs chartreuse
-     dot + right-click "Continue" option both clear.
-  5. Invalidates archive-scan cache + refreshes Subs table.
+ 1. Fires _sync_cancel if the channel's redownload is currently
+ running (pipeline exits at next chunk boundary).
+ 2. Drops any queued entries for this channel from the internal
+ _redwnl_pending list.
+ 3. Removes from queues.sync so the Sync Tasks popover row
+ disappears.
+ 4. Deletes _redownload_progress.json so the Subs chartreuse
+ dot + right-click "Continue" option both clear.
+ 5. Invalidates archive-scan cache + refreshes Subs table.
 Returns {was_running, was_queued, progress_removed} so the toast
 can report exactly what happened.
 
 Data integrity
 
-  - Redownload extension-swap uses two-phase commit: rename
-    original aside → os.replace → drop aside on success, roll
-    back on failure. Prevents file loss when yt-dlp's output
-    container differs from the original (rare but destructive).
+ - Redownload extension-swap uses two-phase commit: rename
+ original aside → os.replace → drop aside on success, roll
+ back on failure. Prevents file loss when yt-dlp's output
+ container differs from the original (rare but destructive).
 
-  - Late-progress-clobbering-done fix: yt-dlp occasionally
-    dribbles a final "[download] 100% of X in Y" stdout line
-    AFTER the `after_video:DLTRACK:::` print has fired. The late
-    tick was re-emitting the progress line with the same dlrow_N
-    marker, inplace-replacing the ✓ done line we had just
-    emitted. Users saw a stuck "Downloading Title 100%" with no
-    checkmark on the first of two videos in a channel. Added a
-    _closed_dlrows set populated by the DLTRACK handler; progress
-    branch drops any tick targeting a closed dlrow.
+ - Late-progress-clobbering-done fix: yt-dlp occasionally
+ dribbles a final "[download] 100% of X in Y" stdout line
+ AFTER the `after_video:DLTRACK:::` print has fired. The late
+ tick was re-emitting the progress line with the same dlrow_N
+ marker, inplace-replacing the ✓ done line we had just
+ emitted. Users saw a stuck "Downloading Title 100%" with no
+ checkmark on the first of two videos in a channel. Added a
+ _closed_dlrows set populated by the DLTRACK handler; progress
+ branch drops any tick targeting a closed dlrow.
 
-  - sync_all now skips kind=redownload tasks. They're drained by
-    a separate Api._redwnl_worker. Previously both workers popped
-    the same queue entries and sync_all mis-processed them as
-    regular downloads (user saw "[1/N] ChannelName — no new
-    videos" while the real redownload was running in the
-    popover).
+ - sync_all now skips kind=redownload tasks. They're drained by
+ a separate Api._redwnl_worker. Previously both workers popped
+ the same queue entries and sync_all mis-processed them as
+ regular downloads (user saw "[1/N] ChannelName — no new
+ videos" while the real redownload was running in the
+ popover).
 
-  - Redownload tasks excluded from the sync_all starting-total +
-    dynamic-total calculations so "Sync pass starting (N
-    channels)" stays accurate when redownloads are queued
-    alongside.
+ - Redownload tasks excluded from the sync_all starting-total +
+ dynamic-total calculations so "Sync pass starting (N
+ channels)" stays accurate when redownloads are queued
+ alongside.
 
 Log UX
 
-  - Active status lines re-emit after every completed/skip entry
-    within the same iteration so the "active is always last" rule
-    holds. Pre-fix, the active line from _emit_active() sat above
-    later-emitted completed entries. Redownload was the most
-    visible — metadata/compress/reorg follow the same pattern
-    (preemptively audited; only redownload needed fixing because
-    the others already re-emit at top of next iteration fast
-    enough that the window is invisible).
+ - Active status lines re-emit after every completed/skip entry
+ within the same iteration so the "active is always last" rule
+ holds. Pre-fix, the active line from _emit_active() sat above
+ later-emitted completed entries. Redownload was the most
+ visible — metadata/compress/reorg follow the same pattern
+ (preemptively audited; only redownload needed fixing because
+ the others already re-emit at top of next iteration fast
+ enough that the window is invisible).
 
-  - Bracket-coloring split across all four "active" module logs
-    (redownload, metadata, compress, reorg): only [/] + the label
-    word render in the module's signature color; numbers + channel
-    names stay white. Matches the visible per-item log pattern
-    the user already had elsewhere.
+ - Bracket-coloring split across all four "active" module logs
+ (redownload, metadata, compress, reorg): only [/] + the label
+ word render in the module's signature color; numbers + channel
+ names stay white. Matches the visible per-item log pattern
+ the user already had elsewhere.
 
-  - "Metadata downloaded" line: em-dash + checkmark + "Metadata"
-    in pink; "downloaded" in white. Color discipline is "subject
-    colored, verb white".
+ - "Metadata downloaded" line: em-dash + checkmark + "Metadata"
+ in pink; "downloaded" in white. Color discipline is "subject
+ colored, verb white".
 
-  - Download progress percentage surfaces in Simple mode via the
-    "— Downloading <title> NN%" row, in-place replaced every tick,
-    replaced cleanly by the final ✓ done line. Pre-fix the dim /
-    dlprogress_pct tags got filtered in Simple mode and the
-    Downloading line sat unchanged until done.
+ - Download progress percentage surfaces in Simple mode via the
+ "— Downloading <title> NN%" row, in-place replaced every tick,
+ replaced cleanly by the final ✓ done line. Pre-fix the dim /
+ dlprogress_pct tags got filtered in Simple mode and the
+ Downloading line sat unchanged until done.
 
-  - Stale _DLROW_COUNTER guards: progress emits drop when no
-    path-to-counter entry matches; DLTRACK done emits fall back
-    to literal-lookup → basename-lookup → unique orphan marker
-    (never to the current _DLROW_COUNTER which may point at the
-    NEXT video if yt-dlp started extracting ahead of the previous
-    video's merge).
+ - Stale _DLROW_COUNTER guards: progress emits drop when no
+ path-to-counter entry matches; DLTRACK done emits fall back
+ to literal-lookup → basename-lookup → unique orphan marker
+ (never to the current _DLROW_COUNTER which may point at the
+ NEXT video if yt-dlp started extracting ahead of the previous
+ video's merge).
 
-  - Cookie sign-out detection in sync.py's yt-dlp stdout loop:
-    matches "sign in to confirm", "cookies are missing|invalid",
-    "failed to extract any player response" + "sign in", and the
-    classic "error: cookie extract|sign in" pattern. Emits a red
-    █ banner ONCE per sync pass explaining what happened. Classic
-    had this; overhaul was silent, so Firefox cookies could stay
-    stale for weeks with no visible feedback.
+ - Cookie sign-out detection in sync.py's yt-dlp stdout loop:
+ matches "sign in to confirm", "cookies are missing|invalid",
+ "failed to extract any player response" + "sign in", and the
+ classic "error: cookie extract|sign in" pattern. Emits a red
+ █ banner ONCE per sync pass explaining what happened. Classic
+ had this; overhaul was silent, so Firefox cookies could stay
+ stale for weeks with no visible feedback.
 
-  - Pause UX cleanup: single "Sync paused at H:MMpm — click
-    Resume." line instead of the previous three. The /streams
-    pass no longer launches when the main pass was just paused.
+ - Pause UX cleanup: single "Sync paused at H:MMpm — click
+ Resume." line instead of the previous three. The /streams
+ pass no longer launches when the main pass was just paused.
 
-  - Log trim warning stops chattering (keep=5000 provides 3000
-    lines of headroom between trims).
+ - Log trim warning stops chattering (keep=5000 provides 3000
+ lines of headroom between trims).
 
-  - Mini-log clones strip data-inplace so inplace-replace emits
-    don't cross-match between main and mini log containers.
+ - Mini-log clones strip data-inplace so inplace-replace emits
+ don't cross-match between main and mini log containers.
 
-  - Caption-fetch and thumbnail-download failures emit dim
-    diagnostic lines instead of silently swallowing. Cookie /
-    auth errors during caption fetch are now visible ("Caption
-    fetch blocked: <error>").
+ - Caption-fetch and thumbnail-download failures emit dim
+ diagnostic lines instead of silently swallowing. Cookie /
+ auth errors during caption fetch are now visible ("Caption
+ fetch blocked: <error>").
 
-  - Disk-error watchdog "Permission denied" regex requires a
-    filesystem-context keyword (writ/output/file/disk/save) —
-    no more false positives pausing all workers on age-gate /
-    member-only / auth rejection.
+ - Disk-error watchdog "Permission denied" regex requires a
+ filesystem-context keyword (writ/output/file/disk/save) —
+ no more false positives pausing all workers on age-gate /
+ member-only / auth rejection.
 
 State / persistence
 
-  - Window geometry sanitized on save + load. Coords outside
-    +/- 10000 reset to None (pywebview centers). Sizes < 400x300
-    or > 20000x20000 reset to defaults (1100x780). Reported:
-    window had ended up at Windows' minimized-parking coordinate
-    (-32000, -32000) while reporting normal state; next launch
-    faithfully restored off every display.
+ - Window geometry sanitized on save + load. Coords outside
+ +/- 10000 reset to None (pywebview centers). Sizes < 400x300
+ or > 20000x20000 reset to defaults (1100x780). Reported:
+ window had ended up at Windows' minimized-parking coordinate
+ (-32000, -32000) while reporting normal state; next launch
+ faithfully restored off every display.
 
-  - Recent tab rows sorted by download_ts descending BEFORE the
-    200-row slice. Fresh entries can no longer be hidden by 200
-    older entries from an out-of-order insertion history.
+ - Recent tab rows sorted by download_ts descending BEFORE the
+ 200-row slice. Fresh entries can no longer be hidden by 200
+ older entries from an out-of-order insertion history.
 
-  - Subs sparse-payload update now mirrors folder→name when only
-    folder was edited, matching the existing name→folder logic.
-    Pre-fix, renaming a channel's folder left the display name
-    stale in Subs / Browse / tray tooltip.
+ - Subs sparse-payload update now mirrors folder→name when only
+ folder was edited, matching the existing name→folder logic.
+ Pre-fix, renaming a channel's folder left the display name
+ stale in Subs / Browse / tray tooltip.
 
-  - Subs edit dirty-check includes folder_override in the `cur`
-    object so it mirrors the `snap` shape. Update button is no
-    longer dirty on panel open.
+ - Subs edit dirty-check includes folder_override in the `cur`
+ object so it mirrors the `snap` shape. Update button is no
+ longer dirty on panel open.
 
-  - Subs undo-remove is a stack (max 50) instead of a single
-    slot. Consecutive removes can all be undone in LIFO order.
-    Failed restores re-push onto the stack for retry.
+ - Subs undo-remove is a stack (max 50) instead of a single
+ slot. Consecutive removes can all be undone in LIFO order.
+ Failed restores re-push onto the stack for retry.
 
-  - _migrate_pending_tx_ids gated behind
-    _migration_v2_pending_tx_ids flag — runs once per config,
-    skipped on subsequent load_config calls.
+ - _migrate_pending_tx_ids gated behind
+ _migration_v2_pending_tx_ids flag — runs once per config,
+ skipped on subsequent load_config calls.
 
-  - download_ts falls back to None instead of 0, and
-    _fmt_time_ago early-returns on falsy input. Eliminates
-    "54 years ago" display for rows with missing timestamps.
+ - download_ts falls back to None instead of 0, and
+ _fmt_time_ago early-returns on falsy input. Eliminates
+ "54 years ago" display for rows with missing timestamps.
 
-  - archive_single_video per-URL in-flight set prevents duplicate
-    yt-dlp processes when the user mashes the button on the
-    same URL. Different URLs still parallel.
+ - archive_single_video per-URL in-flight set prevents duplicate
+ yt-dlp processes when the user mashes the button on the
+ same URL. Different URLs still parallel.
 
 Redownload chain (also part of this pass)
 
-  - Multiple Continue Redownload clicks queue on an internal
-    _redwnl_pending list and drain sequentially through a
-    single worker. Previously the 2nd+ clicks silently errored
-    with "Sync pipeline already running".
+ - Multiple Continue Redownload clicks queue on an internal
+ _redwnl_pending list and drain sequentially through a
+ single worker. Previously the 2nd+ clicks silently errored
+ with "Sync pipeline already running".
 
-  - chan_redownload now clears QueueState.sync_paused +
-    gpu_paused on worker start so the global Pause/Resume button
-    doesn't stay stuck on "Resume" when a new redownload fires.
+ - chan_redownload now clears QueueState.sync_paused +
+ gpu_paused on worker start so the global Pause/Resume button
+ doesn't stay stuck on "Resume" when a new redownload fires.
 
 UI polish
 
-  - Reorg KeyError on month outside 1-12 (corrupted upload_date)
-    degrades to "00 Unknown" folder instead of crashing the
-    whole pass mid-move.
+ - Reorg KeyError on month outside 1-12 (corrupted upload_date)
+ degrades to "00 Unknown" folder instead of crashing the
+ whole pass mid-move.
 
-  - Reorg progress emits every 10 files (was 25) so channels
-    with <25 videos actually show midway progress.
+ - Reorg progress emits every 10 files (was 25) so channels
+ with <25 videos actually show midway progress.
 
-  - Toast auto-dismiss timers pause on document.visibilityState
-    === "hidden" and resume when visible. Tabbing away and back
-    no longer flashes a burst of dismissals.
+ - Toast auto-dismiss timers pause on document.visibilityState
+ === "hidden" and resume when visible. Tabbing away and back
+ no longer flashes a burst of dismissals.
 
-  - Welcome modal Browse button disables while pick_folder is in
-    flight; picker errors surface via toast instead of a silent
-    catch.
+ - Welcome modal Browse button disables while pick_folder is in
+ flight; picker errors surface via toast instead of a silent
+ catch.
 
-  - Watch video pause on tab switch flushes audio buffer via
-    currentTime = currentTime. Eliminates the 1-3 second audio
-    lag after switching tabs while a video was playing.
+ - Watch video pause on tab switch flushes audio buffer via
+ currentTime = currentTime. Eliminates the 1-3 second audio
+ lag after switching tabs while a video was playing.
 
-  - set_log_mode persists to disk BEFORE mutating self._config.
-    Save-failure (e.g. permission denied) no longer leaves
-    in-memory config and disk diverged.
+ - set_log_mode persists to disk BEFORE mutating self._config.
+ Save-failure (e.g. permission denied) no longer leaves
+ in-memory config and disk diverged.
 
-  - TranscribeManager.current_model() public accessor replaces
-    main.py's private-attr reach into _transcribe._model.
+ - TranscribeManager.current_model() public accessor replaces
+ main.py's private-attr reach into _transcribe._model.
 
-  - bookmark_list() returns {ok: True, rows: [...]} to match
-    bookmark_add/remove/update_note shape. JS caller back-compat
-    handles both shapes (old list + new wrapper).
+ - bookmark_list() returns {ok: True, rows: [...]} to match
+ bookmark_add/remove/update_note shape. JS caller back-compat
+ handles both shapes (old list + new wrapper).
 
 Build
 
-  - YTArchiver.spec's datas list now auto-bundles ffprobe.exe
-    when present in the project root (same treatment as
-    yt-dlp.exe and ffmpeg.exe). Safety net for future clean-
-    machine deployments where ffprobe isn't on PATH.
+ - YTArchiver.spec's datas list now auto-bundles ffprobe.exe
+ when present in the project root (same treatment as
+ yt-dlp.exe and ffmpeg.exe). Safety net for future clean-
+ machine deployments where ffprobe isn't on PATH.
 ```
 
 #### v51.8 — Chain multiple Continue Redownload requests sequentially.
@@ -2925,8 +2917,8 @@ subsequent right-click did nothing. Channels 2..N got silently
 dropped.
 
 Root cause: chan_redownload in main.py was doing
-    if self.sync_is_running():
-        return {"ok": False, "error": "Sync pipeline already running"}
+ if self.sync_is_running():
+ return {"ok": False, "error": "Sync pipeline already running"}
 Redownload reuses self._sync_thread, so once the first redownload
 was active, sync_is_running() returned True and any new redownload
 request got rejected. The JS call site didn't await / didn't show
@@ -2934,19 +2926,19 @@ a toast, so from the UI side it looked like nothing happened.
 
 Refactor: introduced self._redwnl_pending (list) + a lock on the
 Api instance. chan_redownload now:
-  - If a regular (non-redownload) sync is running, still refuse
-    (existing guard, correct behavior).
-  - If a redownload is running, APPEND to _redwnl_pending AND
-    mirror into queues.sync_enqueue so the queued redownloads
-    show in the Sync Tasks popover alongside the running one.
-    Returns {ok: true, queued: true}.
-  - If nothing is running, spawns a single worker thread that
-    drains _redwnl_pending sequentially, calling the newly-
-    extracted _run_redownload_one(ch, folder, new_res,
-    scope_label) helper per item. Previously the per-item
-    logic lived as a closure `_run` inside chan_redownload;
-    lifting it out lets the worker loop over multiple items
-    without re-spawning threads.
+ - If a regular (non-redownload) sync is running, still refuse
+ (existing guard, correct behavior).
+ - If a redownload is running, APPEND to _redwnl_pending AND
+ mirror into queues.sync_enqueue so the queued redownloads
+ show in the Sync Tasks popover alongside the running one.
+ Returns {ok: true, queued: true}.
+ - If nothing is running, spawns a single worker thread that
+ drains _redwnl_pending sequentially, calling the newly-
+ extracted _run_redownload_one(ch, folder, new_res,
+ scope_label) helper per item. Previously the per-item
+ logic lived as a closure `_run` inside chan_redownload;
+ lifting it out lets the worker loop over multiple items
+ without re-spawning threads.
 
 JS Continue Redownload action is now async and awaits the
 response to show a toast: "Redownload started: <channel>" on
@@ -2960,9 +2952,9 @@ app.js cache-buster bumped to v=59.
 Two bugs reported in quick succession.
 
 (1) Pause emitted three log lines for one click:
-      ⏸ Paused — stopping current download.
-      ⏸ Paused — stopping current download.
-      ⏸ Sync paused at 5:38pm — click Resume.
+ ⏸ Paused — stopping current download.
+ ⏸ Paused — stopping current download.
+ ⏸ Sync paused at 5:38pm — click Resume.
 
 sync_channel runs TWO yt-dlp subprocesses per channel — one for
 /videos (main pass) and one for /streams (past livestreams). When
@@ -3228,13 +3220,13 @@ and the playhead snapped back to its current position on every seek
 attempt. Any build from v46.0 through v46.2 had this bug.
 
 Fix in backend/local_fileserver.py:
-  - protocol_version = "HTTP/1.1" (required for 206)
-  - Accept-Ranges: bytes on every successful response
-  - _parse_range() handles bytes=X-Y, bytes=X-, bytes=-N
-  - do_GET serves 206 + Content-Range on Range requests
-  - do_HEAD added for browsers that probe before seeking
-  - 416 with Content-Range: bytes */SIZE on malformed ranges
-  - Silent ConnectionError handling for mid-scrub client aborts
+ - protocol_version = "HTTP/1.1" (required for 206)
+ - Accept-Ranges: bytes on every successful response
+ - _parse_range() handles bytes=X-Y, bytes=X-, bytes=-N
+ - do_GET serves 206 + Content-Range on Range requests
+ - do_HEAD added for browsers that probe before seeking
+ - 416 with Content-Range: bytes */SIZE on malformed ranges
+ - Silent ConnectionError handling for mid-scrub client aborts
 ```
 
 #### v46.2 — Watch-view retranscribe polish + stuck progress line fix.
@@ -3271,26 +3263,26 @@ backend as before. The Tkinter build is archived as the "Tkinter
 legacy ver" release on GitHub for anyone who prefers the original UI.
 
 Major UI shifts from classic:
-  - Browse tab consolidates Channels / Search / Graph / Bookmarks /
-    Recent behind one sidebar. Recent has a thumbnail-grid view as
-    well as the legacy list.
-  - Graph tab supports Year / Month / Week buckets (Week uses the
-    new videos.upload_ts column derived from file mtimes).
-  - Settings split into General / Performance / Appearance / Tools /
-    Index sub-tabs.
+ - Browse tab consolidates Channels / Search / Graph / Bookmarks /
+ Recent behind one sidebar. Recent has a thumbnail-grid view as
+ well as the legacy list.
+ - Graph tab supports Year / Month / Week buckets (Week uses the
+ new videos.upload_ts column derived from file mtimes).
+ - Settings split into General / Performance / Appearance / Tools /
+ Index sub-tabs.
 
 Activity log consolidation:
-  - Download + transcribe + metadata for each channel collapse into
-    a single [Dwnld] row per sync pass:
-        [Dwnld] 12:44pm, Apr 20 — Channel — N downloaded · N transcribed
-                                  · N metadata · 0 errors · took 13s
-  - When transcribed or metadata is exactly 1, the count renders as a
-    ✓ instead of a digit (the user's single-video polish). `downloaded`
-    stays numeric. New grid cell for metadata; row max width bumped
-    to 1800px so wide monitors don't truncate.
-  - Race fix: sync_channel reads the transcribe manager's per-channel
-    batch stats synchronously at its end and marks "sync active" so a
-    fast auto-captions flush can't fire a stray [Trnscr] row first.
+ - Download + transcribe + metadata for each channel collapse into
+ a single [Dwnld] row per sync pass:
+ [Dwnld] 12:44pm, Apr 20 — Channel — N downloaded · N transcribed
+ · N metadata · 0 errors · took 13s
+ - When transcribed or metadata is exactly 1, the count renders as a
+ ✓ instead of a digit (the user's single-video polish). `downloaded`
+ stays numeric. New grid cell for metadata; row max width bumped
+ to 1800px so wide monitors don't truncate.
+ - Race fix: sync_channel reads the transcribe manager's per-channel
+ batch stats synchronously at its end and marks "sync active" so a
+ fast auto-captions flush can't fire a stray [Trnscr] row first.
 
 Recent-tab live refresh: new downloads + thumbnails now re-push the
 grid/list without needing an app restart.
@@ -3323,8 +3315,7 @@ handoff (+ existing reverse nudge on the Download tab). Normalizes
 @handle / /@handle / bare handle / channel/UC... / user/name on save.
 ```
 
-### April 16, 2026
-
+---
 #### v42.2 — Redownload log: .mp4 white, truncation ellipsis yellow
 
 ```
@@ -3336,11 +3327,11 @@ task identity. If the filename was too long and got truncated to
 chartreuse redownload color so the truncation indicator stands out.
 
 Now:
-    [ / ] → chartreuse (redwnl task color)
-    numbers inside brackets → white
-    video title → white
-    .mp4 → white (was chartreuse in v42.1)
-    truncation "..." → chartreuse
+ [ / ] → chartreuse (redwnl task color)
+ numbers inside brackets → white
+ video title → white
+ .mp4 → white (was chartreuse in v42.1)
+ truncation "..." → chartreuse
 
 Implementation: in the `_is_redwnl` branch of `_segmented_insert`, the
 extension segment now inserts with `dl_white` instead of `_base_tag`.
@@ -3353,7 +3344,7 @@ splits the text on the trailing `...` and colors the ellipsis with
 
 ```
 The per-item lines in the redownload task (simple mode) looked like:
-    [352/2850] The Verge Mobile Show 019 - October 2nd, 2012.mp4
+ [352/2850] The Verge Mobile Show 019 - October 2nd, 2012.mp4
 but every character was chartreuse — numbers, title, extension all the
 same color as the [ ] brackets. User report: the video title should be white;
 only the brackets, slash, and file extension should be color-matched.
@@ -3361,9 +3352,9 @@ That matches how the download, transcribe-done, and metadata lines
 already render (white title, colored decorators).
 
 Now:
-    [ / ] and .mp4 → chartreuse (redwnl task color)
-    numbers inside brackets → white
-    video title → white
+ [ / ] and .mp4 → chartreuse (redwnl task color)
+ numbers inside brackets → white
+ video title → white
 
 Implementation: extended the existing `_segmented_insert` helper. It
 already had a white-title branch for meta_bracket lines — added a
@@ -3375,10 +3366,10 @@ on the `.ext` suffix so only the extension keeps the task color.
 
 ```
 v41.9's startup notice was:
-    ⏸ Sync queue restored — PAUSED on launch. Click Resume to start processing.
+ ⏸ Sync queue restored — PAUSED on launch. Click Resume to start processing.
 User report: too verbose; last word should be PAUSED.
 Now:
-    ⏸ Sync queue restored — PAUSED
+ ⏸ Sync queue restored — PAUSED
 
 (Version rolls v41.9 → v42.0 per the single-decimal versioning rule.)
 ```
@@ -3406,26 +3397,26 @@ several minutes in, looking like it came out of nowhere.
 
 FIX (two parts):
 
-  1. Restore-time visibility. When sync_pipeline_restored auto-sets
-     pause_event at launch, also log:
-         ⏸ Sync queue restored — PAUSED on launch. Click Resume to
-         start processing.
-     So the user knows immediately, not implicitly.
+ 1. Restore-time visibility. When sync_pipeline_restored auto-sets
+ pause_event at launch, also log:
+ ⏸ Sync queue restored — PAUSED on launch. Click Resume to
+ start processing.
+ So the user knows immediately, not implicitly.
 
-  2. Entry-time pause check on every long-running sync-pipeline
-     worker. Tasks now check pause_event at the START before doing
-     any visible preliminary work. Pauses for the full duration if
-     paused, then runs cleanly when resumed.
+ 2. Entry-time pause check on every long-running sync-pipeline
+ worker. Tasks now check pause_event at the START before doing
+ any visible preliminary work. Pauses for the full duration if
+ paused, then runs cleanly when resumed.
 
-     Worker entry-points that gained the check this round:
-       - Sync (_sync_worker, line ~19036)
-       - Reorganize (_run_reorganize_auto worker, line ~8069)
-       - Transcribe (_start_transcription's _worker, line ~14394)
-       - Redownload (_backlog_redownload_channel's _worker, line ~10469
-         — added in earlier work today)
+ Worker entry-points that gained the check this round:
+ - Sync (_sync_worker, line ~19036)
+ - Reorganize (_run_reorganize_auto worker, line ~8069)
+ - Transcribe (_start_transcription's _worker, line ~14394)
+ - Redownload (_backlog_redownload_channel's _worker, line ~10469
+ — added in earlier work today)
 
-     Metadata (_run_metadata_download, line ~12468) already had this
-     check, so no change there.
+ Metadata (_run_metadata_download, line ~12468) already had this
+ check, so no change there.
 
 NET EFFECT: launch with restored items → clear pause notice immediately
 in the log → click Resume → tasks proceed cleanly without ever showing
@@ -3464,54 +3455,54 @@ Three coordinated fixes that together enforce the "one transcription
 per video, Whisper beats YT" rule end-to-end.
 
 1. BULK-QUEUE LOG SPAM
-   _queue_all_transcriptions used to emit one "Added X to GPU-tasks
-   queue" line per channel — 103 channels = 103 redundant log lines
-   above a single summary. _add_to_gpu_queue now respects _quiet=True
-   for the success log; the bulk caller passes _quiet=True. Summary
-   line gains a leading em-dash so the existing simpleline_green +
-   leading-em-dash painter rule paints it blue (transcription
-   identity). Net result: one tidy line per bulk action, not 103.
+ _queue_all_transcriptions used to emit one "Added X to GPU-tasks
+ queue" line per channel — 103 channels = 103 redundant log lines
+ above a single summary. _add_to_gpu_queue now respects _quiet=True
+ for the success log; the bulk caller passes _quiet=True. Summary
+ line gains a leading em-dash so the existing simpleline_green +
+ leading-em-dash painter rule paints it blue (transcription
+ identity). Net result: one tidy line per bulk action, not 103.
 
 2. AUTO-TRANSCRIBE OVERWRITING WHISPER (the real bug the user reported)
-   Symptom: a video previously retranscribed with Whisper via the
-   client viewer was getting auto-captioned AGAIN on subsequent sync
-   runs, silently overwriting the Whisper transcript. The auto-
-   transcribe-after-sync flow was treating the file as "not yet
-   transcribed" and re-processing it through the YT-captions path.
+ Symptom: a video previously retranscribed with Whisper via the
+ client viewer was getting auto-captioned AGAIN on subsequent sync
+ runs, silently overwriting the Whisper transcript. The auto-
+ transcribe-after-sync flow was treating the file as "not yet
+ transcribed" and re-processing it through the YT-captions path.
 
-   Root cause: file stems on Windows use fullwidth replacements
-   (？/：/／) for forbidden characters, but transcript headers may use
-   either form depending on whether the title came from YouTube's API
-   (ASCII) or from the filename (fullwidth). The _start_transcription
-   skip check ("is this fname already in already_done?") was a literal
-   string compare — so the fullwidth ？ filename stem missed the ASCII
-   ? .txt entry written by the client retranscribe. File fell into
-   files_to_process → auto-captions ran → Whisper overwritten.
+ Root cause: file stems on Windows use fullwidth replacements
+ (？/：/／) for forbidden characters, but transcript headers may use
+ either form depending on whether the title came from YouTube's API
+ (ASCII) or from the filename (fullwidth). The _start_transcription
+ skip check ("is this fname already in already_done?") was a literal
+ string compare — so the fullwidth ？ filename stem missed the ASCII
+ ? .txt entry written by the client retranscribe. File fell into
+ files_to_process → auto-captions ran → Whisper overwritten.
 
-   Fix (two parts):
-     a) NFKC-normalize both sides of the skip check (and the
-        _jsonl_needed check). NFKC collapses fullwidth ？/：/／ to
-        ASCII so `？` and `?` compare equal.
-     b) _run_retranscribe_job now writes new entries with the
-        FILESYSTEM-safe filename stem as the title (was: DB title,
-        which was usually the YouTube API ASCII form). v41.4's
-        purge-by-video_id removes the OLD entry whatever its title
-        was, so the file ends up with ONE entry whose title matches
-        the on-disk filename exactly. No more dual-title entries.
+ Fix (two parts):
+ a) NFKC-normalize both sides of the skip check (and the
+ _jsonl_needed check). NFKC collapses fullwidth ？/：/／ to
+ ASCII so `？` and `?` compare equal.
+ b) _run_retranscribe_job now writes new entries with the
+ FILESYSTEM-safe filename stem as the title (was: DB title,
+ which was usually the YouTube API ASCII form). v41.4's
+ purge-by-video_id removes the OLD entry whatever its title
+ was, so the file ends up with ONE entry whose title matches
+ the on-disk filename exactly. No more dual-title entries.
 
 3. METADATA-PREP-LINE FIGHTING (carry-over noted in changelog)
-   "Fetching channel playlist..." metadata prep line had been
-   inserting at tk.END, which made it RACE the bottom-pinned
-   simplestatus anim ("Transcribing: X··") for the absolute-bottom
-   position. Fixed in v41.6 by inserting at simplestatus[0]; pink
-   em-dash added for metadata identity.
+ "Fetching channel playlist..." metadata prep line had been
+ inserting at tk.END, which made it RACE the bottom-pinned
+ simplestatus anim ("Transcribing: X··") for the absolute-bottom
+ position. Fixed in v41.6 by inserting at simplestatus[0]; pink
+ em-dash added for metadata identity.
 
 END-STATE CONTRACT for transcripts going forward:
-  - One .txt entry per video
-  - One .jsonl segment group per video
-  - Whisper retranscribes cleanly REPLACE YT auto-captions in place
-  - Files stay "transcribed"-flagged across future sync passes
-  - Future re-transcribes will not create dual entries
+ - One .txt entry per video
+ - One .jsonl segment group per video
+ - Whisper retranscribes cleanly REPLACE YT auto-captions in place
+ - Files stay "transcribed"-flagged across future sync passes
+ - Future re-transcribes will not create dual entries
 
 Existing dual entries on disk (created pre-v41.4) remain cleanable
 via cleanup_dup_transcripts.py. Today already cleaned: LaurieWired
@@ -3550,8 +3541,8 @@ scanline tag so the next call's delete-then-reinsert finds the whole
 line and replaces it in-place.
 
 Visual end state when sync + transcribe + metadata are all running:
-    \u2014 Fetching channel playlist... 12,291 titles (149s)   <- pink dash
-  Transcribing: Saturday Night Live\u00b7\u00b7                <- bottom anim
+ \u2014 Fetching channel playlist... 12,291 titles (149s) <- pink dash
+ Transcribing: Saturday Night Live\u00b7\u00b7 <- bottom anim
 ```
 
 #### v41.5 — Auto-transcribe-after-sync skips full channel scan
@@ -3570,22 +3561,22 @@ has a fast path for "I already know which IDs to fetch"). The
 transcribe path was missing the same plumbing.
 
 FIX:
-  1. Sync's auto-transcribe block (line ~6848) now reads the list of
-     freshly-downloaded video_ids from _last_run_counts and includes
-     it as `video_ids` in the GPU queue item.
-  2. GPU worker (line ~21745) forwards `item.get("video_ids")` to
-     _start_transcription.
-  3. _start_transcription (line ~14315 + 14555) gained a new optional
-     video_ids parameter. When set:
-       - Looks up (title, filepath) for each video_id in YTArchiver's
-         own DB and pre-seeds yt_title_to_id[file_stem] = vid_id.
-       - New `_all_files_seeded` flag — true when every file in the
-         batch has a seeded ID. When true, skips BOTH the per-file
-         YT search (small batches) AND the channel-wide playlist
-         fetch (large batches) entirely. Goes straight to caption-
-         fetching for files that have IDs.
-  4. Falls through to existing search/fetch logic for any unseeded
-     files (e.g. retranscribe flows that don't carry sync's IDs).
+ 1. Sync's auto-transcribe block (line ~6848) now reads the list of
+ freshly-downloaded video_ids from _last_run_counts and includes
+ it as `video_ids` in the GPU queue item.
+ 2. GPU worker (line ~21745) forwards `item.get("video_ids")` to
+ _start_transcription.
+ 3. _start_transcription (line ~14315 + 14555) gained a new optional
+ video_ids parameter. When set:
+ - Looks up (title, filepath) for each video_id in YTArchiver's
+ own DB and pre-seeds yt_title_to_id[file_stem] = vid_id.
+ - New `_all_files_seeded` flag — true when every file in the
+ batch has a seeded ID. When true, skips BOTH the per-file
+ YT search (small batches) AND the channel-wide playlist
+ fetch (large batches) entirely. Goes straight to caption-
+ fetching for files that have IDs.
+ 4. Falls through to existing search/fetch logic for any unseeded
+ files (e.g. retranscribe flows that don't carry sync's IDs).
 
 Net effect for the sync->transcribe pipeline: zero channel-wide
 enumeration when sync just downloaded a bounded number of new videos.
@@ -3617,16 +3608,16 @@ vs ASCII chars, length truncation, manual renames), the same bug would
 have left stale duplicates whenever a re-transcribe ran.
 
 FIX:
-  _replace_jsonl_entry now purges entries matching (title OR video_id),
-  returning the SET of distinct titles it found for this video so
-  callers know what extra cleanup the txt needs.
-  _replace_txt_entry accepts an `extra_titles_to_remove` set and
-  purges all matching headers — not just the canonical one. Date /
-  duration provenance is captured from the first removed header so the
-  new entry inherits the original recording context.
-  Both call sites (_run_retranscribe_job worker AND the right-click
-  Browse-tab _on_retranscribe worker) flipped to call jsonl FIRST,
-  then feed the discovered titles into the txt replacer.
+ _replace_jsonl_entry now purges entries matching (title OR video_id),
+ returning the SET of distinct titles it found for this video so
+ callers know what extra cleanup the txt needs.
+ _replace_txt_entry accepts an `extra_titles_to_remove` set and
+ purges all matching headers — not just the canonical one. Date /
+ duration provenance is captured from the first removed header so the
+ new entry inherits the original recording context.
+ Both call sites (_run_retranscribe_job worker AND the right-click
+ Browse-tab _on_retranscribe worker) flipped to call jsonl FIRST,
+ then feed the discovered titles into the txt replacer.
 
 Future re-transcribes will properly wipe-and-replace. Existing
 duplicates already on disk get cleaned up either by re-transcribing
@@ -3658,25 +3649,25 @@ previous localhost-only behavior.
 
 Adds a startup log line surfacing the bind so there's no mystery
 about which mode the receiver is in:
-  [cmd] Receiver listening on 0.0.0.0:9855 (LAN-accessible)
+ [cmd] Receiver listening on 0.0.0.0:9855 (LAN-accessible)
 or
-  [cmd] Receiver listening on 127.0.0.1:9855 (localhost only)
+ [cmd] Receiver listening on 127.0.0.1:9855 (localhost only)
 
 PAIRED VIEWER CHANGES (in ArchiveBrowserWithYTTest, separate codebase):
-  - New YTARCHIVER_HOST env var (default 127.0.0.1). Client viewers
-    on other machines should set this to the host's IP or hostname
-    (e.g. "media-server" or "192.168.0.42"). The host's own viewer
-    keeps the default since YTArchiver is right there on localhost.
-  - All ytarchiver helpers (_ytarchiver_is_running, _ytarchiver_ping,
-    _ytarchiver_url, the retranscribe forwarder, the gpu-status
-    forwarder, the repair forwarder) now route to the configured
-    host instead of hardcoded 127.0.0.1.
-  - Status banner now REPLACES the "transcript is approximate"
-    warning when a re-transcribe is queued/running for the current
-    video. Shows queue position ("next up" / "N jobs ahead"), live
-    whisper progress percentage, and "(GPU queue paused)" suffix
-    when the host's GPU queue is paused. Auto-restores the warning
-    if the job clears without completing.
+ - New YTARCHIVER_HOST env var (default 127.0.0.1). Client viewers
+ on other machines should set this to the host's IP or hostname
+ (e.g. "media-server" or "192.168.0.42"). The host's own viewer
+ keeps the default since YTArchiver is right there on localhost.
+ - All ytarchiver helpers (_ytarchiver_is_running, _ytarchiver_ping,
+ _ytarchiver_url, the retranscribe forwarder, the gpu-status
+ forwarder, the repair forwarder) now route to the configured
+ host instead of hardcoded 127.0.0.1.
+ - Status banner now REPLACES the "transcript is approximate"
+ warning when a re-transcribe is queued/running for the current
+ video. Shows queue position ("next up" / "N jobs ahead"), live
+ whisper progress percentage, and "(GPU queue paused)" suffix
+ when the host's GPU queue is paused. Auto-restores the warning
+ if the job clears without completing.
 ```
 
 #### v41.2 — Fix simple-mode log filter + channel art yt-dlp invocation
@@ -3691,9 +3682,9 @@ return without writing to log_box. The list included simpleline,
 simpleline_green, simpleline_blue, simpleline_pink, summary, header,
 red, simpledownload, pauselog, etc. — but NOT the three task-identity
 tags I introduced in v40.9 / v41.0:
-  - simpleline_redwnl  (redownload)
-  - simpleline_compress  (compress backlog + regular compress)
-  - simpleline_reorg     (reorganize)
+ - simpleline_redwnl (redownload)
+ - simpleline_compress (compress backlog + regular compress)
+ - simpleline_reorg (reorganize)
 So every log call using these tags was silently dropped in simple mode
 the entire time those features existed. The visible symptom was the
 one the user hit: a redownload backlog task on MoistCr1TiKaL advanced
@@ -3704,17 +3695,17 @@ anim line happily updates while every per-video log call gets dropped.
 Fix: added the three missing tags to the allowlist.
 
 THE CHANNEL ART BUG: v41.1's _fetch_channel_art used the yt-dlp invocation
-  yt-dlp --skip-download --no-warnings --playlist-items 0 \\
-         --print "%(thumbnails)j" --cookies-from-browser firefox <url>
+ yt-dlp --skip-download --no-warnings --playlist-items 0 \\
+ --print "%(thumbnails)j" --cookies-from-browser firefox <url>
 This produces NO OUTPUT because --print fires per item but
 --playlist-items 0 means no items are enumerated. Result: the helper
 saw empty stdout, returned silently, and the .ChannelArt/ folder got
 created but never populated. the user noticed: ran metadata on every
 channel overnight, refreshed the test viewer, no avatars anywhere.
 Switched to:
-  yt-dlp --skip-download --no-warnings \\
-         --dump-single-json --flat-playlist --playlist-items 0 \\
-         --cookies-from-browser firefox <url>
+ yt-dlp --skip-download --no-warnings \\
+ --dump-single-json --flat-playlist --playlist-items 0 \\
+ --cookies-from-browser firefox <url>
 This dumps the channel's own JSON. Its `thumbnails` array contains
 both the avatar (id=avatar_uncropped) and the banner
 (id=banner_uncropped) which we then download as before.
@@ -3741,34 +3732,34 @@ for that ID got attributed to all of them. Same upload_date, same view
 count, same description, same thumbnail across all 12 files.
 
 THE FIX: All three resolver passes now use date proximity to disambiguate.
-  - Pass 4 (channel playlist match): _batch_map now stores
-    norm_title -> [(vid_id, upload_date), ...] (every candidate). When
-    multiple files have the same normalized title, each one matches to
-    the candidate whose upload_date is closest to its file mtime. Any
-    best-match with >365 days drift is rejected outright (the wrong
-    video) and the file falls through to date-based matching in Pass 6.
-  - Pass 7 (individual yt-dlp search): the yt-dlp `ytsearch1:` fallback
-    occasionally returns a fuzzy match that shares a substring of the
-    query but is an entirely different video. Now compares the search
-    result's upload_date against the file mtime and rejects assignment
-    if drift >365d.
-  - Pass 2 (DB title shortcut): if the same title has multiple distinct
-    video_ids in the DB (the same-titled-video bug already manifested),
-    skips the shortcut and defers to the date-aware passes.
+ - Pass 4 (channel playlist match): _batch_map now stores
+ norm_title -> [(vid_id, upload_date), ...] (every candidate). When
+ multiple files have the same normalized title, each one matches to
+ the candidate whose upload_date is closest to its file mtime. Any
+ best-match with >365 days drift is rejected outright (the wrong
+ video) and the file falls through to date-based matching in Pass 6.
+ - Pass 7 (individual yt-dlp search): the yt-dlp `ytsearch1:` fallback
+ occasionally returns a fuzzy match that shares a substring of the
+ query but is an entirely different video. Now compares the search
+ result's upload_date against the file mtime and rejects assignment
+ if drift >365d.
+ - Pass 2 (DB title shortcut): if the same title has multiple distinct
+ video_ids in the DB (the same-titled-video bug already manifested),
+ skips the shortcut and defers to the date-aware passes.
 
 THE REPAIR: A standalone repair_metadata_mismatches.py script was run
 against the DB to fix the existing damage from this bug. Scope:
-  - 133 duplicate video_id groups across 22 channels
-  - 121 repaired (winner kept by mtime closest to upload_date,
-    losers cleared for re-resolution)
-  - 12 clear-all (video_id wrong for ALL files in the group;
-    cleared everyone, will re-resolve from scratch)
-  - 194 wrong assignments cleared total
-  - 276 orphan metadata entries removed across 188 jsonl files
-    (entries whose video_id was no longer claimed by any file in the
-    same folder, e.g. a 2026 video's metadata sitting in a 2008/.jsonl
-    because the 2008 file briefly held that ID)
-  - Orphaned thumbnails in .Thumbnails/ folders deleted alongside
+ - 133 duplicate video_id groups across 22 channels
+ - 121 repaired (winner kept by mtime closest to upload_date,
+ losers cleared for re-resolution)
+ - 12 clear-all (video_id wrong for ALL files in the group;
+ cleared everyone, will re-resolve from scratch)
+ - 194 wrong assignments cleared total
+ - 276 orphan metadata entries removed across 188 jsonl files
+ (entries whose video_id was no longer claimed by any file in the
+ same folder, e.g. a 2026 video's metadata sitting in a 2008/.jsonl
+ because the 2008 file briefly held that ID)
+ - Orphaned thumbnails in .Thumbnails/ folders deleted alongside
 Affected channels (top): Jimmy Kimmel (31 dup groups), David Pakman
 (18), MoistCr1TiKaL (15), Bernie Sanders (14), HasanAbi (9), Two
 Minute Papers (8), Stephen Colbert (8), John Michael Godier (7),
@@ -3787,8 +3778,7 @@ to render real channel avatars on the channel grid instead of
 the colored letter placeholder.
 ```
 
-### April 15, 2026
-
+---
 #### v41.0 — Backlog log lines: task-colored em-dashes throughout
 
 ```
@@ -3806,40 +3796,40 @@ to colorize the em-dash given the right base tag (lines 909-914) — the
 bug was just that these calls never passed the right tag.
 
 Lines affected:
-  Redownload backlog (_backlog_redownload_channel ~line 10219+):
-  - "Found N local file(s)." (10340)
-  - "Redownload cancelled before YouTube fetch." (10343)
-  - "Fetching YouTube video list for ID matching..." (10349)
-  - "No videos returned with cookies — retrying without cookies..." (10366)
-  - "Retrying YouTube video list fetch..." (10376)
-  - "Redownload cancelled during YouTube fetch." (10381)
-  - "Found N video(s) on YouTube." (10388)
-  - "Redownload cancelled after YouTube fetch." (10391)
-  - "Scanning YouTube catalog (page X)..." (10306)
-  - "No video files found." (10337)
-  - "No files to process after matching." (10464)
-  - "Resuming — N video(s) already redownloaded, M remaining." (10474)
-  - "All files already redownloaded." (10476)
-  - "Matched N file(s). Starting redownload at Xp..." (10489)
-  - "Matched N file(s). Resuming redownload at Xp..." (10491)
-  - "Matched N file(s). Checking the first 10 at Xp..." (10493)
+ Redownload backlog (_backlog_redownload_channel ~line 10219+):
+ - "Found N local file(s)." (10340)
+ - "Redownload cancelled before YouTube fetch." (10343)
+ - "Fetching YouTube video list for ID matching..." (10349)
+ - "No videos returned with cookies — retrying without cookies..." (10366)
+ - "Retrying YouTube video list fetch..." (10376)
+ - "Redownload cancelled during YouTube fetch." (10381)
+ - "Found N video(s) on YouTube." (10388)
+ - "Redownload cancelled after YouTube fetch." (10391)
+ - "Scanning YouTube catalog (page X)..." (10306)
+ - "No video files found." (10337)
+ - "No files to process after matching." (10464)
+ - "Resuming — N video(s) already redownloaded, M remaining." (10474)
+ - "All files already redownloaded." (10476)
+ - "Matched N file(s). Starting redownload at Xp..." (10489)
+ - "Matched N file(s). Resuming redownload at Xp..." (10491)
+ - "Matched N file(s). Checking the first 10 at Xp..." (10493)
 
-  Compress backlog (_backlog_compress_channel ~line 9510+):
-  - "No video files found." (9549)
-  - "Found N local video file(s)." (9552)
-  - "Scanning YouTube catalog (page X)..." (9638)
-  - "Found N video(s) on YouTube." (9656)
-  - "No files to process after matching." (9722)
-  - "Matched N file(s) for backlog processing." (9725)
-  These four were previously simpleline_redwnl from the v40.9 session
-  where I had the wrong task identified — corrected here so compress
-  runs show green (simpleline_compress) end-to-end.
+ Compress backlog (_backlog_compress_channel ~line 9510+):
+ - "No video files found." (9549)
+ - "Found N local video file(s)." (9552)
+ - "Scanning YouTube catalog (page X)..." (9638)
+ - "Found N video(s) on YouTube." (9656)
+ - "No files to process after matching." (9722)
+ - "Matched N file(s) for backlog processing." (9725)
+ These four were previously simpleline_redwnl from the v40.9 session
+ where I had the wrong task identified — corrected here so compress
+ runs show green (simpleline_compress) end-to-end.
 
-  Regular compress (_compress_channel ~line 9168+):
-  - "No target video files found for this batch." (9200)
-  - "No video files found to compress." (9214)
-  Standardized to simpleline_compress with em-dash too, so a triggered
-  compress job has a consistent identity from the first message.
+ Regular compress (_compress_channel ~line 9168+):
+ - "No target video files found for this batch." (9200)
+ - "No video files found to compress." (9214)
+ Standardized to simpleline_compress with em-dash too, so a triggered
+ compress job has a consistent identity from the first message.
 
 Net effect: a running redownload looks chartreuse-yellow throughout, a
 running compress looks green throughout, regardless of which sub-step
@@ -3869,19 +3859,19 @@ Simple-mode em-dash audit. A handful of log lines were missing
 their task-identity em-dash color, making it hard to glance-scan
 which task a line belonged to when multiple were running:
 - "Fetching YouTube video list for ID matching..." at lines 9577
-  and 10349 (both transcription resolver paths) now lead with
-  "  — " instead of "  ", picking up the blue em-dash via the
-  painter's simpleline + leading-em-dash rule.
+ and 10349 (both transcription resolver paths) now lead with
+ " — " instead of " ", picking up the blue em-dash via the
+ painter's simpleline + leading-em-dash rule.
 - "Found N local file(s)." at line 10340 same treatment.
 - "All videos already transcribed!" / "All videos already
-  transcribed." (lines 14238 / 14256) now lead with "  — ✓"
-  so the em-dash gets blued (painter's simpleline_green +
-  leading-em-dash rule) while the ✓ + text stay green.
+ transcribed." (lines 14238 / 14256) now lead with " — ✓"
+ so the em-dash gets blued (painter's simpleline_green +
+ leading-em-dash rule) while the ✓ + text stay green.
 - Redownload result lines at 10866 / 10868 ("✓ 32.6 MB →
-  109.3 MB (235% larger)") moved from simpleline_green to
-  simpleline_redwnl AND prefixed with an em-dash. simpleline_redwnl's
-  chartreuse foreground (C_LOG_REDWNL) now applies to the whole
-  line including the em-dash, matching the redownload task identity.
+ 109.3 MB (235% larger)") moved from simpleline_green to
+ simpleline_redwnl AND prefixed with an em-dash. simpleline_redwnl's
+ chartreuse foreground (C_LOG_REDWNL) now applies to the whole
+ line including the em-dash, matching the redownload task identity.
 ```
 
 #### v40.8 — Quieter re-transcribe logging in simple mode
@@ -3897,9 +3887,9 @@ Whisper progress line are already the meaningful events.
 Wrapped those four lines with `if not _is_simple_mode`. Simple
 mode now goes:
 
-  — Added M.T. <title> to GPU-tasks queue
-  — ✓ Whisper model loaded (<model>, CUDA).
-  [1/1] Transcribing "<title>", 47%...
+ — Added M.T. <title> to GPU-tasks queue
+ — ✓ Whisper model loaded (<model>, CUDA).
+ [1/1] Transcribing "<title>", 47%...
 
 Verbose mode is unchanged.
 ```
@@ -3924,26 +3914,26 @@ Browse tab + external viewers read stayed untouched.
 
 Fix:
 - /cmd/retranscribe now joins videos → segments to pick up the
-  stored jsonl_path, derives the matching .txt path by stripping
-  the leading dot and swapping extension (same logic as
-  _tp_panel._get_txt_path). Falls back to scanning the video's
-  parent folder for " Transcript.jsonl" / " Transcript.txt" if
-  the video has no segments yet.
+ stored jsonl_path, derives the matching .txt path by stripping
+ the leading dot and swapping extension (same logic as
+ _tp_panel._get_txt_path). Falls back to scanning the video's
+ parent folder for " Transcript.jsonl" / " Transcript.txt" if
+ the video has no segments yet.
 - Builds the queue item as
-  {"type": "mt", "file_path": ..., "model": ...,
-   "retranscribe": True, "title": ..., "video_id": ...,
-   "txt_path": ..., "jsonl_path": ...}.
+ {"type": "mt", "file_path": ..., "model": ...,
+ "retranscribe": True, "title": ..., "video_id": ...,
+ "txt_path": ..., "jsonl_path": ...}.
 - GPU worker's mt branch now has three sub-cases: folder-based MT
-  (unchanged), retranscribe (NEW: routes to _run_retranscribe_job),
-  single-file MT (unchanged — _run_manual_transcription).
+ (unchanged), retranscribe (NEW: routes to _run_retranscribe_job),
+ single-file MT (unchanged — _run_manual_transcription).
 - _run_retranscribe_job reproduces the Browse-tab _on_retranscribe
-  worker body at module scope: _whisper_transcribe → capture BOTH
-  text and segments, _whisper_punct_fixup, then
-  _tp_panel._replace_txt_entry (updates the per-year .txt header
-  to "(WHISPER <MODEL>)" and body to the new text),
-  _tp_panel._replace_jsonl_entry (swaps the per-video segments
-  block in the per-year .jsonl), and _tp_index_file to refresh
-  the FTS search index immediately.
+ worker body at module scope: _whisper_transcribe → capture BOTH
+ text and segments, _whisper_punct_fixup, then
+ _tp_panel._replace_txt_entry (updates the per-year .txt header
+ to "(WHISPER <MODEL>)" and body to the new text),
+ _tp_panel._replace_jsonl_entry (swaps the per-video segments
+ block in the per-year .jsonl), and _tp_index_file to refresh
+ the FTS search index immediately.
 
 Result: retranscription via the command API now touches the same
 files as the Browse tab's right-click. Source detection in the
@@ -3961,55 +3951,55 @@ fire-and-forget button.
 
 /cmd/retranscribe extended:
 - Now accepts {channel, video_id, model?} where model is one of
-  tiny / small / medium / large-v3. Validates the value and
-  returns 400 for anything else. If omitted, the GPU worker falls
-  back to _whisper_model_choice like it always did.
+ tiny / small / medium / large-v3. Validates the value and
+ returns 400 for anything else. If omitted, the GPU worker falls
+ back to _whisper_model_choice like it always did.
 - mt branch of _gpu_worker now reads item.get("model") and, if
-  present, assigns to _whisper_model_choice for this job only.
-  Mirrors the transcribe-branch pattern already in place at line
-  21324, just extended to manual-transcription items.
+ present, assigns to _whisper_model_choice for this job only.
+ Mirrors the transcribe-branch pattern already in place at line
+ 21324, just extended to manual-transcription items.
 
 New /cmd/gpu-status endpoint (GET):
 - Returns current running GPU item (file_path, file_name, type,
-  model, label) plus the pending queue (same shape, minus
-  progress fields).
+ model, label) plus the pending queue (same shape, minus
+ progress fields).
 - Whisper progress: parses _whisper_dots["pct_str"] with a regex
-  so viewers get a 0-100 number. Also includes whisper_active
-  bool and the _whisper_counter batch {idx, total} for channel-
-  level transcriptions.
+ so viewers get a 0-100 number. Also includes whisper_active
+ bool and the _whisper_counter batch {idx, total} for channel-
+ level transcriptions.
 - gpu_paused bool so viewers can say "queued but paused" instead
-  of just "queued".
+ of just "queued".
 - Cheap read-only — polled every ~3 s by the viewer's watch view
-  while open. Locks only briefly to snapshot the queue.
+ while open. Locks only briefly to snapshot the queue.
 
 Viewer-side changes (in the ArchiveBrowserWithYTTest project, not
 YTArchiver — but the APIs above are what they need):
 - Model picker modal replaces the fire-and-forget link. User
-  chooses tiny/small/medium/large-v3 before sending.
+ chooses tiny/small/medium/large-v3 before sending.
 - Watch view polls /cmd/gpu-status every 3s. If the watched video
-  is the current running job, shows a "Re-transcribing with
-  Whisper (small) — 47%" banner with a live progress bar. If it's
-  queued, shows "Queued for re-transcription — N ahead". If GPU
-  is paused, banner annotates that too.
+ is the current running job, shows a "Re-transcribing with
+ Whisper (small) — 47%" banner with a live progress bar. If it's
+ queued, shows "Queued for re-transcription — N ahead". If GPU
+ is paused, banner annotates that too.
 - When the current job transitions away from the watched video
-  (re-transcription finished), viewer waits 1.2 s for the file
-  write, refetches transcript + source, and if source category
-  changed (e.g. yt_captions_punct → whisper) re-renders the
-  watch view in place. Saves and restores the playback position
-  so the user doesn't lose their spot.
+ (re-transcription finished), viewer waits 1.2 s for the file
+ write, refetches transcript + source, and if source category
+ changed (e.g. yt_captions_punct → whisper) re-renders the
+ watch view in place. Saves and restores the playback position
+ so the user doesn't lose their spot.
 
 Minor viewer bug fixes batched in:
 - /api/youtube/retranscribe forwarder on the viewer side was
-  still requiring "year" in the body from v40.5 (leftover from
-  the earlier API shape). Dropped — YTArchiver looks up by
-  (channel, video_id) now. Also now forwards the model param
-  through.
+ still requiring "year" in the body from v40.5 (leftover from
+ the earlier API shape). Dropped — YTArchiver looks up by
+ (channel, video_id) now. Also now forwards the model param
+ through.
 - Source banner in the transcript panel was using display:flex
-  which caused the inline "re-transcribe with Whisper" link to
-  stack vertically in a 380px sidebar. Switched to display:block
-  with inline-block dot; text flows naturally now.
+ which caused the inline "re-transcribe with Whisper" link to
+ stack vertically in a 380px sidebar. Switched to display:block
+ with inline-block dot; text flows naturally now.
 - Right-click context menu on YT cards and search results now
-  includes a Re-transcribe item that pops the same model picker.
+ includes a Re-transcribe item that pops the same model picker.
 ```
 
 #### v40.5 — Integration API, thumbnail dedup, pause-state fixes
@@ -4024,82 +4014,82 @@ process.
 New: localhost command receiver (stdlib http.server on port 9855,
 daemon thread, started right before root.mainloop). Bound to
 127.0.0.1 only — host-only by network layer, no separate auth.
-  - GET/POST /cmd/ping — returns version, hostname, pid, current
-    GPU-queue depth. Used by the viewer as a liveness probe.
-  - POST /cmd/retranscribe {channel, video_id} — looks up the
-    video in the index DB, then calls _add_to_gpu_queue with
-    type='mt'. Identical code path to the Browse tab's right-click
-    "Transcribe single file" action.
-  - POST /cmd/repair-orphans {items:[{channel,year,filename},...]}
-    — for each .mp4 path, clears date_resolve_failed_ts /
-    date_resolve_failed_mtime / search_failed_ts /
-    id_resolve_failed_ts / metadata_fetch_failed_ts so the row is
-    eligible for another multi-pass resolve attempt. Caller is
-    expected to queue metadata afterwards. Fixed mid-flight: the
-    DB filepath lookup was hitting empty because config["output_dir"]
-    is stored with forward slashes but videos.filepath uses all
-    backslashes. Wrapped the os.path.join in os.path.normpath so
-    slash-style mismatches resolve.
-  - POST /cmd/repair-duplicates {items:[{video_id, locations}]}
-    — for each duplicate video_id, reads the canonical title from
-    the videos table for that id, finds the location whose
-    filename prefix matches (normalized title compare), keeps it,
-    deletes the rest. If no location's title matches, keeps the
-    newest by mtime so at least one artifact survives. Thumbnails
-    only — never touches the .mp4.
-  - POST /cmd/repair-mismatches {items:[{channel, year,
-    thumbnail_filename}]} — deletes each thumbnail whose embedded
-    [video_id] disagrees with metadata.jsonl. Next metadata pass
-    re-downloads the correct one.
+ - GET/POST /cmd/ping — returns version, hostname, pid, current
+ GPU-queue depth. Used by the viewer as a liveness probe.
+ - POST /cmd/retranscribe {channel, video_id} — looks up the
+ video in the index DB, then calls _add_to_gpu_queue with
+ type='mt'. Identical code path to the Browse tab's right-click
+ "Transcribe single file" action.
+ - POST /cmd/repair-orphans {items:[{channel,year,filename},...]}
+ — for each .mp4 path, clears date_resolve_failed_ts /
+ date_resolve_failed_mtime / search_failed_ts /
+ id_resolve_failed_ts / metadata_fetch_failed_ts so the row is
+ eligible for another multi-pass resolve attempt. Caller is
+ expected to queue metadata afterwards. Fixed mid-flight: the
+ DB filepath lookup was hitting empty because config["output_dir"]
+ is stored with forward slashes but videos.filepath uses all
+ backslashes. Wrapped the os.path.join in os.path.normpath so
+ slash-style mismatches resolve.
+ - POST /cmd/repair-duplicates {items:[{video_id, locations}]}
+ — for each duplicate video_id, reads the canonical title from
+ the videos table for that id, finds the location whose
+ filename prefix matches (normalized title compare), keeps it,
+ deletes the rest. If no location's title matches, keeps the
+ newest by mtime so at least one artifact survives. Thumbnails
+ only — never touches the .mp4.
+ - POST /cmd/repair-mismatches {items:[{channel, year,
+ thumbnail_filename}]} — deletes each thumbnail whose embedded
+ [video_id] disagrees with metadata.jsonl. Next metadata pass
+ re-downloads the correct one.
 
 Thumbnail downloader dedup (the root cause of 38 duplicate-
 video_id cases the viewer's first integrity scan surfaced across
 the archive):
 - Before writing a new thumbnail, _download_thumbnail now scans
-  the target .Thumbnails folder for any existing file containing
-  [<video_id>]. If found under a different title prefix (because
-  YouTube renamed the video since we last fetched), the existing
-  file is renamed to match the new title instead of creating a
-  second copy. Same video_id now maps to at most one thumbnail
-  file per year folder.
+ the target .Thumbnails folder for any existing file containing
+ [<video_id>]. If found under a different title prefix (because
+ YouTube renamed the video since we last fetched), the existing
+ file is renamed to match the new title instead of creating a
+ second copy. Same video_id now maps to at most one thumbnail
+ file per year folder.
 
 Pause-state fixes. Four separate bugs all around the same area,
 all surfaced while testing the /cmd/retranscribe integration:
 - _sync_task_finished was unconditionally clearing pause_event
-  whenever no task was running. Meant any state transition that
-  reached _sync_task_finished silently wiped the user's manual
-  pause. Removed the clear. Disk-error auto-resume has its own
-  explicit pause_event.clear() at line 2418 so that path is
-  unaffected.
+ whenever no task was running. Meant any state transition that
+ reached _sync_task_finished silently wiped the user's manual
+ pause. Removed the clear. Disk-error auto-resume has its own
+ explicit pause_event.clear() at line 2418 so that path is
+ unaffected.
 - _add_to_metadata_queue's "auto-start if nothing else running"
-  guard now also checks pause_event.is_set(). Previously, adding
-  metadata to a paused sync queue fired the task immediately
-  because the guard only looked at running-flags, which are all
-  False during a pause.
+ guard now also checks pause_event.is_set(). Previously, adding
+ metadata to a paused sync queue fired the task immediately
+ because the guard only looked at running-flags, which are all
+ False during a pause.
 - _start_metadata_task's re-queue-at-head condition now also
-  checks pause_event. Belt-and-suspenders: even if some other
-  caller somehow bypasses the first guard and reaches the task
-  start, the item re-queues instead of running while paused.
+ checks pause_event. Belt-and-suspenders: even if some other
+ caller somehow bypasses the first guard and reaches the task
+ start, the item re-queues instead of running while paused.
 - _save_queue_state_now now writes "sync_paused": pause_event.is_set()
-  to the queue-state file, matching the existing gpu_paused pattern.
-  _load_queue_state restores it — AND sets pause_event if any
-  sync-pipeline items were restored, even if sync_paused wasn't
-  explicitly true. Rule: launching with items in queue never
-  auto-starts; the user has to explicitly hit Start or Resume.
+ to the queue-state file, matching the existing gpu_paused pattern.
+ _load_queue_state restores it — AND sets pause_event if any
+ sync-pipeline items were restored, even if sync_paused wasn't
+ explicitly true. Rule: launching with items in queue never
+ auto-starts; the user has to explicitly hit Start or Resume.
 - Both Start buttons (_global_start_all and the task-list popup's
-  _start_sync_queue) now explicitly clear pause_event (and
-  _gpu_pause for global) before calling _process_next_queued.
-  Otherwise with the new guards, clicking Start while paused
-  would just re-queue the top item and nothing would happen.
+ _start_sync_queue) now explicitly clear pause_event (and
+ _gpu_pause for global) before calling _process_next_queued.
+ Otherwise with the new guards, clicking Start while paused
+ would just re-queue the top item and nothing would happen.
 
 Behaviour changes for anyone paying attention:
 - Queues restored on launch now show as paused. Start/Resume to
-  run them. Previously they'd just sit (same result, different
-  visual).
+ run them. Previously they'd just sit (same result, different
+ visual).
 - Items added while paused stay queued. Previously metadata
-  adds would fire right away.
+ adds would fire right away.
 - Explicit pause now survives across task completions. Previously
-  it got silently cleared on every task finish.
+ it got silently cleared on every task finish.
 
 Unrelated investigation outcome: a viewer-side integrity scan
 across the whole archive found 38 duplicate [video_id] thumbnail
@@ -4122,195 +4112,194 @@ for users who don't hit the specific edge case being fixed.
 
 Threading / race conditions:
 - _gpu_worker was missing _whisper_model_choice in its global
-  declaration. The queue item's requested model was being written
-  to a shadow local and silently discarded — queued transcriptions
-  that asked for a specific model (instead of inheriting the
-  global) were actually running with whatever the global had last
-  been set to. Added the global decl so the assignment takes.
+ declaration. The queue item's requested model was being written
+ to a shadow local and silently discarded — queued transcriptions
+ that asked for a specific model (instead of inheriting the
+ global) were actually running with whatever the global had last
+ been set to. Added the global decl so the assignment takes.
 - Three config writes (whisper_model updates in 2 transcription
-  worker paths + the GPU Tasks dialog path) were mutating the
-  shared config dict and calling save_config without holding
-  config_lock. Could theoretically corrupt config.json if another
-  thread saved at the same instant. Wrapped all three with
-  `with config_lock:`. config_lock is an RLock so there's no
-  deadlock risk on re-entry.
+ worker paths + the GPU Tasks dialog path) were mutating the
+ shared config dict and calling save_config without holding
+ config_lock. Could theoretically corrupt config.json if another
+ thread saved at the same instant. Wrapped all three with
+ `with config_lock:`. config_lock is an RLock so there's no
+ deadlock risk on re-entry.
 - Browse tab Actions button: if you rapidly switched between two
-  videos that both required a background "is the video file
-  actually there?" check, a stale thread from the first selection
-  could enable the button AFTER the second selection had disabled
-  it. Added a "is this check still about the currently-selected
-  video?" guard so only the right thread's result wins. Mirrors
-  the pattern already used in the Play button check.
+ videos that both required a background "is the video file
+ actually there?" check, a stale thread from the first selection
+ could enable the button AFTER the second selection had disabled
+ it. Added a "is this check still about the currently-selected
+ video?" guard so only the right thread's result wins. Mirrors
+ the pattern already used in the Play button check.
 
 Off-by-one / math:
 - Whisper chunk split formula: `if dur % _MAX_SEG_SECS > 1 else 0`
-  returned ceiling-minus-one for videos whose length modulo the
-  chunk cap was exactly 1 second. A 61-second clip with a
-  30-second cap was splitting into 2 chunks of 30.5s instead of
-  3 chunks (30 + 30 + 1). Changed >1 to >0 at all three sites so
-  the chunks always stay at or below the cap.
+ returned ceiling-minus-one for videos whose length modulo the
+ chunk cap was exactly 1 second. A 61-second clip with a
+ 30-second cap was splitting into 2 chunks of 30.5s instead of
+ 3 chunks (30 + 30 + 1). Changed >1 to >0 at all three sites so
+ the chunks always stay at or below the cap.
 
 Error handling / resource lifecycle:
 - SQLite connection in the stale-index check worker didn't close
-  on exception (the .close() sat after the query block, not in a
-  finally). If any of the queries raised, the connection and the
-  WAL lock on the db file leaked. Wrapped with try/finally plus
-  None-guard.
+ on exception (the .close() sat after the query block, not in a
+ finally). If any of the queries raised, the connection and the
+ WAL lock on the db file leaked. Wrapped with try/finally plus
+ None-guard.
 - Fixed the same pattern in the TranscriptionPanel stats worker.
 - Added timeout=10 to the ffmpeg -version and yt-dlp --version
-  probes, and timeout=600 to the tray-dependency pip install.
-  The startup version checks could theoretically hang on a
-  corrupt exe or a stalled network drive.
+ probes, and timeout=600 to the tray-dependency pip install.
+ The startup version checks could theoretically hang on a
+ corrupt exe or a stalled network drive.
 - Added a dedicated concurrent.futures.TimeoutError branch in the
-  captions prefetch handler so a 120s timeout logs as "Timed out
-  after 120s" instead of the generic "Failed:".
+ captions prefetch handler so a 120s timeout logs as "Timed out
+ after 120s" instead of the generic "Failed:".
 - Dim log line now appears when an invalid batch size is entered
-  in channel settings, explaining that the default (20) is being
-  used instead. Previously it silently fell back with no feedback.
+ in channel settings, explaining that the default (20) is being
+ used instead. Previously it silently fell back with no feedback.
 
 Month / date parsing:
 - Upload-date month parse in the folder-placement fix step now
-  handles non-numeric or out-of-range month values gracefully
-  (falls back to "Unknown Month" rather than letting ValueError
-  propagate and abandon the rename).
+ handles non-numeric or out-of-range month values gracefully
+ (falls back to "Unknown Month" rather than letting ValueError
+ propagate and abandon the rename).
 - Browse-grid date_str parse now bounds-checks the month before
-  indexing into _TP_MONTH_NAMES. A bad month digit falls back to
-  a year-only date string rather than the exception handler.
+ indexing into _TP_MONTH_NAMES. A bad month digit falls back to
+ a year-only date string rather than the exception handler.
 
 UI / log polish:
 - Fixed a long-standing issue where the mini-log strips on the
-  Subs / Recent / Browse tabs did not color the "active" status
-  lines correctly for Redownload, Compress, or Reorg modes. The
-  sync function's tag priority list and the mini-log's tag
-  configuration list were both missing the simplestatus_redwnl /
-  _compress / _reorg variants (plus the matching simpleline_*
-  and *_bracket tags for history rows). Added all of them. Now
-  the chartreuse Redownloading / purple Compressing / orange
-  Reorganizing status lines mirror across to the mini logs the
-  same way sync's green line already did.
+ Subs / Recent / Browse tabs did not color the "active" status
+ lines correctly for Redownload, Compress, or Reorg modes. The
+ sync function's tag priority list and the mini-log's tag
+ configuration list were both missing the simplestatus_redwnl /
+ _compress / _reorg variants (plus the matching simpleline_*
+ and *_bracket tags for history rows). Added all of them. Now
+ the chartreuse Redownloading / purple Compressing / orange
+ Reorganizing status lines mirror across to the mini logs the
+ same way sync's green line already did.
 - Recent tab "Downloaded" column now sorts the same direction as
-  every other column. Was inverted (`reverse=not reverse`) — a
-  leftover from a previous fix that's now obsolete. Clicking the
-  header once sorts newest-first, clicking again sorts
-  oldest-first, matching user expectation.
+ every other column. Was inverted (`reverse=not reverse`) — a
+ leftover from a previous fix that's now obsolete. Clicking the
+ header once sorts newest-first, clicking again sorts
+ oldest-first, matching user expectation.
 - Harmonized the three different "Install Whisper AI" dialog
-  wordings. Batch variant that already showed a count of affected
-  videos remained the template; single-file and folder variants
-  now use the same "is needed for transcription" phrasing and
-  same "Whisper requires ~2.5 GB" line.
+ wordings. Batch variant that already showed a count of affected
+ videos remained the template; single-file and folder variants
+ now use the same "is needed for transcription" phrasing and
+ same "Whisper requires ~2.5 GB" line.
 - Standardized "Redownload" (no hyphen) across every user-facing
-  string. Menu items, dialog titles, confirmation bodies, log
-  messages. Was a mix of "Re-download" and "Redownload" — the
-  code counts overwhelmingly favored the no-hyphen form so we
-  went with that throughout.
+ string. Menu items, dialog titles, confirmation bodies, log
+ messages. Was a mix of "Re-download" and "Redownload" — the
+ code counts overwhelmingly favored the no-hyphen form so we
+ went with that throughout.
 - Renamed "Un-Organize Folder" menu item to "Un-Org. Folder" so
-  it visually matches the sibling "Org. Folder by Year" /
-  "Org. Folder by Year/Month" items in the same context menu.
-  Internal queue labels and dialog body text still use the full
-  "Un-Organize" spelling.
+ it visually matches the sibling "Org. Folder by Year" /
+ "Org. Folder by Year/Month" items in the same context menu.
+ Internal queue labels and dialog body text still use the full
+ "Un-Organize" spelling.
 - Year-range stat in the transcript panel now shows "N/A"
-  instead of literal "2024 – None" when only one of MIN/MAX year
-  is populated in the index.
+ instead of literal "2024 – None" when only one of MIN/MAX year
+ is populated in the index.
 - Channel count in the stats label now uses thousands separator
-  (consistent with the segments and videos counts).
+ (consistent with the segments and videos counts).
 
 Dead code / cleanup:
 - Removed two duplicate module-level initializations and three
-  redundant local `import shutil` statements inside exception
-  handlers (global shutil is already imported at line 13).
+ redundant local `import shutil` statements inside exception
+ handlers (global shutil is already imported at line 13).
 - Simplified `1 <= (month or 0) <= 12` to `1 <= month <= 12` at
-  six sites — the `month is not None` check immediately before
-  already makes the `or 0` fallback unreachable.
+ six sites — the `month is not None` check immediately before
+ already makes the `or 0` fallback unreachable.
 
 Subprocess wait / cleanup paths:
 - Added `wait(timeout=10)` after `kill()` at the backlog-compress
-  yt-dlp path so a stuck process gets reaped instead of leaked.
+ yt-dlp path so a stuck process gets reaped instead of leaked.
 - Added `wait(timeout=5)` after `kill()` on the yt-dlp update
-  check path for the same reason.
+ check path for the same reason.
 - Added `on_chan_list_select(event=None)` default so the several
-  call sites that pass None are explicit about it.
+ call sites that pass None are explicit about it.
 ```
 
 #### v40.3 — Activity log column alignment, pause log timestamps, UX polish
 
 ```
 - Activity log columns now align vertically across all entries. Each
-  column (count, label, skipped count, label, errors, duration) is
-  center-aligned in a uniform width computed from the widest cell in
-  that column. Old 3-column entries (legacy Metdta) right-align so
-  their shared existing/errors/duration columns still line up with
-  newer 4-column rows. Widths adapt when the program is resized.
+ column (count, label, skipped count, label, errors, duration) is
+ center-aligned in a uniform width computed from the widest cell in
+ that column. Old 3-column entries (legacy Metdta) right-align so
+ their shared existing/errors/duration columns still line up with
+ newer 4-column rows. Widths adapt when the program is resized.
 - All user-initiated pause/resume log entries now include the time.
-  Previously Compression, Backlog, and Redownload entries showed
-  only "Compression paused." / "Compression resuming..." with no
-  timestamp — they now match sync/metadata/transcription format:
-  "⏸ Compression paused at H:MMam/pm." and "▶ Compression resumed
-  at H:MMam/pm..."
+ Previously Compression, Backlog, and Redownload entries showed
+ only "Compression paused." / "Compression resuming..." with no
+ timestamp — they now match sync/metadata/transcription format:
+ "⏸ Compression paused at H:MMam/pm." and "▶ Compression resumed
+ at H:MMam/pm..."
 - Removed the blank line the pause entries were inserting above
-  themselves in the log.
+ themselves in the log.
 - Fixed the taskbar/tray icon still spinning after all tasks were
-  paused. The task buttons correctly hold their solid "paused"
-  colour, but the tray spinner kept animating because the blink
-  system held it open. Blue tray spin now freezes on the base icon
-  while sync is paused, mirroring the existing behaviour for GPU.
+ paused. The task buttons correctly hold their solid "paused"
+ colour, but the tray spinner kept animating because the blink
+ system held it open. Blue tray spin now freezes on the base icon
+ while sync is paused, mirroring the existing behaviour for GPU.
 - Redownload sample-confirm popup ("check first 10 then ask") now
-  auto-continues after 5 minutes if left unattended. A visible
-  "Auto-continuing in M:SS..." countdown ticks down under the
-  stats. Clicking Continue, Change Resolution, Cancel, or the X
-  cancels the timer.
+ auto-continues after 5 minutes if left unattended. A visible
+ "Auto-continuing in M:SS..." countdown ticks down under the
+ stats. Clicking Continue, Change Resolution, Cancel, or the X
+ cancels the timer.
 ```
 
-### April 13, 2026
-
+---
 #### v40.2 — Fix Browse tab crash under heavy I/O, queue drag, UI polish
 
 ```
 - Fixed critical crash: Browse tab locked up permanently when navigating
-  while a redownload task was running. Root cause was os.path.getmtime()
-  calls on the main thread blocking the UI under disk I/O contention.
+ while a redownload task was running. Root cause was os.path.getmtime()
+ calls on the main thread blocking the UI under disk I/O contention.
 - Removed all blocking file I/O from the main-thread grid card builder.
 - Skipped expensive mtime loop for "All Channels" scope (dateless videos
-  are filtered out anyway — no point statting thousands of files).
+ are filtered out anyway — no point statting thousands of files).
 - Added abort checks to the mtime and thumbnail scanning loops so
-  navigating away cancels stale background work promptly.
+ navigating away cancels stale background work promptly.
 - Fixed date_str edge case where non-standard upload_date formats left
-  date_str empty, triggering unnecessary mtime fallback.
+ date_str empty, triggering unnecessary mtime fallback.
 - Fixed queue drag-to-reorder not working when batch sync entries were
-  present (collapsed display rows broke the position-based index math).
+ present (collapsed display rows broke the position-based index math).
 - Fixed drag-down not landing at the correct position (off-by-one from
-  a bad post-pop index adjustment).
+ a bad post-pop index adjustment).
 - Redownload status now shows as a bottom-pinned animated line (like
-  sync/metadata/compress) instead of a placeholder in the activity log.
-  Eliminates orphaned "running..." lines after crashes.
+ sync/metadata/compress) instead of a placeholder in the activity log.
+ Eliminates orphaned "running..." lines after crashes.
 - Cleaned up orphaned redownload history lines on startup.
 - Whisper model choice now persists across restarts. GPU tasks restored
-  from queue no longer re-prompt for model selection.
+ from queue no longer re-prompt for model selection.
 - Right-click "Transcribe Channel" on already-transcribed channels now
-  skips the organization dialog and follows the existing layout.
+ skips the organization dialog and follows the existing layout.
 ```
 
 #### v40.1 — Fix startup freeze from DB lock contention
 
 ```
 - Fixed ~10 second UI freeze ("Not Responding") during startup caused
-  by slow aggregate queries (COUNT DISTINCT on 8.7M-row segments table)
-  holding _db_lock and blocking the main thread.
+ by slow aggregate queries (COUNT DISTINCT on 8.7M-row segments table)
+ holding _db_lock and blocking the main thread.
 - Moved _ensure_videos_populated to background preload thread so it
-  never blocks the UI.
+ never blocks the UI.
 - Slow stats/index-freshness queries now use separate read-only DB
-  connections instead of competing for _db_lock with disk scan and
-  grid preload threads.
+ connections instead of competing for _db_lock with disk scan and
+ grid preload threads.
 - Redownload activity log placeholder now shows "⏸ paused" / "▶ running..."
-  status in real time when pause is toggled.
+ status in real time when pause is toggled.
 ```
 
 #### v40.0 — Fix Browse tab sort stability for same-day videos
 
 ```
 - Browse tab "Newest" sort now uses file mtime as a tiebreaker within
-  the same day. Previously, switching sort modes and back (e.g. Most
-  Popular → Newest) would shuffle same-day videos into a different
-  order because they all shared the same YYYYMMDD sort key.
+ the same day. Previously, switching sort modes and back (e.g. Most
+ Popular → Newest) would shuffle same-day videos into a different
+ order because they all shared the same YYYYMMDD sort key.
 - Both the initial load sort and the re-sort function are fixed.
 ```
 
@@ -4318,108 +4307,107 @@ Subprocess wait / cleanup paths:
 
 ```
 - New opt-in "Auto-update index" setting in the Index tab: after a
-  configurable number of downloads (default 10), automatically runs
-  an incremental index rebuild in the background.
+ configurable number of downloads (default 10), automatically runs
+ an incremental index rebuild in the background.
 - Browse tab grid data is now silently preloaded for all channels
-  after startup. Opening the Browse tab and clicking any channel
-  is instant — no more "Loading..." spinner.
+ after startup. Opening the Browse tab and clicking any channel
+ is instant — no more "Loading..." spinner.
 - Grid cache limit increased from 20 to 200 scopes.
 - "All Channels" preloads first since it's the most common first click.
 - Fix blank grid when navigating to a preloaded channel for the first
-  time (canvas sizing on initial cache-hit render).
+ time (canvas sizing on initial cache-hit render).
 - Startup log lines unified to --- format; new "Browse tab load
-  complete" log when all channels are preloaded.
+ complete" log when all channels are preloaded.
 ```
 
 #### v39.8 — Log coloring tweaks for punctuation model and download lines
 
 ```
 - "Loading punctuation model..." now shows a blue em dash prefix
-  instead of solid blue text, matching other transcription log lines.
+ instead of solid blue text, matching other transcription log lines.
 - "Punctuation model loaded (CUDA)" line now uses white text instead
-  of green; the blue em dash was already correct.
+ of green; the blue em dash was already correct.
 - Download completion lines (✓ lines) now have a green em dash prefix.
-  Only the em dash, checkmark, and file size are green; title, channel,
-  and date are white for readability.
+ Only the em dash, checkmark, and file size are green; title, channel,
+ and date are white for readability.
 ```
 
 #### v39.7 — Recursive manual folder scan, redownload scoping fix
 
 ```
 - Manual folder transcription now scans subfolders recursively when
-  counting video files, matching the actual transcription worker.
-  Previously folders-within-folders returned "No video/audio files found".
+ counting video files, matching the actual transcription worker.
+ Previously folders-within-folders returned "No video/audio files found".
 - Fix UnboundLocalError in redownload worker: the sample-popup
-  "Change Resolution" branch assigned new_res inside _worker(), causing
-  Python to treat it as an unbound local throughout the function.
-  Added nonlocal declaration.
+ "Change Resolution" branch assigned new_res inside _worker(), causing
+ Python to treat it as an unbound local throughout the function.
+ Added nonlocal declaration.
 ```
 
 #### v39.6 — Metadata pending counter, playlist pause, verbiage fix
 
 ```
 - Add metadata_pending counter mirroring transcription_pending: Subs
-  tab metadata column now shows ✓ -N when videos need metadata.
-  Counter decrements per successful fetch so partial completions
-  (e.g. pause after 3 of 6) are reflected accurately.
+ tab metadata column now shows ✓ -N when videos need metadata.
+ Counter decrements per successful fetch so partial completions
+ (e.g. pause after 3 of 6) are reflected accurately.
 - Queue Pending button now queues both transcription and metadata
-  channels with pending videos.
+ channels with pending videos.
 - Playlist fetch phase ("Fetching channel playlist...") now shows
-  "will pause after this step" when pause is requested, and enters
-  pause loop after the subprocess completes.
+ "will pause after this step" when pause is requested, and enters
+ pause loop after the subprocess completes.
 - Change "use Refresh Metadata to retry" to "video likely deleted"
-  for permanently unmatchable videos.
+ for permanently unmatchable videos.
 ```
 
-### April 12, 2026
-
+---
 #### v39.5 — Log styling consistency pass
 
 ```
 - Fix em-dash-only coloring for GPU queue addition lines: transcription
-  (blue) and compression (compress color) were coloring the entire line
-  instead of just the em-dash character. Now matches metadata (pink)
-  behavior — only the — is colored, rest is default white.
+ (blue) and compression (compress color) were coloring the entire line
+ instead of just the em-dash character. Now matches metadata (pink)
+ behavior — only the — is colored, rest is default white.
 - Standardize all Sync List queue addition headers to consistent
-  "Added to Sync List: [action] [channel]" format across sync, reorg,
-  redownload, and standalone transcription.
+ "Added to Sync List: [action] [channel]" format across sync, reorg,
+ redownload, and standalone transcription.
 - Normalize reorg completion footer from "--- ... ---" to "=== ... ==="
-  to match sync and redownload completion style.
+ to match sync and redownload completion style.
 - Revert last session's unauthorized git-only divergences: GPU queue
-  header format, removed model selection, restored reindex popup,
-  added GPU completion message.
+ header format, removed model selection, restored reindex popup,
+ added GPU completion message.
 ```
 
 #### v39.4 — Fix stale pause lines persisting through clear log
 
 ```
 - Clear log was unconditionally preserving all pause/resume lines even
-  after tasks finished. Now only preserves them if a task is actively
-  paused (pause_event set AND a task running).
+ after tasks finished. Now only preserves them if a task is actively
+ paused (pause_event set AND a task running).
 ```
 
 #### v39.3 — Metadata pause fix, direct-ID metadata fast path
 
 ```
 - Metadata queue now respects pause between channels. Previously
-  channels that already had metadata returned instantly, chaining the
-  next channel without ever checking pause_event.
+ channels that already had metadata returned instantly, chaining the
+ next channel without ever checking pause_event.
 - Auto-metadata after sync now passes the downloaded video IDs directly
-  to the metadata worker, which fetches metadata for just those videos
-  without enumerating the entire channel playlist. Turns a multi-minute
-  playlist scan into a few-second direct fetch.
+ to the metadata worker, which fetches metadata for just those videos
+ without enumerating the entire channel playlist. Turns a multi-minute
+ playlist scan into a few-second direct fetch.
 ```
 
 #### v39.2 — Fix Most Viewed sort, add refresh-all metadata option
 
 ```
 - Fix silent crash in Most Viewed sort: yt-dlp metadata stores null
-  for view_count on some videos. dict.get("view_count", 0) returns
-  None (not 0) when key exists with null value, crashing the sort
-  comparator. Fixed with `or 0` coercion in enrichment + sort.
+ for view_count on some videos. dict.get("view_count", 0) returns
+ None (not 0) when key exists with null value, crashing the sort
+ comparator. Fixed with `or 0` coercion in enrichment + sort.
 - All Videos right-click menu now shows two options:
-  "Queue all for Metadata" (existing) and "Refresh all (update
-  views/likes)" which re-fetches counts without re-downloading comments.
+ "Queue all for Metadata" (existing) and "Refresh all (update
+ views/likes)" which re-fetches counts without re-downloading comments.
 ```
 
 #### v39.1 — Fix All Channels view, column indicators, tree collapse
@@ -4427,7 +4415,7 @@ Subprocess wait / cleanup paths:
 ```
 All Channels view:
 - Fix hang caused by ffprobe fallback running on 90K+ videos (skipped
-  for __all__ view)
+ for __all__ view)
 - Fix breadcrumb showing "__all__" instead of "All Channels"
 - Add per-channel loading progress (Loading metadata... 14/102 — name)
 - Filter out dateless/orphaned videos from All view
@@ -4436,12 +4424,12 @@ All Channels view:
 Subs tab:
 - Remove broken color emoji (tkinter can't render them), use plain text
 - Apply same indicator style to Metadata and Compress columns (was only
-  Transcribe): blank if off, ✓ if done, A ✓ if auto+done
+ Transcribe): blank if off, ✓ if done, A ✓ if auto+done
 
 Browse tree:
 - Revert broken custom +/- indicators to working defaults
 - Add generation guard to preexpand callbacks so stale delayed callbacks
-  can't re-open nodes the user just collapsed
+ can't re-open nodes the user just collapsed
 
 Sort:
 - Most Viewed sort uses .get() for view_count to prevent silent crash
@@ -4452,22 +4440,22 @@ Sort:
 ```
 Verbose log mode:
 - All previously suppressed info now shown: DLTRACK lines, yt-dlp nag
-  messages, filter re-skips, ffmpeg commands + raw stderr, Whisper CUDA
-  fallback reasons, channel count stderr, yt-dlp re-download commands
+ messages, filter re-skips, ffmpeg commands + raw stderr, Whisper CUDA
+ fallback reasons, channel count stderr, yt-dlp re-download commands
 - Throttles relaxed: enum progress every 100 (was 500), download
-  progress unthrottled, scan progress every item (was every 25),
-  metadata scan every file (was every 10%), download count every DL
-  (was every 10)
+ progress unthrottled, scan progress every item (was every 25),
+ metadata scan every file (was every 10%), download count every DL
+ (was every 10)
 - Log cap raised to 50k lines (was 20k), with trim notice
 - ~30 silent except:pass blocks now log errors: queue state save, sync
-  progress, redownload progress, ffprobe functions, whisper cache
-  writes, folder-fix moves, batch callbacks, and more
+ progress, redownload progress, ffprobe functions, whisper cache
+ writes, folder-fix moves, batch callbacks, and more
 - Whisper [idx/total] counter now shown in both modes
 - Simple mode completely unchanged (verified all ~50 edits)
 
 Browse tab:
 - "All Channels" aggregate view at top of tree with year/month folders,
-  cross-channel metadata + thumbnail loading, channel name on cards
+ cross-channel metadata + thumbnail loading, channel name on cards
 - Duration badge ffprobe fallback for videos without metadata
 - Sort selection now persists when switching between channel/subfolder
 - Larger +/- expand/collapse indicators (custom 14px images)
@@ -4479,7 +4467,7 @@ Search tab:
 
 Subs tab:
 - Transcription column: emoji color indicators (🟢 complete, 🟡 pending),
-  "A" prefix for auto-transcribe, removed redundant "Done" text
+ "A" prefix for auto-transcribe, removed redundant "Done" text
 
 Video player:
 - Seek bar now supports click-to-jump (not just drag)
@@ -4493,16 +4481,16 @@ UI:
 ```
 Three fixes:
 1. Title normalization: unsafe chars (*, /, ", :, |) now replaced with
-   spaces instead of stripped, matching yt-dlp's filename sanitization.
-   Fixes mismatches like "9/11" → "911" vs "9 11" and "P*do" → "pdo"
-   vs "p do" that prevented metadata matching on renamed videos.
+ spaces instead of stripped, matching yt-dlp's filename sanitization.
+ Fixes mismatches like "9/11" → "911" vs "9 11" and "P*do" → "pdo"
+ vs "p do" that prevented metadata matching on renamed videos.
 2. Pass 6b timeout: now scales with candidate count (30s per video,
-   120s min) instead of flat 30-minute deadline. Added --socket-timeout
-   30 so yt-dlp doesn't hang indefinitely on unreachable videos.
+ 120s min) instead of flat 30-minute deadline. Added --socket-timeout
+ 30 so yt-dlp doesn't hang indefinitely on unreachable videos.
 3. Pass 6 exclusion: zero-candidate rows (video deleted/private on
-   YouTube, no data exists for that upload date) now properly marked
-   as date_resolve_failed. Previously these re-ran the full pipeline
-   on every metadata fetch — now they're skipped after first failure.
+ YouTube, no data exists for that upload date) now properly marked
+ as date_resolve_failed. Previously these re-ran the full pipeline
+ on every metadata fetch — now they're skipped after first failure.
 ```
 
 #### v38.8 — Code quality refactor: extract shared helpers, eliminate duplication
@@ -4520,8 +4508,7 @@ them inline. Refactored _simple_anim_tick from 7 copy-paste blocks to
 data-driven rendering. Net: -122 lines (139 added, 261 removed).
 ```
 
-### April 11, 2026
-
+---
 #### v38.7 — Fix WinError 206 from uncapped URL list
 
 #### v38.6 removed the cap on Pass 6b candidates but still passed every
@@ -4555,11 +4542,11 @@ every new row instantly, _need_search stays empty, and Passes
 4-6b are all skipped via their gates.
 
 Pass 6b only exists to clean up the legacy cases:
-  (a) Stragglers from older YTArchiver versions that didn't
-      write video_id at download time — the user's 1,007 stuck rows
-  (b) Files imported from other archive tools
-  (c) Manually-dropped files picked up by the browse-tab
-      scanner (register_video with filepath but no video_id)
+ (a) Stragglers from older YTArchiver versions that didn't
+ write video_id at download time — the user's 1,007 stuck rows
+ (b) Files imported from other archive tools
+ (c) Manually-dropped files picked up by the browse-tab
+ scanner (register_video with filepath but no video_id)
 
 In all three cases, the goal is to resolve the row ONCE, write
 video_id to the DB, and have Pass 1 skip it forever after. The
@@ -4570,35 +4557,35 @@ big channels instead of just completing in one run.
 
 CHANGES:
 - Removed _MAX_6B = min(30, max(5, len(_need_search) * 3)) cap.
-  Pass 6b now processes every plausible candidate from the fuzzy
-  pre-filter in one go.
+ Pass 6b now processes every plausible candidate from the fuzzy
+ pre-filter in one go.
 
 - Bumped _6b_deadline 600s (10 min) → 1800s (30 min) to give
-  large legacy cleanups room to complete without mid-run timeout.
-  The deadline still exists as runaway subprocess protection;
-  normal progress is gated on cancel_event and yt-dlp stdout EOF.
+ large legacy cleanups room to complete without mid-run timeout.
+ The deadline still exists as runaway subprocess protection;
+ normal progress is gated on cancel_event and yt-dlp stdout EOF.
 
 - The fuzzy ≥50 pre-filter stays unchanged. Without it, channels
-  like HasanAbi (thousands of undated videos, tens of stuck rows)
-  would fetch dates for the entire channel bucket, which is pure
-  waste. With the pre-filter, Pass 6b only fetches candidates
-  whose title is at least in the ballpark of an unresolved local
-  row — cost scales with actual work, not with channel size.
+ like HasanAbi (thousands of undated videos, tens of stuck rows)
+ would fetch dates for the entire channel bucket, which is pure
+ waste. With the pre-filter, Pass 6b only fetches candidates
+ whose title is at least in the ballpark of an unresolved local
+ row — cost scales with actual work, not with channel size.
 
 - Reframed the Pass 6b block comment with the new mental model
-  so a future edit doesn't re-introduce the cap under the wrong
-  assumption. Explicitly notes that fresh-user flows never hit
-  this pass and that the cap removal is zero-cost for them.
+ so a future edit doesn't re-introduce the cap under the wrong
+ assumption. Explicitly notes that fresh-user flows never hit
+ this pass and that the cap removal is zero-cost for them.
 
 EXPECTED IMPACT FOR THE 1,007 STUCK ROWS:
 - 52 of 57 affected channels had ≤30 stuck rows and would clear
-  in Run 1 even with the old cap — still resolve in Run 1 now.
+ in Run 1 even with the old cap — still resolve in Run 1 now.
 - 5 big channels (EWU Bodycam 365, Two Minute Papers 198,
-  Midwest Safety 113, Dr Insanity 41, HasanAbi 35) previously
-  needed 2-13 runs. With the cap gone, they should clear in a
-  single run (bounded only by yt-dlp fetch rate).
+ Midwest Safety 113, Dr Insanity 41, HasanAbi 35) previously
+ needed 2-13 runs. With the cap gone, they should clear in a
+ single run (bounded only by yt-dlp fetch rate).
 - Remaining after full convergence: ~14 rows (metadata_fetch_
-  failed — deleted/private/region-locked, permanent ceiling).
+ failed — deleted/private/region-locked, permanent ceiling).
 ```
 
 #### v38.5 — Log message polish + stale comment cleanup (cosmetic)
@@ -4609,457 +4596,457 @@ inconsistencies between the "clean simple mode" direction the user set
 for v38.4 and the actual log output / code comments.
 
 - PASS 6a — simple-mode success message no longer exposes the
-  library name. Was: "— Fuzzy-matched N video ID(s) via thefuzz."
-  Now: "— Matched N video ID(s) by title." This matches the
-  cleaned-up Pass 6b summary ("— Matched N video(s) by upload
-  date.") for consistent user-facing language.
+ library name. Was: "— Fuzzy-matched N video ID(s) via thefuzz."
+ Now: "— Matched N video ID(s) by title." This matches the
+ cleaned-up Pass 6b summary ("— Matched N video(s) by upload
+ date.") for consistent user-facing language.
 
 - PASS 6b — red error paths no longer leak internal phase names.
-  Was: "⚠ Pass 6b: per-ID date fetch timed out." / "⚠ Pass 6b:
-  per-ID fetch failed: {e}"
-  Now: "⚠ Date fetch timed out." / "⚠ Date fetch failed: {e}"
-  These only fire on failure/timeout, but they're shown in simple
-  mode (red tag), so they should match the same no-jargon rule.
+ Was: "⚠ Pass 6b: per-ID date fetch timed out." / "⚠ Pass 6b:
+ per-ID fetch failed: {e}"
+ Now: "⚠ Date fetch timed out." / "⚠ Date fetch failed: {e}"
+ These only fire on failure/timeout, but they're shown in simple
+ mode (red tag), so they should match the same no-jargon rule.
 
 - STALE COMMENT — Pass 6a docstring said "collect matches ≥ 85"
-  but the actual threshold was lowered to 75 in v38.4. Updated to
-  match. No code change.
+ but the actual threshold was lowered to 75 in v38.4. Updated to
+ match. No code change.
 
 - STALE COMMENT — Smart cap comment said "3 unresolved rows → max
-  10 fetches" but the formula min(30, max(5, 3*3)) gives 9, not
-  10. Corrected to "max 9 fetches (floor of 5)".
+ 10 fetches" but the formula min(30, max(5, 3*3)) gives 9, not
+ 10. Corrected to "max 9 fetches (floor of 5)".
 
 - STALE REFERENCE — The batch-resolve comment mentioned populating
-  _yt_by_date and _yt_all_list, but _yt_all_list doesn't exist in
-  the code (pre-dates a refactor). Removed the dangling reference.
+ _yt_by_date and _yt_all_list, but _yt_all_list doesn't exist in
+ the code (pre-dates a refactor). Removed the dangling reference.
 
 - VERBOSE DIM LOG — Pass 6b diagnostic line changed "undated
-  entries" → "no-date entries". This line is dim-only (verbose
-  mode), so the user never sees it in simple mode, but kept the "no
-  internal jargon" theme consistent for when verbose mode is on.
+ entries" → "no-date entries". This line is dim-only (verbose
+ mode), so the user never sees it in simple mode, but kept the "no
+ internal jargon" theme consistent for when verbose mode is on.
 
 BEHAVIORAL HEADS-UP (from the sanity sweep):
 - Initial concern was that the 1,007 stuck rows might already be
-  flagged with date_resolve_failed_ts from v38.0-v38.3's Pass 6,
-  which would filter them out before Pass 6b could rescue them on
-  a normal metadata run.
+ flagged with date_resolve_failed_ts from v38.0-v38.3's Pass 6,
+ which would filter them out before Pass 6b could rescue them on
+ a normal metadata run.
 - Live DB query result: ZERO rows are currently flagged. The
-  stuck rows never reached Pass 6's "ambiguous match" branch (the
-  only place that writes the flag) because _candidates was always
-  empty (yt-dlp returns NA dates universally, so everything ends
-  up in the "" bucket and Pass 6 can't find any dated candidates).
+ stuck rows never reached Pass 6's "ambiguous match" branch (the
+ only place that writes the flag) because _candidates was always
+ empty (yt-dlp returns NA dates universally, so everything ends
+ up in the "" bucket and Pass 6 can't find any dated candidates).
 - Net: v38.4's Pass 6b WILL naturally process all 1,007 stuck rows
-  on the next normal metadata run. No refresh needed.
+ on the next normal metadata run. No refresh needed.
 
 PRE-PUSH HOOK FIX:
 - Local-only .git/hooks/pre-push was blocking tag-only pushes
-  after the main branch push completed (both refs show v38.5, so
-  the hook said "version didn't bump"). Added a tag-only skip
-  check: if every ref being pushed is refs/tags/*, skip the
-  version checks entirely. Tag pushes can't change APP_VERSION, so
-  enforcing the bump rule on them was a false positive.
+ after the main branch push completed (both refs show v38.5, so
+ the hook said "version didn't bump"). Added a tag-only skip
+ check: if every ref being pushed is refs/tags/*, skip the
+ version checks entirely. Tag pushes can't change APP_VERSION, so
+ enforcing the bump rule on them was a false positive.
 ```
 
 #### v38.4 — Smarter Pass 6b + lower Pass 6a threshold + cleaner logs
 
 ```
 - ROOT DIAGNOSIS: yt-dlp's --flat-playlist mode now returns
-  upload_date=NA on every channel (confirmed by direct testing on
-  2kliksphilip, 3kliksphilip, Branch Education — all return NA for
-  upload_date and timestamp in flat mode). This means Pass 6's
-  date-based matcher has effectively been broken channel-wide
-  because _yt_by_date never gets populated with dated buckets.
-  Pass 6a (fuzzy title matching) picks up the slack but it has to
-  work harder, and Pass 6b (per-ID date fetch fallback) was
-  running too aggressively.
+ upload_date=NA on every channel (confirmed by direct testing on
+ 2kliksphilip, 3kliksphilip, Branch Education — all return NA for
+ upload_date and timestamp in flat mode). This means Pass 6's
+ date-based matcher has effectively been broken channel-wide
+ because _yt_by_date never gets populated with dated buckets.
+ Pass 6a (fuzzy title matching) picks up the slack but it has to
+ work harder, and Pass 6b (per-ID date fetch fallback) was
+ running too aggressively.
 
 - PASS 6a — lowered fuzzy threshold from 85 to 75.
-  With dates gone, Pass 6a is now the primary resolver for rows
-  that lack video_id. A stricter 85 threshold meant more rows
-  fell through to the expensive Pass 6b per-ID fetch. 75 is still
-  confident enough for distinct titles but catches more minor
-  drift (emoji strip, case differences, punctuation variations).
+ With dates gone, Pass 6a is now the primary resolver for rows
+ that lack video_id. A stricter 85 threshold meant more rows
+ fell through to the expensive Pass 6b per-ID fetch. 75 is still
+ confident enough for distinct titles but catches more minor
+ drift (emoji strip, case differences, punctuation variations).
 
 - PASS 6b — pre-filter candidates by fuzzy score before fetching.
-  The "" (undated) bucket can contain hundreds of videos for a
-  channel (since flat-playlist is always NA). v38.3 fetched up to
-  50 candidate dates blindly, which was wasteful when only a
-  handful of local rows actually needed matching. v38.4 pre-scores
-  every "" bucket candidate against every unresolved local row
-  via fuzz.token_sort_ratio and keeps only candidates with score
-  >= 50. Those are "plausible matches worth the fetch cost" — still
-  below Pass 6a's confident 75 threshold but above noise.
+ The "" (undated) bucket can contain hundreds of videos for a
+ channel (since flat-playlist is always NA). v38.3 fetched up to
+ 50 candidate dates blindly, which was wasteful when only a
+ handful of local rows actually needed matching. v38.4 pre-scores
+ every "" bucket candidate against every unresolved local row
+ via fuzz.token_sort_ratio and keeps only candidates with score
+ >= 50. Those are "plausible matches worth the fetch cost" — still
+ below Pass 6a's confident 75 threshold but above noise.
 
 - PASS 6b — smart cap scales with unresolved row count.
-  Old fixed cap of 50 replaced with min(30, max(5, len(need_search) * 3)).
-  3 unresolved rows -> max 10 fetches. 10 unresolved rows -> max
-  30 fetches. Never more than 30 (roughly 90s of per-ID fetches).
+ Old fixed cap of 50 replaced with min(30, max(5, len(need_search) * 3)).
+ 3 unresolved rows -> max 10 fetches. 10 unresolved rows -> max
+ 30 fetches. Never more than 30 (roughly 90s of per-ID fetches).
 
 - USER-FACING LOGS cleaned up for simple mode:
-  * Scanline now reads "Matching N video(s) by upload date... X/Y (Zs)"
-    instead of "Fetching real dates... X/Y (Zs)". Clearer intent,
-    no "undated candidates" terminology that was confusing.
-  * Final summary reads "— Matched N video(s) by upload date."
-    instead of "— Resolved N video ID(s) via per-ID date lookup."
-  * "Pass 6b: capping fetch to 50 of 446 undated candidates." is
-    moved from simpleline_pink to dim so it only shows in verbose
-    mode. The simple-mode user never sees internal pass jargon.
+ * Scanline now reads "Matching N video(s) by upload date... X/Y (Zs)"
+ instead of "Fetching real dates... X/Y (Zs)". Clearer intent,
+ no "undated candidates" terminology that was confusing.
+ * Final summary reads "— Matched N video(s) by upload date."
+ instead of "— Resolved N video ID(s) via per-ID date lookup."
+ * "Pass 6b: capping fetch to 50 of 446 undated candidates." is
+ moved from simpleline_pink to dim so it only shows in verbose
+ mode. The simple-mode user never sees internal pass jargon.
 ```
 
 #### v38.3 — Metadata resolver: Pass 6b per-ID date fetch as robust fallback
 
 ```
 - METADATA RESOLVER — Pass 6b for channels that return NA dates
-  Backup pass for the edge case where --flat-playlist returns
-  upload_date=NA for every video on a channel (caught Branch
-  Education's 7 emoji-titled videos initially). v38.2's fixes
-  (lowered Pass 4 threshold + "" sentinel bucket + Pass 6a fuzzy)
-  already handle this via title-based fuzzy matching, and it was
-  confirmed working on Branch Education while v38.3 was being
-  written — the bulk metadata run reached that channel in queue
-  order and Pass 6a matched all 7 rows at 100%.
-  But Pass 6a relies on thefuzz.token_sort_ratio matching local
-  filename tokens to YT titles. If the local filename is truly
-  different from the YT title (beyond what token_sort can handle —
-  channel renames, manual file renames, heavy encoding drift,
-  non-ASCII corruption, etc.), fuzzy will miss. For those cases,
-  Pass 6b uses the file's mtime directly against real YT upload
-  dates, which is the "if we know the file's date and the channel
-  uploads ≤1/day just match them" approach that's been the goal
-  all along.
-  Trigger: Pass 6b runs INSIDE the existing
-  `if _yt_by_date and not cancel_event.is_set():` block, AFTER
-  the Pass 6 date-based loop, WHEN:
-    * _need_search is still non-empty (rows remain unresolved)
-    * _yt_by_date has a "" sentinel bucket (undated candidates)
-    * ch_url is available
-    * cancel_event is not set
-  Algorithm:
-    1. Gather (vid, title) pairs from _yt_by_date[""] filtered
-       against _date_known (exclude already-resolved IDs). Cap at
-       50 entries as a safety net against pathological channels.
-    2. Build URL list: "https://www.youtube.com/watch?v={vid}"
-       for each candidate.
-    3. Invoke yt-dlp in batch mode WITHOUT --flat-playlist using
-       --skip-download --print "%(id)s|||%(upload_date)s|||%(timestamp)s"
-       with all URLs in one invocation. Non-flat mode is slower
-       but returns real upload dates (confirmed via empirical test:
-       ~22 seconds for 7 candidates on Branch Education).
-    4. Stream stdout, parse each line, build vid -> YYYYMMDD dict.
-       Update scanline every second with progress counter.
-       10-minute deadline as timeout backstop.
-    5. For each remaining unresolved local row:
-       a. Get file_date from os.path.getmtime(filepath).
-       b. Walk candidate dates, collect those within ±1 day of
-          file_date (timezone safety, same tolerance as Pass 6
-          proper).
-       c. If exactly 1 candidate matches: direct assignment.
-       d. If multiple candidates match (multi-upload-per-day
-          channels): use fuzz.token_sort_ratio as tiebreaker with
-          a more lenient 70 threshold since date has already
-          narrowed the field.
-       e. If match found: append to _resolved_rows, strip from
-          _need_search, clear ALL failure flags on the row
-          (search_failed_ts, id_resolve_failed_ts,
-          date_resolve_failed_ts, date_resolve_failed_mtime).
-    6. Log summary: "— Resolved N video ID(s) via per-ID date
-       lookup." in simpleline_pink (visible in simple mode).
-  Bounded cost:
-    * Only runs when Pass 6a and Pass 6 date-based have both left
-      unresolved rows behind.
-    * Only fetches candidates that are still in the "" bucket and
-      not yet in _date_known.
-    * Capped at 50 per-ID fetches per metadata run.
-    * Most runs will skip Pass 6b entirely (no undated candidates
-      to fetch).
-  Live scanline format (simple mode only, updated once per second):
-    "Fetching real dates... 12/14 (17s)"
-  Error handling: try/except around the yt-dlp call, timeout
-  enforcement, cleanup_process(_6b_proc) in finally. Failures log
-  a red warning and continue — never kill the whole metadata run.
+ Backup pass for the edge case where --flat-playlist returns
+ upload_date=NA for every video on a channel (caught Branch
+ Education's 7 emoji-titled videos initially). v38.2's fixes
+ (lowered Pass 4 threshold + "" sentinel bucket + Pass 6a fuzzy)
+ already handle this via title-based fuzzy matching, and it was
+ confirmed working on Branch Education while v38.3 was being
+ written — the bulk metadata run reached that channel in queue
+ order and Pass 6a matched all 7 rows at 100%.
+ But Pass 6a relies on thefuzz.token_sort_ratio matching local
+ filename tokens to YT titles. If the local filename is truly
+ different from the YT title (beyond what token_sort can handle —
+ channel renames, manual file renames, heavy encoding drift,
+ non-ASCII corruption, etc.), fuzzy will miss. For those cases,
+ Pass 6b uses the file's mtime directly against real YT upload
+ dates, which is the "if we know the file's date and the channel
+ uploads ≤1/day just match them" approach that's been the goal
+ all along.
+ Trigger: Pass 6b runs INSIDE the existing
+ `if _yt_by_date and not cancel_event.is_set():` block, AFTER
+ the Pass 6 date-based loop, WHEN:
+ * _need_search is still non-empty (rows remain unresolved)
+ * _yt_by_date has a "" sentinel bucket (undated candidates)
+ * ch_url is available
+ * cancel_event is not set
+ Algorithm:
+ 1. Gather (vid, title) pairs from _yt_by_date[""] filtered
+ against _date_known (exclude already-resolved IDs). Cap at
+ 50 entries as a safety net against pathological channels.
+ 2. Build URL list: "https://www.youtube.com/watch?v={vid}"
+ for each candidate.
+ 3. Invoke yt-dlp in batch mode WITHOUT --flat-playlist using
+ --skip-download --print "%(id)s|||%(upload_date)s|||%(timestamp)s"
+ with all URLs in one invocation. Non-flat mode is slower
+ but returns real upload dates (confirmed via empirical test:
+ ~22 seconds for 7 candidates on Branch Education).
+ 4. Stream stdout, parse each line, build vid -> YYYYMMDD dict.
+ Update scanline every second with progress counter.
+ 10-minute deadline as timeout backstop.
+ 5. For each remaining unresolved local row:
+ a. Get file_date from os.path.getmtime(filepath).
+ b. Walk candidate dates, collect those within ±1 day of
+ file_date (timezone safety, same tolerance as Pass 6
+ proper).
+ c. If exactly 1 candidate matches: direct assignment.
+ d. If multiple candidates match (multi-upload-per-day
+ channels): use fuzz.token_sort_ratio as tiebreaker with
+ a more lenient 70 threshold since date has already
+ narrowed the field.
+ e. If match found: append to _resolved_rows, strip from
+ _need_search, clear ALL failure flags on the row
+ (search_failed_ts, id_resolve_failed_ts,
+ date_resolve_failed_ts, date_resolve_failed_mtime).
+ 6. Log summary: "— Resolved N video ID(s) via per-ID date
+ lookup." in simpleline_pink (visible in simple mode).
+ Bounded cost:
+ * Only runs when Pass 6a and Pass 6 date-based have both left
+ unresolved rows behind.
+ * Only fetches candidates that are still in the "" bucket and
+ not yet in _date_known.
+ * Capped at 50 per-ID fetches per metadata run.
+ * Most runs will skip Pass 6b entirely (no undated candidates
+ to fetch).
+ Live scanline format (simple mode only, updated once per second):
+ "Fetching real dates... 12/14 (17s)"
+ Error handling: try/except around the yt-dlp call, timeout
+ enforcement, cleanup_process(_6b_proc) in finally. Failures log
+ a red warning and continue — never kill the whole metadata run.
 ```
 
 #### v38.2 — Metadata resolver: handle undated videos + always run Pass 4
 
 ```
 - METADATA RESOLVER — two related fixes for Branch Education's 7
-  emoji-titled videos, which had been stuck through v37.8 → v38.1
-  despite every "this should fix it" attempt. Post-mortem diagnosis
-  by directly querying the DB + simulating yt-dlp against the live
-  channel revealed the real root cause.
+ emoji-titled videos, which had been stuck through v37.8 → v38.1
+ despite every "this should fix it" attempt. Post-mortem diagnosis
+ by directly querying the DB + simulating yt-dlp against the live
+ channel revealed the real root cause.
 
-  THE PROBLEM (finally, for real):
-  All 7 rows had search_failed_ts AND id_resolve_failed_ts set but
-  date_resolve_failed_ts = NULL. v38.1's cleanup pass was a no-op
-  because the flag it cleared was never set in the first place.
-  The reason Pass 6 never set it: when Pass 6's date-based matcher
-  ran with wrong mtimes, _yt_by_date.get(wrong_date) returned [],
-  and the "no candidates" branch was a plain `continue` without
-  marking the row as failed.
+ THE PROBLEM (finally, for real):
+ All 7 rows had search_failed_ts AND id_resolve_failed_ts set but
+ date_resolve_failed_ts = NULL. v38.1's cleanup pass was a no-op
+ because the flag it cleared was never set in the first place.
+ The reason Pass 6 never set it: when Pass 6's date-based matcher
+ ran with wrong mtimes, _yt_by_date.get(wrong_date) returned [],
+ and the "no candidates" branch was a plain `continue` without
+ marking the row as failed.
 
-  Deeper: even after FixDates fixed the mtimes, Pass 6 still failed.
-  Why? Running yt-dlp --flat-playlist against this channel returns
-  upload_date = "NA" for EVERY video (all 48 of them, 0 dated).
-  The Pass 4 and Pass 6 stdout loops both had this pattern:
-      if _resolved_date:
-          _yt_by_date.setdefault(_resolved_date, []).append((vid, t))
-  Undated videos were silently DROPPED. Since Pass 6a's fuzzy
-  matcher builds its candidate list by flattening
-  _yt_by_date.values(), those 48 videos were invisible to fuzzy
-  matching too. And Pass 6 date-based obviously can't match
-  dateless entries. So neither pass could resolve them.
+ Deeper: even after FixDates fixed the mtimes, Pass 6 still failed.
+ Why? Running yt-dlp --flat-playlist against this channel returns
+ upload_date = "NA" for EVERY video (all 48 of them, 0 dated).
+ The Pass 4 and Pass 6 stdout loops both had this pattern:
+ if _resolved_date:
+ _yt_by_date.setdefault(_resolved_date, []).append((vid, t))
+ Undated videos were silently DROPPED. Since Pass 6a's fuzzy
+ matcher builds its candidate list by flattening
+ _yt_by_date.values(), those 48 videos were invisible to fuzzy
+ matching too. And Pass 6 date-based obviously can't match
+ dateless entries. So neither pass could resolve them.
 
-  On top of that, Pass 4 was gated on `len(_need_search) > 10` —
-  for small channels like this one (7 unresolved rows), Pass 4
-  never ran at all, leaving Pass 6 to run its own fetch with the
-  same drop-undated bug.
+ On top of that, Pass 4 was gated on `len(_need_search) > 10` —
+ for small channels like this one (7 unresolved rows), Pass 4
+ never ran at all, leaving Pass 6 to run its own fetch with the
+ same drop-undated bug.
 
-  THE FIXES (2):
+ THE FIXES (2):
 
-  1. Lowered the Pass 4 threshold from `len(_need_search) > 10` to
-     `_need_search` (any unresolved rows). The playlist fetch is
-     cheap and guarantees _yt_by_date / the full title→id map are
-     populated for Pass 6 / Pass 6a regardless of channel size,
-     avoiding the second fetch path entirely.
+ 1. Lowered the Pass 4 threshold from `len(_need_search) > 10` to
+ `_need_search` (any unresolved rows). The playlist fetch is
+ cheap and guarantees _yt_by_date / the full title→id map are
+ populated for Pass 6 / Pass 6a regardless of channel size,
+ avoiding the second fetch path entirely.
 
-  2. In BOTH the Pass 4 stdout loop and the Pass 6 stdout loop,
-     added an `else` branch for undated videos that stashes them
-     under a "" sentinel key:
-         else:
-             _yt_by_date.setdefault("", []).append((vid_id, title))
-     Pass 6a's flatten picks up this bucket via
-     _yt_by_date.values(), so fuzzy matching sees every video
-     regardless of whether yt-dlp returned a date. Pass 6's
-     date-based matcher looks up specific "YYYYMMDD" keys and
-     naturally ignores the "" bucket, so there's no risk of
-     mismatching a dateless video against the wrong local file.
+ 2. In BOTH the Pass 4 stdout loop and the Pass 6 stdout loop,
+ added an `else` branch for undated videos that stashes them
+ under a "" sentinel key:
+ else:
+ _yt_by_date.setdefault("", []).append((vid_id, title))
+ Pass 6a's flatten picks up this bucket via
+ _yt_by_date.values(), so fuzzy matching sees every video
+ regardless of whether yt-dlp returned a date. Pass 6's
+ date-based matcher looks up specific "YYYYMMDD" keys and
+ naturally ignores the "" bucket, so there's no risk of
+ mismatching a dateless video against the wrong local file.
 
-  Also cleaned up the Pass 6a success path to clear
-  id_resolve_failed_ts alongside search_failed_ts,
-  date_resolve_failed_ts, and date_resolve_failed_mtime for
-  consistency — once a row has a video_id, none of those flags
-  are meaningful anymore.
+ Also cleaned up the Pass 6a success path to clear
+ id_resolve_failed_ts alongside search_failed_ts,
+ date_resolve_failed_ts, and date_resolve_failed_mtime for
+ consistency — once a row has a video_id, none of those flags
+ are meaningful anymore.
 
-  SIMULATION CONFIRMED:
-  Before shipping, ran the fix logic against the live DB + live
-  yt-dlp output. All 7 stuck files scored 100% fuzz match against
-  their correct YT videos via token_sort_ratio. The 34 already-
-  resolved rows stay resolved, the 7 stuck rows pick up their
-  correct IDs, and the metadata fetch runs against the 7 new IDs.
+ SIMULATION CONFIRMED:
+ Before shipping, ran the fix logic against the live DB + live
+ yt-dlp output. All 7 stuck files scored 100% fuzz match against
+ their correct YT videos via token_sort_ratio. The 34 already-
+ resolved rows stay resolved, the 7 stuck rows pick up their
+ correct IDs, and the metadata fetch runs against the 7 new IDs.
 - CODE COMMENT CLEANUP
-  Scrubbed personal references from code comments throughout
-  YTArchiver.py — removed channel-specific examples ("David Pakman",
-  "3kliksphilip"), tool-specific references ("FixDates v5"), and
-  path-specific examples from the slash-mismatch dedupe comment.
-  Going forward, all commit messages, release notes, and code
-  comments stay generic per the public-content-privacy rule.
+ Scrubbed personal references from code comments throughout
+ YTArchiver.py — removed channel-specific examples ("David Pakman",
+ "3kliksphilip"), tool-specific references ("FixDates v5"), and
+ path-specific examples from the slash-mismatch dedupe comment.
+ Going forward, all commit messages, release notes, and code
+ comments stay generic per the public-content-privacy rule.
 ```
 
 #### v38.1 — Stale date-failure flag invalidation when file mtime changes
 
 ```
 - METADATA RESOLVER — mtime-aware date_resolve_failed_ts invalidation
-  Root cause of Branch Education's 7 emoji-titled videos staying
-  stuck with no metadata even after running FixDates v5:
-  date_resolve_failed_ts was a one-way latch. When the videos first
-  went through metadata resolution their mtimes were wrong (all set
-  to 2026-03-18, the download date) and Pass 6 couldn't find any YT
-  videos uploaded on that date, so it marked them all as permanently
-  "date-failed". the user then ran FixDates v5 to correct the mtimes
-  to the real YouTube upload dates — but the failure flag was still
-  set. On subsequent metadata runs:
-    * The pre-check's _pc_date_failed count hit 7
-    * _pc_effective dropped to 34 (41 - 7)
-    * The "all metadata covered" fast-exit fired because
-      _pc_covered (34) >= _pc_with_ids (34) and the JSONL entry
-      count covered _pc_effective
-    * Pass 6 and Pass 6a (fuzzy matching) never got a second chance
-  Fix: invalidate the stale flag by comparing the stored mtime to
-  the live file mtime.
-  Schema change:
-    * New column date_resolve_failed_mtime REAL on the videos table
-      — stores the file's mtime at the time date-resolution failed
-  New cleanup pass at the top of _run_metadata_download:
-    * Loads every row in the current scope (channel ± year/month)
-      with date_resolve_failed_ts IS NOT NULL AND video_id IS NULL
-    * For each, reads the file's current mtime
-    * If stored mtime is NULL (pre-v38.1 row), or differs from
-      the current mtime by more than 1 second (fs granularity /
-      float precision tolerance), queues the row for clearing
-    * Batch-clears date_resolve_failed_ts AND date_resolve_failed_mtime
-      for all queued rows in one UPDATE ... WHERE id IN (...)
-    * Logs "— Cleared N stale date-failure flag(s) (file mtime changed)."
-      in simpleline_pink (visible in simple mode) so the user can see
-      the invalidation fired
-  Updated failure setter at the end of Pass 6 to ALSO store the
-  current _mtime value alongside date_resolve_failed_ts, so future
-  invalidation can compare correctly. _mtime is already computed
-  earlier in the same loop iteration from os.path.getmtime, so no
-  extra stat call is needed.
-  Updated every success path (Pass 6a fuzzy match, Pass 6 direct
-  date match, and the refresh=True clear-all) to also clear the
-  new date_resolve_failed_mtime column, keeping the schema tidy
-  (no orphan mtime values for rows with no failure flag).
-  Migration-friendly: every existing row with date_resolve_failed_ts
-  set has NULL stored mtime because the column didn't exist before.
-  The cleanup treats NULL as "changed" and clears the flag, so on
-  the first v38.1 run every previously-stuck row gets a fresh shot.
-  Branch Education's 7 will then fall through to Pass 6a (thefuzz
-  emoji matching from v37.9/v38.0) or Pass 6's "1 candidate on this
-  date" direct match since the channel uploads ≤1/day.
+ Root cause of Branch Education's 7 emoji-titled videos staying
+ stuck with no metadata even after running FixDates v5:
+ date_resolve_failed_ts was a one-way latch. When the videos first
+ went through metadata resolution their mtimes were wrong (all set
+ to , the download date) and Pass 6 couldn't find any YT
+ videos uploaded on that date, so it marked them all as permanently
+ "date-failed". the user then ran FixDates v5 to correct the mtimes
+ to the real YouTube upload dates — but the failure flag was still
+ set. On subsequent metadata runs:
+ * The pre-check's _pc_date_failed count hit 7
+ * _pc_effective dropped to 34 (41 - 7)
+ * The "all metadata covered" fast-exit fired because
+ _pc_covered (34) >= _pc_with_ids (34) and the JSONL entry
+ count covered _pc_effective
+ * Pass 6 and Pass 6a (fuzzy matching) never got a second chance
+ Fix: invalidate the stale flag by comparing the stored mtime to
+ the live file mtime.
+ Schema change:
+ * New column date_resolve_failed_mtime REAL on the videos table
+ — stores the file's mtime at the time date-resolution failed
+ New cleanup pass at the top of _run_metadata_download:
+ * Loads every row in the current scope (channel ± year/month)
+ with date_resolve_failed_ts IS NOT NULL AND video_id IS NULL
+ * For each, reads the file's current mtime
+ * If stored mtime is NULL (pre-v38.1 row), or differs from
+ the current mtime by more than 1 second (fs granularity /
+ float precision tolerance), queues the row for clearing
+ * Batch-clears date_resolve_failed_ts AND date_resolve_failed_mtime
+ for all queued rows in one UPDATE ... WHERE id IN (...)
+ * Logs "— Cleared N stale date-failure flag(s) (file mtime changed)."
+ in simpleline_pink (visible in simple mode) so the user can see
+ the invalidation fired
+ Updated failure setter at the end of Pass 6 to ALSO store the
+ current _mtime value alongside date_resolve_failed_ts, so future
+ invalidation can compare correctly. _mtime is already computed
+ earlier in the same loop iteration from os.path.getmtime, so no
+ extra stat call is needed.
+ Updated every success path (Pass 6a fuzzy match, Pass 6 direct
+ date match, and the refresh=True clear-all) to also clear the
+ new date_resolve_failed_mtime column, keeping the schema tidy
+ (no orphan mtime values for rows with no failure flag).
+ Migration-friendly: every existing row with date_resolve_failed_ts
+ set has NULL stored mtime because the column didn't exist before.
+ The cleanup treats NULL as "changed" and clears the flag, so on
+ the first v38.1 run every previously-stuck row gets a fresh shot.
+ Branch Education's 7 will then fall through to Pass 6a (thefuzz
+ emoji matching from v37.9/v38.0) or Pass 6's "1 candidate on this
+ date" direct match since the channel uploads ≤1/day.
 ```
 
 #### v38.0 — Live prep scanline for metadata download on large channels
 
 ```
 - METADATA DOWNLOAD — live status line during ID resolution
-  Big channels like David Pakman were sitting for 10+ minutes on
-  "Metadata: preparing X..." with no visible progress in simple
-  mode, because every internal log call in the resolution pipeline
-  used the "dim" tag which is filtered out of simple mode. The
-  heavy lifting (yt-dlp --flat-playlist fetching 3000+ titles,
-  JSONL transcript walk, individual ytsearch per video,
-  date-based fallback) happened entirely silently.
-  Added two helpers inside _run_metadata_download:
-    * _update_meta_prep_line(text) — in-place scanline update that
-      reuses the existing "scanline" tag (so the later "Scanning
-      metadata files X/Y" line naturally takes over). 5-second
-      grace period: the first call within 5 seconds of function
-      entry is a no-op. This means fast channels (<5s total prep)
-      see zero extra output — behavior is unchanged there.
-    * _clear_meta_prep_line() — clears the scanline before early
-      returns (pre-check "all metadata covered" shortcut; no-rows
-      shortcut after Pass 6).
-  Instrumented phase boundaries:
-    * Pre-check: "Checking existing metadata (N video(s))..."
-    * Pass 3: "Scanning transcripts for N unresolved ID(s)..."
-    * Pass 4: "Fetching channel playlist for N video(s)..."
-    * Pass 5: "Searching YouTube for N video(s)..."
-    * Pass 6: "Date-resolving N video(s) — fetching channel dates..."
-  Live counters inside the two yt-dlp stdout loops (Pass 4 and
-  Pass 6): each iteration computes elapsed time and calls
-  _update_meta_prep_line once per second with the current title/
-  entry count, so the user sees a growing number every second
-  instead of a motionless line. The existing per-500-title dim
-  log calls are left intact for verbose mode.
-  Simple mode only — verbose mode is completely untouched. The
-  "scanline" tag is the same one "Scanning metadata files X/Y"
-  already uses, so when the scanning phase starts it seamlessly
-  replaces whatever prep message was last shown.
-  Visual example for a big channel:
-    Metadata: preparing David Pakman...
-      Fetching channel playlist... 2,340 titles (47s)   ← live
-      Date-resolving... 1,890 entries (21s)             ← live
-      Scanning metadata files 145/200                   ← existing
-      — Scanned 200 metadata files.
+ Big channels like David Pakman were sitting for 10+ minutes on
+ "Metadata: preparing X..." with no visible progress in simple
+ mode, because every internal log call in the resolution pipeline
+ used the "dim" tag which is filtered out of simple mode. The
+ heavy lifting (yt-dlp --flat-playlist fetching 3000+ titles,
+ JSONL transcript walk, individual ytsearch per video,
+ date-based fallback) happened entirely silently.
+ Added two helpers inside _run_metadata_download:
+ * _update_meta_prep_line(text) — in-place scanline update that
+ reuses the existing "scanline" tag (so the later "Scanning
+ metadata files X/Y" line naturally takes over). 5-second
+ grace period: the first call within 5 seconds of function
+ entry is a no-op. This means fast channels (<5s total prep)
+ see zero extra output — behavior is unchanged there.
+ * _clear_meta_prep_line() — clears the scanline before early
+ returns (pre-check "all metadata covered" shortcut; no-rows
+ shortcut after Pass 6).
+ Instrumented phase boundaries:
+ * Pre-check: "Checking existing metadata (N video(s))..."
+ * Pass 3: "Scanning transcripts for N unresolved ID(s)..."
+ * Pass 4: "Fetching channel playlist for N video(s)..."
+ * Pass 5: "Searching YouTube for N video(s)..."
+ * Pass 6: "Date-resolving N video(s) — fetching channel dates..."
+ Live counters inside the two yt-dlp stdout loops (Pass 4 and
+ Pass 6): each iteration computes elapsed time and calls
+ _update_meta_prep_line once per second with the current title/
+ entry count, so the user sees a growing number every second
+ instead of a motionless line. The existing per-500-title dim
+ log calls are left intact for verbose mode.
+ Simple mode only — verbose mode is completely untouched. The
+ "scanline" tag is the same one "Scanning metadata files X/Y"
+ already uses, so when the scanning phase starts it seamlessly
+ replaces whatever prep message was last shown.
+ Visual example for a big channel:
+ Metadata: preparing David Pakman...
+ Fetching channel playlist... 2,340 titles (47s) ← live
+ Date-resolving... 1,890 entries (21s) ← live
+ Scanning metadata files 145/200 ← existing
+ — Scanned 200 metadata files.
 ```
 
 #### v37.9 — Port FixDates' thefuzz-based fuzzy matching into metadata resolver + bulk-queue log spam fix
 
 ```
 - METADATA RESOLVER — thefuzz.token_sort_ratio fuzzy matching
-  Videos with heavy emoji titles (🛠️⚙️💻 etc.) were breaking the
-  custom _norm_title / word-overlap matching in the metadata
-  pipeline. The old FixDates v5.py Re-Dater tool handles these
-  perfectly via thefuzz.token_sort_ratio — it matched all 7 of
-  Branch Education's emoji-titled videos at 100% in a dry run.
-  Ported that exact algorithm into _run_metadata_download as a new
-  "pass 6a" that runs AFTER _yt_by_date is populated (from
-  batch-resolve or pass 6's own fetch) and BEFORE the existing
-  date-based match loop.
-    * Flatten _yt_by_date into a single list (excluding resolved IDs)
-    * Score each unresolved local file's base filename against every
-      YT title using fuzz.token_sort_ratio (score ≥ 85 threshold)
-    * Sort potential matches by score descending
-    * Greedy-assign each file to its best unused YT video
-  Resolved rows get search_failed_ts and date_resolve_failed_ts
-  cleared and are stripped from _need_search before the date-based
-  loop runs.
-  Log message: "  — Fuzzy-matched N video ID(s) via thefuzz."
-  (pink em-dash, visible in simple mode).
-  thefuzz import is wrapped in try/except so the app degrades
-  gracefully if the package is missing. thefuzz, thefuzz.fuzz, and
-  rapidfuzz added to YTArchiver.spec's hiddenimports so pyinstaller
-  bundles them into the exe.
+ Videos with heavy emoji titles (🛠️⚙️💻 etc.) were breaking the
+ custom _norm_title / word-overlap matching in the metadata
+ pipeline. The old FixDates v5.py Re-Dater tool handles these
+ perfectly via thefuzz.token_sort_ratio — it matched all 7 of
+ Branch Education's emoji-titled videos at 100% in a dry run.
+ Ported that exact algorithm into _run_metadata_download as a new
+ "pass 6a" that runs AFTER _yt_by_date is populated (from
+ batch-resolve or pass 6's own fetch) and BEFORE the existing
+ date-based match loop.
+ * Flatten _yt_by_date into a single list (excluding resolved IDs)
+ * Score each unresolved local file's base filename against every
+ YT title using fuzz.token_sort_ratio (score ≥ 85 threshold)
+ * Sort potential matches by score descending
+ * Greedy-assign each file to its best unused YT video
+ Resolved rows get search_failed_ts and date_resolve_failed_ts
+ cleared and are stripped from _need_search before the date-based
+ loop runs.
+ Log message: " — Fuzzy-matched N video ID(s) via thefuzz."
+ (pink em-dash, visible in simple mode).
+ thefuzz import is wrapped in try/except so the app degrades
+ gracefully if the package is missing. thefuzz, thefuzz.fuzz, and
+ rapidfuzz added to YTArchiver.spec's hiddenimports so pyinstaller
+ bundles them into the exe.
 
 - BULK METADATA QUEUE — single summary line instead of spam
-  When queuing metadata download for all channels via the Browse
-  tab's bulk action, the log was spamming one "Added metadata
-  download to sync-tasks queue" line per channel (102 identical
-  lines for a full subscription list). Added a _quiet=False kwarg
-  to _add_to_metadata_queue — the bulk caller now passes _quiet=True
-  so per-channel lines are suppressed and emits a single summary:
-    "  — Added metadata download to queue for 102 channel(s)"
-  Single-channel callers still get their per-channel line as before.
+ When queuing metadata download for all channels via the Browse
+ tab's bulk action, the log was spamming one "Added metadata
+ download to sync-tasks queue" line per channel (102 identical
+ lines for a full subscription list). Added a _quiet=False kwarg
+ to _add_to_metadata_queue — the bulk caller now passes _quiet=True
+ so per-channel lines are suppressed and emits a single summary:
+ " — Added metadata download to queue for 102 channel(s)"
+ Single-channel callers still get their per-channel line as before.
 ```
 
 #### v37.8 — Date-based metadata resolution now runs on search-failed rows
 
 ```
 - Videos with heavy emoji titles (e.g. 🛠️⚙️💻) break YouTube's search
-  ranking, so the title-based individual search fails on them and
-  marks them search_failed_ts. The date-based resolver (pass 6) was
-  supposed to rescue these via file mtime → channel upload-date
-  matching, but two bugs prevented it from running in practice:
+ ranking, so the title-based individual search fails on them and
+ marks them search_failed_ts. The date-based resolver (pass 6) was
+ supposed to rescue these via file mtime → channel upload-date
+ matching, but two bugs prevented it from running in practice:
 
-  1. Pre-check was subtracting _pc_search_failed from the effective
-     total, letting the "all videos already have metadata" early-exit
-     bail before the pipeline ran. Result on Branch Education: 7
-     videos with no video_id and no metadata, log saying "all 41
-     videos already have metadata".
-  2. Pass 5's _already_searched_ids filter mutated _need_search in
-     place. Pass 6 iterates _need_search, so it never saw the
-     search-failed rows even when the early-exit DID fall through.
+ 1. Pre-check was subtracting _pc_search_failed from the effective
+ total, letting the "all videos already have metadata" early-exit
+ bail before the pipeline ran. Result on Branch Education: 7
+ videos with no video_id and no metadata, log saying "all 41
+ videos already have metadata".
+ 2. Pass 5's _already_searched_ids filter mutated _need_search in
+ place. Pass 6 iterates _need_search, so it never saw the
+ search-failed rows even when the early-exit DID fall through.
 
 - Fixes:
-    * New date_resolve_failed_ts column tracks when date-based has
-      actually been attempted and failed (ALTER TABLE migration).
-    * Pre-check now subtracts date_resolve_failed_ts rows instead of
-      search_failed_ts — rows are only "permanently unreachable" once
-      every method has been exhausted.
-    * _need_search_full captured before pass 5's filter so pass 6 can
-      see the complete unresolved list including search-failed rows.
-    * Pass 6 builds its own candidate list and reassigns _need_search
-      so existing downstream code works unchanged.
-    * Pass 6 success path clears both search_failed_ts AND
-      date_resolve_failed_ts on resolve.
-    * Pass 6 failure path sets date_resolve_failed_ts so future runs
-      fast-path through the pre-check.
-    * refresh=True also clears date_resolve_failed_ts.
-    * Pre-check log message is now honest: reports
-      "X videos have metadata. Y unmatchable (all resolution methods
-      exhausted — use Refresh Metadata to retry)" instead of the
-      previous lie "all N videos already have metadata".
+ * New date_resolve_failed_ts column tracks when date-based has
+ actually been attempted and failed (ALTER TABLE migration).
+ * Pre-check now subtracts date_resolve_failed_ts rows instead of
+ search_failed_ts — rows are only "permanently unreachable" once
+ every method has been exhausted.
+ * _need_search_full captured before pass 5's filter so pass 6 can
+ see the complete unresolved list including search-failed rows.
+ * Pass 6 builds its own candidate list and reassigns _need_search
+ so existing downstream code works unchanged.
+ * Pass 6 success path clears both search_failed_ts AND
+ date_resolve_failed_ts on resolve.
+ * Pass 6 failure path sets date_resolve_failed_ts so future runs
+ fast-path through the pre-check.
+ * refresh=True also clears date_resolve_failed_ts.
+ * Pre-check log message is now honest: reports
+ "X videos have metadata. Y unmatchable (all resolution methods
+ exhausted — use Refresh Metadata to retry)" instead of the
+ previous lie "all N videos already have metadata".
 ```
 
 #### v37.7 — Grid view context menu: dim entries use state="normal" instead of "disabled"
 
 ```
 - Items like "Redownload..." and "Open Video — YouTube" in the grid
-  thumbnail right-click menu were rendered with state="disabled" when
-  their action wasn't available. On Windows, tk.Menu's state="disabled"
-  uses the OS's native disabled rendering which COMPLETELY IGNORES our
-  disabledforeground setting — that's why it looked wrong no matter
-  what color was set in the previous attempt (v37.6).
+ thumbnail right-click menu were rendered with state="disabled" when
+ their action wasn't available. On Windows, tk.Menu's state="disabled"
+ uses the OS's native disabled rendering which COMPLETELY IGNORES our
+ disabledforeground setting — that's why it looked wrong no matter
+ what color was set in the previous attempt (v37.6).
 - The subs-tab channel context menu avoids this by using state="normal"
-  with foreground=C_DIM and a no-op command, which Tk fully respects.
+ with foreground=C_DIM and a no-op command, which Tk fully respects.
 - Added an _add_dim(label) helper inside _grid_on_rightclick that adds
-  a no-op entry, then entryconfig(idx, foreground=C_DIM,
-  activeforeground=C_DIM) so hover doesn't brighten the dimmed text
-  back up. Replaced all three state="disabled" branches with
-  _add_dim() calls.
+ a no-op entry, then entryconfig(idx, foreground=C_DIM,
+ activeforeground=C_DIM) so hover doesn't brighten the dimmed text
+ back up. Replaced all three state="disabled" branches with
+ _add_dim() calls.
 ```
 
 #### v37.6 — Grid view context menu style matches subs tab menu
 
 ```
 - The right-click menu on Browse grid thumbnails was using a bright blue
-  accent hover (#4a9eff) with white text and a 1px border outline, which
-  looked jarring next to the subs tab channel context menu's muted
-  dark-grey hover. Copied the subs-tab menu's style verbatim:
-    * activebackground: #4a9eff → #2e3035 (subtle dark grey)
-    * activeforeground: "white" → _TP_FG (same as normal — no jump on hover)
-    * bd: 1 → 0 (no border outline)
+ accent hover (#4a9eff) with white text and a 1px border outline, which
+ looked jarring next to the subs tab channel context menu's muted
+ dark-grey hover. Copied the subs-tab menu's style verbatim:
+ * activebackground: #4a9eff → #2e3035 (subtle dark grey)
+ * activeforeground: "white" → _TP_FG (same as normal — no jump on hover)
+ * bd: 1 → 0 (no border outline)
 ```
 
 #### v37.5 — Visual identity overhaul, sync ordering fix, DB dedupe, transcribe simplification
@@ -5067,165 +5054,164 @@ PRE-PUSH HOOK FIX:
 ```
 ── VISUAL IDENTITY OVERHAUL ────────────────────────────────────────────────
 - Each task type now has its own color throughout the log + activity history.
-  * Redownload: chartreuse #c7e64f (was sharing green with Manual/Auto sync)
-  * Compress:   purple    #c084fc (was uncolored)
-  * Reorg:      orange    #ff8c42 (was uncolored)
+ * Redownload: chartreuse #c7e64f (was sharing green with Manual/Auto sync)
+ * Compress: purple #c084fc (was uncolored)
+ * Reorg: orange #ff8c42 (was uncolored)
 - Brackets [N/M], em-dashes, and label keywords (Transcribing:, Metadata:,
-  Refreshing:) are now color-coded per task — not just em-dashes.
+ Refreshing:) are now color-coded per task — not just em-dashes.
 - Pinned live "active" status line now fires for transcribe / metadata /
-  compress / reorg (was only sync + redownload before).
+ compress / reorg (was only sync + redownload before).
 - Activity log row colors fixed: ReDwnl is now chartreuse instead of
-  duplicate green, Cmprss is now purple, Reorg has orange handling.
+ duplicate green, Cmprss is now purple, Reorg has orange handling.
 
 ── NEW FEATURES ────────────────────────────────────────────────────────────
 - AUTO CHECKBOX on Sync Tasks popup — mirror of GPU's Auto checkbox. When
-  enabled, the next queued sync-pipeline item auto-starts when the current
-  one finishes (e.g. auto-metadata after a sync). Stored as autorun_sync.
+ enabled, the next queued sync-pipeline item auto-starts when the current
+ one finishes (e.g. auto-metadata after a sync). Stored as autorun_sync.
 - SAMPLE-AND-CONFIRM popup for redownload — after the first 10 successful
-  replacements, shows a dialog with the average size delta and three
-  buttons: Continue / Change Resolution / Cancel. Skipped on resume or
-  for batches ≤ 10.
+ replacements, shows a dialog with the average size delta and three
+ buttons: Continue / Change Resolution / Cancel. Skipped on resume or
+ for batches ≤ 10.
 - UPDATE TRANSCRIPTION INDEX popup BATCHED — was firing per-channel during
-  a queued batch transcribe. Now fires once at the end of the queue with
-  a combined message ("Transcriptions for 5 channels are complete").
+ a queued batch transcribe. Now fires once at the end of the queue with
+ a combined message ("Transcriptions for 5 channels are complete").
 - SMALL-BATCH TRANSCRIBE OPTIMIZATION — for ≤10 new files on a channel,
-  skips the slow yt-dlp --flat-playlist enumeration (5–10 min on big
-  channels) and uses per-file YouTube search instead (~30 s for 10 files).
+ skips the slow yt-dlp --flat-playlist enumeration (5–10 min on big
+ channels) and uses per-file YouTube search instead (~30 s for 10 files).
 
 ── BUG FIXES ───────────────────────────────────────────────────────────────
 - DB SLASH-MISMATCH DEDUPE: _scan_channel_disk_info was inserting
-  un-normalized filepaths. With output_dir set with forward slashes,
-  os.path.join produced mixed-slash paths that bypassed the
-  UNIQUE COLLATE NOCASE constraint. Found and merged 6190 duplicate file
-  pairs in the DB on startup; the scanner now normalizes via
-  os.path.normpath + NFC. One-time _dedupe_slash_mismatch_videos pass
-  runs on _ensure_videos_populated, gated by a sentinel row.
+ un-normalized filepaths. With output_dir set with forward slashes,
+ os.path.join produced mixed-slash paths that bypassed the
+ UNIQUE COLLATE NOCASE constraint. Found and merged 6190 duplicate file
+ pairs in the DB on startup; the scanner now normalizes via
+ os.path.normpath + NFC. One-time _dedupe_slash_mismatch_videos pass
+ runs on _ensure_videos_populated, gated by a sentinel row.
 - SYNC TASKS ORDERING: _single_worker kept _sync_running=True while
-  calling _process_next_queued, which silently re-queued any metadata
-  task instead of dispatching it. Plus _process_next_queued had no
-  handler for "video" source so video items in _queue_order were
-  skipped entirely and the legacy _process_video_dl_queue() fallback
-  fired out of order. Both fixed; the popup order now matches execution.
+ calling _process_next_queued, which silently re-queued any metadata
+ task instead of dispatching it. Plus _process_next_queued had no
+ handler for "video" source so video items in _queue_order were
+ skipped entirely and the legacy _process_video_dl_queue() fallback
+ fired out of order. Both fixed; the popup order now matches execution.
 - AUTO-METADATA-AFTER-SYNC wasn't actually firing without a manual click.
-  Same root cause as the ordering bug above (_start_metadata_task seeing
-  _sync_running=True).
+ Same root cause as the ordering bug above (_start_metadata_task seeing
+ _sync_running=True).
 - COLDFUSION [5/1] COUNTER: pre-count was skipping _fetch_failed_ids but
-  the actual fetch loop wasn't, so the counter showed [5/1] instead of
-  [5/5] and previously-failed videos got re-fetched on every run. Fetch
-  loop now mirrors the pre-count's skip logic.
+ the actual fetch loop wasn't, so the counter showed [5/1] instead of
+ [5/5] and previously-failed videos got re-fetched on every run. Fetch
+ loop now mirrors the pre-count's skip logic.
 - AI-DRIVR DUPLICATE: _TEMP_COMPRESS files (compression intermediates)
-  were being indexed as videos. Both _scan_channel_disk_info and the
-  Browse panel scanner now exclude _TEMP_COMPRESS and _BACKLOG_TEMP.
+ were being indexed as videos. Both _scan_channel_disk_info and the
+ Browse panel scanner now exclude _TEMP_COMPRESS and _BACKLOG_TEMP.
 - WHISPER PROGRESS vs ACTIVE LINE ORDERING: the pinned "Transcribing:
-  Channel···" line was getting pushed above the whisper progress line on
-  every animation tick. log_simple_status rewritten so simplestatus is
-  always re-inserted at tk.END after restoring whisper progress.
+ Channel···" line was getting pushed above the whisper progress line on
+ every animation tick. log_simple_status rewritten so simplestatus is
+ always re-inserted at tk.END after restoring whisper progress.
 - PINNED STATUS LINE DEAD BOTTOM: was only starting AFTER the matching
-  phase, leaving the bottom dead during the (slow) scanning/YT-fetch
-  phases. Now starts immediately when a transcribe job begins, showing
-  "Transcribing: Channel···" until counts are known, then
-  "[N/M] Transcribing: Channel···".
+ phase, leaving the bottom dead during the (slow) scanning/YT-fetch
+ phases. Now starts immediately when a transcribe job begins, showing
+ "Transcribing: Channel···" until counts are known, then
+ "[N/M] Transcribing: Channel···".
 - [Trnscr] activity row was showing done_count + _prior_done (cumulative
-  across the channel's lifetime). Now shows just this run's count.
+ across the channel's lifetime). Now shows just this run's count.
 - EM-DASH COLORS in colored task lines: _segmented_insert was bailing
-  out when a _bk_tag was set but no [N/M] was in the line, leaving
-  em-dashes uncolored. Fixed; "Transcribing:" / "Metadata:" /
-  "Refreshing:" keywords also now get the matching color.
+ out when a _bk_tag was set but no [N/M] was in the line, leaving
+ em-dashes uncolored. Fixed; "Transcribing:" / "Metadata:" /
+ "Refreshing:" keywords also now get the matching color.
 
 ── SIMPLE-MODE LOGGING SLIMDOWN ────────────────────────────────────────────
 - TRANSCRIBE: removed === borders + the entire TRANSCRIPTION SUMMARY
-  block. Replaced with a single line:
-    "  — ✓ Channel transcribed. Completed N - Errors E - Took T"
-  (blue em-dash, green ✓, green count). The verbose phase messages
-  (Scanning local → Found N → Fetching YT → matched) collapse into one
-  updating "scanline" that disappears once the matched-count is known.
+ block. Replaced with a single line:
+ " — ✓ Channel transcribed. Completed N - Errors E - Took T"
+ (blue em-dash, green ✓, green count). The verbose phase messages
+ (Scanning local → Found N → Fetching YT → matched) collapse into one
+ updating "scanline" that disappears once the matched-count is known.
 - METADATA: pink em-dash format throughout.
-    Old:  "Metadata: Channel — N to fetch (M already done)."
-    New:  "  — N to fetch (M already done)."
-  Per-item lines also get the pink em-dash prefix. Completion line:
-    "  — Metadata for Channel download complete. N New"
+ Old: "Metadata: Channel — N to fetch (M already done)."
+ New: " — N to fetch (M already done)."
+ Per-item lines also get the pink em-dash prefix. Completion line:
+ " — Metadata for Channel download complete. N New"
 - [Metdta] activity row: "skipped" column → "existing" column. The 28k
-  "skipped" number was reading like an error; "existing" is neutral
-  and the row now renders without the alarming amber highlight.
+ "skipped" number was reading like an error; "existing" is neutral
+ and the row now renders without the alarming amber highlight.
 - WHISPER SETUP: suppressed three redundant lines in simple mode:
-  "N video(s) need Whisper AI transcription", "Using Whisper model: X",
-  "Selected Whisper model: X". Kept the "✓ Whisper model loaded".
+ "N video(s) need Whisper AI transcription", "Using Whisper model: X",
+ "Selected Whisper model: X". Kept the "✓ Whisper model loaded".
 - PER-ITEM CAPTION FETCH: dropped the leading "Transcribing" word:
-    "[1/1] \"Title\" - fetching captions..."  (was "[1/1] Transcribing \"Title\" - ...")
-  Lowercased the active pinned label TRANSCRIBING: → Transcribing:.
+ "[1/1] \"Title\" - fetching captions..." (was "[1/1] Transcribing \"Title\" - ...")
+ Lowercased the active pinned label TRANSCRIBING: → Transcribing:.
 
 ── CMPRSS ROW ALIGNMENT ────────────────────────────────────────────────────
 - The "Batch X" segment was inserted between channel name and stats,
-  breaking column alignment with the other rows. Removed (the batch
-  number was meaningless for single-video auto-compress runs anyway).
+ breaking column alignment with the other rows. Removed (the batch
+ number was meaningless for single-video auto-compress runs anyway).
 - Added missing "skipped" column. _compress_channel already tracks files
-  that ffprobe says are already compressed; just needed to thread the
-  count into _record_compression.
+ that ffprobe says are already compressed; just needed to thread the
+ count into _record_compression.
 
 ── PINK EM-DASH for "Added metadata download to sync-tasks queue" ──────────
 - Was: "=== Added to Sync List: Download X Metadata ===" (header style).
-- Now: "  — Added metadata download to sync-tasks queue" (pink em-dash).
+- Now: " — Added metadata download to sync-tasks queue" (pink em-dash).
 ```
 
-### April 10, 2026
-
+---
 #### v37.4 — Fix duplicate year nodes in Browse tree (UI race condition)
 
 ```
 - Browse tree was occasionally showing duplicate year entries under a
-  channel (e.g. ColdFusion → 2010, 2011, ..., 2026, 2010, 2011, ...).
-  Verified via direct read-only DB query that the underlying data is
-  clean integer years — this was a UI-level race, not a data bug.
+ channel (e.g. ColdFusion → 2010, 2011, ..., 2026, 2010, 2011, ...).
+ Verified via direct read-only DB query that the underlying data is
+ clean integer years — this was a UI-level race, not a data bug.
 - Root cause: when the user collapsed and re-expanded a channel while
-  its background year query thread was still running, _on_browse_open
-  saw the "Loading..." placeholder (tagged the same as the initial
-  dummy) and spawned a second query thread. Both threads eventually
-  called _apply and each inserted a full set of year nodes.
+ its background year query thread was still running, _on_browse_open
+ saw the "Loading..." placeholder (tagged the same as the initial
+ dummy) and spawned a second query thread. Both threads eventually
+ called _apply and each inserted a full set of year nodes.
 - Fix: added _browse_loading_iids tracking set. Expand handlers bail
-  early if the iid is already loading; async _apply handlers discard
-  from the set in a finally block. Also added a "node already has
-  non-placeholder children, skip insert" defensive guard inside each
-  _apply as secondary protection against any remaining races.
+ early if the iid is already loading; async _apply handlers discard
+ from the set in a finally block. Also added a "node already has
+ non-placeholder children, skip insert" defensive guard inside each
+ _apply as secondary protection against any remaining races.
 ```
 
 #### v37.3 — Persist metadata-fetch failures
 
 ```
 - Videos where yt-dlp --dump-json fails (deleted/private/region-locked/
-  age-restricted) were getting re-fetched on every single metadata run
-  because nothing persisted the failure. Now marked with a new
-  metadata_fetch_failed_ts column and skipped on subsequent runs until
-  the user explicitly hits refresh.
+ age-restricted) were getting re-fetched on every single metadata run
+ because nothing persisted the failure. Now marked with a new
+ metadata_fetch_failed_ts column and skipped on subsequent runs until
+ the user explicitly hits refresh.
 - Example: a channel reporting "506 processed, 502 already had metadata,
-  4 failed" on run 1 will report "all 506 videos already have metadata"
-  on run 2 and exit the pre-check immediately.
+ 4 failed" on run 1 will report "all 506 videos already have metadata"
+ on run 2 and exit the pre-check immediately.
 - Refresh clears all three failure columns together (search_failed_ts,
-  id_resolve_failed_ts, metadata_fetch_failed_ts) for a true clean slate.
+ id_resolve_failed_ts, metadata_fetch_failed_ts) for a true clean slate.
 ```
 
 #### v37.2 — Simple-mode metadata scan visual polish
 
 ```
 - Metadata scan progress no longer spams "Scanning metadata files... N/M"
-  on a new line for every 10% step in simple log mode. Now it uses an
-  in-place updating single line during the scan.
+ on a new line for every 10% step in simple log mode. Now it uses an
+ in-place updating single line during the scan.
 - When the scan completes, the transient line is cleared and replaced
-  with a persistent "— Scanned N metadata files." summary (pink em-dash
-  prefix, matching other metadata lines).
+ with a persistent "— Scanned N metadata files." summary (pink em-dash
+ prefix, matching other metadata lines).
 - Suppressed the "Grouping N video(s) by folder..." line in simple mode.
 - Verbose mode keeps both the original per-10% progress and the grouping
-  line for users who want detailed output.
+ line for users who want detailed output.
 ```
 
 #### v37.1 — Hotfix: date-resolve tuple unpacking
 
 ```
 - The v37.0 metadata pipeline refactor changed _need_search tuples to
-  5-tuples (added row_id as first element), but missed updating a
-  generator expression at the date-resolve prefetch check that still
-  unpacked 4 values. Metadata downloads crashed with "too many values
-  to unpack (expected 4)" whenever rows remained unresolved after the
-  individual search phase.
+ 5-tuples (added row_id as first element), but missed updating a
+ generator expression at the date-resolve prefetch check that still
+ unpacked 4 values. Metadata downloads crashed with "too many values
+ to unpack (expected 4)" whenever rows remained unresolved after the
+ individual search phase.
 - One-line fix; all v37.0 improvements still in place.
 ```
 
@@ -5233,49 +5219,47 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Tray icon spin and tooltip now derive from the sync/GPU blink state
-  instead of scattered _tray_start_spin / _tray_stop_spin calls in every
-  task handler. Fixes "YT Archiver — Idle" showing up in the taskbar
-  tooltip while sync tasks are running. Reorg tasks now also set a
-  proper tooltip (they were the only task type that didn't).
+ instead of scattered _tray_start_spin / _tray_stop_spin calls in every
+ task handler. Fixes "YT Archiver — Idle" showing up in the taskbar
+ tooltip while sync tasks are running. Reorg tasks now also set a
+ proper tooltip (they were the only task type that didn't).
 - Metadata ID resolution refactored into a 3-pass staged pipeline:
-  Pass 1 (free): existing video_ids + filename pattern match
-  Pass 2 (cheap): segments table + videos table SQL lookups
-  Pass 3 (expensive): JSONL folder walk — last resort only
-  For large channels, this means metadata runs no longer walk every
-  transcript JSONL file just to resolve 1-2 missing video_ids.
+ Pass 1 (free): existing video_ids + filename pattern match
+ Pass 2 (cheap): segments table + videos table SQL lookups
+ Pass 3 (expensive): JSONL folder walk — last resort only
+ For large channels, this means metadata runs no longer walk every
+ transcript JSONL file just to resolve 1-2 missing video_ids.
 - New id_resolve_failed_ts column marks rows whose ID couldn't be found
-  after a full JSONL walk. Subsequent runs skip these orphans so a
-  single permanent orphan row no longer triggers a full folder scan
-  every metadata run. Cleared on manual refresh.
+ after a full JSONL walk. Subsequent runs skip these orphans so a
+ single permanent orphan row no longer triggers a full folder scan
+ every metadata run. Cleared on manual refresh.
 - Fixed emoji/unicode video titles causing individual yt-dlp search to
-  re-fire every single run. The search_failed_ts mark UPDATE was
-  matching by filepath, but unicode normalization drift between
-  yt-dlp stdout and os.walk output meant the UPDATE silently matched
-  0 rows and the fail mark never stuck. All metadata-pipeline UPDATEs
-  now target rows by primary key id instead — bulletproof.
+ re-fire every single run. The search_failed_ts mark UPDATE was
+ matching by filepath, but unicode normalization drift between
+ yt-dlp stdout and os.walk output meant the UPDATE silently matched
+ 0 rows and the fail mark never stuck. All metadata-pipeline UPDATEs
+ now target rows by primary key id instead — bulletproof.
 - register_video and _scan_archive now NFC-normalize filepaths on
-  insert so new downloads are always stored in canonical form,
-  preventing duplicate rows from unicode differences going forward.
+ insert so new downloads are always stored in canonical form,
+ preventing duplicate rows from unicode differences going forward.
 ```
 
-### April 9, 2026
-
+---
 #### v36.9 — Fix auto-transcribe not queuing to GPU Tasks list
 
 ```
 - Auto-transcribe was running Phase A inline during sync, so it never
-  appeared in the GPU Tasks list and couldn't be paused independently
+ appeared in the GPU Tasks list and couldn't be paused independently
 - Now queues the full transcription as a proper GPU task, giving the
-  user pause/cancel control and making the GPU Tasks button blink
+ user pause/cancel control and making the GPU Tasks button blink
 ```
 
-### April 8, 2026
-
+---
 #### v36.4 — Restyle grid sort dropdown + fix label order
 
 ```
 - Replace ugly tk.OptionMenu with button+popup menu matching the
-  Actions dropdown style
+ Actions dropdown style
 - Fix "Sort:" / dropdown order so it reads left to right
 ```
 
@@ -5283,21 +5267,21 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Reverted the preload-on-click feature from v36.2 — the async
-  populate method raced with <<TreeviewSelect>> events and created
-  duplicate year nodes in the tree
+ populate method raced with <<TreeviewSelect>> events and created
+ duplicate year nodes in the tree
 ```
 
 #### v36.2 — Skip previously-searched metadata videos + fix disabled menu color
 
 ```
 - Videos that individual yt-dlp search couldn't resolve (deleted/private)
-  are now remembered via search_failed_ts — skipped instantly on future
-  runs instead of re-searching ~8s each (fixes the recurring 597 loop)
+ are now remembered via search_failed_ts — skipped instantly on future
+ runs instead of re-searching ~8s each (fixes the recurring 597 loop)
 - Pre-check early exit accounts for search-failed videos so the pipeline
-  doesn't re-enter unnecessarily
+ doesn't re-enter unnecessarily
 - Refresh mode clears search_failed_ts to allow re-trying everything
 - Fix disabled menu text color in browse right-click menus (use _TP_DIM
-  instead of hardcoded #666b75)
+ instead of hardcoded #666b75)
 - Preload browse tree children on channel click without visually expanding
 ```
 
@@ -5305,7 +5289,7 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Progress logs were using whisper_progress tag which silently fails —
-  changed to simpleline so "Scanning metadata files..." actually shows
+ changed to simpleline so "Scanning metadata files..." actually shows
 - Task menu +1 line height to prevent last item clipping
 ```
 
@@ -5313,9 +5297,9 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Fix task menu last item text being cut off (bottom padding on both
-  Sync Tasks and GPU Tasks popups)
+ Sync Tasks and GPU Tasks popups)
 - Add progress logging during silent metadata phases: "Scanning metadata
-  files... X/Y" during pre-count, "Grouping N videos..." during grouping
+ files... X/Y" during pre-count, "Grouping N videos..." during grouping
 - Fix Unicode slash in date-based resolve normalizer (same ⧸ bug)
 ```
 
@@ -5323,9 +5307,9 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Root cause: all 597 had Unicode big solidus (⧸, U+29F8) in titles —
-  a filesystem-safe replacement for /. Batch resolve stripped / but NOT ⧸,
-  so file titles never matched YouTube titles. Search sent ⧸ to YouTube
-  which returned nothing. Every restart repeated the same 597 searches.
+ a filesystem-safe replacement for /. Batch resolve stripped / but NOT ⧸,
+ so file titles never matched YouTube titles. Search sent ⧸ to YouTube
+ which returned nothing. Every restart repeated the same 597 searches.
 - Added U+29F8 and U+FF0F to title normalization strip regex
 - Individual search replaces ⧸ back to / before querying YouTube
 ```
@@ -5334,20 +5318,20 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Commit resolved video IDs frequently during metadata download so
-  progress survives program restarts (was only committing at the end,
-  so restarting lost all ~600 search results and repeated the cycle)
+ progress survives program restarts (was only committing at the end,
+ so restarting lost all ~600 search results and repeated the cycle)
 - Batch resolve: commit immediately after matching
 - Individual search: commit every 10 successful finds + at end
 - Update disk cache after metadata download so channel list shows
-  "Done" instead of "Auto" without needing a restart
+ "Done" instead of "Auto" without needing a restart
 ```
 
 #### v36.0 — Pre-expand browse tree when grid loads
 
 ```
 - Clicking a channel now pre-expands the tree hierarchy in the background
-  while the thumbnail grid loads. Clicking a video opens instantly — no
-  more "Loading..." delay requiring a second click.
+ while the thumbnail grid loads. Clicking a video opens instantly — no
+ more "Loading..." delay requiring a second click.
 ```
 
 #### v35.9 — Log completion after re-transcription
@@ -5363,10 +5347,10 @@ PRE-PUSH HOOK FIX:
 ```
 - Full audit found 9 discrepancies between main log and mini logs
 - Sync fast-path now compares actual content, not just end index —
-  fixes progress updates not reaching mini logs
+ fixes progress updates not reaching mini logs
 - Created shared _MINI_LOG_TAGS list used by all 3 mini logs
 - Browse mini log had wrong blue (#7eb8da vs #6cb4ee) on 11 tags,
-  wrong summary (#999 vs #f5a623), wrong simplestatus, wrong update colors
+ wrong summary (#999 vs #f5a623), wrong simplestatus, wrong update colors
 - Added missing tags: dim, scanline, dlprogress
 - Fixed simplestatus_green bold mismatch
 - update_sep/update_head added to _ALL_LOG_TAGS for sync detection
@@ -5377,50 +5361,50 @@ PRE-PUSH HOOK FIX:
 
 ```
 - _whisper_transcribe's whisper_progress log calls were silently failing
-  (complex 90-line tag handler), then deleting status handler's updates
+ (complex 90-line tag handler), then deleting status handler's updates
 - Suppress _whisper_transcribe log when progress_cb is provided (retranscribe)
 - _browse_retranscribe_status now directly updates log_box on main thread
-  with simple delete+insert, bypassing the broken handler entirely
+ with simple delete+insert, bypassing the broken handler entirely
 ```
 
 #### v35.4 — Stale transcript after closing player
 
 ```
 - Closing the player after retranscription now refreshes the browse
-  viewer so it shows the updated transcript immediately
+ viewer so it shows the updated transcript immediately
 ```
 
 #### v35.3 — Show retranscribe progress in transcript notice area
 
 ```
 - Moved progress back to transcript area (above body text) instead of
-  title bar — title stays as video title during transcription
+ title bar — title stays as video title during transcription
 - Notice text is replaced and all word char offsets are adjusted by the
-  delta so highlights and click-to-seek stay accurate during transcription
+ delta so highlights and click-to-seek stay accurate during transcription
 ```
 
 #### v35.2 — Fix retranscribe status breaking word mapping + click guard
 
 ```
 - Retranscribe progress was inserting text at "1.0" in the transcript
-  widget, shifting all char offsets — highlights and clicks pointed to
-  wrong positions during transcription. Now uses the title label.
+ widget, shifting all char offsets — highlights and clicks pointed to
+ wrong positions during transcription. Now uses the title label.
 - New _player_reload_transcript() rebuilds transcript text and word
-  mappings without restarting VLC — video keeps playing uninterrupted
+ mappings without restarting VLC — video keeps playing uninterrupted
 - Click handler now ignores clicks in the notice area (before first
-  word) instead of seeking to 0:00 via nearest-word fallback
+ word) instead of seeking to 0:00 via nearest-word fallback
 ```
 
 #### v35.1 — Fix transcript click/highlight cascade failure on compound tokens
 
 ```
 - Root cause: trailing punctuation set included hyphen, so matching "5"
-  in "5-10%" consumed the "-" and advanced the cursor past it. The next
-  token "-10" couldn't match at its correct position, matched at a
-  duplicate hundreds of words later — misaligning everything after it.
+ in "5-10%" consumed the "-" and advanced the cursor past it. The next
+ token "-10" couldn't match at its correct position, matched at a
+ duplicate hundreds of words later — misaligning everything after it.
 - Remove hyphen from trailing punctuation advancement set
 - Relax left boundary check for hyphen-prefixed Whisper tokens
-  (e.g. "-selling", "-on", "-10" from compound word splits)
+ (e.g. "-selling", "-on", "-10" from compound word splits)
 - Add 500-char search distance guard to prevent cascade failures
 - Clean up dead code (_player_segs, _player_prev_tag)
 ```
@@ -5429,187 +5413,184 @@ PRE-PUSH HOOK FIX:
 
 ```
 - Changed YT captions notice to "Youtube Auto Captions — re-transcribe
-  with Whisper for improved results"
+ with Whisper for improved results"
 - Show live "Transcribing - X%" progress in player transcript area
-  during re-transcription
+ during re-transcription
 - Auto-reload player after re-transcription completes (preserves
-  playback position, no manual close/reopen needed)
+ playback position, no manual close/reopen needed)
 - Fix word highlight matching for Whisper split decimal tokens
-  (e.g. "6.3" tokenized as "6" + ".3" — leading dot prevented match)
+ (e.g. "6.3" tokenized as "6" + ".3" — leading dot prevented match)
 ```
 
-### April 7, 2026
-
+---
 #### v34.9 — Queue Sync Subbed when metadata is running + dim style fixes
 
 ```
 - start_sync_all() didn't check _metadata_running, so Sync Subbed fired
-  concurrently with metadata download instead of queueing. Added guard.
+ concurrently with metadata download instead of queueing. Added guard.
 - "Already in Sync List" and "No Videos — Sync First" context menu items
-  now use the same dim style as the org folder items (foreground=C_DIM)
-  instead of tkinter's native disabled grey.
+ now use the same dim style as the org folder items (foreground=C_DIM)
+ instead of tkinter's native disabled grey.
 ```
 
 #### v34.8 — Queue sync when metadata download is running
 
 ```
 - Four pipeline guards checked sync/reorg/redownload but not metadata,
-  allowing sync to fire concurrently with metadata download instead of
-  queueing. Fixed in context menu sync, menu label, sync_single_channel,
-  and tab-switch button refresh.
+ allowing sync to fire concurrently with metadata download instead of
+ queueing. Fixed in context menu sync, menu label, sync_single_channel,
+ and tab-switch button refresh.
 ```
 
 #### v34.7 — Fix startup freeze from slow queries + heavy I/O
 
 ```
 - _scan_channel_disk_info was reading every Transcript.txt line at startup
-  for all 100 channels (millions of lines of I/O). Reverted to fast
-  directory-level check; Browse tab scanner handles per-video accuracy.
+ for all 100 channels (millions of lines of I/O). Reverted to fast
+ directory-level check; Browse tab scanner handles per-video accuracy.
 - Replaced COUNT(*) FROM (SELECT DISTINCT channel, title) subquery
-  (227 seconds on 8M rows) with COUNT(DISTINCT title) using the existing
-  title index (6 seconds). 99.6% accurate, no more DB lock starvation.
+ (227 seconds on 8M rows) with COUNT(DISTINCT title) using the existing
+ title index (6 seconds). 99.6% accurate, no more DB lock starvation.
 ```
 
 #### v34.6 — Exclude no-speech videos from un-indexed warning
 
 ```
 - Warning checks now only count videos with tx_status='transcribed' when
-  comparing against the segments table. Videos with no speech or no captions
-  have nothing to index and no longer trigger the "rebuild index" warning.
+ comparing against the segments table. Videos with no speech or no captions
+ have nothing to index and no longer trigger the "rebuild index" warning.
 ```
 
 #### v34.5 — Fix index stats undercounting videos without video_id
 
 ```
 - All video count queries used COUNT(DISTINCT video_id) which excluded
-  ~6,300 videos with empty video_id — showed 86,377 instead of 92,698
-  and triggered a false "6,505 un-indexed" warning. Fixed in all 4
-  locations to count unique (channel, title) pairs instead.
+ ~6,300 videos with empty video_id — showed 86,377 instead of 92,698
+ and triggered a false "6,505 un-indexed" warning. Fixed in all 4
+ locations to count unique (channel, title) pairs instead.
 ```
 
 #### v34.2 — Fix metadata playlist timeout for large channels
 
 ```
 - Batch playlist fetch timeout was based on videos needing ID resolution
-  instead of total channel size — for David Pakman (598 needing search
-  out of 28,000 total), timeout was 5 min when the full playlist needs
-  10+ min. Now scales with total channel video count, up to 30 min max.
-  Once resolved, IDs persist in the DB so subsequent restarts skip the
-  playlist fetch entirely.
+ instead of total channel size — for David Pakman (598 needing search
+ out of 28,000 total), timeout was 5 min when the full playlist needs
+ 10+ min. Now scales with total channel video count, up to 30 min max.
+ Once resolved, IDs persist in the DB so subsequent restarts skip the
+ playlist fetch entirely.
 ```
 
 #### v34.1 — Fix JSONL backfill dead loop + metadata restart redundancy
 
 ```
 - JSONL backfill was stuck in a dead loop: when all videos were already
-  transcribed but missing searchable .jsonl entries, the early return
-  prevented the backfill from ever running. The log message "will generate
-  next transcription run" was a lie — next run hit the same early return.
-  Now continues to YouTube fetch + backfill when entries are needed. This
-  should close the ~10k gap between transcribed videos and indexed videos.
+ transcribed but missing searchable .jsonl entries, the early return
+ prevented the backfill from ever running. The log message "will generate
+ next transcription run" was a lie — next run hit the same early return.
+ Now continues to YouTube fetch + backfill when entries are needed. This
+ should close the ~10k gap between transcribed videos and indexed videos.
 - Metadata restart: video IDs resolved via batch playlist were saved to the
-  DB but never read back on restart — the resolver only checked segments
-  table, JSONL files, and filenames. Added videos table lookup so resolved
-  IDs persist across restarts, eliminating the 500-700 video playlist
-  timeout + individual search on every app launch.
+ DB but never read back on restart — the resolver only checked segments
+ table, JSONL files, and filenames. Added videos table lookup so resolved
+ IDs persist across restarts, eliminating the 500-700 video playlist
+ timeout + individual search on every app launch.
 ```
 
 #### v34.0 — Fix per-video transcription status detection
 
 ```
 - tx_status was falsely marking ~4,000+ videos as "transcribed" based on
-  directory-level presence of any transcript file — if a folder had even one
-  transcript, every video in it was marked done. Now reads each Transcript.txt
-  and checks per-video titles against the actual transcript entries
+ directory-level presence of any transcript file — if a folder had even one
+ transcript, every video in it was marked done. Now reads each Transcript.txt
+ and checks per-video titles against the actual transcript entries
 - Reverse reconciliation: on scan, videos previously marked "transcribed" that
-  have no transcript entry are corrected back to "pending" and the channel's
-  transcription_pending counter is updated so re-transcription catches them
+ have no transcript entry are corrected back to "pending" and the channel's
+ transcription_pending counter is updated so re-transcription catches them
 - Fixed in all three code paths: Subs tab scan, Browse tab scanner +
-  reconciliation, and post-transcription status update (prompt_reindex)
+ reconciliation, and post-transcription status update (prompt_reindex)
 ```
 
 #### v33.9 — Whisper fallback model on crash, fix title % coloring, internet-pause metadata
 
 ```
 - When Whisper process crashes on a file, automatically retries with large-v3
-  (or medium) as a fallback model before skipping — fixes rare CTranslate2
-  model-specific crashes where one model hard-crashes on audio that another
-  handles fine
+ (or medium) as a fallback model before skipping — fixes rare CTranslate2
+ model-specific crashes where one model hard-crashes on audio that another
+ handles fine
 - Fix transcription progress percentage coloring: video titles containing "%"
-  (e.g. "38% of Americans...") no longer steal the green color from the actual
-  transcription progress — now always colors the last percentage in the line
+ (e.g. "38% of Americans...") no longer steal the green color from the actual
+ transcription progress — now always colors the last percentage in the line
 - Add internet-down check to per-video metadata fetch loop — metadata
-  operations now properly pause when internet is lost instead of continuing
-  to fire requests
+ operations now properly pause when internet is lost instead of continuing
+ to fire requests
 ```
 
-### April 6, 2026
-
+---
 #### v33.8 — Early-exit for complete channels, date-resolve timestamp fallback
 
 ```
 - Re-running metadata download on an already-complete channel now exits
-  near-instantly — pre-reads JSONL metadata before the search pipeline
-  and skips batch-resolve/individual search/date-resolve entirely when
-  all videos are already covered
+ near-instantly — pre-reads JSONL metadata before the search pipeline
+ and skips batch-resolve/individual search/date-resolve entirely when
+ all videos are already covered
 - Fix date-based elimination not capturing upload dates: yt-dlp's
-  flat-playlist mode often returns upload_date as "NA", now falls back
-  to converting the Unix timestamp field to a date
+ flat-playlist mode often returns upload_date as "NA", now falls back
+ to converting the Unix timestamp field to a date
 - Added diagnostic log showing date capture rate during batch-resolve
-  (e.g. "487/500 with dates") for visibility into date-resolve coverage
+ (e.g. "487/500 with dates") for visibility into date-resolve coverage
 ```
 
 #### v33.7 — Date-based elimination fallback for missing metadata
 
 ```
 - New final-stage ID resolver: when batch title matching and individual
-  YouTube search both fail, groups unresolved videos by upload date (file
-  mtime) and cross-references against the channel's YouTube uploads for
-  that day
+ YouTube search both fail, groups unresolved videos by upload date (file
+ mtime) and cross-references against the channel's YouTube uploads for
+ that day
 - Single-candidate dates get a direct match; multi-candidate dates attempt
-  fuzzy title matching but skip anything ambiguous (prefers missing data
-  over incorrect data)
+ fuzzy title matching but skip anything ambiguous (prefers missing data
+ over incorrect data)
 - Checks +/- 1 day to handle timezone discrepancies between file dates
-  and YouTube upload dates
+ and YouTube upload dates
 - Existing batch-resolve now also captures upload dates from the same
-  yt-dlp call (no extra network cost), feeding the date resolver
-  automatically
+ yt-dlp call (no extra network cost), feeding the date resolver
+ automatically
 - Re-queuing metadata download for a channel will now pick up previously
-  unresolvable videos via this new fallback
+ unresolvable videos via this new fallback
 ```
 
 #### v33.6 — Batch-resolve video IDs for metadata downloads
 
 ```
 - Metadata downloads for channels where videos lack [VIDEO_ID] in filenames
-  now fetch the entire channel playlist in one bulk call (~2-5 min) instead
-  of searching YouTube one video at a time (~8s each, days for large channels)
+ now fetch the entire channel playlist in one bulk call (~2-5 min) instead
+ of searching YouTube one video at a time (~8s each, days for large channels)
 - Matches local video titles against YouTube titles using normalized comparison
-  (NFKC unicode, strip unsafe chars, collapse whitespace, case-insensitive)
+ (NFKC unicode, strip unsafe chars, collapse whitespace, case-insensitive)
 - Falls back to individual ytsearch1: only for titles that don't match the
-  bulk playlist — typically a small handful instead of thousands
+ bulk playlist — typically a small handful instead of thousands
 ```
 
-### April 5, 2026
-
+---
 #### v33.5 — Fix search dates for year-only folders, responsive graph toolbar
 
 ```
 - Fix Browse > Search dates showing just "2021" instead of "2021-05" for
-  channels with year folders but no month subfolders — now derives month
-  from companion video file mtime (which is set to YouTube upload date)
+ channels with year folders but no month subfolders — now derives month
+ from companion video file mtime (which is set to YouTube upload date)
 - Fix Browse > Graph toolbar clipping at narrow window widths — controls
-  now dynamically reflow into two rows when space is tight, single row
-  when wide enough
+ now dynamically reflow into two rows when space is tight, single row
+ when wide enough
 ```
 
 #### v33.4 — Fix temp file cleanup regex and queue drag-reorder
 
 ```
 - Fix _PARTIAL_FRAG_RE and _is_partial_file to catch yt-dlp fragment files
-  with dash-suffixed format codes (e.g. .f140-7.m4a) that slipped through
+ with dash-suffixed format codes (e.g. .f140-7.m4a) that slipped through
 - Fix all 6 queue processors to respect drag-to-reorder: pass preferred key
-  from _queue_order so each processor pops the correct item, not always first
+ from _queue_order so each processor pops the correct item, not always first
 ```
 
 #### v33.3 — Log fixes, scroll lock, DB performance, metadata queue persistence
@@ -5618,9 +5599,9 @@ PRE-PUSH HOOK FIX:
 Log:
 - Fix 'no speech detected' lines missing blue brackets
 - Fix auto-scroll snapping back when user scrolls up slightly (tighten
-  threshold so only scrolling to the very bottom re-engages lock)
+ threshold so only scrolling to the very bottom re-engages lock)
 - Fix '...' in video titles being incorrectly colored blue (only color
-  actual truncation ellipsis, not dots in the original title)
+ actual truncation ellipsis, not dots in the original title)
 Database:
 - Skip metadata JSONL files during DB index builds (always 0 segments)
 - Add missing indexes on jsonl_path and video_id for large-scale performance
@@ -5628,24 +5609,22 @@ Database:
 - Fix metadata downloads failing when DB still initializing on startup
 Queue:
 - Fix metadata queue losing the running channel on pause+restart
-  (channel was popped before processing and never saved back to disk)
+ (channel was popped before processing and never saved back to disk)
 ```
 
-### April 4, 2026
-
+---
 #### v33.1 — 3 targeted fixes from deep audit pass 3
 
 ```
 - Fix _scan_archive _scan_running flag never reset on early return,
-  permanently disabling the Scan Archive button for the session
+ permanently disabling the Scan Archive button for the session
 - Fix metadata JSON parsing failing silently when yt-dlp emits non-JSON
-  warnings/notices before the JSON dump
+ warnings/notices before the JSON dump
 - Fix frequency chart click-to-search producing comma-separated FTS query
-  that never matches (changed to space-separated)
+ that never matches (changed to space-separated)
 ```
 
-### April 3, 2026
-
+---
 #### v33.0 — Deep audit pass 2: 55 fixes across reliability, threading, performance
 
 ```
@@ -5805,10 +5784,10 @@ Medium/Low:
 
 ```
 - Add overlay tags (meta_bracket, trans_bracket, dl_white, sync_bracket, trans_dots)
-  to mini-log sync so metadata and transcription lines render with correct colors
-  on Subs/Recent/Browse tabs
+ to mini-log sync so metadata and transcription lines render with correct colors
+ on Subs/Recent/Browse tabs
 - Keep browse grid loading overlay visible 1.8s longer so thumbnails load before
-  grid is shown
+ grid is shown
 ```
 
 #### v31.9 — Major browse grid overhaul: canvas-native rendering, thumbnail matching, navigation
@@ -5832,19 +5811,18 @@ Medium/Low:
 
 ```
 - When viewing a channel at root level with split_years, metadata was only
-  loaded from a nonexistent root JSONL file. Now merges metadata from all
-  per-year/month JSONL files so upload_date and view_count are available
-  for sorting. Also fetches mtimes for all dateless videos instead of just
-  the first page.
+ loaded from a nonexistent root JSONL file. Now merges metadata from all
+ per-year/month JSONL files so upload_date and view_count are available
+ for sorting. Also fetches mtimes for all dateless videos instead of just
+ the first page.
 ```
 
-### April 1, 2026
-
+---
 #### v31.7
 
 ```
 - Metadata lines now subtract prefix length from truncation width so "..." aligns
-  at the same column as transcription lines
+ at the same column as transcription lines
 ```
 
 #### v31.6
@@ -5991,8 +5969,7 @@ UX: spacebar play/pause binding, last-sync 30-day display
 - GPU queue encode task label fix, metadata truncation alignment
 ```
 
-### March 31, 2026
-
+---
 #### v30.1 — Golden Audit #2: 17 fixes
 
 ```
@@ -6067,8 +6044,7 @@ context menu items, log warning on VLC fallback failure
 - Fix cancel button confirmation dialog
 ```
 
-### March 30, 2026
-
+---
 #### v29.1
 
 ```
@@ -6153,8 +6129,7 @@ context menu items, log warning on VLC fallback failure
 - Lower Whisper chunking threshold from 6hrs to 2hrs
 ```
 
-### March 29, 2026
-
+---
 #### v27.1
 
 ```
@@ -6226,8 +6201,7 @@ context menu items, log warning on VLC fallback failure
 - Fix Play Video failing when yt-dlp channel name differs from config name
 ```
 
-### March 28, 2026
-
+---
 #### v26.2
 
 ```
@@ -6284,10 +6258,7 @@ context menu items, log warning on VLC fallback failure
 - Playlist fetches detect if internet dropped mid-fetch and re-fetch from scratch
 ```
 
-### March 27, 2026
-
-### March 26, 2026
-
+---
 #### v25.6
 
 ```
@@ -6350,8 +6321,7 @@ context menu items, log warning on VLC fallback failure
 - Per-item exception handling in all process kill loops
 ```
 
-### March 25, 2026
-
+---
 #### v24.8
 
 ```
@@ -6374,8 +6344,7 @@ context menu items, log warning on VLC fallback failure
 - Fix stale-whisper false positives: add source field to JSONL entries
 ```
 
-### March 24, 2026
-
+---
 #### v24.7
 
 ```
@@ -6441,16 +6410,14 @@ context menu items, log warning on VLC fallback failure
 - Transcription Parser (EARLY BETA): initial graphing and parsing
 ```
 
-### March 22, 2026
-
+---
 #### v23.9
 
 ```
 - Fix spinner during pause, retry errored videos on disk restore
 ```
 
-### March 20, 2026
-
+---
 #### v23.8
 
 ```
@@ -6473,7 +6440,7 @@ context menu items, log warning on VLC fallback failure
 
 ```
 - Verbose mode expanded: active channel line, DLTRACK detail, Whisper queue depth,
-  page enumeration, file move counters, backlog yt-dlp streaming, running totals
+ page enumeration, file move counters, backlog yt-dlp streaming, running totals
 ```
 
 #### v23.4
@@ -6490,8 +6457,7 @@ context menu items, log warning on VLC fallback failure
 - Auto-sync waits for queue, fix auto-sync reorg guard
 ```
 
-### March 19, 2026
-
+---
 #### v23.2
 
 ```
@@ -6534,8 +6500,7 @@ context menu items, log warning on VLC fallback failure
 - Align activity log columns, increase alternating row contrast
 ```
 
-### March 18, 2026
-
+---
 #### v22.5
 
 ```
@@ -6596,8 +6561,7 @@ context menu items, log warning on VLC fallback failure
 - Fix Continue Redownload button needing two clicks
 ```
 
-### March 17, 2026
-
+---
 #### v21.7
 
 ```
@@ -6721,8 +6685,7 @@ context menu items, log warning on VLC fallback failure
 - Fix shorts/live filtered video IDs not being archived (re-scanned every sync)
 ```
 
-### March 16, 2026
-
+---
 #### v19.9
 
 ```
@@ -6804,16 +6767,15 @@ context menu items, log warning on VLC fallback failure
 
 ```
 - Fix Whisper transcription stuck forever at 0%
-  - stderr pipe deadlock (CTranslate2 writing to piped fd 2)
-  - Reader thread race condition (old daemon threads stealing stdout lines)
-  - "starting" heartbeat sent before model.transcribe()
-  - Process failure no longer marks videos as "no speech detected"
+ - stderr pipe deadlock (CTranslate2 writing to piped fd 2)
+ - Reader thread race condition (old daemon threads stealing stdout lines)
+ - "starting" heartbeat sent before model.transcribe()
+ - Process failure no longer marks videos as "no speech detected"
 
 - Fix 4 issues: hide URL column, hover fix, column width persistence, Whisper stuck
 ```
 
-### March 15, 2026
-
+---
 #### v17.7
 
 ```
@@ -6838,10 +6800,7 @@ context menu items, log warning on VLC fallback failure
 - Add per-video progress indicator to JSONL backfill generation
 ```
 
-### March 14, 2026
-
-### March 13, 2026
-
+---
 #### v16.1
 
 ```
@@ -6902,8 +6861,7 @@ context menu items, log warning on VLC fallback failure
 - Fix Whisper punctuation density check (3+ marks AND 1/200 density)
 ```
 
-### March 12, 2026
-
+---
 #### v14.8
 
 ```
@@ -6955,8 +6913,7 @@ context menu items, log warning on VLC fallback failure
 - Bugfix
 ```
 
-### March 11, 2026
-
+---
 #### v13.4
 
 ```
@@ -7060,8 +7017,7 @@ context menu items, log warning on VLC fallback failure
 - (WIP) Compressor mode: download higher quality, re-encode, replace
 ```
 
-### March 10, 2026
-
+---
 #### v9.9
 
 ```
@@ -7132,8 +7088,7 @@ context menu items, log warning on VLC fallback failure
 - Version bump
 ```
 
-### March 9, 2026
-
+---
 #### v8.9
 
 ```
@@ -7182,8 +7137,7 @@ context menu items, log warning on VLC fallback failure
 - Version bump (v7.7 to v8.2)
 ```
 
-### March 8, 2026
-
+---
 #### v7.7
 
 ```
@@ -7214,4 +7168,4 @@ context menu items, log warning on VLC fallback failure
 - Bug patch
 ```
 
-### March 7, 2026
+---

@@ -47,6 +47,13 @@
   }
 
   function initWatchActions() {
+    // Re-init guard — multiple inits would stack duplicate window
+    // mousemove/mouseup/keydown listeners plus duplicate
+    // loadedmetadata listeners on vEl. After a few inits, Space
+    // toggled play/pause TWICE per press and ArrowRight skipped
+    // 2x/3x as far.
+    if (window._watchActionsInited) return;
+    window._watchActionsInited = true;
     const _browseState = window._browseState;
     if (!_browseState) {
       console.warn("[watchActions] window._browseState not published yet");
@@ -107,7 +114,13 @@
         vEl.currentTime = Math.max(0, vEl.currentTime - 5);
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        vEl.currentTime = Math.min(vEl.duration || vEl.currentTime, vEl.currentTime + 5);
+        // Use Infinity as the upper bound when vEl.duration is NaN
+        // (video still loading metadata). Old `vEl.duration ||
+        // vEl.currentTime` collapsed NaN→currentTime, which clamped
+        // the seek to the current time and made the right-arrow
+        // appear broken (audit: watchActions.js:104-110).
+        const _max = Number.isFinite(vEl.duration) ? vEl.duration : Infinity;
+        vEl.currentTime = Math.min(_max, vEl.currentTime + 5);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         vEl.volume = Math.min(1, (vEl.volume || 0) + 0.1);
@@ -176,7 +189,14 @@
         window._showToast?.("Refresh unavailable in browser-preview mode.", "warn");
         return;
       }
-      const _origText = btn ? btn.textContent : "";
+      // Use the stable label from dataset.label (or "Refresh metadata"
+      // as a hard-coded fallback) instead of the live textContent. If
+      // a previous in-flight call somehow paints "Refreshing…" while
+      // a second click sneaks past the disabled guard, the old code
+      // captured that intermediate label as "original" and the button
+      // never recovered (audit: watchActions.js:198).
+      if (btn && !btn.dataset.label) btn.dataset.label = btn.textContent;
+      const _origText = (btn && btn.dataset.label) || "Refresh metadata";
       if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
       try {
         const res = await api.browse_refresh_video_metadata({
@@ -203,6 +223,11 @@
     const _TX_FONT_MIN = 9.5;
     const _TX_FONT_MAX = 22;
     const _txFontKey = "ytarchiver_tx_font_px";
+    // Debounced settings_save so rapid +/- clicks don't spam the
+    // bridge with one save per keypress (audit: watchActions.js:
+    // 206-217). LocalStorage update is immediate so the size
+    // restores correctly if the user navigates away mid-debounce.
+    let _txFontSaveTimer = null;
     function _applyTxFontSize(px) {
       const v = Math.max(_TX_FONT_MIN,
         Math.min(_TX_FONT_MAX, parseFloat(px) || 12.5));
@@ -211,8 +236,11 @@
       try { localStorage.setItem(_txFontKey, String(v)); } catch {}
       const _api = window.pywebview?.api;
       if (_api?.settings_save) {
-        try { _api.settings_save({ transcript_font_size: v }); }
-        catch {}
+        if (_txFontSaveTimer) clearTimeout(_txFontSaveTimer);
+        _txFontSaveTimer = setTimeout(() => {
+          try { _api.settings_save({ transcript_font_size: v }); }
+          catch {}
+        }, 300);
       }
     }
     try {
@@ -320,6 +348,28 @@
     const _splitter = document.getElementById("watch-splitter");
     if (_splitter) {
       let _dragStart = null;
+      // Splitter drag — bind mousemove/mouseup only WHILE dragging,
+      // not for the entire page lifetime. The previous global
+      // listeners fired on every mousemove anywhere in the app (60+
+      // times/second during normal user motion); each fire was a
+      // null-check early-return but the dispatch overhead was real.
+      const _onMove = (e) => {
+        if (!_dragStart) return;
+        const delta = e.clientX - _dragStart.x;
+        const newWidth = _dragStart.startWidth - delta;
+        _applyTxWidth(newWidth);
+      };
+      const _onUp = () => {
+        if (!_dragStart) return;
+        _dragStart = null;
+        _splitter.classList.remove("dragging");
+        document.body.style.cursor = "";
+        const cur = parseInt(getComputedStyle(document.documentElement)
+          .getPropertyValue("--watch-tx-width"), 10);
+        if (Number.isFinite(cur) && cur > 0) _persistTxWidth(cur);
+        window.removeEventListener("mousemove", _onMove);
+        window.removeEventListener("mouseup", _onUp);
+      };
       _splitter.addEventListener("mousedown", (e) => {
         e.preventDefault();
         const layout = _splitter.parentElement;
@@ -329,24 +379,8 @@
         _dragStart = { x: e.clientX, startWidth: cur, layout };
         _splitter.classList.add("dragging");
         document.body.style.cursor = "col-resize";
-      });
-      window.addEventListener("mousemove", (e) => {
-        if (!_dragStart) return;
-        // Dragging RIGHT shrinks the transcript pane (it's on the right),
-        // dragging LEFT grows it. So: newWidth = startWidth - delta.
-        const delta = e.clientX - _dragStart.x;
-        const newWidth = _dragStart.startWidth - delta;
-        _applyTxWidth(newWidth);
-      });
-      window.addEventListener("mouseup", () => {
-        if (!_dragStart) return;
-        _dragStart = null;
-        _splitter.classList.remove("dragging");
-        document.body.style.cursor = "";
-        // Persist on drop, not on every move.
-        const cur = parseInt(getComputedStyle(document.documentElement)
-          .getPropertyValue("--watch-tx-width"), 10);
-        if (Number.isFinite(cur) && cur > 0) _persistTxWidth(cur);
+        window.addEventListener("mousemove", _onMove);
+        window.addEventListener("mouseup", _onUp);
       });
     }
 
@@ -415,8 +449,27 @@
       if (res?.ok) {
         window._showToast?.(
           `Queued ${model} re-transcription.`, "ok");
-        if (vid) window._inflightRetranscribes.set(vid, 0);
-        window._syncWatchRetranscribeButton();
+        if (vid) {
+          window._inflightRetranscribes.set(vid, 0);
+          window._syncWatchRetranscribeButton();
+        } else {
+          // Edge case: no video_id available — the progress display
+          // can't track this job since it keys on vid. Surface the
+          // queued state directly on the button so the user has
+          // SOME visual feedback (audit: watchActions.js:418).
+          const _btn = document.getElementById("btn-watch-retranscribe");
+          if (_btn) {
+            _btn.disabled = true;
+            _btn.textContent = "Re-transcribing…";
+            // Auto-clear after 30s as a last-resort fallback.
+            setTimeout(() => {
+              if (_btn.textContent === "Re-transcribing…") {
+                _btn.disabled = false;
+                _btn.textContent = "Re-transcribe…";
+              }
+            }, 30000);
+          }
+        }
       } else {
         window._showToast?.(res?.error || "Re-transcribe failed.", "error");
       }
@@ -494,7 +547,7 @@
     const watchFindCount = document.getElementById("watch-find-count");
     const watchFindNext = document.getElementById("watch-find-next");
     const watchFindPrev = document.getElementById("watch-find-prev");
-    const findState = { matches: [], idx: -1, q: "" };
+    const findState = { matches: [], idx: -1, q: "", primed: false };
 
     function _rebuildFindMatches() {
       const q = (watchFind?.value || "").toLowerCase().trim();
@@ -506,6 +559,7 @@
       findState.q = q;
       findState.matches = [];
       findState.idx = -1;
+      findState.primed = false;
       if (!q) {
         if (watchFindCount) watchFindCount.textContent = "";
         return;
@@ -522,7 +576,14 @@
           ? `0 of ${findState.matches.length}`
           : "no matches";
       }
-      if (findState.matches.length) _findGoTo(0);
+      if (findState.matches.length) {
+        _findGoTo(0);
+        // Mark the state as freshly-primed at idx 0 so the very next
+        // Enter keeps focus on match 1 instead of jumping to match 2
+        // (audit: watchActions.js:559). After one Enter the flag
+        // clears and Enter resumes its normal advance behavior.
+        findState.primed = true;
+      }
     }
 
     function _findGoTo(i) {
@@ -556,15 +617,29 @@
           _rebuildFindMatches();
           return;
         }
-        _findGoTo(findState.idx + (e.shiftKey ? -1 : 1));
+        if (findState.primed && !e.shiftKey) {
+          // First Enter after a fresh rebuild: keep focus on match 1
+          // instead of skipping straight to match 2.
+          findState.primed = false;
+          _findGoTo(findState.idx);
+        } else {
+          findState.primed = false;
+          _findGoTo(findState.idx + (e.shiftKey ? -1 : 1));
+        }
       } else if (e.key === "Escape") {
         watchFind.value = "";
         _rebuildFindMatches();
         watchFind.blur();
       }
     });
-    watchFindNext?.addEventListener("click", () => _findGoTo(findState.idx + 1));
-    watchFindPrev?.addEventListener("click", () => _findGoTo(findState.idx - 1));
+    watchFindNext?.addEventListener("click", () => {
+      findState.primed = false;
+      _findGoTo(findState.idx + 1);
+    });
+    watchFindPrev?.addEventListener("click", () => {
+      findState.primed = false;
+      _findGoTo(findState.idx - 1);
+    });
   }
 
   window.initWatchActions = initWatchActions;

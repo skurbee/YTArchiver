@@ -30,6 +30,15 @@ _log = get_logger(__name__)
 # mutates this; _record_recent_download reads it.
 _on_recent_changed_hook: Any | None = None
 
+# Module-wide lock around the load-modify-save of recent_downloads +
+# downloads_since_last_index. Two concurrent sync_channel writers
+# previously could both load_config, both prepend their entry, and the
+# loser's recent-entry silently disappeared (audit: recent_track.py:140).
+# The counter increment shares the same critical section so the
+# auto-index trigger doesn't either-fire-too-often or skip entirely
+# (audit: recent_track.py:184).
+_recent_write_lock = threading.Lock()
+
 
 def set_recent_changed_hook(hook: Any | None) -> None:
     """Main.py wires this in __init__ so the Recent tab auto-refreshes
@@ -137,30 +146,31 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             except OSError:
                 pass
 
-        cfg = load_config()
-        entries = list(cfg.get("recent_downloads", []) or [])
-        # Dedupe same filepath or same title+channel
-        entries = [e for e in entries
-                   if e.get("filepath") != filepath
-                   and not (e.get("title") == title and e.get("channel") == channel)]
-        entries.insert(0, {
-            "title": title or "",
-            "channel": channel or "",
-            "date": date_str,             # YYYYMMDD
-            "size": str(int(_size_bytes)),  # raw bytes as string
-            "duration": duration_s,         # raw seconds as string
-            "filepath": filepath,
-            "video_url": (f"https://www.youtube.com/watch?v={video_id}"
-                            if video_id else ""),
-            # Store video_id explicitly so recent_for_ui's
-            # find_thumbnail lookup doesn't have to parse it back out
-            # of video_url. The fallback parse still works, but the
-            # explicit field is cheaper and avoids URL-format coupling.
-            "video_id": video_id or "",
-            "download_ts": time.time(),     # unix float
-        })
-        cfg["recent_downloads"] = entries[:500]
-        save_config(cfg)
+        with _recent_write_lock:
+            cfg = load_config()
+            entries = list(cfg.get("recent_downloads", []) or [])
+            # Dedupe same filepath or same title+channel
+            entries = [e for e in entries
+                       if e.get("filepath") != filepath
+                       and not (e.get("title") == title and e.get("channel") == channel)]
+            entries.insert(0, {
+                "title": title or "",
+                "channel": channel or "",
+                "date": date_str,             # YYYYMMDD
+                "size": str(int(_size_bytes)),  # raw bytes as string
+                "duration": duration_s,         # raw seconds as string
+                "filepath": filepath,
+                "video_url": (f"https://www.youtube.com/watch?v={video_id}"
+                                if video_id else ""),
+                # Store video_id explicitly so recent_for_ui's
+                # find_thumbnail lookup doesn't have to parse it back out
+                # of video_url. The fallback parse still works, but the
+                # explicit field is cheaper and avoids URL-format coupling.
+                "video_id": video_id or "",
+                "download_ts": time.time(),     # unix float
+            })
+            cfg["recent_downloads"] = entries[:500]
+            save_config(cfg)
 
         # Live refresh push to the Recent tab so a download shows up
         # immediately without needing a restart. Hook set by main.py's
@@ -170,36 +180,39 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             except Exception as e: _log.debug("swallowed: %s", e)
 
         # Auto-index trigger: after every Nth download, kick off a
-        # background FTS ingest of any new .jsonl files on disk.
-        if cfg.get("auto_index_enabled", False):
-            threshold = int(cfg.get("auto_index_threshold", 10) or 10)
-            # Canonicalize on `downloads_since_last_index` (the
-            # DEFAULT_CONFIG-declared field). Older code wrote to a
-            # separate `_auto_index_counter` which meant the documented
-            # field was never read and a "next auto-index in N"
-            # progress widget couldn't be built on top of it. Migrate
-            # any legacy `_auto_index_counter` into the canonical key
-            # on first write so no downloads are lost.
-            _legacy = int(cfg.pop("_auto_index_counter", 0) or 0)
-            counter = int(cfg.get("downloads_since_last_index", 0) or 0) \
-                      + _legacy + 1
-            if counter >= threshold:
-                cfg["downloads_since_last_index"] = 0
-                save_config(cfg)
-                # Background sweep — re-ingests any .jsonl that wasn't
-                # already indexed (cheap no-op for already-indexed ones).
-                import threading as _thr
-                def _bg_sweep():
-                    try:
-                        from .. import index as _idx
-                        output_dir = (cfg.get("output_dir") or "").strip()
-                        if output_dir:
-                            _idx.sweep_new_videos(output_dir, cfg.get("channels", []))
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                _thr.Thread(target=_bg_sweep, daemon=True).start()
+        # background FTS ingest of any new .jsonl files on disk. Re-
+        # load + re-write the counter under the same lock as the
+        # recent-downloads write above so two concurrent finishers
+        # can't both read 9, both bump to 10, and both fire the sweep
+        # (or both write 10 + lose one increment).
+        with _recent_write_lock:
+            cfg2 = load_config()
+            if cfg2.get("auto_index_enabled", False):
+                threshold = int(cfg2.get("auto_index_threshold", 10) or 10)
+                _legacy = int(cfg2.pop("_auto_index_counter", 0) or 0)
+                counter = int(cfg2.get("downloads_since_last_index", 0) or 0) \
+                          + _legacy + 1
+                _fire_sweep = counter >= threshold
+                if _fire_sweep:
+                    cfg2["downloads_since_last_index"] = 0
+                else:
+                    cfg2["downloads_since_last_index"] = counter
+                save_config(cfg2)
             else:
-                cfg["downloads_since_last_index"] = counter
-                save_config(cfg)
+                _fire_sweep = False
+        if _fire_sweep:
+            # Spawn the sweep OUTSIDE the lock so it can't deadlock
+            # another writer waiting for the same lock.
+            import threading as _thr
+            def _bg_sweep():
+                try:
+                    from .. import index as _idx
+                    cfg_s = load_config()
+                    output_dir = (cfg_s.get("output_dir") or "").strip()
+                    if output_dir:
+                        _idx.sweep_new_videos(output_dir, cfg_s.get("channels", []))
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            _thr.Thread(target=_bg_sweep, daemon=True).start()
     except Exception as e:
         _log.debug("swallowed: %s", e)

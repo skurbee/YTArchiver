@@ -11,6 +11,15 @@ from __future__ import annotations
 from ._shared import *  # noqa: F401,F403
 
 
+# Module-level init lock — the bridge attribute (_archive_single_lock)
+# is created lazily on first call, and without an outer lock two near-
+# simultaneous first-time calls from JS could both pass the `hasattr`
+# check and create their own set+Lock objects, leaving two yt-dlp
+# processes both thinking they "hold" the URL guard. Use this module
+# lock to make the lazy init atomic.
+_archive_init_lock = threading.Lock()
+
+
 class ArchiveMixin:
 
     # ─── Single-URL archive (Enter on URL field) ───────────────────────
@@ -61,10 +70,14 @@ class ArchiveMixin:
         url = _canonicalize_yt_url(url)
         # Concurrency guard — track in-flight URLs so a rapid
         # double-click doesn't launch two yt-dlp processes fighting
-        # over the same filename.
+        # over the same filename. Lazy init wrapped in a module-level
+        # lock so two near-simultaneous first-time calls can't each
+        # build a separate set+Lock and both think they "hold" the URL.
         if not hasattr(self, "_archive_single_inflight"):
-            self._archive_single_inflight = set()
-            self._archive_single_lock = threading.Lock()
+            with _archive_init_lock:
+                if not hasattr(self, "_archive_single_inflight"):
+                    self._archive_single_lock = threading.Lock()
+                    self._archive_single_inflight = set()
         with self._archive_single_lock:
             if url in self._archive_single_inflight:
                 return {"ok": False,
@@ -150,11 +163,29 @@ class ArchiveMixin:
         # Option: date_file — apply YT upload date as file mtime (default: True)
         date_file = opts.get("date_file", True)
 
+        # Per-URL inplace-replace marker so the "[Dwnld] ..." line stays
+        # at the same scroll position from URL → filename → NN% → Done.
+        # logs.js's _inplaceKind already routes `dwnld_done_*` prefixes
+        # through its in-place-replacement path.
+        import hashlib as _hashlib
+        _marker_tag = "dwnld_done_" + _hashlib.md5(
+            url.encode("utf-8", "replace")
+        ).hexdigest()[:12]
+
         def _run():
-            self._log_stream.emit([
-                ["[Archive] ", "simpleline_green"],
-                [f"{url}\n", "simpleline"],
-            ])
+            # Initial state — no filename known yet; show the URL.
+            _state = {"fname": url, "last_pct": -1}
+
+            def _emit_dwnld(suffix=""):
+                """Replace the inplace [Dwnld] line. suffix is e.g.
+                ' - 42%' or ' - Done.' or '' (no progress yet)."""
+                self._log_stream.emit([
+                    ["[Dwnld] ", ["simpleline_green", _marker_tag]],
+                    [f"{_state['fname']}{suffix}\n",
+                     ["simpleline", _marker_tag]],
+                ])
+
+            _emit_dwnld()
             # Mirror YTArchiver.py:17327 build_video_cmd exactly — skip the
             # mp4 merge args when downloading audio-only.
             cmd = [yt, "--newline", "--no-quiet", "--continue"]
@@ -192,12 +223,33 @@ class ArchiveMixin:
             # on disk invisible to the Browse grid / Recent / Search.
             _dltrack = None
             _stderr_errors = []
+            # Regexes for parsing yt-dlp progress + destination lines.
+            _dest_re = _re.compile(r"^\[download\]\s+Destination:\s+(.+)$")
+            _pct_re = _re.compile(r"^\[download\]\s+(\d+(?:\.\d+)?)%")
             try:
                 for line in proc.stdout:
                     _line = line.rstrip()
+                    # Always feed dim stdout so verbose mode still sees
+                    # yt-dlp's raw output. Simple mode filters dim out.
                     self._log_stream.emit_dim(" " + _line)
                     if _line.startswith("DLTRACK:::"):
                         _dltrack = _line
+                    # Capture filename from yt-dlp's Destination line
+                    # and switch the inplace [Dwnld] line to show it.
+                    _m_dest = _dest_re.match(_line)
+                    if _m_dest:
+                        _state["fname"] = os.path.basename(_m_dest.group(1).strip())
+                        _emit_dwnld()
+                    else:
+                        # Parse progress percentage and update inplace
+                        # line at 5% boundaries (mirrors compress.py).
+                        _m_pct = _pct_re.match(_line)
+                        if _m_pct:
+                            _pct = int(float(_m_pct.group(1)))
+                            if _pct != _state["last_pct"] and (
+                                    _pct % 5 == 0 or _state["last_pct"] < 0):
+                                _state["last_pct"] = _pct
+                                _emit_dwnld(f" - {_pct}%")
                     # capture known-failure yt-dlp error
                     # signatures so the post-run branch can surface a
                     # toast instead of leaving the user staring at dim
@@ -212,7 +264,27 @@ class ArchiveMixin:
                             _stderr_errors.append("video unavailable (deleted or region-locked)")
                         elif "cookies are missing" in _ll or "sign in to confirm" in _ll:
                             _stderr_errors.append("YouTube wants a sign-in (Firefox/Chrome cookies not found or expired)")
-                proc.wait()
+                # Wait with a generous watchdog timeout (15 minutes).
+                # Without this, a wedged yt-dlp (network stall, post-
+                # processor hang, sign-in prompt) keeps the in-flight
+                # URL stuck in _archive_single_inflight forever —
+                # "Already downloading" until app restart.
+                try:
+                    proc.wait(timeout=900)
+                except _sp.TimeoutExpired:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                    self._log_stream.emit_error(
+                        f"[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
                 # audit DT-1: only write to URL history now that the
                 # download actually ran. Previously written on submit,
                 # which polluted history with any URL the user
@@ -327,9 +399,11 @@ class ArchiveMixin:
                 # why their download vanished.
                 if not _dltrack and _stderr_errors:
                     _reason = _stderr_errors[0]
+                    # Replace the inplace [Dwnld] line with a red failure.
                     self._log_stream.emit([
-                        ["[Archive] ", "red"],
-                        [f"Download failed \u2014 {_reason}.\n", "red"],
+                        ["[Dwnld] ", ["red", _marker_tag]],
+                        [f"{_state['fname']} \u2014 failed ({_reason}).\n",
+                         ["red", _marker_tag]],
                     ])
                     try:
                         if self._window is not None:
@@ -341,8 +415,7 @@ class ArchiveMixin:
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 else:
-                    self._log_stream.emit([["[Archive] ", "simpleline_green"],
-                                            ["done.\n", "simpleline"]])
+                    _emit_dwnld(" - Done.")
                 self._log_stream.flush()
                 # Push a Recent-tab refresh so the new video appears
                 # immediately instead of waiting for the next tab

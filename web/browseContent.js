@@ -57,9 +57,26 @@
     // single retranscribe shouldn't mutate it. Second arg `false` =
     // don't persist. "manual retranscriptions have nothing to
     // do with that [settings default]".
+    // Surface swap failure: the old code swallowed every error here, so
+    // a backend swap_model failure left the worker on its previous
+    // model while the user thought their pick had taken effect (audit:
+    // watchActions.js:386-422). Now we toast + return null on failure
+    // so the caller (retranscribe button) aborts instead of queuing
+    // against the wrong model.
     try {
-      await api?.transcribe_swap_model?.(pick, false);
-    } catch (_e) {}
+      const _swap = await api?.transcribe_swap_model?.(pick, false);
+      if (_swap && _swap.ok === false) {
+        window._showToast?.(
+          `Couldn't switch to ${pick}: ${_swap.error || "unknown error"}.`,
+          "error");
+        return null;
+      }
+    } catch (_e) {
+      window._showToast?.(
+        `Couldn't switch to ${pick}: ${_e?.message || _e || "bridge error"}.`,
+        "error");
+      return null;
+    }
     return pick;
   }
   window._askWhisperModel = _askWhisperModel;
@@ -201,8 +218,13 @@
     // If the caller passed a seek target (bookmark jump, search-result jump,
     // transcript-segment click from elsewhere), seek the <video> element
     // once it's ready. Wait for `loadedmetadata` so duration is known.
+    // Treat 0 / unset _seek_to as "no seek requested" — callers who
+    // want to land on Watch view paused at the natural start used to
+    // accidentally trigger an auto-seek-and-play because `>= 0`
+    // accepted 0 as a real value (audit: browseContent.js:204).
+    // Matches the pattern at line ~598 elsewhere in this file.
     const seekTo = Number(video._seek_to);
-    if (Number.isFinite(seekTo) && seekTo >= 0) {
+    if (Number.isFinite(seekTo) && seekTo > 0) {
       const vEl = document.querySelector("#watch-video video") ||
                   document.getElementById("watch-video");
       if (vEl) {
@@ -468,10 +490,13 @@
     // Graph is wired by initGraphView() (Chart.js, native data).
     // No synthesized fallback needed once running in pywebview.
     //
-    // Preserve only the keydown→click Enter shortcut for the search input.
-    document.getElementById("search-query")?.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") document.getElementById("btn-search-run")?.click();
-    });
+    // Enter→Search wiring lives in browseSearch.js initSearchView()
+    // — see web/browseSearch.js:543. Adding another handler here used
+    // to fire doSearch TWICE on every Enter press (once via simulated
+    // btn click, once via the direct keydown handler in browseSearch).
+    // The browseSearch handler is the authoritative one because it
+    // also short-circuits the e.repeat autorepeat stream (audit:
+    // browseContent.js:472).
   }
 
   function synthSearchResults(q, regex) {
@@ -511,7 +536,23 @@
       container.innerHTML = '<div class="browse-empty">No hits.</div>';
       return;
     }
-    const rx = new RegExp("(" + escapeForRegex(q) + ")", "gi");
+    // Multi-word queries previously matched as a single contiguous
+    // substring — "open source" would only highlight the exact pair,
+    // never either word alone (audit: browseContent.js:514). Tokenize
+    // on whitespace and join into an alternation regex so each word
+    // highlights individually. Filter FTS5 operator tokens out.
+    const _FTS_OPS = new Set(["and", "or", "not", "near"]);
+    const _qParts = String(q || "")
+      .toLowerCase()
+      .replace(/["*]/g, "")
+      .replace(/\bnear\s*\([^)]*\)/g, " ")
+      .replace(/[\^()]/g, " ")
+      .split(/\s+/)
+      .filter(w => w && !_FTS_OPS.has(w))
+      .map(escapeForRegex);
+    const rx = _qParts.length
+      ? new RegExp("(" + _qParts.join("|") + ")", "gi")
+      : null;
     const frag = document.createDocumentFragment();
     for (const h of hits) {
       const row = document.createElement("div");
@@ -528,15 +569,19 @@
       // indices and matched terms at odd indices.
       const _bmSnip = row.querySelector(".snippet");
       const _bmRaw = h.snippet || "";
-      const _bmParts = _bmRaw.split(rx);
-      for (let _bi = 0; _bi < _bmParts.length; _bi++) {
-        if (_bi % 2 === 0) {
-          _bmSnip.appendChild(document.createTextNode(_bmParts[_bi]));
-        } else {
-          const _mk = document.createElement("mark");
-          _mk.textContent = _bmParts[_bi];
-          _bmSnip.appendChild(_mk);
+      if (rx) {
+        const _bmParts = _bmRaw.split(rx);
+        for (let _bi = 0; _bi < _bmParts.length; _bi++) {
+          if (_bi % 2 === 0) {
+            _bmSnip.appendChild(document.createTextNode(_bmParts[_bi]));
+          } else {
+            const _mk = document.createElement("mark");
+            _mk.textContent = _bmParts[_bi];
+            _bmSnip.appendChild(_mk);
+          }
         }
+      } else {
+        _bmSnip.textContent = _bmRaw;
       }
       row.querySelector(".meta").textContent = `${h.channel || ""} \u00b7 ${h.title || ""}`;
       row.addEventListener("dblclick", () => _openSearchHitInWatch(h));
@@ -614,6 +659,13 @@
   }
 
   function drawWordFrequencyGraph(word) {
+    // Coerce to string at entry — caller may pass numbers or other
+    // primitives in the synthesized-data debug path (audit:
+    // browseContent.js:670). `${word}` interpolation later is then
+    // safe; Math.sin() on a non-string was a non-issue only because
+    // we don't actually do that, but keeping types stable here
+    // prevents future regressions.
+    word = String(word ?? "");
     const canvas = document.getElementById("graph-canvas");
     const empty = document.getElementById("graph-empty");
     if (!canvas) return;
@@ -710,10 +762,22 @@
     if (Array.isArray(idx.per_channel)) {
       populateIndexTable(idx.per_channel);
     }
-    // "Last built" status line under the control row.
+    // "Last built" status line under the control row. Prefer the
+    // backend-supplied built_ts (when present) over `new Date()` so
+    // the label reflects when the index was ACTUALLY rebuilt, not
+    // when the UI happened to re-fetch the summary (audit:
+    // browseContent.js:716). Falls back to now-time for backends
+    // that don't supply the timestamp yet.
     const last = document.getElementById("idx-last-built");
     if (last) {
-      const t = new Date();
+      let t;
+      const _bt = Number(idx?.built_ts || c?.built_ts);
+      if (Number.isFinite(_bt) && _bt > 0) {
+        // built_ts is a unix-epoch number (seconds or ms \u2014 try both).
+        t = new Date(_bt > 1e12 ? _bt : _bt * 1000);
+      } else {
+        t = new Date();
+      }
       const hh = t.getHours();
       const mm = String(t.getMinutes()).padStart(2, "0");
       const ampm = hh >= 12 ? "pm" : "am";
@@ -737,11 +801,19 @@
     // Auto is back to default. Fix: re-resolve the api when pywebview
     // signals ready, with a 600ms fallback poll in case the event was
     // missed or we're racing boot.
+    // Once the FIRST queue_auto_get resolves we stop polling — old
+    // code kept polling for 3s even after a successful restore, and a
+    // late response could clobber a user toggle that happened in the
+    // 600ms boot window (audit: browseContent.js:743).
+    let _restored = false;
     const restore = () => {
+      if (_restored) return true;
       const api = window.pywebview?.api;
       if (!api?.queue_auto_get) return false;
       api.queue_auto_get().then((st) => {
+        if (_restored) return;            // late response — user already saw a result
         if (!st) return;
+        _restored = true;
         if (syncCB) syncCB.checked = !!st.sync;
         if (gpuCB) gpuCB.checked = !!st.gpu;
       }).catch(() => {});
@@ -751,10 +823,13 @@
       window.addEventListener("pywebviewready", () => { restore(); },
                               { once: true });
       // Belt-and-suspenders: poll briefly in case `pywebviewready` was
-      // already dispatched before we registered the listener.
+      // already dispatched before we registered the listener. _restored
+      // gates further polls so a late response can't trample a user
+      // change that happened mid-boot.
       let tries = 0;
       const poll = () => {
-        if (restore()) return;
+        if (_restored) return;
+        if (restore() && _restored) return;
         if (++tries < 20) setTimeout(poll, 150);
       };
       setTimeout(poll, 150);

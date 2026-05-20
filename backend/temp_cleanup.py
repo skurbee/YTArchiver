@@ -36,14 +36,28 @@ _MIN_TEMP_AGE_SEC = 30 * 60  # 30 minutes
 
 
 def _dir_is_active(full: str) -> bool:
-    """True if the directory contains a .lock sidecar (active encode).
-    Also returns True if the directory itself is newer than
+    """True if the directory contains a fresh .lock sidecar (active
+    encode). Also returns True if the directory itself is newer than
     _MIN_TEMP_AGE_SEC — protects against the race where a new encode
     just started and hasn't written its .lock yet.
+
+    Stale .lock files (older than 24 hours) are IGNORED — they're
+    almost certainly orphans from a crashed compress whose __del__-
+    based cleanup never fired. Without this, GB-sized encode dirs
+    would sit in _TEMP_COMPRESS forever, the .lock file blocking
+    every future cleanup pass.
     """
+    _STALE_LOCK_AGE_SEC = 24 * 3600
     try:
-        if os.path.exists(os.path.join(full, ".lock")):
-            return True
+        _lock = os.path.join(full, ".lock")
+        if os.path.exists(_lock):
+            try:
+                _lock_age = time.time() - os.path.getmtime(_lock)
+            except OSError:
+                _lock_age = 0
+            if _lock_age < _STALE_LOCK_AGE_SEC:
+                return True
+            # Stale lock — fall through to age check + cleanup.
         age = time.time() - os.path.getmtime(full)
         if age < _MIN_TEMP_AGE_SEC:
             return True

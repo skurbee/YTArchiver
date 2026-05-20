@@ -34,9 +34,25 @@
     const ths = thead.querySelectorAll("th");
     let currentSort = { col: null, dir: 1 };
     ths.forEach((th, i) => {
+      // Re-init guard so a hot-reload / repeat initColumnSort call
+      // doesn't stack N click handlers on each th — a single click
+      // would otherwise trigger N sorts in succession (audit:
+      // columnSort.js:38).
+      if (th._sortWired) return;
+      th._sortWired = true;
       th.style.cursor = "pointer";
       th.addEventListener("click", () => {
-        const col = th.dataset.sort || th.textContent.trim().toLowerCase();
+        // The arrow indicator (\u25B2/\u25BC) is stored in data-arrow and
+        // rendered via CSS ::after, so th.textContent itself is clean.
+        // But if a future change ever appends the arrow into the th's
+        // text, the fallback identity here would drift after the first
+        // click. Strip arrow chars defensively so the same column always
+        // produces the same `col` key across clicks.
+        const _txt = (th.textContent || "")
+          .replace(/[\u25B2\u25BC]/g, "")
+          .trim()
+          .toLowerCase();
+        const col = th.dataset.sort || _txt;
         const dir = (currentSort.col === col) ? -currentSort.dir : 1;
         currentSort = { col, dir };
         sortTableBody(tbodyId, i, kinds[col] || "string", dir);
@@ -64,9 +80,20 @@
 
   function compareByKind(a, b, kind) {
     if (kind === "num") {
-      const ai = parseFloat(a.replace(/[^\d.\-]/g, "")) || 0;
-      const bi = parseFloat(b.replace(/[^\d.\-]/g, "")) || 0;
-      return ai - bi;
+      // Treat blanks / em-dash placeholders as +Infinity so they
+      // always sort to the END regardless of direction. Previous
+      // `|| 0` collapsed missing values into the middle of the
+      // numeric range and conflated them with actual zero counts.
+      const _aBlank = !a || a === "—" || a === "-" || a === "–";
+      const _bBlank = !b || b === "—" || b === "-" || b === "–";
+      if (_aBlank && _bBlank) return 0;
+      if (_aBlank) return 1;
+      if (_bBlank) return -1;
+      const ai = parseFloat(a.replace(/[^\d.\-]/g, ""));
+      const bi = parseFloat(b.replace(/[^\d.\-]/g, ""));
+      const aN = Number.isFinite(ai) ? ai : Infinity;
+      const bN = Number.isFinite(bi) ? bi : Infinity;
+      return aN - bN;
     }
     if (kind === "size") {
       return parseBytes(a) - parseBytes(b);
@@ -95,10 +122,23 @@
   }
   function parseAge(s) {
     if (!s) return 0;
-    const m = s.match(/(\d+)\s*(m|h|d|w)/i);
+    // Match the longest unit first ("mo"/"y" before "m"). Without this,
+    // a cell showing "3mo" would match `3m` and be treated as 3 minutes
+    // instead of 3 months — flipping the sort order completely.
+    // Years approximated as 365d, months as 30d (good enough for
+    // a coarse Last-Sync column).
+    const m = s.match(/(\d+)\s*(mo|y|m|h|d|w)/i);
     if (!m) return 0;
     const n = parseInt(m[1], 10);
-    const unit = { m: 60, h: 3600, d: 86400, w: 604800 }[m[2].toLowerCase()] || 60;
+    if (!Number.isFinite(n)) return 0;
+    const unit = {
+      m: 60,
+      h: 3600,
+      d: 86400,
+      w: 604800,
+      mo: 2592000,    // 30d
+      y: 31536000,    // 365d
+    }[m[2].toLowerCase()] || 60;
     return n * unit;
   }
 
@@ -330,9 +370,20 @@
       const tr = e.target.closest("tr");
       if (!tr) return;
       e.preventDefault();
-      // Visual select
-      tbody.querySelectorAll("tr.row-selected").forEach(x => x.classList.remove("row-selected"));
-      tr.classList.add("row-selected");
+      // Visual select. If the user has a multi-select active AND the
+      // right-clicked row is part of it, leave the existing selection
+      // alone — otherwise right-click silently collapsed N-row
+      // selections to one row (audit: columnSort.js:329). The bulk
+      // toolbar above the table is the right place to act on the
+      // multi-selection; right-click stays a per-row action.
+      const _existingSelected =
+        tbody.querySelectorAll("tr.row-selected");
+      const _hasMulti = _existingSelected.length > 1
+        && tr.classList.contains("row-selected");
+      if (!_hasMulti) {
+        _existingSelected.forEach(x => x.classList.remove("row-selected"));
+        tr.classList.add("row-selected");
+      }
       // Prefer the clean `data-channel-name` stashed by the renderer.
       // Fall back to `.col-folder`'s textContent ONLY if the data attr
       // is missing — the cell now may contain a trailing dot span so

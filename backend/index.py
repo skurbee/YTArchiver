@@ -33,6 +33,29 @@ _log = get_logger(__name__)
 
 _db_lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
+# Per-jsonl_path locks used by ingest_jsonl. When a caller passes their
+# own connection (_conn_override) we skip _db_lock for throughput, but
+# the DELETE+INSERT pair inside ingest_jsonl must still be atomic per-
+# jsonl_path: otherwise sync's main-thread ingest and sweep's
+# parallel ingest can interleave on the SAME .jsonl, producing
+# duplicate segments (B's INSERT after A's DELETE+INSERT before A's
+# commit) or vanished segments (B's DELETE after A's INSERT before
+# A's commit). This dict gives each jsonl_path its own logical lock.
+_ingest_locks: dict[str, threading.Lock] = {}
+_ingest_locks_lock = threading.Lock()
+
+
+def _ingest_lock_for(jsonl_path: str) -> threading.Lock:
+    """Return the per-path Lock used to serialize ingest_jsonl on the
+    same .jsonl across connections. Thread-safe lazy-create."""
+    key = os.path.normpath(jsonl_path).lower()
+    with _ingest_locks_lock:
+        lk = _ingest_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _ingest_locks[key] = lk
+    return lk
+
 # a dedicated read-only connection for Browse queries so
 # they never wait on `_db_lock` (held by sync register_video, FTS
 # ingest, etc.). WAL handles cross-connection serialization so this
@@ -126,7 +149,21 @@ def _open() -> sqlite3.Connection | None:
         try:
             TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
             _conn = sqlite3.connect(str(TRANSCRIPTION_DB), check_same_thread=False, timeout=10.0)
-            _conn.execute("PRAGMA journal_mode=WAL")
+            # Check the PRAGMA result — on some filesystems (network
+            # shares without shared-memory support, certain DrivePool
+            # configs) WAL silently falls back to "delete" mode, and
+            # downstream code that assumes WAL semantics
+            # (readers-don't-block-writers) would block the entire UI
+            # during ingests. Log loudly if WAL didn't engage so the
+            # user has a chance to investigate.
+            _wal_row = _conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            _wal_mode = (_wal_row[0] if _wal_row else "").lower()
+            if _wal_mode != "wal":
+                _log.warning(
+                    "PRAGMA journal_mode=WAL did not engage on %s "
+                    "(got %r). Browse/Recent queries may block "
+                    "behind sync writers — file an issue with this msg.",
+                    TRANSCRIPTION_DB, _wal_mode)
             _conn.execute("PRAGMA synchronous=NORMAL")
             # Schema matches YTArchiver.py:23448 verbatim
             _conn.execute("""CREATE TABLE IF NOT EXISTS segments (
@@ -268,6 +305,16 @@ def _open() -> sqlite3.Connection | None:
                 "CREATE INDEX IF NOT EXISTS idx_seg_jsonl ON segments(jsonl_path)",
                 "CREATE INDEX IF NOT EXISTS idx_seg_video_id ON segments(video_id)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_channel ON videos(channel)",
+                # COLLATE NOCASE companion — the bare idx_vid_channel
+                # index doesn't get used by queries that compare
+                # `channel = ? COLLATE NOCASE` (the channel column
+                # itself lacks the COLLATE NOCASE attribute, so the
+                # index's binary collation differs from the query's).
+                # drift_scan._lookup_video_filepaths and several
+                # metadata refresh paths use that form; without this
+                # index they table-scan the videos table.
+                "CREATE INDEX IF NOT EXISTS idx_vid_channel_nocase "
+                "ON videos(channel COLLATE NOCASE)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr ON videos(channel, year)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_ch_yr_mo ON videos(channel, year, month)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_video_id ON videos(video_id)",
@@ -326,7 +373,13 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
     month: int | None = None
     # Walk from the file back to the root, grabbing month then year on
     # the first hits. "NN Month" patterns (e.g. "01 January") also match.
-    for p in reversed(parts):
+    # Year-hit is constrained to within MAX_YEAR_DEPTH path components
+    # from the file so an archive root literally named "2024" doesn't
+    # win over the channel-level year folder. Real layouts are at
+    # most <channel>/<year>/<month>/file.mp4 (depth 3) or
+    # <channel>/<year>/file.mp4 (depth 2).
+    MAX_YEAR_DEPTH = 3
+    for depth, p in enumerate(reversed(parts), start=0):
         low = p.lower().strip()
         # Month hit — either "january" style OR "01 January" style.
         if month is None:
@@ -338,7 +391,11 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
                 # "01 January" — use the text name to be robust.
                 month = months.index(low.split(" ", 1)[1]) + 1
                 continue
-        # Year hit — pure 4-digit in the valid range.
+        # Year hit — pure 4-digit in the valid range. Skip if the
+        # component is too far from the file to plausibly be a
+        # channel-level year folder.
+        if depth > MAX_YEAR_DEPTH:
+            break
         if p.isdigit() and 1900 < int(p) < 2100:
             year = int(p)
             break
@@ -385,16 +442,18 @@ def register_video(filepath: str, channel: str, title: str | None = None,
     ) or None
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
+    # Single os.stat() call rather than separate isfile + getsize +
+    # getmtime. The triple-call version had a TOCTOU window where Z:\
+    # DrivePool could relocate the file between isfile and getsize,
+    # giving size=0 / upload_ts=None for a file that DID exist — later
+    # prune passes would then misclassify the row as zero_byte and
+    # flag it for deletion. Single stat captures a consistent snapshot.
     try:
-        size = os.path.getsize(fp) if os.path.isfile(fp) else 0
+        st = os.stat(fp)
+        size = st.st_size
+        upload_ts = st.st_mtime
     except OSError:
         size = 0
-    # Capture the file mtime as upload_ts. yt-dlp's `--mtime` sets the
-    # file's mtime to the YouTube upload date, so this column carries
-    # the true upload date (needed for week-bucket graphing).
-    try:
-        upload_ts = os.path.getmtime(fp) if os.path.isfile(fp) else None
-    except OSError:
         upload_ts = None
     try:
         # When the caller provided their own connection, skip _db_lock
@@ -444,7 +503,21 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                      video_url=excluded.video_url,
                      size_bytes=excluded.size_bytes,
                      duration_s=COALESCE(excluded.duration_s, videos.duration_s),
-                     tx_status=excluded.tx_status,
+                     /* tx_status: preserve any non-'pending' value on
+                        re-register. Sweep's default tx_status='pending'
+                        would otherwise stomp 'transcribed' / 'no_captions'
+                        every time it walks the disk, flipping completed
+                        videos back to pending and re-queueing them for
+                        Whisper. Mark-transitions still work because explicit
+                        callers (mark_video_transcribed et al.) pass the
+                        non-'pending' value directly. */
+                     tx_status=CASE
+                       WHEN excluded.tx_status = 'pending'
+                            AND videos.tx_status IS NOT NULL
+                            AND videos.tx_status != 'pending'
+                         THEN videos.tx_status
+                       ELSE excluded.tx_status
+                     END,
                      upload_ts=excluded.upload_ts
                      /* added_ts deliberately omitted from UPDATE — preserves
                         the original registration timestamp.
@@ -523,9 +596,24 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
         return 0
 
     vid_id = None
-    m = _ID_RE_IN_NAME.search(os.path.basename(fp))
-    if m:
-        vid_id = m.group(1)
+    # Pick the LAST bracketed 11-char group, not the first. yt-dlp
+    # always appends the real video_id last, so a filename like
+    # "Foo [bar-channel] [abc12_def-3].mp4" should pick "abc12_def-3"
+    # — but .search() returned the FIRST match ("bar-channel") and
+    # the channel-tag-leading filename pattern stamped a fake id
+    # onto every segment (audit: index.py:526). Reject pure-letter
+    # matches too: real YT ids are random picks from the 64-char
+    # alphabet and statistically always include a digit, _, or -.
+    _matches = _ID_RE_IN_NAME.findall(os.path.basename(fp))
+    for _cand in reversed(_matches):
+        if not _cand.isalpha():
+            vid_id = _cand
+            break
+    if vid_id is None and _matches:
+        # Fall back to last match even if all-alpha — better than
+        # nothing for the rare valid YT id that happens to be all
+        # letters.
+        vid_id = _matches[-1]
     year, month = _parse_year_month_from_path(fp)
 
     import json
@@ -549,10 +637,17 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
 
     try:
         # When the caller provided their own connection, skip _db_lock
-        # (see register_video for the reasoning).
+        # (see register_video for the reasoning). BUT the DELETE+INSERT
+        # pair below must still be atomic per-jsonl_path, otherwise two
+        # threads ingesting the same .jsonl on different connections
+        # can interleave and produce duplicate or vanished segments.
+        # A per-path lock here, combined with WAL handling
+        # cross-connection serialization at the per-statement level,
+        # gives us the right granularity.
         from contextlib import nullcontext as _nullctx
         _ctx = _nullctx() if use_override else _db_lock
-        with _ctx:
+        _path_lock = _ingest_lock_for(jp)
+        with _path_lock, _ctx:
             # FTS5 external-content tables don't auto-sync
             # when rows are deleted from the content table. Without
             # the explicit FTS delete-from-content idiom, re-ingesting
@@ -627,10 +722,36 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
             # mark_video_transcribed the Edit-channel footer and stats
             # queries reported stale 'pending' counts for videos that
             # had segments in the index.
-            conn.execute(
+            _tx_cur = conn.execute(
                 "UPDATE videos SET tx_status='transcribed' "
                 "WHERE filepath=? COLLATE NOCASE", (fp,))
+            _tx_rowcount = _tx_cur.rowcount or 0
             conn.commit()
+            # If the UPDATE matched 0 rows, the videos row may still be
+            # mid-INSERT on another connection (race during a boot
+            # sweep that overlaps with sync's per-download path). Retry
+            # the flip on the shared writer connection a moment later
+            # so the row, once committed, still ends up flagged. Best
+            # effort: skip silently if anything fails.
+            if _tx_rowcount == 0:
+                def _retry_tx_flag(_fp=fp):
+                    import time as _t
+                    _t.sleep(0.5)
+                    try:
+                        _main = _open()
+                        if _main is None:
+                            return
+                        with _db_lock:
+                            _main.execute(
+                                "UPDATE videos SET tx_status='transcribed' "
+                                "WHERE filepath=? COLLATE NOCASE", (_fp,))
+                            _main.commit()
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                try:
+                    threading.Thread(target=_retry_tx_flag, daemon=True).start()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
         # Bug [53]: return the actually-inserted row count, not the
         # raw segment count from the JSONL. Empty-text segments and
         # malformed entries are filtered out above (lines 442-451) but
@@ -686,6 +807,15 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
 # / re-transcribed for that channel.
 _browse_videos_cache: dict[tuple[str, str, int, bool], list[dict[str, Any]]] = {}
 _browse_cache_lock = threading.Lock()
+
+# Per-channel thumbnail index cache. Keyed by channel-root path, value
+# is {"mtime": float, "thumbs": {vid_id: thumb_path}}. The audit
+# previously required a full os.walk of every Browse first-click; with
+# this cache, a stale entry is detected via the channel-root mtime
+# (Windows bumps a dir's mtime when entries change) and a re-walk only
+# happens when the directory was actually touched.
+_thumb_index_cache: dict[str, dict[str, Any]] = {}
+_thumb_index_cache_lock = threading.Lock()
 
 
 def invalidate_channel_videos(channel: str | None = None) -> None:
@@ -863,6 +993,7 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             return metadata_cache[folder_key]
         entries: dict[str, Any] = {}
         by_title: dict[str, Any] = {}
+        _walk_failed = False
         try:
             # Walk up the folder tree looking for .{channel} ... Metadata.jsonl
             cur = folder_key
@@ -896,9 +1027,17 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 if parent == cur: break
                 cur = parent
         except Exception as e:
+            _walk_failed = True
             _log.debug("swallowed: %s", e)
-        metadata_cache[folder_key] = entries
-        metadata_cache_by_title[folder_key] = by_title
+        # Don't cache an EMPTY result that came from an exception path
+        # (transient Z:\ DrivePool hiccup, etc.) — caching the empty
+        # entries dict permanently zeros metadata for that folder for
+        # the rest of the process lifetime. View_counts all show 0,
+        # Most Viewed sort breaks. Cache only on clean success or
+        # genuinely empty folder.
+        if not _walk_failed:
+            metadata_cache[folder_key] = entries
+            metadata_cache_by_title[folder_key] = by_title
         return entries
 
     def _fetch_meta_by_title(folder_key: str, title: str):
@@ -966,21 +1105,45 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
                 break
             _ch_root = None
         if _ch_root and os.path.isdir(_ch_root):
+            # Per-channel thumb index cache. The walk over a large
+            # channel root (with many year/month subdirs each
+            # holding a .Thumbnails) was the slowest step on
+            # first-click Browse — seconds on Z:\ DrivePool. Skip
+            # it entirely if the channel root mtime hasn't changed
+            # since our last successful walk.
             try:
-                for _dp, _dns, _fns in os.walk(_ch_root):
-                    if os.path.basename(_dp) != ".Thumbnails":
-                        continue
-                    for _fn in _fns:
-                        _low = _fn.lower()
-                        if not _low.endswith(
-                                (".jpg", ".jpeg", ".webp", ".png")):
-                            continue
-                        _m = _vid_re_local.search(_fn)
-                        if _m:
-                            _thumb_by_vid[_m.group(1)] = os.path.normpath(
-                                os.path.join(_dp, _fn))
+                _ch_mtime = os.path.getmtime(_ch_root)
             except OSError:
-                pass
+                _ch_mtime = 0.0
+            _ch_root_key = os.path.normpath(_ch_root)
+            with _thumb_index_cache_lock:
+                _cached = _thumb_index_cache.get(_ch_root_key)
+            if (_cached is not None
+                    and _ch_mtime > 0
+                    and _cached.get("mtime") == _ch_mtime):
+                _thumb_by_vid = dict(_cached.get("thumbs") or {})
+            else:
+                try:
+                    for _dp, _dns, _fns in os.walk(_ch_root):
+                        if os.path.basename(_dp) != ".Thumbnails":
+                            continue
+                        for _fn in _fns:
+                            _low = _fn.lower()
+                            if not _low.endswith(
+                                    (".jpg", ".jpeg", ".webp", ".png")):
+                                continue
+                            _m = _vid_re_local.search(_fn)
+                            if _m:
+                                _thumb_by_vid[_m.group(1)] = os.path.normpath(
+                                    os.path.join(_dp, _fn))
+                except OSError:
+                    pass
+                if _ch_mtime > 0:
+                    with _thumb_index_cache_lock:
+                        _thumb_index_cache[_ch_root_key] = {
+                            "mtime": _ch_mtime,
+                            "thumbs": dict(_thumb_by_vid),
+                        }
 
     # Helper: parse yt-dlp's YYYYMMDD upload_date string into a Unix
     # epoch. Returns 0 on anything unparseable. The aggregated metadata
@@ -1125,19 +1288,25 @@ def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
     """
     out = {"videos": 0, "channels": 0, "channel_list": []}
     try:
-        conn = _open()
+        # Use the reader connection + reader lock — the previous code
+        # used _open() (shared writer connection) WITHOUT _db_lock, which
+        # races against any concurrent sync writer hitting the same
+        # sqlite3.Connection object. Symptom: ProgrammingError "Recursive
+        # use of cursors not allowed", or silent wrong counts.
+        conn = _reader_open()
         if conn is None:
             return out
         import time as _t
         cutoff = _t.time() - (max(1, int(days)) * 86400.0)
-        row = conn.execute(
-            "SELECT COUNT(*) FROM videos WHERE added_ts >= ?", (cutoff,),
-        ).fetchone()
-        out["videos"] = int(row[0] or 0) if row else 0
-        rows = conn.execute(
-            "SELECT DISTINCT channel FROM videos WHERE added_ts >= ? ORDER BY channel",
-            (cutoff,),
-        ).fetchall()
+        with _reader_lock:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM videos WHERE added_ts >= ?", (cutoff,),
+            ).fetchone()
+            out["videos"] = int(row[0] or 0) if row else 0
+            rows = conn.execute(
+                "SELECT DISTINCT channel FROM videos WHERE added_ts >= ? ORDER BY channel",
+                (cutoff,),
+            ).fetchall()
         out["channel_list"] = [r[0] for r in rows if r[0]]
         out["channels"] = len(out["channel_list"])
     except Exception as e:
@@ -1155,7 +1324,9 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
     if not channel:
         return out
     try:
-        conn = _open()
+        # Use the reader connection + reader lock (was _open() without
+        # _db_lock — same thread-safety race as new_videos_in_last_n_days).
+        conn = _reader_open()
         if conn is None:
             return out
         # `mark_video_transcribed` writes tx_status='transcribed' (see
@@ -1167,19 +1338,20 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
         # from the counts. The Browse grid hides duplicates already,
         # so the footer "N/M transcribed" should match the visible
         # row count, not include hidden dups.
-        row = conn.execute(
-            """SELECT
-                 COUNT(*) AS total,
-                 SUM(CASE WHEN tx_status IN ('transcribed', 'done')
-                          THEN 1 ELSE 0 END) AS done,
-                 SUM(CASE WHEN tx_status='pending' OR tx_status IS NULL
-                          THEN 1 ELSE 0 END) AS pending,
-                 SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed
-               FROM videos
-               WHERE channel = ? COLLATE NOCASE
-                 AND is_duplicate_of IS NULL""",
-            (channel,),
-        ).fetchone()
+        with _reader_lock:
+            row = conn.execute(
+                """SELECT
+                     COUNT(*) AS total,
+                     SUM(CASE WHEN tx_status IN ('transcribed', 'done')
+                              THEN 1 ELSE 0 END) AS done,
+                     SUM(CASE WHEN tx_status='pending' OR tx_status IS NULL
+                              THEN 1 ELSE 0 END) AS pending,
+                     SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed
+                   FROM videos
+                   WHERE channel = ? COLLATE NOCASE
+                     AND is_duplicate_of IS NULL""",
+                (channel,),
+            ).fetchone()
         if row:
             out["total"] = int(row[0] or 0)
             out["transcribed"] = int(row[1] or 0)
@@ -1310,42 +1482,50 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
     # the input and breaks the literal `jsonl_path = ?` match, which
     # made `get_segments` return zero rows and the watch view fall
     # back to its hardcoded placeholder transcript.
-    _jp_from_canon = False
-    if video_id and not jsonl_path:
-        try:
-            canon = conn.execute(
-                "SELECT jsonl_path FROM segments WHERE video_id=? "
-                "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
-                (video_id,)
-            ).fetchone()
-            if canon and canon[0]:
-                jsonl_path = canon[0]
-                _jp_from_canon = True
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-    where = []
-    args: list[Any] = []
-    if video_id:
-        where.append("video_id=?"); args.append(video_id)
-    if jsonl_path:
-        where.append("jsonl_path=?")
-        args.append(jsonl_path if _jp_from_canon
-                    else os.path.normpath(jsonl_path))
-    if title and not where:
-        where.append("title=?"); args.append(title)
-    if not where:
-        return []
-    # Use AND across multiple filters: when a caller passes both video_id
-    # and jsonl_path (the common case from main.py:browse_get_transcript),
-    # we want segments that match BOTH, not segments matching either.
-    # OR semantics would mash together segments from any video that shares
-    # a jsonl_path (combined transcripts) with a different video_id.
-    q = ("SELECT start_time, end_time, text, words FROM segments "
-         f"WHERE {' AND '.join(where)} ORDER BY start_time")
-    cur = conn.execute(q, args)
+    # Acquire reader lock around both queries so two Watch-view clicks
+    # (or one click while list_videos_for_channel is running) don't
+    # race on the same _reader_conn cursor. sqlite3.Connection isn't
+    # safe for concurrent execute on a single connection — without
+    # the lock this would raise "Recursive use of cursors not allowed"
+    # or return wrong segment results.
+    with _reader_lock:
+        _jp_from_canon = False
+        if video_id and not jsonl_path:
+            try:
+                canon = conn.execute(
+                    "SELECT jsonl_path FROM segments WHERE video_id=? "
+                    "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
+                    (video_id,)
+                ).fetchone()
+                if canon and canon[0]:
+                    jsonl_path = canon[0]
+                    _jp_from_canon = True
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+        where = []
+        args: list[Any] = []
+        if video_id:
+            where.append("video_id=?"); args.append(video_id)
+        if jsonl_path:
+            where.append("jsonl_path=?")
+            args.append(jsonl_path if _jp_from_canon
+                        else os.path.normpath(jsonl_path))
+        if title and not where:
+            where.append("title=?"); args.append(title)
+        if not where:
+            return []
+        # Use AND across multiple filters: when a caller passes both video_id
+        # and jsonl_path (the common case from main.py:browse_get_transcript),
+        # we want segments that match BOTH, not segments matching either.
+        # OR semantics would mash together segments from any video that shares
+        # a jsonl_path (combined transcripts) with a different video_id.
+        q = ("SELECT start_time, end_time, text, words FROM segments "
+             f"WHERE {' AND '.join(where)} ORDER BY start_time")
+        cur = conn.execute(q, args)
+        _rows = cur.fetchall()
     out = []
     import json as _j
-    for s, e, t, w in cur.fetchall():
+    for s, e, t, w in _rows:
         try:
             words = _j.loads(w) if w else []
         except (json.JSONDecodeError, ValueError):

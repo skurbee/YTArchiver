@@ -87,13 +87,26 @@ class RedownloadMixin:
 
             def _confirm(avg_pct, direction, res_label, sample_n):
                 ev = threading.Event()
+                # Per-job key so a (theoretical) concurrent sample-
+                # confirm step can't overwrite this one's pending dict.
+                # Redownloads currently drain serially through the
+                # sync queue, but adding the key future-proofs the
+                # path (audit: redownload_mixin.py:88-114).
+                _job_key = (ch.get("url") or ch.get("name") or "")
                 self._redwnl_sample = {
                     "avg_pct": float(avg_pct),
                     "direction": str(direction),
                     "res_label": str(res_label),
                     "sample_n": int(sample_n),
                     "event": ev,
-                    "choice": "continue",
+                    # Default is now `cancel` on timeout. Old default
+                    # was `continue`, so a user who walked away for
+                    # 5+ minutes had the redownload silently proceed
+                    # without their consent (audit: redownload_mixin.
+                    # py:113).
+                    "choice": "cancel",
+                    "_job_key": _job_key,
+                    "_timed_out": False,
                 }
                 try:
                     import json as _json
@@ -110,8 +123,21 @@ class RedownloadMixin:
                     self._log_stream.flush()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-                ev.wait(timeout=300)
-                return self._redwnl_sample.get("choice", "continue")
+                _signaled = ev.wait(timeout=300)
+                if not _signaled:
+                    # User never answered. Mark as timeout and treat
+                    # as cancel — surface a log line so they know
+                    # later that the redownload stopped, not silently
+                    # progressed.
+                    try:
+                        self._redwnl_sample["_timed_out"] = True
+                        self._log_stream.emit_dim(
+                            "[Sync] Redownload sample-confirm timed out "
+                            "(5 min) — cancelling rather than proceeding.")
+                        self._log_stream.flush()
+                    except Exception:
+                        pass
+                return self._redwnl_sample.get("choice", "cancel")
 
             _rd.redownload_channel(
                 ch.get("name", ""), ch.get("url", ""), folder, new_res,

@@ -191,6 +191,10 @@ _COOKIE_ALERT_FIRED: bool = False
 # this, two concurrent channel-sync threads can both observe the flag
 # as False, both set it True, both emit the banner — duplicate alert.
 _cookie_alert_lock = threading.Lock()
+# Serialize ARCHIVE_FILE appends across the entire process. Two channel-
+# sync threads writing concurrently can interleave bytes mid-line, and
+# the loader silently drops malformed lines (audit: sync/core.py:1654).
+_archive_write_lock = threading.Lock()
 # Module-level lock for atomic load-modify-save of channel-keyed
 # config writes (failed_video_ids, etc.) from sync.py code paths.
 # ytarchiver_config.save_config() has its own lock for the write
@@ -263,18 +267,46 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # filter changed. Previously silent — a user who set min_duration=30
     # years ago would wake up to find sub-1-min videos no longer
     # downloading with no log entry explaining why.
+    _migrated_min = False
+    _migrated_max = False
     if 0 < min_dur < 60:
         try:
             stream.emit_dim(f" (legacy min_duration {min_dur}s upgraded to 60s)")
         except Exception as e:
             _log.debug("swallowed: %s", e)
         min_dur = 60
+        _migrated_min = True
     if 0 < max_dur < 60:
         try:
             stream.emit_dim(f" (legacy max_duration {max_dur}s upgraded to 60s)")
         except Exception as e:
             _log.debug("swallowed: %s", e)
         max_dur = 60
+        _migrated_max = True
+    # Persist the upgraded values so the migration line doesn't fire on
+    # every sync pass forever (audit: sync/core.py:266). Match channel
+    # by URL only (same key the failed_video_ids writer uses).
+    if _migrated_min or _migrated_max:
+        try:
+            with _config_write_lock:
+                _cfgm = load_config()
+                _our_url = (channel.get("url") or "").strip()
+                for _ch in _cfgm.get("channels", []):
+                    if (_ch.get("url") or "").strip() == _our_url:
+                        if _migrated_min:
+                            _ch["min_duration"] = 60
+                        if _migrated_max:
+                            _ch["max_duration"] = 60
+                        break
+                save_config(_cfgm)
+            # Update the in-memory channel too so this pass uses the
+            # bumped values without re-reading the config.
+            if _migrated_min:
+                channel["min_duration"] = 60
+            if _migrated_max:
+                channel["max_duration"] = 60
+        except Exception as e:
+            _log.debug("min/max migration persist swallowed: %s", e)
     mode = (channel.get("mode") or "new").lower() # "new" | "full" | "fromdate"
     from_date = (channel.get("from_date") or "").strip()
     # Folder-org flags: matches YTArchiver.py:17257 split_years / split_months
@@ -661,7 +693,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         def __init__(self, ex): self._exec = ex
         def __del__(self):
             try:
-                self._exec.shutdown(wait=False, cancel_futures=True)
+                # wait=True so the guard cleanup actually blocks until
+                # any in-flight metadata task finishes before the next
+                # sync_channel call starts. cancel_futures=True drops
+                # any not-yet-started work. The earlier wait=False
+                # variant let already-running tasks keep mutating
+                # channel config AFTER sync_channel had returned —
+                # racing the next channel's config writes (audit:
+                # sync/core.py:644).
+                self._exec.shutdown(wait=True, cancel_futures=True)
             except Exception:
                 pass
     _meta_guard = _ExecGuard(_meta_exec) if _meta_exec is not None else None
@@ -754,6 +794,25 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         proc = None
         for attempt in range(3):
             if cancel_event is not None and cancel_event.is_set():
+                # Audit fix (sync/core.py:757): close the previous-iteration
+                # proc handle before bailing. Without this, a /streams retry
+                # cancel left the /videos pass's Popen object + its stdout
+                # pipe dangling until GC. _ExecGuard handles the metadata
+                # executor; this just covers the yt-dlp proc resources.
+                try:
+                    if proc is not None:
+                        try:
+                            if proc.stdout is not None:
+                                proc.stdout.close()
+                        except Exception:
+                            pass
+                        try:
+                            if proc.poll() is None:
+                                proc.terminate()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 return SyncResult(ok=False, reason="cancelled",
                                   downloaded=downloaded, errors=errors)
             try:
@@ -764,7 +823,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 proc = subprocess.Popen(
                     cmd_this, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    bufsize=1, startupinfo=_startupinfo,
+                    # bufsize=0 (unbuffered) for the binary pipe. Old
+                    # bufsize=1 is line-buffering, which Python only
+                    # honors in TEXT mode — in binary mode it falls
+                    # back to block buffering with a DeprecationWarning,
+                    # causing yt-dlp's "Downloading <title> NN%"
+                    # inplace progress to arrive in bursts instead of
+                    # streaming (audit: sync/core.py:764).
+                    bufsize=0, startupinfo=_startupinfo,
                     env=_utils.utf8_subprocess_env(),
                 )
                 # register with ProcessRegistry so
@@ -1650,10 +1716,19 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                          "filterskip_dim"],
                     ])
                     if _vid_id:
+                        # Serialize through the module-level lock so a
+                        # second sync thread appending at the same
+                        # instant can't interleave bytes mid-line.
+                        # Also write the line in one os.write so the
+                        # OS sees an atomic single-line append
+                        # (Windows guarantees < 4KB writes are atomic).
                         try:
-                            with open(ARCHIVE_FILE, "a",
-                                      encoding="utf-8") as _af:
-                                _af.write(f"youtube {_vid_id}\n")
+                            with _archive_write_lock:
+                                with open(ARCHIVE_FILE, "ab") as _af:
+                                    _af.write(
+                                        f"youtube {_vid_id}\n".encode("utf-8"))
+                                    try: _af.flush()
+                                    except OSError: pass
                         except OSError:
                             pass
                     continue
@@ -1666,8 +1741,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     # "ERROR: [youtube] <id>: ..." format. Extract any
                     # 11-char ID pattern and stash it; we deduplicate
                     # against the success set below before persisting.
+                    # Match the FIRST 11-char alnum token in the error
+                    # line — but reject all-letter matches (audit:
+                    # sync/core.py:1670). Real YT ids are random picks
+                    # from [A-Za-z0-9_-], statistically always include
+                    # a digit/_/-; a benign error message can contain
+                    # natural-language 11-letter words ("permissions",
+                    # "downloading") that would otherwise get stuffed
+                    # into the failed list and re-tried as a yt-dlp URL.
                     _err_vid_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
-                    if _err_vid_m:
+                    if _err_vid_m and not _err_vid_m.group(1).isalpha():
                         _failed_this_run.add(_err_vid_m.group(1))
                 # Rate-limit detection: 429 or HTTP 429 in the output → pause
                 # for 30s before continuing. yt-dlp retries internally but we
@@ -1689,7 +1772,29 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            # terminate is async on Windows (TerminateProcess) — wait
+            # briefly for the process to actually exit, then force-kill
+            # if it's still alive. Previously a hung yt-dlp.exe stayed
+            # running while sync_channel returned, and proc.returncode
+            # was None so the "no completed pass" downgrade logic at
+            # line 2120 misreported.
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+        # close stdout explicitly — Python's subprocess.Popen
+        # with PIPE on a binary pipe can keep the FD reserved past wait
+        # otherwise.
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         # record this pass's returncode for the final
         # _ok check. None = terminated mid-flight without wait (treated
         # below as not-a-failure if any other pass succeeded).
@@ -1734,7 +1839,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # the next periodic disk scan fires (up to 24h depending on the
     # user's setting). Cheap when called per-channel; only walks one
     # folder.
-    if downloaded > 0:
+    # Short-circuit the post-download helpers on cancel. Both walk Z:
+    # for every channel video and ignore cancel_event otherwise, so a
+    # cancel during a download-heavy channel used to feel sluggish
+    # (audit: sync/core.py:1737).
+    _post_sync_cancelled = (cancel_event is not None and cancel_event.is_set())
+    if downloaded > 0 and not _post_sync_cancelled:
         try:
             from .. import archive_scan as _as
             _as.update_disk_cache_for_channel(channel)
@@ -1748,7 +1858,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # thumbnails never landed" symptom — rate-limit / transient HTTP
     # failures during the bulk download path. Runs after metadata so
     # the JSONL is current.
-    if downloaded > 0:
+    if downloaded > 0 and not _post_sync_cancelled:
         try:
             from .. import metadata as _md
             _sweep = _md.sweep_missing_thumbnails(channel, stream=stream)
@@ -1797,11 +1907,26 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # overwrites the first.
                 with _config_write_lock:
                     _cfg2 = load_config()
-                    for _ch in _cfg2.get("channels", []):
-                        if (_ch.get("url") == channel.get("url")
-                                or _ch.get("name") == channel.get("name")):
-                            _ch["failed_video_ids"] = _next_failed
-                            break
+                    # Match on URL only. Old `url == OR name == ` would
+                    # mis-route the failed-id list when two channels
+                    # share a display name (e.g. both renamed "News")
+                    # — the second channel's failed_ids could overwrite
+                    # the first's (audit: sync/core.py:1798). URL is
+                    # the channel's only true unique key.
+                    _our_url = (channel.get("url") or "").strip()
+                    if not _our_url:
+                        # Last-resort fallback when this channel has no
+                        # URL — match by name. Rare path.
+                        _our_name = channel.get("name") or ""
+                        for _ch in _cfg2.get("channels", []):
+                            if (_ch.get("name") or "") == _our_name:
+                                _ch["failed_video_ids"] = _next_failed
+                                break
+                    else:
+                        for _ch in _cfg2.get("channels", []):
+                            if (_ch.get("url") or "").strip() == _our_url:
+                                _ch["failed_video_ids"] = _next_failed
+                                break
                     save_config(_cfg2)
             except Exception as _fce:
                 stream.emit_dim(
@@ -1815,10 +1940,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
     # Drain the inline-metadata executor. Every video dispatched during
     # this pass is now waiting (or running) on the one worker thread.
-    # Shutdown(wait=True) blocks until all queued tasks finish.
+    # If a cancel was raised, drop pending tasks immediately rather
+    # than waiting for them — old wait=True with no cancel check made
+    # the whole sync UI freeze whenever a metadata fetch was stuck on
+    # a slow YouTube call (audit: sync/core.py:1820).
     if _meta_exec is not None:
         try:
-            _meta_exec.shutdown(wait=True)
+            if cancel_event is not None and cancel_event.is_set():
+                # Cancel-fast: drop queued, don't wait for in-flight
+                # (they'll be torn down by the broader cancel pass).
+                _meta_exec.shutdown(wait=False, cancel_futures=True)
+            else:
+                _meta_exec.shutdown(wait=True, cancel_futures=True)
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -2055,7 +2188,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # download event, it gets caught on the next pass that does download.
     if downloaded > 0:
         try:
-            _swept = _sweep_orphan_vtts(str(ch_dir))
+            _swept = _sweep_orphan_vtts(str(ch_dir), cancel_event=cancel_event)
             if _swept > 0:
                 stream.emit([[" ", "dim"],
                              [f"Swept {_swept} orphan caption file(s).\n", "dim"]])

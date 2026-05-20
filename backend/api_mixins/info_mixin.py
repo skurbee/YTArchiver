@@ -156,25 +156,43 @@ class InfoMixin:
     def url_history(self):
         """Return recently-typed YouTube URLs (latest first, max 20)."""
         cfg = load_config()
-        return cfg.get("url_history", [])[:20]
+        # Apply the 20-item cap on read too. Older configs / imported
+        # configs may have grown past the cap on disk (audit:
+        # info_mixin.py:166), so we re-trim here defensively.
+        return list(cfg.get("url_history", []) or [])[:20]
+
+
+    # Process-wide lock for url_history mutation. Two near-simultaneous
+    # downloads finishing within ms both used to load_config + mutate +
+    # save_config without coordination, so the second save_config could
+    # overwrite the first's append (audit: info_mixin.py:162-171).
+    _url_history_lock = threading.Lock()
 
 
     def _push_url_history(self, url):
         if not config_is_writable():
             return
-        cfg = load_config()
-        hist = [u for u in cfg.get("url_history", []) if u != url]
-        hist.insert(0, url)
-        del hist[20:]
-        cfg["url_history"] = hist
-        from backend.ytarchiver_config import save_config as _sc
-        _sc(cfg)
+        with InfoMixin._url_history_lock:
+            cfg = load_config()
+            hist = [u for u in (cfg.get("url_history", []) or []) if u != url]
+            hist.insert(0, url)
+            del hist[20:]
+            cfg["url_history"] = hist
+            from backend.ytarchiver_config import save_config as _sc
+            _sc(cfg)
 
 
     # ─── Last Full Sync live label ──────────────────────────────────────
 
     def get_last_sync_label(self):
-        """Return a formatted 'Last Full Sync: HH:MMam/pm, Mon D (X ago)' string."""
-        cfg = self._config or load_config()
+        """Return a formatted 'Last Full Sync: HH:MMam/pm, Mon D (X ago)' string.
+
+        Always reads from disk. The old `self._config or load_config()`
+        path used a stale boot-cached snapshot that never got refreshed
+        after sync wrote a new `last_sync` value to disk — the label
+        sat at its placeholder forever after the first sync of a
+        fresh session.
+        """
+        cfg = load_config()
         ts = cfg.get("last_sync", "") or ""
         return {"label": _format_last_sync_label(ts)}

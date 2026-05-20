@@ -371,7 +371,12 @@ class BrowseMixin:
                         break
                     cur = parent
 
-            # Fall back: scan the channel folder the hard way
+            # Fall back: scan the channel folder. Depth-cap at 3 levels
+            # below the channel root (channel → year → month → ...).
+            # Channel folder organization never goes deeper than that,
+            # but the unbounded walk used to freeze the UI for several
+            # seconds when a metadata jsonl lived in an unexpected
+            # location (audit: browse_mixin.py:329).
             cfg = self._config or load_config()
             base = (cfg.get("output_dir") or "").strip()
             if base and channel:
@@ -383,7 +388,11 @@ class BrowseMixin:
                         ch_dict = ch; break
                 folder = os.path.join(base, _cfn(ch_dict) if ch_dict else channel)
                 if os.path.isdir(folder):
-                    for dp, _dns, fns in os.walk(folder):
+                    _root_depth = folder.rstrip(os.sep).count(os.sep)
+                    _MAX_DEPTH = 3
+                    for dp, dns, fns in os.walk(folder):
+                        if dp.rstrip(os.sep).count(os.sep) - _root_depth >= _MAX_DEPTH:
+                            dns[:] = []  # don't recurse further
                         for fn in fns:
                             if fn.startswith(".") and fn.endswith("Metadata.jsonl"):
                                 entries = _read_metadata_jsonl(os.path.join(dp, fn))
@@ -495,6 +504,15 @@ class BrowseMixin:
         (then × 1000) so channels of different sizes become comparable —
         matches YTArchiver.py:30427 normalize checkbox.
         """
+        # Coerce/validate `word` — JS callers occasionally pass null which
+        # would trip the .split AttributeError below and surface as an
+        # opaque TypeError. Return a clear error instead.
+        word = (word or "")
+        if not isinstance(word, str):
+            try: word = str(word)
+            except Exception: word = ""
+        if not word.strip():
+            return {"ok": False, "error": "word required"}
         # Multi-channel overlay takes priority if both given
         if isinstance(channel, list) and channel and isinstance(word, str):
             w = word.split(",")[0].strip()

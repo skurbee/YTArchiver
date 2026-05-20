@@ -125,7 +125,12 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # The flag lives in core.py (sync_channel reads it). Mutate via the
     # imported module so the change is visible across modules — a plain
     # `global` here wouldn't reach core.py's module namespace.
-    _core._COOKIE_ALERT_FIRED = False
+    # Hold the same _cookie_alert_lock that sync_channel uses for
+    # mutating the flag, so an autorun-triggered second pass overlapping
+    # the tail of the prior pass can't read a torn flag value (audit:
+    # sync/core.py:919).
+    with _core._cookie_alert_lock:
+        _core._COOKIE_ALERT_FIRED = False
 
     # Start-of-pass header — show total remaining work, not len(config).
     # In resume mode that's the restored queue size; fresh mode it's the
@@ -214,16 +219,38 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # yt-dlp walk when everything is already archived. Mirrors the OLD
     # YTArchiver _load_archived_ids + _quick_check_new_uploads pairing.
     _known_ids: set = set()
+    _archive_malformed = 0
     try:
         if os.path.isfile(ARCHIVE_FILE):
             with open(ARCHIVE_FILE, "r", encoding="utf-8", errors="replace") as _af:
                 for _line in _af:
                     # Format: "youtube VIDEOID\n" — split and keep the id
-                    _parts = _line.strip().split(None, 1)
+                    _stripped = _line.strip()
+                    if not _stripped:
+                        continue
+                    _parts = _stripped.split(None, 1)
                     if len(_parts) == 2:
                         _known_ids.add(_parts[1])
+                    else:
+                        # Non-empty line that didn't parse — count and
+                        # log a single warn at the end. Without this,
+                        # a corrupted archive line silently shrinks
+                        # _known_ids, defeating quick_check_new_uploads
+                        # and forcing full channel walks (audit:
+                        # sync/sync_all.py:218). Counting individual
+                        # lines is cheap; we cap the per-line log to
+                        # a single summary so a deeply-corrupt archive
+                        # doesn't flood the main log.
+                        _archive_malformed += 1
     except OSError:
         pass
+    if _archive_malformed:
+        try:
+            stream.emit_dim(
+                f"[Sync] archive: {_archive_malformed} malformed line(s) "
+                f"skipped (consider regenerating via diagnostics).")
+        except Exception:
+            pass
 
     def _now_clock() -> str:
         # "1:03am" style, matching OLD's log format.
@@ -291,11 +318,20 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # per iteration, so pausing+resuming made [3/7] drift to [3/4] as
     # remaining items drained — confusing.)
     _processed = 0
+    # Snapshot the queue size under queues._lock so the count we
+    # display in [N/total] matches what sync_pop will actually
+    # deliver. Without the lock, an enqueue happening between
+    # the count + the first pop made the denominator drift by
+    # the number of newly-added items (audit: sync_all.py:294).
     try:
-        _initial_total = sum(
-            1 for c in queues.sync
-            if (c.get("kind") or "download").lower() != "redownload"
-        ) if queues is not None else 0
+        if queues is not None:
+            with queues._lock:
+                _initial_total = sum(
+                    1 for c in queues.sync
+                    if (c.get("kind") or "download").lower() != "redownload"
+                )
+        else:
+            _initial_total = 0
     except Exception:
         _initial_total = 0
     while True:
@@ -904,10 +940,25 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                                name_tag="simpleline", summary_tag="dim")
                 _last_live["name"] = ""
                 continue
-        res = sync_channel(ch, stream, cancel_event,
-                           queues=queues, transcribe_mgr=transcribe_mgr,
-                           pause_event=pause_event,
-                           pass_idx=i, pass_total=total)
+        # Wrap sync_channel in try/finally so the sync-active flag is
+        # ALWAYS cleared on this channel — even when sync_channel takes
+        # one of its many early-return paths (no URL, yt-dlp missing,
+        # write blocked, disk_low, launch failed, cancelled-during-
+        # launch, etc.) which historically skipped the in-function
+        # clear_sync_active() at the bottom. Stuck-active channels make
+        # is_any_sync_active() lie and hold transcribe [Trnscr] rows
+        # forever.
+        try:
+            res = sync_channel(ch, stream, cancel_event,
+                               queues=queues, transcribe_mgr=transcribe_mgr,
+                               pause_event=pause_event,
+                               pass_idx=i, pass_total=total)
+        finally:
+            try:
+                from .active_state import clear_sync_active as _clear_active
+                _clear_active(ch_name)
+            except Exception as _ce:
+                _log.debug("swallowed: %s", _ce)
         _dl = int(res.get("downloaded", 0) or 0)
         _err = int(res.get("errors", 0) or 0)
         sum_dl += _dl
@@ -1010,13 +1061,17 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     emit_parts.append([f"took {_fmt_duration(elapsed)} ", "simpleline"])
     emit_parts.append(["===\n", "simplestatus_green"])
     stream.emit(emit_parts)
-    # Clean up: drop any remaining queued items (pass may have broken
-    # out early on cancel), clear the running-slot, and clear the
-    # pass-progress decoration. The popover should return to empty
-    # state once this runs.
+    # Clean up: clear the running-slot and pass-progress decoration.
+    # Only flush remaining queued items when the loop drained
+    # NATURALLY (no cancel). On cancel, leave the queue alone so
+    # items re-inserted by the pause/cancel path (sync_all line 923
+    # re-insert + metadata pause line 447 re-queue) survive for the
+    # user to resume (audit: sync/sync_all.py:1018).
+    _cancelled = (cancel_event is not None and cancel_event.is_set())
     if queues is not None:
-        try: queues.sync_clear()
-        except Exception as e: _log.debug("swallowed: %s", e)
+        if not _cancelled:
+            try: queues.sync_clear()
+            except Exception as e: _log.debug("swallowed: %s", e)
         try: queues.set_current_sync(None)
         except Exception as e: _log.debug("swallowed: %s", e)
         try: queues.set_sync_pass_progress(0, 0)

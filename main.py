@@ -36,7 +36,14 @@ if os.name == "nt":
             if _n > 0:
                 _buf = ctypes.create_unicode_buffer(_n + 1)
                 ctypes.windll.user32.GetWindowTextW(hwnd, _buf, _n + 1)
-                if "YT Archiver" in _buf.value:
+                # Match both legacy "YT Archiver" (space) AND
+                # current "YTArchiver" (no space). The window kwarg
+                # uses the no-space form, so the original substring
+                # check would never match the real window and the
+                # second-instance launch silently exited without
+                # focusing the existing window (audit: main.py:28-47).
+                _tv = _buf.value
+                if "YTArchiver" in _tv or "YT Archiver" in _tv:
                     ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
                     ctypes.windll.user32.SetForegroundWindow(hwnd)
                     return False
@@ -59,7 +66,10 @@ except ImportError:
             "YTArchiver", 0x10,
         )
     except Exception as e:
-        _log.debug("swallowed: %s", e)
+        # _log isn't defined yet at this stage (set below) — use print
+        # so a secondary ctypes failure doesn't mask the original
+        # ImportError with NameError (audit: main.py:62).
+        print(f"[YTArchiver] pywebview ImportError MessageBox failed: {e}")
     sys.exit(1)
 
 ROOT = Path(__file__).resolve().parent
@@ -156,19 +166,14 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # and the draining worker.
         self._redwnl_pending: list = []
         self._redwnl_lock = threading.Lock()
-        # Pull whisper model from config so Settings changes actually take
-        # effect on next launch. Without this the TranscribeManager defaults
-        # to "large-v3" regardless of what the user picked in Settings.
-        _init_model = (load_config() or {}).get("whisper_model") or "small"
-        self._transcribe = TranscribeManager(self._log_stream, model=_init_model)
-        # Disk-error watchdog — pauses all tasks on write failure, resumes
-        # construct _queues BEFORE DiskErrorMonitor so the
-        # monitor's on_pause/on_resume lambdas don't fire on a not-yet-
-        # existent self._queues attribute (which would AttributeError
-        # inside the watchdog callback and silently fail to pause).
-        # wrap queue load in try/except so a corrupt queue
-        # file doesn't brick the entire app — log + start empty, and
-        # back up the corrupt file for debugging.
+        # Construct QueueState BEFORE TranscribeManager (audit:
+        # main.py:140-201). The transcribe manager's __init__ can
+        # eventually fire callbacks that touch self._queues; building
+        # the queue object first ensures `self._queues` exists if any
+        # of those callbacks race init.
+        # wrap queue load in try/except so a corrupt queue file
+        # doesn't brick the entire app — log + start empty, and back
+        # up the corrupt file for debugging.
         self._queues = QueueState()
         try:
             self._queues.load()
@@ -182,8 +187,22 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 print(f"[queues] corrupt queue file backed up to {_bak}: {_qe}")
             except Exception:
                 print(f"[queues] queue load failed: {_qe}")
+            # Disable atexit on the discarded instance so its atexit
+            # handler can't fire at process exit and clobber the
+            # corrupt-but-recoverable on-disk queue file with this
+            # orphan's empty state. The fresh replacement instance
+            # below registers its own atexit hook.
+            try:
+                self._queues.mark_orphan()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             # Reset to a fresh empty state so the app can still launch.
             self._queues = QueueState()
+        # Pull whisper model from config so Settings changes actually take
+        # effect on next launch. Without this the TranscribeManager defaults
+        # to "large-v3" regardless of what the user picked in Settings.
+        _init_model = (load_config() or {}).get("whisper_model") or "small"
+        self._transcribe = TranscribeManager(self._log_stream, model=_init_model)
 
         from backend.disk_watch import DiskErrorMonitor
         self._disk_mon = DiskErrorMonitor(
@@ -719,7 +738,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                     # forever waiting on jobs that aren't firing.
                     def _gpu_busy():
                         try:
-                            mgr = api._transcribe
+                            mgr = self._transcribe
                             return mgr._current_job is not None
                         except Exception:
                             return False
@@ -1053,27 +1072,44 @@ def main():
             _log.debug("swallowed: %s", e)
     threading.Thread(target=_apply_dark_titlebar_when_ready, daemon=True).start()
 
+    # Debounced window-state save. pywebview emits resize/move at ~60Hz
+    # during a drag — without debounce that's 60 config-file writes per
+    # second, each loading/mutating/saving the same JSON file (audit:
+    # main.py:1057-1076 + window_state.py:146-163). We coalesce all
+    # in-flight {width,height,x,y,maximized} updates into one save 250ms
+    # after the last event arrives.
+    _ws_lock = threading.Lock()
+    _ws_pending: dict = {}
+    _ws_timer: list = [None]  # holds the current Timer, if any
+    def _ws_flush():
+        try:
+            with _ws_lock:
+                snap = _ws_pending.copy()
+                _ws_pending.clear()
+                _ws_timer[0] = None
+            if snap:
+                winstate.save_window_state(snap)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    def _ws_schedule(updates: dict):
+        with _ws_lock:
+            _ws_pending.update(updates)
+            t = _ws_timer[0]
+            if t is not None:
+                try: t.cancel()
+                except Exception: pass
+            _ws_timer[0] = threading.Timer(0.25, _ws_flush)
+            _ws_timer[0].daemon = True
+            _ws_timer[0].start()
     # Register window-event handlers to save state on resize/move/close.
     def _on_resized(w, h):
-        try:
-            winstate.save_window_state({"width": int(w), "height": int(h)})
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        _ws_schedule({"width": int(w), "height": int(h)})
     def _on_moved(x, y):
-        try:
-            winstate.save_window_state({"x": int(x), "y": int(y)})
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        _ws_schedule({"x": int(x), "y": int(y)})
     def _on_maximized():
-        try:
-            winstate.save_window_state({"maximized": True})
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        _ws_schedule({"maximized": True})
     def _on_restored():
-        try:
-            winstate.save_window_state({"maximized": False})
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        _ws_schedule({"maximized": False})
     # X-button behavior is config-driven (.txt close-to-tray request):
     #   "quit"  — shut down immediately (legacy behavior)
     #   "tray"  — minimize to tray, keep app running
@@ -1128,6 +1164,14 @@ def main():
             _log.debug("swallowed: %s", e)
         return False
 
+    # Pre-declare tray = None so the closure inside _shutdown_cleanup
+    # has a defined name to read even if the user closes the window
+    # before TrayController is instantiated (~150 lines below). Without
+    # this, an X-click during Stage 2/3 startup raised NameError inside
+    # the closing handler and skipped subprocess kill + queue persist
+    # + port release.
+    tray = None
+
     def _shutdown_cleanup():
         """Flush disk writes + kill child processes on real shutdown.
 
@@ -1135,6 +1179,21 @@ def main():
         the window (X / Ctrl+Q / tray Quit). Order matters — save before kill.
         """
         try:
+            # 0. Signal cancel FIRST so the sync worker has a chance to
+            # tear down cleanly before we start killing subprocesses
+            # underneath it (audit: main.py:1131-1227). Old order
+            # killed yt-dlp procs BEFORE setting the cancel event,
+            # which let the worker observe a dead subprocess return
+            # code and journal a partial-file row to the DB before
+            # checking _sync_cancel.
+            try: api._sync_cancel.set()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            # Brief join window so an in-flight worker iteration can
+            # see the cancel and bail.
+            try:
+                if api._sync_thread is not None and api._sync_thread.is_alive():
+                    api._sync_thread.join(timeout=0.5)
+            except Exception as e: _log.debug("swallowed: %s", e)
             # 1. Persist queue state NOW (defeat the debounce timer).
             try: api._queues.save_now()
             except Exception as e: _log.debug("swallowed: %s", e)
@@ -1157,9 +1216,9 @@ def main():
                 if punct is not None and getattr(punct, "_proc", None):
                     kill_process(punct._proc)
             except Exception as e: _log.debug("swallowed: %s", e)
-            # 5. Cancel any in-flight sync (best effort).
-            try: api._sync_cancel.set()
-            except Exception as e: _log.debug("swallowed: %s", e)
+            # 5. (cancel-then-kill order: cancel already signaled at
+            # step 0; PROCESS_REGISTRY.kill_all below reaps anything
+            # the worker didn't tear down on its own.)
             # kill registered subprocesses first via
             # PROCESS_REGISTRY (sync's yt-dlp, compress's ffmpeg, etc.).
             # The psutil fallback below catches anything that escaped
@@ -1280,9 +1339,29 @@ def main():
         except Exception as e:
             _log.debug("swallowed: %s", e)
     def _tray_quit():
+        # Set the truly-quit flag first so the closing handler skips
+        # the modal and proceeds with shutdown.
         _truly_quit["flag"] = True
+        # window.destroy() must run on the GUI thread on Windows. The
+        # pystray callback fires this on its own thread; calling
+        # window.destroy() directly from there is undefined behavior
+        # and was observed to occasionally fail to close the app
+        # (user had to click X again). Marshal via webview.windows[0]
+        # which schedules the call on the GUI thread. Falls back to
+        # direct destroy on platforms where webview.windows is empty.
+        def _do_destroy():
+            try:
+                import webview as _wv
+                wins = list(_wv.windows or [])
+                if wins:
+                    wins[0].destroy()
+                else:
+                    window.destroy()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         try:
-            window.destroy()
+            threading.Thread(target=_do_destroy, daemon=True,
+                             name="tray-quit-marshal").start()
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -1354,9 +1433,14 @@ def main():
             from backend.index import backfill_upload_ts as _backfill
             _backfill()
         except Exception as e: _log.debug("swallowed: %s", e)
-    threading.Thread(target=_startup_checks, daemon=True).start()
-
-    webview.start(debug=False)
+    # Defer startup checks until pywebview has actually rendered the
+    # window. Previously this thread started BEFORE webview.start(), so
+    # api.check_dependencies / check_channel_folders / check_app_update
+    # would call evaluate_js while window.html was still loading — the
+    # warnings either silently dropped or landed in a queue the
+    # frontend never drained. webview.start's `func=` argument runs the
+    # callable on its own thread AFTER the DOM is ready.
+    webview.start(func=_startup_checks, debug=False)
     # After webview returns, stop the tray icon so pystray's mainloop exits
     try:
         tray.stop()

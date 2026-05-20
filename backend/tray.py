@@ -108,6 +108,11 @@ class TrayController:
         self._ImageDraw = None
         self._spin_thread: threading.Thread | None = None
         self._spin_stop = threading.Event()
+        # Monotonic epoch — incremented on every stop_spin so an old
+        # spin loop still alive after join-timeout can detect it has
+        # been superseded and self-exit without writing more frames
+        # (audit: tray.py:266-287).
+        self._spin_epoch = 0
         self._spin_color = (80, 160, 240, 255)
         self._spin_interval = 0.18
         # Badge overlay — downloaded-this-session count. 0 = no badge.
@@ -260,7 +265,10 @@ class TrayController:
         if self._spin_thread is not None:
             return # already spinning
         self._spin_stop.clear()
-        self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
+        self._spin_epoch += 1
+        _epoch = self._spin_epoch
+        self._spin_thread = threading.Thread(
+            target=self._spin_loop, args=(_epoch,), daemon=True)
         self._spin_thread.start()
 
     def stop_spin(self):
@@ -335,7 +343,7 @@ class TrayController:
             _log.debug("swallowed: %s", e)
         return img
 
-    def _spin_loop(self):
+    def _spin_loop(self, epoch: int = 0):
         import math
         frame = 0
         # .txt issue: the spin animation was barely visible — a single
@@ -347,6 +355,11 @@ class TrayController:
         # Trailing dot opacities — head bright, tail dim.
         OPACITIES = [255, 220, 180, 140, 100, 70, 40, 25]
         while not self._spin_stop.is_set():
+            # If a newer start_spin was issued after our join-timeout,
+            # the epoch will have bumped — bail rather than fight the
+            # new loop for the icon.
+            if epoch != self._spin_epoch:
+                return
             try:
                 img = self._base_img.copy()
                 draw = self._ImageDraw.Draw(img)

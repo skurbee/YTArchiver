@@ -178,9 +178,23 @@ def _load_checkpoint(scope_url: str) -> list | None:
     except (OSError, json.JSONDecodeError, ValueError):
         return None
     out = []
+    dropped_missing = 0
     for row in data.get("work", []):
         if isinstance(row, list) and len(row) >= 4:
-            out.append((Path(row[0]), row[1], row[2], row[3]))
+            jp = Path(row[0])
+            # Drop entries whose jsonl_path no longer exists — typically
+            # happens after a drive remap (Z:\ → Y:\) or after the user
+            # moved their archive. Without this filter, every video in
+            # the checkpoint would fail-fetch against a nonexistent
+            # path and produce a massive failure rate on resume.
+            if not jp.exists():
+                dropped_missing += 1
+                continue
+            out.append((jp, row[1], row[2], row[3]))
+    if dropped_missing:
+        _log.warning(
+            "repair checkpoint: dropped %d entries whose jsonl_path no longer exists",
+            dropped_missing)
     return out or None
 
 
@@ -231,13 +245,20 @@ def _find_txt_for_jsonl(jsonl_path: Path) -> Path:
 
 
 def _fetch_vtt(yt_dlp: str, video_id: str,
-               out_dir: Path) -> tuple[Path | None, str | None]:
+               out_dir: Path,
+               cancel_event: threading.Event | None = None
+               ) -> tuple[Path | None, str | None]:
     """Run yt-dlp to fetch a single video's auto-caption VTT.
 
     Passes the same `--cookies-from-browser` (or `--cookies cookies.txt`)
     args every other YTArchiver yt-dlp call uses. Authenticated requests
     get higher YT quotas (fewer 429s) and unlock age-gated content that
     would otherwise come back as "Sign in to confirm your age".
+
+    `cancel_event` is polled while the subprocess runs so a Cancel
+    during a single hung fetch can break out promptly instead of
+    waiting for the full 120s timeout (previously the only way the
+    fetch could end early).
     """
     cmd = [
         yt_dlp,
@@ -249,16 +270,40 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
         f"https://www.youtube.com/watch?v={video_id}",
     ]
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
             startupinfo=_startupinfo, creationflags=_CREATE_NO_WINDOW,
         )
-    except subprocess.TimeoutExpired:
-        return None, "yt-dlp timeout"
     except FileNotFoundError:
         return None, f"yt-dlp not found: {yt_dlp}"
-    if r.returncode != 0:
-        msg = (r.stderr or r.stdout or "").splitlines()
+    # Poll loop — checks cancel_event every 250ms.
+    deadline = time.time() + 120.0
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+            return None, "cancelled"
+        try:
+            r_code = proc.wait(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if time.time() >= deadline:
+                try: proc.kill()
+                except Exception: pass
+                return None, "yt-dlp timeout"
+    try:
+        _stderr_text = proc.stderr.read() if proc.stderr else ""
+        _stdout_text = proc.stdout.read() if proc.stdout else ""
+    except Exception:
+        _stderr_text = ""
+        _stdout_text = ""
+    if r_code != 0:
+        msg = (_stderr_text or _stdout_text or "").splitlines()
         tail = msg[-1] if msg else "yt-dlp failed"
         return None, tail[:200]
     for cand in out_dir.glob(f"{video_id}*.vtt"):
@@ -266,22 +311,52 @@ def _fetch_vtt(yt_dlp: str, video_id: str,
     return None, "no captions available"
 
 
+def _open_repair_db_conn() -> sqlite3.Connection | None:
+    """Open one shared sqlite3 connection for the lifetime of a repair
+    pass. WAL mode is set explicitly here so a cold-start invocation
+    (e.g. CLI) doesn't leave the DB in default rollback-journal mode,
+    which would block every reader during each UPDATE. Returns None if
+    the DB file is missing or open fails."""
+    if not Path(TRANSCRIPTION_DB).exists():
+        return None
+    try:
+        # check_same_thread=False mirrors what index._open() uses, so
+        # this conn behaves consistently if a future caller passes it
+        # across threads (audit: repair_captions.py:300).
+        conn = sqlite3.connect(str(TRANSCRIPTION_DB), timeout=30.0,
+                               check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=30000")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error as e:
+            _log.debug("swallowed: %s", e)
+        return conn
+    except sqlite3.Error as e:
+        _log.error("repair conn open failed: %s", e)
+        return None
+
+
 def _update_db_words(video_id: str,
-                     new_segments: list) -> tuple[int, str | None]:
+                     new_segments: list,
+                     conn: sqlite3.Connection | None = None
+                     ) -> tuple[int, str | None]:
     """Targeted UPDATE on the segments table — column-only, FTS untouched.
 
     Match on (video_id, start_time, end_time). The parser fix doesn't
     change segmentation or timing, only the `w` array contents, so
     every row matches exactly.
+
+    If `conn` is provided, reuse it (caller is responsible for close).
+    Otherwise open + close per call (slow path; preserved for back-compat
+    but not used by repair_archive's main loop anymore).
     """
-    if not Path(TRANSCRIPTION_DB).exists():
-        return 0, f"DB not found at {TRANSCRIPTION_DB}"
+    owns_conn = False
+    if conn is None:
+        conn = _open_repair_db_conn()
+        if conn is None:
+            return 0, f"DB not found at {TRANSCRIPTION_DB}"
+        owns_conn = True
     try:
-        conn = sqlite3.connect(str(TRANSCRIPTION_DB), timeout=30.0)
-    except sqlite3.Error as e:
-        return 0, f"DB open: {e}"
-    try:
-        conn.execute("PRAGMA busy_timeout=30000")
         updated = 0
         for seg in new_segments:
             s_val = seg.get("start") if "start" in seg else seg.get("s", 0)
@@ -289,18 +364,32 @@ def _update_db_words(video_id: str,
             w_val = seg.get("words") if "words" in seg else seg.get("w", [])
             if not isinstance(w_val, list):
                 w_val = []
+            # Float-equality match is unreliable because re-parsing the
+            # same VTT can produce tiny FP drift (e.g. 2.879 vs
+            # 2.8790000000000002). Use a small tolerance window so the
+            # UPDATE actually lands. The 0.01s window is much smaller
+            # than any real Whisper segment (~3-10s).
             cur = conn.execute(
                 "UPDATE segments SET words=? "
-                "WHERE video_id=? AND start_time=? AND end_time=?",
+                "WHERE video_id=? "
+                "AND ABS(start_time - ?) < 0.01 "
+                "AND ABS(end_time - ?) < 0.01",
                 (json.dumps(w_val, ensure_ascii=False), video_id,
                  float(s_val or 0), float(e_val or 0)))
             updated += cur.rowcount
-        conn.commit()
+            # Commit per-segment so a mid-loop error doesn't roll back
+            # earlier successful updates. The previous single-commit
+            # at end meant one bad row wiped every row's update in
+            # that _repair_one_video call.
+            conn.commit()
         return updated, None
     except sqlite3.Error as e:
+        try: conn.rollback()
+        except Exception as _re: _log.debug("swallowed: %s", _re)
         return 0, f"DB update: {e}"
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 _PUNCT_CHARS_RE = re.compile(r"[.,!?;:]")
@@ -335,7 +424,7 @@ def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
     time to release the throttle; if all three retries still 429 we
     give up on that video and let the caller log it as FAIL.
     """
-    vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir)
+    vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir, cancel_event=cancel_event)
     if vtt or not err or not _RATE_LIMIT_RE.search(err):
         return vtt, err
     for attempt, backoff in enumerate(_RATE_LIMIT_BACKOFFS, 1):
@@ -350,7 +439,7 @@ def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
                 return None, "cancelled during backoff"
         else:
             time.sleep(backoff)
-        vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir)
+        vtt, err = _fetch_vtt(yt_dlp, video_id, out_dir, cancel_event=cancel_event)
         if vtt:
             return vtt, None
         if not err or not _RATE_LIMIT_RE.search(err):
@@ -361,7 +450,8 @@ def _fetch_vtt_with_backoff(yt_dlp: str, video_id: str, out_dir: Path,
 def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
                       video_id: str, source_tag: str, dry_run: bool,
                       log_stream,
-                      cancel_event: threading.Event | None = None
+                      cancel_event: threading.Event | None = None,
+                      db_conn: sqlite3.Connection | None = None,
                       ) -> tuple[bool, str, int, int]:
     """Fetch+parse+write a single video. Returns (ok, msg, n_segs, n_words).
 
@@ -389,7 +479,7 @@ def _repair_one_video(yt_dlp: str, jsonl_path: Path, title: str,
             _replace_jsonl_entry(str(jsonl_path), title, video_id, new_segs)
         except Exception as e:
             return False, f"JSONL replace: {e}", 0, 0
-        db_rows, db_err = _update_db_words(video_id, new_segs)
+        db_rows, db_err = _update_db_words(video_id, new_segs, conn=db_conn)
         if db_err:
             return True, f"DB skipped: {db_err}", len(new_segs), total_words
         return True, f"{db_rows} DB rows", len(new_segs), total_words
@@ -454,9 +544,28 @@ def _collect_yt_videos(jsonl_path: Path) -> list:
 def _find_jsonl_for_video_id(root: Path, video_id: str
                              ) -> tuple[Path | None, str | None]:
     """Scan every JSONL under `root` for an entry with this video_id.
-    Returns `(jsonl_path, title)` or `(None, None)`."""
+    Returns `(jsonl_path, title)` or `(None, None)`.
+
+    Reads in binary mode and uses _VID_RE.search to detect the id
+    BEFORE parsing JSON per line. Old code json.loads'd every line
+    of every JSONL up front — on a large archive (100k+ lines per
+    channel) that turned single-video repair into a multi-minute
+    startup (audit: repair_captions.py:455). Now: O(jsonls * bytes-
+    to-match) with early-break when the substring shows up.
+    """
+    _needle = (b'"video_id": "' + video_id.encode("ascii") + b'"')
+    _needle_alt = (b'"video_id":"' + video_id.encode("ascii") + b'"')
     for j in root.rglob(".*Transcript.jsonl"):
         try:
+            # Read the file in binary mode and scan for the substring
+            # first. The JSON writer is consistent within a file, so a
+            # quick byte-contains pre-filter rules out 99%+ of jsonls
+            # in microseconds.
+            with open(j, "rb") as f:
+                _data = f.read()
+            if _needle not in _data and _needle_alt not in _data:
+                continue
+            # Found a hit — parse line-by-line to extract the title.
             with open(j, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
@@ -573,6 +682,16 @@ def repair_archive(*, output_dir: str, log_stream,
                 f" — Scanning {scope.name}...\n", "simpleline")
             log_stream.flush()
             for j in scope.rglob(".*Transcript.jsonl"):
+                # Honor cancel inside the rglob walk too — the
+                # original only checked at channel boundaries, so on a
+                # huge channel the rglob enumeration alone could run
+                # for tens of seconds while the user thought Cancel
+                # was hung.
+                if _cancelled():
+                    log_stream.emit_text(
+                        " — Cancelled during scan.\n", "simpleline")
+                    log_stream.flush()
+                    break
                 for vid, t, tag in _collect_yt_videos(j):
                     work.append((j, vid, t, tag))
         else:
@@ -646,7 +765,13 @@ def repair_archive(*, output_dir: str, log_stream,
     fail_count = 0
     skip_count = 0  # downgrade-guard skips, tracked separately
     cancelled_early = False
-    for i, (j, vid, t, tag) in enumerate(work, 1):
+    # Open one shared sqlite3 connection for the whole pass. With ~80k
+    # videos per full repair, opening/closing per video was wasting tens
+    # of thousands of file-handle operations and prevented the WAL
+    # pragma from taking effect on cold-start invocations.
+    db_conn = None if dry_run else _open_repair_db_conn()
+    try:
+      for i, (j, vid, t, tag) in enumerate(work, 1):
         _wait_if_paused()
         if _cancelled():
             cancelled_early = True
@@ -654,7 +779,8 @@ def repair_archive(*, output_dir: str, log_stream,
                 f"   Cancelled after {i - 1}/{len(work)} videos.\n", "dim")
             break
         success, msg, n_segs, n_words = _repair_one_video(
-            yt_dlp, j, t, vid, tag, dry_run, log_stream, cancel_event)
+            yt_dlp, j, t, vid, tag, dry_run, log_stream, cancel_event,
+            db_conn=db_conn)
         # Record progress AFTER each outcome (success/skip/fail-non-429)
         # so a restart picks up after the last completed video. We don't
         # record "rate-limited (all retries exhausted)" failures — those
@@ -717,6 +843,10 @@ def repair_archive(*, output_dir: str, log_stream,
                     break
             else:
                 time.sleep(_per_fetch_sleep)
+    finally:
+        if db_conn is not None:
+            try: db_conn.close()
+            except Exception as e: _log.debug("swallowed: %s", e)
 
     status_word = "Cancelled" if cancelled_early else "Repair done"
     log_stream.emit_text(

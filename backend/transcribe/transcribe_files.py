@@ -75,6 +75,14 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
                 "end": round(float(e or 0), 2),
                 "text": t or "",
             }
+            # Distinguish None (key absent — generate words) from []
+            # (key explicit-empty — respect Whisper Branch 3 intent)
+            # (audit: transcribe_files.py:67-89).
+            if raw_words is None:
+                entry["words"] = _generate_distributed_words(
+                    entry["text"], entry["start"], entry["end"])
+                new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+                continue
             if raw_words:
                 # Normalize word records to long-form too (OLD uses "w"/"s"/"e" inside
                 # the words array, same as our short-form — already correct)
@@ -143,6 +151,12 @@ def _write_transcript_entry(txt_path: str, title: str,
       ===(title), (MM.DD.YYYY), (H:MM:SS), (SOURCE)===
       {text}
       [triple newline]
+
+    Atomic write: read existing content, append the new entry in memory,
+    write to <path>.tmp with fsync, then os.replace onto the final path.
+    The previous open(path, "a") pattern could leave a partially-flushed
+    final entry on crash mid-write — the torn header at EOF wouldn't
+    parse cleanly on the next read.
     """
     try:
         os.makedirs(os.path.dirname(txt_path), exist_ok=True)
@@ -151,8 +165,27 @@ def _write_transcript_entry(txt_path: str, title: str,
         dur_fmt = f"({dur_raw})" if dur_raw else "(Unknown length)"
         src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
         entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
-        with open(txt_path, "a", encoding="utf-8") as f:
-            f.write(entry)
+        # Read existing content (file may not exist yet on first transcribe).
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except FileNotFoundError:
+            existing = ""
+        new_content = existing + entry
+        tmp = txt_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(new_content)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError as e:
+                    _log.debug("swallowed: %s", e)
+            os.replace(tmp, txt_path)
+        except OSError:
+            try: os.remove(tmp)
+            except OSError: pass
+            raise
         return True
     except Exception:
         return False
@@ -183,103 +216,136 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
     can feed them into `_replace_txt_entry` for the same cleanup on the
     .txt side.
     """
-    # Clear Windows hidden/readonly so we can write (re-hidden by
-    # _write_jsonl_entry on append).
-    _unhide_file_win(os.path.normpath(jsonl_path))
-    if os.name == "nt":
-        try:
-            import stat
-            os.chmod(jsonl_path, stat.S_IWRITE | stat.S_IREAD)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-
-    old_lines: list[str] = []
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            old_lines = f.readlines()
-    except FileNotFoundError:
-        pass
-
-    kept: list[str] = []
-    removed_titles: set = set()
-    vid_norm = (video_id or "").strip()
-    tit_key = _norm_title(title)
-    for line in old_lines:
-        ls = line.strip()
-        if not ls:
-            continue
-        try:
-            obj = json.loads(ls)
-            seg_title = (obj.get("title") or "").strip()
-            seg_vid = (obj.get("video_id") or "").strip()
-            # Match by normalized title (punctuation-insensitive) OR by
-            # video_id. Either signal means this segment belongs to the
-            # video being re-transcribed and should be swapped out.
-            if (seg_title and _norm_title(seg_title) == tit_key) or \
-               (vid_norm and seg_vid == vid_norm):
-                if seg_title:
-                    removed_titles.add(seg_title)
-                continue # drop this line
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        kept.append(line if line.endswith("\n") else line + "\n")
-
-    # build the new segments inline and write the
-    # filtered-kept lines + new lines in ONE atomic operation. Previously
-    # this function wrote kept lines, then called _write_jsonl_entry which
-    # re-read the file from disk and rewrote it — two reads + two writes
-    # for an operation that only needs one of each.
-    new_lines: list[str] = []
-    for seg in new_segments:
-        s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
-        e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
-        t = seg.get("text") if "text" in seg else seg.get("t", "")
-        raw_words = seg.get("words") if "words" in seg else seg.get("w")
-        entry = {
-            "video_id": video_id or "",
-            "title": title,
-            "start": round(float(s or 0), 2),
-            "end": round(float(e or 0), 2),
-            "text": t or "",
-        }
-        if raw_words:
-            entry["words"] = [
-                {"w": w.get("w") if isinstance(w, dict) else str(w),
-                 "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
-                 "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
-                for w in raw_words
-            ]
-        else:
-            entry["words"] = _generate_distributed_words(
-                entry["text"], entry["start"], entry["end"])
-        new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    # If kept's last entry is missing a trailing newline, fix before append.
-    if kept and not kept[-1].endswith("\n"):
-        kept[-1] = kept[-1] + "\n"
-
-    final_bytes = ("".join(kept) + "".join(new_lines)).encode("utf-8")
-    tmp = jsonl_path + ".tmp"
-    try:
-        with open(tmp, "wb") as f:
-            f.write(final_bytes)
+    # Clear Windows hidden/readonly so we can write. The re-hide is
+    # in a try/finally below so the sidecar can never get stranded
+    # visible — even if any step between unhide and the final hide
+    # raises (read failure, build error, disk full, AV-locked rename).
+    # Violating the "hidden sidecars" invariant would expose internals
+    # to the user's archive view permanently.
+    # Skip chmod if the file doesn't exist yet — a first-time
+    # retranscribe targets a path the writer is about to create, so
+    # chmoding raises FileNotFoundError. Skip cleanly instead of
+    # swallowing a confusing OSError (audit: transcribe_files.py:
+    # 188-194). The hide/unhide pair only matters when the file
+    # already exists.
+    _jsonl_abs = os.path.normpath(jsonl_path)
+    if os.path.exists(_jsonl_abs):
+        _unhide_file_win(_jsonl_abs)
+        if os.name == "nt":
             try:
-                f.flush()
-                os.fsync(f.fileno())
-            except OSError as e:
+                import stat
+                os.chmod(jsonl_path, stat.S_IWRITE | stat.S_IREAD)
+            except FileNotFoundError:
+                # Raced with another writer that deleted the file —
+                # rare. Carry on; the writer below will recreate it.
+                pass
+            except Exception as e:
                 _log.debug("swallowed: %s", e)
-        os.replace(tmp, jsonl_path)
-        _hide_file_win(jsonl_path)
-    except OSError as _oe:
-        # previously returned early WITHOUT re-appending the
-        # new segments, silently leaving the OLD entry on disk while the
-        # caller thought retranscribe succeeded. Now we re-raise so the
-        # caller's emit_error in _write_outputs surfaces the failure and
-        # the user can see that their retranscribe didn't land.
-        try: os.remove(tmp)
-        except OSError: pass
-        _log.error("_replace_jsonl_entry atomic replace failed: %s", _oe)
-        raise
+
+    try:
+        old_lines: list[str] = []
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                old_lines = f.readlines()
+        except FileNotFoundError:
+            pass
+
+        kept: list[str] = []
+        removed_titles: set = set()
+        vid_norm = (video_id or "").strip()
+        tit_key = _norm_title(title)
+        for line in old_lines:
+            ls = line.strip()
+            if not ls:
+                continue
+            try:
+                obj = json.loads(ls)
+                seg_title = (obj.get("title") or "").strip()
+                seg_vid = (obj.get("video_id") or "").strip()
+                # Match by normalized title (punctuation-insensitive) OR by
+                # video_id. Either signal means this segment belongs to the
+                # video being re-transcribed and should be swapped out.
+                if (seg_title and _norm_title(seg_title) == tit_key) or \
+                   (vid_norm and seg_vid == vid_norm):
+                    if seg_title:
+                        removed_titles.add(seg_title)
+                    continue # drop this line
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            kept.append(line if line.endswith("\n") else line + "\n")
+
+        # build the new segments inline and write the
+        # filtered-kept lines + new lines in ONE atomic operation. Previously
+        # this function wrote kept lines, then called _write_jsonl_entry which
+        # re-read the file from disk and rewrote it — two reads + two writes
+        # for an operation that only needs one of each.
+        new_lines: list[str] = []
+        for seg in new_segments:
+            s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
+            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
+            t = seg.get("text") if "text" in seg else seg.get("t", "")
+            raw_words = seg.get("words") if "words" in seg else seg.get("w")
+            entry = {
+                "video_id": video_id or "",
+                "title": title,
+                "start": round(float(s or 0), 2),
+                "end": round(float(e or 0), 2),
+                "text": t or "",
+            }
+            # Distinguish None (key absent — generate words) from []
+            # (key explicit-empty — respect Whisper Branch 3 intent)
+            # (audit: transcribe_files.py:67-89).
+            if raw_words is None:
+                entry["words"] = _generate_distributed_words(
+                    entry["text"], entry["start"], entry["end"])
+                new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+                continue
+            if raw_words:
+                entry["words"] = [
+                    {"w": w.get("w") if isinstance(w, dict) else str(w),
+                     "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
+                     "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
+                    for w in raw_words
+                ]
+            else:
+                entry["words"] = _generate_distributed_words(
+                    entry["text"], entry["start"], entry["end"])
+            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # If kept's last entry is missing a trailing newline, fix before append.
+        if kept and not kept[-1].endswith("\n"):
+            kept[-1] = kept[-1] + "\n"
+
+        final_bytes = ("".join(kept) + "".join(new_lines)).encode("utf-8")
+        tmp = jsonl_path + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(final_bytes)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError as e:
+                    _log.debug("swallowed: %s", e)
+            os.replace(tmp, jsonl_path)
+        except OSError as _oe:
+            # previously returned early WITHOUT re-appending the
+            # new segments, silently leaving the OLD entry on disk while the
+            # caller thought retranscribe succeeded. Now we re-raise so the
+            # caller's emit_error in _write_outputs surfaces the failure and
+            # the user can see that their retranscribe didn't land.
+            try: os.remove(tmp)
+            except OSError: pass
+            _log.error("_replace_jsonl_entry atomic replace failed: %s", _oe)
+            raise
+    finally:
+        # Always restore the hidden attribute, even on failure. If the
+        # file was deleted by an earlier step or never existed, this is
+        # a no-op. Best-effort — never let a re-hide failure mask the
+        # real exception above.
+        try:
+            _hide_file_win(jsonl_path)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     return removed_titles
 
@@ -298,61 +364,74 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
     verbatim as the 4th bracketed field on the header line so the
     ArchivePlayer / Browse source banner can detect it.
 
-    Returns True on success. Appends the new entry inheriting the OLD
-    entry's date + duration so provenance is preserved across
-    re-transcriptions.
+    Returns True on success. On failure, raises — the caller in
+    transcribe.core._write_outputs catches the exception and runs the
+    .jsonl roll-back to keep the two sidecars in sync. The previous
+    bare `except Exception: return False` here silently swallowed the
+    failure so the caller's roll-back branch never fired, leaving the
+    user with a new .jsonl + an old .txt (split state).
     """
     try:
-        try:
-            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except FileNotFoundError:
-            content = ""
+        with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except FileNotFoundError:
+        content = ""
 
-        # Build purge set as NORMALIZED keys (NFC + lowercase +
-        # whitespace-collapsed + trailing-punct stripped). Without this
-        # the check below misses "Title." vs "Title" variants that the
-        # retranscribe flow legitimately needs to swap out — which is
-        # what caused the triple-block duplication in v47.6 and older.
-        purge = {_norm_title(t) for t in (extra_titles_to_remove or ())}
-        purge.add(_norm_title(title))
-        purge.discard("")
+    # Build purge set as NORMALIZED keys (NFC + lowercase +
+    # whitespace-collapsed + trailing-punct stripped). Without this
+    # the check below misses "Title." vs "Title" variants that the
+    # retranscribe flow legitimately needs to swap out — which is
+    # what caused the triple-block duplication in v47.6 and older.
+    purge = {_norm_title(t) for t in (extra_titles_to_remove or ())}
+    purge.add(_norm_title(title))
+    purge.discard("")
 
-        # Remove each matching entry (header line through the next header
-        # or EOF). Iterate from the end so earlier match positions stay
-        # valid as we slice. Capture date+duration from the FIRST removed
-        # entry so the new block inherits the provenance.
-        matches = list(_HEADER_RE.finditer(content))
-        new_content = content
-        found_old = False
-        date_fmt = "(Unknown date)"
-        dur_fmt = "(Unknown length)"
-        captured = False
-        for i in range(len(matches) - 1, -1, -1):
-            m = matches[i]
-            entry_key = _norm_title(m.group(1))
-            if entry_key not in purge:
-                continue
-            end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
-            if not captured:
-                # Matches group indices of _HEADER_RE: (title, date, dur, src)
-                date_fmt = m.group(2)
-                dur_fmt = m.group(3)
-                captured = True
-            new_content = new_content[:m.start()] + new_content[end:]
-            found_old = True
+    # Remove each matching entry (header line through the next header
+    # or EOF). Iterate from the end so earlier match positions stay
+    # valid as we slice. Capture date+duration from the FIRST removed
+    # entry so the new block inherits the provenance.
+    matches = list(_HEADER_RE.finditer(content))
+    new_content = content
+    found_old = False
+    date_fmt = "(Unknown date)"
+    dur_fmt = "(Unknown length)"
+    captured = False
+    for i in range(len(matches) - 1, -1, -1):
+        m = matches[i]
+        entry_key = _norm_title(m.group(1))
+        if entry_key not in purge:
+            continue
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(new_content)
+        if not captured:
+            # Matches group indices of _HEADER_RE: (title, date, dur, src)
+            date_fmt = m.group(2)
+            dur_fmt = m.group(3)
+            captured = True
+        new_content = new_content[:m.start()] + new_content[end:]
+        found_old = True
 
-        src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
-        new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"
+    src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
+    new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"
 
-        new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
-        new_content += new_entry
+    new_content = new_content.rstrip("\n") + "\n\n\n" if new_content.strip() else ""
+    new_content += new_entry
 
-        os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
-        tmp = txt_path + ".tmp"
+    # Assert absolute path so a misrouted bare filename doesn't silently
+    # write into cwd (audit: transcribe_files.py:351). Background worker
+    # threads inherit cwd from main(), which on a shortcut-launched
+    # frozen exe isn't where the user expects.
+    if not os.path.isabs(txt_path):
+        raise ValueError(
+            f"_replace_txt_entry refusing non-absolute txt_path: {txt_path}")
+    os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
+    tmp = txt_path + ".tmp"
+    try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(new_content)
         os.replace(tmp, txt_path)
-        return True
-    except Exception:
-        return False
+    except OSError:
+        # Clean up partial tmp so the next attempt doesn't see stale data.
+        try: os.remove(tmp)
+        except OSError: pass
+        raise
+    return True

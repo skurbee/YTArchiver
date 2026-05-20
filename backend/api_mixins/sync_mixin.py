@@ -58,10 +58,35 @@ class SyncMixin:
         the worker \u2014 so "Queued metadata for 103 channels" turned
         into "Sync pass starting (206 channels)."
         """
-        if self.sync_is_running():
-            return {"ok": False, "error": "Sync already running"}
-        if not sync_backend.find_yt_dlp():
-            return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
+        # Hold a lock around the is-running check + thread spawn. Old
+        # code did check-then-spawn outside a lock, so two near-
+        # simultaneous calls (autorun timer + user-clicked Start)
+        # could both pass the check and spawn parallel worker threads
+        # (audit: sync_mixin.py:46). The check inside _start_sync_locked
+        # is now atomic with the assignment.
+        if not hasattr(self, "_sync_start_lock"):
+            self._sync_start_lock = threading.Lock()
+        # Non-blocking attempt — if another caller is mid-startup we
+        # treat it the same as "already running".
+        _acquired = self._sync_start_lock.acquire(blocking=False)
+        if not _acquired:
+            return {"ok": False, "error": "Sync already starting"}
+        try:
+            if self.sync_is_running():
+                return {"ok": False, "error": "Sync already running"}
+            if not sync_backend.find_yt_dlp():
+                return {"ok": False, "error": "yt-dlp not found. Install yt-dlp or place yt-dlp.exe next to the app."}
+            return self._sync_start_all_inner(add_downloads_from_config)
+        finally:
+            try: self._sync_start_lock.release()
+            except Exception: pass
+
+
+    def _sync_start_all_inner(self, add_downloads_from_config=True):
+        """Inner body of sync_start_all. Caller must hold
+        _sync_start_lock. Encapsulates the original logic so the
+        atomic check-and-spawn wrapper stays small.
+        """
         # Auto-off + fresh "Sync Subbed" click: enqueue every channel
         # but DON'T spawn the worker. User must manually click Start in
         # the Sync Tasks popover (or toggle Auto on). Matches classic
@@ -174,6 +199,29 @@ class SyncMixin:
                 # (YTArchiver.py:23380).
                 try: self._autorun.notify_sync_done()
                 except Exception as e: _log.debug("swallowed: %s", e)
+                # Refresh the in-memory config snapshot so consumers that
+                # read self._config (Last Full Sync label, channel
+                # listing, etc.) see the new last_sync timestamp + any
+                # initialized/sync_complete flags the sync just wrote.
+                try: self._reload_config()
+                except Exception as e: _log.debug("swallowed: %s", e)
+                # Push the new "Last Full Sync" label to the UI now,
+                # not 60 seconds later when the JS tick happens to fire.
+                try:
+                    if self._window is not None:
+                        self._window.evaluate_js(
+                            "(function(){"
+                            " if (!window.pywebview || !window.pywebview.api) return;"
+                            " var api = window.pywebview.api;"
+                            " if (!api.get_last_sync_label) return;"
+                            " api.get_last_sync_label().then(function(r){"
+                            "   if (!r || !r.label) return;"
+                            "   var el = document.getElementById('last-full-sync');"
+                            "   if (el) el.textContent = r.label;"
+                            " }).catch(function(){});"
+                            "})();")
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 self._log_stream.flush()
                 self._on_queue_changed()
                 # drain any pending redownloads that were
@@ -228,8 +276,13 @@ class SyncMixin:
         # means cancel everything, matching user expectation.
         self._sync_cancel.set()
         try:
-            _drained = len(self._redwnl_pending)
-            self._redwnl_pending.clear()
+            # Hold _redwnl_lock for the drain so a concurrent chan_
+            # redownload worker can't pop(0) from an empty list mid-
+            # clear and IndexError. Same protection used in
+            # chan_cancel_redownload.
+            with self._redwnl_lock:
+                _drained = len(self._redwnl_pending)
+                self._redwnl_pending.clear()
             if _drained:
                 # Notify the UI so the queue popover clears visually.
                 self._on_queue_changed()
@@ -281,9 +334,11 @@ class SyncMixin:
             _log.debug("swallowed: %s", e)
         # Drain the redownload pending list too (same as sync_cancel
         # does — without this a queued redownload chain would silently
-        # resume on the next loop iteration).
+        # resume on the next loop iteration). Same lock protection as
+        # sync_cancel.
         try:
-            self._redwnl_pending.clear()
+            with self._redwnl_lock:
+                self._redwnl_pending.clear()
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._sync_cancel.set()

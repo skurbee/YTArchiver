@@ -405,6 +405,16 @@ class TranscribeManager:
         with self._proc_lock:
             if self._proc is None:
                 return
+            # Close stdin BEFORE terminating so the worker's blocking
+            # `for line in sys.stdin:` reader sees EOF and exits its
+            # for-loop cleanly. Without this, the worker process
+            # could hang waiting on the read-end of stdin until the
+            # OS reclaims pipes.
+            try:
+                if self._proc.stdin is not None and not self._proc.stdin.closed:
+                    self._proc.stdin.close()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             try:
                 if force:
                     self._proc.kill()
@@ -413,6 +423,16 @@ class TranscribeManager:
                         self._proc.terminate()
                     except Exception:
                         self._proc.kill()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            # Push a None sentinel onto the queue if a consumer is
+            # currently blocked on .get() — without this, after a
+            # forced kill the reader's queue.get(timeout=0.5) takes
+            # the full timeout before noticing the subprocess died.
+            try:
+                _q = self._line_queue
+                if _q is not None:
+                    _q.put(None)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             self._proc = None
@@ -910,6 +930,15 @@ class TranscribeManager:
                     break
                 job = self._jobs.pop(0)
             self._current_job = job
+            # Journal the in-flight job state IMMEDIATELY so a crash
+            # between here and the finally-end _persist_pending call
+            # doesn't lose the in-flight job (audit: transcribe/
+            # core.py:912-934). Best-effort — failure here doesn't
+            # disturb the actual transcription path.
+            try:
+                self._persist_pending()
+            except Exception as _pe:
+                _log.debug("swallowed: %s", _pe)
             # Reflect "now running" in the shared GPU queue: pop the
             # matching popover entry off `queues.gpu` and stamp it as
             # `current_gpu` so the popover's top row switches to
@@ -938,6 +967,39 @@ class TranscribeManager:
                     self._compress_one(job)
                 else:
                     self._transcribe_one(job)
+            except RuntimeError as _empty_e:
+                # "Whisper returned an empty transcript" — this is a
+                # SUCCESSFUL but speechless run (silent intro, music-
+                # only video, vad_filter rejected everything), not a
+                # crash. Surface as a calm dim line, NOT a scary red
+                # "Transcribe crashed" entry (audit: transcribe/
+                # core.py:1881-1886).
+                _msg_lower = str(_empty_e).lower()
+                if "cancelled before write" in _msg_lower:
+                    # "Cancel All" raced into _write_outputs — silent.
+                    # Counts as done so the err counter doesn't bump.
+                    crashed = False
+                elif "empty transcript" in _msg_lower:
+                    _vid_for_empty = (job.get("video_id") or "").strip()
+                    _empty_marker = f"tx_done_{_vid_for_empty}" if _vid_for_empty else ""
+                    _empty_tags = [t for t in (_empty_marker, "dim") if t]
+                    self._stream.emit([[
+                        f" — no speech detected in {job.get('title') or 'video'}.\n",
+                        _empty_tags,
+                    ]])
+                    # Not a crash — counts as done (avoids polluting
+                    # the error counter for a benign outcome).
+                    crashed = False
+                else:
+                    # Genuine RuntimeError — treat as a crash.
+                    _vid_for_err = (job.get("video_id") or "").strip()
+                    _marker = f"tx_done_{_vid_for_err}" if _vid_for_err else ""
+                    _err_tags = [t for t in (_marker, "red") if t]
+                    self._stream.emit([[
+                        f"{_job_kind.capitalize()} crashed: {_empty_e}\n",
+                        _err_tags,
+                    ]])
+                    crashed = True
             except Exception as e:
                 # audit SR-3 (user screenshot): if a transcribe
                 # job crashes, the error line must still REPLACE the
@@ -1253,6 +1315,22 @@ class TranscribeManager:
         # each, and merges segments (offset timestamps, drop overlap dupes).
         # Matches YTArchiver.py:11139 _whisper_transcribe_chunked.
         duration = _ffprobe_duration(path) or 0.0
+        # Fallback heuristic when ffprobe fails (missing binary, file
+        # locked, timeout) — a 0.0 duration would skip the chunked
+        # branch on a 4-hour video and OOM Whisper trying to load the
+        # whole audio at once. Use file-size as a rough proxy: typical
+        # 1080p mp4 is ~50 MB/hr. A file >120 MB roughly maps to >2 h.
+        if duration <= 0.0:
+            try:
+                _sz = os.path.getsize(path)
+                # 120 MB threshold ~= 2 hour 1080p — conservative; we'd
+                # rather chunk a short video unnecessarily than OOM a
+                # long one. Chunking on a short video is just slower,
+                # not broken.
+                if _sz > 120 * 1024 * 1024:
+                    duration = float(_CHUNK_MIN_DURATION)
+            except OSError:
+                pass
         if duration >= _CHUNK_MIN_DURATION:
             self._transcribe_chunked(job, duration)
             return
@@ -1299,13 +1377,26 @@ class TranscribeManager:
             ])
         _emit_progress(0)
 
-        # Request
-        req = json.dumps({"path": path, "duration": 0}) + "\n"
+        # Request. Pass the parent's ffprobe duration as a fallback so
+        # the worker's progress emitter still has a denominator even
+        # when faster-whisper's info.duration comes back None/0 (audit:
+        # transcribe/core.py:1303 / 1729). vad_filter occasionally
+        # rejects everything on silent-intro videos and reports 0,
+        # which silently disabled all "[%]" progress emits before this.
+        req = json.dumps({
+            "path": path,
+            "duration": 0,
+            "duration_fallback": float(duration) if duration else 0.0,
+        }) + "\n"
         try:
             self._proc.stdin.write(req)
             self._proc.stdin.flush()
         except Exception as e:
-            self._stream.emit_error(f"Write to whisper failed: {e}")
+            # Suppress the error toast when cancel was already
+            # requested — BrokenPipeError on cancel is normal cleanup,
+            # not a real failure (audit: transcribe/core.py:1303-1310).
+            if not (job["cancel"].is_set() or self._cancel_all.is_set()):
+                self._stream.emit_error(f"Write to whisper failed: {e}")
             self._stop_subprocess()
             return
 
@@ -1375,6 +1466,16 @@ class TranscribeManager:
                     # Requeue this job (but not in a loop — bail if it fails again)
                     if not job.get("_retried_cpu"):
                         job["_retried_cpu"] = True
+                        # Mark the pending-counter as already
+                        # decremented for THIS failed attempt so the
+                        # outer worker-loop's per-iteration finally
+                        # skips the decrement. Without this flag the
+                        # finally block decrements pending for both
+                        # the failed CUDA attempt AND the CPU retry,
+                        # causing transcription_pending to underflow
+                        # to 0 prematurely while the retry is still
+                        # running.
+                        job["_pending_decremented"] = True
                         with self._jobs_lock:
                             self._jobs.insert(0, job)
                     return
@@ -1408,6 +1509,19 @@ class TranscribeManager:
                             # Also run punctuation per-segment so the .jsonl
                             # matches what search / transcript view shows
                             for seg in result.get("segments", []):
+                                # Cancel-respect inside the per-segment
+                                # punct loop. Without this, a Skip /
+                                # Cancel during a long Whisper transcribe
+                                # with punctuation enabled has to wait
+                                # for every segment's punctuate() call
+                                # to finish (each can take seconds on
+                                # CPU fallback) — minutes of unwanted
+                                # CPU after the user clicked Cancel.
+                                _job_cancel = job.get("cancel")
+                                if _job_cancel is not None and _job_cancel.is_set():
+                                    break
+                                if self._cancel_all.is_set():
+                                    break
                                 t = seg.get("t", "")
                                 if t and len(t.split()) >= 3:
                                     pt = self._punct.punctuate(t)
@@ -1570,12 +1684,28 @@ class TranscribeManager:
                     "-i", path, "-vn", "-ac", "1", "-ar", "16000",
                     "-acodec", "pcm_s16le", chunk_path,
                 ]
+                # Scale the ffmpeg-split timeout with chunk_dur — old
+                # hard-coded 600s could expire mid-split on slow disks
+                # (Z: DrivePool + AV) for a 2h chunk, dropping that
+                # whole section from the merged transcript (audit:
+                # transcribe/core.py:1564-1581). Allow at least 3x
+                # realtime per second of chunk audio, with a 1200s
+                # floor for short chunks. If a section STILL times
+                # out, fail the whole chunked transcribe rather than
+                # silently continuing with a 2-hour hole.
+                _ff_timeout = max(1200.0, chunk_dur * 3.0)
                 try:
                     subprocess.run(
                         ff_cmd, check=True, capture_output=True,
-                        timeout=600,
+                        timeout=_ff_timeout,
                         creationflags=(0x08000000 if os.name == "nt" else 0),
                     )
+                except subprocess.TimeoutExpired as _toe:
+                    self._stream.emit_error(
+                        f"Section {ci+1}/{n_chunks} split timed out after "
+                        f"{int(_ff_timeout)}s — aborting chunked transcribe "
+                        f"to avoid silent gaps in the merged transcript.")
+                    return
                 except Exception as e:
                     self._stream.emit_error(f"Section {ci+1}/{n_chunks} split failed: {e}")
                     continue
@@ -1617,8 +1747,14 @@ class TranscribeManager:
                         if "s" in w: w["s"] = round(w["s"] + start_sec, 3)
                         if "e" in w: w["e"] = round(w["e"] + start_sec, 3)
                 if ci > 0 and segs:
+                    # Strict >= overlap_boundary so segments whose start
+                    # falls in [boundary-2, boundary) aren't counted
+                    # by BOTH chunks. Old `>= boundary - 2` buffer
+                    # let 2 seconds of segments at the seam land
+                    # twice in the merged .jsonl on 2h+ videos
+                    # (audit: transcribe/core.py:1611-1622).
                     overlap_boundary = start_sec + _CHUNK_OVERLAP_SECS
-                    segs = [s for s in segs if s.get("s", 0) >= overlap_boundary - 2]
+                    segs = [s for s in segs if s.get("s", 0) >= overlap_boundary]
                 all_segments.extend(segs)
 
             # Merge result
@@ -1726,7 +1862,14 @@ class TranscribeManager:
             if not self.start_subprocess():
                 return None
         try:
-            req = json.dumps({"path": path, "duration": 0}) + "\n"
+            # Pass ffprobe duration as fallback so the worker can still
+            # render progress on chunks where info.duration is 0
+            # (audit: transcribe/core.py:1303 / 1729).
+            _chunk_dur = _ffprobe_duration(path) or 0.0
+            req = json.dumps({
+                "path": path, "duration": 0,
+                "duration_fallback": float(_chunk_dur),
+            }) + "\n"
             self._proc.stdin.write(req)
             self._proc.stdin.flush()
         except Exception as e:
@@ -1820,6 +1963,11 @@ class TranscribeManager:
         doesn't carry `[videoId]` — helps `_replace_jsonl_entry` find
         title-drifted stale entries.
         """
+        # Bail early on cancel_all so a "Cancel All" click during the
+        # Whisper response stage doesn't still commit one more
+        # transcript to disk (audit: transcribe/core.py:783-799).
+        if self._cancel_all.is_set():
+            raise RuntimeError("cancelled before write")
         if not title:
             title = os.path.basename(video_path).rsplit(".", 1)[0]
             # Strip any trailing " [videoId]" if the stem has one

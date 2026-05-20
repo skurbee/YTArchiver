@@ -39,6 +39,35 @@ from .log import get_logger
 _log = get_logger(__name__)
 
 
+def _is_hidden_transcript_jsonl(dirpath: str, name: str) -> bool:
+    """A jsonl is "the channel's transcript sidecar" if EITHER its filename
+    starts with '.' (the canonical convention) OR it has the Windows
+    hidden attribute set. The dot prefix is what the writers emit, but
+    files that were manually moved/copied via Explorer can lose the dot
+    prefix while keeping the hidden attribute — those should still count.
+    """
+    if not name.endswith("Transcript.jsonl"):
+        return False
+    if name.startswith("."):
+        return True
+    # Fallback: check the Windows FILE_ATTRIBUTE_HIDDEN bit. Quietly
+    # returns False on non-Windows or on any ctypes failure.
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(
+            os.path.join(dirpath, name))
+        # GetFileAttributesW returns 0xFFFFFFFF (INVALID_FILE_ATTRIBUTES) on error
+        if attrs == 0xFFFFFFFF:
+            return False
+        return bool(attrs & FILE_ATTRIBUTE_HIDDEN)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+        return False
+
+
 # consolidated onto text_utils.normalize_title.
 # The canonical normalizer adds trailing-punct stripping ("title." ==
 # "title") which is what drift detection wants — the previous copy here
@@ -47,8 +76,13 @@ from .text_utils import normalize_title as _norm_title
 
 # Regex for .txt header: "===(title), (MM.DD.YYYY), (H:MM), (SOURCE)==="
 # Same as transcribe._HEADER_RE; copied here to stay import-independent.
+# title group is non-greedy + anchored by the literal "), (" that
+# follows. Old [^)]* refused to cross any close-paren so a real
+# YT title like "Foo (Bar)" parsed as title="Foo (Bar" and every
+# video with parens in its name showed up as drift (audit:
+# drift_scan.py:80).
 _HEADER_RE = re.compile(
-    r'^===\(([^)]*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    r'^===\((.+?)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
     re.MULTILINE)
 
 # Id bracket suffix extraction (matches `... [abc12_def-3]` at end of
@@ -56,15 +90,17 @@ _HEADER_RE = re.compile(
 _ID_BRACKET_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]\s*$")
 
 
-def _scan_txt_titles(folder_path: str) -> dict[str, dict[str, Any]]:
+def _scan_txt_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
     """Walk all `*Transcript.txt` under folder_path. Return
-    {norm_title: {"raw": raw_title, "video_id": id_or_empty,
-                  "txt_path": abs_path, "src_tag": "(WHISPER:large-v3)",
-                  "date": "(MM.DD.YYYY)"}}
-    One entry per distinct title. If the same title appears in multiple
-    .txt files (shouldn't happen but possible with split-years drift),
-    the first one wins."""
-    out: dict[str, dict[str, Any]] = {}
+    {norm_title: [ {"raw": ..., "video_id": ..., "txt_path": ...,
+                    "src_tag": ..., "date": ...}, ... ]}
+
+    Stores a LIST per normalized title so duplicate-title entries (re-
+    uploads, daily-show duplicates, series with shared title prefix)
+    are all preserved. The previous setdefault dropped every duplicate
+    after the first, hiding genuine drift for those entries.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
     if not folder_path or not os.path.isdir(folder_path):
         return out
     for dirpath, _dirs, files in os.walk(folder_path):
@@ -85,32 +121,43 @@ def _scan_txt_titles(folder_path: str) -> dict[str, dict[str, Any]]:
                 im = _ID_BRACKET_RE.search(raw)
                 if im:
                     vid_id = im.group(1)
-                # Store two normalized keys so lookups succeed regardless
-                # of whether the jsonl side has the [id] suffix or not.
                 raw_plain = _ID_BRACKET_RE.sub("", raw).strip() or raw
                 rec = {"raw": raw, "video_id": vid_id, "txt_path": fp,
                        "date": (m.group(2) or "").strip("()"),
                        "dur": (m.group(3) or "").strip("()"),
                        "src_tag": (m.group(4) or "").strip("()")}
-                out.setdefault(_norm_title(raw), rec)
-                out.setdefault(_norm_title(raw_plain), rec)
+                # Append-not-setdefault so duplicate titles are kept.
+                out.setdefault(_norm_title(raw), []).append(rec)
+                out.setdefault(_norm_title(raw_plain), []).append(rec)
     return out
 
 
-def _scan_jsonl_titles(folder_path: str) -> dict[str, dict[str, Any]]:
+def _scan_jsonl_titles(folder_path: str) -> dict[str, list[dict[str, Any]]]:
     """Walk all hidden `.*Transcript.jsonl` under folder_path. Return
-    {norm_title: {"raw": raw_title, "video_id": id_or_empty,
-                  "jsonl_path": abs_path}}
-    One entry per distinct title across all .jsonl files."""
-    out: dict[str, dict[str, Any]] = {}
+    {norm_title: [ {"raw": ..., "video_id": ..., "jsonl_path": ...} ] }
+
+    Stores a LIST per normalized title so duplicate-title entries
+    (re-uploads etc.) are all preserved. See _scan_txt_titles for the
+    same rationale. Within a single jsonl file, duplicate lines for
+    the same video_id are de-duplicated; cross-file duplicates are
+    kept so drift detection sees them.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
     if not folder_path or not os.path.isdir(folder_path):
         return out
     for dirpath, _dirs, files in os.walk(folder_path):
         for f in files:
-            # Hidden .*Transcript.jsonl (dot prefix = Windows hidden).
-            if not (f.startswith(".") and f.endswith("Transcript.jsonl")):
+            # Channel transcript sidecar: dot-prefix is the canonical
+            # form, but we also accept files with the Windows hidden
+            # attribute (in case a copy/restore stripped the dot prefix).
+            if not _is_hidden_transcript_jsonl(dirpath, f):
                 continue
             fp = os.path.join(dirpath, f)
+            # Within this file, dedupe by video_id so a single jsonl
+            # with thousands of segments per video doesn't append the
+            # same record thousands of times.
+            seen_vid_in_file: set = set()
+            seen_title_in_file: set = set()
             try:
                 with open(fp, "r", encoding="utf-8") as fh:
                     for line in fh:
@@ -125,19 +172,23 @@ def _scan_jsonl_titles(folder_path: str) -> dict[str, dict[str, Any]]:
                         if not title:
                             continue
                         vid_id = (obj.get("video_id") or "").strip()
+                        # Skip if we already saw this video in THIS file
+                        dedup_key = vid_id or f"_t::{_norm_title(title)}"
+                        if dedup_key in seen_vid_in_file:
+                            continue
+                        seen_vid_in_file.add(dedup_key)
                         key = _norm_title(title)
-                        if key not in out:
-                            out[key] = {"raw": title, "video_id": vid_id,
-                                        "jsonl_path": fp}
+                        seen_title_in_file.add(key)
+                        rec = {"raw": title, "video_id": vid_id,
+                               "jsonl_path": fp}
+                        out.setdefault(key, []).append(rec)
                         # Also store [id]-stripped key so callers can
                         # match regardless of bracket presence.
                         raw_plain = _ID_BRACKET_RE.sub("", title).strip()
                         if raw_plain:
                             plain_key = _norm_title(raw_plain)
-                            if plain_key not in out:
-                                out[plain_key] = {"raw": title,
-                                                  "video_id": vid_id,
-                                                  "jsonl_path": fp}
+                            if plain_key != key:
+                                out.setdefault(plain_key, []).append(rec)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
     return out
@@ -174,17 +225,19 @@ def _count_fts_phantoms() -> int:
         # writer (sweep, ingest). Drift Scan is a diagnostic, so making
         # it block was extra painful.
         with _idx._reader_lock:
-            # Simple total comparison. If FTS > segments, the delta is
-            # the phantom count. FTS rowids that point at nothing still
-            # get counted in segments_fts, so `COUNT(*)` captures them.
-            # Note: FTS5 contentless queries against a virtual table
-            # require a MATCH expression, but segments_fts is
-            # external-content so COUNT(*) works directly.
-            n_fts = conn.execute(
-                "SELECT COUNT(*) FROM segments_fts").fetchone()[0]
-            n_seg = conn.execute(
-                "SELECT COUNT(*) FROM segments").fetchone()[0]
-        return max(0, int(n_fts) - int(n_seg))
+            # Count phantoms via LEFT JOIN on rowid — that's the only
+            # reliable way. The old simple-subtraction approach (COUNT
+            # segments_fts - COUNT segments) over-reports because FTS5
+            # external-content tables can include deleted-but-not-merged
+            # entries in their COUNT(*) until the next 'merge'/'optimize'
+            # command. LEFT JOIN finds the rowids that genuinely have no
+            # backing segment.
+            row = conn.execute(
+                "SELECT COUNT(*) FROM segments_fts f "
+                "LEFT JOIN segments s ON f.rowid = s.id "
+                "WHERE s.id IS NULL"
+            ).fetchone()
+        return int(row[0]) if row else 0
     except Exception:
         return 0
 
@@ -213,33 +266,41 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
     txt_map = _scan_txt_titles(folder)
     jsonl_map = _scan_jsonl_titles(folder)
 
-    # Collect distinct entries — dedup since _scan_* store each entry
-    # under two keys (with and without [id] suffix). We use txt_path or
-    # jsonl_path as the dedup ID since each entry has exactly one.
+    # Pre-compute video_id sets from each side so the cross-check
+    # inside the loop is O(1) instead of O(N) per entry. With list-
+    # valued maps, .values() yields lists-of-records; flatten.
+    def _flatten(m: dict[str, list[dict[str, Any]]]):
+        out_ = []
+        for v in m.values():
+            out_.extend(v)
+        return out_
+    _txt_all = _flatten(txt_map)
+    _jsonl_all = _flatten(jsonl_map)
+    _jsonl_vids = {r.get("video_id") for r in _jsonl_all if r.get("video_id")}
+    _txt_vids = {r.get("video_id") for r in _txt_all if r.get("video_id")}
+
     seen_txt_paths: set = set()
     seen_jsonl_paths: set = set()
 
     txt_without_jsonl: list[dict[str, Any]] = []
     jsonl_without_txt: list[dict[str, Any]] = []
 
-    for key, rec in txt_map.items():
-        # Dedup by (txt_path, raw title)
+    # Iterate the flattened lists so duplicate-title entries are all
+    # checked individually for drift (rather than the previous
+    # setdefault-first-wins behavior that hid drift for re-uploads).
+    for rec in _txt_all:
         dedup_key = (rec["txt_path"], rec["raw"])
         if dedup_key in seen_txt_paths:
             continue
         seen_txt_paths.add(dedup_key)
-        # Does a matching .jsonl entry exist?
+        key = _norm_title(rec["raw"])
         if key in jsonl_map:
             continue
-        # Also try the [id]-stripped key
         raw_plain = _ID_BRACKET_RE.sub("", rec["raw"]).strip()
         if raw_plain and _norm_title(raw_plain) in jsonl_map:
             continue
-        # Also try by video_id if we have one
-        if rec.get("video_id"):
-            if any(m.get("video_id") == rec["video_id"]
-                   for m in jsonl_map.values()):
-                continue
+        if rec.get("video_id") and rec["video_id"] in _jsonl_vids:
+            continue
         txt_without_jsonl.append({
             "title": rec["raw"],
             "video_id": rec.get("video_id", ""),
@@ -248,20 +309,19 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
             "date": rec.get("date", ""),
         })
 
-    for key, rec in jsonl_map.items():
+    for rec in _jsonl_all:
         dedup_key = (rec["jsonl_path"], rec["raw"])
         if dedup_key in seen_jsonl_paths:
             continue
         seen_jsonl_paths.add(dedup_key)
+        key = _norm_title(rec["raw"])
         if key in txt_map:
             continue
         raw_plain = _ID_BRACKET_RE.sub("", rec["raw"]).strip()
         if raw_plain and _norm_title(raw_plain) in txt_map:
             continue
-        if rec.get("video_id"):
-            if any(m.get("video_id") == rec["video_id"]
-                   for m in txt_map.values()):
-                continue
+        if rec.get("video_id") and rec["video_id"] in _txt_vids:
+            continue
         jsonl_without_txt.append({
             "title": rec["raw"],
             "video_id": rec.get("video_id", ""),
@@ -282,9 +342,9 @@ def scan_channel(channel: dict[str, Any], output_dir: str) -> dict[str, Any]:
         except Exception:
             return p
     txt_titles_distinct = len({(_np(r["txt_path"]), r["raw"])
-                                for r in txt_map.values()})
+                                for r in _txt_all})
     jsonl_titles_distinct = len({(_np(r["jsonl_path"]), r["raw"])
-                                  for r in jsonl_map.values()})
+                                  for r in _jsonl_all})
 
     return {
         "ok": True,
@@ -318,10 +378,32 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
         pass
     header = f"===({title}), ({date_str}), ({duration_str}), ({source_tag})==="
     body = text.rstrip() + "\n\n"
+    # Atomic read-append-tmp-replace pattern. The previous open("a")
+    # path was vulnerable to interleaving when an active transcribe
+    # passed simultaneously appended to the SAME aggregated .txt
+    # (drift_apply runs concurrent with sync's transcribe writers).
+    # Read once, append in memory, write to .tmp, os.replace.
     try:
-        with open(txt_path, "a", encoding="utf-8") as fh:
-            fh.write(header + "\n")
-            fh.write(body)
+        try:
+            with open(txt_path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        except FileNotFoundError:
+            existing = ""
+        new_content = existing + header + "\n" + body
+        tmp = txt_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+                try:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                except OSError as e:
+                    _log.debug("swallowed: %s", e)
+            os.replace(tmp, txt_path)
+        except OSError:
+            try: os.remove(tmp)
+            except OSError: pass
+            return False
         return True
     except OSError:
         return False

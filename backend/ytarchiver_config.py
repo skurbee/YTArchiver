@@ -15,6 +15,7 @@ Keep reads safe; gated writes below go through config_is_writable().
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -270,12 +271,12 @@ def load_config() -> dict[str, Any]:
     dated snapshot in `backups/` before giving up and returning defaults.
     """
     if not CONFIG_FILE.exists():
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
     try:
         with _config_lock:
             with CONFIG_FILE.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-        merged = dict(DEFAULT_CONFIG)
+        merged = copy.deepcopy(DEFAULT_CONFIG)
         merged.update(data)
         # Run migrations exactly once per config, then stamp a flag so
         # subsequent load_config calls skip the work. Previously
@@ -283,34 +284,30 @@ def load_config() -> dict[str, Any]:
         # wasteful, and any future migration accidentally breaking
         # idempotency would silently corrupt state.
         if not merged.get("_migration_v2_pending_tx_ids"):
-            _migrate_pending_tx_ids(merged)
-            # only stamp the migration flag AFTER
-            # save_config returns True. Previously we set the flag,
-            # then wrapped save in except:pass — if the save failed
-            # (antivirus lock, OneDrive sync), the migration re-ran
-            # every launch, and its zero-out of transcription_pending
-            # silently wiped real pending work between boots. Setting
-            # the flag post-save guarantees the re-run only happens
-            # if we truly never persisted.
-            # Patch A: set the flag in `merged` BEFORE save_config so
-            # a single atomic write commits both the migrated state and
-            # the flag together. Previously two save calls were used —
-            # if the second failed (antivirus, OneDrive lock), the
-            # migration would re-run next launch even though its
-            # changes were already on disk. Single-save: either both
-            # the migration and the flag land, or neither does, in
-            # which case re-running is correct.
-            merged["_migration_v2_pending_tx_ids"] = True
+            # Run the migration on a DEEP COPY first. If save_config
+            # fails (antivirus lock, OneDrive sync, disk full), the
+            # in-memory `merged` we return must NOT carry the migrated
+            # values — otherwise the caller keeps using the wiped
+            # state for the rest of the session, and any later
+            # save_config call from a different path commits the wipe
+            # WITHOUT the migration flag, causing the migration to
+            # re-run next launch and re-wipe. The migration's
+            # destructive zero-out of transcription_pending and flip of
+            # transcription_complete makes this a real data-loss path.
+            _candidate = copy.deepcopy(merged)
+            _migrate_pending_tx_ids(_candidate)
+            _candidate["_migration_v2_pending_tx_ids"] = True
             try:
-                if not save_config(merged):
-                    # Unset the in-memory flag too so the rest of this
-                    # session knows migration didn't persist.
-                    merged.pop("_migration_v2_pending_tx_ids", None)
-                    # print → logger so PyInstaller
-                    # --noconsole builds also capture it.
-                    _log.warning("migration save failed; will retry next launch")
+                if save_config(_candidate):
+                    # Only adopt the migrated state into `merged` after
+                    # the save lands on disk. Now in-memory and on-disk
+                    # agree, so subsequent saves can't silently lose
+                    # the migration flag.
+                    merged = _candidate
+                else:
+                    _log.warning(
+                        "migration save failed; will retry next launch")
             except Exception as _me:
-                merged.pop("_migration_v2_pending_tx_ids", None)
                 _log.error("migration save exception: %s", _me)
         return merged
     except (json.JSONDecodeError, OSError) as e:
@@ -326,11 +323,19 @@ def load_config() -> dict[str, Any]:
                         with snap.open("r", encoding="utf-8") as f:
                             data = json.load(f)
                         _log.warning("recovered from snapshot: %s", snap.name)
-                        merged = dict(DEFAULT_CONFIG)
+                        merged = copy.deepcopy(DEFAULT_CONFIG)
                         merged.update(data)
                         # Sideline the corrupt file so the next launch uses the snapshot
                         try:
-                            CONFIG_FILE.rename(CONFIG_FILE.with_suffix(".json.corrupt"))
+                            # Use a unique timestamp suffix so
+                            # repeated corruption events preserve
+                            # forensic evidence instead of overwriting
+                            # the single .json.corrupt slot every
+                            # time.
+                            _ts = int(time.time())
+                            _corrupt_path = CONFIG_FILE.with_suffix(
+                                f".json.corrupt.{_ts}")
+                            CONFIG_FILE.rename(_corrupt_path)
                         except OSError:
                             pass
                         return merged
@@ -338,7 +343,7 @@ def load_config() -> dict[str, Any]:
                         continue
         except Exception as _r:
             _log.error("recovery attempt failed: %s", _r)
-        return dict(DEFAULT_CONFIG)
+        return copy.deepcopy(DEFAULT_CONFIG)
 
 
 # atomic read-modify-write context manager. Use
@@ -374,7 +379,16 @@ def config_transaction():
             # Don't persist partial mutations — re-raise to caller.
             raise
         else:
-            save_config(cfg)
+            # Raise on save failure so the caller can react. Previously
+            # a failed save (disk full, antivirus lock) was swallowed
+            # — the caller's transaction succeeded silently in memory
+            # but never landed on disk, and a later load would return
+            # the stale state with no signal that the mutation was
+            # lost.
+            if not save_config(cfg):
+                raise OSError(
+                    "config_transaction: save_config returned False — "
+                    "mutation not persisted; check log for details")
 
 
 def config_file_exists() -> bool:
@@ -407,9 +421,15 @@ def backup_config_on_start(keep: int = 10) -> str | None:
         ts = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         dst = backup_dir / f"config_{ts}.json"
         shutil.copy2(str(CONFIG_FILE), str(dst))
-        # Prune to `keep` most-recent
+        # Prune to `keep` most-recent. Sort by mtime DESC, then by
+        # filename DESC as a tiebreaker — the filename has a
+        # second-resolution timestamp, so when two snapshots share an
+        # mtime (shutil.copy2 preserves it) the lexicographic order on
+        # the dated filename gives a deterministic newest-first
+        # ordering (audit: ytarchiver_config.py:393-418).
         snaps = sorted(backup_dir.glob("config_*.json"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+                       key=lambda p: (p.stat().st_mtime, p.name),
+                       reverse=True)
         for old in snaps[keep:]:
             try: old.unlink()
             except OSError: pass
@@ -445,17 +465,31 @@ def save_config(cfg: dict[str, Any]) -> bool:
         # months of scroll history. JSON entry is ~250 bytes →
         # ~2.5 MB worst-case in config.json. Trimming in-place on the
         # passed dict is fine — the UI uses a fresh read per render.
+        # Snapshot a serialization-only view of cfg so the autorun_history
+        # trim doesn't mutate the caller's dict. The previous in-place
+        # trim caused callers inside config_transaction to see a
+        # silently-shrunken list immediately after save — calls like
+        # cfg["autorun_history"].append(...) post-save would land on
+        # the trimmed copy and produce inconsistent in-memory snapshots.
+        cfg_for_write = cfg
         try:
             _hist = cfg.get("autorun_history")
             if isinstance(_hist, list) and len(_hist) > 10000:
-                cfg["autorun_history"] = _hist[-10000:]
+                cfg_for_write = dict(cfg)
+                cfg_for_write["autorun_history"] = _hist[-10000:]
         except Exception as e:
             _log.debug("swallowed: %s", e)
         with _config_lock:
             # Write-via-temp for atomicity (matches tkinter app's save_config)
+            # Wrap both paths with _long_path so an OneDrive-redirected
+            # APPDATA on a deeply-nested user profile (>240 chars) can
+            # still write — previously OSError was silently logged and
+            # the user's settings stopped persisting with no signal.
             tmp = CONFIG_FILE.with_suffix(".json.tmp")
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2)
+            _tmp_path = _long_path(str(tmp))
+            _cfg_path = _long_path(str(CONFIG_FILE))
+            with open(_tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cfg_for_write, f, indent=2)
                 # flush + fsync before closing so the
                 # os.replace below commits a file whose contents are
                 # physically on disk (not just in the OS write cache).
@@ -464,7 +498,21 @@ def save_config(cfg: dict[str, Any]) -> bool:
                     os.fsync(f.fileno())
                 except OSError:
                     pass
-            tmp.replace(CONFIG_FILE)
+            os.replace(_tmp_path, _cfg_path)
+            # fsync the parent directory entry too so a power loss
+            # immediately after replace doesn't leave the directory
+            # pointing at a half-committed inode. Only POSIX supports
+            # directory fsync; on Windows there's no direct equivalent,
+            # and the dated backups path is the recovery story.
+            if os.name != "nt":
+                try:
+                    _dfd = os.open(str(APP_DATA_DIR), os.O_RDONLY)
+                    try:
+                        os.fsync(_dfd)
+                    finally:
+                        os.close(_dfd)
+                except OSError as e:
+                    _log.debug("swallowed: %s", e)
         # periodic snapshot. Runs outside the lock because
         # backup_config_on_start does its own I/O. Non-fatal on failure.
         _save_counter += 1

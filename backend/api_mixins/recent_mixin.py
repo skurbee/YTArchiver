@@ -62,7 +62,10 @@ class RecentMixin:
             try: self._reload_config()
             except Exception as e: _log.debug("swallowed: %s", e)
             rows = self.get_recent_downloads() or []
-            js = f"window.renderRecentTable && window.renderRecentTable({_json.dumps(rows)});"
+            # default=str so a Path or datetime sneaking into a row
+            # doesn't raise TypeError, silently freeze the Recent tab
+            # (audit: recent_mixin.py:64-65).
+            js = f"window.renderRecentTable && window.renderRecentTable({_json.dumps(rows, default=str)});"
             self._window.evaluate_js(js)
         except Exception as e:
             # Best-effort — never let a UI push crash the download pipeline.
@@ -84,13 +87,32 @@ class RecentMixin:
         """
         cfg = load_config()
         video_id_hint = ""
-        stored_path = ""
+        # Iterate ALL matching entries — old code returned at the
+        # first stored_path that existed, but with duplicates from
+        # re-download cycles the FIRST match wasn't always the
+        # newest (audit: recent_mixin.py:88-93). Pick the entry
+        # whose file exists with the most recent mtime.
+        _candidates = []
         for r in cfg.get("recent_downloads", []):
             if r.get("title") == title and r.get("channel") == channel:
-                stored_path = r.get("filepath", "") or ""
                 video_id_hint = r.get("video_id", "") or video_id_hint
-                if stored_path and os.path.isfile(stored_path):
-                    return stored_path
+                _sp = r.get("filepath", "") or ""
+                if _sp:
+                    _candidates.append(_sp)
+        _best = None
+        _best_mt = -1.0
+        for _sp in _candidates:
+            try:
+                if os.path.isfile(_sp):
+                    _mt = os.path.getmtime(_sp)
+                    if _mt > _best_mt:
+                        _best_mt = _mt
+                        _best = _sp
+            except OSError:
+                continue
+        if _best:
+            return _best
+        stored_path = _candidates[0] if _candidates else ""
         # DB fallback
         try:
             vids = index_backend.list_recent_videos(limit=500, channel=channel)
@@ -214,6 +236,25 @@ class RecentMixin:
         """Open the YouTube page for this recent video (if we have video_id)."""
         import re as _re
         import webbrowser
+        # Prefer the video_id stashed on the recent_downloads entry —
+        # single-video downloads via archive_single_video write files
+        # without a `[VIDEOID]` suffix in the filename, so the regex
+        # path used to always fail for those rows even though the ID
+        # was sitting right there in config (audit: recent_mixin.py:
+        # 213-223).
+        try:
+            cfg = load_config()
+            for r in (cfg.get("recent_downloads") or []):
+                if r.get("title") == title and r.get("channel") == channel:
+                    vid = (r.get("video_id") or "").strip()
+                    if vid:
+                        webbrowser.open(f"https://www.youtube.com/watch?v={vid}")
+                        return {"ok": True}
+                    break
+        except Exception as _e:
+            _log.debug("swallowed: %s", _e)
+        # Filename-suffix fallback for older entries that pre-date the
+        # video_id field.
         fp = self._recent_lookup_path(title, channel)
         if fp:
             m = _re.search(r"\[([A-Za-z0-9_-]{11})\]", os.path.basename(fp))
@@ -235,6 +276,27 @@ class RecentMixin:
         # Drop sidecars. audit F-24 list lives in utils.delete_video_sidecars.
         from backend.utils import delete_video_sidecars
         delete_video_sidecars(fp)
+        # Mirror video_mixin.video_delete_file's index cleanup so the
+        # FTS / videos rows tied to this filepath are dropped too.
+        # Without this, Browse + Search kept returning "file not
+        # found" hits for the deleted file (audit: recent_mixin.py:
+        # 226-246).
+        try:
+            from backend import index as _idx
+            _conn = _idx._open()
+            if _conn is not None:
+                _stem, _ext = os.path.splitext(fp)
+                _sidecar = _stem + ".jsonl"
+                with _idx._db_lock:
+                    _conn.execute(
+                        "DELETE FROM segments WHERE jsonl_path = ? COLLATE NOCASE",
+                        (_sidecar,))
+                    _conn.execute(
+                        "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
+                        (fp,))
+                    _conn.commit()
+        except Exception as _e:
+            _log.debug("swallowed: %s", _e)
         # Remove from recent_downloads (if writable)
         if config_is_writable():
             cfg = load_config()

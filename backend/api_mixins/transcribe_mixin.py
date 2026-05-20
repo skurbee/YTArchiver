@@ -39,21 +39,31 @@ class TranscribeMixin:
         """Prompt for a folder, recursively queue every untranscribed video.
 
         Mirrors YTArchiver.py:16505 _run_manual_transcription_folder. Skips
-        files that already have a .jsonl sidecar. Runs the folder walk in a
-        background thread so the UI stays responsive.
+        files that already have a .jsonl sidecar.
+
+        Both the modal dialog AND the folder walk now run on a worker
+        thread. Previously the dialog was opened on the js_api bridge
+        thread, freezing the UI thread for the entire duration the user
+        was in the native folder picker (anywhere from a few seconds to
+        a minute on a slow system). With the dialog on a worker thread,
+        the bridge returns immediately and result toast/log lines push
+        via evaluate_js when work finishes.
         """
-        try:
-            import webview as _wv
-            if self._window is None:
-                return {"ok": False, "error": "No window"}
-            paths = self._window.create_file_dialog(_wv.FOLDER_DIALOG)
-            if not paths:
-                return {"ok": False, "cancelled": True}
-            folder = paths if isinstance(paths, str) else paths[0]
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        if self._window is None:
+            return {"ok": False, "error": "No window"}
 
         def _run():
+            try:
+                import webview as _wv
+                paths = self._window.create_file_dialog(_wv.FOLDER_DIALOG)
+            except Exception as e:
+                self._log_stream.emit_error(
+                    f"[GPU] transcribe_folder dialog failed: {e}")
+                self._log_stream.flush()
+                return
+            if not paths:
+                return  # user cancelled
+            folder = paths if isinstance(paths, str) else paths[0]
             queued = 0
             skipped = 0
             for dp, _dns, fns in os.walk(folder):
@@ -74,8 +84,9 @@ class TranscribeMixin:
                 [f"{queued} queued, {skipped} already done\n", "simpleline"],
             ])
             self._log_stream.flush()
-        threading.Thread(target=_run, daemon=True).start()
-        return {"ok": True, "started": True, "folder": folder}
+        threading.Thread(target=_run, daemon=True,
+                         name="transcribe-folder-dialog").start()
+        return {"ok": True, "started": True}
 
 
     def transcribe_retranscribe(self, path, title="", video_id=""):
@@ -135,11 +146,22 @@ class TranscribeMixin:
             from backend.index import _reader_lock, _reader_open
             rconn = _reader_open()
             if rconn is not None:
+                # Look up both normpath AND the raw path COLLATE NOCASE.
+                # Stored rows may have been inserted with a different
+                # slash direction than the JS-supplied path (audit:
+                # transcribe_mixin.py:147), and COLLATE NOCASE handles
+                # case but not slash mixing.
+                _np = os.path.normpath(path)
                 with _reader_lock:
                     row = rconn.execute(
                         "SELECT video_id, channel FROM videos WHERE filepath=? "
                         "COLLATE NOCASE LIMIT 1",
-                        (os.path.normpath(path),)).fetchone()
+                        (_np,)).fetchone()
+                    if not row and _np != path:
+                        row = rconn.execute(
+                            "SELECT video_id, channel FROM videos WHERE filepath=? "
+                            "COLLATE NOCASE LIMIT 1",
+                            (path,)).fetchone()
                 if row:
                     if not vid_id and row[0]:
                         vid_id = row[0]
@@ -202,10 +224,21 @@ class TranscribeMixin:
 
     def transcribe_available(self):
         """Check whether YTArchiver can run whisper (needs Python 3.11)."""
+        # Cache worker_script.exists() — Path.exists() hits the FS
+        # every call, and on a slow mount this added UI hitch every
+        # time the Transcribe section refreshed (audit:
+        # transcribe_mixin.py:206-208).
+        _cached = getattr(self, "_worker_script_exists_cached", None)
+        if _cached is None:
+            try:
+                _cached = bool(self._transcribe._worker_script.exists())
+            except Exception:
+                _cached = False
+            self._worker_script_exists_cached = _cached
         return {
             "ok": self._transcribe.is_available(),
             "python311": self._transcribe._python311,
-            "worker_script_exists": self._transcribe._worker_script.exists(),
+            "worker_script_exists": _cached,
         }
 
 
@@ -229,11 +262,26 @@ class TranscribeMixin:
         if ok and persist:
             if self._config is not None:
                 self._config["whisper_model"] = new_model
+            # Acquire the same settings_save lock so a parallel
+            # settings_save can't load_config, see the OLD whisper
+            # model, mutate, and clobber our write (audit:
+            # transcribe_mixin.py:212-239).
+            try:
+                from backend.api_mixins.settings_mixin import SettingsMixin
+                _lock = SettingsMixin._settings_save_lock
+            except Exception:
+                _lock = None
             try:
                 from backend.ytarchiver_config import save_config as _sc
-                cfg = load_config()
-                cfg["whisper_model"] = new_model
-                _sc(cfg)
+                if _lock is not None:
+                    with _lock:
+                        cfg = load_config()
+                        cfg["whisper_model"] = new_model
+                        _sc(cfg)
+                else:
+                    cfg = load_config()
+                    cfg["whisper_model"] = new_model
+                    _sc(cfg)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         return {"ok": ok, "model": new_model, "persisted": bool(ok and persist)}

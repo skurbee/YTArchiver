@@ -44,8 +44,15 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
 
 # Per-folder fingerprint cache. Adding a new download bumps the folder
 # mtime, so the fingerprint changes naturally and the cache invalidates.
+# Bounded to _SCAN_CACHE_MAX entries to prevent slow leak across days of
+# runtime when many one-off folders (renamed channels, scratch dirs) get
+# scanned (audit: metadata/scan.py:78-83). Eviction policy: when the cap
+# is hit on insert, drop the oldest insertion-order entry. dict in
+# Python 3.7+ preserves insertion order, so iterating `next(iter(d))`
+# returns the oldest key.
 _scan_videos_cache: dict[str, tuple[float, list]] = {}
 _scan_videos_cache_lock = threading.Lock()
+_SCAN_CACHE_MAX = 256
 
 
 def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int | None, str]]:
@@ -143,6 +150,18 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             out.append((vid_id, title, year, month, fp))
     if _fp > 0:
         with _scan_videos_cache_lock:
+            # LRU-ish behavior via dict insertion order. If the key is
+            # already present we re-key by popping first; this moves
+            # it to the end (most-recent). If we're at the cap, drop
+            # the oldest entry before insertion.
+            try:
+                if _folder_str in _scan_videos_cache:
+                    del _scan_videos_cache[_folder_str]
+                while len(_scan_videos_cache) >= _SCAN_CACHE_MAX:
+                    _oldest = next(iter(_scan_videos_cache))
+                    del _scan_videos_cache[_oldest]
+            except Exception:
+                pass
             _scan_videos_cache[_folder_str] = (_fp, list(out))
     return out
 

@@ -150,10 +150,19 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None
                         _c = _idx._open()
                         if _c is not None:
                             with _idx._db_lock:
-                                _c.execute(
-                                    "UPDATE videos SET has_thumbnail=1 "
-                                    "WHERE video_id=?", (vid_id,))
-                                _c.commit()
+                                try:
+                                    _c.execute(
+                                        "UPDATE videos SET has_thumbnail=1 "
+                                        "WHERE video_id=?", (vid_id,))
+                                    _c.commit()
+                                except Exception as _ue:
+                                    # Roll back so a parallel reader
+                                    # doesn't see this UPDATE half-
+                                    # applied (audit: thumbnails_ops.
+                                    # py:149-158).
+                                    try: _c.rollback()
+                                    except Exception: pass
+                                    _log.debug("has_thumbnail rollback: %s", _ue)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 else:
@@ -192,27 +201,73 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
     if not out_dir:
         return {"ok": False, "error": "no output_dir"}
 
-    # Build vid → mp4_parent map from the DB (only rows where the
-    # file actually exists). One query.
+    if channels is None:
+        channels = (load_config() or {}).get("channels", []) or []
+
+    # Build vid → mp4_parent map from the DB. When `channels` is
+    # narrow (typical case — single-channel realign), prefix-filter
+    # the SQL with the channel folder so we don't os.path.isfile()
+    # every row in the videos table. On a 92k-video archive this
+    # was the bottleneck: 92k isfile syscalls per call, all on Z:\
+    # DrivePool, which made realign take minutes to even start.
     vid_to_mp4_parent: dict[str, str] = {}
     try:
         conn = _idx._reader_open() or _idx._open()
         if conn is not None:
             with _idx._reader_lock:
-                for fp, vid in conn.execute(
-                        "SELECT filepath, video_id FROM videos "
-                        "WHERE video_id IS NOT NULL AND video_id<>''"):
-                    if fp and vid and os.path.isfile(fp):
-                        vid_to_mp4_parent[vid] = os.path.normpath(
-                            os.path.dirname(fp))
+                if channels:
+                    # Filter to just the channel folders we'll process.
+                    # LIKE prefix matches normalize via SUBSTR before
+                    # the isfile() check so we only stat files that
+                    # could possibly belong to one of the targeted
+                    # channels.
+                    from backend.sync import channel_folder_name as _cfn
+                    _allowed_prefixes = []
+                    for _ch in channels:
+                        _fn = _cfn(_ch)
+                        if _fn:
+                            _allowed_prefixes.append(
+                                os.path.normpath(os.path.join(out_dir, _fn)))
+                    for fp, vid in conn.execute(
+                            "SELECT filepath, video_id FROM videos "
+                            "WHERE video_id IS NOT NULL AND video_id<>''"):
+                        if not (fp and vid):
+                            continue
+                        _np = os.path.normpath(fp)
+                        if not any(_np.startswith(_p) for _p in _allowed_prefixes):
+                            continue
+                        # Wrap isfile in try/except so a single path-
+                        # too-long row doesn't abort the whole realign
+                        # (audit: metadata/core.py:194-212). Long paths
+                        # are common in deeply-organized archives.
+                        try:
+                            _is_file = os.path.isfile(_np)
+                        except OSError:
+                            continue
+                        if _is_file:
+                            vid_to_mp4_parent[vid] = os.path.normpath(
+                                os.path.dirname(_np))
+                else:
+                    # No channel filter — fall back to the old scan
+                    # (only used when caller explicitly wants a global
+                    # realign).
+                    for fp, vid in conn.execute(
+                            "SELECT filepath, video_id FROM videos "
+                            "WHERE video_id IS NOT NULL AND video_id<>''"):
+                        if not (fp and vid):
+                            continue
+                        try:
+                            _is_file = os.path.isfile(fp)
+                        except OSError:
+                            continue
+                        if _is_file:
+                            vid_to_mp4_parent[vid] = os.path.normpath(
+                                os.path.dirname(fp))
     except Exception as e:
         if stream:
             try: stream.emit_error(f"Couldn't read the archive index for thumbnail repair: {e}")
             except Exception as e: _log.debug("swallowed: %s", e)
         return {"ok": False, "error": str(e)}
-
-    if channels is None:
-        channels = (load_config() or {}).get("channels", []) or []
 
     id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
     scanned = aligned = misaligned = moved = skipped_dest = orphan = 0

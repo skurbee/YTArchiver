@@ -93,6 +93,11 @@
   // Replaces the 137+ inline patterns:
   //   window.pywebview?.api?.foo?.(...)
   //   const api = window.pywebview?.api; if (api) api.foo(...)
+  // Cache returned function wrappers per property name so reference
+  // identity is preserved across accesses — `YT.api.foo === YT.api.foo`
+  // now holds, which matters for removeEventListener-style call sites
+  // (audit: bridge.js:97-110).
+  const _apiFnCache = new Map();
   const _apiProxy = new Proxy({}, {
     get(_target, prop) {
       // Allow JS engines to probe these without firing the toast.
@@ -100,7 +105,9 @@
       if (prop === "then") return undefined;  // not a thenable
       if (prop === "__isProxy") return true;
 
-      return function (...args) {
+      const _cached = _apiFnCache.get(prop);
+      if (_cached) return _cached;
+      const _fn = function (...args) {
         const api = window.pywebview && window.pywebview.api;
         if (api && typeof api[prop] === "function") {
           return api[prop].apply(api, args);
@@ -108,6 +115,8 @@
         _toastNativeRequired();
         return undefined;
       };
+      _apiFnCache.set(prop, _fn);
+      return _fn;
     },
   });
 
@@ -127,23 +136,58 @@
 
   // ── Ready-gate ──────────────────────────────────────────────────
   // Called from Python (evaluate_js) when Stage 1 of startup finishes.
+  let _readyState = false;
+  function _applyReadyTo(el, on) {
+    if (on) {
+      el.removeAttribute("disabled");
+      el.classList.remove("is-locked-pre-ready");
+    } else {
+      el.setAttribute("disabled", "");
+      el.classList.add("is-locked-pre-ready");
+    }
+  }
   function setReady(ready) {
-    const on = !!ready;
+    _readyState = !!ready;
     document.querySelectorAll("[data-needs-ready]").forEach(el => {
-      if (on) {
-        el.removeAttribute("disabled");
-        el.classList.remove("is-locked-pre-ready");
-      } else {
-        el.setAttribute("disabled", "");
-        el.classList.add("is-locked-pre-ready");
-      }
+      _applyReadyTo(el, _readyState);
     });
+  }
+  // MutationObserver so dynamically-added [data-needs-ready] elements
+  // inherit the latest ready state. Without this, elements added
+  // after setReady was last called stayed un-ready forever (audit:
+  // bridge.js:131-140).
+  if (typeof MutationObserver === "function") {
+    try {
+      const _mo = new MutationObserver(_records => {
+        for (const rec of _records) {
+          for (const node of rec.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            if (node.hasAttribute && node.hasAttribute("data-needs-ready")) {
+              _applyReadyTo(node, _readyState);
+            }
+            if (node.querySelectorAll) {
+              node.querySelectorAll("[data-needs-ready]").forEach(el => {
+                _applyReadyTo(el, _readyState);
+              });
+            }
+          }
+        }
+      });
+      _mo.observe(document.body || document.documentElement, {
+        childList: true, subtree: true,
+      });
+    } catch (_e) { /* MutationObserver unavailable on this WebView */ }
   }
 
   // Bare-bones bridgeCall — the legacy app.js name. Kept for back-compat
   // until the migration completes; new code should use YT.api.* directly.
   function bridgeCall(method, ...args) {
-    return _apiProxy[method](...args);
+    // Defensive: if `method` resolves to undefined (e.g. someone
+    // called `bridgeCall("then", ...)` while we serve "then" as
+    // not-a-thenable), don't invoke undefined as a function (audit:
+    // bridge.js:148).
+    const fn = _apiProxy[method];
+    return typeof fn === "function" ? fn(...args) : undefined;
   }
 
   // ── Expose ──────────────────────────────────────────────────────

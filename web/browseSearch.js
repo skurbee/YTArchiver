@@ -93,7 +93,28 @@
     body.innerHTML = "";
     const frag = document.createDocumentFragment();
     const q = _searchViewerState.query;
-    const qWords = q ? q.toLowerCase().replace(/["*]/g, "").split(/\s+/).filter(Boolean) : [];
+    // Strip FTS5 operator tokens before highlighting. Old code only
+    // dropped quotes/star, so a query like "cats AND dogs" highlighted
+    // the literal word "and" in every viewer segment (audit:
+    // browseSearch.js:96). FTS5 ops we filter: AND, OR, NOT, NEAR,
+    // and leading/embedded ^.
+    const _FTS_OPS = new Set(["and", "or", "not", "near"]);
+    const qWords = q
+      ? q.toLowerCase()
+         .replace(/["*]/g, "")
+         .replace(/\bnear\s*\([^)]*\)/g, " ") // NEAR(...) → drop entirely
+         .replace(/[\^()]/g, " ")
+         .split(/\s+/)
+         .filter(w => w && !_FTS_OPS.has(w))
+      : [];
+    // Pre-compile the alternation regex ONCE per render. Building it
+    // inside the per-segment loop wasted ~N-1 RegExp compilations on a
+    // 50-segment context window (same pattern, same flags). Hoisted
+    // out so each segment just runs `re.exec` against fresh text.
+    const _hlParts = qWords
+      .filter(Boolean)
+      .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const _hlRe = _hlParts.length ? new RegExp("(" + _hlParts.join("|") + ")", "gi") : null;
     let scrollTarget = null;
     for (const seg of (ctx.segments || [])) {
       const row = document.createElement("div");
@@ -106,17 +127,36 @@
       txtEl.className = "sv-text";
       // Highlight query words inside the text for visual parity with the
       // snippet <mark> tags from the list side.
-      if (qWords.length) {
-        const esc = escapeHtml(seg.t || "");
-        let html = esc;
-        for (const w of qWords) {
-          if (!w) continue;
-          const re = new RegExp("(" + w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
-          html = html.replace(re, '<mark>$1</mark>');
+      // Build the highlight via DOM nodes (createTextNode + <mark>)
+      // instead of innerHTML. The old multi-pass `html.replace(re, '<mark>')`
+      // pattern was vulnerable to two issues: (a) overlapping matches from
+      // sequential passes corrupted previously-inserted <mark> tags, and
+      // (b) any future change that loosened the escapeHtml step would
+      // let raw HTML from segment text reach innerHTML. textContent is
+      // immune to both.
+      const _txt = seg.t || "";
+      if (_hlRe) {
+        // Reuse the hoisted alternation regex; reset lastIndex
+        // since /g state persists across exec() calls.
+        _hlRe.lastIndex = 0;
+        let last = 0;
+        let m;
+        while ((m = _hlRe.exec(_txt)) !== null) {
+          if (m.index > last) {
+            txtEl.appendChild(document.createTextNode(_txt.slice(last, m.index)));
+          }
+          const mk = document.createElement("mark");
+          mk.textContent = m[0];
+          txtEl.appendChild(mk);
+          last = m.index + m[0].length;
+          // Guard against zero-width matches (empty alternation branch).
+          if (m[0].length === 0) _hlRe.lastIndex++;
         }
-        txtEl.innerHTML = html;
+        if (last < _txt.length) {
+          txtEl.appendChild(document.createTextNode(_txt.slice(last)));
+        }
       } else {
-        txtEl.textContent = seg.t || "";
+        txtEl.textContent = _txt;
       }
       row.append(tsEl, txtEl);
       // Click a segment in the viewer → open in Watch view at that ts
@@ -380,6 +420,27 @@
         const [txRows, tiRows] = await Promise.all(promises);
         if (myId !== _searchSeq) return; // user kicked off a newer search; drop stale results
         let rows = [...txRows, ...tiRows];
+        // Re-sort the merged list by the user's chosen sort key. Each
+        // leg was sorted server-side, but a naive [...txRows, ...tiRows]
+        // concat put every transcript hit before every title hit
+        // regardless of date / channel / title (audit:
+        // browseSearch.js:381). For "relevance" we leave the order as-is
+        // (transcripts have an FTS score, titles don't — no meaningful
+        // unified score).
+        if (rows.length > 1 && wantTranscripts && wantTitles && sortKey !== "relevance") {
+          const _cmpStr = (a, b) =>
+            String(a || "").localeCompare(String(b || ""),
+                                          undefined, { sensitivity: "base" });
+          const _cmpNum = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+          rows.sort((a, b) => {
+            if (!a || !b) return 0;
+            if (sortKey === "newest")  return _cmpNum(b.added_ts, a.added_ts);
+            if (sortKey === "oldest")  return _cmpNum(a.added_ts, b.added_ts);
+            if (sortKey === "channel") return _cmpStr(a.channel, b.channel);
+            if (sortKey === "title")   return _cmpStr(a.title, b.title);
+            return 0;
+          });
+        }
         // Surface a backend-shaped error row if either leg returned one.
         const errRow = rows.find(r => r && r.error);
         if (errRow) rows = [errRow];
@@ -514,7 +575,15 @@
       }
     };
     btn?.addEventListener("click", doSearch);
-    input?.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+    // Repeat-fire guard: holding Enter generates a stream of keydown events
+    // (autorepeat). Each one would queue a new doSearch and pile up API
+    // calls. e.repeat short-circuits the autorepeat stream so we only
+    // fire once per physical Enter press. _searchSeq still drops any
+    // stale responses if the user does press Enter multiple times.
+    input?.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" || e.repeat) return;
+      doSearch();
+    });
     // Re-run on sort change so the user doesn't have to re-click Search
     // every time they pick a different ordering. Only re-runs when the
     // query box has something in it — avoids a spurious search on first

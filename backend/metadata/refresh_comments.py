@@ -123,10 +123,20 @@ def refresh_channel_comments(channel: dict[str, Any],
             return False
         try:
             # ISO format from datetime.now().isoformat() — no tz, local.
+            # On naive datetimes .timestamp() interprets as local time,
+            # which means a DST transition during a multi-hour pass
+            # shifts the comparison by ±3600s — skipping a video that
+            # hadn't actually been refreshed, OR re-refreshing one
+            # that had. Add a 1-hour tolerance to the comparison so
+            # DST drift can't slip past it.
             ts = datetime.fromisoformat(str(fa)).timestamp()
         except (ValueError, TypeError):
             return False
-        return ts >= _pass_start_ts
+        # Subtract 3600 so a comparison near a DST transition still
+        # correctly classifies "fetched during THIS pass" — false
+        # negatives (re-fetching) are acceptable; false positives
+        # (skipping a real refresh) are the actual bug.
+        return ts >= (_pass_start_ts - 3600)
     _skipped_already_done = 0
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:

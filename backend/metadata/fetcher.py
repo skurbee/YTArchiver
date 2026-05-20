@@ -46,6 +46,31 @@ from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
 from ..utils import utf8_subprocess_env as _utf8_env
 from .scan import _group_by_metadata_path, _scan_channel_videos
 
+
+# Module-scoped tracking for in-flight metadata-fetch subprocesses.
+# Used so a cancel during a bulk pre-fetch can forcibly kill the
+# yt-dlp processes WITHOUT touching sync's separate yt-dlp procs
+# (which use the global PROCESS_REGISTRY). Set is mutated under lock
+# so concurrent worker threads can add/remove safely.
+_inflight_procs: set[subprocess.Popen] = set()
+_inflight_procs_lock = threading.Lock()
+
+
+def _kill_inflight_metadata_procs() -> int:
+    """Terminate every in-flight _fetch_video_metadata yt-dlp Popen.
+    Called by the bulk pre-fetch cancel handler. Returns count killed."""
+    with _inflight_procs_lock:
+        procs = list(_inflight_procs)
+    killed = 0
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.kill()
+                killed += 1
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    return killed
+
 _log = get_logger(__name__)
 
 
@@ -86,50 +111,104 @@ def _fetch_video_metadata(yt: str, video_id: str,
     _attempts = (60, 60, 90)
     for _attempt_idx, _attempt_timeout in enumerate(_attempts):
         try:
+            # CREATE_NEW_PROCESS_GROUP so taskkill /T /F on cancel/timeout
+            # also reaps spawned ffmpeg/curl children. Without it,
+            # proc.kill() only kills yt-dlp itself and orphaned child
+            # processes pile up over a long refresh — eventually
+            # exhausting handles or holding the cookie file lock
+            # (audit: metadata/fetcher.py:99-111). 0x00000200 is
+            # CREATE_NEW_PROCESS_GROUP on Windows.
+            _creationflags = 0
+            if os.name == "nt":
+                _creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
             proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 encoding="utf-8", errors="replace",
                 startupinfo=_startupinfo,
                 env=_utf8_env(),
+                creationflags=_creationflags,
             )
         except OSError:
             return None
+        # Register this yt-dlp Popen in a module-scoped set so a
+        # cancel-during-bulk-fetch can forcibly kill in-flight metadata
+        # fetches without disturbing sync's downloads. Each call can
+        # chew up to ~210s across its three attempts; without targeted
+        # kill, cancel feels "stuck" for many minutes during a bulk
+        # pre-fetch (max_workers=3, ~1000 videos).
+        with _inflight_procs_lock:
+            _inflight_procs.add(proc)
         try:
-            stdout, _ = proc.communicate(timeout=_attempt_timeout)
-            _rc = proc.returncode
-            break
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try: proc.communicate(timeout=5)
-            except Exception as e: _log.debug("swallowed: %s", e)
-            if _attempt_idx == len(_attempts) - 1:
-                # All attempts exhausted — still a transient signal,
-                # not a permanent failure. audit E-11 sentinel.
-                return {"_timeout": True}
-            # Short backoff before retry
-            time.sleep(2 ** _attempt_idx)  # 1s, 2s
+            try:
+                stdout, _ = proc.communicate(timeout=_attempt_timeout)
+                _rc = proc.returncode
+                break
+            except subprocess.TimeoutExpired:
+                # Use taskkill /T /F on Windows so the entire process
+                # tree (yt-dlp + any ffmpeg/curl children it spawned)
+                # gets reaped, not just the top-level yt-dlp (audit:
+                # metadata/fetcher.py:99-111).
+                _reaped = False
+                if os.name == "nt":
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                            capture_output=True, timeout=5,
+                            creationflags=0x08000000,  # CREATE_NO_WINDOW
+                        )
+                        _reaped = True
+                    except Exception as _tk:
+                        _log.debug("taskkill /T failed: %s", _tk)
+                if not _reaped:
+                    try: proc.kill()
+                    except Exception: pass
+                try: proc.communicate(timeout=5)
+                except Exception as e: _log.debug("swallowed: %s", e)
+                if _attempt_idx == len(_attempts) - 1:
+                    # All attempts exhausted — still a transient signal,
+                    # not a permanent failure. audit E-11 sentinel.
+                    return {"_timeout": True}
+                # Short backoff before retry
+                time.sleep(2 ** _attempt_idx)  # 1s, 2s
+        finally:
+            with _inflight_procs_lock:
+                _inflight_procs.discard(proc)
     if _rc is None or _rc != 0:
         return None
 
-    # yt-dlp --dump-json writes exactly one JSON object on
-    # stdout followed by newline. Parse line-by-line looking for a
-    # line that starts with `{` and parses cleanly. This is robust
-    # against warning chatter that contains literal `{` characters
-    # (e.g. jinja-ish template errors, thumbnail URLs with braces).
+    # yt-dlp --dump-json writes exactly one JSON object on stdout.
+    # Try the WHOLE stdout first — that's the canonical case and
+    # handles descriptions/comments containing literal `{` characters
+    # (which broke the line-by-line + find/rfind heuristic on videos
+    # where the description had a `{` near the top: the slice would
+    # extract an invalid sub-substring and treat the fetch as failed,
+    # which then set metadata_fetch_failed_ts and made the video
+    # un-retryable on future rechecks). Fall back to the line-scan
+    # only if the whole-stdout parse fails (e.g. extractor warnings
+    # leaked onto stdout).
     data: dict[str, Any] | None = None
-    for _line in stdout.splitlines():
-        _ls = _line.strip()
-        if not _ls or _ls[0] != "{":
-            continue
-        try:
-            data = json.loads(_ls)
-            break
-        except Exception:
-            continue
+    try:
+        data = json.loads(stdout)
+        if not isinstance(data, dict):
+            data = None
+    except Exception:
+        data = None
     if data is None:
-        # Fall back to the old slice-between-first-and-last-brace
-        # parse, which handles pretty-printed multi-line output.
+        for _line in stdout.splitlines():
+            _ls = _line.strip()
+            if not _ls or _ls[0] != "{":
+                continue
+            try:
+                data = json.loads(_ls)
+                break
+            except Exception:
+                continue
+    if data is None:
+        # Last-resort slice-between-first-and-last-brace parse. Same
+        # caveat as before — fragile against descriptions containing
+        # `{` — kept for back-compat but the whole-stdout path above
+        # should win in normal operation.
         js = stdout.find("{")
         je = stdout.rfind("}")
         if js < 0 or je <= js:
@@ -422,22 +501,43 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
         thumb_dir = _ensure_thumbnails_dir(g["subfolder"])
         changed = False
 
+        # Hoist the thumbnail listing once per group. Old code did
+        # os.listdir() inside _has_thumbnail_for, called per-video,
+        # so a 1000-video group did 1000 redundant directory walks
+        # against the same .Thumbnails folder (audit: metadata/
+        # fetcher.py:425-440). Build a set of `[vid]` substrings
+        # extracted from the listing and check membership in O(1).
+        _thumb_brackets: set[str] = set()
+        if os.path.isdir(thumb_dir):
+            try:
+                _IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+                for _fn in os.listdir(thumb_dir):
+                    if not _fn.lower().endswith(_IMG_EXTS):
+                        continue
+                    # Extract every `[xxx]` chunk from the filename and
+                    # add to the set. Real thumbs only have ONE bracket
+                    # group (the video id), but tolerate weirder names.
+                    _i = 0
+                    while True:
+                        _o = _fn.find("[", _i)
+                        if _o < 0:
+                            break
+                        _c = _fn.find("]", _o + 1)
+                        if _c < 0:
+                            break
+                        _thumb_brackets.add(_fn[_o:_c+1])
+                        _i = _c + 1
+            except OSError:
+                pass
+
         def _has_thumbnail_for(vid: str) -> bool:
             """Check if any thumbnail file in this group's .Thumbnails
             folder matches `[vid]`. a case: 2 videos had metadata
             but no thumbnail — the old skip-if-in-existing check treated
             those as "complete" and never re-downloaded the thumbnail."""
-            if not vid or not os.path.isdir(thumb_dir):
+            if not vid:
                 return False
-            bracket = f"[{vid}]"
-            try:
-                for _fn in os.listdir(thumb_dir):
-                    if bracket in _fn and _fn.lower().endswith(
-                            (".jpg", ".jpeg", ".png", ".webp")):
-                        return True
-            except OSError:
-                pass
-            return False
+            return f"[{vid}]" in _thumb_brackets
 
         # Patch F (followup): parallel pre-fetch metadata for this
         # group. Previously the inner loop called _fetch_video_metadata
@@ -490,6 +590,22 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                         if cancel_event is not None and cancel_event.is_set():
                             for _f in _pf_futs:
                                 _f.cancel()
+                            # .cancel() only stops futures that haven't
+                            # started yet; in-flight workers keep
+                            # running until their subprocess timeout
+                            # (~210s worst case). Kill the in-flight
+                            # metadata-fetch yt-dlp procs targeted via
+                            # the module-scoped registry so cancel feels
+                            # responsive — without touching sync's own
+                            # yt-dlp procs in PROCESS_REGISTRY.
+                            try:
+                                _killed = _kill_inflight_metadata_procs()
+                                if _killed:
+                                    _log.info(
+                                        "metadata cancel killed %d "
+                                        "in-flight yt-dlp procs", _killed)
+                            except Exception as _ke:
+                                _log.debug("swallowed: %s", _ke)
                             break
                         _vid_done = _pf_futs[_fut]
                         try:
@@ -602,20 +718,62 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     ["Metadata failed — ", "red"],
                     [f"{title[:90]}\n", "simpleline"],
                 ])
-                # Mark this video_id as permanently failed so future
-                # rechecks don't re-hit yt-dlp for it. Matches OLD's
-                # `metadata_fetch_failed_ts` pattern — cleared on
-                # refresh=True via fetch_channel_metadata's purge.
+                # Mark this video_id as permanently failed only after
+                # N consecutive failed attempts — soft-failure
+                # tracking. The previous one-shot stamp meant a
+                # single transient yt-dlp error (throttle, network
+                # blip surviving all 3 retries) marked the video as
+                # failed forever, and future rechecks would skip it
+                # via the _failed_fetch set. Now we use a counter
+                # column `metadata_fetch_fail_count`; only after 3
+                # consecutive failures do we stamp the permanent
+                # flag. The counter resets on success (handled by
+                # the merge/insert path elsewhere).
+                _PERM_FAIL_THRESHOLD = 3
                 try:
                     from .. import index as _idx
-                    conn = _idx._open()
-                    if conn is not None:
-                        with _idx._db_lock:
-                            conn.execute(
-                                "UPDATE videos SET metadata_fetch_failed_ts=? "
-                                "WHERE video_id=?",
-                                (time.time(), vid_id))
-                            conn.commit()
+                    # Move _idx._open() INSIDE the lock + add an
+                    # explicit try/except/rollback around the UPDATE
+                    # batch. Old code opened outside the lock and let
+                    # an exception leak after a partial COALESCE
+                    # increment — flag write could half-apply (audit:
+                    # metadata/fetcher.py:611-619).
+                    with _idx._db_lock:
+                        conn = _idx._open()
+                        if conn is not None:
+                            try:
+                                # Ensure the column exists (lazy migration
+                                # — cheap, only happens once per process).
+                                try:
+                                    conn.execute(
+                                        "ALTER TABLE videos ADD COLUMN "
+                                        "metadata_fetch_fail_count INTEGER "
+                                        "DEFAULT 0")
+                                except Exception:
+                                    pass
+                                conn.execute(
+                                    "UPDATE videos SET "
+                                    "metadata_fetch_fail_count = "
+                                    "COALESCE(metadata_fetch_fail_count, 0) + 1 "
+                                    "WHERE video_id=?",
+                                    (vid_id,))
+                                row = conn.execute(
+                                    "SELECT MIN(metadata_fetch_fail_count) "
+                                    "FROM videos WHERE video_id=?",
+                                    (vid_id,)).fetchone()
+                                _fail_n = int(row[0] or 0) if row else 0
+                                if _fail_n >= _PERM_FAIL_THRESHOLD:
+                                    conn.execute(
+                                        "UPDATE videos SET "
+                                        "metadata_fetch_failed_ts=? "
+                                        "WHERE video_id=?",
+                                        (time.time(), vid_id))
+                                conn.commit()
+                            except Exception as _ue:
+                                try: conn.rollback()
+                                except Exception: pass
+                                _log.warning(
+                                    "fail-count UPDATE rolled back: %s", _ue)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
                 continue

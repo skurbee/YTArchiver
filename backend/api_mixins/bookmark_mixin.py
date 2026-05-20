@@ -80,9 +80,32 @@ class BookmarkMixin:
             )
             if not paths:
                 return {"ok": False, "cancelled": True}
-            path = paths if isinstance(paths, str) else paths[0]
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(buf.getvalue())
+            if isinstance(paths, str):
+                path = paths
+            else:
+                try:
+                    if not len(paths):
+                        return {"ok": False, "cancelled": True}
+                    path = paths[0]
+                except (TypeError, IndexError):
+                    return {"ok": False, "cancelled": True}
+            # Atomic tmp+replace so a mid-write disk-full doesn't
+            # clobber a pre-existing CSV the user picked to overwrite
+            # (audit: bookmark_mixin.py:58-88).
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8", newline="") as f:
+                    f.write(buf.getvalue())
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+            except Exception:
+                try: os.remove(tmp)
+                except OSError: pass
+                raise
             return {"ok": True, "path": path, "count": len(bms)}
         except Exception as e:
             return {"ok": False, "error": str(e)}

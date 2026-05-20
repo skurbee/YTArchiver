@@ -26,7 +26,7 @@ import unicodedata
 
 _WS_RE = re.compile(r"\s+")
 _TRAILING_PUNCT_RE = re.compile(r"[.?!]+$")
-_ID_BRACKET_RE = re.compile(r"\s*\[[a-z0-9_-]{11}\]\s*$")
+_ID_BRACKET_RE = re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
 _ALNUM_COLLAPSE_RE = re.compile(r"[^a-z0-9]+")
 _WIN_ILLEGAL_RE = re.compile(r'[<>:"/\\|?*]')
 
@@ -106,16 +106,32 @@ def normalize_title(
 
 
 def normalize_title_loose(s: str) -> str:
-    """Stricter normalize — strips ALL punctuation, not just trailing.
+    """Stricter normalize — strips ALL punctuation, not just trailing,
+    AND ASCII-folds accented letters so "café" matches "cafe".
 
     Useful for fuzzy matching where "title — pt 1" and "title pt 1" should
     key together. The trailing-punct-only `normalize_title` is the default;
     use this variant when you specifically need punctuation-insensitive
     matching across the whole title.
+
+    audit: text_utils.py:108-122 — old code used NFKC which preserved
+    non-ASCII letters, so this "stricter" form was actually LESS strict
+    than the alnum_only normalizer. NFKD + ASCII-encode-with-ignore
+    strips the combining marks, dropping "café" → "cafe".
     """
     if not s:
         return ""
-    t = unicodedata.normalize("NFKC", s).strip().lower()
+    t = unicodedata.normalize("NFKD", s)
+    # Drop combining marks (the NFKD-separated accents) but keep base
+    # letters. Anything that can't round-trip to ASCII (CJK chars) is
+    # preserved verbatim — folding to "?" or dropping would hurt
+    # matching for transliterated channel names.
+    _ascii = t.encode("ascii", "ignore").decode("ascii")
+    # If ASCII-fold ate everything (pure non-ASCII title), fall back to
+    # the original NFKC form so we still have something to match on.
+    if not _ascii.strip():
+        _ascii = unicodedata.normalize("NFKC", s)
+    t = _ascii.strip().lower()
     # Drop everything that isn't a word char or whitespace, then collapse.
     t = re.sub(r"[^\w\s]+", " ", t)
     t = _WS_RE.sub(" ", t).strip()
@@ -188,13 +204,27 @@ def extract_video_id(
 
     if conn is not None and path:
         try:
+            # Try BOTH normpath AND raw path. Rows in DB may have been
+            # inserted with different slash direction (Z:\Foo/Bar vs
+            # Z:\Foo\Bar). COLLATE NOCASE handles case but not slash
+            # mixing (audit: text_utils.py:191-198). Two cheap UNIQUE
+            # lookups is faster than scanning + normalizing every row.
+            _norm = os.path.normpath(path)
             row = conn.execute(
                 "SELECT video_id FROM videos WHERE filepath = ? "
                 "COLLATE NOCASE LIMIT 1",
-                (os.path.normpath(path),),
+                (_norm,),
             ).fetchone()
             if row and row[0] and _ok(str(row[0])):
                 return str(row[0])
+            if _norm != path:
+                row = conn.execute(
+                    "SELECT video_id FROM videos WHERE filepath = ? "
+                    "COLLATE NOCASE LIMIT 1",
+                    (path,),
+                ).fetchone()
+                if row and row[0] and _ok(str(row[0])):
+                    return str(row[0])
         except Exception:
             pass
 
@@ -203,9 +233,12 @@ def extract_video_id(
             import json as _json
             from pathlib import Path as _Path
             fp = _Path(path)
-            info_json = fp.with_suffix("").with_suffix(".info.json")
-            if not info_json.is_file():
-                info_json = fp.parent / (fp.stem + ".info.json")
+            # Sidecar naming preserves the FULL stem (incl. yt-dlp
+            # format tags like ".f137"). The previous double
+            # .with_suffix("").with_suffix(".info.json") collapsed
+            # multi-dot stems and looked up the wrong filename first
+            # (audit: text_utils.py:206-216). Use stem+suffix directly.
+            info_json = fp.parent / (fp.stem + ".info.json")
             if info_json.is_file():
                 with info_json.open("r", encoding="utf-8") as f:
                     data = _json.load(f)

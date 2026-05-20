@@ -98,6 +98,17 @@ class IndexMixin:
             folder = (cfg.get("output_dir") or "").strip()
         if not folder or not os.path.isdir(folder):
             return {"ok": False, "error": "Folder not found"}
+        # Re-entry guard — double-click on the button or rapid retries
+        # used to launch parallel sweeps over the same tree, racing on
+        # os.remove + on the DELETE FROM segments.
+        if not hasattr(self, "_delete_transcripts_lock"):
+            self._delete_transcripts_lock = threading.Lock()
+            self._delete_transcripts_running = False
+        with self._delete_transcripts_lock:
+            if self._delete_transcripts_running:
+                return {"ok": False,
+                        "error": "Delete-all-transcripts is already running"}
+            self._delete_transcripts_running = True
         def _run():
             self._log_stream.emit_text(
                 f"\u26A0 Deleting all transcripts under {folder}\u2026",
@@ -146,7 +157,13 @@ class IndexMixin:
                 "FTS index cleared.",
                 "simpleline_red")
             self._log_stream.flush()
-        threading.Thread(target=_run, daemon=True).start()
+        def _run_wrapped():
+            try:
+                _run()
+            finally:
+                with self._delete_transcripts_lock:
+                    self._delete_transcripts_running = False
+        threading.Thread(target=_run_wrapped, daemon=True).start()
         return {"ok": True, "started": True}
 
 
@@ -193,6 +210,17 @@ class IndexMixin:
         """Drop + rebuild the FTS5 virtual table from scratch. Runs on a
         background thread and emits progress to the log. Returns immediately.
         """
+        # Re-entry guard \u2014 double-click would launch two concurrent
+        # DROP+REBUILD passes that race on the same FTS table, leaving
+        # the index in a partial/garbled state until the user noticed
+        # and clicked Rebuild a third time.
+        if not hasattr(self, "_fts_rebuild_lock"):
+            self._fts_rebuild_lock = threading.Lock()
+            self._fts_rebuild_running = False
+        with self._fts_rebuild_lock:
+            if self._fts_rebuild_running:
+                return {"ok": False, "error": "FTS rebuild already running"}
+            self._fts_rebuild_running = True
         def _run():
             try:
                 self._log_stream.emit_text(
@@ -210,5 +238,7 @@ class IndexMixin:
                 self._log_stream.emit_error(f"FTS rebuild crashed: {e}")
             finally:
                 self._log_stream.flush()
+                with self._fts_rebuild_lock:
+                    self._fts_rebuild_running = False
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}

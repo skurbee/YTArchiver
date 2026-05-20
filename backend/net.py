@@ -33,6 +33,10 @@ _poll_interval_sec = 30.0
 _probe_timeout_sec = 5.0
 
 
+_probe_inflight_lock = threading.Lock()
+_probe_inflight = False
+
+
 def probe_once(timeout: float = _probe_timeout_sec) -> bool:
     """Return True if at least one probe host answers a TCP handshake.
 
@@ -44,23 +48,44 @@ def probe_once(timeout: float = _probe_timeout_sec) -> bool:
     YouTube itself was reachable. With parallel probes the worst-case
     latency is the per-host timeout, not its multiple.
     """
-    result_event = threading.Event()
-    success = [False]
-    def _probe(host: str, port: int):
-        try:
-            with socket.create_connection((host, port), timeout=timeout):
-                success[0] = True
-                result_event.set()
-        except (TimeoutError, socket.gaierror, OSError):
-            pass
-    threads = []
-    for host, port in _PROBE_HOSTS:
-        t = threading.Thread(target=_probe, args=(host, port), daemon=True)
-        t.start()
-        threads.append(t)
-    # Wait either until one succeeds or all have finished trying.
-    result_event.wait(timeout=timeout + 0.5)
-    return success[0]
+    # Coalesce concurrent probes. Old code returned on first-host
+    # success but left the remaining probe threads running with their
+    # own 5s timeouts; if block_if_down re-probed every 5s under
+    # extended network failure, threads piled up faster than they
+    # finished (audit: net.py:62). Now we refuse to start a second
+    # batch while one is still in flight — the caller just observes
+    # the cached net_down state instead.
+    global _probe_inflight
+    with _probe_inflight_lock:
+        if _probe_inflight:
+            return not net_down.is_set()
+        _probe_inflight = True
+    try:
+        result_event = threading.Event()
+        success = [False]
+        remaining = [len(_PROBE_HOSTS)]
+        remaining_lock = threading.Lock()
+        def _probe(host: str, port: int):
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    success[0] = True
+                    result_event.set()
+            except (TimeoutError, socket.gaierror, OSError):
+                pass
+            finally:
+                with remaining_lock:
+                    remaining[0] -= 1
+                    if remaining[0] <= 0:
+                        result_event.set()
+        for host, port in _PROBE_HOSTS:
+            t = threading.Thread(target=_probe, args=(host, port), daemon=True)
+            t.start()
+        # Wait either until one succeeds or all have finished trying.
+        result_event.wait(timeout=timeout + 0.5)
+        return success[0]
+    finally:
+        with _probe_inflight_lock:
+            _probe_inflight = False
 
 
 def start_monitor():

@@ -38,17 +38,22 @@ def _hide_sidecar_win(video_path: str) -> None:
         _utils.hide_file_win(sidecar)
 
 
-def _sweep_orphan_vtts(channel_folder: str) -> int:
+def _sweep_orphan_vtts(channel_folder: str, cancel_event=None) -> int:
     """Delete orphan `.vtt` / `.ttml` / `.srt` caption sidecars under a
     channel folder. Called after each sync pass — ensures the archive
     stays clean even when auto-transcribe is off or when the transcribe
     fast-path crashed mid-run.
+
+    Accepts an optional cancel_event so a multi-TB archive cancel
+    feels responsive (audit: sync/sync_helpers.py:51).
     """
     if not channel_folder or not os.path.isdir(channel_folder):
         return 0
     removed = 0
     exts = (".vtt", ".ttml", ".srt")
     for dp, _dns, fns in os.walk(channel_folder):
+        if cancel_event is not None and cancel_event.is_set():
+            break
         # Skip the hidden Thumbnails folder
         base = os.path.basename(dp)
         if base == ".Thumbnails" or base == ".ChannelArt":

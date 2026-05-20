@@ -13,10 +13,18 @@ from ._shared import *  # noqa: F401,F403
 
 class StartupMixin:
 
+    _startup_lock = threading.Lock()
+
     def startup_ready(self):
         """Called by JS on DOMContentLoaded. Kicks off the startup log sequence."""
-        if getattr(self, "_startup_fired", False):
-            return {"ok": True, "already": True}
-        self._startup_fired = True
+        # Atomic check-and-set under a class-level lock so a rare
+        # reload race (DOMContentLoaded firing twice during a hot
+        # reload) doesn't spawn the startup sequence thread twice
+        # and double up the boot log lines (audit: startup_mixin.py:
+        # 18-22).
+        with StartupMixin._startup_lock:
+            if getattr(self, "_startup_fired", False):
+                return {"ok": True, "already": True}
+            self._startup_fired = True
         threading.Thread(target=self._run_startup_sequence, daemon=True).start()
         return {"ok": True}

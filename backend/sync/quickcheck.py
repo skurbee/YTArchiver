@@ -72,7 +72,24 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
         deadline = time.time() + float(timeout_sec)
         for line in proc.stdout:
             if time.time() > deadline:
-                proc.terminate()
+                # Drain stdout in a background thread before terminate
+                # so a full pipe doesn't deadlock the subsequent wait
+                # (audit: sync/quickcheck.py:87). yt-dlp can dump
+                # output faster than we consume it on a wide-screen
+                # console; without the drain, proc.terminate() then
+                # proc.wait() can hang because the OS pipe buffer is
+                # full and the child blocks on write().
+                try: proc.terminate()
+                except Exception: pass
+                try:
+                    import threading as _th
+                    def _drain():
+                        try:
+                            while proc.stdout.readline():
+                                pass
+                        except Exception: pass
+                    _th.Thread(target=_drain, daemon=True).start()
+                except Exception: pass
                 break
             raw = line.strip()
             if "|||" not in raw:
@@ -85,9 +102,13 @@ def prefetch_channel_total(ch_url: str, timeout_sec: int = 30
             elif status == "is_upcoming":
                 upcoming += 1
     finally:
+        # Bound the post-kill wait so a child refusing to die can't
+        # leak a Windows handle until GC (audit: sync/quickcheck.py:88).
         try: proc.wait(timeout=5)
         except Exception:
             try: proc.kill()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            try: proc.wait(timeout=5)
             except Exception as e: _log.debug("swallowed: %s", e)
     return {"ok": True, "total": total, "lives": lives, "upcoming": upcoming}
 
@@ -132,6 +153,14 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
             creationflags=(0x08000000 if os.name == "nt" else 0),
             env=_utils.utf8_subprocess_env(),
         )
+    except subprocess.TimeoutExpired:
+        # yt-dlp didn't finish in time, but that's NOT a launch failure
+        # — it's a transient slow YouTube response. Treat the same as
+        # "no result", which the OLD-behavior empty path treats as
+        # "might have new" so the sync pipeline does a full walk
+        # rather than skipping (audit: sync/quickcheck.py:129).
+        return {"ok": True, "has_new": True,
+                "checked": 0, "fresh_ids": [], "timed_out": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
     for raw in (proc.stdout or "").splitlines():

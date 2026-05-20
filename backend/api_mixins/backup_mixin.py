@@ -29,7 +29,18 @@ class BackupMixin:
             )
             if not paths:
                 return {"ok": False, "cancelled": True}
-            path = paths if isinstance(paths, str) else paths[0]
+            # Some pywebview versions return () on cancel, others None,
+            # others a single str, others a tuple. Guard against
+            # empty-sequence indexing (audit: backup_mixin.py:32).
+            if isinstance(paths, str):
+                path = paths
+            else:
+                try:
+                    if not len(paths):
+                        return {"ok": False, "cancelled": True}
+                    path = paths[0]
+                except (TypeError, IndexError):
+                    return {"ok": False, "cancelled": True}
             with open(path, "w", encoding="utf-8") as f:
                 _json.dump({
                     "exported_from": "YTArchiver",
@@ -53,7 +64,18 @@ class BackupMixin:
             )
             if not paths:
                 return {"ok": False, "cancelled": True}
-            path = paths if isinstance(paths, str) else paths[0]
+            # Some pywebview versions return () on cancel, others None,
+            # others a single str, others a tuple. Guard against
+            # empty-sequence indexing (audit: backup_mixin.py:32).
+            if isinstance(paths, str):
+                path = paths
+            else:
+                try:
+                    if not len(paths):
+                        return {"ok": False, "cancelled": True}
+                    path = paths[0]
+                except (TypeError, IndexError):
+                    return {"ok": False, "cancelled": True}
             with open(path, "r", encoding="utf-8") as f:
                 data = _json.load(f)
             imported = data.get("channels", []) if isinstance(data, dict) else data
@@ -181,19 +203,31 @@ class BackupMixin:
                 return {"ok": False, "cancelled": True}
             out_path = paths if isinstance(paths, str) else paths[0]
             n = 0
-            with _zf.ZipFile(out_path, "w", _zf.ZIP_DEFLATED) as zf:
-                for p in candidates:
-                    if p.exists():
-                        zf.write(str(p), arcname=p.name)
-                        n += 1
-                # Include latest dated snapshot as well
-                backup_dir = APP_DATA_DIR / "backups"
-                if backup_dir.is_dir():
-                    snaps = sorted(backup_dir.glob("config_*.json"),
-                                   key=lambda pp: pp.stat().st_mtime, reverse=True)
-                    if snaps:
-                        zf.write(str(snaps[0]), arcname=f"backups/{snaps[0].name}")
-                        n += 1
+            # Write to a .tmp file then os.replace into the final
+            # path. A crash / power loss / disk full mid-zip
+            # previously partially overwrote the user's previous
+            # backup ZIP at out_path, leaving them with no
+            # recoverable backup. With the tmp+replace pattern, the
+            # old file stays intact until the new zip closes cleanly.
+            tmp_path = out_path + ".tmp"
+            try:
+                with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED) as zf:
+                    for p in candidates:
+                        if p.exists():
+                            zf.write(str(p), arcname=p.name)
+                            n += 1
+                    backup_dir = APP_DATA_DIR / "backups"
+                    if backup_dir.is_dir():
+                        snaps = sorted(backup_dir.glob("config_*.json"),
+                                       key=lambda pp: pp.stat().st_mtime, reverse=True)
+                        if snaps:
+                            zf.write(str(snaps[0]), arcname=f"backups/{snaps[0].name}")
+                            n += 1
+                os.replace(tmp_path, out_path)
+            except Exception:
+                try: os.remove(tmp_path)
+                except OSError: pass
+                raise
             _resp = {"ok": True, "path": out_path, "files": n}
             if _fts_skipped_reason:
                 _resp["fts_skipped"] = _fts_skipped_reason
@@ -236,17 +270,31 @@ class BackupMixin:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
+                        # Validate date_time tuple. zipfile sets it to
+                        # (0,0,0,0,0,0) when the ZIP entry's date is
+                        # missing / malformed — render as "unknown"
+                        # rather than "0000-00-00 00:00" (audit:
+                        # backup_mixin.py:242-251).
+                        _dt_tuple = getattr(info, "date_time", None)
+                        if (isinstance(_dt_tuple, tuple)
+                                and len(_dt_tuple) >= 5
+                                and _dt_tuple[0] >= 1980
+                                and 1 <= _dt_tuple[1] <= 12
+                                and 1 <= _dt_tuple[2] <= 31):
+                            _mod = (
+                                f"{_dt_tuple[0]:04d}-"
+                                f"{_dt_tuple[1]:02d}-"
+                                f"{_dt_tuple[2]:02d} "
+                                f"{_dt_tuple[3]:02d}:"
+                                f"{_dt_tuple[4]:02d}"
+                            )
+                        else:
+                            _mod = "unknown"
                         items.append({
                             "name": info.filename,
                             "size": info.file_size,
                             "size_label": self._fmt_bytes_short(info.file_size),
-                            "modified": (
-                                f"{info.date_time[0]:04d}-"
-                                f"{info.date_time[1]:02d}-"
-                                f"{info.date_time[2]:02d} "
-                                f"{info.date_time[3]:02d}:"
-                                f"{info.date_time[4]:02d}"
-                            ),
+                            "modified": _mod,
                         })
                         total_bytes += info.file_size
             except Exception as e:
@@ -386,21 +434,48 @@ class BackupMixin:
                             skipped.append(name)
                             continue
                         target = APP_DATA_DIR / base
-                    # final containment check — resolve the
-                    # target and require it to sit under APP_DATA_DIR.
+                    # final containment check — resolve the target
+                    # and require it to be a TRUE child of
+                    # APP_DATA_DIR, not just a string prefix-match.
+                    # The previous startswith() check would let a
+                    # path like .../YTArchiver2/file pass when
+                    # APP_DATA_DIR resolves to .../YTArchiver,
+                    # allowing extraction outside the directory via
+                    # crafted ZIP names. Path.is_relative_to gives
+                    # the strict parent-child check.
                     try:
                         _t_resolved = Path(str(target)).resolve()
-                        if not str(_t_resolved).startswith(
-                                str(_app_data_resolved)):
+                        try:
+                            _ok_contained = _t_resolved.is_relative_to(_app_data_resolved)
+                        except AttributeError:
+                            # Python <3.9 fallback — compare parents.
+                            _ok_contained = (
+                                _app_data_resolved in _t_resolved.parents
+                                or _t_resolved == _app_data_resolved)
+                        if not _ok_contained:
                             skipped.append(f"{name} (rejected — escapes APP_DATA_DIR)")
                             continue
                     except Exception:
                         skipped.append(f"{name} (rejected — path resolve failed)")
                         continue
+                    # Atomic extract — write to .restore.tmp then
+                    # os.replace into target. Previously a crash /
+                    # disk-full / read error mid-write truncated the
+                    # live target file (config.json / queue.json /
+                    # the DB). After this fix the live target stays
+                    # intact until the new content is fully buffered
+                    # to disk.
                     try:
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        with zf.open(name, "r") as src, open(target, "wb") as dst:
-                            dst.write(src.read())
+                        _tmp = str(target) + ".restore.tmp"
+                        try:
+                            with zf.open(name, "r") as src, open(_tmp, "wb") as dst:
+                                dst.write(src.read())
+                            os.replace(_tmp, str(target))
+                        except Exception:
+                            try: os.remove(_tmp)
+                            except OSError: pass
+                            raise
                         restored.append(target.name)
                     except Exception as e:
                         skipped.append(f"{name} ({e})")

@@ -61,7 +61,11 @@ def _load_progress(folder: str, ch_url: str, new_res: str) -> set[str]:
     return set()
 
 
-def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> None:
+def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> bool:
+    """Persist the redownload progress dict atomically. Returns True on
+    success, False on failure (caller can surface a warning when False
+    so the user knows resume might re-do already-completed videos —
+    audit: redownload.py:935-959)."""
     try:
         os.makedirs(folder, exist_ok=True)
         pf = _progress_path(folder)
@@ -70,8 +74,10 @@ def _save_progress(folder: str, ch_url: str, new_res: str, done: set[str]) -> No
             json.dump({"ch_url": ch_url, "resolution": new_res,
                        "done_ids": list(done)}, f)
         os.replace(tmp, pf)
+        return True
     except Exception as e:
         _log.debug("swallowed: %s", e)
+        return False
 
 
 def _clear_progress(folder: str) -> None:
@@ -79,6 +85,40 @@ def _clear_progress(folder: str) -> None:
         pf = _progress_path(folder)
         if os.path.isfile(pf):
             os.remove(pf)
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+
+
+def _broken_counts_path(folder: str) -> str:
+    return os.path.join(folder, "_redownload_broken_counts.json")
+
+
+def _load_broken_counts(folder: str) -> dict[str, int]:
+    """Per-video broken-download counter. Used to quarantine
+    permanently-broken videos after 3 consecutive broken downloads
+    (audit: redownload.py:1011-1015)."""
+    try:
+        pf = _broken_counts_path(folder)
+        if not os.path.isfile(pf):
+            return {}
+        with open(pf, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        if isinstance(data, dict):
+            return {str(k): int(v) for k, v in data.items()
+                    if isinstance(v, (int, float))}
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    return {}
+
+
+def _save_broken_counts(folder: str, counts: dict[str, int]) -> None:
+    try:
+        os.makedirs(folder, exist_ok=True)
+        pf = _broken_counts_path(folder)
+        tmp = pf + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(counts, f)
+        os.replace(tmp, pf)
     except Exception as e:
         _log.debug("swallowed: %s", e)
 
@@ -99,13 +139,16 @@ def _extract_id_from_filename(name: str) -> str | None:
 def _scan_local_files(folder: str) -> dict[str, str]:
     """Walk channel folder, return {filename: fullpath} for all video files.
 
-    Skips temp subdirs (_BACKLOG_TEMP, _TEMP_COMPRESS) to match YTArchiver.
+    Skips temp subdirs (_BACKLOG_TEMP, _TEMP_COMPRESS, _REDOWNLOAD_TEMP) so
+    orphan downloads from a previous failed redownload pass don't get
+    matched + promoted into the archive as if they were originals.
     """
     out: dict[str, str] = {}
     if not os.path.isdir(folder):
         return out
     for dp, dns, fns in os.walk(folder):
-        dns[:] = [d for d in dns if d not in ("_BACKLOG_TEMP", "_TEMP_COMPRESS")]
+        dns[:] = [d for d in dns if d not in (
+            "_BACKLOG_TEMP", "_TEMP_COMPRESS", "_REDOWNLOAD_TEMP")]
         for f in fns:
             low = f.lower()
             if not low.endswith(_VIDEO_EXTS):
@@ -162,7 +205,17 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
                     try: queues.set_sync_paused_active(False)
                     except Exception as e: _log.debug("swallowed: %s", e)
             if cancel_ev.is_set():
-                proc.terminate()
+                # Close stdout BEFORE terminate so a full pipe doesn't
+                # leave the child blocked on write while we wait for
+                # it to die (audit: redownload.py:152-188). Without
+                # this, terminate() on Windows could hang for the
+                # full 300s wait-timeout.
+                try:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                except Exception: pass
+                try: proc.terminate()
+                except Exception: pass
                 break
             line = raw.strip()
             if "|||" in line:
@@ -185,6 +238,10 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
             proc.wait(timeout=300)
         except Exception:
             try: proc.kill()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            # Second wait after kill so Windows releases the handle
+            # immediately rather than leaking it until GC.
+            try: proc.wait(timeout=5)
             except Exception as e: _log.debug("swallowed: %s", e)
     return result
 
@@ -217,7 +274,10 @@ def _build_metadata_index(folder: str) -> dict[str, Any]:
                 continue
             _full = os.path.join(dp, fn)
             try:
-                with open(_full, "r", encoding="utf-8") as f:
+                # utf-8-sig so an externally-edited jsonl with a UTF-8
+                # BOM doesn't drop its first line on read (audit:
+                # redownload.py:215-244).
+                with open(_full, "r", encoding="utf-8-sig") as f:
                     for ln in f:
                         ln = ln.strip()
                         if not ln:
@@ -451,7 +511,9 @@ def _height_from_metadata_jsonl(filepath: str) -> int | None:
             target_vid = m.group(1)
             for jsonl in cand:
                 try:
-                    with jsonl.open("r", encoding="utf-8") as f:
+                    # utf-8-sig handles BOM-prefixed jsonl files (audit:
+                    # redownload.py:454).
+                    with jsonl.open("r", encoding="utf-8-sig") as f:
                         for line in f:
                             line = line.strip()
                             if not line or '"video_id"' not in line:
@@ -605,6 +667,12 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
     try: proc.wait(timeout=10)
     except Exception:
         try: proc.kill()
+        except Exception as e: _log.debug("swallowed: %s", e)
+        # Second wait after kill so Windows releases the proc handle
+        # promptly. Repeated download failures without this leaked
+        # one handle per failure until GC (audit: redownload.py:
+        # 605-608).
+        try: proc.wait(timeout=5)
         except Exception as e: _log.debug("swallowed: %s", e)
     # Patch C: surface non-zero returncode so silent failures are
     # visible. yt-dlp emits its actual error message on stderr, which
@@ -1010,6 +1078,33 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 ])
                 try: os.remove(new_fp)
                 except OSError: pass
+                # Track broken-download counter in the per-channel
+                # _redownload_progress.json so a permanently-broken
+                # video (geo-blocked, deleted, region-locked) doesn't
+                # retry forever across resume runs. After 3
+                # consecutive broken downloads, add to `done` so the
+                # next pass skips it (audit: redownload.py:1011-1015).
+                try:
+                    _broken_counts = _load_broken_counts(folder)
+                    _bc = int(_broken_counts.get(vid, 0)) + 1
+                    if _bc >= 3:
+                        stream.emit([
+                            ["  \u2014 ", "simpleline_redwnl"],
+                            [f"{vid}: 3 broken downloads in a row \u2014 "
+                             f"quarantining (delete from "
+                             f"_redownload_progress.json to retry).\n",
+                             "dim"],
+                        ])
+                        # Quarantine: mark as done so this pass + future
+                        # resumes skip the video.
+                        done.add(vid)
+                        _save_progress(folder, ch_url, cur_res[0], done)
+                        _broken_counts.pop(vid, None)
+                    else:
+                        _broken_counts[vid] = _bc
+                    _save_broken_counts(folder, _broken_counts)
+                except Exception as _qe:
+                    _log.debug("swallowed: %s", _qe)
                 _emit_active(file_num, _live_total)
                 n_err += 1
                 continue
@@ -1038,6 +1133,25 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     with open(fp, "rb") as _a, open(new_fp, "rb") as _b:
                         if _a.read(_SAMPLE) != _b.read(_SAMPLE):
                             _ident = False
+                        elif _orig_sz > _SAMPLE * 3:
+                            # Audit fix (redownload.py:1023-1066): head + tail
+                            # samples can both match while the middle differs
+                            # (different codecs, same container size). Add a
+                            # mid-file 1MB sample — three independent 1MB
+                            # windows make a same-size/different-content
+                            # collision astronomically unlikely without paying
+                            # the full chunked-compare cost.
+                            _mid_off = _orig_sz // 2 - _SAMPLE // 2
+                            _a.seek(_mid_off)
+                            _b.seek(_mid_off)
+                            if _a.read(_SAMPLE) != _b.read(_SAMPLE):
+                                _ident = False
+                            else:
+                                _tail_off = _orig_sz - _SAMPLE
+                                _a.seek(_tail_off)
+                                _b.seek(_tail_off)
+                                if _a.read(_SAMPLE) != _b.read(_SAMPLE):
+                                    _ident = False
                         elif _orig_sz > _SAMPLE * 2:
                             _tail_off = _orig_sz - _SAMPLE
                             _a.seek(_tail_off)
@@ -1068,6 +1182,26 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             orig_ext = os.path.splitext(fp)[1].lower()
             target_fp = fp
             if new_ext and new_ext != orig_ext:
+                # Refuse cross-extension replacement. yt-dlp is
+                # invoked with --merge-output-format mp4 so this
+                # should never happen — when it DOES (rare codec
+                # combination that yt-dlp couldn't remux), the
+                # rename leaves sidecars (transcripts, jsonl,
+                # thumbnails) keyed to the old stem orphaned. Sync,
+                # metadata refresh, and Watch view all key on filename
+                # and would silently miss the file. Safer to abort
+                # this video's redownload and emit a clear error so
+                # the user can investigate manually.
+                try:
+                    if os.path.isfile(new_fp):
+                        os.remove(new_fp)
+                except OSError:
+                    pass
+                stream.emit_error(
+                    f"  [skip] {os.path.basename(fp)}: yt-dlp produced "
+                    f"{new_ext} instead of {orig_ext}. Sidecar rename "
+                    f"unsupported — skipping to avoid metadata orphans.")
+                continue
                 # Two-phase commit so a failed os.replace doesn't lose
                 # the original. Pre-fix path: os.remove(fp) then
                 # os.replace(new_fp, target_fp). If replace failed
@@ -1093,19 +1227,55 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                 try:
                     os.replace(new_fp, target_fp)
                 except OSError:
-                    # Replace failed — roll back if we have an aside.
+                    # Replace failed — roll back if we have an aside,
+                    # AND clean up the abandoned new_fp so we don't
+                    # leak a multi-GB orphan in _REDOWNLOAD_TEMP/. The
+                    # previous code rolled back the aside but left
+                    # new_fp on disk forever (rmdir at end-of-pass
+                    # only succeeds on an empty dir).
                     if aside_valid:
                         try: os.rename(aside_fp, fp)
                         except OSError: pass
+                    try:
+                        if os.path.isfile(new_fp):
+                            os.remove(new_fp)
+                    except OSError: pass
                     raise
                 # Replace succeeded — drop the aside.
                 if aside_valid:
                     try: os.remove(aside_fp)
                     except OSError: pass
             else:
-                os.replace(new_fp, target_fp)
+                # Same-extension replace path. Apply the same
+                # retry+jitter loop the cross-extension path has — a
+                # single transient lock (VLC preview, antivirus,
+                # Explorer thumb cache) should not throw away minutes
+                # of yt-dlp work.
+                import random as _random
+                _last_err = None
+                _ok = False
+                for _try in range(3):
+                    try:
+                        os.replace(new_fp, target_fp)
+                        _last_err = None
+                        _ok = True
+                        break
+                    except OSError as _re:
+                        _last_err = _re
+                        if _try < 2:
+                            time.sleep(2.0 + _random.uniform(0, 1.0))
+                if not _ok:
+                    try:
+                        if os.path.isfile(new_fp):
+                            os.remove(new_fp)
+                    except OSError: pass
+                    raise _last_err if _last_err else OSError(
+                        "os.replace failed after 3 attempts")
             done.add(vid)
-            _save_progress(folder, ch_url, cur_res[0], done)
+            if not _save_progress(folder, ch_url, cur_res[0], done):
+                stream.emit_dim(
+                    "  — warning: progress file save failed; resume "
+                    "may retry this video on next run.")
             n_done += 1
             # Completed entry — TWO lines that stack above the active
             # status line. Format mirrors classic YTArchiver.py:10723+11067:
@@ -1211,10 +1381,22 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                          [f" replace failed: {e}\n", "red"]])
             n_err += 1
     # Remove the temp dir if empty (redownload complete or cancelled clean).
+    # Walks the entire channel tree, not just the channel root, because
+    # per-video subfolder _REDOWNLOAD_TEMP/ dirs (created when the
+    # video lived under year/month splits) are NEVER cleaned by a
+    # root-only rmdir. Without this sweep, those subfolder temps
+    # accumulated permanently AND their orphan downloads could be
+    # promoted as originals on the next pass.
     try:
-        _tmp = os.path.join(folder, "_REDOWNLOAD_TEMP")
-        if os.path.isdir(_tmp) and not os.listdir(_tmp):
-            os.rmdir(_tmp)
+        for _dp, _dns, _fns in os.walk(folder):
+            for _d in list(_dns):
+                if _d == "_REDOWNLOAD_TEMP":
+                    _tmp = os.path.join(_dp, _d)
+                    try:
+                        if not os.listdir(_tmp):
+                            os.rmdir(_tmp)
+                    except OSError:
+                        pass
     except OSError:
         pass
 

@@ -95,11 +95,12 @@ def sweep_new_videos(output_dir: str, channels: list,
     registered = 0
     ingested = 0
 
-    # Cache existing filepaths to avoid hitting the DB per file. Use
-    # the sweep's private connection — readers in WAL mode never block
-    # writers, so this doesn't compete with anything.
-    existing = {r[0].lower() for r in sweep_conn.execute("SELECT filepath FROM videos").fetchall()
-                if r[0]}
+    # `existing` is built per-channel inside the loop below — was
+    # previously a single SELECT-fetchall across the entire videos
+    # table at sweep start, which on a 200k-row archive pinned a
+    # multi-MB set in memory for the entire sweep duration. Per-channel
+    # scoping bounds memory to one channel's filepaths at a time, and
+    # uses the idx_vid_channel index so each query is fast.
     indexed_jsonls = {r[0].lower() for r in sweep_conn.execute("SELECT path FROM indexed_files").fetchall()
                       if r[0]}
 
@@ -129,27 +130,34 @@ def sweep_new_videos(output_dir: str, channels: list,
             mx = ch_folder.stat().st_mtime
         except OSError:
             return 0.0
+        # Use scandir as a context manager so the underlying directory
+        # handle is released promptly. Without `with`, the generator
+        # holds the handle until GC, which on Z: DrivePool + antivirus
+        # can produce transient access failures (audit:
+        # index_maintenance.py:122).
         try:
-            for entry in _os.scandir(ch_folder):
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        try:
-                            m = entry.stat(follow_symlinks=False).st_mtime
-                            if m > mx:
-                                mx = m
-                            # One extra level for year/month splits.
-                            for sub in _os.scandir(entry.path):
-                                try:
-                                    if sub.is_dir(follow_symlinks=False):
-                                        sm = sub.stat(follow_symlinks=False).st_mtime
-                                        if sm > mx:
-                                            mx = sm
-                                except OSError:
-                                    pass
-                        except OSError:
-                            pass
-                except OSError:
-                    pass
+            with _os.scandir(ch_folder) as _it:
+                for entry in _it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            try:
+                                m = entry.stat(follow_symlinks=False).st_mtime
+                                if m > mx:
+                                    mx = m
+                                # One extra level for year/month splits.
+                                with _os.scandir(entry.path) as _it2:
+                                    for sub in _it2:
+                                        try:
+                                            if sub.is_dir(follow_symlinks=False):
+                                                sm = sub.stat(follow_symlinks=False).st_mtime
+                                                if sm > mx:
+                                                    mx = sm
+                                        except OSError:
+                                            pass
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
         except OSError:
             pass
         return mx
@@ -189,6 +197,16 @@ def sweep_new_videos(output_dir: str, channels: list,
             skipped_unchanged += 1
             continue
         # Either never swept before or the folder changed — walk it.
+        # Load `existing` scoped to JUST this channel so the membership
+        # check below is fast without holding every filepath in memory
+        # across the entire sweep. Uses idx_vid_channel.
+        existing = {
+            r[0].lower()
+            for r in sweep_conn.execute(
+                "SELECT filepath FROM videos WHERE channel=? COLLATE NOCASE",
+                (ch_name,)).fetchall()
+            if r[0]
+        }
         # Use scandir directly so we get DirEntry objects with cached
         # stat info — avoids a separate `os.path.getsize` disk round
         # trip per file. Walk recursively by yielding directories
@@ -399,37 +417,30 @@ def prune_missing_videos() -> dict[str, int]:
                         "AND filepath != ? COLLATE NOCASE",
                         (vid, fp)).fetchone()
                     if not other or other[0] == 0:
-                        # cascade the segment delete into
-                        # the FTS external-content table so the
-                        # rowids we just orphaned can't keep
-                        # producing phantom search hits. Using
-                        # segments_fts's special 'delete' command
-                        # would require per-row text, so just drop
-                        # every fts row whose rowid is no longer in
-                        # segments. Simpler + bulletproof.
-                        _seg_ids = [r[0] for r in conn.execute(
-                            "SELECT id FROM segments WHERE video_id=?",
-                            (vid,)).fetchall()]
+                        # Cascade the segment delete into the FTS
+                        # external-content table using the proper
+                        # 'delete' command (which requires rowid + text).
+                        # The previous DELETE FROM segments_fts WHERE
+                        # rowid IN (...) pattern only removed the entry
+                        # mapping; the tokens stayed indexed and could
+                        # still match search queries via phantom hits.
+                        # Worse, SQLite recycles rowids after DELETE, so
+                        # a later INSERT could land on a recycled id and
+                        # inherit the stale FTS tokens — making a brand
+                        # new video's text alias under an old text's
+                        # search hits. Mirrors index.py:564 pattern.
+                        try:
+                            conn.execute(
+                                "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                                "SELECT 'delete', id, text FROM segments "
+                                "WHERE video_id=?",
+                                (vid,))
+                        except Exception as e:
+                            _log.debug("swallowed: %s", e)
                         c1 = conn.execute(
                             "DELETE FROM segments WHERE video_id=?",
                             (vid,))
                         segs_removed += c1.rowcount or 0
-                        # Best-effort FTS delete. Skip silently if
-                        # the segments_fts table doesn't exist (very
-                        # old DB).
-                        if _seg_ids:
-                            try:
-                                # Chunk to stay under SQLite's bound
-                                # parameter limit (999 default).
-                                for _start in range(0, len(_seg_ids), 500):
-                                    _chunk = _seg_ids[_start:_start + 500]
-                                    _ph = ",".join("?" * len(_chunk))
-                                    conn.execute(
-                                        f"DELETE FROM segments_fts "
-                                        f"WHERE rowid IN ({_ph})",
-                                        _chunk)
-                            except Exception as e:
-                                _log.debug("swallowed: %s", e)
                 c2 = conn.execute(
                     "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
                     (fp,))
@@ -520,13 +531,36 @@ def rebuild_fts_index() -> dict[str, Any]:
             # claiming "N unindexed" even though every segment just got
             # re-indexed. Refresh indexed_files from the segments table
             # so the banner reflects reality.
+            #
+            # Stamp the on-disk mtime of each jsonl_path. The old
+            # mtime=0 placeholder caused the next sweep to treat every
+            # jsonl as needing re-ingest (every "current mtime" is
+            # greater than 0), doing huge redundant work after every
+            # FTS rebuild.
             conn.execute("DELETE FROM indexed_files")
-            conn.execute(
-                "INSERT OR REPLACE INTO indexed_files(path, mtime, segment_count) "
-                "SELECT jsonl_path, 0, COUNT(*) "
-                "FROM segments WHERE jsonl_path IS NOT NULL "
-                "GROUP BY jsonl_path"
-            )
+            jsonl_paths = [r[0] for r in conn.execute(
+                "SELECT DISTINCT jsonl_path FROM segments "
+                "WHERE jsonl_path IS NOT NULL").fetchall()]
+            for _jp in jsonl_paths:
+                if not _jp:
+                    continue
+                try:
+                    _mt = os.path.getmtime(_jp)
+                except OSError:
+                    _mt = 0.0
+                try:
+                    n = conn.execute(
+                        "SELECT COUNT(*) FROM segments WHERE jsonl_path=?",
+                        (_jp,)).fetchone()[0]
+                except sqlite3.Error:
+                    n = 0
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files"
+                        "(path, mtime, segment_count) VALUES(?, ?, ?)",
+                        (_jp, float(_mt), int(n)))
+                except sqlite3.Error as e:
+                    _log.debug("swallowed: %s", e)
             conn.commit()
         return {"ok": True, "rows_indexed": int(rows)}
     except sqlite3.Error as e:

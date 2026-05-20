@@ -403,29 +403,73 @@ def hide_file_win(path) -> None:
 
     Used for sidecar files (e.g. `.{name} Metadata.jsonl`) and folders
     (e.g. `.Thumbnails/`, `.ChannelArt/`) that should be invisible to
-    Explorer but readable by the app. Silently swallows errors; failure
-    to hide is non-fatal — it just means Explorer will show the file.
+    Explorer but readable by the app.
+
+    Checks the SetFileAttributesW return value (Windows returns 0 on
+    failure). Logs a warning on failure rather than silently swallowing —
+    per the "ULTIMATE RULE" memory, sidecars MUST stay hidden; a silent
+    failure here would expose internals to the user's archive view.
+    Preserves the file's other attributes (read-only, system, archive
+    bit) by OR-ing FILE_ATTRIBUTE_HIDDEN into the current value rather
+    than passing 0x02 alone.
     """
     if os.name != "nt":
         return
     try:
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
+        p = str(path)
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+        cur = ctypes.windll.kernel32.GetFileAttributesW(p)
+        if cur == INVALID_FILE_ATTRIBUTES:
+            # File may not exist; nothing to do. Don't warn — callers
+            # often invoke this defensively against paths that may have
+            # already been deleted.
+            return
+        new = cur | FILE_ATTRIBUTE_HIDDEN
+        if new == cur:
+            return  # already hidden
+        ok = ctypes.windll.kernel32.SetFileAttributesW(p, new)
+        if not ok:
+            err = ctypes.windll.kernel32.GetLastError()
+            _log.warning("hide_file_win failed for %s (err=%s)", p, err)
     except Exception as e:
         _log.debug("swallowed: %s", e)
 
 
 def unhide_file_win(path) -> None:
-    """Clear the Windows HIDDEN attribute (set FILE_ATTRIBUTE_NORMAL).
-    No-op on non-Windows.
+    """Clear the Windows HIDDEN attribute. No-op on non-Windows.
 
     Companion to `hide_file_win` — used before atomic rewrites of hidden
     sidecars so `os.replace` can target the file. Re-hide after the
     rewrite with `hide_file_win`.
+
+    Preserves other attributes (read-only, system, archive bit) by
+    masking out only FILE_ATTRIBUTE_HIDDEN instead of overwriting all
+    attributes with FILE_ATTRIBUTE_NORMAL (0x80). The old behavior
+    clobbered the archive bit, breaking backup tools that rely on it.
     """
     if os.name != "nt":
         return
     try:
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x80)
+        p = str(path)
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+        cur = ctypes.windll.kernel32.GetFileAttributesW(p)
+        if cur == INVALID_FILE_ATTRIBUTES:
+            return
+        new = cur & ~FILE_ATTRIBUTE_HIDDEN
+        # Per MSDN: FILE_ATTRIBUTE_NORMAL is only valid when set ALONE;
+        # SetFileAttributesW will fail if NORMAL is combined with other
+        # attributes. Replace with NORMAL only if no other bits remain.
+        if new == 0:
+            new = FILE_ATTRIBUTE_NORMAL
+        if new == cur:
+            return  # already not hidden
+        ok = ctypes.windll.kernel32.SetFileAttributesW(p, new)
+        if not ok:
+            err = ctypes.windll.kernel32.GetLastError()
+            _log.warning("unhide_file_win failed for %s (err=%s)", p, err)
     except Exception as e:
         _log.debug("swallowed: %s", e)
 
@@ -462,7 +506,13 @@ def delete_video_sidecars(filepath: str) -> None:
             pass
     # Language-coded caption variants (en, en-orig, en-US, es, …).
     # Glob avoids enumerating every language code yt-dlp might emit.
-    for pat in (base + ".*.vtt", base + ".*.srt", base + ".*.ttml"):
+    # `glob.escape` is required — titles routinely contain bracket
+    # metacharacters like "[Live]" or "[Remastered]" which would
+    # otherwise be interpreted as glob character classes, causing the
+    # pattern to silently match nothing and leak orphan caption files.
+    _base_glob = glob.escape(base)
+    for pat in (_base_glob + ".*.vtt", _base_glob + ".*.srt",
+                _base_glob + ".*.ttml"):
         try:
             for _hit in glob.glob(pat):
                 try: os.remove(_hit)
@@ -517,7 +567,16 @@ def managed_popen(*args, **kwargs):
     try:
         yield proc
     finally:
-        kill_process(proc)
+        # Skip terminate when the proc already exited normally —
+        # kill_process eats the no-op anyway, but avoiding the
+        # spurious "trying to terminate a dead PID" path keeps logs
+        # cleaner and is the right cosmetic shape (audit:
+        # utils.py:494-520).
+        try:
+            if proc.poll() is None:
+                kill_process(proc)
+        except Exception:
+            kill_process(proc)
 
 
 # ── Atomic file replace ────────────────────────────────────────────────
@@ -544,7 +603,19 @@ def atomic_write(path, mode: str = "w", encoding: str = "utf-8"):
     if "a" in mode:
         raise ValueError("atomic_write does not support append mode")
     path = os.fspath(path)
-    tmp = path + ".tmp"
+    # Use mkstemp for a UNIQUE temp filename per writer. Old `path +
+    # ".tmp"` collided when two threads wrote the same path
+    # concurrently — second open truncated the first's in-flight tmp,
+    # then both raced on os.replace and the loser committed half-
+    # flushed content over the winner (audit: utils.py:525-577).
+    import tempfile as _tempfile
+    _dir = os.path.dirname(path) or "."
+    _stem = os.path.basename(path) + "."
+    fd, tmp = _tempfile.mkstemp(prefix=_stem, suffix=".tmp", dir=_dir)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     open_kwargs: dict[str, Any] = {"mode": mode}
     if "b" not in mode:
         open_kwargs["encoding"] = encoding

@@ -55,9 +55,22 @@ class LivestreamsMixin:
         UI's "Retry in 24hrs / 1 week" dropdown uses this to suppress
         the drawer without forgetting the entries.
         """
+        # Explicit validation up front — old `float(seconds or 0)`
+        # raised ValueError on garbage strings, then the outer try/
+        # except surfaced the bare Python error verbatim (audit:
+        # livestreams_mixin.py:60).
+        try:
+            _sec = float(seconds or 0)
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "error": f"Snooze duration must be a number (got "
+                             f"{seconds!r})."}
+        if _sec < 0:
+            return {"ok": False,
+                    "error": "Snooze duration must be a non-negative number."}
         try:
             from backend import livestreams as _ls
-            return {"ok": _ls.snooze_drawer(float(seconds or 0))}
+            return {"ok": _ls.snooze_drawer(_sec)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

@@ -94,9 +94,22 @@ class SubsMixin:
         yt = sync_backend.find_yt_dlp()
         if not yt:
             return {"ok": False, "error": "yt-dlp not found"}
-        token = str(id(url)) + "-" + str(int(time.time() * 1000))
-        self._pending_previews = getattr(self, "_pending_previews", {})
-        self._pending_previews[token] = {"ok": False, "pending": True}
+        # uuid4 for the token. Old `id(url) + time.time()*ms` collided
+        # when two previews fired within the same millisecond AND
+        # Python recycled the id for a short-lived string (audit:
+        # subs_mixin.py:97). uuid4 is collision-free in practice.
+        import uuid as _uuid
+        token = _uuid.uuid4().hex
+        # Lock-protected pending-preview dict. js_api and worker
+        # threads both mutate it (set→pending, set→result, pop on
+        # poll), so a bare dict could drop entries on concurrent set+
+        # pop (audit: subs_mixin.py:98).
+        if not hasattr(self, "_pending_previews"):
+            self._pending_previews = {}
+        if not hasattr(self, "_pending_previews_lock"):
+            self._pending_previews_lock = threading.Lock()
+        with self._pending_previews_lock:
+            self._pending_previews[token] = {"ok": False, "pending": True}
         def _run():
             import subprocess as _sp
             try:
@@ -112,14 +125,17 @@ class SubsMixin:
                 out = (r.stdout or "").strip().splitlines()
                 name = (out[0] if out else "").strip() or (out[1] if len(out) > 1 else "").strip()
                 if not name:
-                    self._pending_previews[token] = {
-                        "ok": False, "error": "yt-dlp returned nothing"}
+                    with self._pending_previews_lock:
+                        self._pending_previews[token] = {
+                            "ok": False, "error": "yt-dlp returned nothing"}
                     return
                 folder = sync_backend.sanitize_folder(name)
-                self._pending_previews[token] = {
-                    "ok": True, "channel": name, "folder": folder}
+                with self._pending_previews_lock:
+                    self._pending_previews[token] = {
+                        "ok": True, "channel": name, "folder": folder}
             except Exception as e:
-                self._pending_previews[token] = {"ok": False, "error": str(e)}
+                with self._pending_previews_lock:
+                    self._pending_previews[token] = {"ok": False, "error": str(e)}
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "token": token}
 
@@ -129,13 +145,26 @@ class SubsMixin:
         {ok, pending} while running, or the final {ok, channel, folder}
         once `_run` sets it.
         """
+        lock = getattr(self, "_pending_previews_lock", None)
         pend = getattr(self, "_pending_previews", {})
+        if lock is not None:
+            with lock:
+                res = pend.get(token)
+                if res is None:
+                    return {"ok": False, "error": "unknown token"}
+                if res.get("pending"):
+                    return {"ok": True, "pending": True}
+                # One-shot: pop the result inside the lock so a second
+                # poll racing with this one can't double-deliver.
+                try: del pend[token]
+                except KeyError: pass
+                return res
+        # Defensive fallback if lock somehow isn't initialized yet.
         res = pend.get(token)
         if res is None:
             return {"ok": False, "error": "unknown token"}
         if res.get("pending"):
             return {"ok": True, "pending": True}
-        # One-shot: pop the result
         try: del pend[token]
         except KeyError: pass
         return res
@@ -152,10 +181,15 @@ class SubsMixin:
         try:
             ch = subs_backend.add_channel(payload or {})
             self._reload_config()
-            # Fire-and-forget channel-art fetch
+            # Fire-and-forget channel-art fetch — but only when the
+            # channel record actually committed to disk. If the config
+            # write was gated (`_write_blocked`), skip the art fetch
+            # so we don't leave .ChannelArt/ files for a channel
+            # whose subs entry will revert on next reload (audit:
+            # subs_mixin.py:144).
             try:
                 name = ch.get("name") or ch.get("folder", "")
-                if name:
+                if name and not ch.get("_write_blocked"):
                     self.chan_fetch_art(name, False)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -208,21 +242,37 @@ class SubsMixin:
             # that side effect would also surprise a live sync.
             if delete_files and ch_snap:
                 _target_url = (ch_snap.get("url") or "").strip()
-                try:
-                    active_sync = (self._current_sync_channel
-                                   if hasattr(self, "_current_sync_channel")
-                                   else "")
-                    if active_sync and _target_url and active_sync == _target_url:
-                        return {
-                            "ok": False,
-                            "error": ("Sync is currently running on this "
-                                      "channel. Cancel or pause the sync "
-                                      "first, then retry the delete."),
-                        }
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
-            result = subs_backend.remove_channel(
-                identity or {}, delete_files=bool(delete_files))
+                # Hold the sync-mutation lock for BOTH the check and
+                # the subs_backend.remove_channel() call below (which
+                # is what actually calls rmtree). Without the lock,
+                # a sync worker could start touching this channel
+                # between the active-sync check and the rmtree —
+                # racing yt-dlp's writes against rmtree's directory
+                # walk. The lock is reentrant so sync_start_all
+                # taking it elsewhere doesn't self-deadlock.
+                if not hasattr(self, "_sync_mutation_lock"):
+                    self._sync_mutation_lock = threading.RLock()
+                with self._sync_mutation_lock:
+                    try:
+                        active_sync = (self._current_sync_channel
+                                       if hasattr(self, "_current_sync_channel")
+                                       else "")
+                        if active_sync and _target_url and active_sync == _target_url:
+                            return {
+                                "ok": False,
+                                "error": ("Sync is currently running on this "
+                                          "channel. Cancel or pause the sync "
+                                          "first, then retry the delete."),
+                            }
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                    # Take the rmtree branch INSIDE the lock so an
+                    # incoming sync start can't slip past our check.
+                    result = subs_backend.remove_channel(
+                        identity or {}, delete_files=bool(delete_files))
+            else:
+                result = subs_backend.remove_channel(
+                    identity or {}, delete_files=bool(delete_files))
             ok = bool(result.get("ok"))
             if ok and ch_snap and not delete_files:
                 if not hasattr(self, "_removed_channels_stack"):
@@ -304,13 +354,21 @@ class SubsMixin:
                     getattr(self, "_removed_channels_stack", None)),
             }
         except subs_backend.SubsError as e:
-            # Restore the item to the stack so the user can retry.
+            # Restore so the user can retry. Cover BOTH the stack and
+            # the legacy single-slot branches — previously the legacy
+            # branch had cleared `_last_removed_channel` before the
+            # restore attempt, and on exception the channel was lost
+            # forever with no fallback.
             if stack is not None:
                 stack.append(ch)
+            else:
+                self._last_removed_channel = ch
             return {"ok": False, "error": str(e)}
         except Exception as e:
             if stack is not None:
                 stack.append(ch)
+            else:
+                self._last_removed_channel = ch
             return {"ok": False, "error": str(e)}
 
 
@@ -451,6 +509,7 @@ class SubsMixin:
             return {"ok": False, "error": "No allowed fields in changes"}
         updated = 0
         failed = []
+        write_blocked = []
         for n in names:
             try:
                 ch = subs_backend.get_channel({"name": n}) \
@@ -461,46 +520,88 @@ class SubsMixin:
                 payload = dict(ch)
                 payload.update(clean)
                 # Preserve url so update_channel's identity match works
-                subs_backend.update_channel(
+                _res = subs_backend.update_channel(
                     {"url": ch.get("url", ""), "name": ch.get("name", "")},
                     payload)
-                updated += 1
+                # Detect save failures the backend signals via
+                # `_write_blocked: True` (my Fix 10 made update_channel
+                # roll back its in-memory mutation and return that
+                # marker rather than raise). Without surfacing it,
+                # bulk_update silently reported "updated:N" while
+                # half of those updates never landed on disk.
+                if isinstance(_res, dict) and _res.get("_write_blocked"):
+                    write_blocked.append(n)
+                    failed.append({
+                        "name": n,
+                        "reason": "save_config failed (disk full / locked?); update rolled back",
+                    })
+                else:
+                    updated += 1
             except Exception as e:
                 failed.append({"name": n, "reason": str(e)})
         self._reload_config()
-        return {"ok": True, "updated": updated, "failed": failed}
+        return {"ok": True, "updated": updated, "failed": failed,
+                "write_blocked": write_blocked}
 
 
     def subs_bulk_delete(self, names, delete_files=False):
         """Delete N channels at once. `delete_files=True` also removes
-        the on-disk folders. Returns {ok, deleted, failed}.
+        the on-disk folders. Returns {ok, started}.
+
+        The per-channel shutil.rmtree calls can take many minutes on
+        TB-scale channels; the work runs on a background thread so the
+        bridge call returns immediately. The result toast + Subs table
+        refresh are pushed via evaluate_js when the worker finishes.
         """
         if not isinstance(names, list) or not names:
             return {"ok": False, "error": "No channels selected"}
-        deleted = 0
-        failed = []
-        # Collect URLs so undo can push them all onto the stack.
         if not hasattr(self, "_removed_channels_stack"):
             self._removed_channels_stack = []
-        for n in names:
+
+        def _bd_worker():
+            deleted = 0
+            failed = []
+            for n in names:
+                try:
+                    ch = subs_backend.get_channel({"name": n}) \
+                         or subs_backend.get_channel({"folder": n})
+                    if not ch:
+                        failed.append({"name": n, "reason": "not found"})
+                        continue
+                    res = self.subs_remove_channel(
+                        {"url": ch.get("url", "")},
+                        delete_files=bool(delete_files))
+                    if res.get("ok"):
+                        deleted += 1
+                    else:
+                        failed.append({"name": n,
+                                       "reason": res.get("error", "unknown")})
+                except Exception as e:
+                    failed.append({"name": n, "reason": str(e)})
+            self._log_stream.emit([["[Subs] ", "sync_bracket"],
+                                    [f"Bulk delete: {deleted} removed"
+                                     + (f" ({len(failed)} failed)" if failed else "")
+                                     + ".\n", "simpleline"]])
+            self._log_stream.flush()
             try:
-                ch = subs_backend.get_channel({"name": n}) \
-                     or subs_backend.get_channel({"folder": n})
-                if not ch:
-                    failed.append({"name": n, "reason": "not found"})
-                    continue
-                # Reuse the single-delete guard for delete_files + active sync
-                res = self.subs_remove_channel(
-                    {"url": ch.get("url", "")},
-                    delete_files=bool(delete_files))
-                if res.get("ok"):
-                    deleted += 1
-                else:
-                    failed.append({"name": n,
-                                   "reason": res.get("error", "unknown")})
+                if self._window is not None:
+                    import json as _json
+                    _msg = f"Removed {deleted} channel(s)."
+                    if failed:
+                        _msg += f" {len(failed)} failed."
+                    _kind = "ok" if not failed else "warn"
+                    self._window.evaluate_js(
+                        f"window._showToast && window._showToast("
+                        f"{_json.dumps(_msg)}, {_json.dumps(_kind)});"
+                        f"window.refreshSubsTable && window.refreshSubsTable();"
+                    )
             except Exception as e:
-                failed.append({"name": n, "reason": str(e)})
-        return {"ok": True, "deleted": deleted, "failed": failed}
+                _log.debug("swallowed: %s", e)
+
+        threading.Thread(target=_bd_worker, daemon=True,
+                         name="subs_bulk_delete").start()
+        return {"ok": True, "started": True}
+
 
 
     def subs_bulk_queue_metadata(self, names, refresh=False):
@@ -544,93 +645,120 @@ class SubsMixin:
         transcribed, and resets stale counters so the badge self-heals.
 
         Matches YTArchiver.py:5808 _queue_pending_transcriptions.
+
+        The walk + per-channel scan moved to a background thread so the
+        bridge call returns immediately. Final tally + Subs refresh
+        land via evaluate_js when the worker finishes.
         """
         cfg = self._config or load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name as _cfn
-        tx_added = 0
-        mt_added = 0
-        for ch in cfg.get("channels", []):
-            ch_name = ch.get("name") or ch.get("folder") or ""
-            if not ch_name:
-                continue
-            folder = os.path.join(base, _cfn(ch))
-            # Pending transcribe list is authoritative (see sync hook at
-            # `append_pending_tx_id` and transcribe-complete hook at
-            # `remove_pending_tx_id`). Iterate only channels with a
-            # non-empty ID list — stale integer counters don't matter.
-            pending_ids = ch.get("pending_tx_ids") or []
-            if isinstance(pending_ids, list) and len(pending_ids) > 0:
-                r = self.chan_transcribe_pending(ch_name)
-                if r and r.get("ok") and r.get("queued", 0) > 0:
-                    tx_added += 1
-            if int(ch.get("metadata_pending") or 0) > 0:
-                # Enqueue directly as a sync-queue metadata task rather
-                # than calling `metadata_recheck_channel` (which pops a
-                # per-channel confirm dialog when the folder already has
-                # metadata — N dialogs for N channels is a terrible
-                # bulk-queue UX). The sync worker's metadata branch calls
-                # `fetch_channel_metadata(refresh=False)` which
-                # skip-appends rather than overwriting, matching the
-                # "Check for New" default behavior.
+
+        def _qp_worker():
+            tx_added = 0
+            mt_added = 0
+            for ch in cfg.get("channels", []):
+                ch_name = ch.get("name") or ch.get("folder") or ""
+                if not ch_name:
+                    continue
+                _ = os.path.join(base, _cfn(ch))
+                pending_ids = ch.get("pending_tx_ids") or []
+                if isinstance(pending_ids, list) and len(pending_ids) > 0:
+                    r = self.chan_transcribe_pending(ch_name)
+                    if r and r.get("ok") and r.get("queued", 0) > 0:
+                        tx_added += 1
+                if int(ch.get("metadata_pending") or 0) > 0:
+                    try:
+                        task = dict(ch)
+                        task["kind"] = "metadata"
+                        task["refresh"] = False
+                        if self._queues.sync_enqueue(task):
+                            mt_added += 1
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+            if mt_added or tx_added:
                 try:
-                    task = dict(ch)
-                    task["kind"] = "metadata"
-                    task["refresh"] = False
-                    if self._queues.sync_enqueue(task):
-                        mt_added += 1
+                    self._on_queue_changed()
+                    cfg2 = load_config() or {}
+                    if (cfg2.get("autorun_sync", False) and
+                            not self.sync_is_running() and mt_added > 0):
+                        self.sync_start_all(add_downloads_from_config=False)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
-        # Fire the sync worker if autorun_sync is on and we just queued
-        # metadata work. Pass `add_downloads_from_config=False` so we
-        # drain only the metadata items just queued; don't sneak in
-        # a full Sync Subbed pass.
-        if mt_added or tx_added:
+            parts = []
+            if tx_added: parts.append(f"{tx_added} for transcription")
+            if mt_added: parts.append(f"{mt_added} for metadata")
+            if parts:
+                self._log_stream.emit([["[Subs] ", "sync_bracket"],
+                                        [f"\u21ba Queued {', '.join(parts)}.\n",
+                                         "simpleline_green"]])
+                _toast_msg = f"Queued {', '.join(parts)}."
+                _toast_kind = "ok"
+            else:
+                self._log_stream.emit([["[Subs] ", "sync_bracket"],
+                                        ["No channels with pending transcriptions or metadata.\n",
+                                         "dim"]])
+                _toast_msg = "No pending channels."
+                _toast_kind = "warn"
+            self._log_stream.flush()
             try:
-                self._on_queue_changed()
-                cfg2 = load_config() or {}
-                if (cfg2.get("autorun_sync", False) and
-                        not self.sync_is_running() and mt_added > 0):
-                    self.sync_start_all(add_downloads_from_config=False)
+                if self._window is not None:
+                    import json as _json
+                    self._window.evaluate_js(
+                        f"window._showToast && window._showToast("
+                        f"{_json.dumps(_toast_msg)}, {_json.dumps(_toast_kind)});"
+                        f"window.refreshSubsTable && window.refreshSubsTable();"
+                    )
             except Exception as e:
                 _log.debug("swallowed: %s", e)
-        parts = []
-        if tx_added: parts.append(f"{tx_added} for transcription")
-        if mt_added: parts.append(f"{mt_added} for metadata")
-        if parts:
-            self._log_stream.emit([["[Subs] ", "sync_bracket"],
-                                    [f"\u21ba Queued {', '.join(parts)}.\n",
-                                     "simpleline_green"]])
-        else:
-            self._log_stream.emit([["[Subs] ", "sync_bracket"],
-                                    ["No channels with pending transcriptions or metadata.\n",
-                                     "dim"]])
-        self._log_stream.flush()
-        return {"ok": True, "transcribe_queued": tx_added,
-                "metadata_queued": mt_added}
+
+        threading.Thread(target=_qp_worker, daemon=True,
+                         name="subs_queue_pending").start()
+        return {"ok": True, "started": True}
+
 
 
     def subs_queue_all(self):
         """Right-click of the "↺ Queue Pending" button — queues ALL channels
         for transcribe. Matches YTArchiver.py:5844 _queue_all_transcriptions.
+
+        Walk + per-channel scan moved to a background thread so the
+        bridge call returns immediately. Final tally toast lands via
+        evaluate_js when the worker finishes.
         """
         cfg = self._config or load_config()
         channels = cfg.get("channels", []) or []
-        queued = 0
-        for ch in channels:
-            name = ch.get("name") or ch.get("folder") or ""
-            if not name:
-                continue
-            r = self.chan_transcribe_all(name)
-            if r and r.get("ok") and r.get("queued", 0) > 0:
-                queued += 1
-        self._log_stream.emit([["[Subs] ", "sync_bracket"],
-                                [f"\u21ba Queued all: {queued} channels\n",
-                                 "simpleline_green"]])
-        self._log_stream.flush()
-        return {"ok": True, "queued": queued}
+
+        def _qa_worker():
+            queued = 0
+            for ch in channels:
+                name = ch.get("name") or ch.get("folder") or ""
+                if not name:
+                    continue
+                r = self.chan_transcribe_all(name)
+                if r and r.get("ok") and r.get("queued", 0) > 0:
+                    queued += 1
+            self._log_stream.emit([["[Subs] ", "sync_bracket"],
+                                    [f"\u21ba Queued all: {queued} channels\n",
+                                     "simpleline_green"]])
+            self._log_stream.flush()
+            try:
+                if self._window is not None:
+                    import json as _json
+                    self._window.evaluate_js(
+                        f"window._showToast && window._showToast("
+                        f"{_json.dumps(f'Queued {queued} channels.')}, 'ok');"
+                        f"window.refreshSubsTable && window.refreshSubsTable();"
+                    )
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+        threading.Thread(target=_qa_worker, daemon=True,
+                         name="subs_queue_all").start()
+        return {"ok": True, "started": True}
+
 
 
     def subs_relocate_channel(self, identity, new_folder_name):

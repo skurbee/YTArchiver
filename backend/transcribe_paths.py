@@ -38,6 +38,15 @@ def _get_transcript_filename(ch_name: str, folder_path: str,
                              ) -> tuple[str, str]:
     """Mirror of YTArchiver.py:11771 _get_transcript_filename.
     Returns (txt_path, subfolder)."""
+    # Defensive: split_years=True with year=None is a caller bug —
+    # without this guard, both the month and year branches below
+    # fall through and we'd silently write to the combined-mode
+    # filename (audit: transcribe_paths.py:43-58). Surface the bug
+    # rather than silently misroute.
+    if split_years and year is None and not combined:
+        raise ValueError(
+            "_get_transcript_filename: split_years=True requires a "
+            "non-None year; got year=None")
     if combined or (not split_years):
         return (os.path.join(folder_path, f"{ch_name} Transcript.txt"), folder_path)
 

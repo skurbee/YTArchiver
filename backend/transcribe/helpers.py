@@ -332,7 +332,15 @@ def find_python311() -> str | None:
         p = os.path.join(base, "python.exe")
         if os.path.isfile(p):
             candidates.append(p)
+    # Prefer paths that mention Python311 specifically — old code
+    # returned candidates[0] which on some installs was the
+    # Python310 base dir. faster-whisper imports then failed under
+    # an opaque "Transcription tool didn't respond" message (audit:
+    # transcribe/helpers.py:330-336).
     if candidates:
+        _py311 = [p for p in candidates if "Python311" in p]
+        if _py311:
+            return _py311[0]
         return candidates[0]
     for name in ("python3.11", "python"):
         found = _shutil.which(name)

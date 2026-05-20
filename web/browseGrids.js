@@ -76,25 +76,41 @@
         card.dataset.pendingMeta = String(c.metadata_pending);
       }
 
-      const bgImg = bannerSrc
-        ? `<img class="channel-card-bg" src="${bannerSrc}" loading="lazy" decoding="async" alt="" />`
-        : "";
-      const avatarImg = avatarUrl
-        ? `<img class="channel-avatar" src="${avatarUrl}" loading="lazy" decoding="async" alt="" />`
-        : "";
+      // Banner + avatar URLs come from per-channel metadata (potentially
+      // user-influenced via custom configs); interpolating them into
+      // innerHTML would XSS via " onerror=... or " /><script>. Build the
+      // <img> elements via createElement + .src so the URL is treated as
+      // a URL, not as HTML to parse.
       const letterHtml = (!bannerSrc && !avatarUrl)
         ? `<div class="channel-letter">${escapeHtml(first)}</div>`
         : "";
 
       card.innerHTML = `
-        ${bgImg}
         ${letterHtml}
         <div class="channel-card-overlay">
           <div class="channel-card-name"></div>
           <div class="channel-card-meta"></div>
         </div>
-        ${avatarImg}
       `;
+
+      if (bannerSrc) {
+        const bgEl = document.createElement("img");
+        bgEl.className = "channel-card-bg";
+        bgEl.src = bannerSrc;
+        bgEl.loading = "lazy";
+        bgEl.decoding = "async";
+        bgEl.alt = "";
+        card.insertBefore(bgEl, card.firstChild);
+      }
+      if (avatarUrl) {
+        const avEl = document.createElement("img");
+        avEl.className = "channel-avatar";
+        avEl.src = avatarUrl;
+        avEl.loading = "lazy";
+        avEl.decoding = "async";
+        avEl.alt = "";
+        card.appendChild(avEl);
+      }
       card.querySelector(".channel-card-name").textContent = name;
       card.querySelector(".channel-card-meta").textContent =
         `${vids}${vids && vids !== "—" ? " videos" : ""}${size ? " · " + size : ""}`;
@@ -146,12 +162,29 @@
     // assignment to a push).
     _prefetchQueue = [];
     const first = channels.slice(0, PREFETCH_LIMIT);
+    // Validate URL scheme before prefetching — `new Image().src =
+    // "javascript:..."` is a no-op but file:// or chrome-extension://
+    // URLs sneak in from a poisoned backend payload could probe
+    // local resources from the webview context (audit:
+    // browseGrids.js:151). Allow only http/https + file:// for the
+    // local thumbnail-server path.
+    const _safeScheme = (u) => {
+      const s = String(u || "").trim();
+      if (!s) return false;
+      const lo = s.toLowerCase();
+      return lo.startsWith("http://")
+          || lo.startsWith("https://")
+          || lo.startsWith("file://")
+          || lo.startsWith("/")              // server-relative
+          || lo.startsWith("data:image/");   // inline base64 thumbs
+    };
     const urls = [];
     for (const c of first) {
-      if (c.banner_url) urls.push(c.banner_url);
+      if (c.banner_url && _safeScheme(c.banner_url)) urls.push(c.banner_url);
     }
     for (const c of first) {
-      if (c.avatar_url && c.avatar_url !== c.banner_url) urls.push(c.avatar_url);
+      if (c.avatar_url && c.avatar_url !== c.banner_url
+          && _safeScheme(c.avatar_url)) urls.push(c.avatar_url);
     }
     _prefetchQueue = urls;
     for (let i = 0; i < PREFETCH_MAX_CONCURRENT; i++) _pumpPrefetch();
@@ -203,17 +236,14 @@
     // `background: url(...)` — the image tag is far more forgiving of
     // http://127.0.0.1 URLs through pywebview's webview, and failed loads
     // trigger a clean `onerror` swap to the gradient placeholder.
+    // The img element is built via createElement (not innerHTML) so the
+    // thumbnail_url can't be parsed as HTML — closes XSS via crafted urls.
     const hasThumb = !!v.thumbnail_url;
-    const imgTag = hasThumb
-      ? `<img class="video-thumb-img" src="${v.thumbnail_url}" alt=""
-              loading="lazy" decoding="async" />`
-      : "";
     const removedBadge = v.removed_from_yt
       ? '<span class="video-removed-badge" title="No longer on YouTube">✗ Removed from YT</span>'
       : "";
     card.innerHTML = `
       <div class="video-thumb" style="${hasThumb ? '' : `background: ${gradientFor(v.title)};`}">
-        ${imgTag}
         ${hasThumb ? '' : '<span>&#9654;</span>'}
         ${removedBadge}
         <span class="video-duration-badge"></span>
@@ -224,6 +254,18 @@
         <div class="video-card-meta"></div>
       </div>
     `;
+    if (hasThumb) {
+      const thumbWrap = card.querySelector(".video-thumb");
+      if (thumbWrap) {
+        const img = document.createElement("img");
+        img.className = "video-thumb-img";
+        img.src = v.thumbnail_url;
+        img.alt = "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        thumbWrap.insertBefore(img, thumbWrap.firstChild);
+      }
+    }
     // Swap to gradient placeholder if the thumb fails to load
     const imgEl = card.querySelector(".video-thumb-img");
     if (imgEl) {

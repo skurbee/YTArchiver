@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -145,6 +146,25 @@ PROCESS_REGISTRY = ProcessRegistry()
 
 # ── yt-dlp locator (re-exports the legacy one for now) ───────────────
 
+def _exe_dir_candidates() -> list[Path]:
+    """Paths to check next to the YTArchiver executable. Frozen builds
+    place yt-dlp.exe alongside YTArchiver.exe, not in cwd — when the user
+    launches a shortcut, cwd is wherever the shortcut lives (audit:
+    process_runner.py:148-164). Path(sys.executable).parent catches both
+    the frozen exe case and the python script + venv case.
+    """
+    out: list[Path] = []
+    try:
+        out.append(Path(sys.executable).resolve().parent)
+    except Exception:
+        pass
+    # PyInstaller's _MEIPASS is the runtime unpack dir (read-only); we
+    # don't expect yt-dlp.exe THERE, but the directory containing the
+    # exe IS the parent of _MEIPASS, which sys.executable already
+    # returns. So no extra _MEIPASS check needed.
+    return out
+
+
 def find_yt_dlp() -> str | None:
     """Locate yt-dlp.exe. Identical behavior to sync.find_yt_dlp but
     available without importing sync (which pulls in heavy deps).
@@ -154,6 +174,7 @@ def find_yt_dlp() -> str | None:
     if p:
         return p
     candidates = [
+        *( _exe_dir / "yt-dlp.exe" for _exe_dir in _exe_dir_candidates() ),
         Path.cwd() / "yt-dlp.exe",
         Path(__file__).resolve().parent.parent / "yt-dlp.exe",
         Path.home() / "Desktop" / "yt-dlp.exe",
@@ -170,6 +191,7 @@ def find_ffprobe() -> str | None:
     if p:
         return p
     candidates = [
+        *( _exe_dir / "ffprobe.exe" for _exe_dir in _exe_dir_candidates() ),
         Path.cwd() / "ffprobe.exe",
         Path(__file__).resolve().parent.parent / "ffprobe.exe",
     ]
@@ -205,7 +227,11 @@ class YtDlpRunner:
                  cookie_provider: CookieProvider | None = None,
                  registry: ProcessRegistry | None = None,
                  binary_finder: Callable[[], str | None] = find_yt_dlp):
-        self._cookies = cookie_provider or (list)
+        # Default to an empty-args lambda — `list` as a type works by
+        # coincidence (list() returns []) but is type-confusing if a
+        # future caller passes a non-callable (audit:
+        # process_runner.py:208).
+        self._cookies = cookie_provider or (lambda: [])
         self._registry = registry or PROCESS_REGISTRY
         self._binary_finder = binary_finder
         self._binary_cached: str | None = None
@@ -289,8 +315,19 @@ class YtDlpRunner:
                     proc.kill()
                 except Exception:
                     pass
-                stdout, stderr = proc.communicate()
-                return -1, stdout or "", "timeout"
+                # Bound the post-kill drain too. If kill failed silently
+                # (e.g. AV injection holding the process alive), the
+                # un-timeouted communicate would hang the calling thread
+                # forever.
+                try:
+                    proc.communicate(timeout=5)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                # Return an empty stdout instead of the partial buffer —
+                # caller code that checks stdout first would otherwise
+                # parse partial output as a valid result when stderr
+                # says "timeout".
+                return -1, "", "timeout"
         finally:
             self._registry.unregister(proc)
         return proc.returncode, stdout or "", stderr or ""
@@ -361,6 +398,10 @@ class YtDlpRunner:
                             on_stdout_line(line.rstrip("\n"))
                         except Exception as e:
                             _log.debug("swallowed: %s", e)
+            # Full terminate→wait→kill→wait cleanup. Previously after
+            # wait timeout we'd terminate() but never wait/kill again,
+            # leaving a process that ignored SIGTERM running until app
+            # shutdown's kill_all reaped it.
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -368,8 +409,24 @@ class YtDlpRunner:
                     proc.terminate()
                 except Exception:
                     pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
         finally:
             self._registry.unregister(proc)
+            # Join the stderr drain thread so its appends to
+            # stderr_tail can't race the list(stderr_tail) snapshot
+            # below. Best-effort; thread is daemon so it'll die with
+            # the process anyway if join times out.
+            try:
+                t.join(timeout=2.0)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         return proc.returncode if proc.returncode is not None else -1, list(stderr_tail)
 
 

@@ -65,7 +65,10 @@ def write_sync_progress(channel_name: str = "",
                 "err": t["err"],
             }
         path = _sync_progress_path()
-        tmp = path + ".tmp"
+        # Per-thread tmp suffix so concurrent writers can't clobber
+        # each other's tmp file before the os.replace (audit:
+        # sync/display_push.py:69). pid+ident are cheap and reliable.
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, path)

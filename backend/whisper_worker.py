@@ -54,7 +54,29 @@ except Exception as _cuda_err:
     _cuda_fallback_reason = str(_cuda_err)
     _device = "cpu"
     _compute = "default"
-    model = WhisperModel(_model_name, device=_device, compute_type=_compute)
+    try:
+        model = WhisperModel(_model_name, device=_device, compute_type=_compute)
+    except Exception as _cpu_err:
+        # Both CUDA AND CPU failed — surface the error JSON BEFORE
+        # exiting so the parent's "didn't respond" generic message
+        # is replaced with the real diagnostic. Previously this
+        # raise propagated through and the parent saw only a dead
+        # subprocess + the captured-StringIO stderr that never
+        # flushed (sys.stderr restoration happens AFTER model load,
+        # so worker stderr during model load goes to the buffer).
+        try:
+            sys.stderr = sys.__stderr__
+            _out.write(json.dumps({
+                "status": "error",
+                "text": (f"Whisper model load failed on BOTH cuda "
+                         f"and cpu. cuda: {_cuda_fallback_reason!r}; "
+                         f"cpu: {_cpu_err!r}"),
+                "fatal": True,
+            }) + "\n")
+            _out.flush()
+        except Exception:
+            pass
+        sys.exit(1)
 
 # Restore stderr for real errors during transcription
 sys.stderr = sys.__stderr__
@@ -65,21 +87,71 @@ if _cuda_fallback_reason:
 _out.write(json.dumps(_ready_msg) + "\n")
 _out.flush()
 
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
+# Shared cancel flag — set by a separate stdin-reader thread when the
+# parent sends `{"command": "cancel"}`. The transcription segments
+# loop polls this and bails out cleanly, freeing GPU resources without
+# the parent having to TerminateProcess (which leaves CUDA context
+# fragmented on Windows and degrades GPU memory availability over
+# repeated skip_current actions).
+import threading as _threading
+_cancel_flag = _threading.Event()
+_request_queue: list = []  # FIFO of pending {path, duration, language}
+_request_lock = _threading.Lock()
+_stdin_done = _threading.Event()
+
+def _stdin_reader():
+    """Continuously read stdin lines; route cancel commands to the
+    cancel flag, route everything else as new requests."""
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            _stdin_done.set()
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            with _request_lock:
+                _request_queue.append({"path": line, "duration": 0, "language": "en"})
+            continue
+        if obj.get("command") == "cancel":
+            _cancel_flag.set()
+            continue
+        with _request_lock:
+            _request_queue.append(obj)
+
+_threading.Thread(target=_stdin_reader, daemon=True,
+                  name="whisper-stdin-reader").start()
+
+# Main loop: pull requests from the queue. Sleeps briefly when empty
+# so we don't burn CPU between jobs.
+import time as _time
+while True:
+    line = None
+    with _request_lock:
+        if _request_queue:
+            req = _request_queue.pop(0)
+            line = "_consumed"
+    if line is None:
+        if _stdin_done.is_set():
+            break
+        _time.sleep(0.05)
         continue
-    try:
-        req = json.loads(line)
-        path = req.get("path", "")
-        duration = req.get("duration", 0)
-        # Optional per-job language override; defaults to English.
-        # Pass `null` (or omit) to enable Whisper's auto-detect.
-        language = req.get("language", "en")
-    except json.JSONDecodeError:
-        path = line
-        duration = 0
-        language = "en"
+    # Convert the dict back to the path/duration/language vars the
+    # legacy body expects.
+    path = req.get("path", "")
+    duration = req.get("duration", 0)
+    # Parent's ffprobe-derived fallback when info.duration comes back
+    # 0 or None (rare with vad_filter rejecting everything on silent-
+    # intro videos). Without this, progress emits got skipped and the
+    # UI looked hung (audit: transcribe/core.py:1303 / 1729).
+    duration_fallback = req.get("duration_fallback", 0) or 0
+    language = req.get("language", "en")
+    # Clear cancel for the new job — cancel only applies to the
+    # currently-running job.
+    _cancel_flag.clear()
     if not path:
         continue
 
@@ -97,10 +169,24 @@ for line in sys.stdin:
             no_speech_threshold=0.6,
             word_timestamps=True,
         )
-        total_dur = info.duration if info.duration and info.duration > 0 else duration
+        # Pick the best non-zero duration source: faster-whisper's
+        # detected info.duration first, then the JSON-supplied
+        # duration field, then the parent's ffprobe fallback.
+        total_dur = (info.duration
+                     if info.duration and info.duration > 0
+                     else (duration or duration_fallback or 0))
         all_segments = []
         last_pct = -1
+        _cancelled = False
         for seg in segments_gen:
+            # Check the cancel flag on each segment. Parent sends
+            # `{"command": "cancel"}` on stdin; the stdin-reader
+            # thread sets _cancel_flag. We break early, freeing the
+            # GPU without the parent having to TerminateProcess
+            # (which fragments CUDA context on Windows).
+            if _cancel_flag.is_set():
+                _cancelled = True
+                break
             all_segments.append(seg)
             if total_dur > 0:
                 pct = min(99, int(seg.end / total_dur * 100))
@@ -108,6 +194,10 @@ for line in sys.stdin:
                     last_pct = pct
                     _out.write(json.dumps({"status": "progress", "pct": pct}) + "\n")
                     _out.flush()
+        if _cancelled:
+            _out.write(json.dumps({"status": "cancelled"}) + "\n")
+            _out.flush()
+            continue
 
         text = " ".join(seg.text.strip() for seg in all_segments if seg.text.strip())
 
@@ -169,8 +259,16 @@ for line in sys.stdin:
                     chunk_text = " ".join(w.word.strip() for w in chunk_ws)
                     w_data = [{"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)}
                               for w in chunk_ws]
-                    seg_data.append({"s": round(chunk_ws[0].start, 2),
-                                     "e": round(chunk_ws[-1].end, 2),
+                    # Clamp end >= start + 0.01 so a rare faster-whisper
+                    # edge case where last-word.end comes back below
+                    # first-word.start doesn't emit a malformed segment
+                    # with e < s (audit: whisper_worker.py:170-174).
+                    _s_round = round(chunk_ws[0].start, 2)
+                    _e_round = round(chunk_ws[-1].end, 2)
+                    if _e_round < _s_round + 0.01:
+                        _e_round = round(_s_round + 0.01, 2)
+                    seg_data.append({"s": _s_round,
+                                     "e": _e_round,
                                      "t": chunk_text, "w": w_data})
             # Branch 3: too long AND no word timestamps. Fall back to
             # splitting the text by word count and interpolating segment

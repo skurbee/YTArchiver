@@ -336,8 +336,41 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     _PROGRESS_TICK_SECS = 5.0
     _tick_count = 0
     _last_tick_ts = time.time()
+    # Hang-detect: read stdout on a side thread feeding a queue, and
+    # let the main loop queue.get(timeout=) so a stalled yt-dlp (HTTP
+    # read that never returns) can be detected and terminated instead
+    # of blocking forever (audit: metadata/core.py:382-386).
+    import queue as _queue
+    _stdout_q: _queue.Queue = _queue.Queue(maxsize=1000)
+    _STDOUT_SENTINEL = object()
+    def _drain_stdout():
+        try:
+            for line in proc.stdout:
+                _stdout_q.put(line)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        finally:
+            try: _stdout_q.put(_STDOUT_SENTINEL)
+            except Exception: pass
+    _stdout_thread = threading.Thread(target=_drain_stdout, daemon=True,
+                                       name="yt-catalog-stdout-drain")
+    _stdout_thread.start()
+    # If no new line arrives for 60s, treat as stall and terminate.
+    _STALL_TIMEOUT_S = 60.0
     try:
-        for raw in proc.stdout:
+        while True:
+            try:
+                raw = _stdout_q.get(timeout=_STALL_TIMEOUT_S)
+            except _queue.Empty:
+                # Stalled — give up and terminate the subprocess.
+                stream.emit_dim(
+                    f" (catalog walk stalled — no output for "
+                    f"{int(_STALL_TIMEOUT_S)}s, terminating)")
+                try: proc.terminate()
+                except Exception as e: _log.debug("swallowed: %s", e)
+                break
+            if raw is _STDOUT_SENTINEL:
+                break
             if cancel_event is not None and cancel_event.is_set():
                 try: proc.terminate()
                 except Exception as e: _log.debug("swallowed: %s", e)
@@ -810,6 +843,12 @@ def backfill_video_ids(channel: dict[str, Any],
     duration_bucket_to_vids: dict[int, list[str]] = {}
 
     for _vid, _stats in bulk.items():
+        # YT catalog can legitimately list the same video twice (rare
+        # unlisted-then-relisted case). Skip if we already indexed it
+        # so Strategy 3's bucket lists don't end up with duplicate
+        # vids (audit: metadata/core.py:805-838).
+        if _vid in vid_to_duration:
+            continue
         _raw_title = _stats.get("title") or ""
         _nt = _norm_title_for_match(_raw_title)
         _upload = (_stats.get("upload_date") or "").strip()
@@ -1040,14 +1079,27 @@ def backfill_video_ids(channel: dict[str, Any],
         _shortlist_vids = [v for v, n in counter.items() if n >= 2]
         if not _shortlist_vids:
             return ""
-        _shortlist_titles = []
+        # Detect titles that collide (two different vids normalize to
+        # the same title — re-uploads, "Part 1" duplicates, daily-show
+        # repeats). Drop those from the candidate set rather than
+        # arbitrarily picking the last-written vid, which would risk
+        # stamping the wrong video_id onto an unrelated local file.
+        # Mirrors Strategy 2's title_ambiguous discipline.
         _title_to_vid_local: dict[str, str] = {}
+        _ambiguous_titles: set[str] = set()
         for _v in _shortlist_vids:
             _t = bulk.get(_v, {}).get("title") or ""
             _nt = _norm_title_for_match(_t)
-            if _nt:
-                _shortlist_titles.append(_nt)
-                _title_to_vid_local[_nt] = _v
+            if not _nt:
+                continue
+            if _nt in _title_to_vid_local and _title_to_vid_local[_nt] != _v:
+                _ambiguous_titles.add(_nt)
+                continue
+            _title_to_vid_local[_nt] = _v
+        # Strip ambiguous titles from both the lookup and the search set.
+        for _amb in _ambiguous_titles:
+            _title_to_vid_local.pop(_amb, None)
+        _shortlist_titles = [t for t in _title_to_vid_local.keys()]
         from difflib import SequenceMatcher, get_close_matches
         # Ask for more matches than before (5 instead of 3) so the
         # date-based tiebreak has room to operate when several
@@ -1114,10 +1166,25 @@ def backfill_video_ids(channel: dict[str, Any],
             return ""
         try:
             import datetime as _dt
-            _day = _dt.datetime.fromtimestamp(_mtime).strftime("%Y%m%d")
+            # Use UTC, not local time. yt-dlp --mtime sets the file
+            # mtime to YT upload time in UTC; converting through
+            # local time misclassified the day for files uploaded
+            # near a day boundary in the user's timezone (Central
+            # Time = 6h offset) — audit: metadata/core.py:1116-1119.
+            _day = _dt.datetime.utcfromtimestamp(_mtime).strftime("%Y%m%d")
         except Exception:
             return ""
-        cands = date_to_cands.get(_day, [])
+        # Try the exact UTC day first, then ±1 day to catch any
+        # timezone-related drift. Strategy 5 has its own duration
+        # disambiguation downstream so wider candidate sets are safe.
+        cands = list(date_to_cands.get(_day, []))
+        try:
+            _d_obj = _dt.datetime.strptime(_day, "%Y%m%d")
+            for _delta in (-1, 1):
+                _adj = (_d_obj + _dt.timedelta(days=_delta)).strftime("%Y%m%d")
+                cands.extend(date_to_cands.get(_adj, []))
+        except Exception:
+            pass
         if not cands:
             return ""
         if len(cands) == 1:
@@ -1335,13 +1402,16 @@ def backfill_video_ids(channel: dict[str, Any],
             for _off in (-2, -1, 0, 1, 2):
                 _candidate_vids.update(
                     duration_bucket_to_vids.get(_ctr + _off, []))
-        # Strip vids that already have an upload_date (no point
-        # re-fetching).
+        # Strip vids that already have a valid 8-digit upload_date
+        # (no point re-fetching). The previous boolean expression
+        # was `not (X) or Y` — Python precedence made empty-date vids
+        # WRONGLY excluded from the candidate set, which were exactly
+        # the ones that needed re-fetching most.
+        def _has_valid_date(v: str) -> bool:
+            _d = (bulk.get(v, {}).get("upload_date") or "").strip()
+            return len(_d) == 8 and _d.isdigit()
         _candidate_vids = {v for v in _candidate_vids
-                           if not (bulk.get(v, {}).get("upload_date") or "")
-                              .strip().isdigit()
-                           or len((bulk.get(v, {}).get("upload_date")
-                                   or "").strip()) != 8}
+                           if not _has_valid_date(v)}
         _cand_list = sorted(_candidate_vids)
         if _cand_list:
             _yt = find_yt_dlp()
@@ -1410,26 +1480,49 @@ def backfill_video_ids(channel: dict[str, Any],
             with _idx._db_lock:
                 for _fp, _vid, _how in to_backfill:
                     _vurl = f"https://www.youtube.com/watch?v={_vid}"
+                    # Try the path AS-GIVEN first; if rowcount=0,
+                    # fall back to normpath form. register_video
+                    # stores normpath'd paths, but the on-disk walk
+                    # producing this filepath might already match,
+                    # might not. Trying both forms covers legacy rows
+                    # whose stored filepath was inserted before
+                    # register_video added normpath.
+                    _np = os.path.normpath(_fp)
                     try:
-                        conn.execute(
+                        _cur = conn.execute(
                             "UPDATE videos SET video_id=?, video_url=?, "
                             "id_backfill_tried_ts=? "
                             "WHERE filepath=? COLLATE NOCASE "
                             "AND (video_id IS NULL OR video_id='')",
-                            (_vid, _vurl, _now_ts, _fp))
+                            (_vid, _vurl, _now_ts, _np))
+                        if (_cur.rowcount or 0) == 0 and _fp != _np:
+                            conn.execute(
+                                "UPDATE videos SET video_id=?, video_url=?, "
+                                "id_backfill_tried_ts=? "
+                                "WHERE filepath=? COLLATE NOCASE "
+                                "AND (video_id IS NULL OR video_id='')",
+                                (_vid, _vurl, _now_ts, _fp))
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 # Stamp tried-ts on rows that failed every strategy
                 # so the UI can tell the user these are probably
                 # genuinely unresolvable (title changed too much,
-                # channel renamed them, etc.).
+                # channel renamed them, etc.). Same path-form fallback
+                # as above.
                 for _fp in tried_failed_paths:
+                    _np = os.path.normpath(_fp)
                     try:
-                        conn.execute(
+                        _cur = conn.execute(
                             "UPDATE videos SET id_backfill_tried_ts=? "
                             "WHERE filepath=? COLLATE NOCASE "
                             "AND (video_id IS NULL OR video_id='')",
-                            (_now_ts, _fp))
+                            (_now_ts, _np))
+                        if (_cur.rowcount or 0) == 0 and _fp != _np:
+                            conn.execute(
+                                "UPDATE videos SET id_backfill_tried_ts=? "
+                                "WHERE filepath=? COLLATE NOCASE "
+                                "AND (video_id IS NULL OR video_id='')",
+                                (_now_ts, _fp))
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 conn.commit()

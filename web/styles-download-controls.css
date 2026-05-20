@@ -98,10 +98,35 @@
 .vo-custom-name {
   flex: 1;
   min-width: 120px;
+  max-width: 320px;
 }
 .vo-custom-name[disabled] {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Bottom-two-rows + Download button container. The button stretches
+   vertically so its top aligns with the row above. */
+.vo-actions-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-top: 6px;
+}
+.vo-actions-rows {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.vo-actions-rows > .vo-row { margin-top: 0; }
+.vo-download-btn {
+  align-self: stretch;
+  min-width: 130px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 14px;
 }
 
 /* Channel options panel (inline on Download tab — mirrors video-opts-panel

@@ -88,6 +88,11 @@ def find_ffmpeg() -> str | None:
 # probes invalidates correctly.
 _probe_cache: dict[tuple[str, float], tuple[float, str]] = {}
 _probe_cache_lock = threading.Lock()
+# LRU bound — old code never evicted, so the cache grew unbounded
+# over a long session and stale entries for replaced files leaked
+# memory (audit: compress.py:88-91). Eviction policy: when the cap
+# is hit on insert, drop oldest insertion-order entry.
+_PROBE_CACHE_MAX = 512
 
 
 def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
@@ -115,6 +120,15 @@ def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
     except (subprocess.TimeoutExpired, OSError):
         result = (0.0, "")
         with _probe_cache_lock:
+            # LRU eviction: drop oldest entry when at cap.
+            try:
+                if _key in _probe_cache:
+                    del _probe_cache[_key]
+                while len(_probe_cache) >= _PROBE_CACHE_MAX:
+                    _oldest_key = next(iter(_probe_cache))
+                    del _probe_cache[_oldest_key]
+            except Exception:
+                pass
             _probe_cache[_key] = result
         return result
     stderr = proc.stderr or ""
@@ -129,6 +143,14 @@ def _probe_video_info(filepath: str, ffmpeg: str) -> tuple[float, str]:
         codec = m2.group(1).lower()
     result = (dur, codec)
     with _probe_cache_lock:
+        try:
+            if _key in _probe_cache:
+                del _probe_cache[_key]
+            while len(_probe_cache) >= _PROBE_CACHE_MAX:
+                _oldest_key = next(iter(_probe_cache))
+                del _probe_cache[_oldest_key]
+        except Exception:
+            pass
         _probe_cache[_key] = result
     return result
 
@@ -187,7 +209,15 @@ def compress_video(input_path: str, stream: LogStreamer,
                 "quality": quality, "output_res": output_res}
 
     base, ext = os.path.splitext(input_path)
-    temp_path = base + "_TEMP_COMPRESS" + ext
+    # Uniquify the temp path with the process PID + a 6-char random
+    # suffix so two compress jobs on the same input file (user
+    # double-clicked, or queue layer mis-deduped) don't collide on
+    # ffmpeg's -y overwrite (audit: compress.py:189-190). Each job
+    # gets its own temp file; the loser still writes to disk but
+    # neither corrupts the other's output.
+    import secrets as _secrets
+    _uniq = f"_TEMP_COMPRESS_{os.getpid()}_{_secrets.token_hex(3)}"
+    temp_path = base + _uniq + ext
     # write a .lock sidecar next to the temp file so a
     # concurrent startup_cleanup_temps pass (e.g. second-instance launch)
     # doesn't nuke this in-flight encode. _LockGuard removes it via
@@ -198,7 +228,18 @@ def compress_video(input_path: str, stream: LogStreamer,
     try:
         with open(lock_path, "w", encoding="utf-8") as _lk:
             _lk.write(str(int(time.time())))
-    except OSError:
+    except OSError as _le:
+        # Lock-write failure silently disabled the "active encode"
+        # protection — startup_cleanup_temps was free to nuke this
+        # in-flight encode after 30 min if the dir mtime hadn't been
+        # touched recently (audit: temp_cleanup.py:38-53). Warn so
+        # the user sees this encode is unprotected.
+        try:
+            stream.emit_dim(
+                f" (warning: couldn't create .lock for compress temp; "
+                f"long encodes may be vulnerable to cleanup: {_le})")
+        except Exception:
+            pass
         lock_path = ""
 
     class _LockGuard:
@@ -332,9 +373,33 @@ def compress_video(input_path: str, stream: LogStreamer,
         stream.emit_error(f"Couldn't start video compression: {e}")
         return {"ok": False, "error": str(e)}
 
+    # Drain stderr on a side thread + read lines from a queue with a
+    # timeout. The previous `for line in proc.stderr:` blocked on
+    # readline forever when ffmpeg stopped producing output (NVENC
+    # driver wedge, paused pipeline, etc.) \u2014 cancel_event would not be
+    # checked again until a new line arrived. With a polling queue.get,
+    # cancel is reacted to within 250ms regardless of ffmpeg output.
+    import queue as _queue
+    _stderr_q: _queue.Queue = _queue.Queue()
+    _SENTINEL = object()
+
+    def _drain_stderr():
+        try:
+            for _l in proc.stderr:
+                _stderr_q.put(_l)
+        except Exception as _de:
+            _log.debug("stderr drain failed: %s", _de)
+        finally:
+            _stderr_q.put(_SENTINEL)
+
+    _stderr_thread = threading.Thread(
+        target=_drain_stderr, daemon=True,
+        name=f"compress-stderr-drain-{os.getpid()}")
+    _stderr_thread.start()
+
     last_pct = -1
     first_progress_emitted = False
-    for line in proc.stderr:
+    while True:
         if cancel_event is not None and cancel_event.is_set():
             try:
                 proc.terminate()
@@ -347,6 +412,17 @@ def compress_video(input_path: str, stream: LogStreamer,
                 pass
             stream.emit_text(" \u26d4 Encode cancelled.", "red")
             return {"ok": False, "reason": "cancelled"}
+        try:
+            line = _stderr_q.get(timeout=0.25)
+        except _queue.Empty:
+            # Check process is still alive \u2014 if ffmpeg died without
+            # writing more stderr, the drain thread will push SENTINEL
+            # soon. Loop continues so cancel_event still gets polled.
+            if proc.poll() is not None and _stderr_q.empty():
+                break
+            continue
+        if line is _SENTINEL:
+            break
 
         m = _FFMPEG_TIME_RE.search(line)
         if m and dur > 0:
@@ -380,7 +456,19 @@ def compress_video(input_path: str, stream: LogStreamer,
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        proc.terminate()
+        # Full terminate→wait→kill→wait so a hung ffmpeg (NVENC driver
+        # wedge) doesn't leave proc.returncode=None — which would let
+        # the "smaller than orig" safety below misinterpret a truncated
+        # stub as a successful encode.
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
     # unregister from PROCESS_REGISTRY now that the
     # encode has exited.
     try:
@@ -518,6 +606,33 @@ def compress_video(input_path: str, stream: LogStreamer,
                 pass
             return {"ok": False, "error": str(_replace_err)}
 
+        # Post-replace verification — the original is now GONE (os.replace
+        # already overwrote it atomically at the directory-entry level).
+        # On a StableBit DrivePool boundary or other rare backend write
+        # failure, the rename can succeed while the underlying inode is
+        # corrupt or zero-length. Re-stat input_path immediately and bail
+        # LOUDLY if size doesn't match what we just wrote — the user
+        # can't restore the original automatically, but they need to
+        # know NOW (so they can recover from a backup) rather than
+        # discovering it weeks later in the archive.
+        try:
+            _stat_size = os.path.getsize(input_path)
+        except OSError as _se:
+            stream.emit_error(
+                f"CRITICAL: replaced file unreadable after os.replace — "
+                f"{input_path}: {_se}. Original is gone; restore from backup.")
+            return {"ok": False, "error": f"post-replace stat failed: {_se}",
+                    "data_loss": True}
+        if _stat_size != new_size:
+            stream.emit_error(
+                f"CRITICAL: post-replace size mismatch on {input_path} — "
+                f"wrote {new_size:,} bytes, on-disk reports {_stat_size:,}. "
+                f"Original is gone; restore from backup.")
+            return {"ok": False,
+                    "error": f"post-replace size mismatch: wrote={new_size} "
+                             f"on_disk={_stat_size}",
+                    "data_loss": True}
+
     # Per-file done line. Same _marker_tag as the progress bars so it
     # REPLACES the bar in place (issue #146) instead of appending at
     # log bottom after unrelated channels have scrolled past.
@@ -567,6 +682,7 @@ def compress_videos_batch(paths, stream: LogStreamer,
         n_splits = (len(paths) + batch_size - 1) // batch_size
         agg = {"done": 0, "grew": 0, "errors": 0,
                "sum_orig": 0, "sum_new": 0, "cancelled": False}
+        _t_agg_start = time.time()
         for i in range(n_splits):
             if cancel_event is not None and cancel_event.is_set():
                 agg["cancelled"] = True
@@ -586,7 +702,45 @@ def compress_videos_batch(paths, stream: LogStreamer,
             if r.get("cancelled"):
                 agg["cancelled"] = True
                 break
+        # Compute aggregated saved_pct now that all chunks are folded.
+        # Previously the recursive split path returned an agg without
+        # saved_pct, so the activity-log row + UI summary saw 0% on
+        # any compress job large enough to hit the batch-split threshold.
+        if agg["sum_orig"] > 0:
+            agg["saved_pct"] = 100.0 * (1.0 - agg["sum_new"] / agg["sum_orig"])
+        else:
+            agg["saved_pct"] = 0.0
         agg["ok"] = True
+        # Aggregated [Cmprss] activity-log row. Each recursive chunk
+        # passes batch_num != batch_total so the per-chunk emit at
+        # line 788 is suppressed — we emit ONCE here with the full
+        # totals across all chunks (audit: compress.py:706).
+        try:
+            if agg["done"] > 0 or agg["errors"] > 0:
+                _ag_elapsed = time.time() - _t_agg_start
+                from . import autorun as _ar
+                _ag_primary = f"{agg['done']} compressed"
+                _ar.append_history_entry(
+                    _ar.format_history_entry("Cmprss", channel_name or "",
+                                             _ag_primary, secondary="",
+                                             errors=agg["errors"],
+                                             took_sec=_ag_elapsed))
+                from datetime import datetime as _dt
+                _now = _dt.now()
+                _time_str = _now.strftime("%I:%M%p").lstrip("0").lower()
+                _date_str = _now.strftime("%b %d").replace(" 0", " ")
+                _took = (f"took {int(_ag_elapsed)}s" if _ag_elapsed < 60
+                         else f"took {int(_ag_elapsed)//60}m {int(_ag_elapsed)%60}s")
+                stream.emit_activity({
+                    "kind": "Cmprss",
+                    "time_date": f"{_time_str}, {_date_str}",
+                    "channel": channel_name or "",
+                    "primary": _ag_primary,
+                    "secondary": f"{_took} · saved {agg['saved_pct']:.1f}%",
+                    "errors": agg["errors"],
+                })
+        except Exception as _ae:
+            _log.debug("aggregate Cmprss emit swallowed: %s", _ae)
         return agg
     # Header when we're one of N batches
     if batch_total > 1:

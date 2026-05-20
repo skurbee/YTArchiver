@@ -57,6 +57,12 @@
   window._paintBlinkState = paintBlinkState;
 
   function initQueueBlink() {
+    // Re-init guard — without this, repeated init calls double-wrap
+    // setQueueState / renderQueues every time (each wrap chains the
+    // previous wrapper inside origSet), causing blink ticks and
+    // queue paints to fire 2x, 3x, ... on subsequent inits.
+    if (window._queueBlinkInited) return;
+    window._queueBlinkInited = true;
     // Backend drives blink state via:
     // window.setQueueState({ sync: {running, paused, pausedActive}, gpu: {...} })
     window.setQueueState = (state) => {
@@ -347,10 +353,18 @@
                            _blinkState.gpu, "GPU");
     // Sync popover: no sibling buttons in the footer — hide the entire
     // footer when there's nothing to act on so we don't show an empty
-    // bar with just the border-top.
+    // bar with just the border-top. But keep it visible while the
+    // popover is OPEN even when the queue just drained, so the Pause
+    // button doesn't disappear mid-view if the user was about to
+    // click it (audit: queueBlink.js:351-354). Re-check
+    // visibility next paint after the popover closes.
     const syncFooter = _bdom("sync-tasks-footer");
     if (syncFooter) {
-      syncFooter.style.display = _blinkState.sync.count > 0 ? "" : "none";
+      const _pop = _bdom("sync-tasks-popover");
+      const _popOpen = !!(_pop && _pop.style.display !== "none"
+        && !_pop.hasAttribute("hidden"));
+      syncFooter.style.display =
+        (_blinkState.sync.count > 0 || _popOpen) ? "" : "none";
     }
     // GPU popover: footer also hosts the Manual Transcribe folder icon,
     // which should stay visible. Only hide the Pause/Cancel pair.

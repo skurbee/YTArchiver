@@ -94,17 +94,13 @@ class MediaOpsMixin:
         """Scan one channel's transcript files for drift between the
         aggregated .txt, hidden .jsonl, and FTS index.
 
-        Cross-references three sources:
-          - `{Ch} Transcript.txt` (header-delimited entries)
-          - hidden `.{Ch} Transcript.jsonl` (one line per segment)
-          - segments_fts (FTS5 external-content table)
-
-        Reports three drift categories:
-          A. TXT-without-JSONL — entry in .txt but no matching .jsonl
-          B. JSONL-without-TXT — segments in .jsonl but no .txt entry
-          C. FTS phantoms — global count of orphan FTS rowids (C-9)
-
-        Pure read, no mutations. Apply side is drift_apply_channel."""
+        Spawns a background worker so the js_api thread doesn't freeze
+        the UI while we walk three sources for a large channel (audit:
+        media_ops_mixin.py:93). Returns a token immediately; caller
+        polls drift_scan_channel_poll. The synchronous behavior
+        (return the scan result directly) is preserved when called
+        from worker context — detect via thread name.
+        """
         from backend import drift_scan as _ds
         ch = subs_backend.get_channel(identity or {})
         if not ch:
@@ -113,7 +109,44 @@ class MediaOpsMixin:
         output_dir = (cfg.get("output_dir") or "").strip()
         if not output_dir:
             return {"ok": False, "error": "output_dir is not configured"}
-        return _ds.scan_channel(ch, output_dir)
+        # Worker thread + token-poll pattern. Same shape as the other
+        # async js_api methods (chan_scan_resolution_mismatch et al.).
+        import uuid as _uuid
+        token = _uuid.uuid4().hex
+        if not hasattr(self, "_drift_scan_results"):
+            self._drift_scan_results = {}
+        if not hasattr(self, "_drift_scan_lock"):
+            self._drift_scan_lock = threading.Lock()
+        with self._drift_scan_lock:
+            self._drift_scan_results[token] = {"ok": True, "pending": True}
+        def _run():
+            try:
+                res = _ds.scan_channel(ch, output_dir)
+                with self._drift_scan_lock:
+                    self._drift_scan_results[token] = res
+            except Exception as e:
+                with self._drift_scan_lock:
+                    self._drift_scan_results[token] = {"ok": False, "error": str(e)}
+        threading.Thread(target=_run, daemon=True,
+                         name="drift-scan-channel").start()
+        return {"ok": True, "pending": True, "token": token}
+
+    def drift_scan_channel_poll(self, token):
+        """Poll the drift_scan_channel worker by token. Returns
+        {ok, pending} while running, the full scan result once done."""
+        lock = getattr(self, "_drift_scan_lock", None)
+        results = getattr(self, "_drift_scan_results", {})
+        if lock is None:
+            return {"ok": False, "error": "unknown token"}
+        with lock:
+            res = results.get(token)
+            if res is None:
+                return {"ok": False, "error": "unknown token"}
+            if res.get("pending"):
+                return {"ok": True, "pending": True}
+            try: del results[token]
+            except KeyError: pass
+            return res
 
 
     def drift_apply_channel(self, identity):
@@ -141,40 +174,74 @@ class MediaOpsMixin:
         def _enqueue_retranscribe(filepath, title, video_id):
             self.transcribe_retranscribe(filepath, title, video_id)
 
-        result = _ds.apply_channel(
-            ch, output_dir,
-            enqueue_retranscribe_fn=_enqueue_retranscribe,
-            rebuild_fts_fn=_ds.rebuild_fts_index)
+        # Spawn the apply on a worker thread + token-poll. drift_apply
+        # walks every drift entry and calls _enqueue_retranscribe per
+        # entry; on a large channel this blocked the js_api thread for
+        # multiple seconds (audit: media_ops_mixin.py:140). Same
+        # pattern as drift_scan_channel above.
+        import uuid as _uuid
+        token = _uuid.uuid4().hex
+        if not hasattr(self, "_drift_apply_results"):
+            self._drift_apply_results = {}
+        if not hasattr(self, "_drift_apply_lock"):
+            self._drift_apply_lock = threading.Lock()
+        with self._drift_apply_lock:
+            self._drift_apply_results[token] = {"ok": True, "pending": True}
+        def _run():
+            try:
+                result = _ds.apply_channel(
+                    ch, output_dir,
+                    enqueue_retranscribe_fn=_enqueue_retranscribe,
+                    rebuild_fts_fn=_ds.rebuild_fts_index)
+                if result.get("ok"):
+                    a = result.get("actions", {})
+                    parts = []
+                    if a.get("txt_reconstructed"):
+                        parts.append(f"{a['txt_reconstructed']} .txt rebuilt")
+                    if a.get("retranscribe_queued"):
+                        parts.append(f"{a['retranscribe_queued']} queued for Whisper")
+                    if a.get("retranscribe_skipped"):
+                        parts.append(f"{a['retranscribe_skipped']} skipped (video file missing)")
+                    if a.get("fts_rebuilt"):
+                        parts.append("FTS rebuilt")
+                    ch_name = ch.get("name") or ch.get("folder", "")
+                    if parts:
+                        self._log_stream.emit_text(
+                            f" \u2014 Drift fix for {ch_name}: "
+                            f"{' \u00b7 '.join(parts)}.", "simpleline_pink")
+                    else:
+                        self._log_stream.emit_text(
+                            f" \u2014 Drift fix for {ch_name}: no actions taken.",
+                            "dim")
+                    self._log_stream.flush()
+                    if a.get("retranscribe_queued", 0) > 0:
+                        self._maybe_autostart_sync()
+                with self._drift_apply_lock:
+                    self._drift_apply_results[token] = result
+            except Exception as e:
+                with self._drift_apply_lock:
+                    self._drift_apply_results[token] = {"ok": False, "error": str(e)}
+        threading.Thread(target=_run, daemon=True,
+                         name="drift-apply-channel").start()
+        return {"ok": True, "pending": True, "token": token}
 
-        # Surface what happened in the main log so the user has a
-        # record (same pattern as other Tools actions).
-        if result.get("ok"):
-            a = result.get("actions", {})
-            parts = []
-            if a.get("txt_reconstructed"):
-                parts.append(f"{a['txt_reconstructed']} .txt rebuilt")
-            if a.get("retranscribe_queued"):
-                parts.append(f"{a['retranscribe_queued']} queued for Whisper")
-            if a.get("retranscribe_skipped"):
-                parts.append(f"{a['retranscribe_skipped']} skipped (video file missing)")
-            if a.get("fts_rebuilt"):
-                parts.append("FTS rebuilt")
-            ch_name = ch.get("name") or ch.get("folder", "")
-            if parts:
-                self._log_stream.emit_text(
-                    f" \u2014 Drift fix for {ch_name}: "
-                    f"{' \u00b7 '.join(parts)}.", "simpleline_pink")
-            else:
-                self._log_stream.emit_text(
-                    f" \u2014 Drift fix for {ch_name}: no actions taken.",
-                    "dim")
-            self._log_stream.flush()
-            # Kick the sync worker so retranscribe jobs drain (matches
-            # the H-7 pattern used in metadata_queue_*). Respects the
-            # paused flag — see _maybe_autostart_sync.
-            if a.get("retranscribe_queued", 0) > 0:
-                self._maybe_autostart_sync()
-        return result
+
+    def drift_apply_channel_poll(self, token):
+        """Poll the drift_apply_channel worker by token. Returns
+        {ok, pending} while running, the full apply result once done."""
+        lock = getattr(self, "_drift_apply_lock", None)
+        results = getattr(self, "_drift_apply_results", {})
+        if lock is None:
+            return {"ok": False, "error": "unknown token"}
+        with lock:
+            res = results.get(token)
+            if res is None:
+                return {"ok": False, "error": "unknown token"}
+            if res.get("pending"):
+                return {"ok": True, "pending": True}
+            try: del results[token]
+            except KeyError: pass
+            return res
 
 
     # ─── Repair YT auto-captions (v64.7 parser fix) ────────────────────
@@ -234,8 +301,13 @@ class MediaOpsMixin:
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not queued:
-            return {"ok": True, "queued": False,
-                    "error": "Already queued for this scope"}
+            # Don't pair ok:True with an `error` field — that mixed
+            # contract used to trip JS callers into rendering both
+            # a success AND an error toast (audit: media_ops_mixin.
+            # py:236 + :295). Surface dedupe as a distinct `duplicate`
+            # flag so callers branch cleanly.
+            return {"ok": True, "queued": False, "duplicate": True,
+                    "reason": "Already queued for this scope"}
         self._on_queue_changed()
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "started": started,
@@ -293,8 +365,13 @@ class MediaOpsMixin:
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not queued:
-            return {"ok": True, "queued": False,
-                    "error": "Already queued for this scope"}
+            # Don't pair ok:True with an `error` field — that mixed
+            # contract used to trip JS callers into rendering both
+            # a success AND an error toast (audit: media_ops_mixin.
+            # py:236 + :295). Surface dedupe as a distinct `duplicate`
+            # flag so callers branch cleanly.
+            return {"ok": True, "queued": False, "duplicate": True,
+                    "reason": "Already queued for this scope"}
         self._on_queue_changed()
         started = self._maybe_autostart_sync()
         return {"ok": True, "queued": True, "started": started,
@@ -461,6 +538,28 @@ class MediaOpsMixin:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name
         folder = os.path.join(base, channel_folder_name(ch))
+        # Refuse reorg when sync, redownload, or compress is currently
+        # writing to this channel's folder. Without this guard, reorg
+        # could move files out from under an in-flight yt-dlp download
+        # → corrupted partial files, sync errors, orphan .part files.
+        ch_name = ch.get("name") or ch.get("folder") or ""
+        ch_url = (ch.get("url") or "").strip()
+        if ch_name and ch_url:
+            try:
+                _cur = self._queues.current_sync
+                if _cur and _cur.get("url") == ch_url:
+                    return {"ok": False,
+                            "error": f"Sync is currently downloading "
+                                     f"{ch_name} — wait for it to finish "
+                                     f"before reorganizing."}
+                _cur_g = self._queues.current_gpu
+                if _cur_g and _cur_g.get("channel") == ch_name:
+                    return {"ok": False,
+                            "error": f"GPU work (transcribe/encode) is "
+                                     f"running against {ch_name} — wait "
+                                     f"for it to finish before reorganizing."}
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         def _run():
             try:
                 reorg_backend.reorg_channel(folder,

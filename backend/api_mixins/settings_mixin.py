@@ -22,19 +22,31 @@ class SettingsMixin:
         # leaving self._config unchanged keeps the in-memory state
         # consistent with what the next reload will read.
         persisted = False
-        try:
-            from backend.ytarchiver_config import save_config as _sc
-            cfg = load_config()
-            cfg["log_mode"] = mode
-            persisted = bool(_sc(cfg))
-        except Exception:
-            persisted = False
-        if persisted:
-            if self._config is not None:
-                self._config["log_mode"] = mode
-            # LogStreamer respects `simple_mode` when filtering dim/verbose lines
-            self._log_stream.simple_mode = (mode == "Simple")
-        return persisted
+        # Hold the same settings-save lock so a parallel settings_save
+        # can't interleave the load→mutate→save (audit: settings_mixin.
+        # py:33-37). With the lock, even if save fails partway, the
+        # in-memory state reload below + on next call is consistent
+        # with whatever survived on disk.
+        with SettingsMixin._settings_save_lock:
+            try:
+                from backend.ytarchiver_config import save_config as _sc
+                cfg = load_config()
+                cfg["log_mode"] = mode
+                persisted = bool(_sc(cfg))
+            except Exception:
+                persisted = False
+            if persisted:
+                if self._config is not None:
+                    self._config["log_mode"] = mode
+                # LogStreamer respects `simple_mode` when filtering dim/verbose lines
+                self._log_stream.simple_mode = (mode == "Simple")
+            else:
+                # Save failed — reload from disk so in-memory state
+                # matches whatever's actually persisted, not the
+                # caller's intent.
+                try: self._reload_config()
+                except Exception: pass
+            return persisted
 
 
     # ─── Autorun scheduler ─────────────────────────────────────────────
@@ -96,9 +108,20 @@ class SettingsMixin:
         }
 
 
+    # Process-wide lock around settings_save's load→mutate→save. Old
+    # code did this unlocked, so two near-simultaneous calls (e.g.
+    # window_state.save firing while the user clicked Save in Settings)
+    # could both load_config, mutate independent copies, and the loser
+    # silently overwrote the winner (audit: settings_mixin.py:99-196).
+    _settings_save_lock = threading.Lock()
+
     def settings_save(self, data):
         if not config_is_writable():
             return {"ok": False, "error": "Write-gate off"}
+        with SettingsMixin._settings_save_lock:
+            return self._settings_save_inner(data)
+
+    def _settings_save_inner(self, data):
         cfg = load_config()
         # Track the OLD whisper model so we can hot-apply a change to
         # the running TranscribeManager (audit U-7). Settings_save was
@@ -198,17 +221,30 @@ class SettingsMixin:
 
     # ─── yt-dlp version / update ───────────────────────────────────────
 
+    # Session-cached yt-dlp version. The subprocess timeout=10 was
+    # blocking the JS-bridge thread on every About-dialog open or
+    # diagnostics scan — when Defender was scanning yt-dlp.exe this
+    # could feel like a 10s UI freeze (audit: settings_mixin.py:
+    # 206-213). Cache by yt-dlp path so a user pointing at a new
+    # binary still re-probes.
+    _ytdlp_version_cache: dict[str, dict] = {}
+
     def ytdlp_version(self):
         """Return current yt-dlp version string."""
         yt = sync_backend.find_yt_dlp()
         if not yt:
             return {"ok": False, "error": "yt-dlp not found"}
+        _cached = SettingsMixin._ytdlp_version_cache.get(yt)
+        if _cached is not None:
+            return _cached
         try:
             import subprocess as _sp
             r = _sp.run([yt, "--version"], capture_output=True, text=True,
                         timeout=10, startupinfo=sync_backend._startupinfo)
             ver = (r.stdout or "").strip().split("\n")[0] or "unknown"
-            return {"ok": True, "version": ver, "path": yt}
+            _result = {"ok": True, "version": ver, "path": yt}
+            SettingsMixin._ytdlp_version_cache[yt] = _result
+            return _result
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

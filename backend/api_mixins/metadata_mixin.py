@@ -109,7 +109,7 @@ class MetadataMixin:
         # enqueue a normal fetch-new-only pass.
         if existing_count > 0:
             def _prompt_then_enqueue():
-                choice = (self.prompt_metadata_already_downloaded(
+                choice = (self._prompt_metadata_already_downloaded(
                     ch_name, existing_count) or {}).get("choice", "skip")
                 if choice in ("skip", "cancel"):
                     self._log_stream.emit_text(
@@ -535,7 +535,12 @@ class MetadataMixin:
                 "paused": bool(self._queues.sync_paused)}
 
 
-    def prompt_metadata_already_downloaded(self, channel_name, count):
+    def _prompt_metadata_already_downloaded(self, channel_name, count):
+        # Underscore prefix hides this from the js_api surface (pywebview
+        # convention) so a future JS caller can't accidentally wedge
+        # the bridge thread on the 2-minute wait. Only the backend
+        # sync/recheck worker should invoke this method (see
+        # metadata_recheck_channel above).
         """Ask user via JS dialog: Skip / Overwrite / Append. Returns choice string.
 
         Intended to be called BY the backend sync worker when it detects

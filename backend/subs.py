@@ -265,9 +265,37 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
         import subprocess as _sp
 
         from . import sync as _sync
+        from .process_runner import PROCESS_REGISTRY
         yt = _sync.find_yt_dlp()
         if not yt:
             return None
+        # Helper that registers the spawned proc with the global
+        # registry so a shutdown mid-call kills the yt-dlp probe child
+        # cleanly. Old subprocess.run path bypassed the registry, so
+        # shutting down while adding a channel left yt-dlp.exe running
+        # for up to 30s (audit: subs.py:280-296).
+        def _run_registered(argv, timeout):
+            proc = _sp.Popen(
+                argv, stdout=_sp.PIPE, stderr=_sp.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                startupinfo=_sync._startupinfo)
+            try:
+                PROCESS_REGISTRY.register(proc)
+            except Exception:
+                pass
+            try:
+                try:
+                    out, _err = proc.communicate(timeout=timeout)
+                except _sp.TimeoutExpired:
+                    try: proc.kill()
+                    except Exception: pass
+                    try: proc.communicate(timeout=5)
+                    except Exception: pass
+                    return ""
+            finally:
+                try: PROCESS_REGISTRY.unregister(proc)
+                except Exception: pass
+            return out or ""
         # Pass 1: flat-playlist with channel+uploader fields
         cmd = [
             yt, "--flat-playlist", "--playlist-end", "1",
@@ -276,9 +304,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
             *_sync._find_cookie_source(),
             normalize_channel_url(url),
         ]
-        r = _sp.run(cmd, capture_output=True, text=True,
-                    timeout=timeout_sec, startupinfo=_sync._startupinfo)
-        raw_out = (r.stdout or "").strip()
+        raw_out = _run_registered(cmd, timeout_sec).strip()
         name = raw_out.split("\n")[0].strip() if raw_out else ""
         # yt-dlp sentinel for "not available" is the literal string "NA"
         if name in ("", "NA"):
@@ -291,10 +317,7 @@ def fetch_channel_display_name(url: str, timeout_sec: int = 15) -> str | None:
                 *_sync._find_cookie_source(),
                 normalize_channel_url(url),
             ]
-            r2 = _sp.run(cmd2, capture_output=True, text=True,
-                         timeout=timeout_sec + 15,
-                         startupinfo=_sync._startupinfo)
-            raw_out = (r2.stdout or "").strip()
+            raw_out = _run_registered(cmd2, timeout_sec + 15).strip()
             name = raw_out.split("\n")[0].strip() if raw_out else ""
         if name == "NA":
             name = ""
@@ -371,6 +394,15 @@ def add_channel(payload: dict[str, Any]) -> dict[str, Any]:
     # Sort alphabetically by name (matches YTArchiver's usual ordering)
     channels.sort(key=lambda c: (c.get("name") or "").lower())
     if not save_config(cfg):
+        # Save failed — roll back the in-memory append so the ghost
+        # channel can't be persisted later by an unrelated save_config
+        # call. Without this, the channel sits in cfg["channels"] in the
+        # process's load_config cache; the next legitimate save (e.g.
+        # window_state, settings) would commit it to disk silently.
+        try:
+            channels.remove(new_ch)
+        except ValueError:
+            pass
         # Gated — return the proposed channel anyway so the UI can show it
         return {**new_ch, "_write_blocked": True}
     return new_ch
@@ -478,6 +510,31 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
             old_path = _os.path.join(base, _sync.sanitize_folder(old_name))
             new_path = _os.path.join(base, _sync.sanitize_folder(new_name))
             if _os.path.isdir(old_path) and not _os.path.exists(new_path):
+                # Reject cross-volume renames up front. os.rename is
+                # documented atomic only when source + dest live on the
+                # same volume. On UNC/junction'd setups the destination
+                # path may resolve to a different physical volume even
+                # though both paths share `base` — partial moves are
+                # possible if the OS falls through to copy+delete. We
+                # never want a half-moved channel folder.
+                try:
+                    _os_name = _os.name
+                    if _os_name == "nt":
+                        _old_drv, _ = _os.path.splitdrive(_os.path.abspath(old_path))
+                        _new_drv, _ = _os.path.splitdrive(_os.path.abspath(new_path))
+                        _same_vol = _old_drv.lower() == _new_drv.lower()
+                    else:
+                        # POSIX: stat().st_dev tells us the actual device.
+                        _same_vol = (_os.stat(old_path).st_dev ==
+                                     _os.stat(_os.path.dirname(new_path)).st_dev)
+                except OSError:
+                    _same_vol = False
+                if not _same_vol:
+                    raise SubsError(
+                        f"Cannot rename folder from {old_name!r} to "
+                        f"{new_name!r}: source and destination are on "
+                        f"different volumes. Move the channel folder "
+                        f"manually, then rename in the app.")
                 try:
                     _os.rename(old_path, new_path)
                     updated["_folder_renamed"] = {"from": old_path, "to": new_path}
@@ -503,6 +560,14 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
     channels[idx] = updated
     channels.sort(key=lambda c: (c.get("name") or "").lower())
     if not save_config(cfg):
+        # Save failed — restore the original channel record in-memory so
+        # a later unrelated save_config call can't accidentally persist
+        # the unsaved mutation. Re-locate by identity since the sort
+        # above may have shuffled the index.
+        _r_idx = _find_channel(channels, identity)
+        if _r_idx is not None:
+            channels[_r_idx] = existing
+            channels.sort(key=lambda c: (c.get("name") or "").lower())
         return {**updated, "_write_blocked": True}
     return updated
 
@@ -540,9 +605,40 @@ def remove_channel(identity: dict[str, str],
                 from .sync import channel_folder_name as _cfn
                 folder_name = _cfn(ch)
                 folder_path = os.path.join(base, folder_name)
+                # Path-containment guard — refuse to rmtree anything
+                # that doesn't live INSIDE output_dir. A malformed
+                # channel name with .. traversal characters could
+                # otherwise yield a path outside the archive root.
+                # Use os.path.commonpath to detect escapes.
+                _base_abs = os.path.abspath(base)
+                _folder_abs = os.path.abspath(folder_path)
+                try:
+                    _common = os.path.commonpath([_folder_abs, _base_abs])
+                except ValueError:
+                    _common = ""
+                if _common != _base_abs:
+                    raise ValueError(
+                        f"refused to delete folder outside output_dir: "
+                        f"{folder_path}")
                 if os.path.isdir(folder_path):
-                    shutil.rmtree(folder_path, ignore_errors=False)
-                    result["deleted_folder"] = True
+                    # Track partial-failure paths so the user sees
+                    # which sub-files survived a botched rmtree. The
+                    # ignore_errors=False path stops at first failure;
+                    # using onerror lets us continue and report.
+                    _failed_paths: list[tuple[str, str]] = []
+                    def _onerr(_fn, _p, _exc):
+                        try:
+                            _failed_paths.append((_p, str(_exc[1])))
+                        except Exception:
+                            _failed_paths.append((str(_p), "?"))
+                    shutil.rmtree(folder_path, onerror=_onerr)
+                    if _failed_paths:
+                        result["delete_error"] = (
+                            f"{len(_failed_paths)} item(s) could not be "
+                            f"removed (first: {_failed_paths[0][0]})")
+                        result["delete_partial_failures"] = _failed_paths
+                    else:
+                        result["deleted_folder"] = True
                     result["folder_path"] = folder_path
             except Exception as e:
                 # Delete failed — surface the error but STILL drop the

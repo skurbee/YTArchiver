@@ -140,24 +140,38 @@ def fetch_channel_metadata(channel: dict[str, Any],
     _failed_id_files: set = set()
     try:
         from .. import index as _idx
-        conn = _idx._open()
-        if conn is not None:
-            ch_name = channel.get("name") or channel.get("folder") or ""
-            with _idx._db_lock:
-                if refresh:
-                    conn.execute(
-                        "UPDATE videos SET metadata_fetch_failed_ts=NULL, "
-                        "id_resolve_failed_ts=NULL WHERE channel=?",
-                        (ch_name,))
-                    conn.commit()
-                else:
-                    for (_vid,) in conn.execute(
+        ch_name = channel.get("name") or channel.get("folder") or ""
+        if refresh:
+            # The refresh UPDATE has to use the writer + _db_lock.
+            conn = _idx._open()
+            if conn is not None:
+                with _idx._db_lock:
+                    try:
+                        conn.execute(
+                            "UPDATE videos SET metadata_fetch_failed_ts=NULL, "
+                            "id_resolve_failed_ts=NULL WHERE channel=?",
+                            (ch_name,))
+                        conn.commit()
+                    except Exception as _ue:
+                        try: conn.rollback()
+                        except Exception: pass
+                        _log.warning("refresh UPDATE rolled back: %s", _ue)
+        else:
+            # SELECT-only path: switch to the reader connection so it
+            # doesn't queue behind sync writers holding _db_lock (audit:
+            # metadata/refresh_fetch.py:139-167). Hundreds-of-ms to
+            # multi-second writer blocking on every metadata recheck
+            # was visible in long sessions.
+            rconn = _idx._reader_open()
+            if rconn is not None:
+                with _idx._reader_lock:
+                    for (_vid,) in rconn.execute(
                             "SELECT video_id FROM videos WHERE channel=? "
                             "AND metadata_fetch_failed_ts IS NOT NULL "
                             "AND video_id IS NOT NULL AND video_id != ''",
                             (ch_name,)).fetchall():
                         _failed_fetch.add(_vid)
-                    for (_fp,) in conn.execute(
+                    for (_fp,) in rconn.execute(
                             "SELECT filepath FROM videos WHERE channel=? "
                             "AND id_resolve_failed_ts IS NOT NULL "
                             "AND (video_id IS NULL OR video_id='')",
@@ -321,6 +335,19 @@ def fetch_channel_metadata(channel: dict[str, Any],
                 conn = _idx._open()
                 if conn is not None:
                     with _idx._db_lock:
+                        # BEGIN IMMEDIATE so the duplicate-detection
+                        # SELECT-then-UPDATE pairs run as a single
+                        # write transaction. Without this, a concurrent
+                        # sync writing a new row for _vid between SELECT
+                        # and UPDATE could flag the live in-progress
+                        # download as duplicate-of an older file
+                        # (audit: refresh_fetch.py:319-373).
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                        except Exception:
+                            # If a tx is already open (auto-begin),
+                            # carry on — _db_lock still serializes us.
+                            pass
                         for _fp, _vid in resolved.items():
                             existing = conn.execute(
                                 "SELECT filepath, size_bytes FROM videos "
@@ -370,7 +397,14 @@ def fetch_channel_metadata(channel: dict[str, Any],
                                     (_vid,
                                      f"https://www.youtube.com/watch?v={_vid}",
                                      _fp))
-                        conn.commit()
+                        try:
+                            conn.commit()
+                        except Exception as _ce:
+                            try: conn.rollback()
+                            except Exception: pass
+                            _log.warning(
+                                "duplicate-detect commit rolled back: %s",
+                                _ce)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             if n_duplicates_flagged:
@@ -416,10 +450,21 @@ def fetch_channel_metadata(channel: dict[str, Any],
                     _now = time.time()
                     with _idx._db_lock:
                         for _fp in still_unmatched:
-                            conn.execute(
+                            # Try normpath first (register_video stores
+                            # normpath'd paths). Fall back to the raw
+                            # path for legacy rows inserted before
+                            # register_video added normpath, so a flag
+                            # write doesn't silently miss them.
+                            _np = os.path.normpath(_fp)
+                            _cur = conn.execute(
                                 "UPDATE videos SET id_resolve_failed_ts=? "
                                 "WHERE filepath=? COLLATE NOCASE",
-                                (_now, os.path.normpath(_fp)))
+                                (_now, _np))
+                            if (_cur.rowcount or 0) == 0 and _fp != _np:
+                                conn.execute(
+                                    "UPDATE videos SET id_resolve_failed_ts=? "
+                                    "WHERE filepath=? COLLATE NOCASE",
+                                    (_now, _fp))
                         conn.commit()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -448,7 +493,14 @@ def fetch_channel_metadata(channel: dict[str, Any],
              "simpleline"],
         ])
 
-        # Recompute targets with the newly-resolved ids in scope.
+    # Recompute targets with the newly-resolved ids in scope. This
+    # MUST run unconditionally whenever the title-resolution backfill
+    # produced any new ids \u2014 previously the block was indented inside
+    # `if n_perm_no_id:`, so a successful backfill without any
+    # permanent skips would leave `targets` referencing the stale
+    # list and the newly-resolved files never got their metadata
+    # fetched on this pass (user had to click Recheck twice).
+    if n_without_id:
         if refresh:
             targets = list(on_disk_ids)
         else:

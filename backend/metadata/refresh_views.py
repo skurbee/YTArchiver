@@ -259,17 +259,28 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             _conn = _idx._open()
             if _conn is not None:
                 with _idx._db_lock:
-                    for _fp, _vid, _ttl in _title_resolved:
-                        _vurl = f"https://www.youtube.com/watch?v={_vid}"
-                        try:
-                            _conn.execute(
-                                "UPDATE videos SET video_id=?, video_url=? "
-                                "WHERE filepath=? COLLATE NOCASE "
-                                "AND (video_id IS NULL OR video_id='')",
-                                (_vid, _vurl, _fp))
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                    _conn.commit()
+                    try:
+                        for _fp, _vid, _ttl in _title_resolved:
+                            _vurl = f"https://www.youtube.com/watch?v={_vid}"
+                            try:
+                                _conn.execute(
+                                    "UPDATE videos SET video_id=?, video_url=? "
+                                    "WHERE filepath=? COLLATE NOCASE "
+                                    "AND (video_id IS NULL OR video_id='')",
+                                    (_vid, _vurl, _fp))
+                            except Exception as e:
+                                _log.debug("swallowed: %s", e)
+                        _conn.commit()
+                    except Exception as _ce:
+                        # Roll back the whole title-resolve batch if
+                        # commit fails (e.g. disk full mid-flush).
+                        # Without this, some files end up with video_id
+                        # set and others don't, and the in-memory
+                        # on_disk list disagrees with the DB (audit:
+                        # metadata/refresh_views.py:264-273).
+                        try: _conn.rollback()
+                        except Exception: pass
+                        _log.error("title-resolve commit failed: %s", _ce)
         except Exception as e:
             _log.debug("swallowed: %s", e)
         # User-friendly wording: dropped "(no [id] in filename)"
@@ -298,7 +309,16 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # Read-only state lookup — reader path avoids queueing behind sweep.
         _conn_rm = _idx._reader_open()
         if _conn_rm is not None:
-            _pat = _like_esc(str(folder)) + "%"
+            # Normalize the folder path to the SAME canonical form that
+            # videos.filepath rows were inserted with (os.path.normpath
+            # in register_video). Old _like_esc(str(folder)) used the
+            # Path's str form which can have forward-slash separators
+            # on Windows when the Path was constructed from a forward-
+            # slash source — leaving the LIKE pattern mismatched
+            # against backslash-stored DB rows (audit: refresh_views.
+            # py:294-352).
+            _folder_norm = os.path.normpath(str(folder))
+            _pat = _like_esc(_folder_norm) + "%"
             _db_state: dict[str, tuple[str | None, float | None]] = {}
             with _idx._reader_lock:
                 for _row in _conn_rm.execute(
@@ -317,24 +337,37 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 elif _is_in_catalog and _db_removed_ts is not None:
                     _newly_restored.append(_fp)
             if _newly_removed or _newly_restored:
-                with _idx._db_lock:
-                    for _fp in _newly_removed:
+                # Writes must go through the writer connection. The
+                # previous code re-used the reader connection (_conn_rm)
+                # for these UPDATEs, which on WAL with query_only=ON
+                # either fails outright or bypasses the writer's
+                # busy-timeout discipline. Use _open() for writes and
+                # serialize via _db_lock.
+                _conn_wr = _idx._open()
+                if _conn_wr is not None:
+                    with _idx._db_lock:
                         try:
-                            _conn_rm.execute(
-                                "UPDATE videos SET removed_from_yt_ts=? "
-                                "WHERE filepath=? COLLATE NOCASE",
-                                (_now_rm, _fp))
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                    for _fp in _newly_restored:
-                        try:
-                            _conn_rm.execute(
-                                "UPDATE videos SET removed_from_yt_ts=NULL "
-                                "WHERE filepath=? COLLATE NOCASE",
-                                (_fp,))
-                        except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                    _conn_rm.commit()
+                            for _fp in _newly_removed:
+                                try:
+                                    _conn_wr.execute(
+                                        "UPDATE videos SET removed_from_yt_ts=? "
+                                        "WHERE filepath=? COLLATE NOCASE",
+                                        (_now_rm, _fp))
+                                except Exception as e:
+                                    _log.debug("swallowed: %s", e)
+                            for _fp in _newly_restored:
+                                try:
+                                    _conn_wr.execute(
+                                        "UPDATE videos SET removed_from_yt_ts=NULL "
+                                        "WHERE filepath=? COLLATE NOCASE",
+                                        (_fp,))
+                                except Exception as e:
+                                    _log.debug("swallowed: %s", e)
+                            _conn_wr.commit()
+                        except Exception as _we:
+                            try: _conn_wr.rollback()
+                            except Exception as e: _log.debug("swallowed: %s", e)
+                            _log.error("removed_from_yt UPDATE failed: %s", _we)
                 if _newly_removed:
                     stream.emit([
                         [" \u26a0 ", ["meta_bracket", "views_refresh_progress"]],
@@ -428,15 +461,21 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # (members-only, very recent uploads, etc.).
         _no_flat_data = (_view_new is None and _view_old is not None)
 
-        # Always update the stats in-place — even if unchanged, bump
-        # `fetched_at` so the "last refreshed" timestamp is accurate.
+        # Only bump in-place counters + fetched_at when something
+        # actually changed. The previous "always bump fetched_at"
+        # path meant every "no-op" refresh rewrote EVERY metadata
+        # jsonl on disk (10k-video archive = thousands of MB of churn
+        # + DrivePool I/O + mtime bumps that defeated downstream
+        # fingerprint caches). Now unchanged vids stay untouched.
         if _view_new is not None:
             old["view_count"] = _view_new
         if _like_new is not None:
             old["like_count"] = _like_new
         if _comment_new is not None:
             old["comment_count"] = _comment_new
-        old["fetched_at"] = datetime.now().isoformat()
+        if _changed or _no_flat_data:
+            old["fetched_at"] = datetime.now().isoformat()
+            old["_dirty"] = True
 
         # VERBOSE-ONLY per-video diff trace. Compact one-liner showing
         # the old→new counts and the decision. With 1000s of videos
@@ -472,14 +511,21 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             skipped_same += 1
 
     # Persist the in-place-updated entries. Group by jsonl path so we
-    # only rewrite each file once.
+    # only rewrite each file once. Skip entries that aren't actually
+    # dirty — see `_dirty` flag set above. The previous code added
+    # every video in existing_by_id to dirty_paths, churning every
+    # jsonl on disk even for a no-op refresh.
     _hb_phase[0] = "writing updated counts"
     dirty_paths: dict[str, dict[str, dict[str, Any]]] = {}
     for vid, entry in existing_by_id.items():
+        if not entry.get("_dirty"):
+            continue
         jp = jsonl_by_id.get(vid)
         if jp is None:
             continue
-        dirty_paths.setdefault(jp, {})[vid] = entry
+        # Strip the transient _dirty marker before persisting.
+        _entry_clean = {k: v for k, v in entry.items() if k != "_dirty"}
+        dirty_paths.setdefault(jp, {})[vid] = _entry_clean
     for jp, entries in dirty_paths.items():
         # Load current contents, merge our updates on top, rewrite.
         full = _read_metadata_jsonl(jp)
@@ -577,14 +623,28 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # N minutes ago" for the whole channel.
     try:
         from .. import ytarchiver_config as _cfg
-        cfg = _cfg.load_config()
-        ch_url_norm = ch_url.rstrip("/")
-        now_ts = time.time()
-        for ch in cfg.get("channels", []):
-            if (ch.get("url") or "").rstrip("/") == ch_url_norm:
-                ch["last_views_refresh_ts"] = now_ts
-                break
-        _cfg.save_config(cfg)
+        # Hold the sync-side config write lock so a concurrent
+        # settings_save / channel update doesn't read same cfg and
+        # lose this timestamp update on race (audit: refresh_views.
+        # py:582-589). _config_write_lock lives in sync/core.py.
+        try:
+            from ..sync.core import _config_write_lock as _cwl
+        except Exception:
+            _cwl = None
+        def _do_stamp():
+            cfg = _cfg.load_config()
+            ch_url_norm = ch_url.rstrip("/")
+            now_ts = time.time()
+            for ch in cfg.get("channels", []):
+                if (ch.get("url") or "").rstrip("/") == ch_url_norm:
+                    ch["last_views_refresh_ts"] = now_ts
+                    break
+            _cfg.save_config(cfg)
+        if _cwl is not None:
+            with _cwl:
+                _do_stamp()
+        else:
+            _do_stamp()
     except Exception as e:
         _log.debug("swallowed: %s", e)
 

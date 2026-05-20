@@ -129,6 +129,16 @@ class LogStreamer:
 
     def set_window(self, window):
         self._window = window
+        # Flush any messages buffered while _window was None — workers
+        # that started Timer-driven log emits during Api.__init__ (the
+        # restore-paused notice, dependency-check banners, etc.) would
+        # otherwise sit in the buffer until the next emit triggered a
+        # flush, occasionally surfacing minutes late or never. Best-
+        # effort; failure leaves the buffer for the next normal flush.
+        try:
+            self.flush()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     def add_line_scanner(self, fn):
         """Register a callback(text: str) invoked once per emitted line.

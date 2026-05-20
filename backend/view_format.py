@@ -38,7 +38,12 @@ def _fmt_time_ago(ts) -> str:
         diff = time.time() - float(ts)
     except (TypeError, ValueError):
         return ""
-    if diff <= 0:
+    # Treat slightly-future timestamps (clock drift, DST fall-back) as
+    # "just now" instead of empty. Old `diff <= 0` returned "" on the
+    # 1-hour DST window so a newly-recorded download appeared with no
+    # time-ago label (audit: view_format.py:29-49). Cap the
+    # generous-clock-drift bucket at 60s past "now".
+    if diff < -60:
         return ""
     if diff < 60:
         return "just now"
@@ -78,11 +83,25 @@ def _fmt_dur(raw) -> str:
 
 
 _VIDEO_ID_RE = re.compile(r"[?&]v=([A-Za-z0-9_-]{11})")
+# Additional patterns for short-form YT URLs that don't carry ?v=.
+# Without these, recent_downloads entries with manually-pasted
+# `youtu.be/<id>` or `/watch/<id>` URLs lost thumbnail resolution
+# (audit: view_format.py:80).
+_VIDEO_ID_RE_YOUTU_BE = re.compile(r"youtu\.be/([A-Za-z0-9_-]{11})")
+_VIDEO_ID_RE_WATCH_PATH = re.compile(r"/watch/([A-Za-z0-9_-]{11})")
+_VIDEO_ID_RE_SHORTS = re.compile(r"/shorts/([A-Za-z0-9_-]{11})")
 
 
 def _extract_video_id(video_url: str) -> str:
-    """Parse the `v=XXXX` param from a YouTube URL. Returns "" if not found."""
+    """Parse the YouTube video id from any of the URL forms:
+        watch?v=XXXX, youtu.be/XXXX, /watch/XXXX, /shorts/XXXX.
+    Returns "" if not found.
+    """
     if not video_url:
         return ""
-    m = _VIDEO_ID_RE.search(video_url)
-    return m.group(1) if m else ""
+    for _rx in (_VIDEO_ID_RE, _VIDEO_ID_RE_YOUTU_BE,
+                _VIDEO_ID_RE_WATCH_PATH, _VIDEO_ID_RE_SHORTS):
+        m = _rx.search(video_url)
+        if m:
+            return m.group(1)
+    return ""

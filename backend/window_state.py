@@ -17,6 +17,7 @@ Schema:
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 from .log import get_logger
@@ -143,21 +144,32 @@ def load_window_state() -> dict[str, Any]:
     return _sanitize_geometry(state)
 
 
+_save_lock = threading.Lock()
+
+
 def save_window_state(partial: dict[str, Any]) -> bool:
     """Merge `partial` into the saved state and persist (gated).
 
     Sanitizes geometry before persisting — a transient (-32000, -32000)
     read from the window would otherwise poison the config and trap
     every future launch off-screen.
+
+    Serializes through _save_lock so two simultaneous saves (resize
+    + move firing on different pywebview event threads during a drag)
+    can't read the same cfg, mutate it independently, and clobber each
+    other on save (audit: window_state.py:146-163). main.py also
+    debounces incoming events at the call site so this lock is rarely
+    contended in practice.
     """
-    cfg = load_config()
-    current = cfg.get("window_state") or {}
-    if not isinstance(current, dict):
-        current = {}
-    # Only accept known keys
-    for k in DEFAULT_STATE.keys():
-        if k in partial:
-            current[k] = partial[k]
-    current = _sanitize_geometry(current)
-    cfg["window_state"] = current
-    return bool(save_config(cfg))
+    with _save_lock:
+        cfg = load_config()
+        current = cfg.get("window_state") or {}
+        if not isinstance(current, dict):
+            current = {}
+        # Only accept known keys
+        for k in DEFAULT_STATE.keys():
+            if k in partial:
+                current[k] = partial[k]
+        current = _sanitize_geometry(current)
+        cfg["window_state"] = current
+        return bool(save_config(cfg))

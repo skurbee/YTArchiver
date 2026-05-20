@@ -58,7 +58,20 @@ for line in sys.stdin:
     try:
         req = json.loads(line)
         text = req.get("text", "")
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as _je:
+        # Emit an error response so the parent's readline call
+        # unblocks immediately. Old code silently continued the loop,
+        # leaving punctuate() blocked until its 60s timeout
+        # (audit: punct_worker.py:54-66).
+        try:
+            _out.write(json.dumps({
+                "status": "error",
+                "text": "",
+                "error": f"JSON decode failed: {_je}",
+            }) + "\n")
+            _out.flush()
+        except Exception:
+            pass
         continue
     if not text:
         _out.write(json.dumps({"status": "ok", "text": ""}) + "\n")

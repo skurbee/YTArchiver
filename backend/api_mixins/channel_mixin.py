@@ -16,6 +16,14 @@ class ChannelMixin:
     # ─── Channel context actions ───────────────────────────────────────
 
     def chan_open_folder(self, folder_or_name):
+        # Validate arg type up front. JS callers can accidentally pass
+        # None or a number; without this guard, .get(...) below raises
+        # AttributeError which surfaces in the JS bridge as an opaque
+        # "TypeError: NoneType has no attribute 'get'" instead of a
+        # friendly toast.
+        if folder_or_name is None or not isinstance(folder_or_name, (str, dict)):
+            return {"ok": False,
+                    "error": "Invalid argument (expected str or dict)"}
         cfg = load_config()
         base = (cfg.get("output_dir") or "").strip()
         if not base:
@@ -134,8 +142,23 @@ class ChannelMixin:
         folder = os.path.join(base, _cfn(ch))
 
         def _run():
-            from backend import channel_art as _ca
-            _ca.fetch_channel_art(ch.get("url", ""), folder, force=bool(force))
+            # Surface failures explicitly. Old code let any exception
+            # escape the thread silently — the user clicked "Fetch
+            # art", saw no error, and assumed it worked even when the
+            # network was down or yt-dlp failed (audit:
+            # channel_mixin.py:118).
+            try:
+                from backend import channel_art as _ca
+                _ca.fetch_channel_art(ch.get("url", ""), folder,
+                                       force=bool(force))
+            except Exception as e:
+                try:
+                    self._log_stream.emit_error(
+                        f"Channel-art fetch failed for {name}: {e}")
+                    self._log_stream.flush()
+                except Exception:
+                    pass
+                _log.debug("chan_fetch_art swallowed: %s", e)
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
@@ -196,16 +219,23 @@ class ChannelMixin:
         # double-clicks don't stack duplicates.
         queued_paths = set()
         try:
+            # Read _current_job INSIDE the same _jobs_lock that protects
+            # the queue. Old code released the lock first, so the
+            # transcribe worker could reassign _current_job between the
+            # release and the read — letting a duplicate slip past the
+            # dedupe set or, in the other direction, marking an
+            # already-finished job as still queued (audit:
+            # channel_mixin.py:204).
             with self._transcribe._jobs_lock:
                 for j in self._transcribe._jobs:
                     p = j.get("path") or ""
                     if p:
                         queued_paths.add(os.path.normpath(p).lower())
-            cj = self._transcribe._current_job
-            if cj:
-                p = cj.get("path") or ""
-                if p:
-                    queued_paths.add(os.path.normpath(p).lower())
+                cj = self._transcribe._current_job
+                if cj:
+                    p = cj.get("path") or ""
+                    if p:
+                        queued_paths.add(os.path.normpath(p).lower())
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -572,15 +602,20 @@ class ChannelMixin:
 
     def chan_scan_resolution_mismatch(self, folder_or_name, target_res):
         """ffprobe every video in the channel's folder and count how many
-        are below `target_res` (height). Returns {ok, mismatch, total}.
+        are below `target_res` (height). Returns {ok, started, token}.
 
         Used by the edit panel's "Recheck resolution" button before offering
         to queue a bulk redownload. Matches YTArchiver.py:5155 res_check_btn.
         Fast path: "best" always reports 0 mismatches since we can't know
         what "best" actually is without a fresh catalog probe.
+
+        Bridge-thread fast return — the os.walk + per-file ffprobe loop
+        can take minutes on large channels; the work runs on a worker
+        thread. JS polls via chan_scan_resolution_mismatch_poll(token).
         """
         try:
             import subprocess as _sp
+            import uuid as _uuid
             name = folder_or_name if isinstance(folder_or_name, str) else (
                 folder_or_name.get("name") or folder_or_name.get("folder", ""))
             if not name:
@@ -605,34 +640,68 @@ class ChannelMixin:
             if not os.path.isdir(folder):
                 return {"ok": False, "error": f"Folder missing: {folder}"}
 
-            total = 0
-            mismatch = 0
-            scanned = 0
-            _exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
-            for dp, _dns, fns in os.walk(folder):
-                for fn in fns:
-                    if not fn.lower().endswith(_exts):
-                        continue
-                    total += 1
-                    fp = os.path.join(dp, fn)
-                    try:
-                        r = _sp.run(
-                            ["ffprobe", "-v", "error",
-                             "-select_streams", "v:0",
-                             "-show_entries", "stream=height",
-                             "-of", "default=noprint_wrappers=1:nokey=1", fp],
-                            capture_output=True, text=True, timeout=6,
-                            creationflags=(0x08000000 if os.name == "nt" else 0))
-                        height = int((r.stdout or "0").strip() or 0)
-                        scanned += 1
-                        if height > 0 and height < (target_h - 8):
-                            mismatch += 1
-                    except Exception:
-                        continue
-            return {"ok": True, "mismatch": mismatch, "total": total,
-                    "scanned": scanned, "target": target_h}
+            token = _uuid.uuid4().hex
+            if not hasattr(self, "_pending_res_scans"):
+                self._pending_res_scans = {}
+                self._pending_res_scans_lock = threading.Lock()
+
+            def _scan_worker():
+                total = 0
+                mismatch = 0
+                scanned = 0
+                _exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v")
+                for dp, _dns, fns in os.walk(folder):
+                    for fn in fns:
+                        if not fn.lower().endswith(_exts):
+                            continue
+                        total += 1
+                        fp_ = os.path.join(dp, fn)
+                        try:
+                            r = _sp.run(
+                                ["ffprobe", "-v", "error",
+                                 "-select_streams", "v:0",
+                                 "-show_entries", "stream=height",
+                                 "-of", "default=noprint_wrappers=1:nokey=1", fp_],
+                                capture_output=True, text=True, timeout=6,
+                                creationflags=(0x08000000 if os.name == "nt" else 0))
+                            height = int((r.stdout or "0").strip() or 0)
+                            scanned += 1
+                            if height > 0 and height < (target_h - 8):
+                                mismatch += 1
+                        except Exception:
+                            continue
+                with self._pending_res_scans_lock:
+                    self._pending_res_scans[token] = {
+                        "done": True,
+                        "result": {"ok": True, "mismatch": mismatch,
+                                   "total": total, "scanned": scanned,
+                                   "target": target_h},
+                    }
+
+            with self._pending_res_scans_lock:
+                self._pending_res_scans[token] = {"done": False}
+            threading.Thread(target=_scan_worker, daemon=True,
+                             name="chan_scan_resolution").start()
+            return {"ok": True, "started": True, "token": token}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+
+    def chan_scan_resolution_mismatch_poll(self, token):
+        """Poll a token returned by chan_scan_resolution_mismatch. Returns
+        {pending: True} while running, or the final {ok, mismatch, total,
+        ...} payload when done. Once returned, the token is forgotten."""
+        if not hasattr(self, "_pending_res_scans"):
+            return {"ok": False, "error": "unknown token"}
+        with self._pending_res_scans_lock:
+            entry = self._pending_res_scans.get(token)
+            if entry is None:
+                return {"ok": False, "error": "unknown token"}
+            if not entry.get("done"):
+                return {"pending": True}
+            del self._pending_res_scans[token]
+        return entry.get("result") or {"ok": False, "error": "no result"}
+
 
 
     def chan_redownload(self, folder_or_name, new_resolution=None,
@@ -698,11 +767,19 @@ class ChannelMixin:
             # to drain _redwnl_pending on completion — left for a
             # follow-up since it crosses two worker abstractions.)
             if (_cur.get("kind") or "").lower() != "redownload":
+                # Pre-check for duplicate enqueue against the same
+                # channel URL so a user clicking multiple times doesn't
+                # pile up the same redownload in the pending list.
+                _ch_url = (ch.get("url") or "").strip()
                 with self._redwnl_lock:
-                    self._redwnl_pending.append({
-                        "ch": dict(ch),
-                        "folder": folder,
-                        "new_res": new_res,
+                    _already = any(
+                        (p.get("ch") or {}).get("url") == _ch_url
+                        for p in self._redwnl_pending) if _ch_url else False
+                    if not _already:
+                        self._redwnl_pending.append({
+                            "ch": dict(ch),
+                            "folder": folder,
+                            "new_res": new_res,
                         "scope_label": "",
                         "rd_task": dict(ch, kind="redownload",
                                          redownload_res=new_res),
@@ -838,6 +915,23 @@ class ChannelMixin:
             return {"ok": False, "error": "output_dir not set"}
         from backend.sync import channel_folder_name as _cfn
         folder = os.path.join(base, _cfn(ch))
+
+        # Refuse to stamp mtimes while sync / GPU / reorg is actively
+        # writing into this channel folder. Without this guard, a
+        # yt-dlp finalize (which sets mtime=now) racing with our
+        # fix_file_dates pass left timestamps in an inconsistent
+        # state (audit: channel_mixin.py:826). Match the same channel
+        # checks used by reorg_channel_folder.
+        ch_name = ch.get("name") or ch.get("folder", "")
+        try:
+            cur_sync = self._queues.current_sync_channel() or ""
+            cur_gpu  = self._queues.current_gpu_channel() or ""
+        except Exception:
+            cur_sync = cur_gpu = ""
+        if ch_name and (cur_sync == ch_name or cur_gpu == ch_name):
+            return {"ok": False,
+                    "error": f"\"{ch_name}\" is currently being synced or "
+                             f"transcribed; try again when that finishes."}
 
         def _run():
             try:

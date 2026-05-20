@@ -166,32 +166,48 @@
     // they queue N*K yt-dlp jobs.
     const metaQueueAll = document.getElementById("btn-metadata-queue-all");
     const metaRefresh = document.getElementById("btn-metadata-refresh-all");
+    // Disable-during-await guard for both Queue and Refresh buttons.
+    // Without this, an impatient double-click stacked two askConfirm
+    // modals — the user could click through both, queuing the same
+    // job twice (audit: settingsTab.js:170).
     metaQueueAll?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
-      const ok = await askConfirm("Queue all metadata",
-        "Queue a metadata download for EVERY subscribed channel?\n\n" +
-        "For a large library this can run for hours and will hammer the yt-dlp " +
-        "queue. You can cancel mid-pass from the Sync popover.",
-        { confirm: "Queue all" });
-      if (!ok) return;
-      const res = await api.metadata_queue_all(false);
-      if (res?.ok) window._showToast?.(`Queued ${res.channels} channel(s).`, "ok");
-      else window._showToast?.(res?.error || "Queue failed.", "error");
+      if (metaQueueAll.disabled) return;
+      metaQueueAll.disabled = true;
+      try {
+        const api = window.pywebview?.api;
+        if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
+        const ok = await askConfirm("Queue all metadata",
+          "Queue a metadata download for EVERY subscribed channel?\n\n" +
+          "For a large library this can run for hours and will hammer the yt-dlp " +
+          "queue. You can cancel mid-pass from the Sync popover.",
+          { confirm: "Queue all" });
+        if (!ok) return;
+        const res = await api.metadata_queue_all(false);
+        if (res?.ok) window._showToast?.(`Queued ${res.channels} channel(s).`, "ok");
+        else window._showToast?.(res?.error || "Queue failed.", "error");
+      } finally {
+        metaQueueAll.disabled = false;
+      }
     });
     metaRefresh?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
-      const ok = await askConfirm("Refresh views/likes",
-        "Re-fetch view counts and like counts for every video on every channel?\n\n" +
-        "Every on-disk video gets re-hit — previously-skipped failures too " +
-        "(the failure flag is cleared first). Expect one yt-dlp call per video, " +
-        "so this is slow on a 100k-video archive.",
-        { confirm: "Refresh" });
-      if (!ok) return;
-      const res = await api.metadata_queue_all(true);
-      if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
-      else window._showToast?.(res?.error || "Refresh failed.", "error");
+      if (metaRefresh.disabled) return;
+      metaRefresh.disabled = true;
+      try {
+        const api = window.pywebview?.api;
+        if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
+        const ok = await askConfirm("Refresh views/likes",
+          "Re-fetch view counts and like counts for every video on every channel?\n\n" +
+          "Every on-disk video gets re-hit — previously-skipped failures too " +
+          "(the failure flag is cleared first). Expect one yt-dlp call per video, " +
+          "so this is slow on a 100k-video archive.",
+          { confirm: "Refresh" });
+        if (!ok) return;
+        const res = await api.metadata_queue_all(true);
+        if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
+        else window._showToast?.(res?.error || "Refresh failed.", "error");
+      } finally {
+        metaRefresh.disabled = false;
+      }
     });
 
     // "Realign misplaced thumbnails" — survey + (optionally) move
@@ -351,15 +367,42 @@
 
     save?.addEventListener("click", async () => {
       const api = window.pywebview?.api;
+      // Force a blur on the focused element first so an in-progress
+      // typed value commits through any input/change handlers
+      // (validation, formatters) before we snapshot it. Without this,
+      // a Save click that lands while the user is still typing into
+      // a numeric input persisted whatever intermediate state was in
+      // the DOM at click time (audit: settingsTab.js:386).
+      try {
+        const _focused = document.activeElement;
+        if (_focused && typeof _focused.blur === "function"
+            && _focused !== document.body) {
+          _focused.blur();
+        }
+      } catch { /* ignore */ }
       const payload = {
         output_dir: document.getElementById("settings-output-dir").value,
         video_out_dir: document.getElementById("settings-video-dir").value,
         whisper_model: document.getElementById("settings-whisper-model").value,
         default_resolution: document.getElementById("settings-default-res").value,
         log_mode: document.getElementById("settings-log-mode").value,
-        // Startup knobs
-        disk_scan_staleness_hours:
-          Math.max(0, parseInt(document.getElementById("settings-disk-staleness")?.value, 10) || 0),
+        // Startup knobs. Clearing the input or typing non-numeric
+        // text previously got silently mapped to 0 (= "always
+        // rescan"). Validate and refuse to save when blank/invalid;
+        // the user sees a toast and can correct.
+        disk_scan_staleness_hours: (() => {
+          const _v = document.getElementById("settings-disk-staleness")?.value;
+          if (_v == null || _v === "") {
+            window._showToast?.("Disk-scan staleness can't be empty.", "error");
+            throw new Error("invalid disk-staleness");
+          }
+          const _n = parseInt(_v, 10);
+          if (!Number.isFinite(_n) || _n < 0) {
+            window._showToast?.("Disk-scan staleness must be a non-negative number.", "error");
+            throw new Error("invalid disk-staleness");
+          }
+          return _n;
+        })(),
         browse_preload_all:
           !!document.getElementById("settings-preload-all")?.checked,
         show_avg_size:

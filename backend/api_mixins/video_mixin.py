@@ -41,15 +41,19 @@ class VideoMixin:
             from backend import index as _idx
             _conn = _idx._open()
             if _conn is not None:
+                # Sidecar .jsonl path was derived via SQL REPLACE() on the
+                # 4-char extension — but SQLite's REPLACE swaps ALL
+                # occurrences of the substring (audit: video_mixin.py:46-55).
+                # A path like "C:\.mp4-archive\foo.mp4" mangled to
+                # "C:\.jsonl-archive\foo.jsonl" and the DELETE missed.
+                # Compute the sidecar path in Python and parameterize it
+                # straight into the IN clause.
+                _stem, _ext = os.path.splitext(fp)
+                _sidecar = _stem + ".jsonl"
                 with _idx._db_lock:
-                    # Find the segments tied to this filepath via the
-                    # videos table, then remove them + the videos row.
                     _conn.execute(
-                        "DELETE FROM segments WHERE jsonl_path IN ("
-                        "  SELECT REPLACE(filepath, "
-                        "    SUBSTR(filepath, LENGTH(filepath) - 3, 4), '.jsonl') "
-                        "  FROM videos WHERE filepath = ? COLLATE NOCASE)",
-                        (fp,))
+                        "DELETE FROM segments WHERE jsonl_path = ? COLLATE NOCASE",
+                        (_sidecar,))
                     _conn.execute(
                         "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
                         (fp,))
@@ -96,7 +100,14 @@ class VideoMixin:
             from backend import index as _idx
             _rconn = _idx._reader_open()
             if _rconn is None:
-                return {"ok": False, "error": "Index DB unavailable"}
+                # Friendlier message during transient startup state —
+                # the index DB takes a moment to come up after launch
+                # and the old terse "Index DB unavailable" gave no
+                # hint that retrying would help (audit: video_mixin.
+                # py:107).
+                return {"ok": False,
+                        "error": "Index is still initializing — try again "
+                                 "in a moment."}
             with _idx._reader_lock:
                 row = _rconn.execute(
                     "SELECT filepath, channel FROM videos "

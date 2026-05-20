@@ -53,9 +53,11 @@ Module map (alphabetical):
                        comments / description) for already-downloaded
                        videos. Writes the colored .txt sidecar that
                        Browse shows in the details panel.
-  net.py               Shared network helpers (timeouts, retries,
-                       user agent) used by anything that hits
-                       YouTube outside of yt-dlp itself.
+  net.py               Network-down probe: parallel TCP-handshake
+                       checks against a small set of hosts so the
+                       pipeline can pause when the network goes
+                       away and resume when it comes back. NOT a
+                       general-purpose HTTP helper.
   punct_worker.py      Subprocess that runs the punctuation /
                        capitalization model over a transcript's raw
                        Whisper output. Stays in its own process so

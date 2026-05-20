@@ -56,6 +56,18 @@
       } catch { /* non-fatal */ }
     })();
 
+    // Pre-populate the Save-to placeholder with the actual default
+    // folder so users don't have to remember what they set it to.
+    (async () => {
+      try {
+        const api = window.pywebview?.api;
+        const s = await api?.settings_load?.();
+        const def = (s?.video_out_dir || s?.output_dir || "").trim();
+        const saveInput = document.getElementById("vo-save-to");
+        if (saveInput && def) saveInput.placeholder = def;
+      } catch { /* non-fatal */ }
+    })();
+
     const urlLooksLikeVideo = (s) => _YT_RE.test((s || "").trim());
     const urlLooksLikeChannel = (s) => {
       const t = (s || "").trim();

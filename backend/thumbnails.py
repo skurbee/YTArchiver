@@ -112,7 +112,15 @@ def _download_thumbnail(url: str, thumb_dir: str,
                         if _is_recent:
                             return
                         # Fall through to re-download (YT likely has
-                        # a newer thumbnail; old one renamed for backup).
+                        # a newer thumbnail). Delete the renamed
+                        # backup so the new download doesn't end up
+                        # coexisting with it for the same video_id —
+                        # without this, _thumbnail_exists_for would
+                        # report True for both files and Browse
+                        # picked arbitrarily (audit: thumbnails.py:
+                        # 110-118).
+                        try: os.remove(new_path)
+                        except OSError: pass
                         break
                     except OSError:
                         pass
@@ -129,8 +137,21 @@ def _download_thumbnail(url: str, thumb_dir: str,
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": "Mozilla/5.0"})
+        # Pre-check Content-Length: YouTube thumbs are typically <200KB,
+        # and we cap at 20MB. A misbehaving server reporting 100MB+
+        # gets refused without burning a slow read (audit:
+        # thumbnails.py:130-141).
+        _MAX_BYTES = 20 * 1024 * 1024
         with urllib.request.urlopen(req, timeout=30) as resp:
-            img_data = resp.read(20 * 1024 * 1024)
+            try:
+                _cl = resp.headers.get("Content-Length")
+                if _cl and int(_cl) > _MAX_BYTES:
+                    raise ValueError(
+                        f"Content-Length {_cl} exceeds 20MB cap")
+            except (TypeError, ValueError) as _cle:
+                if "exceeds" in str(_cle):
+                    raise
+            img_data = resp.read(_MAX_BYTES)
         if not img_data or len(img_data) < 16:
             raise ValueError(f"empty/short response ({len(img_data)} bytes)")
         # JPEG: FF D8 FF. PNG: 89 50 4E 47. WEBP: RIFF....WEBP.
@@ -140,14 +161,34 @@ def _download_thumbnail(url: str, thumb_dir: str,
         if not _magic_ok:
             raise ValueError("not a recognized image format")
         tmp_path = fpath + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(img_data)
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, fpath)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(img_data)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path, fpath)
+        except Exception:
+            # Clean up the orphan .tmp file before re-raising so a
+            # disk-full / permission failure doesn't leave a half-
+            # written .tmp inside .Thumbnails/ that accumulates over
+            # repeated failures.
+            try: os.remove(tmp_path)
+            except OSError: pass
+            raise
+        # Re-apply the hidden attribute. Although the parent
+        # .Thumbnails/ folder is hidden, files inside a hidden folder
+        # are NOT automatically hidden on Windows — `dir /a` would
+        # show them. If a user ever un-hides the folder, the contents
+        # would become visible. Belt-and-suspenders per the "hidden
+        # sidecars ULTIMATE RULE" memory.
+        try:
+            from .utils import hide_file_win
+            hide_file_win(fpath)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         # Patch fix (v68.4): debug-level log of the exact path written.
         # Helps diagnose "Recent card shows gradient placeholder" when
         # the thumbnail IS on disk somewhere but find_thumbnail's

@@ -77,7 +77,20 @@ class QueueState:
 
         # Debounced save scheduler
         self._save_timer: threading.Timer | None = None
-        self._save_interval_sec = 2.0
+        # Shortened from 2.0s — a task-killed (Task Manager "End Task")
+        # process during the debounce window loses the last queue
+        # mutation since SIGTERM doesn't fire on Windows force-kill
+        # and atexit is skipped. 0.5s still coalesces normal bursts
+        # of enqueue/remove calls (every save_debounced inside a sync
+        # iteration lands within ms of each other) but cuts the
+        # window-of-loss to a quarter of what it was (audit:
+        # main.py:1362).
+        self._save_interval_sec = 0.5
+        # Save mutex — serializes save_now() so two near-simultaneous
+        # debounce-timer fires (the in-progress one + a freshly-scheduled
+        # one from a new save_debounced call) can't both write to the
+        # same .tmp file and race on os.replace.
+        self._save_io_lock = threading.Lock()
 
         # resuming items pulled from the persisted file
         # (in-flight when the app last shut down). Caller reads via
@@ -88,15 +101,31 @@ class QueueState:
         # Listeners notified on any state change (UI push)
         self._listeners: list[Callable[[], None]] = []
 
+        # When True, _atexit_flush is a no-op. Set via mark_orphan()
+        # by the caller (main.py) when it discards a QueueState
+        # instance that failed to load — without this flag, the
+        # orphan's atexit handler still fires at process exit and
+        # clobbers the on-disk queue file with its EMPTY in-memory
+        # state (overwriting whatever the replacement instance just
+        # wrote).
+        self._atexit_disabled: bool = False
+
         # register atexit hook so a crash/kill within the
         # 2s debounce window still flushes. Idempotent — atexit only
         # fires once per process, and _atexit_flush is a no-op when
-        # nothing is pending.
+        # nothing is pending OR when the instance has been marked
+        # as an orphan.
         try:
             import atexit as _atx
             _atx.register(self._atexit_flush)
         except Exception as e:
             _log.debug("swallowed: %s", e)
+
+    def mark_orphan(self) -> None:
+        """Caller-side signal that this QueueState should NOT participate
+        in atexit-save. Use when discarding an instance whose load()
+        raised (and replacing it with a fresh QueueState)."""
+        self._atexit_disabled = True
 
     # ── listener registration ───────────────────────────────────────
 
@@ -113,11 +142,30 @@ class QueueState:
         self._listeners.append(fn)
 
     def _notify(self):
-        for fn in list(self._listeners):
-            try:
-                fn()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+        # Fire listeners on a background thread so the mutation path
+        # (sync_enqueue, sync_pop, etc.) doesn't block on
+        # window.evaluate_js round-trips. Previously every queue
+        # mutation blocked the calling worker thread on Chromium's JS
+        # engine — a fast download burst against 50 channels
+        # serialized through evaluate_js, slowing throughput and
+        # making the UI feel unresponsive. The listeners are
+        # idempotent and run on a short-lived daemon thread; ordering
+        # is preserved because we snapshot the listener list before
+        # dispatching.
+        snapshot = list(self._listeners)
+        if not snapshot:
+            return
+        def _fire():
+            for fn in snapshot:
+                try:
+                    fn()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+        try:
+            threading.Thread(target=_fire, daemon=True,
+                             name="queues-notify").start()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
     # ── load/save ────────────────────────────────────────────────────
 
@@ -172,20 +220,22 @@ class QueueState:
                 # lists; pull them out and stash for the caller.
                 self._loaded_resuming = dict(resuming_raw)
             else:
-                # Old format: any item at queue[0] that we'd consider
-                # "in-flight" (matched by being a dict with our shape)
-                # is actually a resuming item. Move it to _loaded_resuming
-                # and drop from the list. Mirrors the prior load behavior
-                # but cleanly.
+                # Old format: any item at queue[0] that carries the
+                # in-flight marker (_in_flight=True; legacy save
+                # pattern wrote it). Requiring the marker prevents
+                # mis-classifying every regular schema-1 queue's head
+                # item as resuming — a plain dict item without the
+                # marker is just a queued task, not in-flight. Pop
+                # it off the regular list so it doesn't get processed
+                # twice (once as a resuming candidate AND again as a
+                # normal head item).
                 self._loaded_resuming = {}
                 for key in ("sync", "redownload", "metadata", "gpu"):
                     lst = getattr(self, key, None)
-                    if lst and isinstance(lst, list) and lst and isinstance(lst[0], dict):
-                        # Heuristic: first item is a dict → treat as in-flight
-                        # (matches old write pattern that prepended currents).
-                        self._loaded_resuming[key] = lst[0]
-                        # Don't pop — leave for backwards-compat. Caller
-                        # can decide via _loaded_resuming what to do.
+                    if (lst and isinstance(lst, list)
+                            and isinstance(lst[0], dict)
+                            and lst[0].get("_in_flight")):
+                        self._loaded_resuming[key] = lst.pop(0)
         self._notify()
         return True
 
@@ -236,14 +286,17 @@ class QueueState:
             # pick one path, and the OTHER would silently leak as a
             # phantom queue item. Now writes are clean: items are in
             # exactly ONE place.
-        try:
-            tmp = str(QUEUE_FILE) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-            os.replace(tmp, QUEUE_FILE)
-            return True
-        except OSError:
-            return False
+        # Serialize the file-write step so two save_now invocations
+        # can't both be partway through writing the same .tmp file.
+        with self._save_io_lock:
+            try:
+                tmp = str(QUEUE_FILE) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp, QUEUE_FILE)
+                return True
+            except OSError:
+                return False
 
     def save_debounced(self):
         """Schedule a save for _save_interval_sec from now (coalesces bursts).
@@ -279,7 +332,14 @@ class QueueState:
     def _atexit_flush(self):
         """atexit hook — cancel any pending debounce timer and force a
         synchronous save. No-op if nothing is pending. Called once per
-        process at interpreter shutdown."""
+        process at interpreter shutdown.
+
+        Refuses to save when self._atexit_disabled is True — set by
+        mark_orphan() so a discarded instance's atexit doesn't clobber
+        the live instance's file.
+        """
+        if getattr(self, "_atexit_disabled", False):
+            return
         try:
             with self._lock:
                 t = self._save_timer
@@ -734,17 +794,25 @@ class QueueState:
 
     def set_gpu_paused(self, paused: bool):
         with self._lock:
+            old_paused = self.gpu_paused
             self.gpu_paused = bool(paused)
-            # Reset the active flag whenever pause state changes —
-            # workers will re-set it when they enter pause-wait.
-            self.gpu_paused_active = False
+            # Only reset the active flag on a True→False transition.
+            # Previously this reset on EVERY call, so a redundant
+            # pause (e.g. tray + UI both flipping the bit) wrongly
+            # cleared `gpu_paused_active` while the worker was still
+            # parked — the UI showed a "blinking" half-paused state
+            # until the worker re-set it.
+            if old_paused and not paused:
+                self.gpu_paused_active = False
         self._notify()
         self.save_debounced()
 
     def set_sync_paused(self, paused: bool):
         with self._lock:
+            old_paused = self.sync_paused
             self.sync_paused = bool(paused)
-            self.sync_paused_active = False
+            if old_paused and not paused:
+                self.sync_paused_active = False
         self._notify()
         self.save_debounced()
 

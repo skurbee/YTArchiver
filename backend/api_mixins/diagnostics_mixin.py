@@ -91,9 +91,13 @@ class DiagnosticsMixin:
                             msg = (f"Missing: {names}. "
                                    "Install + add to PATH for downloads "
                                    "to work.")
+                            # Use json.dumps so the JS-side string
+                            # literal stays valid for quotes / non-
+                            # ASCII (audit: diagnostics_mixin.py:96-97).
+                            import json as _json
                             self._window.evaluate_js(
                                 "window._showToast && "
-                                f"window._showToast({{msg: {msg!r}, "
+                                f"window._showToast({{msg: {_json.dumps(msg)}, "
                                 "kind: 'error', ttlMs: 12000}});")
                         except Exception:
                             pass
@@ -161,7 +165,11 @@ class DiagnosticsMixin:
                     headers={"User-Agent": "YTArchiver"},
                 )
                 with _ur.urlopen(req, timeout=8) as resp:
-                    data = _json.loads(resp.read())
+                    # Size-cap the read so a malformed or malicious
+                    # response can't OOM the app (audit:
+                    # diagnostics_mixin.py:155-191). 1MB is plenty
+                    # for a GitHub release-metadata JSON.
+                    data = _json.loads(resp.read(1_000_000))
                 latest = (data.get("tag_name") or "").strip()
                 rel_url = data.get("html_url") or \
                     "https://github.com/skurbee/YTArchiver/releases/latest"
@@ -239,18 +247,27 @@ class DiagnosticsMixin:
         except Exception as e:
             _row("Transcript DB", False, str(e))
 
-        # 4. GPU (nvidia-smi probe)
+        # 4. GPU (nvidia-smi probe). Bound the JS-bridge freeze window:
+        # 5s was long enough for a driver-glitch hang to make the
+        # Diagnostics dialog feel frozen (audit: diagnostics_mixin.py:
+        # 243-255). nvidia-smi returns in <100ms on a healthy install,
+        # so 2s is safe and still tolerates a slow first call after
+        # driver reload. creationflags suppresses the console-flash
+        # on Windows.
         try:
             import subprocess
             r = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total",
                  "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=2,
+                creationflags=(0x08000000 if os.name == "nt" else 0),
             )
             if r.returncode == 0 and r.stdout.strip():
                 _row("GPU", True, r.stdout.strip().splitlines()[0])
             else:
                 _row("GPU", False, "nvidia-smi not available (CPU whisper only)")
+        except subprocess.TimeoutExpired:
+            _row("GPU", False, "nvidia-smi probe timed out (>2s)")
         except Exception as e:
             _row("GPU", False, f"nvidia-smi not runnable: {e}")
 
@@ -260,14 +277,18 @@ class DiagnosticsMixin:
             if not base:
                 _row("Archive root", False, "Not configured (Settings > Archive root)")
             elif not os.path.isdir(base):
-                _row("Archive root", False, f"{base} (missing)")
+                _row("Archive root", False, "(missing)")
             else:
                 import shutil
                 total, used, free = shutil.disk_usage(base)
                 free_gb = free / (1024 ** 3)
                 pct = (used / total * 100) if total else 0.0
+                # Mask the absolute path so a pasted diagnostics dump
+                # doesn't leak the user's Z:\ archive root in a public
+                # bug report. Only the drive letter is shown.
+                _drv = os.path.splitdrive(base)[0] or base
                 _row("Archive root", True,
-                     f"{base} \u2014 {free_gb:.0f} GB free ({pct:.0f}% full)")
+                     f"{_drv}\\\u2026 \u2014 {free_gb:.0f} GB free ({pct:.0f}% full)")
         except Exception as e:
             _row("Archive root", False, str(e))
 
@@ -294,8 +315,16 @@ class DiagnosticsMixin:
             from backend.sync import _find_cookie_source
             src = _find_cookie_source() or []
             if src and len(src) >= 2:
-                label = src[1] if src[0] == "--cookies-from-browser" else f"file: {src[1]}"
-                _row("Cookies source", True, label)
+                # Mask the actual browser-profile filename or
+                # cookies.txt path so the diagnostics dump only shows
+                # "browser cookies" / "cookies file" without leaking
+                # the user's profile name / path. Concrete values are
+                # only useful for forensic debugging which a support
+                # request can ask for separately.
+                if src[0] == "--cookies-from-browser":
+                    _row("Cookies source", True, "browser cookies (profile masked)")
+                else:
+                    _row("Cookies source", True, "cookies.txt file (path masked)")
             else:
                 _row("Cookies source", False,
                      "No browser profile or cookies.txt found (public-only mode)")

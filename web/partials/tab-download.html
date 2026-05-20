@@ -13,10 +13,9 @@
                list="url-history-list"
                placeholder="https://www.youtube.com/watch?v=..." />
         <datalist id="url-history-list"></datalist>
-        <!-- "▶ Download" appears only when a YouTube URL is typed/pasted.
-             Matches YTArchiver.py:19706 download_btn + _validate_download_btn. -->
-        <button class="btn btn-primary btn-thin" id="btn-download-single"
-                title="Download the video from the URL above" hidden>&#9654; Download</button>
+        <!-- "▶ Download" button moved into the video-opts panel below,
+             inline with the custom-filename row, vertically spanning
+             the two rows above it. -->
       </div>
       <!-- Persistent inline URL error text (YTArchiver.py:17060 url_error_var).
            Stays visible until URL is valid or cleared &mdash; replaces transient toast. -->
@@ -47,23 +46,32 @@
             <option value="360">360p</option>
           </select>
         </div>
-        <div class="vo-row vo-row-checks">
-          <label class="vo-check">
-            <input type="checkbox" id="vo-date-file" checked />
-            <span>Date file to YT upload date</span>
-          </label>
-          <label class="vo-check">
-            <input type="checkbox" id="vo-add-date" />
-            <span>Add date to filename</span>
-          </label>
-        </div>
-        <div class="vo-row">
-          <label class="vo-check">
-            <input type="checkbox" id="vo-use-yt-title" checked />
-            <span>Use YT title as filename</span>
-          </label>
-          <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
-                 placeholder="Custom filename" disabled />
+        <!-- Bottom two rows + Download button on the right. The button is
+             stretched to span both rows so its top aligns with the
+             "Date file to YT upload date" checkbox row above. -->
+        <div class="vo-actions-row">
+          <div class="vo-actions-rows">
+            <div class="vo-row vo-row-checks">
+              <label class="vo-check">
+                <input type="checkbox" id="vo-date-file" checked />
+                <span>Date file to YT upload date</span>
+              </label>
+              <label class="vo-check">
+                <input type="checkbox" id="vo-add-date" />
+                <span>Add date to filename</span>
+              </label>
+            </div>
+            <div class="vo-row">
+              <label class="vo-check">
+                <input type="checkbox" id="vo-use-yt-title" checked />
+                <span>Use YT title as filename</span>
+              </label>
+              <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
+                     placeholder="Custom filename" disabled />
+            </div>
+          </div>
+          <button class="btn btn-primary vo-download-btn" id="btn-download-single"
+                  title="Download the video from the URL above" hidden>&#9654; Download</button>
         </div>
       </fieldset>
 
@@ -72,8 +80,8 @@
            Mirrors YTArchiver.py:4458 channel_nudge_panel. -->
       <div class="channel-nudge-panel" id="channel-nudge-panel" hidden>
         <span class="channel-nudge-icon">&#x1F4FA;</span>
-        <span class="channel-nudge-text">Channel URL detected.</span>
-        <button class="btn btn-primary btn-thin" id="btn-channel-nudge-add">&#8594; Add to saved channels</button>
+        <span class="channel-nudge-text">Add channels in the Subs tab.</span>
+        <button class="btn btn-primary btn-thin" id="btn-channel-nudge-add">&#8594; Add to sub list</button>
       </div>
 
       <!-- Row 2: Main actions + quick-action icons + status -->

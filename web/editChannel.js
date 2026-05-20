@@ -144,9 +144,12 @@
           _rangeRadio.dispatchEvent(new Event("change", { bubbles: true }));
         }
         const _fromDate = channel.from_date || channel.date_after || "";
-        if (_fromDate && /^\d{4}-?\d{2}-?\d{2}$/.test(_fromDate)) {
-          const _clean = _fromDate.replace(/-/g, "");
-          const y = _clean.slice(0, 4), m = _clean.slice(4, 6), d = _clean.slice(6, 8);
+        // Stricter regex: dashes must be present consistently or absent
+        // entirely. Old `\d{4}-?\d{2}-?\d{2}` accepted mixed "1999-0115"
+        // which then sliced wrong (audit: editChannel.js:147).
+        const _dateMatch = /^(\d{4})(-?)(\d{2})\2(\d{2})$/.exec(_fromDate);
+        if (_dateMatch) {
+          const y = _dateMatch[1], m = _dateMatch[3], d = _dateMatch[4];
           const dy = document.getElementById("edit-date-year");
           const dm = document.getElementById("edit-date-month");
           const dd = document.getElementById("edit-date-day");
@@ -235,7 +238,23 @@
       window._editOriginalSnapshot = null;
     };
 
-    cancel.addEventListener("click", closePanel);
+    // Dirty check before discarding edits. update.disabled === false
+    // means _checkEditChanges saw a change relative to the snapshot
+    // (Add mode treats any non-empty folder+url as "dirty"). Without
+    // this confirm, Cancel silently nuked unsaved changes (audit:
+    // editChannel.js:225).
+    cancel.addEventListener("click", async () => {
+      if (!update.disabled && window.askConfirm) {
+        try {
+          const ok = await window.askConfirm(
+            "Discard changes?",
+            "You have unsaved edits to this channel. Discard them?",
+            { confirm: "Discard", cancel: "Keep editing" });
+          if (!ok) return;
+        } catch { /* if confirm fails, fall through to close */ }
+      }
+      closePanel();
+    });
 
     // Live change-detection three-state Update button.
     const _editFields = [
@@ -314,14 +333,19 @@
     });
     const _editLabel = document.getElementById("edit-channel-label");
     if (_editLabel) {
-      // MutationObserver lives for the app's lifetime — never torn down
-      // explicitly. The previous version called _trackObserver from app.js;
-      // here we just create it directly since the label outlives every
-      // listener anyway.
+      // If a previous initEditChannelPanel call (hot-reload, late-init
+      // race) attached an observer, disconnect it before observing
+      // again. Otherwise each call stacked another live observer and
+      // every label flip fired N redundant peek() API calls (audit:
+      // editChannel.js:321).
+      if (_editLabel._mo) {
+        try { _editLabel._mo.disconnect(); } catch {}
+      }
       const mo = new MutationObserver(() => {
         refreshContinueBtn(_editFolderEl?.value.trim() || "");
       });
       mo.observe(_editLabel, { childList: true, characterData: true, subtree: true });
+      _editLabel._mo = mo;
     }
     continueBtn?.addEventListener("click", async () => {
       const name = _editFolderEl?.value.trim() || "";
@@ -418,7 +442,28 @@
       }
       window._showToast?.("Scanning video files…", "ok");
       try {
-        const res = await api.chan_scan_resolution_mismatch(name, target);
+        // Token+poll pattern — bridge returns immediately with a token;
+        // poll every 500ms until the worker thread reports done. The
+        // old synchronous call could freeze the UI for minutes on
+        // large channels.
+        const startRes = await api.chan_scan_resolution_mismatch(name, target);
+        if (!startRes?.ok) {
+          window._showToast?.(startRes?.error || "Scan failed.", "error");
+          return;
+        }
+        let res = startRes;
+        if (startRes.token && startRes.started) {
+          const deadline = Date.now() + 30 * 60 * 1000;
+          while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 500));
+            const p = await api.chan_scan_resolution_mismatch_poll(startRes.token);
+            if (!p?.pending) { res = p; break; }
+          }
+          if (!res || res.pending) {
+            window._showToast?.("Scan timed out.", "error");
+            return;
+          }
+        }
         if (!res?.ok) {
           window._showToast?.(res?.error || "Scan failed.", "error");
           return;
@@ -476,8 +521,24 @@
         url: document.getElementById("edit-url").value.trim(),
         folder_override: _folderVal,
         resolution: document.getElementById("edit-resolution").value,
-        min_duration: parseInt(document.getElementById("edit-min-dur").value) || 0,
-        max_duration: parseInt(document.getElementById("edit-max-dur").value) || 0,
+        // parseInt(...) || 0 silently mapped NaN to 0 — clearing the
+        // input was indistinguishable from "set to 0". Refuse to
+        // persist invalid input and keep the user's previously-saved
+        // value by omitting the field entirely when the input is
+        // empty / non-numeric. (collectPayload's callers filter out
+        // undefined fields before update_channel.)
+        min_duration: (() => {
+          const _v = document.getElementById("edit-min-dur").value;
+          if (_v === "" || _v == null) return undefined;
+          const _n = parseInt(_v, 10);
+          return Number.isFinite(_n) && _n >= 0 ? _n : undefined;
+        })(),
+        max_duration: (() => {
+          const _v = document.getElementById("edit-max-dur").value;
+          if (_v === "" || _v == null) return undefined;
+          const _n = parseInt(_v, 10);
+          return Number.isFinite(_n) && _n >= 0 ? _n : undefined;
+        })(),
         folder_org: document.getElementById("edit-folder-org").value,
         auto_transcribe: document.getElementById("edit-transcribe").checked,
         auto_metadata: document.getElementById("edit-metadata").checked,
@@ -502,7 +563,15 @@
         : null;
     };
     window._editChannelFromContext = (folder, urlGuess) => {
-      const chan = { folder, url: urlGuess || ("https://www.youtube.com/@" + folder.replace(/\s+/g, "")) };
+      // No URL fallback construction here. Previously the fallback
+      // built a guessed `youtube.com/@{folder-without-spaces}` URL
+      // that was indistinguishable from a real URL when persisted —
+      // a folder name with `?`, `#`, `/`, or `..` produced a
+      // malformed/invalid URL that silently saved into the channel
+      // record. Leave url empty when we don't have a real one; the
+      // edit panel surfaces the missing URL so the user pastes a
+      // legitimate one before saving.
+      const chan = { folder, url: urlGuess || "" };
       if (window.pywebview?.api?.subs_get_channel) {
         window.pywebview.api.subs_get_channel({ name: folder }).then(res => {
           const channel = (res && res.ok && res.channel) ? {
@@ -528,6 +597,20 @@
     }
 
     update.addEventListener("click", async () => {
+      // Disable the button during the in-flight subs_check_duplicate +
+      // subs_update_channel/subs_add_channel sequence. Without this
+      // guard a double-click fires two concurrent saves in parallel
+      // — last-write-wins with potentially stale snapshot data on
+      // the second, or duplicate "Channel added" toasts and DB rows
+      // on the Add path. Snapshot _editingIdentity locally before
+      // the awaits since closePanel() inside the success branch
+      // nulls it, which would otherwise make the post-await toast
+      // report the wrong action ("Channel added" vs "Channel
+      // updated") if the user clicked Cancel mid-flight.
+      if (update.disabled) return;
+      update.disabled = true;
+      const _savedIdentity = _editingIdentity;
+      try {
       const payload = collectPayload();
       if (!payload.folder) { flashError("Folder name is required."); return; }
       if (!payload.url) { flashError("Channel URL is required."); return; }
@@ -562,14 +645,27 @@
           res = await api.subs_add_channel(payload);
         }
       } catch (e) { flashError("Error: " + e); return; }
-      if (!res.ok) { flashError(res.error || "Unknown error"); return; }
+      // Defensive: subs_update_channel can return undefined on bridge
+      // failures (audit: editChannel.js:565). Old `!res.ok` threw
+      // TypeError on undefined and silently bailed without a toast.
+      if (!res || !res.ok) {
+        flashError(res?.error || "Unknown error");
+        return;
+      }
       if (res.write_blocked) {
         flashError("Saved in memory but disk write is gated.");
       } else {
-        flashOk(_editingIdentity ? "Channel updated." : "Channel added.");
+        // Use the snapshot taken before the awaits — closePanel()
+        // below nulls _editingIdentity, so this branch would
+        // otherwise toast "Channel added" on an update if the user
+        // cancelled during the in-flight call.
+        flashOk(_savedIdentity ? "Channel updated." : "Channel added.");
       }
       await refreshSubsTable();
       closePanel();
+      } finally {
+        update.disabled = false;
+      }
     });
 
     remove.addEventListener("click", async () => {

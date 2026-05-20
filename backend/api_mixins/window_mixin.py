@@ -107,12 +107,14 @@ class WindowMixin:
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         else:
-            # Quit path: schedule the killer. Two threads in case
-            # one gets starved.
-            try:
-                threading.Thread(target=_kill_via_thread, daemon=True).start()
-            except Exception as e:
-                _log.debug("swallowed: %s", e)
+            # Quit path: schedule a SINGLE killer thread. The
+            # previous double-thread pattern (originally intended as
+            # belt-and-suspenders) caused two concurrent
+            # self._queues.save_now() calls to race on the same
+            # .tmp / os.replace — the queue file could be left
+            # half-written or truncated on Quit. Single thread is
+            # enough since the killer's join timeout is 200ms and the
+            # TerminateProcess fallback is its own guarantee.
             try:
                 threading.Thread(target=_kill_via_thread, daemon=True).start()
             except Exception as e:
@@ -199,6 +201,21 @@ class WindowMixin:
         """
         try:
             import subprocess
+            # Run shutdown cleanup FIRST so child subprocesses are
+            # killed, queue state saved, ports released BEFORE the
+            # new instance launches. The previous order spawned the
+            # new process and then waited 0.6s before tearing down —
+            # during that window two YTArchiver instances briefly ran
+            # concurrently against the same SQLite WAL DB and config,
+            # observed to cause WAL/locked-db errors and the stale
+            # instance's queue save clobbering the freshly-restored
+            # config.
+            try:
+                _cb = getattr(self, "_shutdown_cleanup_fn", None)
+                if callable(_cb):
+                    _cb()
+            except Exception as _ce:
+                print(f"[app_restart] shutdown_cleanup (pre-launch): {_ce}")
             if getattr(sys, "frozen", False):
                 # Running as PyInstaller exe — relaunch the .exe itself.
                 subprocess.Popen([sys.executable],
@@ -253,9 +270,32 @@ class WindowMixin:
             )
             if not paths:
                 return {"ok": False, "cancelled": True}
-            path = paths if isinstance(paths, str) else paths[0]
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text or "")
+            if isinstance(paths, str):
+                path = paths
+            else:
+                try:
+                    if not len(paths):
+                        return {"ok": False, "cancelled": True}
+                    path = paths[0]
+                except (TypeError, IndexError):
+                    return {"ok": False, "cancelled": True}
+            # Atomic tmp+replace so a mid-write disk-full doesn't
+            # truncate a pre-existing file the user picked to
+            # overwrite (audit: window_mixin.py:244-261).
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(text or "")
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+            except Exception:
+                try: os.remove(tmp)
+                except OSError: pass
+                raise
             return {"ok": True, "path": path}
         except Exception as e:
             return {"ok": False, "error": str(e)}

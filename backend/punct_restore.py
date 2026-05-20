@@ -81,15 +81,64 @@ def _segments_for_video(conn: sqlite3.Connection, video_id: str) -> list:
 
 def _update_db_text(conn: sqlite3.Connection, video_id: str,
                     segments: list) -> int:
-    """Targeted UPDATE on segments.text — column-only, FTS untouched
-    (text shape unchanged, only punctuation added)."""
+    """Targeted UPDATE on segments.text — column-only.
+
+    Also re-syncs the FTS5 external-content index for the affected
+    rows. Without this, the FTS tokens stay indexed against the OLD
+    pre-punctuation text — searches for the newly-added punctuated
+    forms miss, and searches for the lowercase raw form still match
+    (returning rows whose visible text no longer contains those raw
+    forms). The audit called this out at index.py:564 — the phantom
+    accumulated specifically because callers like this one were
+    updating segments.text without re-syncing FTS.
+    """
     updated = 0
+    affected_ids = []
     for seg in segments:
+        # Capture rowids we'll touch so we can re-sync FTS afterward.
+        try:
+            row = conn.execute(
+                "SELECT id, text FROM segments "
+                "WHERE video_id=? AND start_time=? AND end_time=?",
+                (video_id, seg["start"], seg["end"])).fetchone()
+        except sqlite3.Error:
+            row = None
         cur = conn.execute(
             "UPDATE segments SET text=? "
             "WHERE video_id=? AND start_time=? AND end_time=?",
             (seg["text"], video_id, seg["start"], seg["end"]))
+        if cur.rowcount and row:
+            # (rowid, old_text) — used to clear stale FTS tokens.
+            affected_ids.append((row[0], row[1]))
         updated += cur.rowcount
+    # FTS re-sync: issue 'delete' with the OLD text to clear stale
+    # tokens, then re-insert with the NEW text. Done in batches to
+    # keep the transaction small.
+    if affected_ids:
+        try:
+            conn.executemany(
+                "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                "VALUES('delete', ?, ?)",
+                affected_ids)
+            new_id_text = []
+            for rid, _old in affected_ids:
+                row2 = conn.execute(
+                    "SELECT text FROM segments WHERE id=?", (rid,)).fetchone()
+                if row2:
+                    new_id_text.append((rid, row2[0]))
+            if new_id_text:
+                conn.executemany(
+                    "INSERT INTO segments_fts(rowid, text) VALUES(?, ?)",
+                    new_id_text)
+        except sqlite3.Error as e:
+            # Best-effort — log and continue. A subsequent
+            # rebuild_fts_index will fix any drift.
+            try:
+                from .log import get_logger
+                get_logger(__name__).debug(
+                    "FTS re-sync after _update_db_text failed: %s", e)
+            except Exception:
+                pass
     conn.commit()
     return updated
 
@@ -345,8 +394,17 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
 
             # Run each segment's text through punctuate(). Failures fall
             # through to "no change" — better than dropping the video.
+            # Cancel check INSIDE the per-segment loop so a click during
+            # a long video doesn't get ignored until the next video
+            # boundary (audit: punct_restore.py:355). A 1000-segment
+            # video × 30s timeout was up to 8 hours of unresponsive
+            # Cancel button before this fix.
             new_segs = []
+            _cancelled_mid = False
             for seg in segs:
+                if _cancelled():
+                    _cancelled_mid = True
+                    break
                 old_text = seg["text"]
                 if not old_text.strip():
                     new_segs.append(seg)
@@ -358,6 +416,13 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 ns = dict(seg)
                 ns["text"] = new_text or old_text
                 new_segs.append(ns)
+            if _cancelled_mid:
+                cancelled_early = True
+                log_stream.emit_text(
+                    f"   Cancelled mid-video after {i - 1}/{len(work)} "
+                    f"complete + {len(new_segs)}/{len(segs)} segments "
+                    f"of {vid}.\n", "simpleline")
+                break
 
             if dry_run:
                 ok_count += 1
@@ -377,10 +442,16 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                     except Exception as e: _log.debug("swallowed: %s", e)
                 continue
 
-            # Write back: DB column update + JSONL rewrite.
+            # Write back: JSONL FIRST (atomic tmp+replace), then commit
+            # DB. Old order committed DB then wrote JSONL — if the
+            # JSONL write failed (locked, disk full), the DB had the
+            # new punctuated text but JSONL kept the raw text, so
+            # Watch view showed old text while search returned new
+            # (audit: punct_restore.py:381-392). Now: JSONL succeeds
+            # → DB updates; JSONL fails → DB unchanged.
             try:
-                _update_db_text(conn, vid, new_segs)
                 _replace_jsonl_entry(str(jsonl_path), title, vid, new_segs)
+                _update_db_text(conn, vid, new_segs)
             except Exception as e:
                 fail_count += 1
                 short = (title[:55] + "…") if len(title) > 58 else title

@@ -59,6 +59,7 @@
       "tx_done_",
       "meta_done_",
       "compress_done_",
+      "dwnld_done_",
       "whisper_job_",
       "sync_row_",
       "dlrow_",
@@ -470,7 +471,14 @@
     const el = document.getElementById("activity-log");
     if (!el) return;
     wireUserScrollDetection(el);
-    el.innerHTML = "";
+    // replaceChildren is cheaper than innerHTML="" for a large
+    // activity log — innerHTML triggers a full HTML re-parse pass
+    // even for empty string (audit: logs.js:474).
+    if (typeof el.replaceChildren === "function") {
+      el.replaceChildren();
+    } else {
+      el.innerHTML = "";
+    }
     entries.forEach((entry) => {
       el.appendChild(buildActivityRow(entry));
     });
@@ -479,8 +487,16 @@
     // the new rows, leaving scrollTop at 0. Delay via rAF + one more tick.
     maybeSnapToBottom(el);
     requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
-      setTimeout(() => { el.scrollTop = el.scrollHeight; }, 30);
+      // Re-check userScrolled before each snap. The setTimeout fires
+      // 30ms later — if the user scrolled up in that window (mouse
+      // wheel right after the first render), the old code still
+      // yanked them to the bottom (audit: logs.js:493).
+      const _st1 = scrollState.get(el);
+      if (!_st1 || !_st1.userScrolled) el.scrollTop = el.scrollHeight;
+      setTimeout(() => {
+        const _st2 = scrollState.get(el);
+        if (!_st2 || !_st2.userScrolled) el.scrollTop = el.scrollHeight;
+      }, 30);
     });
   };
 
@@ -720,6 +736,12 @@
         // read position.
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
+        // Track whether THIS batch introduced any new pin-to-bottom
+        // rows. If not, we can skip the expensive querySelectorAll +
+        // re-append pass below entirely (audit: logs.js:799,837-840).
+        // Old code scanned every line in the 8000-row log on every
+        // batch even when no pinned rows were touched.
+        let _batchHasPinned = false;
         for (const segs of payload.main) {
           if (!Array.isArray(segs) || segs.length === 0) continue;
           // Control-line handling — run in order, then skip render.
@@ -733,6 +755,14 @@
               // an invalid selector and querySelectorAll throws —
               // killing the entire log batch and breaking in-place
               // replacements downstream. CSS.escape is browser-native.
+              // Dispatch the yt-control event FIRST so listeners
+               // observe the removal as a clean transition. Old order
+               // was remove → dispatch, which let a listener that
+               // also handled clear_line attempt a second removal on
+               // an already-detached node (audit: logs.js:746).
+              window.dispatchEvent(new CustomEvent("yt-control", {
+                detail: data,
+              }));
               if (data.kind === "clear_line" && data.marker) {
                 // Remove matching `data-inplace` elements from BOTH
                 // the committed DOM AND the in-progress fragment —
@@ -745,9 +775,6 @@
                 frag.querySelectorAll(sel).forEach((n) => n.remove());
                 el.querySelectorAll(sel).forEach((n) => n.remove());
               }
-              window.dispatchEvent(new CustomEvent("yt-control", {
-                detail: data,
-              }));
             } catch (e) {
               console.error("control payload parse failed:", e);
             }
@@ -796,7 +823,7 @@
           // pinning, the active "Transcribing X%" line gets pushed up
           // by unrelated sync output and disappears from the mini-log
           // even though it's still the most relevant thing happening.
-          if (_isPinToBottom(segs)) line.dataset.pinBottom = "1";
+          if (_isPinToBottom(segs)) { line.dataset.pinBottom = "1"; _batchHasPinned = true; }
           const inplaceKind = _inplaceKind(segs);
           if (inplaceKind) {
             line.dataset.inplace = inplaceKind;
@@ -834,9 +861,11 @@
         // pinned ones back down. Inplace-replacement still works
         // because the replacement line lands in the same DOM position,
         // and this pass re-pulls it to the end on the next batch.
-        const _pinned = el.querySelectorAll('.log-line[data-pin-bottom="1"]');
-        if (_pinned.length) {
-          for (const _p of _pinned) el.appendChild(_p);
+        if (_batchHasPinned) {
+          const _pinned = el.querySelectorAll('.log-line[data-pin-bottom="1"]');
+          if (_pinned.length) {
+            for (const _p of _pinned) el.appendChild(_p);
+          }
         }
         // Same scroll-freeze / trim behavior as appendMainLog
         const cap = 8000, keep = 5000;
@@ -885,6 +914,14 @@
         // this, when a [Dwnld] and its retroactive update arrive in
         // the same batch, the DOM lookup misses (new row isn't in
         // DOM yet, only in frag), and both rows are appended.
+        // CSS.escape availability fallback — same pattern as the
+        // clear_line handler above (audit: logs.js:899,909). Old code
+        // assumed CSS.escape; on stale WebView2 builds that's
+        // undefined, and any row_id-bearing activity row threw and
+        // killed the rest of the batch.
+        const _escRid = (s) =>
+          (typeof CSS !== "undefined" && CSS.escape)
+            ? CSS.escape(s) : String(s).replace(/["\\\]]/g, "\\$&");
         for (const entry of payload.activity) {
           const row = buildActivityRow(entry);
           const rid = row.dataset.rowId;
@@ -896,7 +933,7 @@
             // with `0 transcribed`. Preserve the existing row's alt
             // class so the parity sequence doesn't shift.
             const existing = el.querySelector(
-              `.log-line[data-row-id="${CSS.escape(rid)}"]`);
+              `.log-line[data-row-id="${_escRid(rid)}"]`);
             if (existing) {
               const wasAlt = existing.classList.contains("hist_row_alt");
               if (wasAlt) row.classList.add("hist_row_alt");
@@ -906,7 +943,7 @@
             }
             // Also search the fragment for a same-batch predecessor.
             const pending = frag.querySelector(
-              `.log-line[data-row-id="${CSS.escape(rid)}"]`);
+              `.log-line[data-row-id="${_escRid(rid)}"]`);
             if (pending) {
               const wasAlt = pending.classList.contains("hist_row_alt");
               if (wasAlt) row.classList.add("hist_row_alt");

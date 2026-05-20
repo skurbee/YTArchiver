@@ -33,6 +33,12 @@
   const showContextMenu = window.showContextMenu || (() => {});
 
   function initMetadataTab() {
+    // Re-init guard — multiple calls would stack duplicate global
+    // listeners (mousedown/keydown/resize/scroll capture), each one
+    // triggering on every event. After several re-inits the page
+    // gets noticeably slower on scroll.
+    if (window._metadataTabInited) return;
+    window._metadataTabInited = true;
     const tbody = document.getElementById("metadata-tbody");
     const table = document.getElementById("metadata-table");
     const bAllViews = document.getElementById("btn-md-refresh-all-views");
@@ -79,9 +85,14 @@
       return { text, cls };
     };
 
+    // Must escape ' as &#39; — the data-identity attribute is wrapped in
+    // single quotes (because its value is JSON, which contains "), so an
+    // unescaped apostrophe in a folder name (e.g. "Don't Tell Comedy")
+    // would break out of the attribute and inject markup.
     const escapeHtml = (s) => String(s || "")
       .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
 
     const sortRows = (rows) => {
       const mult = _sortDir === "asc" ? 1 : -1;
@@ -562,7 +573,11 @@
     // we want the user to know the task was queued but the queue
     // won't auto-start. Surface message ends with "queue is paused —
     // resume to start." in that case.
-    const _pausedTail = (res) => res?.paused ? " Queue is paused — resume to start." : "";
+    // Defensive: require strictly boolean true (not "true" / "false"
+    // strings) so a backend regression that ever flips the field type
+    // can't render the "queue paused" tail on every toast (audit:
+    // metadataTab.js:565).
+    const _pausedTail = (res) => res?.paused === true ? " Queue is paused — resume to start." : "";
 
     // Prompt the user to pick fast vs thorough backfill mode. Time
     // estimates derived from videoCount: fast is mostly catalog-walk
@@ -815,7 +830,13 @@
       if (!tr) return;
       try {
         const sel = window.getSelection?.();
-        if (sel && sel.toString().length > 0) return;
+        // Only suppress the menu if the active text selection is
+        // INSIDE this row — old check blocked the click even when
+        // the selection was elsewhere in the page (audit:
+        // metadataTab.js:818).
+        if (sel && sel.toString().length > 0
+            && typeof sel.containsNode === "function"
+            && sel.containsNode(tr, true)) return;
       } catch {}
       _openRowMenu(tr, e.clientX, e.clientY);
     });
@@ -1074,7 +1095,15 @@
     // restart where it was remembered as active), pull data now.
     const metaView = document.getElementById("settings-view-metadata");
     if (metaView && metaView.style.display !== "none") {
-      setTimeout(() => window._refreshMetadataTab?.(), 400);
+      // Re-check display inside the timeout — if the user clicks
+      // away to another tab in the 400ms window, the fetch isn't
+      // needed and would just spam the bridge (audit:
+      // metadataTab.js:1077).
+      setTimeout(() => {
+        if (metaView.style.display !== "none") {
+          window._refreshMetadataTab?.();
+        }
+      }, 400);
     }
   }
   window._initMetadataTab = initMetadataTab;

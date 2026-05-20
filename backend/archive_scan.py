@@ -32,8 +32,13 @@ from .ytarchiver_config import DISK_CACHE_FILE, load_config
 _log = get_logger(__name__)
 
 
-# Matches YTArchiver.py:134 _CHANNEL_VIDEO_EXTS
-_CHANNEL_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".wav", ".mp3", ".m4a", ".flac")
+# Matches YTArchiver.py:134 _CHANNEL_VIDEO_EXTS. Kept in sync with
+# index_maintenance._VIDEO_EXTS so the per-channel disk count (here)
+# and the sweep-registration walk both classify the same files as
+# videos. Earlier divergence (.mov / .m4v missing from this list)
+# made the Subs table report fewer videos than the Browse grid showed.
+_CHANNEL_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+                       ".wav", ".mp3", ".m4a", ".flac")
 
 # Partial file suffixes — never count these as real videos
 _PARTIAL_SUFFIXES = (".part", ".tmp", ".temp", ".download", ".ytdl")
@@ -300,17 +305,28 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
             fp = os.path.join(dp, fn)
             try:
                 size = os.path.getsize(fp)
-                # Skip 0-byte phantom files (failed downloads that
-                # left an empty placeholder). Counting them would
-                # inflate the per-channel video count vs what the
-                # grid actually renders.
-                if size == 0:
-                    zero_byte += 1
-                    continue
-                total += size
-                n_vids += 1
             except OSError:
-                pass
+                # File vanished between os.walk and the stat — typically
+                # caught mid-replace (compress finalize, sync atomic
+                # rename). Brief retry catches the case where the new
+                # file is already in place; if still missing, the next
+                # rescan will pick it up (self-healing). Without the
+                # retry, the per-channel vid count was permanently 1 low
+                # until the user triggered another scan.
+                import time as _t
+                _t.sleep(0.05)
+                try:
+                    size = os.path.getsize(fp)
+                except OSError:
+                    continue
+            # Skip 0-byte phantom files (failed downloads that left an
+            # empty placeholder). Counting them would inflate the
+            # per-channel video count vs what the grid actually renders.
+            if size == 0:
+                zero_byte += 1
+                continue
+            total += size
+            n_vids += 1
     # Bug [24]: surface 0-byte files instead of silently dropping them.
     # Previously this was completely invisible — a channel with 100
     # zero-byte placeholders showed clean stats while the orphans
@@ -336,15 +352,23 @@ def scan_channel_folder(base_dir: Path, channel: dict[str, Any]) -> tuple[int, i
                        or "").strip()
             if ch_name:
                 # Reader path — duplicate-count is a pure SELECT and
-                # shouldn't queue behind sweep / ingest writes.
+                # shouldn't queue behind sweep / ingest writes. Only
+                # count duplicates whose file STILL EXISTS on disk;
+                # the previous query included rows whose file had
+                # already been deleted, double-subtracting from the
+                # walk count and producing under-counts.
                 with _idx._reader_lock:
-                    _dup_row = _conn.execute(
-                        "SELECT COUNT(*) FROM videos "
+                    _dup_rows = _conn.execute(
+                        "SELECT filepath FROM videos "
                         "WHERE channel=? COLLATE NOCASE "
                         "AND is_duplicate_of IS NOT NULL",
-                        (ch_name,)).fetchone()
-                if _dup_row:
-                    _n_dup = int(_dup_row[0] or 0)
+                        (ch_name,)).fetchall()
+                _n_dup = 0
+                for _r in _dup_rows or ():
+                    _fp = (_r[0] or "")
+                    if _fp and os.path.isfile(_fp):
+                        _n_dup += 1
+                if _n_dup:
                     n_vids = max(0, n_vids - _n_dup)
     except Exception as e:
         _log.debug("swallowed: %s", e)

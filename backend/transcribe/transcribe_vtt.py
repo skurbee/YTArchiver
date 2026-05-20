@@ -279,15 +279,35 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                 f"falling back to Whisper)")
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        # Clean up any temp files we fetched before bailing.
+        # Clean up any temp files we fetched before bailing. Retry
+        # on Windows file-lock cases (yt-dlp's fd may not be fully
+        # closed yet) — without this, the orphan .__cap_probe*.vtt
+        # accumulates on every subsequent attempt because the same
+        # path keeps coming back from the cookieless re-fetch.
         for _p in _fetched_temp:
-            try: os.remove(_p)
-            except OSError: pass
+            _removed = False
+            for _attempt in range(3):
+                try:
+                    os.remove(_p)
+                    _removed = True
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            if not _removed:
+                _log.debug("temp .vtt cleanup failed (will retry next pass): %s", _p)
         return False
     if not segs:
-        for _p in _fetched_temp:
-            try: os.remove(_p)
-            except OSError: pass
+        # Also clean any other on-disk .vtt candidates (parse-success
+        # but zero-segments case). The original returned False
+        # without sweeping `candidates`, leaving stale .vtt sidecars
+        # accumulating next to videos.
+        for _p in (list(_fetched_temp) + [c for c in candidates if os.path.isfile(c)]):
+            for _attempt in range(3):
+                try:
+                    os.remove(_p)
+                    break
+                except OSError:
+                    time.sleep(0.1)
         return False
 
     # Resolve aggregated transcript paths for this channel (matches OLD layout).
@@ -326,8 +346,26 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     # now consistently means "no punct pass ran during ingest".
     src_tag = "YT CAPTIONS"
     _vtt_punct_re = re.compile(r"[.,!?;:]")
-    _already_punct = bool(
-        full_text and _vtt_punct_re.search(full_text[:800]))
+    # Sample three windows (start + middle + end) instead of just the
+    # first 800 chars so a long video with mixed caption sources (e.g.
+    # punctuated manual-subs intro + bare-words auto-cap body) doesn't
+    # falsely classify as "already punctuated" and skip the per-segment
+    # punct pass. Each sample is 400 chars.
+    _already_punct = False
+    if full_text:
+        _W = 400
+        _samples = [full_text[:_W]]
+        if len(full_text) > _W * 2:
+            _mid = max(0, (len(full_text) - _W) // 2)
+            _samples.append(full_text[_mid:_mid + _W])
+        if len(full_text) > _W * 3:
+            _samples.append(full_text[-_W:])
+        _punct_hits = sum(
+            1 for s in _samples if _vtt_punct_re.search(s))
+        # Need punctuation in EVERY sample to declare "already
+        # punctuated." Even one bare-words sample means the body is
+        # uneven and we should run punctuation.
+        _already_punct = _punct_hits >= len(_samples)
     if punct_mgr is not None and full_text and not _already_punct:
         try:
             # `job_tag` (e.g. `whisper_job_7`) makes this line
@@ -551,6 +589,20 @@ def _parse_vtt(path: str) -> list:
         for _cs, _ce, _txt, _raw in raw_cues:
             if _cs <= _last_start <= _ce:
                 _last_end = round(_ce, 3)
+        # Cap the last word's end at start + median word duration so a
+        # cue with trailing silence doesn't stretch the karaoke
+        # highlight on the final word for seconds past the actual
+        # utterance (audit: transcribe_vtt.py:540-554). Median over
+        # previously-computed (e-s) values; falls back to 0.5s if
+        # there's only one word.
+        if len(all_words) >= 2:
+            _durs = sorted(
+                max(0.0, all_words[_i].get("e", 0.0) - all_words[_i]["s"])
+                for _i in range(len(all_words) - 1)
+            )
+            _med = _durs[len(_durs) // 2] if _durs else 0.5
+            _cap = round(_last_start + max(0.2, min(2.0, _med)), 3)
+            _last_end = min(_last_end, _cap)
         all_words[-1]["e"] = _last_end
         for w in all_words:
             w["s"] = round(w["s"], 3)
@@ -563,6 +615,12 @@ def _parse_vtt(path: str) -> list:
     seg_text = raw_cues[0][2]
     for i in range(1, len(raw_cues)):
         _s, _e, _t, _ = raw_cues[i]
+        # Skip empty/formatting-only cues — they used to slip past the
+        # echo guard below because `_t` was falsy, but the duration-only
+        # branch (<0.1s) then mis-flagged the next non-empty cue as an
+        # overlap and merged it (audit: transcribe_vtt.py:564-603).
+        if not _t.strip():
+            continue
         is_overlap = False
         if seg_text and _t:
             seg_words_list = seg_text.split()
@@ -612,10 +670,23 @@ def _parse_vtt(path: str) -> list:
         words = seg["text"].split()
         n = max(2, int(dur / MAX_SEG_SECS) + (1 if dur % MAX_SEG_SECS > 0 else 0))
         cdur = dur / n
-        wper = max(1, len(words) // n)
+        # Distribute words EVENLY across chunks instead of dumping the
+        # remainder into the last chunk. Old wper = len//n then "last
+        # chunk grabs everything left" made the last chunk much larger
+        # than wper on a 600-word seg split into 3 chunks — its words
+        # didn't line up with its time slice and karaoke drifted on
+        # the tail (audit: transcribe_vtt.py:611-625). Spread the
+        # remainder across the first `rem` chunks so chunk sizes
+        # differ by at most 1 word.
+        _nw = len(words)
+        _base = _nw // n
+        _rem = _nw % n
+        _cursor = 0
         for ci in range(n):
-            w0 = ci * wper
-            w1 = w0 + wper if ci < n - 1 else len(words)
+            _len_ci = _base + (1 if ci < _rem else 0)
+            w0 = _cursor
+            w1 = _cursor + _len_ci
+            _cursor = w1
             ct = " ".join(words[w0:w1])
             if not ct:
                 continue

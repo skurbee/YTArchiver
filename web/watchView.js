@@ -159,6 +159,11 @@
     if (!transcript || transcript.length === 0) {
       tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
       _unbindKaraoke(vEl);
+      // Clear caption cues too — previously a failed retranscribe left
+      // the previous video's cues on the TextTrack so they kept
+      // appearing as overlay while the still-playing video kept going
+      // (audit: watchView.js:88-91).
+      try { _setCueTrackFromTranscript(vEl, []); } catch { /* ignore */ }
       return;
     }
 
@@ -201,6 +206,11 @@
       // edits, etc.) fall back to the raw words.
       const segText = seg.t || seg.text || "";
       const textTokens = segText.trim().split(/\s+/).filter(Boolean);
+      // Per-word click handlers were causing memory pressure on long
+      // videos — a 10k-word transcript allocated 10k closures that
+      // GC eventually had to reap. Use event delegation instead:
+      // one click listener on the body root walks up to the nearest
+      // .word and seeks. Set up below, once per render.
       if (words && textTokens.length === words.length) {
         for (let i = 0; i < words.length; i++) {
           const wobj = words[i];
@@ -209,7 +219,6 @@
           span.dataset.s = wobj.s ?? 0;
           span.dataset.e = wobj.e ?? 0;
           span.textContent = textTokens[i] + " ";
-          span.addEventListener("click", () => _seekTo(vEl, wobj.s ?? 0));
           segEl.appendChild(span);
         }
       } else if (words) {
@@ -219,14 +228,13 @@
           span.dataset.s = wobj.s ?? 0;
           span.dataset.e = wobj.e ?? 0;
           span.textContent = (wobj.w || "") + " ";
-          span.addEventListener("click", () => _seekTo(vEl, wobj.s ?? 0));
           segEl.appendChild(span);
         }
       } else {
         const span = document.createElement("span");
         span.className = "word";
+        span.dataset.s = String(seg.s ?? 0);
         span.textContent = segText + " ";
-        span.addEventListener("click", () => _seekTo(vEl, seg.s ?? 0));
         segEl.appendChild(span);
       }
       // Trailing space between segments keeps words from running together.
@@ -234,6 +242,16 @@
       body.appendChild(segEl);
       segEls.push(segEl);
     }
+    // Delegated click handler — one listener on body instead of N
+    // per-word listeners. Walks up to nearest .word and seeks via
+    // dataset.s. Replaces the previous closure-per-word pattern
+    // that allocated thousands of listeners for long transcripts.
+    body.addEventListener("click", (e) => {
+      const wEl = e.target && e.target.closest && e.target.closest(".word");
+      if (!wEl) return;
+      const _s = parseFloat(wEl.dataset.s);
+      if (Number.isFinite(_s)) _seekTo(vEl, _s);
+    });
     frag.appendChild(body);
     tr.appendChild(frag);
     _bindKaraoke(vEl, tr, segEls);
@@ -264,9 +282,21 @@
     // banner reflects what the user can see.
     const _hasContentPunct = (() => {
       if (!Array.isArray(transcript) || transcript.length === 0) return false;
-      const sample = transcript.slice(0, 8)
-        .map(s => s && (s.t || s.text || "")).join(" ");
-      return /[.,!?;:]/.test(sample);
+      // Broader sample: a music-intro segment list ("♪♪♪", "[Music]")
+      // followed by a punctuated body used to mis-label the banner
+      // because only the first 8 segments were sampled (audit:
+      // watchView.js:265-270). Sample up to ~50 segments at regular
+      // strides across the whole transcript so legitimate punctuation
+      // anywhere in the body is detected.
+      const _n = transcript.length;
+      const _stride = Math.max(1, Math.floor(_n / 50));
+      let _sampled = "";
+      for (let _i = 0; _i < _n; _i += _stride) {
+        const _seg = transcript[_i];
+        _sampled += " " + (_seg && (_seg.t || _seg.text || ""));
+        if (_sampled.length > 4096) break; // cap regex input
+      }
+      return /[.,!?;:]/.test(_sampled);
     })();
 
     const banner = document.createElement("div");
@@ -454,10 +484,22 @@
     // already has) — but building paragraph nodes is cleaner.
     // Instead we use a single container and insert `\n` literally
     // between match-split fragments; CSS preserves the newlines.
-    const RX = /(?<![\d:])(\d{1,3}):(\d{2})(?::(\d{2}))?\b/g;
+    // Lookbehind-free variant. The old regex used `(?<![\d:])` which
+    // throws at parse time on stale WebView2 / older Safari (audit:
+    // watchView.js:457). We now do the boundary check manually:
+    // strip matches whose preceding character is `[0-9:]`, so
+    // "3:14:15 PM" and "ratio 2:30" still don't get auto-linked.
+    const RX = /(\d{1,3}):(\d{2})(?::(\d{2}))?\b/g;
     let lastIdx = 0;
     let m;
     while ((m = RX.exec(text)) !== null) {
+      const _prev = m.index > 0 ? text.charAt(m.index - 1) : "";
+      if (_prev && (_prev === ":" || (_prev >= "0" && _prev <= "9"))) {
+        // Skip this match — preceded by digit or colon. Advance one
+        // char and retry so a later non-skipped match isn't missed.
+        if (RX.lastIndex === m.index) RX.lastIndex++;
+        continue;
+      }
       // Pre-match text
       if (m.index > lastIdx) {
         el.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
@@ -479,7 +521,14 @@
           const vEl = document.getElementById("watch-video");
           if (!vEl) return;
           try {
-            vEl.currentTime = secs;
+            // Clamp to duration so a malformed description
+            // timestamp (e.g. "9:99:99" decoded as 35999s on a
+            // 2-minute video) doesn't throw on Safari / older
+            // Chromium (audit: watchView.js:480-485). Modern
+            // Chrome silently clamps; clamp explicitly for cross-
+            // browser consistency.
+            const _dur = Number.isFinite(vEl.duration) ? vEl.duration : secs;
+            vEl.currentTime = Math.min(secs, _dur);
             vEl.play().catch(() => {});
           } catch {}
         });
@@ -583,6 +632,17 @@
       return;
     }
     if (url) {
+      // Stop the previous video's load explicitly before swapping src.
+      // Without this, rapid back-to-back video clicks can leave the
+      // old request holding the file handle on Z:\ DrivePool until
+      // the local HTTP server times out (~30s) — at peak this
+      // transiently leaks N file handles. Pause+removeAttribute+load
+      // is the documented clean-teardown pattern.
+      try {
+        vEl.pause();
+        vEl.removeAttribute("src");
+        if (typeof vEl.load === "function") vEl.load();
+      } catch { /* noop */ }
       vEl.src = url;
       vEl.style.display = "";
       if (ph) {
@@ -782,7 +842,14 @@
       else if (t > e) lo = mid + 1;
       else return mid;
     }
-    // Fall-through: return the last segment we've crossed (for gaps)
+    // Fall-through: return the last segment we've crossed (for gaps).
+    // Bail with -1 when t is past the last segment's end so the
+    // karaoke highlight doesn't get stuck on the last word forever
+    // after the transcript ends (audit: watchView.js:781-792).
+    if (segEls.length > 0) {
+      const _lastE = parseFloat(segEls[segEls.length - 1].dataset.e || "0");
+      if (Number.isFinite(_lastE) && t > _lastE) return -1;
+    }
     let best = -1;
     for (let i = 0; i < segEls.length; i++) {
       const s = parseFloat(segEls[i].dataset.s || "0");
@@ -822,10 +889,30 @@
   function _setCueTrackFromTranscript(vEl, transcript) {
     const t = _ensureCapTrack(vEl);
     if (!t) return;
-    // Clear prior cues — addTextTrack accumulates if you call it again,
-    // and we want a clean slate per video.
-    while (t.cues && t.cues.length) {
-      try { t.removeCue(t.cues[0]); } catch { break; }
+    // Clear prior cues. The old `break` on removeCue throw left the
+    // loop early at the first failure, stranding remaining cues from
+    // the previous video — they then bled into the next video's
+    // captions (visible as stale phrases overlaying unrelated
+    // footage). With continue-on-throw + a bounded retry counter
+    // we drain everything we can, accepting that some genuinely
+    // un-removable cues stay (extremely rare, and at worst hidden
+    // behind the new cues' time ranges).
+    if (t.cues) {
+      let _attempts = 0;
+      while (t.cues.length && _attempts < 5000) {
+        _attempts++;
+        try {
+          t.removeCue(t.cues[0]);
+        } catch {
+          // Skip this cue; try removing from the end instead so we
+          // don't get stuck on cue[0] forever.
+          try {
+            t.removeCue(t.cues[t.cues.length - 1]);
+          } catch {
+            break;
+          }
+        }
+      }
     }
     if (!Array.isArray(transcript)) return;
     const Cue = window.VTTCue || window.TextTrackCue;

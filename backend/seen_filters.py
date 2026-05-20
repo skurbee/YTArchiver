@@ -29,7 +29,13 @@ def _load_locked():
         with SEEN_FILTER_TITLES.open("r", encoding="utf-8") as f:
             for line in f:
                 ln = line.strip()
-                if ln:
+                # Skip obviously-corrupt lines (concatenated entries
+                # left by an unlocked append race). Heuristic: any
+                # single title >2KB is suspect — real YouTube titles
+                # cap at ~100 chars. Without this, garbage from a
+                # crash-during-append would pollute the cache and
+                # never match real entries.
+                if ln and len(ln) <= 2048:
                     _cache.add(ln)
                     _cache_lower.add(ln.lower())
     except OSError:
@@ -68,26 +74,37 @@ def mark_seen(title: str) -> bool:
         _cache.add(t)
         _cache_lower.add(_lower)
     if config_is_writable():
-        try:
-            SEEN_FILTER_TITLES.parent.mkdir(parents=True, exist_ok=True)
-            with SEEN_FILTER_TITLES.open("a", encoding="utf-8") as f:
-                f.write(t + "\n")
-        except OSError:
-            pass
+        # Hold _lock across the file write so concurrent mark_seen
+        # calls can't interleave bytes within a single line. Python's
+        # text-append is NOT atomic at the line level on Windows
+        # without O_APPEND; without this lock, two threads writing
+        # different titles produced corrupted concatenated entries
+        # (e.g. "Title oneTitle two\n") that polluted the cache.
+        with _lock:
+            try:
+                SEEN_FILTER_TITLES.parent.mkdir(parents=True, exist_ok=True)
+                with SEEN_FILTER_TITLES.open("a", encoding="utf-8") as f:
+                    f.write(t + "\n")
+            except OSError:
+                pass
     return True
 
 
 def clear():
     """Nuke the cache + file."""
+    # Hold _lock across BOTH the cache clear AND the file unlink so a
+    # concurrent mark_seen can't slip an entry into the cache that
+    # then doesn't match disk after the unlink — previously the cache
+    # diverged from disk after a clear-vs-mark race.
     with _lock:
         _cache.clear()
         _cache_lower.clear()
-    if config_is_writable():
-        try:
-            if SEEN_FILTER_TITLES.exists():
-                SEEN_FILTER_TITLES.unlink()
-        except OSError:
-            pass
+        if config_is_writable():
+            try:
+                if SEEN_FILTER_TITLES.exists():
+                    SEEN_FILTER_TITLES.unlink()
+            except OSError:
+                pass
 
 
 def count() -> int:

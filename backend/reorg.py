@@ -42,10 +42,24 @@ _MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November", "December"]
 
 
+_REORG_SKIP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP", "_REDOWNLOAD_TEMP")
+
+
 def _gather_video_files(root: Path) -> list[Path]:
-    """Walk `root` for video-type files (skipping our temp files)."""
+    """Walk `root` for video-type files (skipping our temp files +
+    temp working dirs).
+
+    Old code filtered by filename only ("_TEMP_COMPRESS" in fn),
+    but the walk still descended INTO `*_TEMP_COMPRESS/` directories
+    and collected videos inside — letting a concurrent reorg pull
+    an active compress's temp video out from under it (audit:
+    reorg.py:51-54). Skip those dirs entirely via the `dns[:]`
+    mutation pattern.
+    """
     out: list[Path] = []
-    for dp, _dns, fns in os.walk(root):
+    for dp, dns, fns in os.walk(root):
+        # In-place mutation of dns prunes the walk before descent.
+        dns[:] = [d for d in dns if d not in _REORG_SKIP_DIRS]
         for fn in fns:
             if "_TEMP_COMPRESS" in fn or fn.endswith(".part"):
                 continue
@@ -156,31 +170,66 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
         # destination collision. Before, we silently left
         # the source in place AND kept going, which for a previously-
         # interrupted reorg produced duplicate files in both folders
-        # with no dedupe. Now: if dst and src look identical (same
-        # size + mtime within 2s), assume this is a resumed reorg and
-        # remove the source as cleanup. If they differ, emit an error
-        # so the user can investigate instead of silent leak.
+        # with no dedupe. Now: if dst and src look identical
+        # (same size + mtime within 2s AND first-MB + last-MB byte
+        # content matches), assume this is a resumed reorg and remove
+        # the source as cleanup. If they differ, emit an error so the
+        # user can investigate instead of silent leak.
         try:
             _s_stat = video.stat()
             _d_stat = dst.stat()
-            _same = (_s_stat.st_size == _d_stat.st_size
-                     and abs(_s_stat.st_mtime - _d_stat.st_mtime) <= 2.0)
+            _same_meta = (_s_stat.st_size == _d_stat.st_size
+                          and abs(_s_stat.st_mtime - _d_stat.st_mtime) <= 2.0)
         except OSError:
-            _same = False
+            _same_meta = False
+        _same = False
+        if _same_meta:
+            # Confirm with a content-sample compare so two genuinely
+            # different videos that happen to have the same size +
+            # near-identical mtime (rare but possible \u2014 re-encodes
+            # produced at the same instant, or restored-from-backup
+            # files) aren't deduped as identical. Mirrors the
+            # redownload.py head/tail sample-compare pattern.
+            _SAMPLE = 1024 * 1024  # 1 MB
+            _same = True
+            try:
+                with open(video, "rb") as _sf, open(dst, "rb") as _df:
+                    if _sf.read(_SAMPLE) != _df.read(_SAMPLE):
+                        _same = False
+                    if _same and _s_stat.st_size > _SAMPLE * 2:
+                        _tail_off = _s_stat.st_size - _SAMPLE
+                        _sf.seek(_tail_off)
+                        _df.seek(_tail_off)
+                        if _sf.read(_SAMPLE) != _df.read(_SAMPLE):
+                            _same = False
+            except OSError:
+                _same = False
         if _same:
+            # Handle sidecars FIRST (move or remove). The source video
+            # is deleted LAST so that any sidecar failure mid-loop
+            # leaves the source video in place (orphaned but
+            # recoverable) instead of deleted while half its sidecars
+            # are stranded at the source path.
+            _sc_err = None
+            for _sc in _sidecars_for(video):
+                _sc_dst = target_dir / _sc.name
+                try:
+                    if _sc_dst.exists():
+                        _sc.unlink()
+                    else:
+                        shutil.move(str(_sc), str(_sc_dst))
+                except OSError as _se:
+                    _sc_err = _se
+                    break
+            if _sc_err is not None:
+                stream.emit_dim(
+                    f" [skip] duplicate but sidecar handling failed: "
+                    f"{video.name} ({_sc_err})")
+                return False
             try:
                 video.unlink()
                 stream.emit_dim(
                     f" [dedup] removed duplicate source: {video.name}")
-                # Also move/remove sidecars so they don't linger.
-                for _sc in _sidecars_for(video):
-                    _sc_dst = target_dir / _sc.name
-                    if _sc_dst.exists():
-                        try: _sc.unlink()
-                        except OSError: pass
-                    else:
-                        try: shutil.move(str(_sc), str(_sc_dst))
-                        except OSError: pass
                 return True
             except OSError as _ue:
                 stream.emit_dim(
@@ -194,6 +243,28 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             return False
     sidecars = _sidecars_for(video)
     has_sibling = _has_video_sibling(video)
+    # Refuse cross-volume reorg moves. shutil.move falls back to
+    # copy+delete across volumes, which is NOT atomic — a cancel or
+    # crash between the copy and the delete leaves the file in BOTH
+    # locations with no automatic cleanup. On Z:\ DrivePool this can
+    # happen if the pool reassigns the physical drive mid-pool.
+    # Better to refuse and let the user move manually than risk a
+    # silent duplicate.
+    try:
+        if os.name == "nt":
+            _src_drv, _ = os.path.splitdrive(os.path.abspath(str(video)))
+            _dst_drv, _ = os.path.splitdrive(os.path.abspath(str(dst)))
+            _same_vol = _src_drv.lower() == _dst_drv.lower()
+        else:
+            _same_vol = (os.stat(str(video)).st_dev ==
+                         os.stat(str(target_dir)).st_dev)
+    except OSError:
+        _same_vol = False
+    if not _same_vol:
+        stream.emit_error(
+            f" [skip] {video.name}: source and destination on different "
+            f"volumes — move manually to avoid a non-atomic copy+delete.")
+        return False
     try:
         shutil.move(str(video), str(dst))
         # track sidecar failures so a partial orphan state
@@ -213,6 +284,21 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
                     shutil.copy2(str(sc), str(sc_dst))
                 else:
                     shutil.move(str(sc), str(sc_dst))
+                # Re-apply the Windows hidden attribute if the
+                # original sidecar was hidden. shutil.move across
+                # volumes (copy+delete) does NOT preserve the
+                # hidden attribute on Windows, exposing
+                # `.{ch} Metadata.jsonl`, `.{stem}.jsonl`,
+                # `.Thumbnails/` etc. in Explorer at the new
+                # location. Same-volume rename usually preserves it,
+                # but apply unconditionally for safety — hide is a
+                # no-op when already hidden.
+                if sc.name.startswith(".") or "Thumbnails" in sc.name:
+                    try:
+                        from .utils import hide_file_win
+                        hide_file_win(str(sc_dst))
+                    except Exception as _he:
+                        _log.debug("swallowed: %s", _he)
             except OSError as _sce:
                 _sc_failed.append((sc.name, str(_sce)))
         if _sc_failed:
@@ -496,6 +582,17 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                     _moved_path = target / video.name
                     ts_stamp = d.timestamp()
                     os.utime(_moved_path, (ts_stamp, ts_stamp))
+                    # Re-stamp any sidecars that moved alongside the
+                    # video. Cross-pool moves (DrivePool boundary) can
+                    # reset sidecar mtimes to "now", and any future
+                    # mtime-based logic (drift detection, "what's
+                    # changed since last sync" probes) would then
+                    # treat the sidecars as freshly-modified.
+                    for _sc in _sidecars_for(_moved_path):
+                        try:
+                            os.utime(_sc, (ts_stamp, ts_stamp))
+                        except OSError:
+                            pass
                 except (OSError, ValueError):
                     pass
             # Every 10 instead of 25 — on a ≤24-video reorg the old

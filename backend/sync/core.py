@@ -714,18 +714,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
         def _task():
             try:
-                # bail early on BOTH cancel AND pause so a
-                # backlog of metadata fetches doesn't "catch up" with a
-                # wall of "Metadata downloaded" lines after the user
-                # clicks Pause. Cancel is permanent; pause is
-                # recoverable — re-submit the task to the front of a
-                # pending-on-resume list. For now we drop on pause
-                # rather than persist; the metadata refresh will
-                # re-pick it up via the next sync pass.
                 if cancel_event is not None and cancel_event.is_set():
                     return
-                if pause_event is not None and pause_event.is_set():
-                    return
+                # Pause path: previously this dropped the task on the
+                # floor with "the next sync pass will re-pick it up."
+                # In practice that left "⏳ Metadata queued…" stuck on
+                # the log (no done-line ever fires with the same
+                # marker) and the activity-row metadata counter at 0
+                # for the in-flight video (audit 2026-05-20: SNL row
+                # showed "0 metadata" after a pause/resume mid-fetch).
+                # Instead, poll-wait until resume. The executor is
+                # single-worker so at most one task sleeps at a time;
+                # the rest queue behind it. 0.5s slices keep us
+                # responsive to cancel.
+                while pause_event is not None and pause_event.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    time.sleep(0.5)
                 from .. import metadata as _meta
                 res = _meta.fetch_single_video_metadata(
                     channel, vid_id, final_path, title, stream)

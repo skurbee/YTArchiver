@@ -444,19 +444,18 @@
         // Surface a backend-shaped error row if either leg returned one.
         const errRow = rows.find(r => r && r.error);
         if (errRow) rows = [errRow];
-        // When BOTH legs ran, prepend a tiny [title]/[transcript] tag
-        // to each row's snippet so the user can tell the source at a
-        // glance. Single-leg searches stay unbadged to match the
-        // pre-refactor look.
+        // When BOTH legs ran, the per-row renderer below prepends a
+        // tiny [title]/[transcript] badge to the snippet so the user
+        // can tell the source at a glance. Single-leg searches stay
+        // unbadged to match the pre-refactor look.
+        //
+        // Badge HTML used to be string-concatenated into r.snippet
+        // here, but Patch B's text-node snippet renderer treats every
+        // non-<mark> chunk as literal text — so the raw `<span ...>`
+        // markup leaked into the result rows as escaped angle-bracket
+        // noise. Build the badge as a real DOM element down in the
+        // render loop instead, keying off r._match_kind.
         const bothLegs = wantTranscripts && wantTitles;
-        if (bothLegs) {
-          rows = rows.map(r => {
-            if (!r || r.error) return r;
-            const kind = r._match_kind === "title" ? "title" : "transcript";
-            const badge = `<span class="search-match-pill search-match-${kind}">${kind}</span>`;
-            return { ...r, snippet: badge + " " + (r.snippet || "") };
-          });
-        }
         if (!Array.isArray(rows) || rows.length === 0 || (rows[0] && rows[0].error)) {
           const errMsg = (rows && rows[0] && rows[0].error) ? `Search error: ${rows[0].error}` : "No matches.";
           results.innerHTML = `<div class="browse-empty">${escapeHtml(errMsg)}</div>`;
@@ -486,6 +485,17 @@
           // with textContent so any user content is treated as
           // literal text, never parsed as HTML.
           const _snipEl = row.querySelector(".search-result-snippet");
+          // When both legs ran, prepend the [title]/[transcript]
+          // badge as a real DOM node — the previous string-concat path
+          // got swallowed by the text-node renderer below (2026-05-20).
+          if (bothLegs && r._match_kind) {
+            const _badge = document.createElement("span");
+            _badge.className =
+              `search-match-pill search-match-${r._match_kind}`;
+            _badge.textContent = r._match_kind;
+            _snipEl.appendChild(_badge);
+            _snipEl.appendChild(document.createTextNode(" "));
+          }
           const _rawSnip = r.snippet || r.text || "";
           const _snipParts = _rawSnip.split(/<mark>([\s\S]*?)<\/mark>/);
           for (let _si = 0; _si < _snipParts.length; _si++) {

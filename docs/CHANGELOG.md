@@ -6,6 +6,23 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v74.6 — 2026-05-20
+
+### Fixed
+- **Browse > Search**: when both Transcripts and Video Title legs ran,
+  each result row's `[title]`/`[transcript]` source badge was leaking
+  as escaped angle-bracket HTML instead of rendering as a styled pill.
+  The badge was concatenated as a raw `<span>` into `r.snippet`, but
+  the per-row renderer's XSS hardening treats every non-`<mark>` chunk
+  as literal text. Now built as a real DOM node in the render loop.
+- **Sync pause/resume**: when the user paused mid-pass while an inline
+  metadata fetch was queued, the task would bail out silently and never
+  re-enqueue on resume — the `⏳ Metadata queued…` placeholder stayed
+  in the log forever and the activity-log metadata counter for that
+  video stuck at 0. The task now poll-waits on `pause_event` in 0.5s
+  slices (cancel-checked) so it resumes naturally when the user clicks
+  Resume and the done-line replaces the placeholder.
+
 ## v72.x – v73.x — Continued decomposition + bug audit
 
 Continuation of the v71.x organization series, plus a deep

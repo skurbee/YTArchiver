@@ -80,12 +80,16 @@
           dry_run: !!dryEl?.checked,
         };
         // Confirm a destructive all-channels live run (audit:
-        // repairCaptionsDialog H236).
+        // repairCaptionsDialog H236). Uses the app's styled askDanger
+        // modal — the raw `window.confirm` it previously used rendered
+        // as a browser-chrome "127.0.0.1 says…" popup that looked like
+        // a regression.
         if (!payload.channel && !payload.dry_run) {
-          const _ok = window.confirm(
-            "Repair YT captions — ALL channels with dry-run OFF.\n\n" +
-            "This rewrites every YT-captioned transcript in every " +
-            "channel and can take hours.\n\nProceed?");
+          const _ok = await window.askDanger(
+            "Repair YT captions — ALL channels",
+            "Dry-run is OFF. This rewrites every YT-captioned transcript "
+            + "in every channel and can take hours.\n\nProceed?",
+            "Run on all channels");
           if (!_ok) return;
         }
         try {

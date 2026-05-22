@@ -75,11 +75,15 @@
         // Confirm a destructive all-channels live run — without this
         // a single Run click could spend hours rewriting every
         // segment in every channel (audit: punctRestoreDialog H236).
+        // Uses the app's styled askDanger modal so the confirmation
+        // matches the rest of the UI (the raw `window.confirm` it
+        // previously used rendered as a browser-chrome popup).
         if (!payload.channel && !payload.dry_run) {
-          const _ok = window.confirm(
-            "Punctuation restore — ALL channels with dry-run OFF.\n\n" +
-            "This will rewrite every segment in every transcript and " +
-            "can take hours.\n\nProceed?");
+          const _ok = await window.askDanger(
+            "Punctuation restore — ALL channels",
+            "Dry-run is OFF. This rewrites every segment in every "
+            + "transcript and can take hours.\n\nProceed?",
+            "Run on all channels");
           if (!_ok) return;
         }
         try {

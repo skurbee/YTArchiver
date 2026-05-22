@@ -276,6 +276,19 @@ _CHUNK_MIN_DURATION = 7800 # below this, do a single-pass transcribe
 # lifecycle, so progress/done lines replace each other within a job
 # but stay independent of other jobs. See `_transcribe_one`.
 _JOB_COUNTER = 0
+# Lock around the increment-and-read so two enqueues racing for a
+# new tag don't both read the same pre-increment value (audit:
+# helpers.py L27). `next_job_id()` is the canonical accessor.
+_JOB_COUNTER_LOCK = __import__("threading").Lock()
+
+
+def next_job_id() -> int:
+    """Thread-safe job-id allocator. Replaces the bare `_JOB_COUNTER
+    += 1` + read pattern that could double-issue an id under contention."""
+    global _JOB_COUNTER
+    with _JOB_COUNTER_LOCK:
+        _JOB_COUNTER += 1
+        return _JOB_COUNTER
 
 
 def _ffprobe_duration(filepath: str) -> float | None:

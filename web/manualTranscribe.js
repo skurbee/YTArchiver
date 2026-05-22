@@ -81,6 +81,14 @@
         window._showToast?.("Native mode required.", "warn");
         return;
       }
+      // Reject non-media files BEFORE the API call — Whisper would
+      // otherwise waste minutes failing on a JSON / text file
+      // (audit: manualTranscribe.js H238).
+      if (!/\.(mp4|mkv|webm|mov|m4a|mp3|wav|flac|m4v|avi|wmv)$/i.test(path)) {
+        window._showToast?.(
+          "Pick a media file (.mp4/.mkv/.webm/etc).", "warn");
+        return;
+      }
       const title = path.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.(`"${title}"`));

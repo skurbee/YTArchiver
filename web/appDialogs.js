@@ -53,13 +53,21 @@
   window._showCloseDialog = function () {
     if (document.getElementById("close-confirm-modal")) return;
     // Dismiss any already-open modal before showing the close confirm.
-    // User hit this by clicking X while a Diagnostics dialog was open —
-    // close dialog appeared ON TOP of Diagnostics, two modals stacked.
+    // Fire a synthetic Escape keydown FIRST so each modal's
+    // Esc-handler runs and resolves its promise — display:none
+    // alone left the await chains hanging forever (audit:
+    // appDialogs H229).
     try {
       document.querySelectorAll(".askq-backdrop").forEach((el) => {
         if (el.id && el.id !== "close-confirm-modal"
             && el.style.display !== "none") {
-          el.style.display = "none";
+          try {
+            el.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "Escape", bubbles: true, cancelable: true,
+            }));
+          } catch {}
+          // Belt-and-suspenders: hide if still visible after Esc.
+          if (el.style.display !== "none") el.style.display = "none";
         }
       });
     } catch (_e) { /* non-fatal */ }

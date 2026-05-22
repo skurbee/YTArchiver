@@ -45,8 +45,16 @@
       });
     }
 
-    // Close on outside click
+    // Close on outside click — but ignore clicks inside modals /
+    // context menus / dropdowns that originated FROM the popover.
+    // Those attach to document.body so `popover.contains(target)`
+    // is false even though the user is still interacting with the
+    // popover's modal (audit: queuePopovers.js H191).
     document.addEventListener("click", (e) => {
+      if (e.target.closest && e.target.closest(
+          ".askq-backdrop, .ctx-menu, .context-menu, .dropdown-menu, .ask-confirm")) {
+        return;
+      }
       const open = document.querySelectorAll(".queue-popover.open");
       open.forEach(p => {
         if (!p.contains(e.target)) p.classList.remove("open");

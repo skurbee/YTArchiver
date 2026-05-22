@@ -81,7 +81,13 @@ def refresh_channel_comments(channel: dict[str, Any],
     fp_by_id: dict[str, str] = {}
     for (_v, _t, _y, _m, _fp) in on_disk:
         if _v and _fp:
-            fp_by_id[_v] = _fp
+            # Don't overwrite an existing primary with a later
+            # duplicate. The previous last-write-wins assignment
+            # could swap the primary entry for a smaller copy,
+            # then refresh_comments would write its update to the
+            # duplicate's metadata file instead of the canonical
+            # one (audit: refresh_comments H86).
+            fp_by_id.setdefault(_v, _fp)
 
     # Collect every existing metadata entry. For recent-days scope,
     # filter by upload_date stored on the entry.
@@ -122,21 +128,21 @@ def refresh_channel_comments(channel: dict[str, Any],
         if not fa:
             return False
         try:
-            # ISO format from datetime.now().isoformat() — no tz, local.
-            # On naive datetimes .timestamp() interprets as local time,
-            # which means a DST transition during a multi-hour pass
-            # shifts the comparison by ±3600s — skipping a video that
-            # hadn't actually been refreshed, OR re-refreshing one
-            # that had. Add a 1-hour tolerance to the comparison so
-            # DST drift can't slip past it.
-            ts = datetime.fromisoformat(str(fa)).timestamp()
+            # Treat stored value as UTC. New writes use a "Z"-suffixed
+            # UTC string (see writer below). Old writes were naive
+            # local-time; parse them as UTC anyway so DST drift can't
+            # mis-classify (audit: refresh_comments H75).
+            _s = str(fa)
+            if _s.endswith("Z"):
+                _s = _s[:-1] + "+00:00"
+            _dt = datetime.fromisoformat(_s)
+            if _dt.tzinfo is None:
+                from datetime import timezone as _tz
+                _dt = _dt.replace(tzinfo=_tz.utc)
+            ts = _dt.timestamp()
         except (ValueError, TypeError):
             return False
-        # Subtract 3600 so a comparison near a DST transition still
-        # correctly classifies "fetched during THIS pass" — false
-        # negatives (re-fetching) are acceptable; false positives
-        # (skipping a real refresh) are the actual bug.
-        return ts >= (_pass_start_ts - 3600)
+        return ts >= _pass_start_ts
     _skipped_already_done = 0
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
@@ -230,7 +236,12 @@ def refresh_channel_comments(channel: dict[str, Any],
                     unchanged += 1
             elif not res.get("transient"):
                 errors += 1
-        except Exception:
+        except Exception as _re:
+            # Log the actual exception so signature-mismatch /
+            # type-error bugs aren't hidden behind a generic counter
+            # bump (audit: refresh_comments H89).
+            _log.warning("refresh_comments per-video failed for %s: %s",
+                         vid_id, _re)
             errors += 1
     _clear_active()
 

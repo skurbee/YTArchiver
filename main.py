@@ -166,6 +166,32 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # and the draining worker.
         self._redwnl_pending: list = []
         self._redwnl_lock = threading.Lock()
+        # Pre-init per-mixin pending dicts + their locks so two
+        # concurrent first-callers from JS can't both lazy-init,
+        # silently clobbering each other's Lock object and dropping
+        # mutex semantics on subsequent calls (audit: HIGH H4 — same
+        # pattern in channel_mixin, index_mixin, subs_mixin,
+        # media_ops_mixin). Created up-front so the JS bridge never
+        # races the first hasattr() check.
+        self._pending_res_scans: dict = {}
+        self._pending_res_scans_lock = threading.Lock()
+        self._delete_transcripts_lock = threading.Lock()
+        self._fts_rebuild_lock = threading.Lock()
+        self._pending_previews: dict = {}
+        self._pending_previews_lock = threading.Lock()
+        self._drift_scan_results: dict = {}
+        self._drift_apply_results: dict = {}
+        self._drift_scan_lock = threading.Lock()
+        self._drift_apply_lock = threading.Lock()
+        # Lock for the session-download counter + tray badge update
+        # below — read-modify-write under contention from multiple log
+        # scanner threads (audit: HIGH H14).
+        self._session_dl_count_lock = threading.Lock()
+        # Reentrant close-dialog guard — _on_closing's ask-path used
+        # to spawn an unbounded thread per X click; flag here so
+        # additional clicks while a dialog is pending no-op (audit:
+        # HIGH H24).
+        self._close_dialog_pending = False
         # Construct QueueState BEFORE TranscribeManager (audit:
         # main.py:140-201). The transcribe manager's __init__ can
         # eventually fire callbacks that touch self._queues; building
@@ -228,10 +254,17 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                 # Match only the exact sync-emitted "Downloading <title>" prefix;
                 # don't false-positive on yt-dlp chatter or other flows.
                 if text.lstrip().startswith("Downloading ") and "yt-dlp" not in text:
-                    self._session_dl_count += 1
+                    # Lock the read-modify-write + tray badge update so
+                    # two near-simultaneous Downloading lines from
+                    # parallel yt-dlp passes don't both read the same
+                    # pre-increment value and emit duplicate badge
+                    # counts (audit: main.py H14).
+                    with self._session_dl_count_lock:
+                        self._session_dl_count += 1
+                        _badge_val = self._session_dl_count
                     tray = getattr(self, "_tray", None)
                     if tray is not None:
-                        try: tray.set_badge(self._session_dl_count)
+                        try: tray.set_badge(_badge_val)
                         except Exception as e: _log.debug("tray badge set failed: %s", e)
             except Exception as e:
                 _log.debug("_dl_scan failed: %s", e)
@@ -295,6 +328,13 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         try:
             sync_backend.set_metadata_changed_hook(self._push_metadata_refresh)
         except Exception as e: _log.debug("set_metadata_changed_hook failed: %s", e)
+        # Subs-tab live refresh — fires after each channel finishes in
+        # a sync pass so the "Last Sync" column updates in place as the
+        # pass advances. Without this the column stayed frozen at the
+        # boot-time values until the user clicked away and back.
+        try:
+            sync_backend.set_channel_synced_hook(self._push_subs_table_refresh)
+        except Exception as e: _log.debug("set_channel_synced_hook failed: %s", e)
         # Autorun scheduler — trigger kicks sync_start_all on the scheduled thread.
         # Passing `sync_busy_fn` so the scheduler can (a) postpone a fire
         # when sync is already running and (b) hold the countdown visible
@@ -993,25 +1033,55 @@ def main():
                 return {"ok": False,
                         "error": f"Video not found on disk (id={video_id}, ch={channel})"}
             # Model swap BEFORE enqueue so this job runs under the
-            # requested model. Matches OLD's per-job model attachment —
-            # we use a global model so this is the simplest correct mapping.
+            # requested model. Capture the prior model so we can
+            # restore it after this job completes — without this, an
+            # ArchivePlayer-driven retranscribe with model="medium"
+            # would persistently leave the worker on medium, and the
+            # next user-initiated retranscribe from the UI would run
+            # under the wrong model (audit: main.py H20).
+            _restore_model = None
             if model:
                 try:
+                    _restore_model = api._transcribe.current_model()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                try:
                     api._transcribe.swap_model(model)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            def _restore_after(_res):
+                if not _restore_model:
+                    return
+                try:
+                    api._transcribe.swap_model(_restore_model)
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             # Route through the same path the Watch-view re-transcribe
             # uses so retranscribe=True + video_id are forwarded, and the
             # completion callback push-updates any open Watch view.
             try:
-                res = api.transcribe_retranscribe(filepath, title, video_id)
+                res = api.transcribe_retranscribe(
+                    filepath, title, video_id,
+                    _on_complete_extra=_restore_after if _restore_model else None)
                 if res and res.get("ok"):
                     return {"ok": True, "queued": True,
                             "video_id": video_id,
                             "model": model or None}
+                # Enqueue failed — restore immediately since the job
+                # won't run and the completion hook will never fire.
+                if _restore_model:
+                    try:
+                        api._transcribe.swap_model(_restore_model)
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
                 return {"ok": False,
                         "error": (res or {}).get("error") or "enqueue failed"}
             except Exception as e:
+                if _restore_model:
+                    try:
+                        api._transcribe.swap_model(_restore_model)
+                    except Exception as e2:
+                        _log.debug("swallowed: %s", e2)
                 return {"ok": False, "error": str(e)}
         _cmd.register_handler("get", "/cmd/ping", _handle_ping)
         _cmd.register_handler("get", "/cmd/gpu-status", _handle_gpu_status)
@@ -1152,6 +1222,16 @@ def main():
         # while we wait for the user to pick. Dispatch evaluate_js
         # from a background thread so it can never block the GUI
         # thread that's currently servicing this closing event.
+        # Reentrant-X-click guard: rapid X clicks would otherwise
+        # spawn a new modal-showing thread per click and wedge the
+        # JS-side modal (audit: main.py H24). Flag clears in
+        # confirm_close (window_mixin).
+        if getattr(api, "_close_dialog_pending", False):
+            return False
+        try:
+            api._close_dialog_pending = True
+        except Exception:
+            pass
         def _show_modal():
             try:
                 window.evaluate_js(
@@ -1365,9 +1445,17 @@ def main():
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
-    tray = TrayController(on_show=_tray_show, on_hide=_tray_hide,
-                          on_sync=_tray_sync, on_quit=_tray_quit,
-                          tooltip="YT Archiver \u2014 Idle")
+    # Tray is optional (pystray import or icon load can fail); wrap
+    # construction so a tray failure doesn't kill the whole app launch.
+    # All later tray.* references are guarded by `if tray is not None`
+    # (audit: main.py H11).
+    tray = None
+    try:
+        tray = TrayController(on_show=_tray_show, on_hide=_tray_hide,
+                              on_sync=_tray_sync, on_quit=_tray_quit,
+                              tooltip="YT Archiver \u2014 Idle")
+    except Exception as _trayE:
+        _log.debug("tray construction failed (continuing window-only): %s", _trayE)
     # Always-on-top toggle (restore saved pref, defaults to off)
     _on_top_state = {"on": bool(ws.get("always_on_top", False))}
     def _toggle_on_top():
@@ -1376,31 +1464,38 @@ def main():
             window.on_top = _on_top_state["on"]
         except Exception as e:
             _log.debug("swallowed: %s", e)
-        tray._always_on_top = _on_top_state["on"]
+        if tray is not None:
+            tray._always_on_top = _on_top_state["on"]
         try:
             winstate.save_window_state({"always_on_top": _on_top_state["on"]})
         except Exception as e:
             _log.debug("swallowed: %s", e)
-    tray.set_on_top_toggle(_toggle_on_top, initial=_on_top_state["on"])
+    if tray is not None:
+        tray.set_on_top_toggle(_toggle_on_top, initial=_on_top_state["on"])
     # Auto-Sync submenu — radio interval items ("Off", "30 min", ... "24 hr").
     # Matches YTArchiver.py:3671 pystray.MenuItem("Auto-Sync", ...).
-    try:
-        from backend.autorun import AUTORUN_LABELS as _AR_LABELS
-        def _tray_get_autorun_label():
-            try: return api.autorun_state().get("label", "Off")
-            except Exception: return "Off"
-        def _tray_set_autorun_label(lbl):
-            try: api.autorun_set(lbl)
-            except Exception as e: _log.debug("swallowed: %s", e)
-        tray.set_autorun_menu(_AR_LABELS, _tray_get_autorun_label, _tray_set_autorun_label)
-    except Exception as e:
-        _log.debug("swallowed: %s", e)
+    if tray is not None:
+        try:
+            from backend.autorun import AUTORUN_LABELS as _AR_LABELS
+            def _tray_get_autorun_label():
+                try: return api.autorun_state().get("label", "Off")
+                except Exception: return "Off"
+            def _tray_set_autorun_label(lbl):
+                try: api.autorun_set(lbl)
+                except Exception as e: _log.debug("swallowed: %s", e)
+            tray.set_autorun_menu(_AR_LABELS, _tray_get_autorun_label, _tray_set_autorun_label)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
     # Apply the saved always-on-top state to the window itself
     if _on_top_state["on"]:
         try: window.on_top = True
         except Exception as e: _log.debug("swallowed: %s", e)
-    tray.start()
-    api.attach_tray(tray)
+    if tray is not None:
+        try:
+            tray.start()
+            api.attach_tray(tray)
+        except Exception as e:
+            _log.debug("tray start failed (continuing window-only): %s", e)
 
     # Start the network-down monitor so sync workers can pause on outage.
     # Cheap (single background thread, 30s TCP probe); no-op on full uptime.

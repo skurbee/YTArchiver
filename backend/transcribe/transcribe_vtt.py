@@ -170,15 +170,24 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
                         "this video is members",
                 )):
                     try:
-                        # First matching error line, trimmed.
+                        # First matching error line, trimmed. Guard
+                        # the splitlines()[0] fallback against an
+                        # empty err_text \u2014 IndexError previously got
+                        # swallowed and the user got no diagnostic
+                        # at all (audit: transcribe_vtt H53).
+                        _lines = err_text.splitlines() if err_text else []
                         first_err = next(
-                            (ln.strip() for ln in err_text.splitlines()
+                            (ln.strip() for ln in _lines
                              if ln.strip().lower().startswith(("error", "warning"))),
-                            err_text.strip().splitlines()[0])[:160]
-                        stream.emit([
-                            [" \u26A0 Caption fetch blocked: ", "dim"],
-                            [f"{first_err}\n", "dim"],
-                        ])
+                            (_lines[0].strip() if _lines else "")
+                        )[:160]
+                        if first_err:
+                            stream.emit([
+                                [" \u26A0 Caption fetch blocked: ", "dim"],
+                                [f"{first_err}\n", "dim"],
+                            ])
+                        else:
+                            _log.debug("caption fetch returned no stderr")
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
             return True
@@ -297,11 +306,12 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
                 _log.debug("temp .vtt cleanup failed (will retry next pass): %s", _p)
         return False
     if not segs:
-        # Also clean any other on-disk .vtt candidates (parse-success
-        # but zero-segments case). The original returned False
-        # without sweeping `candidates`, leaving stale .vtt sidecars
-        # accumulating next to videos.
-        for _p in (list(_fetched_temp) + [c for c in candidates if os.path.isfile(c)]):
+        # Clean ONLY the .vtt files we just fetched into the temp
+        # location. Sweeping `candidates` would delete pre-existing
+        # user-supplied .vtt sidecars next to videos that happen to
+        # parse to zero segments (audit: transcribe_vtt H72) —
+        # permanently losing the user's caption work.
+        for _p in list(_fetched_temp):
             for _attempt in range(3):
                 try:
                     os.remove(_p)
@@ -362,10 +372,14 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
             _samples.append(full_text[-_W:])
         _punct_hits = sum(
             1 for s in _samples if _vtt_punct_re.search(s))
-        # Need punctuation in EVERY sample to declare "already
-        # punctuated." Even one bare-words sample means the body is
-        # uneven and we should run punctuation.
-        _already_punct = _punct_hits >= len(_samples)
+        # Majority vote (was: unanimous). Unanimous-vote with only 2
+        # samples flagged punctuated captions as unpunctuated whenever
+        # the second sample's specific 400-char window happened to lack
+        # terminal punctuation, triggering a wasteful + sometimes
+        # double-punctuating re-pass (audit: transcribe_vtt H47).
+        # Floor-half ceiling so 1/1, 1/2, 2/3, 2/4 = punctuated.
+        import math as _math
+        _already_punct = _punct_hits >= _math.ceil(len(_samples) / 2)
     if punct_mgr is not None and full_text and not _already_punct:
         try:
             # `job_tag` (e.g. `whisper_job_7`) makes this line
@@ -449,6 +463,12 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
     _tx_tag = f"tx_done_{vid_id}" if vid_id else ""
     _em_tag = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
     _dim_tag = [t for t in (_tx_tag, "dim", job_tag) if t]
+    # Parens detail uses `tx_detail` (a brighter shade than `dim`) so
+    # "(auto-captions, took 2s, 133.0x realtime)" is actually readable.
+    # `.t-dim` is so close to the log background that the detail blended
+    # into the noise \u2014 this lifts it into the readable range without
+    # competing with the main "\u2713 Transcription" label.
+    _detail_tag = [t for t in (_tx_tag, "tx_detail", job_tag) if t]
     _lbl_tag = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
     # Match the Whisper done line in core.py: indent under the parent
     # " \u2014 \u2713 Title (size)" video row when this transcription is part of
@@ -459,7 +479,7 @@ def _try_auto_captions(video_path: str, title: str, channel: str,
         [_lead, _dim_tag],
         ["\u2014 \u2713 ", _em_tag],
         ["Transcription", _lbl_tag],
-        [f" (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _dim_tag],
+        [f" (auto-captions, took {took:.0f}s, {realtime} realtime)\n", _detail_tag],
     ])
     return True
 

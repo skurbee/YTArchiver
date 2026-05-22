@@ -149,6 +149,18 @@
       (r.title || "").toLowerCase().includes(q) ||
       (r.channel || "").toLowerCase().includes(q)
     );
+    // Clear any per-row selection FIRST so the delete button stays
+    // in sync with the visible filtered set. Otherwise a selection
+    // made before the filter survives into the filtered view but
+    // points at a now-hidden / non-existent row (audit: tables.js
+    // L94).
+    try {
+      document.querySelectorAll("#recent-list tr.row-selected, "
+        + "#recent-grid .row-selected").forEach(
+          el => el.classList.remove("row-selected"));
+      const delBtn = document.getElementById("btn-delete-file");
+      if (delBtn) delBtn.hidden = true;
+    } catch {}
     _dispatchRecent(filtered);
   };
 

@@ -121,9 +121,13 @@
   function _isPinToBottom(segments) {
     if (!Array.isArray(segments)) return false;
     // Sync running → never pin transcribe progress. Keep it inline so
-    // it stays with its channel + video context in the log.
+    // it stays with its channel + video context in the log. Read the
+    // batch-cached result first (set in _logBatch) to avoid an O(M)
+    // sync-queue walk per line (audit: logs.js H198).
     try {
-      if (typeof window._anySyncRunning === "function"
+      if (window.__yt_batch_anySyncRunning === true) return false;
+      if (window.__yt_batch_anySyncRunning === false) { /* fall through */ }
+      else if (typeof window._anySyncRunning === "function"
           && window._anySyncRunning()) {
         return false;
       }
@@ -534,17 +538,20 @@
       for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
       // audit LG-2: re-compute zebra-stripe parity on the kept
       // rows so the alternating background stays coherent after
-      // a trim. Without this, removing an even number of rows from
-      // the top is fine, but removing odd N leaves the visible
-      // log with two adjacent same-background rows at the old
-      // trim boundary.
-      try {
-        const rows = el.querySelectorAll(".log-line");
-        for (let i = 0; i < rows.length; i++) {
-          if (i % 2 === 1) rows[i].classList.add("hist_row_alt");
-          else rows[i].classList.remove("hist_row_alt");
-        }
-      } catch (_e) { /* non-fatal */ }
+      // a trim. Only re-walk when the removed count is ODD (parity
+      // actually shifted); when EVEN, every kept row's existing
+      // .hist_row_alt class is still on the right parity. Avoids a
+      // multi-second main-thread block re-styling 25k rows on every
+      // trim under heavy sync log throughput (audit: logs.js C30).
+      if (toRemove % 2 === 1) {
+        try {
+          const rows = el.querySelectorAll(".log-line");
+          for (let i = 0; i < rows.length; i++) {
+            if (i % 2 === 1) rows[i].classList.add("hist_row_alt");
+            else rows[i].classList.remove("hist_row_alt");
+          }
+        } catch (_e) { /* non-fatal */ }
+      }
     }
     maybeSnapToBottom(el);
   };
@@ -566,14 +573,28 @@
   // isConnected goes false (DOM teardown).
   const _miniDom = { main: null, minis: {} };
   function _miniGet(id) {
-    let el = _miniDom.minis[id];
-    if (el && el.isConnected) return el;
-    el = document.getElementById(id);
-    _miniDom.minis[id] = el;
-    return el;
+    // Cache nulls too so we don't re-query getElementById every
+    // emit for mini-logs that don't exist in this DOM (audit:
+    // logs.js L130). Uses `in` check to distinguish "not yet
+    // looked up" from "looked up and null".
+    if (id in _miniDom.minis) {
+      const el = _miniDom.minis[id];
+      if (el === null) return null;
+      if (el.isConnected) return el;
+    }
+    const el2 = document.getElementById(id);
+    _miniDom.minis[id] = el2;
+    return el2;
   }
 
-  function mirrorMiniLogs() {
+  // Coalesce mirror calls into one per animation frame. Without this,
+  // every line append during heavy sync output (hundreds of emits/sec)
+  // re-clones 5 last main-log children into all 4 mini-logs — 20 deep
+  // clones + attribute strips per emit, a documented WebView2 jank
+  // source (audit: logs.js C31). rAF batching collapses a burst into
+  // one mirror per frame.
+  let _miniScheduled = false;
+  function _doMirrorMiniLogs() {
     let main = _miniDom.main;
     if (!main || !main.isConnected) {
       main = document.getElementById("main-log");
@@ -610,13 +631,30 @@
         for (const _a of clone.attributes) {
           if (_a.name.startsWith("data-")
               || _a.name.startsWith("aria-")
-              || _a.name === "role") {
+              || _a.name === "role"
+              // `id` would duplicate across main + 4 mini logs,
+              // violating HTML spec uniqueness and breaking
+              // getElementById lookups (audit: logs.js L120).
+              || _a.name === "id") {
             _toRemove.push(_a.name);
           }
         }
         for (const _n of _toRemove) clone.removeAttribute(_n);
         m.appendChild(clone);
       }
+    }
+  }
+  function mirrorMiniLogs() {
+    if (_miniScheduled) return;
+    _miniScheduled = true;
+    const _fire = () => {
+      _miniScheduled = false;
+      try { _doMirrorMiniLogs(); } catch (_e) { /* non-fatal */ }
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(_fire);
+    } else {
+      setTimeout(_fire, 16);
     }
   }
   window._mirrorMiniLogs = mirrorMiniLogs;
@@ -736,11 +774,17 @@
         // read position.
         wireUserScrollDetection(el);
         const frag = document.createDocumentFragment();
-        // Track whether THIS batch introduced any new pin-to-bottom
-        // rows. If not, we can skip the expensive querySelectorAll +
-        // re-append pass below entirely (audit: logs.js:799,837-840).
-        // Old code scanned every line in the 8000-row log on every
-        // batch even when no pinned rows were touched.
+        // Cache _anySyncRunning() ONCE at batch start so the per-line
+        // `_isPinToBottom` calls don't all re-walk the sync queue —
+        // O(N×M) per batch where M is queue size (audit: logs.js
+        // H198). Stash on a global the per-line check reads.
+        try {
+          window.__yt_batch_anySyncRunning = (
+            typeof window._anySyncRunning === "function"
+            && window._anySyncRunning());
+        } catch (_e) {
+          window.__yt_batch_anySyncRunning = false;
+        }
         let _batchHasPinned = false;
         for (const segs of payload.main) {
           if (!Array.isArray(segs) || segs.length === 0) continue;
@@ -768,9 +812,15 @@
                 // the committed DOM AND the in-progress fragment —
                 // otherwise a same-batch clear can't see the sibling
                 // inplace line that was just added above it.
+                // Escape EVERY CSS-attribute-value metacharacter so a
+                // marker containing `(`, `)`, `[`, `*`, `:`, etc.
+                // doesn't break the selector. The previous partial
+                // fallback only handled `"`, `\`, `]` (audit:
+                // logs.js H202).
                 const _esc = (typeof CSS !== "undefined" && CSS.escape)
                   ? CSS.escape(data.marker) : String(data.marker)
-                    .replace(/["\\\]]/g, "\\$&");
+                    .replace(/[^\w-]/g, (c) =>
+                      "\\" + c.charCodeAt(0).toString(16) + " ");
                 const sel = `.log-line[data-inplace="${_esc}"]`;
                 frag.querySelectorAll(sel).forEach((n) => n.remove());
                 el.querySelectorAll(sel).forEach((n) => n.remove());

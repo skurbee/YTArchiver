@@ -170,7 +170,12 @@
         fixBtn.disabled = (totalDrift === 0);
       };
 
+      let _scanInFlight = false;
       const _scan = async () => {
+        // In-flight guard so a rapid double-click on Scan can't
+        // start two overlapping drift_scan_channel calls (audit:
+        // driftScanDialog H215).
+        if (_scanInFlight) return;
         const raw = chanSel.value;
         if (!raw) {
           _renderScan({ ok: false, error: "Pick a channel first." });
@@ -182,6 +187,8 @@
         body.innerHTML = `<div class="browse-empty" style="padding:16px;">Scanning…</div>`;
         if (summary) summary.textContent = "";
         fixBtn.disabled = true;
+        if (scanBtn) scanBtn.disabled = true;
+        _scanInFlight = true;
         try {
           const api = window.pywebview?.api;
           if (!api?.drift_scan_channel) {
@@ -189,18 +196,30 @@
             return;
           }
           const res = await api.drift_scan_channel(identity);
+          // Stash the identity we just scanned with so _fix uses
+          // the same one regardless of dropdown drift (audit H216).
+          if (res && typeof res === "object") res._scan_identity = identity;
           _renderScan(res);
         } catch (e) {
           _renderScan({ ok: false, error: String(e) });
+        } finally {
+          _scanInFlight = false;
+          if (scanBtn) scanBtn.disabled = false;
         }
       };
 
       const _fix = async () => {
         if (!_lastScan?.ok) return;
-        const raw = chanSel.value;
-        let identity;
-        try { identity = JSON.parse(raw); }
-        catch { identity = { name: raw }; }
+        // Use the identity FROM _lastScan, not chanSel.value — the
+        // user could have changed the dropdown between Scan and Fix,
+        // and we want to fix what we just scanned (audit:
+        // driftScanDialog H216).
+        const identity = _lastScan._scan_identity
+          || (() => {
+            const raw = chanSel.value;
+            try { return JSON.parse(raw); }
+            catch { return { name: raw }; }
+          })();
         const txtCount = (_lastScan.txt_without_jsonl || []).length;
         const jsonlCount = (_lastScan.jsonl_without_txt || []).length;
         const phantoms = _lastScan.fts_phantoms || 0;

@@ -275,6 +275,22 @@ class SyncMixin:
         # run silently when the worker looped around. Now cancel
         # means cancel everything, matching user expectation.
         self._sync_cancel.set()
+        # Clear paused state symmetrically with the cancel. Without
+        # this, the queue would be empty but `_sync_pause` /
+        # `queues.sync_paused` / `queues.gpu_paused` stayed set, so
+        # the global Pause/Resume button kept showing "Resume" forever
+        # with nothing to resume (audit: sync_mixin H16). Matches the
+        # cleanup the redownload-chain path does at chan_redownload.
+        try:
+            self._sync_pause.clear()
+        except Exception as e: _log.debug("swallowed: %s", e)
+        try:
+            self._queues.set_sync_paused(False)
+            self._queues.set_gpu_paused(False)
+        except Exception as e: _log.debug("swallowed: %s", e)
+        try:
+            self._transcribe.resume()
+        except Exception as e: _log.debug("swallowed: %s", e)
         try:
             # Hold _redwnl_lock for the drain so a concurrent chan_
             # redownload worker can't pop(0) from an empty list mid-
@@ -428,6 +444,33 @@ class SyncMixin:
         return {"ok": True, "removed": removed}
 
 
+    def sync_enqueue_all_channels(self):
+        """Append every subscribed channel to the sync queue without
+        starting the worker. Right-click on Sync Subbed: "add to end of
+        queue". Dedupe is handled by `sync_enqueue` (kind+url key), so
+        channels already queued or currently running are skipped.
+        Returns {ok, queued, skipped, total_queued}.
+        """
+        try:
+            cfg = self._config or load_config()
+            channels = cfg.get("channels", []) or []
+            queued = 0
+            skipped = 0
+            for ch in channels:
+                if self._queues.sync_enqueue(ch):
+                    queued += 1
+                else:
+                    skipped += 1
+            try: self._on_queue_changed()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            try: total_queued = len(self._queues.sync)
+            except Exception: total_queued = queued
+            return {"ok": True, "queued": queued,
+                    "skipped": skipped, "total_queued": total_queued}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
     def sync_prefetch_channel(self, identity):
         """Probe a channel for total video + live counts before sync starts.
         Best-effort — returns {ok, total, lives, upcoming}.
@@ -554,10 +597,16 @@ class SyncMixin:
             if cur:
                 deferred = dict(cur)
                 deferred.pop("_pass_start_ts", None)
-                # Use the queue's normal enqueue (de-dupes on (kind,url),
-                # appends at end). If the task is somehow already queued
-                # again, the existing entry wins and we just skip \u2014 same
-                # net effect.
+                # Drop any pre-existing queued entry with the same URL
+                # FIRST so the dedupe inside sync_enqueue can't skip
+                # our append. Without this, defer could become a no-op
+                # (existing queue entry stays at its old position) and
+                # "send to END of queue" became "may or may not append"
+                # (audit: sync_mixin H18).
+                try:
+                    self._queues.sync_remove(deferred.get("url") or "")
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 self._queues.sync_enqueue(deferred)
                 self._log_stream.emit([
                     ["[Sync] ", "sync_bracket"],

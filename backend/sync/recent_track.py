@@ -146,6 +146,13 @@ def _record_recent_download(filepath: str, channel: str, title: str,
             except OSError:
                 pass
 
+        # Combine recent_downloads update + auto-index counter bump
+        # into ONE load/modify/save cycle so the lock holds across a
+        # single I/O round-trip instead of two. The previous two
+        # back-to-back lock+load+save cycles roughly doubled the
+        # latency and stalled concurrent download finishers serially
+        # (audit: recent_track H41).
+        _fire_sweep = False
         with _recent_write_lock:
             cfg = load_config()
             entries = list(cfg.get("recent_downloads", []) or [])
@@ -170,6 +177,18 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                 "download_ts": time.time(),     # unix float
             })
             cfg["recent_downloads"] = entries[:500]
+            # Auto-index counter bump (was a separate second lock+
+            # load+save; merged here per H41).
+            if cfg.get("auto_index_enabled", False):
+                threshold = int(cfg.get("auto_index_threshold", 10) or 10)
+                _legacy = int(cfg.pop("_auto_index_counter", 0) or 0)
+                counter = int(cfg.get("downloads_since_last_index", 0) or 0) \
+                          + _legacy + 1
+                if counter >= threshold:
+                    _fire_sweep = True
+                    cfg["downloads_since_last_index"] = 0
+                else:
+                    cfg["downloads_since_last_index"] = counter
             save_config(cfg)
 
         # Live refresh push to the Recent tab so a download shows up
@@ -178,28 +197,6 @@ def _record_recent_download(filepath: str, channel: str, title: str,
         if _on_recent_changed_hook is not None:
             try: _on_recent_changed_hook()
             except Exception as e: _log.debug("swallowed: %s", e)
-
-        # Auto-index trigger: after every Nth download, kick off a
-        # background FTS ingest of any new .jsonl files on disk. Re-
-        # load + re-write the counter under the same lock as the
-        # recent-downloads write above so two concurrent finishers
-        # can't both read 9, both bump to 10, and both fire the sweep
-        # (or both write 10 + lose one increment).
-        with _recent_write_lock:
-            cfg2 = load_config()
-            if cfg2.get("auto_index_enabled", False):
-                threshold = int(cfg2.get("auto_index_threshold", 10) or 10)
-                _legacy = int(cfg2.pop("_auto_index_counter", 0) or 0)
-                counter = int(cfg2.get("downloads_since_last_index", 0) or 0) \
-                          + _legacy + 1
-                _fire_sweep = counter >= threshold
-                if _fire_sweep:
-                    cfg2["downloads_since_last_index"] = 0
-                else:
-                    cfg2["downloads_since_last_index"] = counter
-                save_config(cfg2)
-            else:
-                _fire_sweep = False
         if _fire_sweep:
             # Spawn the sweep OUTSIDE the lock so it can't deadlock
             # another writer waiting for the same lock.

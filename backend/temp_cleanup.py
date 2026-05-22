@@ -61,6 +61,24 @@ def _dir_is_active(full: str) -> bool:
         age = time.time() - os.path.getmtime(full)
         if age < _MIN_TEMP_AGE_SEC:
             return True
+        # Also walk the contents for a recent file write — Windows
+        # doesn't always bump the directory mtime when files inside
+        # are appended-to (yt-dlp progressive writes), so a long
+        # active download to an old-looking dir could otherwise be
+        # rmtree'd out from under itself (audit: temp_cleanup H110).
+        try:
+            _RECENT_WRITE_SEC = 60
+            _now = time.time()
+            for _root, _dns, _fns in os.walk(full):
+                for _fn in _fns:
+                    try:
+                        if (_now - os.path.getmtime(
+                                os.path.join(_root, _fn))) < _RECENT_WRITE_SEC:
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            return True
     except OSError:
         # If we can't stat it, err on the side of NOT deleting.
         return True

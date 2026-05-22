@@ -61,6 +61,12 @@
     openBtn?.addEventListener("click", show);
     closeBtn?.addEventListener("click", hide);
     bd.addEventListener("click", (e) => { if (e.target === bd) hide(); });
+    // Esc-to-close — matches every other modal in the app (audit:
+    // aboutDialog H226). Only close when this modal is visible so
+    // we don't intercept Esc for other open dialogs.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && bd.style.display !== "none") hide();
+    });
   }
 
   window.initAboutDialog = initAboutDialog;

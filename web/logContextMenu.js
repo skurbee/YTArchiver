@@ -34,7 +34,15 @@
       el.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         const sel = window.getSelection()?.toString() || "";
-        const lineEl = e.target.closest(".log-line");
+        // Fall back to elementFromPoint when closest fails — clicks
+        // on empty cell space or pseudo-element content can miss the
+        // .log-line ancestor via `e.target.closest` alone (audit:
+        // logContextMenu.js H200).
+        let lineEl = e.target.closest(".log-line");
+        if (!lineEl) {
+          const _at = document.elementFromPoint(e.clientX, e.clientY);
+          lineEl = _at && _at.closest ? _at.closest(".log-line") : null;
+        }
         const items = [];
         if (sel) {
           items.push({ label: "Copy selection",

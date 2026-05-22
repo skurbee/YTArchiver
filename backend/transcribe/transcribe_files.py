@@ -129,8 +129,17 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
                 os.fsync(f.fileno())
             except OSError as e:
                 _log.debug("swallowed: %s", e)
+        # Hide tmp BEFORE replace so the file is never briefly visible
+        # in Explorer between the replace and the re-hide (audit:
+        # transcribe_files H58).
+        try: _hide_file_win(tmp)
+        except Exception: pass
         os.replace(tmp, jsonl_path)
-        _hide_file_win(jsonl_path)
+        # Defensive re-hide after replace in case the hidden attribute
+        # was lost during the rename (rare on same-volume, but happens
+        # cross-volume on Windows).
+        try: _hide_file_win(jsonl_path)
+        except Exception: pass
     except Exception as _jse:
         # surface to module-level log so .txt/.jsonl desync
         # is diagnosable. Was a print() — routes via
@@ -166,8 +175,12 @@ def _write_transcript_entry(txt_path: str, title: str,
         src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
         entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{text}\n\n\n"
         # Read existing content (file may not exist yet on first transcribe).
+        # `errors="replace"` so a partially corrupt UTF-8 byte sequence
+        # doesn't UnicodeDecodeError and leave the file broken for
+        # subsequent appends — matches _replace_txt_entry's read mode
+        # (audit: transcribe_files H43).
         try:
-            with open(txt_path, "r", encoding="utf-8") as f:
+            with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
                 existing = f.read()
         except FileNotFoundError:
             existing = ""
@@ -195,8 +208,13 @@ def _write_transcript_entry(txt_path: str, title: str,
 # line in the aggregated Transcript.txt. Captures title (group 1), date
 # (group 2), duration (group 3), source tag (group 4). Matches OLD
 # YTArchiver.py:28997 `_HEADER_RE`.
+# Title uses `.+?` (non-greedy) so YT titles containing `)` (e.g.
+# "How I made $1M (in one year)") are not truncated at the first paren.
+# The trailing `,\s*\(` anchor guarantees correct termination at the
+# date field. Date/dur/src groups stay restrictive because they're
+# emitted by our own writers and won't contain `)`.
 _HEADER_RE = re.compile(
-    r'^===\(([^)]*)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
+    r'^===\((.+?)\),\s*(\([^)]*\)),\s*(\([^)]*\)),\s*(\([^)]*\))===',
     re.MULTILINE)
 
 
@@ -326,6 +344,10 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
                     os.fsync(f.fileno())
                 except OSError as e:
                     _log.debug("swallowed: %s", e)
+            # Hide tmp BEFORE the replace so the jsonl is never
+            # briefly visible in Explorer (audit: transcribe_files H58).
+            try: _hide_file_win(tmp)
+            except Exception: pass
             os.replace(tmp, jsonl_path)
         except OSError as _oe:
             # previously returned early WITHOUT re-appending the

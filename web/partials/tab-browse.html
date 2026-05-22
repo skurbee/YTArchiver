@@ -97,21 +97,33 @@
               </div>
               <h2 class="watch-title" id="watch-title">Video Title</h2>
               <div class="watch-meta" id="watch-meta">Channel · upload date · duration</div>
-              <div class="watch-actions">
+              <!-- Compact two-row layout. Row 1 = primary actions; Row 2 =
+                   playback/overlay/follow controls. Splitting the row
+                   keeps everything reachable at narrow window widths
+                   instead of falling off / wrapping unpredictably.
+                   Less-used actions (Redownload, Re-transcribe, Refresh
+                   metadata) live behind the ⋮ More button to keep the
+                   visible toolbar uncluttered — same context-menu
+                   pattern used on grid cards, so users see consistent
+                   places for those actions. -->
+              <div class="watch-actions watch-actions-row1">
                 <button class="btn btn-ghost btn-thin" id="btn-open-external"
                         title="Open in system default player (VLC etc.)">Open in player</button>
                 <button class="btn btn-ghost btn-thin" id="btn-bookmark-now"
                         title="Bookmark current segment (B)">Bookmark</button>
-                <!-- Redownload + Re-transcribe, matches the grid-card right-
-                     click actions. Same flows, just buttons on the Watch view
-                     so you don't have to go back to the grid. -->
-                <button class="btn btn-ghost btn-thin" id="btn-watch-redownload"
-                        title="Re-download this video at a different resolution">Redownload&hellip;</button>
-                <button class="btn btn-ghost btn-thin" id="btn-watch-retranscribe"
-                        title="Force re-transcribe this video (deletes current transcript)">Re-transcribe&hellip;</button>
-                <button class="btn btn-ghost btn-thin" id="btn-watch-refresh-meta"
-                        title="Re-fetch views, likes, description, and top comments for this video">Refresh metadata</button>
-                <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Speed:</label>
+                <button class="btn btn-ghost btn-thin watch-more-btn" id="btn-watch-more"
+                        title="More actions (Redownload, Re-transcribe, Refresh metadata)">More&hellip;</button>
+                <!-- Hidden originals kept in the DOM so the existing
+                     click handlers in watchActions.js can keep firing
+                     through the More menu without rewiring everything.
+                     The More menu's `action` callbacks just .click()
+                     these. -->
+                <button class="hidden-action" id="btn-watch-redownload" aria-hidden="true" tabindex="-1"></button>
+                <button class="hidden-action" id="btn-watch-retranscribe" aria-hidden="true" tabindex="-1"></button>
+                <button class="hidden-action" id="btn-watch-refresh-meta" aria-hidden="true" tabindex="-1"></button>
+              </div>
+              <div class="watch-actions watch-actions-row2">
+                <label class="ctl-label ctl-label-thin">Speed:</label>
                 <select class="ctl-select" id="watch-speed"
                         title="Playback speed">
                   <option value="0.5">0.5×</option>
@@ -122,7 +134,7 @@
                   <option value="2">2×</option>
                 </select>
                 <label class="ctl-label ctl-label-thin" style="margin-left:10px;"
-                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay transcript:</label>
+                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
                 <select class="ctl-select" id="watch-cap-size"
                         title="Overlay text size — Off hides the overlay">
                   <option value="off" selected>Off</option>
@@ -135,6 +147,11 @@
                   <option value="translucent" selected>Translucent</option>
                   <option value="outline">Outline</option>
                   <option value="none">None</option>
+                </select>
+                <select class="ctl-select" id="watch-cap-mode"
+                        title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                  <option value="single" selected>1 word</option>
+                  <option value="phrase3">3 words</option>
                 </select>
                 <div class="spacer"></div>
                 <label class="checkbox-label" title="Keep transcript scrolled to current line">

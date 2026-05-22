@@ -51,6 +51,12 @@
       } else {
         if (syncCB.disabled) syncCB.disabled = false;
         if (wrap && wrap.title) wrap.title = "";
+        // uxPolish migrates `title` → `data-tooltip` on hover. Clear
+        // both so the tooltip text doesn't outlive the autorun-off
+        // state (audit: autoSync.js H134).
+        if (wrap && wrap.hasAttribute("data-tooltip")) {
+          wrap.removeAttribute("data-tooltip");
+        }
       }
     };
     // IPC-bound polling replaced with a cached
@@ -76,6 +82,10 @@
         reconcileSyncAutoLock(st.label !== "Off");
       } catch (e) { /* ignore */ }
     };
+    // Gate the sec===0 anchor re-fetch with an in-flight flag so the
+    // 1Hz paint() can't spam fetchAnchor every tick while the
+    // backend's response is still pending (audit: autoSync.js H133).
+    let _fetchInFlight = false;
     const paint = () => {
       if (!cd || !_anchor) { if (cd) cd.textContent = ""; return; }
       const st = _anchor;
@@ -85,28 +95,45 @@
         const elapsed = Math.floor((Date.now() - st.anchored_at_ms) / 1000);
         const sec = Math.max(0, st.seconds_remaining - elapsed);
         cd.textContent = `next in ${_fmtRemain(sec)}`;
-        if (sec === 0) fetchAnchor();
+        if (sec === 0 && !_fetchInFlight) {
+          _fetchInFlight = true;
+          fetchAnchor().finally(() => { _fetchInFlight = false; });
+        }
       } else {
         cd.textContent = "";
       }
     };
+    // Serialize select-change handler so rapid dropdown changes don't
+    // overlap autorun_set calls and resolve out-of-order with the
+    // last-to-resolve winning instead of last-to-fire (audit:
+    // autoSync.js H142).
+    let _selChangeInFlight = false;
     sel.addEventListener("change", async () => {
+      if (_selChangeInFlight) return;
       const api = window.pywebview?.api;
       if (!api?.autorun_set) return;
+      _selChangeInFlight = true;
       try {
         await api.autorun_set(sel.value);
         window._showToast?.(sel.value === "Off" ? "Auto-sync off." : `Auto-sync every ${sel.value}.`, "ok");
         await fetchAnchor();
         paint();
       } catch (e) { window._showToast?.("Error: " + e, "error"); }
+      finally { _selChangeInFlight = false; }
     });
     fetchAnchor().then(paint);
-    setInterval(paint, 1000);
-    setInterval(() => {
+    // Capture interval ids + clean up on beforeunload so they don't
+    // leak across pywebview reloads (audit: autoSync.js H140).
+    const _paintIv = setInterval(paint, 1000);
+    const _anchorIv = setInterval(() => {
       if (document.visibilityState === "visible") {
         fetchAnchor().then(paint);
       }
     }, 60_000);
+    window.addEventListener("beforeunload", () => {
+      try { clearInterval(_paintIv); } catch {}
+      try { clearInterval(_anchorIv); } catch {}
+    });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") fetchAnchor().then(paint);
     });

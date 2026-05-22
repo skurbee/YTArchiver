@@ -58,7 +58,15 @@
     // subs table body since re-renders are frequent.
     const _obsTarget = document.getElementById("subs-table-body");
     if (_obsTarget) {
-      const obs = new MutationObserver(updateBadge);
+      // Debounce updateBadge so a full re-render's burst of mutations
+      // doesn't trigger a hundred badge-walk passes in rapid sequence
+      // (audit: queuePending.js H196).
+      let _badgeTimer = null;
+      const _debouncedUpdate = () => {
+        if (_badgeTimer) clearTimeout(_badgeTimer);
+        _badgeTimer = setTimeout(updateBadge, 50);
+      };
+      const obs = new MutationObserver(_debouncedUpdate);
       if (typeof trackObserver === "function") trackObserver(obs);
       obs.observe(_obsTarget, { childList: true });
       updateBadge();

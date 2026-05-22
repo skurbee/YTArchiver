@@ -124,16 +124,24 @@
             window._showToast?.("Jump failed: " + err, "error");
           }
         };
-        row.querySelector(".bookmark-head").addEventListener("click", (e) => {
-          // Only fire if the user clicked the title/meta, not the × button.
-          if (e.target.closest("[data-remove]")) return;
-          _jumpToBookmark();
-        });
-        row.querySelector(".bookmark-text").addEventListener("click", _jumpToBookmark);
-        row.querySelector(".bookmark-head").style.cursor = "pointer";
-        row.querySelector(".bookmark-text").style.cursor = "pointer";
-        row.querySelector(".bookmark-head").title = "Click to jump to this moment";
-        row.querySelector(".bookmark-text").title = "Click to jump to this moment";
+        // Whole-video bookmark rows don't render .bookmark-text — only
+        // the .bookmark-head — so guard every text-element access
+        // (audit: bookmarks.js H186) to avoid `null.addEventListener`.
+        const _headEl = row.querySelector(".bookmark-head");
+        const _textEl = row.querySelector(".bookmark-text");
+        if (_headEl) {
+          _headEl.addEventListener("click", (e) => {
+            if (e.target.closest("[data-remove]")) return;
+            _jumpToBookmark();
+          });
+          _headEl.style.cursor = "pointer";
+          _headEl.title = "Click to jump to this moment";
+        }
+        if (_textEl) {
+          _textEl.addEventListener("click", _jumpToBookmark);
+          _textEl.style.cursor = "pointer";
+          _textEl.title = "Click to jump to this moment";
+        }
         frag.appendChild(row);
       }
       list.innerHTML = "";

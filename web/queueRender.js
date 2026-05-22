@@ -211,7 +211,23 @@
       row.addEventListener("contextmenu", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        const idx = Number(row.dataset.idx);
+        // Resolve index FRESH from the live _queueState by matching
+        // the row's identity. row.dataset.idx is stale after a drag
+        // reorder (set at render time, not updated until next paint)
+        // so trusting it could cancel the wrong task (audit:
+        // queueRender H205).
+        let idx = Number(row.dataset.idx);
+        try {
+          const arr = _queueState[queueKind] || [];
+          const _myUrl = t.url || "";
+          const _myPath = t.path || "";
+          const _myName = t.name || t.title || "";
+          const _matched = arr.findIndex(x => x && (
+            (x.url && _myUrl && x.url === _myUrl)
+            || (x.path && _myPath && x.path === _myPath)
+            || (x.name && _myName && x.name === _myName)));
+          if (_matched >= 0) idx = _matched;
+        } catch {}
         const api = window.pywebview?.api;
         const items = [];
         const taskLabel = (t.name || t.title || t.url || "this task").toString().slice(0, 60);

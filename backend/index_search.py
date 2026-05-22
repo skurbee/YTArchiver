@@ -118,6 +118,11 @@ def search_video_titles(query: str,
         "filepath": r[3] or "",
         "year": r[4],
         "ts": r[5],
+        # added_ts/upload_ts under the same key the transcript leg
+        # uses so the JS merge-sort can apply newest/oldest ordering
+        # without a missing-field fall-back to 0 (audit: H148).
+        "added_ts": r[5] or 0,
+        "upload_ts": r[5] or 0,
     } for r in rows]
 
 
@@ -216,6 +221,13 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     try:
         rows = _run(query)
     except sqlite3.Error:
+        # Roll back any aborted txn state on the shared reader
+        # connection before retrying — otherwise the second _run
+        # can inherit a "transaction aborted" state and fail with
+        # an opaque error instead of returning rows (audit:
+        # index_search H122).
+        try: conn.rollback()
+        except sqlite3.Error: pass
         # Retry once with the sanitized query — gives user-typed input a chance
         # to match even with stray punctuation or unbalanced quotes.
         cleaned = _sanitize_fts_query(query)

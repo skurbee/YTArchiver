@@ -537,8 +537,11 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
             mt = os.path.getmtime(jsonl_path)
             ts_struct = time.localtime(mt)
             date_str = time.strftime("%m.%d.%Y", ts_struct)
-            time_str = time.strftime("%-I:%M", ts_struct) if os.name != "nt" \
-                       else time.strftime("%#I:%M", ts_struct)
+            # `%-I` is GNU/Linux glibc only; macOS BSD libc accepts
+            # it but Linux musl + Windows do not. Use the cross-
+            # platform `lstrip("0")` workaround so Linux glibc-free
+            # builds don't ValueError (audit: drift_scan H115).
+            time_str = time.strftime("%I:%M", ts_struct).lstrip("0") or "12:00"
         except Exception:
             date_str = "00.00.0000"
             time_str = "0:00"

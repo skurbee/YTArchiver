@@ -102,6 +102,10 @@
               // elements they own, so this listener just makes sure
               // nothing else hijacks ESC to close the modal.
               const escBlock = (e) => {
+                // Skip auto-repeat events (holding Esc) — running
+                // the comparison + preventDefault 30+ times/sec is
+                // wasteful (audit: seedLogs L132).
+                if (e.repeat) return;
                 if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); }
               };
               document.addEventListener("keydown", escBlock, true);

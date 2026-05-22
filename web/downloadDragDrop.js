@@ -49,7 +49,15 @@
                   e.dataTransfer.getData("text/plain");
       if (!url) return;
       const trimmed = url.trim();
-      if (!/youtube|youtu\.be/i.test(trimmed)) {
+      // Reject file:// drags entirely (audit: downloadDragDrop.js
+      // H239). Also tighten the regex to anchor on a real youtube /
+      // youtu.be domain instead of the bare substring "youtube" —
+      // "notyoutube.com" used to pass.
+      if (/^file:/i.test(trimmed)) {
+        window._showToast?.("Drop a YouTube URL, not a file.", "warn");
+        return;
+      }
+      if (!/(^|[./@])(youtube\.com|youtu\.be|music\.youtube\.com)(\/|$)/i.test(trimmed)) {
         window._showToast?.("Drop a YouTube URL to archive.", "warn");
         return;
       }
@@ -59,9 +67,11 @@
         // pass the same readVideoOptions() dict the URL-
         // submit flow does, so dropped URLs honor the user's
         // resolution / save-to / custom-name fields instead of
-        // silently using backend defaults.
-        const opts = (typeof readVideoOptions === "function")
-            ? readVideoOptions() : {};
+        // silently using backend defaults. Consume the cross-IIFE
+        // helper from downloadUrl.js — the bareword `readVideoOptions`
+        // is scoped to that file's IIFE and not visible here.
+        const opts = (typeof window._readVideoOptions === "function")
+            ? window._readVideoOptions() : {};
         await window.pywebview.api.archive_single_video(trimmed, opts);
         window._showToast?.("Queued: " + trimmed.slice(0, 60), "ok");
       }

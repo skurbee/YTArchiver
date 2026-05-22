@@ -432,13 +432,18 @@
             String(a || "").localeCompare(String(b || ""),
                                           undefined, { sensitivity: "base" });
           const _cmpNum = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+          // Deterministic tie-break on video_id so equal-key rows
+          // (same upload_ts, same channel, etc.) don't shuffle order
+          // on every re-sort (audit: browseSearch.js H147).
           rows.sort((a, b) => {
             if (!a || !b) return 0;
-            if (sortKey === "newest")  return _cmpNum(b.added_ts, a.added_ts);
-            if (sortKey === "oldest")  return _cmpNum(a.added_ts, b.added_ts);
-            if (sortKey === "channel") return _cmpStr(a.channel, b.channel);
-            if (sortKey === "title")   return _cmpStr(a.title, b.title);
-            return 0;
+            let _r = 0;
+            if (sortKey === "newest")       _r = _cmpNum(b.added_ts, a.added_ts);
+            else if (sortKey === "oldest")  _r = _cmpNum(a.added_ts, b.added_ts);
+            else if (sortKey === "channel") _r = _cmpStr(a.channel, b.channel);
+            else if (sortKey === "title")   _r = _cmpStr(a.title, b.title);
+            if (_r !== 0) return _r;
+            return _cmpStr(a.video_id, b.video_id);
           });
         }
         // Surface a backend-shaped error row if either leg returned one.
@@ -592,6 +597,11 @@
     // stale responses if the user does press Enter multiple times.
     input?.addEventListener("keydown", (e) => {
       if (e.key !== "Enter" || e.repeat) return;
+      // IME composition Enter doesn't set e.repeat but DOES set
+      // e.isComposing — skip those so picking a Japanese/Korean
+      // candidate doesn't fire a search prematurely (audit:
+      // browseSearch.js H187).
+      if (e.isComposing) return;
       doSearch();
     });
     // Re-run on sort change so the user doesn't have to re-click Search

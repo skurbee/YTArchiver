@@ -72,6 +72,16 @@
           channel: chanSel.value || "",
           dry_run: !!dryEl?.checked,
         };
+        // Confirm a destructive all-channels live run — without this
+        // a single Run click could spend hours rewriting every
+        // segment in every channel (audit: punctRestoreDialog H236).
+        if (!payload.channel && !payload.dry_run) {
+          const _ok = window.confirm(
+            "Punctuation restore — ALL channels with dry-run OFF.\n\n" +
+            "This will rewrite every segment in every transcript and " +
+            "can take hours.\n\nProceed?");
+          if (!_ok) return;
+        }
         try {
           const res = await api.punct_restore_segments(payload);
           if (res?.ok && res.queued) {

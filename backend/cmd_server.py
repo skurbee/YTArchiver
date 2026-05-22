@@ -78,10 +78,29 @@ def _load_or_create_token() -> str:
                 return _AUTH_TOKEN
     except OSError as e:
         _log.debug("swallowed: %s", e)
-    # Generate fresh
+    # Generate fresh + atomic write so two concurrent launches don't
+    # leave one process running with an in-memory token that doesn't
+    # match the on-disk file the other process wrote (audit:
+    # cmd_server L59).
     _AUTH_TOKEN = secrets.token_urlsafe(32)
     try:
-        tok_path.write_text(_AUTH_TOKEN, encoding="utf-8")
+        _tmp_tok = str(tok_path) + ".tmp"
+        with open(_tmp_tok, "w", encoding="utf-8") as _f:
+            _f.write(_AUTH_TOKEN)
+            try:
+                _f.flush()
+                os.fsync(_f.fileno())
+            except OSError:
+                pass
+        os.replace(_tmp_tok, str(tok_path))
+        # If a concurrent launch raced us, prefer their token over
+        # ours so both processes converge to the same value.
+        try:
+            _disk = tok_path.read_text(encoding="utf-8").strip()
+            if _disk and _disk != _AUTH_TOKEN and len(_disk) >= 16:
+                _AUTH_TOKEN = _disk
+        except OSError:
+            pass
     except OSError as e:
         _log.debug("swallowed: %s", e)
     return _AUTH_TOKEN

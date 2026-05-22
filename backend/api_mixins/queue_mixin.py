@@ -117,22 +117,12 @@ class QueueMixin:
         ident = str(identifier or "").strip()
         ok = self._queues.sync_remove(ident)
         if not ok and ident:
-            # Name / folder fallback — first match only (was: list
-            # comprehension that dropped EVERY matching row, which
-            # surprised users who clicked X on one duplicate row and
-            # watched two disappear).
-            with self._queues._lock:
-                target_idx = -1
-                for i, c in enumerate(self._queues.sync):
-                    if (c.get("name") or c.get("folder") or "") == ident:
-                        target_idx = i
-                        break
-                if target_idx >= 0:
-                    del self._queues.sync[target_idx]
-                    ok = True
-            if ok:
-                self._queues._notify()
-                self._queues.save_debounced()
+            # Name / folder fallback — first match only. Routed
+            # through QueueState's public sync_remove_by_name() so the
+            # _lock/_notify/save_debounced invariants are honored
+            # inside the class instead of bypassing encapsulation
+            # (audit: queue_mixin H5).
+            ok = self._queues.sync_remove_by_name(ident)
         self._on_queue_changed()
         return {"ok": ok}
 
@@ -226,13 +216,28 @@ class QueueMixin:
 
 
     def queues_sync_reorder(self, identifier, new_index):
-        ok = self._queues.sync_reorder(str(identifier or ""), int(new_index or 0))
+        # Reject None/missing new_index explicitly — `int(None or 0)`
+        # silently defaulted to index 0, sending unrelated drops to
+        # the top of the queue (audit: queue_mixin L11).
+        if new_index is None:
+            return {"ok": False, "error": "new_index required"}
+        try:
+            _idx = int(new_index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"Invalid new_index: {new_index!r}"}
+        ok = self._queues.sync_reorder(str(identifier or ""), _idx)
         self._on_queue_changed()
         return {"ok": ok}
 
 
     def queues_gpu_reorder(self, identifier, new_index):
-        ok = self._queues.gpu_reorder(str(identifier or ""), int(new_index or 0))
+        if new_index is None:
+            return {"ok": False, "error": "new_index required"}
+        try:
+            _idx = int(new_index)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"Invalid new_index: {new_index!r}"}
+        ok = self._queues.gpu_reorder(str(identifier or ""), _idx)
         self._on_queue_changed()
         return {"ok": ok}
 

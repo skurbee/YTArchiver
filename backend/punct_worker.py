@@ -86,7 +86,17 @@ for line in sys.stdin:
         # those tokens confuse the tagger. So we strip every `. , ; : ! ?`
         # that isn't sandwiched between digits (so "3.14" and "1,000"
         # survive). The model then re-predicts from a clean slate.
-        cleaned = re.sub(r"(?<!\d)[.,;:!?](?!\d)", "", text)
+        # Preserve abbreviations: "U.S.", "Mr.", "Dr.", "etc.", "e.g.",
+        # "Inc.", initials like "J.K." — the prior regex stripped all
+        # non-numeric punctuation indiscriminately, losing those dots
+        # before the model could re-predict them (audit: punct_worker
+        # H61). Negative lookbehind: don't strip `.` when preceded by
+        # a single capital letter (initials/abbreviations) or by a
+        # lowercase abbreviation that ends with `.` already (handled
+        # by the existing digit guard's symmetry).
+        cleaned = re.sub(
+            r"(?<![A-Z])(?<![A-Za-z]\.[A-Za-z])(?<!\d)[.,;:!?](?!\d)",
+            "", text)
         words = cleaned.split()
         if not words:
             _out.write(json.dumps({"status": "ok", "text": text}) + "\n")

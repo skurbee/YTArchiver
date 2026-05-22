@@ -61,6 +61,8 @@ __all__ = [
     "sync_channel",
     "set_recent_changed_hook",
     "set_metadata_changed_hook",
+    "set_channel_synced_hook",
+    "fire_channel_synced_hook",
     "set_sync_active",
     "clear_sync_active",
     "is_sync_active",
@@ -174,8 +176,12 @@ _VIDID_RE = re.compile(r"\[(?:youtube|info|download)\]\s+([A-Za-z0-9_-]{11}):")
 # "✓ done" line (both would be `dlrow_1`) and the new Downloading would
 # REPLACE the old Done in the DOM — making done lines disappear
 # as soon as the next channel starts. Monotonic across all sync_channel
-# calls in a single process lifetime.
+# calls in a single process lifetime. Lock around increments so two
+# parallel sync drivers (autorun + manual single-channel) can't read
+# the same pre-increment value and emit duplicate `dlrow_N` markers
+# that overwrite each other's rows (audit: sync/core.py C6).
 _DLROW_COUNTER: int = 0
+_DLROW_COUNTER_LOCK = threading.Lock()
 
 
 # Firefox / cookie-browser signed-out alert — emit ONCE per sync pass
@@ -187,6 +193,10 @@ _DLROW_COUNTER: int = 0
 # silent — user's browser cookies could go stale for weeks with no
 # log feedback.
 _COOKIE_ALERT_FIRED: bool = False
+# Per-pass set of pass-ids that have already fired the cookie banner —
+# guards against an overlapping second pass resetting the flag mid-way
+# through the first pass and double-emitting (audit: sync/core.py H25).
+_COOKIE_ALERT_PASSES_FIRED: set = set()
 # Patch A: lock for the check-and-set on _COOKIE_ALERT_FIRED. Without
 # this, two concurrent channel-sync threads can both observe the flag
 # as False, both set it True, both emit the banner — duplicate alert.
@@ -600,6 +610,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # `_path_to_counter` stays local because it's only queried within
     # this channel's DLTRACK flow.
     _path_to_counter: dict[str, int] = {}
+    # Authoritative record of every dlrow counter created in this channel.
+    # Separate from `_path_to_counter.values()` because that dict can
+    # lose entries when two videos resolve to the same sanitized
+    # `final_path` (yt-dlp's filename sanitization rules can collapse
+    # distinct titles to the same path — `:` → `：` then later `?`,
+    # accented vowel folding, length truncation). When that happens
+    # `_path_to_counter[final_path]` keeps only the LAST writer's
+    # counter, so the earlier dlrow vanishes from `.values()` and the
+    # post-channel orphan sweep can't find it — leaving a stuck
+    # "Downloading Title 100%" row in the log. This set is append-only
+    # so the sweep always sees every dlrow we emitted.
+    _dlrows_in_channel: set[int] = set()
     # Display title per-path, stashed by the Destination branch so the
     # Progress branch can rebuild the full "— Downloading <title> NN%"
     # line. Without this the progress tick has no access to the title
@@ -656,6 +678,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # Transcription stays kicked out to the GPU queue because it's
     # genuinely compute-heavy.
     _meta_exec = None
+    # Track every submitted future so we can drain in-flight ones on a
+    # cancel-fast shutdown. Without this, shutdown(wait=False) returned
+    # while in-flight metadata tasks were still writing through
+    # save_config, racing with the next channel's writes in sync_all
+    # (audit: sync/core.py:1957 C5).
+    _meta_futures: list = []
     _meta_counts = {"fetched": 0, "skipped": 0, "errors": 0}
     # lock around _meta_counts mutations + reads. The
     # executor is single-worker today so increments are serialized, but
@@ -711,6 +739,25 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         No-op when auto_metadata is off. Never raises."""
         if _meta_exec is None or not vid_id or not final_path:
             return
+        # Snapshot just the fields the metadata fetcher needs so a
+        # mid-pass mutation of sync_channel's `channel` dict (e.g.
+        # `channel["initialized"]`, `failed_video_ids`,
+        # `last_views_refresh_ts`) can't race with the metadata
+        # task's read or save_config writes (audit: sync/core.py
+        # H33). The fetcher only needs url/name/folder_override/
+        # auto_metadata; pass a shallow copy of just those keys.
+        try:
+            _ch_snapshot = {
+                "url": channel.get("url", ""),
+                "name": channel.get("name", ""),
+                "folder": channel.get("folder", ""),
+                "folder_override": channel.get("folder_override", ""),
+                "auto_metadata": bool(channel.get("auto_metadata")),
+                "split_years": bool(channel.get("split_years")),
+                "split_months": bool(channel.get("split_months")),
+            }
+        except Exception:
+            _ch_snapshot = dict(channel) if isinstance(channel, dict) else {}
 
         def _task():
             try:
@@ -733,7 +780,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     time.sleep(0.5)
                 from .. import metadata as _meta
                 res = _meta.fetch_single_video_metadata(
-                    channel, vid_id, final_path, title, stream)
+                    _ch_snapshot, vid_id, final_path, title, stream)
                 if res.get("ok") and res.get("fetched"):
                     _bump_meta_counts("fetched")
                 elif res.get("ok") and res.get("skipped"):
@@ -752,7 +799,9 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             fire_recent_changed_hook()
 
         try:
-            _meta_exec.submit(_task)
+            _fut = _meta_exec.submit(_task)
+            try: _meta_futures.append(_fut)
+            except Exception: pass
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -974,10 +1023,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # public videos still download without auth, so letting
             # the pass continue is strictly better than aborting.
             global _COOKIE_ALERT_FIRED
+            # Per-pass guard so a second sync_all pass that overlaps
+            # the first doesn't reset the flag mid-pass and let the
+            # first pass's remaining channels re-emit the banner
+            # (audit: sync/core.py H25). Use the pass-id from
+            # _ROW_EMIT_PASS_ID which sync_all set at the start; if
+            # we've already alerted for this pass, skip even if the
+            # module-level flag was reset by a concurrent pass.
+            try:
+                _my_pass_id = getattr(_ROW_EMIT_PASS_ID, "id", "") or ""
+            except Exception:
+                _my_pass_id = ""
             # Patch A: atomic check-and-set under _cookie_alert_lock so
             # concurrent channel-syncs don't both fire the banner.
             with _cookie_alert_lock:
                 _should_emit_cookie_alert = False
+                if _my_pass_id and _my_pass_id in _COOKIE_ALERT_PASSES_FIRED:
+                    _COOKIE_ALERT_FIRED = True
                 if not _COOKIE_ALERT_FIRED:
                     _sl = s.lower()
                     if (("sign in to confirm" in _sl)
@@ -988,6 +1050,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         or ("error:" in _sl and "cookie" in _sl
                             and ("extract" in _sl or "sign in" in _sl))):
                         _COOKIE_ALERT_FIRED = True
+                        if _my_pass_id:
+                            _COOKIE_ALERT_PASSES_FIRED.add(_my_pass_id)
+                            # Cap the set so it can't grow unbounded
+                            # across thousands of passes in a long-
+                            # running session.
+                            if len(_COOKIE_ALERT_PASSES_FIRED) > 200:
+                                try:
+                                    _COOKIE_ALERT_PASSES_FIRED.pop()
+                                except KeyError:
+                                    pass
                         _should_emit_cookie_alert = True
             if _should_emit_cookie_alert:
                 _bar = "\u2588" * 65
@@ -1049,13 +1121,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     # below — the download silently failed to register.
                     # Now: warn + continue so the rest of the for-loop
                     # processes other lines normally.
-                    _parts = s.split(":::", 6)
-                    if len(_parts) != 7:
+                    # Split with NO limit so titles containing literal
+                    # `:::` don't shift the trailing fields. The other
+                    # 5 fields (uploader/date/size/duration/id) are
+                    # well-formed yt-dlp metadata that can't contain
+                    # `:::`, so we treat them as fixed anchors and
+                    # rejoin everything between them into the title
+                    # (audit: sync/core.py H29). The previous code
+                    # used `split(":::", 6)` which silently corrupted
+                    # the id field on `:::` titles even though the
+                    # `len==7` check passed.
+                    _parts = s.split(":::")
+                    if len(_parts) < 7:
                         _log.warning(
-                            "DLTRACK malformed (%d parts, expected 7): %s",
+                            "DLTRACK malformed (%d parts, expected ≥7): %s",
                             len(_parts), s[:200])
                         continue
-                    _, t, upl, ud, sz, dur, vid = _parts
+                    # Anchor on the trailing 5 + leading DLTRACK; the
+                    # middle parts (parts[1:-5]) belong to the title.
+                    _ = _parts[0]
+                    upl, ud, sz, dur, vid = _parts[-5:]
+                    t = ":::".join(_parts[1:-5])
                     t = (t or "").strip()
                     vid = (vid or "").strip()
                     if t and vid:
@@ -1340,7 +1426,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         if not auto_tx:
                             try:
                                 from .. import ytarchiver_config as _cfg
-                                _cfg.append_pending_tx_id(name, vid)
+                                # Serialize the read-modify-write via
+                                # the same module-level config lock the
+                                # other sync writers use. Without this,
+                                # two parallel-channel DLTRACK handlers
+                                # racing into append_pending_tx_id
+                                # could silently drop the loser's id
+                                # (audit: sync/core.py H36).
+                                with _config_write_lock:
+                                    _cfg.append_pending_tx_id(name, vid)
                             except Exception as _re3:
                                 # pending transcribe list
                                 # silently loses the ID otherwise —
@@ -1386,12 +1480,29 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             # for the em-dash + hourglass so the line
                             # visually matches the eventual ✓ done
                             # emit's em-dash color.
+                            # Indent to match the eventual " \u2014 \u2713 Metadata
+                            # downloaded" / " \u2014 \u2713 Transcription (\u2026)" lines
+                            # below the parent video row (6 leading spaces).
+                            # Previously this used 1 space so the queued
+                            # placeholder didn't align with its own
+                            # finished line.
                             stream.emit([
-                                [" \u2014 \u23F3 ", ["whisper_bracket", _tx_marker]],
+                                ["      \u2014 \u23F3 ", ["whisper_bracket", _tx_marker]],
                                 ["Transcription queued\u2026\n",
                                  ["simpleline", _tx_marker]],
                             ])
-                            transcribe_mgr.enqueue(final_path, t,
+                            # Fall back to the filename stem if the
+                            # yt-dlp title field came back empty (rare
+                            # but happens for region-locked / partially-
+                            # extracted videos that still successfully
+                            # downloaded). Empty `t` made the
+                            # transcribe row land in the log + DB
+                            # without a usable name (audit:
+                            # sync/core.py H35).
+                            _title_for_tx = (
+                                t or os.path.splitext(
+                                    os.path.basename(final_path))[0])
+                            transcribe_mgr.enqueue(final_path, _title_for_tx,
                                                     channel=name,
                                                     on_complete=cb,
                                                     video_id=vid,
@@ -1416,14 +1527,34 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 except Exception as _e:
                                     stream.emit_error(f"Couldn't queue video compression: {_e}")
                             else:
+                                # Don't run compress inline on the
+                                # sync worker thread — ffmpeg on a 4K
+                                # video can block this loop for 30+
+                                # min, freezing downstream channel
+                                # processing and making the UI appear
+                                # hung. Run it on a daemon thread
+                                # instead (audit: sync/core.py H37).
                                 try:
                                     from .. import compress as _cmp
-                                    _cmp.compress_video(final_path, stream,
-                                                         quality=_comp_lvl,
-                                                         output_res=_comp_res,
-                                                         cancel_event=cancel_event)
+                                    def _do_compress():
+                                        try:
+                                            _cmp.compress_video(
+                                                final_path, stream,
+                                                quality=_comp_lvl,
+                                                output_res=_comp_res,
+                                                cancel_event=cancel_event)
+                                        except Exception as _e:
+                                            try:
+                                                stream.emit_error(
+                                                    f"Video compression failed: {_e}")
+                                            except Exception:
+                                                pass
+                                    threading.Thread(
+                                        target=_do_compress, daemon=True,
+                                        name="compress-fallback").start()
                                 except Exception as _e:
-                                    stream.emit_error(f"Video compression failed: {_e}")
+                                    stream.emit_error(
+                                        f"Video compression failed to start: {_e}")
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
                 # Reset per-video path captures so the NEXT video in the
@@ -1503,16 +1634,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     # is declared at the top of sync_channel so this
                     # assignment (and the read above in the DLTRACK
                     # branch) both resolve to the module-level name.
-                    _DLROW_COUNTER += 1
-                    _path_to_counter[final_path] = _DLROW_COUNTER
+                    with _DLROW_COUNTER_LOCK:
+                        _DLROW_COUNTER += 1
+                        _my_dlrow = _DLROW_COUNTER
+                    _path_to_counter[final_path] = _my_dlrow
                     _path_to_display_title[final_path] = display_title
+                    # Append-only record so the post-channel sweep can
+                    # find every dlrow we ever emitted, even if the
+                    # path-keyed dict above lost the entry to a same-
+                    # path collision.
+                    _dlrows_in_channel.add(_my_dlrow)
                     # Parallel join key by video_id — sidesteps filename-
                     # character-substitution mismatches (`:` titles becoming
                     # `：` or `?` in the file path) that defeat path-based
                     # lookups in the DLTRACK handler below.
                     if current_vid_id:
-                        _vid_to_counter[current_vid_id] = _DLROW_COUNTER
-                    _dl_kind = f"dlrow_{_DLROW_COUNTER}"
+                        _vid_to_counter[current_vid_id] = _my_dlrow
+                    _dl_kind = f"dlrow_{_my_dlrow}"
                     stream.emit([
                         [" ", ["dim", _dl_kind]],
                         ["\u2014 Downloading ", ["simpleline_green", _dl_kind]],
@@ -1866,7 +2004,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     if downloaded > 0 and not _post_sync_cancelled:
         try:
             from .. import metadata as _md
-            _sweep = _md.sweep_missing_thumbnails(channel, stream=stream)
+            _sweep = _md.sweep_missing_thumbnails(
+                channel, stream=stream, cancel_event=cancel_event)
             if _sweep.get("fetched"):
                 stream.emit_dim(
                     f" (thumbnail sweep: {_sweep['fetched']} fetched, "
@@ -1952,9 +2091,21 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     if _meta_exec is not None:
         try:
             if cancel_event is not None and cancel_event.is_set():
-                # Cancel-fast: drop queued, don't wait for in-flight
-                # (they'll be torn down by the broader cancel pass).
+                # Cancel-fast: drop queued, but BRIEFLY drain in-flight
+                # futures so their save_config writes complete before
+                # sync_all picks the next channel. Without the drain,
+                # the next channel's writes raced concurrent writers
+                # from the cancelled channel's metadata tasks (audit:
+                # sync/core.py:1957 C5). 10s cap keeps the UI cancel
+                # responsive while still serializing the writes.
                 _meta_exec.shutdown(wait=False, cancel_futures=True)
+                try:
+                    from concurrent.futures import wait as _fwait
+                    _in_flight = [f for f in _meta_futures if not f.done()]
+                    if _in_flight:
+                        _fwait(_in_flight, timeout=10.0)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             else:
                 _meta_exec.shutdown(wait=True, cancel_futures=True)
         except Exception as e:
@@ -2153,9 +2304,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     c["last_comments_refresh_ts"] = _now_ts
                     _dirty = True
                 break
-            if downloaded > 0:
-                cfg2["last_sync"] = now.strftime("%Y-%m-%d %H:%M")
-                _dirty = True
+            # Per-channel pass would write the GLOBAL `cfg2["last_sync"]`
+            # whenever any channel downloaded — so "Last Full Sync" on
+            # the UI advanced mid-pass (after the first channel that
+            # downloaded), not when the pass actually completed. The
+            # global timestamp now lives at the end of `sync_all`
+            # (gated on pass kind + not-cancelled) so it really reflects
+            # "pass completed at <time>". Per-channel `c["last_sync"]`
+            # above still updates so the Subs tab's per-row column
+            # advances live.
             if _dirty:
                 save_config(cfg2)
             if not _matched_any:
@@ -2203,11 +2360,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # Also refresh the channel's avatar/banner art. Internal 30-day
     # threshold on channel_art.fetch_channel_art means this is near-free
     # when art is already current. Matches OLD auto-fetch behavior.
-    try:
-        from .. import channel_art as _ca
-        _ca.fetch_channel_art(url or "", str(ch_dir), force=False)
-    except Exception as _ae:
-        stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
+    # Gate behind _post_sync_cancelled for consistency with the other
+    # post-sync passes above — the freshness check + network probe
+    # still adds noticeable cancel-latency if it fires (audit:
+    # sync/core.py H39).
+    if not _post_sync_cancelled:
+        try:
+            from .. import channel_art as _ca
+            _ca.fetch_channel_art(url or "", str(ch_dir), force=False)
+        except Exception as _ae:
+            stream.emit_dim(f" (channel-art refresh skipped: {_ae})")
 
     # Clear the sync-active flag — allow transcribe._flush_batch_stats to
     # emit standalone [Trnscr] rows for any transcriptions that slip in
@@ -2222,9 +2384,17 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # 100%" with no done-line replacement. Sweep them now and emit
     # clear_line markers so they vanish from the log before the next
     # channel's rows render.
+    # Multi-video channels (5+ downloads with similar titles like
+    # "Show — PART ONE / PART TWO / PART THREE") were leaving stuck
+    # "Downloading … 100%" rows because the previous sweep walked
+    # `_path_to_counter.values()` — and when two videos sanitized to
+    # the same `final_path`, the dict only kept the latest counter.
+    # Earlier counters vanished from `.values()` and never got cleared.
+    # `_dlrows_in_channel` is append-only so the sweep now sees every
+    # dlrow we ever emitted, regardless of path-key collisions.
     try:
         import json as _json_mod_clean
-        for _ctr in set(_path_to_counter.values()) - _closed_dlrows:
+        for _ctr in _dlrows_in_channel - _closed_dlrows:
             _stuck_kind = f"dlrow_{_ctr}"
             try:
                 stream.emit([
@@ -2247,6 +2417,21 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # pass finished) treat as ok-but-partial when downloaded > 0.
     _good_rcs = [rc for rc in _pass_returncodes if rc in (0, 1)]
     _crashed = [rc for rc in _pass_returncodes if rc is not None and rc not in (0, 1)]
+    # If yt-dlp crashed before emitting any output (corrupt exe,
+    # antivirus quarantine, DLL missing), the readline loop saw zero
+    # ERROR: lines and `errors` stayed 0 — the per-channel summary
+    # rolled up as "no new videos" instead of the real crash. Bump
+    # errors here so the summary tells the truth (audit:
+    # sync/core.py H31).
+    if _crashed and downloaded == 0:
+        errors = max(errors, 1)
+        try:
+            _rc_hex = ", ".join(f"0x{(rc & 0xFFFFFFFF):08X}" for rc in _crashed)
+            stream.emit_error(
+                f"yt-dlp crashed with no output (exit {_rc_hex}) — "
+                "no videos checked.")
+        except Exception as _e:
+            _log.debug("swallowed: %s", _e)
     if _good_rcs:
         _ok = True
     elif _crashed:
@@ -2283,6 +2468,8 @@ from .active_state import (  # noqa: F401
     is_any_sync_active,
     set_metadata_changed_hook,
     fire_metadata_changed_hook,
+    set_channel_synced_hook,
+    fire_channel_synced_hook,
 )
 
 

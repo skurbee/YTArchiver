@@ -20,6 +20,7 @@ from ..log import get_logger
 from ..log_stream import LogStreamer
 from ..metadata_io import (
     _folder_for_channel,
+    _lock_for,
     _read_metadata_jsonl,
     _write_metadata_jsonl,
 )
@@ -143,6 +144,22 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 _log.debug("swallowed: %s", e)
     _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
     _hb_thread.start()
+    # Cap the heartbeat at a hard deadline (30 min) and watch the
+    # current thread's liveness so it can't leak forever if the
+    # function body raises before reaching the normal `_hb_alive[0]
+    # = False` teardown (audit: refresh_views H76). The
+    # parent-thread watch is cheap and bounded.
+    _parent_thread = threading.current_thread()
+    _hb_start_ts = time.time()
+    def _hb_self_kill():
+        while _hb_alive[0]:
+            time.sleep(5)
+            if (not _parent_thread.is_alive()
+                    or (time.time() - _hb_start_ts) > 1800):
+                _hb_alive[0] = False
+                break
+    threading.Thread(target=_hb_self_kill, daemon=True,
+                     name="hb-watchdog").start()
 
     def _catalog_progress(n):
         _hb_catalog_count[0] = int(n)
@@ -347,20 +364,29 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 if _conn_wr is not None:
                     with _idx._db_lock:
                         try:
+                            # Scope by channel too — filepath alone is
+                            # not a unique identity in a multi-channel
+                            # archive on case-insensitive NTFS / pooled
+                            # drives. A path collision across channels
+                            # without the channel scope would mis-flag
+                            # the wrong channel's video as removed
+                            # (audit: refresh_views.py C14).
                             for _fp in _newly_removed:
                                 try:
                                     _conn_wr.execute(
                                         "UPDATE videos SET removed_from_yt_ts=? "
-                                        "WHERE filepath=? COLLATE NOCASE",
-                                        (_now_rm, _fp))
+                                        "WHERE filepath=? COLLATE NOCASE "
+                                        "AND channel=?",
+                                        (_now_rm, _fp, name))
                                 except Exception as e:
                                     _log.debug("swallowed: %s", e)
                             for _fp in _newly_restored:
                                 try:
                                     _conn_wr.execute(
                                         "UPDATE videos SET removed_from_yt_ts=NULL "
-                                        "WHERE filepath=? COLLATE NOCASE",
-                                        (_fp,))
+                                        "WHERE filepath=? COLLATE NOCASE "
+                                        "AND channel=?",
+                                        (_fp, name))
                                 except Exception as e:
                                     _log.debug("swallowed: %s", e)
                             _conn_wr.commit()
@@ -390,17 +416,43 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             _log.debug("swallowed: %s", e)
 
     on_disk_ids = {v[0] for v in on_disk if v[0]}
+    # Count duplicate video_ids (same id on disk in two folders — usually
+    # a manual file copy / channel-merge leftover). Set comprehension
+    # silently drops duplicates; count them explicitly so the user can
+    # see the inconsistency (audit: refresh_views H77).
+    _on_disk_vid_count = sum(1 for v in on_disk if v[0])
+    if _on_disk_vid_count > len(on_disk_ids):
+        try:
+            stream.emit_dim(
+                f" ({_on_disk_vid_count - len(on_disk_ids)} duplicate "
+                f"video_id(s) on disk — same video in multiple folders)")
+        except Exception:
+            pass
 
     # Load existing metadata across all on-disk JSONLs, keyed by id.
     # Track which JSONL each entry came from so we can write it back.
     existing_by_id: dict[str, dict[str, Any]] = {}
     jsonl_by_id: dict[str, str] = {}
+    # Scope by channel-name prefix so a sibling channel's JSONL that
+    # accidentally lives under this tree doesn't pollute existing_by_id
+    # (audit: refresh_views H100 — same fix as C16/refresh_fetch).
+    _expected_prefix = f".{name} "
+    _expected_exact = f".{name} Metadata.jsonl"
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
             if not fn.endswith("Metadata.jsonl"):
                 continue
+            if fn != _expected_exact and not fn.startswith(_expected_prefix):
+                continue
             jp = os.path.join(dp, fn)
-            entries = _read_metadata_jsonl(jp)
+            try:
+                entries = _read_metadata_jsonl(jp)
+            except Exception as _re:
+                try:
+                    stream.emit_dim(f" (jsonl read failed: {fn} — {_re})")
+                except Exception:
+                    pass
+                continue
             for vid, entry in entries.items():
                 existing_by_id[vid] = entry
                 jsonl_by_id[vid] = jp
@@ -528,12 +580,19 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         dirty_paths.setdefault(jp, {})[vid] = _entry_clean
     for jp, entries in dirty_paths.items():
         # Load current contents, merge our updates on top, rewrite.
-        full = _read_metadata_jsonl(jp)
-        full.update(entries)
-        try:
-            _write_metadata_jsonl(jp, full)
-        except OSError as e:
-            stream.emit_dim(f" (metadata write failed for {os.path.basename(jp)}: {e})")
+        # Hold the per-path write lock across read+merge+write so a
+        # concurrent writer's just-landed entry can't be clobbered by
+        # our stale read. Without this, _write_metadata_jsonl's
+        # internal lock only serialized the WRITE half — two threads
+        # could read, both miss the other's changes, then both write
+        # (audit: refresh_views.py C15).
+        with _lock_for(jp):
+            full = _read_metadata_jsonl(jp)
+            full.update(entries)
+            try:
+                _write_metadata_jsonl(jp, full)
+            except OSError as e:
+                stream.emit_dim(f" (metadata write failed for {os.path.basename(jp)}: {e})")
 
     # Secondary pass: full --dump-json fetch for videos whose counts
     # changed (picks up new comments, updated descriptions, etc.).
@@ -629,7 +688,12 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         # py:582-589). _config_write_lock lives in sync/core.py.
         try:
             from ..sync.core import _config_write_lock as _cwl
-        except Exception:
+        except Exception as _ilex:
+            # Fail loud rather than silently dropping serialization —
+            # a concurrent settings_save could land between our load
+            # and save and lose the timestamp update (audit: H85, H94).
+            _log.error("refresh_views can't import _config_write_lock: %s "
+                       "(skipping timestamp stamp to avoid lost-update)", _ilex)
             _cwl = None
         def _do_stamp():
             cfg = _cfg.load_config()
@@ -643,8 +707,9 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         if _cwl is not None:
             with _cwl:
                 _do_stamp()
-        else:
-            _do_stamp()
+        # If _cwl is None (import failed), we intentionally SKIP the
+        # stamp rather than fall through to an unserialized write that
+        # could clobber a concurrent writer.
     except Exception as e:
         _log.debug("swallowed: %s", e)
 

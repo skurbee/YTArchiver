@@ -115,7 +115,10 @@
 }
 .browse-find-wrap {
   position: relative;
-  flex: 0 0 220px;
+  /* Allow shrinking below the 220px ideal so the toolbar doesn't
+     horizontally overflow at narrow widths (audit: H257). */
+  flex: 0 1 220px;
+  min-width: 80px;
 }
 .browse-find-wrap .search-icon {
   left: 8px;
@@ -209,7 +212,7 @@
   color: var(--c-dim);
 }
 .browse-summary-bar .bsb-val {
-  color: #7ac98c;
+  color: var(--c-log-green);  /* was #7ac98c — audit L174 */
   font-weight: 600;
   margin-left: 2px;
 }

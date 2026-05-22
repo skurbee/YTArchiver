@@ -176,7 +176,16 @@
           transcript = res.segments;
           sourceInfo = res.source || null;
         }
-      } catch { /* ignore */ }
+      } catch (e) {
+        // Surface bridge errors so the user knows the transcript
+        // couldn't load (was: silent swallow → empty "No transcript
+        // available" with no clue why; audit: browseContent H149).
+        console.warn("browse_get_transcript failed:", e);
+        try {
+          window._showToast?.(
+            `Couldn't load transcript: ${e?.message || e}`, "warn");
+        } catch {}
+      }
     }
     if (myToken !== _watchOpenToken) return;
     // Bug fix: if user navigated away from Watch view entirely (back
@@ -384,40 +393,15 @@
     // YTArchiver.py:25091 _grid_meta_banner_lbl. Banner appears above the
     // grid, clicking it queues metadata for the channel.
     _refreshVideoGridMetaBanner(vids);
+    // Route through _openVideoInWatch so the canonical race-token
+    // guard (myToken !== _watchOpenToken) protects against rapid
+    // A-then-B clicks landing B's video with A's transcript (audit:
+    // browseContent.js C26). The inline duplicate of the load logic
+    // had no token check, so two awaits could resolve out of order.
     window.renderVideoGrid(vids, async (v) => {
-      _browseState.currentVideo = v;
-      showView("watch");
-      // Try real transcript from DB first, fall back to synthesized
-      const api = window.pywebview?.api;
-      let transcript = null;
-      let sourceInfo = null;
-      if (api && api.browse_get_transcript) {
-        try {
-          const res = await api.browse_get_transcript({
-            video_id: v.video_id || undefined,
-            title: v.title,
-          });
-          if (Array.isArray(res)) transcript = res;
-          else if (res && res.segments) {
-            transcript = res.segments;
-            sourceInfo = res.source || null;
-          }
-        } catch (e) { console.warn("get_transcript failed:", e); }
+      if (typeof window._openVideoInWatch === "function") {
+        window._openVideoInWatch(v);
       }
-      if (!transcript || transcript.length === 0) {
-        // pass [] so the renderer shows "No transcript
-        // available." instead of demo placeholder text.
-        transcript = [];
-      } else {
-        // Convert DB schema (s/e/t/w) to renderer schema (ts/text)
-        transcript = transcript.map(seg => ({
-          ts: _formatTs(seg.s),
-          text: seg.t,
-          words: seg.w,
-          s: seg.s, e: seg.e,
-        }));
-      }
-      window.renderWatchView(v, transcript, sourceInfo);
     }, { groupByYear, groupByMonth });
   }
 

@@ -66,11 +66,11 @@
        Channels / Search / Graph / Bookmarks so all "library navigation"
        lives in one place. See the `panel-browse` sidebar below for the
        new location. -->
-  <div class="tab-row">
-    <div class="tab active" data-tab="download">Download</div>
-    <div class="tab" data-tab="subs">Subs</div>
-    <div class="tab browse-tab" data-tab="browse">Browse</div>
-    <div class="tab settings-tab" data-tab="settings">Settings</div>
+  <div class="tab-row" role="tablist" aria-label="Main navigation">
+    <div class="tab active" data-tab="download" role="tab" tabindex="0" aria-selected="true" aria-controls="panel-download">Download</div>
+    <div class="tab" data-tab="subs" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-subs">Subs</div>
+    <div class="tab browse-tab" data-tab="browse" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-browse">Browse</div>
+    <div class="tab settings-tab" data-tab="settings" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-settings">Settings</div>
   </div>
   <!-- Download tab -->
   <div class="tab-panel active" id="panel-download">
@@ -1266,9 +1266,11 @@
                 <span class="find-count" id="watch-find-count"></span>
                 <button class="btn btn-ghost btn-thin find-nav"
                         id="watch-find-prev"
+                        aria-label="Previous match"
                         title="Previous match (Shift+Enter)" tabindex="-1">&#x25B2;</button>
                 <button class="btn btn-ghost btn-thin find-nav"
                         id="watch-find-next"
+                        aria-label="Next match"
                         title="Next match (Enter)" tabindex="-1">&#x25BC;</button>
               </div>
               <div class="watch-transcript" id="watch-transcript"></div>
@@ -1345,11 +1347,9 @@
               <button class="search-op-btn" data-op="*"
                       title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
               <span class="search-hint-label" style="margin-left:10px;">Year:</span>
-              <input type="text" class="ctl-input" id="search-year-from" placeholder="from"
-                     class="search-year-input"
+              <input type="text" class="ctl-input search-year-input" id="search-year-from" placeholder="from"
                      title="Limit to segments from this year onward" />
-              <input type="text" class="ctl-input" id="search-year-to" placeholder="to"
-                     class="search-year-input"
+              <input type="text" class="ctl-input search-year-input" id="search-year-to" placeholder="to"
                      title="Limit to segments through this year" />
               <span class="search-hint-label" style="margin-left:10px;">Sort:</span>
               <select class="ctl-select" id="search-sort"
@@ -1849,10 +1849,11 @@
        CSS `.yt-modal` rule uses `display: flex` or something that
        would otherwise override the bare `hidden` attribute. JS that
        opens the modal sets style.display explicitly. -->
-  <div id="welcome-modal" class="yt-modal" hidden style="display:none;">
+  <div id="welcome-modal" class="yt-modal" hidden style="display:none;"
+       role="dialog" aria-modal="true" aria-labelledby="welcome-modal-title">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body" style="min-width:460px; max-width:560px;">
-      <div class="yt-modal-title">Pick an archive folder</div>
+      <div class="yt-modal-title" id="welcome-modal-title">Pick an archive folder</div>
       <div class="yt-modal-sub">
         YTArchiver saves each subscribed channel as
         <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
@@ -1881,10 +1882,11 @@
        fills/shows it. Buttons call api.redownload_sample_confirm(). -->
   <!-- audit E-26: same inline display:none belt-and-suspenders as
        welcome-modal above. -->
-  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;">
+  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;"
+       role="dialog" aria-modal="true" aria-labelledby="redwnl-sample-title">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body">
-      <div class="yt-modal-title">Sample Complete</div>
+      <div class="yt-modal-title" id="redwnl-sample-title">Sample Complete</div>
       <div class="yt-modal-sub" id="redwnl-sample-sub"></div>
       <div class="yt-modal-stats" id="redwnl-sample-stats"></div>
       <div class="yt-modal-countdown" id="redwnl-sample-countdown"></div>

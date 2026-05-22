@@ -40,6 +40,10 @@
   }
 
   function initBrowseSubmodes() {
+    // Re-init guard so a second call doesn't double up the click
+    // handlers on the same buttons (audit: browseView.js H167).
+    if (initBrowseSubmodes._wired) return;
+    initBrowseSubmodes._wired = true;
     const buttons = document.querySelectorAll(".submode-btn");
     buttons.forEach(b => {
       b.addEventListener("click", () => {

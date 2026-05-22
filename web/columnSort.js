@@ -21,7 +21,11 @@
                                  { folder: "string", res: "string",
                                    min: "num", max: "num",
                                    compress: "string", transcribed: "string", metadata: "string",
-                                   last_sync: "string", n_vids: "num",
+                                   // "age" kind parses "10d ago" / "3h" etc. so the
+                                   // column sorts by recency, not by alphabetical
+                                   // ordering of the formatted string (which had it
+                                   // jumping 10d → 5d → 18h instead of monotonic).
+                                   last_sync: "age", n_vids: "num",
                                    size: "size", avg_size: "size" });
     // Recent table
     const recentThead = document.querySelector(".recent-table thead");
@@ -121,16 +125,25 @@
     return 0;
   }
   function parseAge(s) {
-    if (!s) return 0;
+    if (!s) return Infinity;
+    const _s = s.trim().toLowerCase();
+    // "Never" channels are infinitely-old by definition — sort them to
+    // the end regardless of direction. Without this they returned 0
+    // (== "just now") and clustered with the most-recently-synced rows.
+    if (_s === "never" || _s === "—" || _s === "-") return Infinity;
+    // "just now" is 0 seconds ago — most recent. Caught explicitly so
+    // it doesn't fall into the regex-miss path (which now returns
+    // Infinity instead of 0).
+    if (_s.startsWith("just now")) return 0;
     // Match the longest unit first ("mo"/"y" before "m"). Without this,
     // a cell showing "3mo" would match `3m` and be treated as 3 minutes
     // instead of 3 months — flipping the sort order completely.
     // Years approximated as 365d, months as 30d (good enough for
     // a coarse Last-Sync column).
     const m = s.match(/(\d+)\s*(mo|y|m|h|d|w)/i);
-    if (!m) return 0;
+    if (!m) return Infinity;
     const n = parseInt(m[1], 10);
-    if (!Number.isFinite(n)) return 0;
+    if (!Number.isFinite(n)) return Infinity;
     const unit = {
       m: 60,
       h: 3600,

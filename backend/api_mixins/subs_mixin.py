@@ -108,8 +108,22 @@ class SubsMixin:
             self._pending_previews = {}
         if not hasattr(self, "_pending_previews_lock"):
             self._pending_previews_lock = threading.Lock()
+        # Sweep entries older than 10 minutes on every new submit so
+        # the dict can't grow unbounded when users abandon previews
+        # (modal dismissed, navigated away, race with another preview)
+        # without ever polling. Same TTL pattern applies to
+        # _pending_res_scans / _drift_scan_results / _drift_apply_results
+        # (audit: subs_mixin H10).
+        import time as _t_mod
+        _now_ts = _t_mod.time()
         with self._pending_previews_lock:
-            self._pending_previews[token] = {"ok": False, "pending": True}
+            _stale = [k for k, v in self._pending_previews.items()
+                      if isinstance(v, dict)
+                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
+            for k in _stale:
+                self._pending_previews.pop(k, None)
+            self._pending_previews[token] = {
+                "ok": False, "pending": True, "_ts": _now_ts}
         def _run():
             import subprocess as _sp
             try:
@@ -127,15 +141,18 @@ class SubsMixin:
                 if not name:
                     with self._pending_previews_lock:
                         self._pending_previews[token] = {
-                            "ok": False, "error": "yt-dlp returned nothing"}
+                            "ok": False, "error": "yt-dlp returned nothing",
+                            "_ts": _t_mod.time()}
                     return
                 folder = sync_backend.sanitize_folder(name)
                 with self._pending_previews_lock:
                     self._pending_previews[token] = {
-                        "ok": True, "channel": name, "folder": folder}
+                        "ok": True, "channel": name, "folder": folder,
+                        "_ts": _t_mod.time()}
             except Exception as e:
                 with self._pending_previews_lock:
-                    self._pending_previews[token] = {"ok": False, "error": str(e)}
+                    self._pending_previews[token] = {
+                        "ok": False, "error": str(e), "_ts": _t_mod.time()}
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "token": token}
 
@@ -317,16 +334,21 @@ class SubsMixin:
         in LIFO order.
         """
         stack = getattr(self, "_removed_channels_stack", None)
-        if not stack:
-            # Back-compat: check the pre-stack single-slot attr in case
-            # a remove happened before this method was upgraded. Shouldn't
-            # hit in normal use, but harmless belt-and-suspenders.
+        # Distinguish `stack is None` (legacy — attr was never set,
+        # consult single-slot fallback) from `stack == []` (set but
+        # empty — there's nothing to undo, return immediately). The
+        # old `if not stack:` collapsed both into the legacy branch
+        # which broke LIFO ordering when a later exception path
+        # appended back to the stack mid-undo (audit: subs_mixin H12).
+        if stack is None:
             legacy = getattr(self, "_last_removed_channel", None)
             if legacy:
                 self._last_removed_channel = None
                 ch = legacy
             else:
                 return {"ok": False, "error": "Nothing to undo"}
+        elif not stack:
+            return {"ok": False, "error": "Nothing to undo"}
         else:
             ch = stack.pop()
         try:

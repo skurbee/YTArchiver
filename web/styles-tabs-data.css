@@ -223,7 +223,10 @@
   border-radius: 3px;
   font-size: 12px;
 }
-.edit-nudge-row[hidden] { display: none !important; }
+/* Removed duplicate `.edit-nudge-row[hidden]` rule — the global
+   `[hidden] { display: none !important }` in
+   styles-download-controls.css:212 already covers this (audit:
+   L160). */
 
 /* Legacy grid selectors — kept as no-ops so residual markup /
    class-references elsewhere don't trip on missing rules. */
@@ -295,7 +298,10 @@
   width: 54px;
   flex: 0 0 54px;
 }
-.edit-grid .icon-btn-slim { width: 26px; height: 26px; }
+/* Removed: dead rule. `.edit-grid { display: contents }` makes it
+   a no-op layout container, so `.edit-grid .icon-btn-slim` never
+   matches — global `.icon-btn-slim` styling lives in
+   styles-browse.css (audit: styles-tabs-data L156). */
 .edit-grid .edit-dim { color: var(--c-dim); font-size: 11.5px; }
 
 /* Compact inline radio */

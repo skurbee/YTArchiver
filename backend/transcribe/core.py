@@ -151,7 +151,14 @@ class TranscribeManager:
         # so go up one more level.
         self._worker_script = Path(__file__).resolve().parent.parent / "whisper_worker.py"
         # Optional punctuation model — lazy-loaded, reused across jobs.
-        self._punct = PunctuationManager(stream)
+        # Routed through the process-singleton getter so the
+        # Restore-Punctuation pass and the live transcribe worker
+        # share one subprocess + VRAM allocation (audit: H44).
+        try:
+            from .punct_manager import get_shared_punct_manager
+            self._punct = get_shared_punct_manager(stream)
+        except Exception:
+            self._punct = PunctuationManager(stream)
         self._punctuate_enabled = True
 
         # Queue of jobs. Each job = {path, title, cb, cancel_event}
@@ -275,8 +282,18 @@ class TranscribeManager:
 
             env = os.environ.copy()
             env["WHISPER_MODEL"] = m
-            env["WHISPER_DEVICE"] = "cuda"
-            env["WHISPER_COMPUTE"] = "float16"
+            # Honor a one-shot CPU-fallback on this instance instead
+            # of mutating os.environ globally (audit: H51). The OOM
+            # handler sets `self._cpu_fallback_active`; we read it
+            # here so the next subprocess starts in CPU mode without
+            # polluting process-wide env that any sibling subprocess
+            # would inherit.
+            if getattr(self, "_cpu_fallback_active", False):
+                env["WHISPER_DEVICE"] = "cpu"
+                env["WHISPER_COMPUTE"] = "default"
+            else:
+                env["WHISPER_DEVICE"] = "cuda"
+                env["WHISPER_COMPUTE"] = "float16"
 
             # capture stderr so crashes during model load
             # or transcription land somewhere diagnosable. Previously
@@ -435,6 +452,18 @@ class TranscribeManager:
                     _q.put(None)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+            # Drain the old reader thread before nulling proc + queue.
+            # Without this, a subprocess restart left the old reader
+            # alive reading from a dead pipe — a zombie thread until
+            # daemon cleanup at process exit (audit: H48 + H64). 2s
+            # join cap so a wedged reader can't block the next start.
+            try:
+                _rt = self._reader_thread
+                if _rt is not None and _rt.is_alive():
+                    _rt.join(timeout=2.0)
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            self._reader_thread = None
             self._proc = None
             self._line_queue = None
 
@@ -527,11 +556,17 @@ class TranscribeManager:
         # / right-click "Re-transcribe" sat in the queue until the user
         # manually clicked Start — confusing because Auto was on.
         try:
-            if (self._auto_enabled() and self._paused.is_set()
-                    and self._queues is not None
-                    and getattr(self._queues, "gpu_paused", False)):
-                self._paused.clear()
-                self._queues.set_gpu_paused(False)
+            # Hold the jobs lock around the check + clear so a
+            # concurrent queue_pause("gpu") can't slip its set()
+            # between our `is_set()` read and our clear(), leaving
+            # paused=True when we thought we'd just cleared it
+            # (audit: transcribe/core.py H67).
+            with self._jobs_lock:
+                if (self._auto_enabled() and self._paused.is_set()
+                        and self._queues is not None
+                        and getattr(self._queues, "gpu_paused", False)):
+                    self._paused.clear()
+                    self._queues.set_gpu_paused(False)
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._ensure_worker()
@@ -1055,8 +1090,10 @@ class TranscribeManager:
                         and _job_kind != "compress"):
                     self._cpu_fallback_active = False
                     try:
-                        os.environ.pop("WHISPER_DEVICE", None)
-                        os.environ.pop("WHISPER_COMPUTE", None)
+                        # No global env pop needed any more — the
+                        # next _start_subprocess reads the instance
+                        # flag (now False) and rebuilds env on GPU
+                        # automatically (audit: H51).
                         self._stop_subprocess(force=True)
                         _reset_label = (
                             "\u21A9 Resetting to GPU mode for next job."
@@ -1236,13 +1273,12 @@ class TranscribeManager:
         # "Loading punctuation..." would stomp video 1's done line
         # when two videos for the same channel get transcribed in
         # sequence. Store on the job so `punct_mgr` can pick it up.
-        # _JOB_COUNTER lives in helpers.py (Patch 16 split). The `global`
-        # keyword doesn't reach across modules, so we mutate the
-        # counter through the module reference. Functionally
-        # equivalent to the old `global _JOB_COUNTER; _JOB_COUNTER += 1`.
+        # Thread-safe job-id allocation via the locked accessor in
+        # helpers.py (audit: L27). Previously the bare `+= 1` could
+        # double-issue an id under contention.
         from . import helpers as _h
-        _h._JOB_COUNTER += 1
-        job_tag = f"whisper_job_{_h._JOB_COUNTER}"
+        _my_job_id = _h.next_job_id()
+        job_tag = f"whisper_job_{_my_job_id}"
         job["job_tag"] = job_tag
 
         # ── Auto-captions fast-path ──
@@ -1320,6 +1356,12 @@ class TranscribeManager:
         # branch on a 4-hour video and OOM Whisper trying to load the
         # whole audio at once. Use file-size as a rough proxy: typical
         # 1080p mp4 is ~50 MB/hr. A file >120 MB roughly maps to >2 h.
+        # Track whether the duration is a real ffprobe value or just a
+        # chunking-routing sentinel — the realtime-ratio emit below
+        # would otherwise print a fabricated "1.2x realtime" derived
+        # from `_CHUNK_MIN_DURATION` instead of the true video length
+        # (audit: transcribe/core.py H70).
+        _duration_is_real = duration > 0.0
         if duration <= 0.0:
             try:
                 _sz = os.path.getsize(path)
@@ -1331,6 +1373,7 @@ class TranscribeManager:
                     duration = float(_CHUNK_MIN_DURATION)
             except OSError:
                 pass
+        job["_duration_is_real"] = _duration_is_real
         if duration >= _CHUNK_MIN_DURATION:
             self._transcribe_chunked(job, duration)
             return
@@ -1454,14 +1497,11 @@ class TranscribeManager:
                         " \u21A9 Falling back to CPU mode for this job.",
                         "simpleline_blue")
                     self._stop_subprocess(force=True)
-                    # previously we set WHISPER_DEVICE=cpu
-                    # globally and NEVER reset it, so one early OOM
-                    # degraded every subsequent transcribe in the session
-                    # to slow CPU mode. Now we flag on the instance and
-                    # reset to GPU after the retried job completes
-                    # (see _reset_cuda_after_cpu below).
-                    os.environ["WHISPER_DEVICE"] = "cpu"
-                    os.environ["WHISPER_COMPUTE"] = "default"
+                    # Flag-only: the next _start_subprocess reads
+                    # `self._cpu_fallback_active` and builds its env
+                    # accordingly. No more os.environ mutation (audit:
+                    # H51) — global mutation would leak into any
+                    # sibling subprocess spawned in between.
                     self._cpu_fallback_active = True
                     # Requeue this job (but not in a loop — bail if it fails again)
                     if not job.get("_retried_cpu"):
@@ -1492,12 +1532,18 @@ class TranscribeManager:
                 # pass left the tag as "(WHISPER:model)" even though
                 # the text was unpunctuated — users assumed punctuation
                 # was present in the Watch banner.
-                result["_punct_attempted"] = True
+                # Only mark `_punct_attempted = True` when we ACTUALLY
+                # call punctuate(). For silent videos with empty text
+                # the prior code set attempted=True but never made the
+                # call, so the source tag wrongly read "+NO-PUNCT"
+                # (audit: H73).
                 result["_punct_success"] = False
                 result["_punct_timeout"] = False  # bug [43]
+                result.setdefault("_punct_attempted", False)
                 try:
                     raw_text = result.get("text", "") or ""
                     if raw_text:
+                        result["_punct_attempted"] = True
                         punct_text = self._punct.punctuate(raw_text)
                         # Bug [43]: surface a timeout-specific signal so
                         # downstream code (source tag, summary log) can
@@ -1535,7 +1581,8 @@ class TranscribeManager:
             self._write_outputs(path, result, title=title, channel=channel,
                                 combined_override=job.get("combined_override"),
                                 retranscribe=bool(job.get("retranscribe")),
-                                video_id_hint=job.get("video_id", ""))
+                                video_id_hint=job.get("video_id", ""),
+                                job=job)
             # audit A-1 real fix: set _pending_decremented on the job
             # dict HERE (caller scope, where `job` actually exists)
             # instead of inside _write_outputs which doesn't take job
@@ -1562,8 +1609,13 @@ class TranscribeManager:
             # the done line reads "Transcription (Whisper small, took
             # 55sec, 12.3x realtime)" instead of just "(took 55sec)".
             _model_label = (self._model or "").strip()
+            # Only emit a realtime ratio when we have a real ffprobe
+            # duration — otherwise the displayed "Nx realtime" is
+            # derived from a chunking-routing sentinel, not the actual
+            # video length (audit: H70).
             _realtime_str = (f"{duration / _elapsed:.1f}x realtime"
-                             if _elapsed > 0 and duration > 0 else "")
+                             if _elapsed > 0 and duration > 0
+                             and job.get("_duration_is_real", True) else "")
             _detail_parts = []
             if _model_label:
                 _detail_parts.append(f"Whisper {_model_label}")
@@ -1583,6 +1635,10 @@ class TranscribeManager:
             # (logs.js has also been fixed to scan all tags with
             # tx_done_ priority first; this is belt-and-suspenders.)
             _dim_tags = [t for t in (_tx_tag, "dim", job_tag) if t]
+            # Parens detail (Whisper model, elapsed, realtime) uses
+            # `tx_detail` — brighter than `dim` so the detail is actually
+            # readable but still subordinate to the main label.
+            _detail_tags = [t for t in (_tx_tag, "tx_detail", job_tag) if t]
             _em_tags = [t for t in (_tx_tag, "whisper_bracket", job_tag) if t]
             _lbl_tags = [t for t in (_tx_tag, "simpleline_blue", job_tag) if t]
             _txt_tags = [t for t in (_tx_tag, "simpleline", job_tag) if t]
@@ -1613,7 +1669,7 @@ class TranscribeManager:
                     if _seg_channel:
                         _segs.append([" \u2014 ", _dim_tags])
                         _segs.append([_seg_channel, _txt_tags])
-            _segs.append([f" ({_detail_str})\n", _dim_tags])
+            _segs.append([f" ({_detail_str})\n", _detail_tags])
             self._stream.emit(_segs)
             if job.get("cb"):
                 try:
@@ -1760,8 +1816,23 @@ class TranscribeManager:
             # Merge result
             if not all_segments and not all_text_parts:
                 return
+            # Rebuild text from deduped segments, NOT from all_text_parts.
+            # all_text_parts contains each chunk's full body including the
+            # 30s overlap window, so joining them duplicated ~60s of
+            # speech at every chunk seam in the merged .txt while the
+            # .jsonl segments were correctly deduped — the two sidecars
+            # diverged by content on every multi-hour video (audit:
+            # transcribe/core.py C9). Single-source from segments now.
+            if all_segments:
+                merged_text = " ".join(
+                    (s.get("t") or s.get("text") or "").strip()
+                    for s in all_segments
+                    if (s.get("t") or s.get("text") or "").strip()
+                )
+            else:
+                merged_text = " ".join(all_text_parts)
             merged = {
-                "text": " ".join(all_text_parts) if all_text_parts else "",
+                "text": merged_text,
                 "segments": all_segments,
             }
             # Optional punctuation pass on the merged text (same as single-pass).
@@ -1795,7 +1866,8 @@ class TranscribeManager:
             self._write_outputs(path, merged, title=title, channel=channel,
                                 combined_override=job.get("combined_override"),
                                 retranscribe=bool(job.get("retranscribe")),
-                                video_id_hint=job.get("video_id", ""))
+                                video_id_hint=job.get("video_id", ""),
+                                job=job)
             # audit A-1 real fix: same as the single-pass caller above.
             # Flag belongs on the `job` dict in caller scope; never
             # inside _write_outputs (which has no `job` param).
@@ -1819,8 +1891,15 @@ class TranscribeManager:
             _dim_tag = ["dim", _job_tag_ch] if _job_tag_ch else "dim"
             _lbl_tag = ["simpleline_blue", _job_tag_ch] if _job_tag_ch else "simpleline_blue"
             _txt_tag = ["simpleline", _job_tag_ch] if _job_tag_ch else "simpleline"
+            # Match the lead-indent used by the single-pass done line
+            # at 1624: 6 spaces when this transcribe was triggered by a
+            # download (so it threads under the [Dwnld] row), one
+            # space otherwise. Without this the chunked path produced
+            # a single-space line that visually misaligned in sync logs
+            # (audit: H62).
+            _lead_ch = "      " if job.get("from_download") else " "
             _segs_c = [
-                [" ", _dim_tag],
+                [_lead_ch, _dim_tag],
                 ["\u2014 \u2713 ", _em_tag],
                 ["Transcription", _lbl_tag],
             ]
@@ -1944,7 +2023,8 @@ class TranscribeManager:
                        title: str = "", channel: str = "",
                        combined_override: bool | None = None,
                        retranscribe: bool = False,
-                       video_id_hint: str = ""):
+                       video_id_hint: str = "",
+                       job: dict | None = None):
         """Write a transcript entry to the aggregated {ch} Transcript.txt
         + hidden JSONL sidecar. Matches YTArchiver.py:15449-15478 output
         layout exactly, so OLD YTArchiver can read transcripts written
@@ -1963,11 +2043,21 @@ class TranscribeManager:
         doesn't carry `[videoId]` — helps `_replace_jsonl_entry` find
         title-drifted stale entries.
         """
-        # Bail early on cancel_all so a "Cancel All" click during the
-        # Whisper response stage doesn't still commit one more
-        # transcript to disk (audit: transcribe/core.py:783-799).
+        # Bail early on cancel_all OR per-job Skip so the user's Skip
+        # click during the Whisper response stage doesn't still commit
+        # a transcript to disk (audit: transcribe/core.py:783-799 +
+        # transcribe H60 — previously only `_cancel_all` was checked,
+        # letting a per-job `job["cancel"]` slip past).
         if self._cancel_all.is_set():
             raise RuntimeError("cancelled before write")
+        try:
+            _job_cancel_ev = (job or {}).get("cancel") if isinstance(job, dict) else None
+            if _job_cancel_ev is not None and _job_cancel_ev.is_set():
+                raise RuntimeError("cancelled before write (per-job skip)")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
         if not title:
             title = os.path.basename(video_path).rsplit(".", 1)[0]
             # Strip any trailing " [videoId]" if the stem has one
@@ -2051,9 +2141,15 @@ class TranscribeManager:
         # user sees "Whisper:large-v3" and assumes punct is present.
         _punct_attempted = bool(result.get("_punct_attempted"))
         _punct_success = bool(result.get("_punct_success"))
+        _punct_timeout = bool(result.get("_punct_timeout"))
         _punct_suffix = ""
         if _punct_attempted and not _punct_success:
-            _punct_suffix = "+NO-PUNCT"
+            # Distinguish timeout from generic no-punct so the user
+            # can tell at-a-glance why a transcript is unpunctuated.
+            # The _punct_timeout flag was already being set by the
+            # punctuation manager but the source tag never read it
+            # (audit: transcribe/core.py H69).
+            _punct_suffix = "+TIMEOUT" if _punct_timeout else "+NO-PUNCT"
         if model_name:
             source_tag = f"(WHISPER:{model_name}{_punct_suffix})"
         else:
@@ -2082,11 +2178,27 @@ class TranscribeManager:
             # .txt fails, surface a prominent error and attempt a
             # roll-back by re-reading the backup we captured first.
             _jsonl_backup: bytes | None = None
+            _backup_failed = False
             try:
                 with open(jsonl_path, "rb") as _jb:
                     _jsonl_backup = _jb.read()
-            except OSError:
+            except FileNotFoundError:
+                # First-ever retranscribe on a fresh .jsonl — no
+                # backup needed because there's no prior state to
+                # roll back to.
                 _jsonl_backup = None
+            except OSError as _bke:
+                _jsonl_backup = None
+                _backup_failed = True
+                # Fail FAST before touching the .jsonl when we can't
+                # capture a backup — otherwise a .txt failure later
+                # would leave new .jsonl + old .txt with no way to
+                # recover (audit: transcribe/core.py H52).
+                self._stream.emit_error(
+                    f"Refusing retranscribe of "
+                    f"{os.path.basename(jsonl_path)}: backup capture "
+                    f"failed ({_bke}). Files left untouched.")
+                return
             try:
                 extra_titles = _replace_jsonl_entry(
                     jsonl_path, title, vid_id, segs) or set()

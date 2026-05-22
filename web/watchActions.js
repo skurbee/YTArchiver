@@ -265,11 +265,13 @@
       _applyTxFontSize(cur + 1);
     });
 
-    // Caption overlay size + background controls (persisted).
+    // Caption overlay size + background + mode controls (persisted).
     const _capSizeKey = "ytarchiver_caption_size";
     const _capBgKey   = "ytarchiver_caption_bg";
+    const _capModeKey = "ytarchiver_caption_mode";
     const _CAP_SIZES = new Set(["off", "small", "medium", "large"]);
     const _CAP_BGS   = new Set(["translucent", "outline", "none"]);
+    const _CAP_MODES = new Set(["single", "phrase3"]);
     function _applyCapSize(size) {
       const v = _CAP_SIZES.has(size) ? size : "off";
       window.setCaptionPref?.("size", v);
@@ -292,11 +294,24 @@
         try { _api.settings_save({ caption_overlay_bg: v }); } catch {}
       }
     }
+    function _applyCapMode(mode) {
+      const v = _CAP_MODES.has(mode) ? mode : "single";
+      window.setCaptionPref?.("mode", v);
+      const sel = document.getElementById("watch-cap-mode");
+      if (sel && sel.value !== v) sel.value = v;
+      try { localStorage.setItem(_capModeKey, v); } catch {}
+      const _api = window.pywebview?.api;
+      if (_api?.settings_save) {
+        try { _api.settings_save({ caption_overlay_mode: v }); } catch {}
+      }
+    }
     try {
       const _sz = localStorage.getItem(_capSizeKey);
       if (_sz && _CAP_SIZES.has(_sz)) _applyCapSize(_sz);
       const _bg = localStorage.getItem(_capBgKey);
       if (_bg && _CAP_BGS.has(_bg)) _applyCapBg(_bg);
+      const _md = localStorage.getItem(_capModeKey);
+      if (_md && _CAP_MODES.has(_md)) _applyCapMode(_md);
     } catch {}
     (async () => {
       try {
@@ -307,6 +322,9 @@
         if (s?.caption_overlay_bg && _CAP_BGS.has(s.caption_overlay_bg)) {
           _applyCapBg(s.caption_overlay_bg);
         }
+        if (s?.caption_overlay_mode && _CAP_MODES.has(s.caption_overlay_mode)) {
+          _applyCapMode(s.caption_overlay_mode);
+        }
       } catch {}
     })();
     document.getElementById("watch-cap-size")?.addEventListener("change", (ev) => {
@@ -314,6 +332,25 @@
     });
     document.getElementById("watch-cap-bg")?.addEventListener("change", (ev) => {
       _applyCapBg(ev.target.value);
+    });
+    document.getElementById("watch-cap-mode")?.addEventListener("change", (ev) => {
+      _applyCapMode(ev.target.value);
+    });
+
+    // ⋮ More — overflow menu for less-used watch-view actions.
+    // Reuses the hidden source buttons' click handlers so we don't have
+    // to re-implement the redownload / re-transcribe / refresh flows.
+    document.getElementById("btn-watch-more")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      const showMenu = window.showContextMenu;
+      if (!showMenu) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const click = (id) => () => document.getElementById(id)?.click();
+      showMenu(rect.left, rect.bottom + 4, [
+        { label: "Redownload…", action: click("btn-watch-redownload") },
+        { label: "Re-transcribe…", action: click("btn-watch-retranscribe") },
+        { label: "Refresh metadata", action: click("btn-watch-refresh-meta") },
+      ]);
     });
 
     // Drag-resize splitter between video and transcript panels.
@@ -438,11 +475,20 @@
         return;
       }
       if (!model) return; // user cancelled
+      // Mark inflight BEFORE the bridge call so a whisper_pct event
+      // racing between the bridge return and the post-await success
+      // branch finds the entry and updates it. Roll back on failure
+      // (audit: watchActions.js C27).
+      if (vid) {
+        window._inflightRetranscribes.set(vid, 0);
+        window._syncWatchRetranscribeButton();
+      }
       let res;
       try {
         res = await api.transcribe_retranscribe(
           v.filepath, v.title || "", vid);
       } catch (e) {
+        if (vid) window._inflightRetranscribes.delete(vid);
         window._showToast?.(`Re-transcribe call failed: ${e?.message || e}`, "error");
         return;
       }
@@ -450,8 +496,7 @@
         window._showToast?.(
           `Queued ${model} re-transcription.`, "ok");
         if (vid) {
-          window._inflightRetranscribes.set(vid, 0);
-          window._syncWatchRetranscribeButton();
+          // already in the map from the optimistic insert above
         } else {
           // Edge case: no video_id available — the progress display
           // can't track this job since it keys on vid. Surface the
@@ -471,6 +516,8 @@
           }
         }
       } else {
+        if (vid) window._inflightRetranscribes.delete(vid);
+        window._syncWatchRetranscribeButton?.();
         window._showToast?.(res?.error || "Re-transcribe failed.", "error");
       }
     });
@@ -609,7 +656,14 @@
       }
     }
 
-    watchFind?.addEventListener("input", _rebuildFindMatches);
+    // Debounce so each keystroke doesn't full-scan the transcript
+    // (audit: watchActions.js H157). 120ms keeps the find feel
+    // responsive while collapsing rapid typing into one scan.
+    let _findDebounce = null;
+    watchFind?.addEventListener("input", () => {
+      if (_findDebounce) clearTimeout(_findDebounce);
+      _findDebounce = setTimeout(_rebuildFindMatches, 120);
+    });
     watchFind?.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();

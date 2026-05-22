@@ -124,9 +124,20 @@
         // Focus the safe button by default (Cancel for danger, Confirm
         // otherwise). Audit U-10: accidental Enter on a danger dialog
         // shouldn't auto-confirm.
-        const focusTarget = (cfg.danger && cancelBtn)
-          ? cancelBtn
-          : root.querySelector('[data-act="confirm"]');
+        // BUT: if danger+noCancel (no cancel button rendered), the
+        // fallback to focusing the confirm button defeats the safety
+        // entirely — an Enter press auto-confirms the destructive
+        // action. In that case focus the dialog root instead, so
+        // Enter doesn't immediately commit (audit: modals.js H230).
+        let focusTarget;
+        if (cfg.danger && !cancelBtn) {
+          focusTarget = root;
+          try { root.setAttribute("tabindex", "-1"); } catch {}
+        } else if (cfg.danger && cancelBtn) {
+          focusTarget = cancelBtn;
+        } else {
+          focusTarget = root.querySelector('[data-act="confirm"]');
+        }
         setTimeout(() => focusTarget?.focus(), 30);
       },
     });

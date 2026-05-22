@@ -14,27 +14,24 @@ from ._shared import *  # noqa: F401,F403
 class SettingsMixin:
 
     def set_log_mode(self, mode):
-        """UI toggled log mode. Pushes filter state into LogStreamer + persists (gated)."""
+        """UI toggled log mode. Pushes filter state into LogStreamer +
+        persists (gated). Returns the {ok, error?} dict shape that the
+        rest of the Api surface uses, instead of a raw bool — JS
+        callers that read `.ok` used to see `undefined` and couldn't
+        tell success from failure (audit: settings_mixin H6)."""
         if mode not in ("Simple", "Verbose"):
-            return False
-        # Persist to disk FIRST, then mutate in-memory state on success.
-        # If the save fails (permission, write-gate off, disk full),
-        # leaving self._config unchanged keeps the in-memory state
-        # consistent with what the next reload will read.
+            return {"ok": False, "error": "Invalid mode"}
         persisted = False
-        # Hold the same settings-save lock so a parallel settings_save
-        # can't interleave the load→mutate→save (audit: settings_mixin.
-        # py:33-37). With the lock, even if save fails partway, the
-        # in-memory state reload below + on next call is consistent
-        # with whatever survived on disk.
+        save_exc = ""
         with SettingsMixin._settings_save_lock:
             try:
                 from backend.ytarchiver_config import save_config as _sc
                 cfg = load_config()
                 cfg["log_mode"] = mode
                 persisted = bool(_sc(cfg))
-            except Exception:
+            except Exception as _se:
                 persisted = False
+                save_exc = str(_se)
             if persisted:
                 if self._config is not None:
                     self._config["log_mode"] = mode
@@ -46,19 +43,35 @@ class SettingsMixin:
                 # caller's intent.
                 try: self._reload_config()
                 except Exception: pass
-            return persisted
+        if persisted:
+            return {"ok": True}
+        return {"ok": False, "error": save_exc or "Config write failed"}
 
 
     # ─── Autorun scheduler ─────────────────────────────────────────────
 
     def autorun_set(self, label_or_mins):
-        """Accept a label like '30 min' / '1 hr' / 'Off' OR an integer minutes."""
+        """Accept a label like '30 min' / '1 hr' / 'Off' OR an integer
+        minutes. Booleans are rejected explicitly so a JS coercion
+        (e.g. `autorun_set(false)` meaning "off") doesn't silently
+        land as `int(True)==1` minute (audit: settings_mixin H7)."""
+        if isinstance(label_or_mins, bool):
+            return {"ok": False,
+                    "error": "Pass a label string ('Off', '30 min', ...) "
+                             "or an integer minute count, not a boolean."}
         if isinstance(label_or_mins, str):
-            return self._autorun.set_interval_label(label_or_mins)
+            try:
+                return self._autorun.set_interval_label(label_or_mins)
+            except ValueError as _ve:
+                return {"ok": False, "error": f"Invalid label: {_ve}"}
         try:
-            return self._autorun.set_interval_mins(int(label_or_mins))
-        except Exception:
-            return {"ok": False, "error": "bad value"}
+            mins = int(label_or_mins)
+        except (TypeError, ValueError) as _ve:
+            return {"ok": False, "error": f"Bad value: {_ve}"}
+        try:
+            return self._autorun.set_interval_mins(mins)
+        except ValueError as _ve:
+            return {"ok": False, "error": f"Invalid minutes: {_ve}"}
 
 
     def autorun_state(self):

@@ -32,7 +32,17 @@ class WindowMixin:
         """
         choice = (choice or "").lower()
         if choice not in ("quit", "tray"):
+            # Bad choice still releases the reentrant-X guard so the
+            # next click can show a fresh modal (audit: main.py H24).
+            try: self._close_dialog_pending = False
+            except Exception: pass
             return {"ok": False, "error": "Invalid choice"}
+        # Release the X-click reentrant guard either way — if the user
+        # picked "tray" we'll get more X-clicks later; if "quit" the
+        # process is about to exit anyway. Doing it here keeps the flag
+        # lifetime tied to the modal lifetime (audit: main.py H24).
+        try: self._close_dialog_pending = False
+        except Exception: pass
         if remember:
             try:
                 from backend.ytarchiver_config import save_config as _sc
@@ -125,6 +135,30 @@ class WindowMixin:
 
     # ─── Native file/folder dialogs ─────────────────────────────────────
 
+    def _normalize_dialog_paths(self, paths):
+        """pywebview returns one of: None, "" (cancel), a single string
+        (some platforms wrap one path in a bare string), a tuple/list
+        of strings (most common), or an empty tuple/list (cancel).
+        Bare `if paths: paths[0]` failed both cases: a string is
+        truthy but `paths[0]` is the first char; an empty tuple was
+        truthy on some pywebview versions even when no selection
+        landed (audit: window_mixin H9 — same fix already in
+        backup_mixin.py).
+        """
+        if not paths:
+            return None
+        if isinstance(paths, str):
+            return paths or None
+        try:
+            if len(paths) == 0:
+                return None
+            first = paths[0]
+            if isinstance(first, str) and first:
+                return first
+        except (TypeError, IndexError):
+            return None
+        return None
+
     def pick_folder(self, title="Choose a folder", initial=None):
         """Open a native folder picker (pywebview's FOLDER_DIALOG)."""
         try:
@@ -136,8 +170,9 @@ class WindowMixin:
                 directory=str(initial) if initial else "",
                 allow_multiple=False,
             )
-            if paths:
-                return {"ok": True, "path": paths[0]}
+            path = self._normalize_dialog_paths(paths)
+            if path:
+                return {"ok": True, "path": path}
             return {"ok": False, "cancelled": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -156,8 +191,9 @@ class WindowMixin:
                 allow_multiple=False,
                 file_types=file_types,
             )
-            if paths:
-                return {"ok": True, "path": paths[0]}
+            path = self._normalize_dialog_paths(paths)
+            if path:
+                return {"ok": True, "path": path}
             return {"ok": False, "cancelled": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -201,21 +237,15 @@ class WindowMixin:
         """
         try:
             import subprocess
-            # Run shutdown cleanup FIRST so child subprocesses are
-            # killed, queue state saved, ports released BEFORE the
-            # new instance launches. The previous order spawned the
-            # new process and then waited 0.6s before tearing down —
-            # during that window two YTArchiver instances briefly ran
-            # concurrently against the same SQLite WAL DB and config,
-            # observed to cause WAL/locked-db errors and the stale
-            # instance's queue save clobbering the freshly-restored
-            # config.
-            try:
-                _cb = getattr(self, "_shutdown_cleanup_fn", None)
-                if callable(_cb):
-                    _cb()
-            except Exception as _ce:
-                print(f"[app_restart] shutdown_cleanup (pre-launch): {_ce}")
+            # Cleanup happens ONCE in `_die` (post-launch) — the
+            # previous pre-launch + post-launch double-call meant
+            # `_queues.save_now()` ran twice. On a slow disk the
+            # second save could land AFTER the new instance had
+            # already written its own queue file, clobbering it
+            # (audit: window_mixin H8). Also: pre-launch cleanup
+            # would race the new instance's port-bind (~2.5s kill
+            # vs new instance startup), so dropping it here also
+            # eliminates the brief two-instance window.
             if getattr(sys, "frozen", False):
                 # Running as PyInstaller exe — relaunch the .exe itself.
                 subprocess.Popen([sys.executable],

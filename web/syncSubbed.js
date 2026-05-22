@@ -39,6 +39,40 @@
     const pauseBtn = document.getElementById("btn-pause");
     if (!btn) return;
 
+    // Right-click: append every subbed channel to end of the queue
+    // without starting the worker. Dedupe-aware (skips already-queued
+    // or currently-running channels). For when a sync is mid-pass and
+    // you want another full pass to follow it, or for staging the queue
+    // while Auto is off.
+    btn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const api = window.pywebview?.api;
+      if (!api?.sync_enqueue_all_channels) return;
+      showContextMenu(e.clientX, e.clientY, [
+        { label: "Add all subbed channels to end of queue",
+          action: async () => {
+            try {
+              const r = await api.sync_enqueue_all_channels();
+              if (!r?.ok) {
+                window._showToast?.(r?.error || "Enqueue failed.", "error");
+                return;
+              }
+              const q = r.queued || 0;
+              const s = r.skipped || 0;
+              const msg = q > 0
+                ? `Queued ${q} channel${q === 1 ? "" : "s"}`
+                  + (s > 0 ? ` (${s} already queued).` : ".")
+                : (s > 0
+                    ? `All ${s} channels already in queue.`
+                    : "No subbed channels to queue.");
+              window._showToast?.(msg, q > 0 ? "ok" : "warn");
+            } catch (err) {
+              window._showToast?.("Error: " + err, "error");
+            }
+          }},
+      ]);
+    });
+
     btn.addEventListener("click", _inFlight(async () => {
       const api = window.pywebview?.api;
       if (!api) {

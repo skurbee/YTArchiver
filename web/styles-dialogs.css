@@ -346,7 +346,10 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  z-index: 10000;
+  /* Toast must sit ABOVE modals (9999) so a quick toast isn't
+     obscured by an open confirm dialog. Tier: ctx-menu/popover
+     9500 < modal 9999 < toast 10001 (audit: styles-dialogs L145). */
+  z-index: 10001;
   pointer-events: none;
 }
 .toast {

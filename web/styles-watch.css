@@ -121,6 +121,32 @@
   white-space: nowrap;
   flex-shrink: 0;
 }
+/* Two-row split: row 1 holds the primary action buttons (+ ⋮ More for
+   the secondary actions), row 2 holds playback/overlay/follow controls.
+   Splitting keeps everything reachable at narrow widths instead of
+   silently wrapping off the visible area. */
+.watch-actions-row1 { margin-top: 6px; }
+.watch-actions-row2 { margin-top: 4px; }
+/* Source buttons for the More menu — kept in the DOM (their existing
+   click handlers fire when the menu items dispatch .click()), but never
+   visible or focusable themselves. */
+.hidden-action {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.watch-more-btn {
+  /* Slightly tighter than the regular ghost button — it's a menu
+     trigger, not a primary action. */
+  padding-left: 8px;
+  padding-right: 8px;
+}
 .watch-title {
   color: var(--c-text);
   font-size: 16px;
@@ -188,6 +214,12 @@
 }
 .watch-video-el[data-cap-bg="none"]::cue {
   background: transparent;
+}
+/* 3-words mode: previous + next words are wrapped in <c.dim> spans so
+   the current word stays at full opacity and the neighbors fade. ::cue
+   only honors a narrow style set — opacity is on that list. */
+.watch-video-el::cue(.dim) {
+  opacity: 0.55;
 }
 
 /* Hover-only keyboard-shortcuts hint in the transcript header. Styled
@@ -283,12 +315,14 @@
 .watch-src-banner.whisper {
   background: rgba(74, 158, 106, 0.08);
   border-color: rgba(74, 158, 106, 0.28);
-  color: #bfe6cf;
+  /* Use --c-ok-fg palette token (audit: L173). */
+  color: var(--c-ok-fg);
 }
 .watch-src-banner.yt {
   background: rgba(210, 160, 80, 0.08);
   border-color: rgba(210, 160, 80, 0.28);
-  color: #e8cfa0;
+  /* Use --c-warn-fg palette token (audit: L173). */
+  color: var(--c-warn-fg);
 }
 .watch-src-dot {
   width: 8px;
@@ -356,8 +390,11 @@
 }
 .watch-meta-body {
   padding: 0 16px 12px;
+  /* Inherit scroll from .watch-video-wrap (its overflow-y: auto
+     handles the whole column). Having both this AND the wrapper
+     scroll caused scroll-chaining issues — wheel events stalled
+     when the inner reached its max-height (audit: H255). */
   max-height: 420px;
-  overflow-y: auto;
 }
 .watch-meta-description {
   color: var(--c-text);

@@ -27,7 +27,10 @@
   //
   // The old "Paste & archive" button is gone — pasting a URL just shows the
   // Download button, which is more discoverable and matches the original.
-  const _YT_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/)|youtu\.be\/)[\w-]{6,}/i;
+  // Anchor on the youtube domain proper (with optional subdomain or
+  // music.) so "notyoutube.com" can't match. Add `/clip/` for shorts-
+  // clip URLs (audit: downloadUrl.js H240).
+  const _YT_RE = /(?:^|[./@])(?:music\.|m\.|www\.)?youtube\.com\/(?:watch\?v=|shorts\/|embed\/|live\/|clip\/)|(?:^|[./@])youtu\.be\/[\w-]{6,}/i;
 
   function initUrlField() {
     const input = document.getElementById("url-input");
@@ -172,6 +175,14 @@
         custom_name: customName,
       };
     };
+    // Expose on window so cross-IIFE callers (e.g. downloadDragDrop.js
+    // when a URL is dropped onto the window) can read the same panel
+    // values. Previously downloadDragDrop.js used a `typeof readVideoOptions`
+    // bareword check that silently fell through to `{}` because the
+    // const above was scoped to this IIFE — dropped URLs always used
+    // backend defaults, ignoring everything the user filled in (audit:
+    // downloadDragDrop.js C35).
+    window._readVideoOptions = readVideoOptions;
 
     const submit = async () => {
       const url = (input.value || "").trim();

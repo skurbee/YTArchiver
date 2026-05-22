@@ -32,6 +32,10 @@
   let _graphType = "line"; // current chart type
 
   function initGraphView() {
+    // Re-init guard so a second invocation doesn't double-wire
+    // every click handler (audit: graphTab.js H218).
+    if (window._graphInited) return;
+    window._graphInited = true;
     const btn = document.getElementById("btn-graph-run");
     if (btn) btn.addEventListener("click", drawGraph);
     // Chart-type buttons
@@ -334,6 +338,18 @@
     // Scale font sizes between 12px and 52px based on rank.
     const max = words[0].count || 1;
     const min = words[words.length - 1].count || 1;
+    // Degenerate-data hint: when every word ties at the same count
+    // the cloud renders as one uniform size with no rank cue. Make
+    // the user aware that frequency ordering is arbitrary (audit:
+    // graphTab.js H220).
+    if (max === min && words.length > 1) {
+      const hint = document.createElement("div");
+      hint.className = "browse-hint";
+      hint.style.cssText = "padding:8px 12px;color:var(--c-dim);font-size:12px;";
+      hint.textContent = `All ${words.length} words tied at ${max} `
+        + `occurrences — frequency ordering is arbitrary.`;
+      cloud.appendChild(hint);
+    }
     const palette = ["#6cb4ee", "#e87aac", "#3dd68c", "#c7e64f",
                      "#c084fc", "#ff8c42", "#38d9e0", "#dde1e8"];
     for (let i = 0; i < words.length; i++) {

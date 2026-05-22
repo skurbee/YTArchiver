@@ -189,13 +189,40 @@ def fetch_channel_metadata(channel: dict[str, Any],
                         and os.path.normpath(v[4]).lower() in _failed_id_files)
 
     # 2. Read existing metadata JSONLs.
+    # Scope by the channel's name-prefix so a sibling channel's JSONL
+    # that happens to live under this tree (rename leftover, manual
+    # reorg, etc.) doesn't contribute foreign video_ids to `have_meta`.
+    # Without this, targets selection would skip "covered" videos that
+    # are actually missing metadata for THIS channel (audit:
+    # refresh_fetch.py C16).
     have_meta: set = set()
     jsonl_count = 0
+    _expected_prefix = f".{name} "          # ".{ch_name} ..."
+    _expected_exact  = f".{name} Metadata.jsonl"
     for dp, _dns, fns in os.walk(str(folder)):
         for fn in fns:
-            if fn.endswith("Metadata.jsonl"):
-                jsonl_count += 1
-                have_meta.update(_read_metadata_jsonl(os.path.join(dp, fn)).keys())
+            if not fn.endswith("Metadata.jsonl"):
+                continue
+            # Accept either the bare ".{name} Metadata.jsonl" form
+            # (no year/month split) or any ".{name} <year/month tag>
+            # Metadata.jsonl" form. Reject ".{otherChannel} ..." files
+            # even though they share the suffix.
+            if fn != _expected_exact and not fn.startswith(_expected_prefix):
+                continue
+            jsonl_count += 1
+            # Per-file error isolation so one corrupt jsonl doesn't
+            # tank the whole channel's metadata pass (audit:
+            # refresh_fetch H79). Surface the failure to the stream
+            # so the user can investigate / regenerate.
+            try:
+                have_meta.update(
+                    _read_metadata_jsonl(os.path.join(dp, fn)).keys())
+            except Exception as _re:
+                try:
+                    stream.emit_dim(
+                        f" (jsonl read failed: {fn} — {_re})")
+                except Exception:
+                    pass
 
     # 3. Enumerate existing THUMBNAILS. a case: 2 videos had
     # metadata JSONL entries but no thumbnail file on disk — the
@@ -348,7 +375,14 @@ def fetch_channel_metadata(channel: dict[str, Any],
                             # If a tx is already open (auto-begin),
                             # carry on — _db_lock still serializes us.
                             pass
+                        # Chunked-commit so a single long transaction
+                        # doesn't block other DB readers for the entire
+                        # duplicate-detect pass on large channels. The
+                        # 50-row chunk size matches index sweep_new
+                        # cadence (audit: refresh_fetch H83).
+                        _chunk_n = 0
                         for _fp, _vid in resolved.items():
+                            _chunk_n += 1
                             existing = conn.execute(
                                 "SELECT filepath, size_bytes FROM videos "
                                 "WHERE video_id=? AND filepath != ? "
@@ -397,6 +431,13 @@ def fetch_channel_metadata(channel: dict[str, Any],
                                     (_vid,
                                      f"https://www.youtube.com/watch?v={_vid}",
                                      _fp))
+                            if _chunk_n >= 50:
+                                try:
+                                    conn.commit()
+                                    conn.execute("BEGIN IMMEDIATE")
+                                except Exception:
+                                    pass
+                                _chunk_n = 0
                         try:
                             conn.commit()
                         except Exception as _ce:

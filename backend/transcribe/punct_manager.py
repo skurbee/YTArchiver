@@ -17,6 +17,7 @@ import os
 import subprocess
 import threading
 from pathlib import Path
+from typing import Any  # used in line 174 type-annotation (audit H42)
 
 from ..log import get_logger
 from ..log_stream import LogStreamer
@@ -25,6 +26,27 @@ from .helpers import find_python311
 
 _log = get_logger(__name__)
 _startupinfo = _make_startupinfo()
+
+# Process-wide singleton handle. Two PunctuationManagers each spawn
+# their own subprocess and each load the CUDA model into VRAM, which
+# OOMs low-VRAM GPUs. Reuse one instance across both the live
+# transcribe worker AND the Restore-Punctuation pass (audit: H44).
+_singleton_lock = threading.Lock()
+_singleton: "PunctuationManager | None" = None
+
+
+def get_shared_punct_manager(stream: LogStreamer) -> "PunctuationManager":
+    """Return the process-singleton PunctuationManager, constructing
+    it on first call. Subsequent callers see the same instance even
+    if they pass a different `stream` — the stream from the first
+    call wins (this is fine: the only stream consumer is the
+    subprocess-emit path, and emitting to the original stream is
+    safe even when the call originated from a different stage)."""
+    global _singleton
+    with _singleton_lock:
+        if _singleton is None:
+            _singleton = PunctuationManager(stream)
+        return _singleton
 
 
 class PunctuationManager:

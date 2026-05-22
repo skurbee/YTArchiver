@@ -97,3 +97,26 @@ def fire_metadata_changed_hook() -> None:
             _on_metadata_changed_hook()
         except Exception as e:
             _log.debug("swallowed: %s", e)
+
+
+# Channel-synced hook — fires each time `sync_all` finishes one channel
+# (after the done-row emit + config write). Main.py wires this to a
+# debounced JS push so the Subs tab's "Last Sync" column updates as
+# channels finish, not only at end-of-pass.
+_on_channel_synced_hook: Any | None = None
+
+
+def set_channel_synced_hook(hook: Any | None) -> None:
+    """Main.py wires this so the Subs tab auto-refreshes after each
+    channel finishes syncing (per-channel live "Last Sync" updates)."""
+    global _on_channel_synced_hook
+    _on_channel_synced_hook = hook
+
+
+def fire_channel_synced_hook() -> None:
+    """Best-effort fire of the registered hook. Safe no-op when unset."""
+    if _on_channel_synced_hook is not None:
+        try:
+            _on_channel_synced_hook()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)

@@ -22,7 +22,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -143,7 +143,11 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             # title display.
             title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
             try:
-                mtime = datetime.fromtimestamp(os.path.getmtime(fp))
+                # Read mtime as UTC — yt-dlp --mtime stamps files in UTC,
+                # and the metadata JSONL bucket lookup elsewhere is UTC.
+                # Using local time here would route near-midnight uploads
+                # into the wrong bucket and cause duplicate entries.
+                mtime = datetime.fromtimestamp(os.path.getmtime(fp), tz=timezone.utc)
                 year, month = mtime.year, mtime.month
             except OSError:
                 year, month = None, None

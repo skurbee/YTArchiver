@@ -87,13 +87,14 @@ class RedownloadMixin:
 
             def _confirm(avg_pct, direction, res_label, sample_n):
                 ev = threading.Event()
-                # Per-job key so a (theoretical) concurrent sample-
-                # confirm step can't overwrite this one's pending dict.
-                # Redownloads currently drain serially through the
-                # sync queue, but adding the key future-proofs the
-                # path (audit: redownload_mixin.py:88-114).
+                # Per-job key so a concurrent sample-confirm step can't
+                # overwrite this one's pending dict. Each call captures
+                # its own `pending` local and reads choice from THAT —
+                # never from `self._redwnl_sample` — so a second job
+                # writing the single-slot attribute can't mis-resolve
+                # this one (audit: redownload_mixin.py C4).
                 _job_key = (ch.get("url") or ch.get("name") or "")
-                self._redwnl_sample = {
+                pending = {
                     "avg_pct": float(avg_pct),
                     "direction": str(direction),
                     "res_label": str(res_label),
@@ -102,12 +103,19 @@ class RedownloadMixin:
                     # Default is now `cancel` on timeout. Old default
                     # was `continue`, so a user who walked away for
                     # 5+ minutes had the redownload silently proceed
-                    # without their consent (audit: redownload_mixin.
-                    # py:113).
+                    # without their consent.
                     "choice": "cancel",
                     "_job_key": _job_key,
                     "_timed_out": False,
                 }
+                if not hasattr(self, "_redwnl_samples") or \
+                        self._redwnl_samples is None:
+                    self._redwnl_samples = {}
+                self._redwnl_samples[_job_key] = pending
+                # Legacy single-slot kept for the resolver fast-path and
+                # any external introspection; resolver also walks the
+                # keyed dict so multiple-pending overlaps still resolve.
+                self._redwnl_sample = pending
                 try:
                     import json as _json
                     _payload = _json.dumps({
@@ -130,14 +138,18 @@ class RedownloadMixin:
                     # later that the redownload stopped, not silently
                     # progressed.
                     try:
-                        self._redwnl_sample["_timed_out"] = True
+                        pending["_timed_out"] = True
                         self._log_stream.emit_dim(
                             "[Sync] Redownload sample-confirm timed out "
                             "(5 min) — cancelling rather than proceeding.")
                         self._log_stream.flush()
                     except Exception:
                         pass
-                return self._redwnl_sample.get("choice", "cancel")
+                try:
+                    self._redwnl_samples.pop(_job_key, None)
+                except Exception:
+                    pass
+                return pending.get("choice", "cancel")
 
             _rd.redownload_channel(
                 ch.get("name", ""), ch.get("url", ""), folder, new_res,
@@ -187,20 +199,32 @@ class RedownloadMixin:
           - "best" / "2160" / "1440" / "1080" / "720" / "480" / "360"
             / "240" / "144" → switch to that resolution and resample
         """
-        pending = getattr(self, "_redwnl_sample", None)
-        if not pending:
+        samples = getattr(self, "_redwnl_samples", None) or {}
+        pending_list = list(samples.values())
+        if not pending_list:
+            # Fall back to legacy single-slot in case nothing was keyed
+            # (paths that haven't been migrated yet).
+            legacy = getattr(self, "_redwnl_sample", None)
+            if legacy:
+                pending_list = [legacy]
+        if not pending_list:
             return {"ok": False, "error": "no pending sample-confirm"}
         c = str(choice or "continue").strip().lower()
         if c not in ("continue", "cancel",
                      "best", "2160", "1440", "1080", "720",
                      "480", "360", "240", "144"):
             return {"ok": False, "error": f"invalid choice: {c}"}
-        pending["choice"] = c
-        ev = pending.get("event")
-        if ev is not None:
-            try: ev.set()
-            except Exception as e: _log.debug("swallowed: %s", e)
-        return {"ok": True, "choice": c}
+        # In normal (serial) operation there's exactly one pending. If
+        # multiple ever overlap, apply the user's choice to all rather
+        # than dropping any — leaving one stranded would hang the worker
+        # for the full 5-minute timeout.
+        for pending in pending_list:
+            pending["choice"] = c
+            ev = pending.get("event")
+            if ev is not None:
+                try: ev.set()
+                except Exception as e: _log.debug("swallowed: %s", e)
+        return {"ok": True, "choice": c, "resolved": len(pending_list)}
 
 
     def queue_pending_check(self):

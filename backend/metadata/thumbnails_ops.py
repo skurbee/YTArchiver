@@ -64,14 +64,20 @@ _video_id_cache_state: dict[str, Any] = {"ts": 0.0, "rows": {}}
 _video_id_cache_lock = threading.Lock()
 
 
-def sweep_missing_thumbnails(channel: dict[str, Any], stream=None
-                              ) -> dict[str, int]:
+def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
+                              cancel_event=None) -> dict[str, int]:
     """Issue #147/#158: scan a channel folder for .mp4 files that lack a
     thumbnail in `.Thumbnails/` and download any missing ones from the
     URLs cached in metadata.jsonl. Use after a sync pass to catch
     thumbnails that yt-dlp's bulk download missed (rate-limited, racy,
     transient network blips). Returns {checked, fetched, missing}.
+
+    `cancel_event` (audit: thumbnails_ops H38) is checked per-bucket so
+    a user-pressed Cancel during the post-sync sweep returns promptly
+    instead of waiting for hundreds of HTTP fetches.
     """
+    def _is_cancelled():
+        return cancel_event is not None and cancel_event.is_set()
     folder = _folder_for_channel(channel)
     if not folder or not folder.exists():
         return {"checked": 0, "fetched": 0, "missing": 0}
@@ -108,7 +114,14 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None
                     continue
                 _m = _id_re.search(_fn)
                 if _m:
-                    _all_thumb_vids.add(_m.group(1))
+                    _candidate = _m.group(1)
+                    # Reject all-alpha 11-char strings — those are
+                    # almost always user-typed labels (e.g.
+                    # "[a-user-channel]") rather than real YouTube
+                    # video IDs which always mix digits + symbols
+                    # (audit: thumbnails_ops H98).
+                    if not _candidate.isalpha():
+                        _all_thumb_vids.add(_candidate)
     except Exception as e:
         _log.debug("swallowed: %s", e)
     by_bucket: dict[tuple[int | None, int | None],
@@ -118,11 +131,15 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None
             continue
         by_bucket.setdefault((_y, _m), []).append((path, vid_id))
     for (yr, mo), items in by_bucket.items():
+        if _is_cancelled():
+            break
         jp, sub = _get_metadata_jsonl_path(
             name, ch_root, split_years, split_months, yr, mo)
         thumb_dir = _ensure_thumbnails_dir(sub)
         meta = _read_metadata_jsonl(jp) if jp else {}
         for path, vid_id in items:
+            if _is_cancelled():
+                break
             checked += 1
             # Already covered somewhere in the channel? Skip the
             # re-download. (Was: only checked thumb_dir adjacent to
@@ -151,9 +168,16 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None
                         if _c is not None:
                             with _idx._db_lock:
                                 try:
+                                    # Scope by channel so a video that
+                                    # exists in multiple channel folders
+                                    # (cross-channel merge / manual copy)
+                                    # doesn't flip the flag for the
+                                    # wrong channel's row (audit:
+                                    # thumbnails_ops H78).
                                     _c.execute(
                                         "UPDATE videos SET has_thumbnail=1 "
-                                        "WHERE video_id=?", (vid_id,))
+                                        "WHERE video_id=? AND channel=?",
+                                        (vid_id, name))
                                     _c.commit()
                                 except Exception as _ue:
                                     # Roll back so a parallel reader
@@ -332,9 +356,11 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                         _c2 = _idx2._open()
                         if _c2 is not None:
                             with _idx2._db_lock:
+                                # Channel-scoped UPDATE (audit: H78).
                                 _c2.execute(
                                     "UPDATE videos SET has_thumbnail=1 "
-                                    "WHERE video_id=?", (vid,))
+                                    "WHERE video_id=? AND channel=?",
+                                    (vid, name))
                                 _c2.commit()
                     except Exception as e:
                         _log.debug("swallowed: %s", e)

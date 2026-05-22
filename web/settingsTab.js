@@ -121,9 +121,18 @@
         // after settings_load completes. Belt-and-suspenders: also
         // dispatch `change` so any listeners reacting to live selection
         // changes also fire (matches a user clicking the option).
-        document.querySelectorAll(".settings-view .ctl-select").forEach((sel) => {
-          if (sel._ytddRepaint) sel._ytddRepaint();
-        });
+        // Skip repaint if the Settings panel is hidden — repaint
+        // reads layout sizes that are 0 / wrong while display:none,
+        // so the cached widths would be junk until the next activate
+        // event re-fires it anyway (audit: settingsTab H241).
+        const _settingsPanel = document.getElementById("panel-settings");
+        const _settingsHidden = !_settingsPanel
+          || _settingsPanel.classList.contains("active") === false;
+        if (!_settingsHidden) {
+          document.querySelectorAll(".settings-view .ctl-select").forEach((sel) => {
+            if (sel._ytddRepaint) sel._ytddRepaint();
+          });
+        }
         _updatePreloadHints();
         const vEl = document.getElementById("settings-ytdlp-version");
         if (vEl) vEl.textContent = "checking\u2026";

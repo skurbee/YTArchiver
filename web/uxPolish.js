@@ -69,24 +69,29 @@
       hide();
       currentEl = el;
       timer = setTimeout(() => {
+        // Bail if the element was removed from the DOM between
+        // mouseover and the 400ms tooltip-show timer (audit:
+        // uxPolish.js H141). Without this, mouseout never fires and
+        // the bubble stays orphaned on screen.
+        if (!document.contains(el)) return;
         const rect = el.getBoundingClientRect();
         let x = rect.left + rect.width / 2;
         let y = rect.bottom + 6;
         bubble = makeBubble(text, x, y);
-        // Now that it's in the DOM, re-measure + clamp to viewport
+        // Compute center FIRST, then clamp ONCE at the end so the
+        // re-center doesn't push a right-edge tooltip back off-
+        // screen (audit: uxPolish.js H135).
         const br = bubble.getBoundingClientRect();
-        if (br.right > window.innerWidth - 10) {
-          bubble.style.left = (window.innerWidth - br.width - 10) + "px";
+        const _centered_left = (rect.left + rect.width / 2) - (br.width / 2);
+        let _left = _centered_left;
+        if (_left + br.width > window.innerWidth - 10) {
+          _left = window.innerWidth - br.width - 10;
         }
-        if (br.left < 10) bubble.style.left = "10px";
+        if (_left < 10) _left = 10;
+        bubble.style.left = _left + "px";
         if (br.bottom > window.innerHeight - 10) {
-          // Flip above the element if no room below
           bubble.style.top = (rect.top - br.height - 6) + "px";
         }
-        // Center-align horizontally
-        const bbr = bubble.getBoundingClientRect();
-        bubble.style.left = (parseFloat(bubble.style.left) -
-                             (bbr.width / 2) + (rect.width / 2)) + "px";
       }, 400);
     });
     document.addEventListener("mouseout", (e) => {

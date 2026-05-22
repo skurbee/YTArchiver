@@ -91,12 +91,30 @@ def _is_under_allowed_root(path: str) -> bool:
         return False
     if not p:
         return False
+    # Also resolve symlinks so a malicious symlink under an allowed
+    # root can't tunnel to a path outside it (audit: local_fileserver
+    # H103). Use realpath on the ORIGINAL (un-normcased) path then
+    # re-normalize for the prefix check.
+    try:
+        _real = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
+    except Exception:
+        _real = p
     for root in _allowed_roots:
         # os.path.normcase ensures case-insensitive prefix match on
         # Windows. The + os.sep guard prevents "/ArchiveBad" from
         # matching an allowed root "/Archive".
         if p == root or p.startswith(root + os.sep) or p.startswith(root + "/"):
-            return True
+            # Belt + suspenders: also require the realpath under root.
+            if (_real == root or _real.startswith(root + os.sep)
+                    or _real.startswith(root + "/")):
+                return True
+            try:
+                _log.warning(
+                    "local_fileserver: symlink escape blocked: %r → %r",
+                    path, _real)
+            except Exception:
+                pass
+            return False
     return False
 
 
@@ -246,8 +264,22 @@ def start_server() -> int:
     with _lock:
         if _server_port and _server_thread and _server_thread.is_alive():
             return _server_port
-        port = _pick_free_port()
-        _httpd = ThreadingHTTPServer(("127.0.0.1", port), _FileRequestHandler)
+        # TOCTOU retry: _pick_free_port releases the probe socket
+        # before bind, so another process can grab the port in the
+        # gap. Retry a few times on EADDRINUSE before failing
+        # (audit: local_fileserver L58).
+        _last_err = None
+        for _try in range(5):
+            port = _pick_free_port()
+            try:
+                _httpd = ThreadingHTTPServer(
+                    ("127.0.0.1", port), _FileRequestHandler)
+                break
+            except OSError as _be:
+                _last_err = _be
+                if _try == 4:
+                    raise
+                continue
         _server_thread = threading.Thread(
             target=_httpd.serve_forever, name="YTA-FileServer", daemon=True)
         _server_thread.start()

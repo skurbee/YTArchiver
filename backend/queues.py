@@ -340,7 +340,13 @@ class QueueState:
         """
         if getattr(self, "_atexit_disabled", False):
             return
+        # Set the disable flag FIRST so any concurrent
+        # save_debounced caller can't schedule a fresh timer between
+        # our cancel and the save_now (audit: queues H121). The
+        # `_save_io_lock` then guards against an already-firing
+        # save_now landing after us with stale data.
         try:
+            self._atexit_disabled = True
             with self._lock:
                 t = self._save_timer
                 self._save_timer = None
@@ -459,6 +465,49 @@ class QueueState:
         self._notify()
         self.save_debounced()
         return True
+
+    def sync_remove_by_name(self, name: str) -> bool:
+        """Remove the FIRST queued sync item whose name/folder matches
+        `name`. Public encapsulated replacement for the queue_mixin
+        fallback that used to reach into `self._queues._lock` and
+        `self._queues.sync` directly and bypass QueueState's
+        invariants (audit: queue_mixin H5).
+        """
+        if not name:
+            return False
+        with self._lock:
+            target_idx = -1
+            for i, c in enumerate(self.sync):
+                if (c.get("name") or c.get("folder") or "") == name:
+                    target_idx = i
+                    break
+            if target_idx < 0:
+                return False
+            removed_url = (self.sync[target_idx].get("url") or "").strip()
+            del self.sync[target_idx]
+            if removed_url:
+                for j, o in enumerate(self.order):
+                    if o and o[0] == "sync" and o[1] == removed_url:
+                        del self.order[j]
+                        break
+        self._notify()
+        self.save_debounced()
+        return True
+
+    def sync_requeue_front(self, channel: dict[str, Any]) -> None:
+        """Insert `channel` at the front of the sync queue atomically.
+        Used by sync_all on a pause-interrupted channel so Resume picks
+        the in-flight channel back up first. Replaces a bare
+        `queues.sync.insert(0, ch); queues._notify()` pair that bypassed
+        `_lock`, racing with concurrent `sync_pop` / `sync_remove` /
+        `sync_enqueue` callers (audit: sync/sync_all.py C7).
+        """
+        url = channel.get("url", "")
+        with self._lock:
+            self.sync.insert(0, copy.deepcopy(channel))
+            self.order.insert(0, ["sync", url])
+        self._notify()
+        self.save_debounced()
 
     def sync_clear(self) -> int:
         """Remove every queued sync task; keep the currently-running one.
@@ -596,6 +645,16 @@ class QueueState:
         with self._lock:
             self.current_sync = copy.deepcopy(ch) if ch else None
         self._notify()
+        # Persist immediately. Force-kill (Windows "End Task", power
+        # loss) doesn't run atexit, and a 0.5s debounce can lose this
+        # transition — meaning the "resuming" dict on next launch
+        # misses the in-flight channel (audit: queues H106). The
+        # transition rate is low (one per channel start/end), so the
+        # extra disk write is negligible.
+        try:
+            self.save_now()
+        except Exception:
+            self.save_debounced()
 
     def set_sync_pass_progress(self, index: int, total: int) -> None:
         """Record `(index, total)` so the popover label reads

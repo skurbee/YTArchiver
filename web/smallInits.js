@@ -84,10 +84,20 @@
       }, 400);
     });
     obs.observe(top);
-    // Apply saved height on load
-    window.pywebview?.api?.window_state_load?.().then((st) => {
-      if (st?.splitter_top_px && top) top.style.flex = `0 0 ${st.splitter_top_px}px`;
-    }).catch(() => {});
+    // Tear down on unload so the observer + pending timer don't
+    // leak across pywebview reloads (audit: smallInits.js H143).
+    window.addEventListener("beforeunload", () => {
+      try { obs.disconnect(); } catch {}
+      try { clearTimeout(saveTimer); } catch {}
+    });
+    // Apply saved height on load. Guard the .then chain in case the
+    // backend returns undefined (audit: smallInits.js H143).
+    const _p = window.pywebview?.api?.window_state_load?.();
+    if (_p && typeof _p.then === "function") {
+      _p.then((st) => {
+        if (st?.splitter_top_px && top) top.style.flex = `0 0 ${st.splitter_top_px}px`;
+      }).catch(() => {});
+    }
   }
 
   // Recent tab live filter — 100ms debounce, Esc clears.

@@ -304,7 +304,18 @@
     if (v.views) metaParts.push(v.views + " views");
     if (v.tx_status === "transcribed") metaParts.push("transcribed");
     card.querySelector(".video-card-meta").textContent = metaParts.join(" · ");
-    card.addEventListener("click", () => onVideoClick && onVideoClick(v));
+    // Defer the single-click open by 220ms so a double-click can
+    // cancel it before the Watch view opens — otherwise both
+    // handlers fire and the external player AND in-app player
+    // race each other (audit: browseGrids.js H151).
+    let _clickTimer = null;
+    card.addEventListener("click", () => {
+      if (_clickTimer) clearTimeout(_clickTimer);
+      _clickTimer = setTimeout(() => {
+        _clickTimer = null;
+        if (onVideoClick) onVideoClick(v);
+      }, 220);
+    });
 
     // (Hover-enlarge preview removed in v49.7 — intrusive on a dense
     // grid; covered the adjacent cards and interrupted normal browsing
@@ -313,6 +324,7 @@
     card.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
+      if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
       if (v.filepath && window.pywebview?.api?.browse_open_video) {
         window.pywebview.api.browse_open_video(v.filepath);
       }
@@ -363,9 +375,15 @@
         for (let i = cursor; i < end; i++) {
           frag.appendChild(_buildVideoCard(videos[i], onVideoClick));
         }
-        // Remove old sentinel if present, append batch, add new sentinel
+        // Remove old sentinel if present, append batch, add new
+        // sentinel. Explicitly unobserve before remove so the shared
+        // IntersectionObserver doesn't hold a dead-DOM reference
+        // until GC (audit: browseGrids.js H162, H163).
         const oldSentinel = grid.querySelector(".video-grid-sentinel");
-        oldSentinel?.remove();
+        if (oldSentinel) {
+          try { _gridIO?.unobserve?.(oldSentinel); } catch {}
+          oldSentinel.remove();
+        }
         grid.appendChild(frag);
         cursor = end;
         if (cursor < videos.length) {

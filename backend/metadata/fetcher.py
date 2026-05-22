@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ..log import get_logger
@@ -285,13 +285,14 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     split_months = bool(channel.get("split_months"))
 
     # Compute year/month from file mtime — yt-dlp --mtime sets mtime to
-    # the YouTube upload date, so this is authoritative. Falls back to
-    # "now" if the file's somehow missing (shouldn't happen right after a
-    # successful download).
+    # the YouTube upload date IN UTC, so we must read it as UTC too.
+    # Using local time here would file near-midnight-UTC uploads under
+    # the wrong day/month/year bucket (asymmetric with the UTC reader
+    # elsewhere, producing duplicate JSONL entries).
     year: int | None = None
     month: int | None = None
     try:
-        mt = datetime.fromtimestamp(os.path.getmtime(file_path))
+        mt = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
         year, month = mt.year, mt.month
     except OSError:
         pass
@@ -329,10 +330,16 @@ def fetch_single_video_metadata(channel: dict[str, Any],
         return {"ok": False, "error": "yt-dlp dump-json failed"}
 
     existing[video_id] = entry
+    _jsonl_write_failed = False
     try:
         _write_metadata_jsonl(jp, existing)
     except Exception as e:
-        return {"ok": False, "error": f"write failed: {e}"}
+        # Don't return early — still attempt the thumbnail so the
+        # user gets SOMETHING (audit: fetcher H93). The caller sees
+        # ok=False with the underlying error so the failure is still
+        # surfaced.
+        _jsonl_write_failed = True
+        _jsonl_err = str(e)
 
     # Thumbnail (best-effort). Stream passed through so fetch errors
     # surface as verbose-only dim log lines instead of disappearing.
@@ -372,7 +379,12 @@ def fetch_single_video_metadata(channel: dict[str, Any],
             ["downloaded\n", _md_tag("simpleline")],
         ])
     # Return the entry so callers (refresh_channel_comments) can
-    # diff old-vs-new to count "unchanged" videos.
+    # diff old-vs-new to count "unchanged" videos. If the jsonl write
+    # failed we still attempted the thumbnail, but the contract
+    # demands ok=False in that case (audit: fetcher H93).
+    if _jsonl_write_failed:
+        return {"ok": False, "error": f"jsonl write failed: {_jsonl_err}",
+                "entry": entry}
     return {"ok": True, "fetched": True, "entry": entry}
 
 
@@ -515,8 +527,12 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     if not _fn.lower().endswith(_IMG_EXTS):
                         continue
                     # Extract every `[xxx]` chunk from the filename and
-                    # add to the set. Real thumbs only have ONE bracket
-                    # group (the video id), but tolerate weirder names.
+                    # add to the set IF the inner string looks like a
+                    # real YouTube video id (exactly 11 chars from the
+                    # YT id alphabet). Tolerates weirder filenames
+                    # without admitting non-id bracket groups that
+                    # could false-match a different video's real id
+                    # (audit: fetcher.py L1).
                     _i = 0
                     while True:
                         _o = _fn.find("[", _i)
@@ -525,7 +541,10 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                         _c = _fn.find("]", _o + 1)
                         if _c < 0:
                             break
-                        _thumb_brackets.add(_fn[_o:_c+1])
+                        _inner = _fn[_o+1:_c]
+                        if len(_inner) == 11 and all(
+                                c.isalnum() or c in "_-" for c in _inner):
+                            _thumb_brackets.add(_fn[_o:_c+1])
                         _i = _c + 1
             except OSError:
                 pass

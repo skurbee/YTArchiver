@@ -41,6 +41,34 @@ class MetadataMixin:
             except Exception as e: _log.debug("swallowed: %s", e)
 
 
+    def _push_subs_table_refresh(self):
+        """Refresh the Subs tab's channel table so its "Last Sync"
+        column reflects per-channel completion as a sync pass advances.
+        Without this, the column stayed frozen at boot-time values until
+        the user clicked away and back.
+
+        Fired by `sync.active_state.fire_channel_synced_hook` after each
+        channel's done-row emit in sync_all. evaluate_js is cheap when
+        the tab isn't visible, so no throttling needed at the per-
+        channel cadence of a normal sync pass.
+        """
+        if self._window is None:
+            return
+        try:
+            # The just-finished sync_channel wrote a fresh `last_sync`
+            # into the on-disk config — reload so subsequent js_api
+            # roundtrips (refreshSubsTable → get_subs_channels) read
+            # the new values.
+            try: self._reload_config()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            self._window.evaluate_js(
+                "window.refreshSubsTable && window.refreshSubsTable();")
+        except Exception as e:
+            try: self._log_stream.emit_dim(
+                f"(subs tab refresh push failed: {e})")
+            except Exception as e: _log.debug("swallowed: %s", e)
+
+
     # ─── Metadata (manual "Recheck" from context menu) ──────────────────
 
     def metadata_recheck_channel(self, identity):
@@ -550,26 +578,52 @@ class MetadataMixin:
             return {"choice": "skip"}
         import json as _json
         result = {"val": None, "event": threading.Event()}
+        token = id(result)
         try:
+            # Keyed by `token = id(result)` so two concurrent prompts
+            # don't overwrite each other's pending slot. The previous
+            # single-slot `self._pending_metadata_choice` would let
+            # the second prompt clobber the first; the user's first
+            # dismissal then resolved the SECOND prompt's event with
+            # the wrong choice and the original timed out 120s later
+            # defaulting to "skip" (audit: metadata_mixin H1).
+            if not hasattr(self, "_pending_metadata_choices") or \
+                    self._pending_metadata_choices is None:
+                self._pending_metadata_choices = {}
+            self._pending_metadata_choices[token] = result
+            # Legacy single-slot kept only as a fallback for any
+            # resolver caller that doesn't echo the token back.
+            self._pending_metadata_choice = result
             # Create a one-shot global callback the JS side writes into
             js = (
                 "(async () => {"
                 f" const c = await window.askMetadataAlreadyDownloaded({_json.dumps(channel_name)}, {int(count)});"
-                f" window.pywebview.api._metadata_choice_resolve({_json.dumps(id(result))}, c);"
+                f" window.pywebview.api._metadata_choice_resolve({_json.dumps(token)}, c);"
                 "})()"
             )
-            # Register a one-shot resolver
-            self._pending_metadata_choice = result
             self._window.evaluate_js(js)
             result["event"].wait(timeout=120)
             return {"choice": result["val"] or "skip"}
         except Exception:
             return {"choice": "skip"}
+        finally:
+            try:
+                self._pending_metadata_choices.pop(token, None)
+            except Exception:
+                pass
 
 
     def _metadata_choice_resolve(self, _token, val):
-        """Internal: JS calls this when the user picks a choice."""
-        pending = getattr(self, "_pending_metadata_choice", None)
+        """Internal: JS calls this when the user picks a choice. Routes
+        by token so concurrent prompts each get their own response."""
+        try:
+            pending_map = getattr(self, "_pending_metadata_choices", None) or {}
+            pending = pending_map.get(_token)
+            if pending is None:
+                # Fallback to single-slot for legacy callers.
+                pending = getattr(self, "_pending_metadata_choice", None)
+        except Exception:
+            pending = getattr(self, "_pending_metadata_choice", None)
         if pending:
             pending["val"] = val
             pending["event"].set()

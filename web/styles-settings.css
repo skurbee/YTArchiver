@@ -528,7 +528,10 @@
    Compact, Windows-context-menu vibe — NOT a centered modal. */
 .md-context-menu {
   position: fixed;
-  z-index: 9999;
+  /* Drop from 9999 (same as .yt-modal) so DOM order doesn't decide
+     stacking — context menu should sit BELOW modals (audit:
+     styles-settings L146). */
+  z-index: 9500;
   min-width: 200px;
   background: #1c1f23;
   border: 1px solid rgba(255, 255, 255, 0.10);

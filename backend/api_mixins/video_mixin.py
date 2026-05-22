@@ -28,6 +28,12 @@ class VideoMixin:
             return {"ok": False, "error": "Missing filepath"}
         if not os.path.isfile(fp):
             return {"ok": False, "error": f"File not found: {fp}"}
+        # Refuse the destructive os.remove if config writes are blocked
+        # — see recent_mixin H22 for the same precondition.
+        if not config_is_writable():
+            return {"ok": False,
+                    "error": "Config is currently read-only. "
+                             "Refusing to delete file when state can't be updated."}
         try:
             os.remove(fp)
         except OSError as e:

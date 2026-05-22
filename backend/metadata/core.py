@@ -174,23 +174,27 @@ def _resolve_ids_by_title(yt: str, url: str,
     # titles (rare but possible — e.g. a re-uploaded video with the
     # same title as the original) don't silently overwrite each other.
     playlist: dict[str, list] = {}
+    # `with proc.stdout` closes the pipe FD even on break/exception,
+    # eliminating the per-call FD leak that accumulated across many
+    # cancelled passes (audit: metadata/core.py H90).
     try:
-        for line in proc.stdout:
-            if cancel_event is not None and cancel_event.is_set():
-                try: proc.terminate()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                break
-            if pause_event is not None and pause_event.is_set():
-                try: proc.terminate()
-                except Exception as e: _log.debug("swallowed: %s", e)
-                break
-            parts = line.rstrip().split("\t", 1)
-            if len(parts) != 2:
-                continue
-            vid, title = parts[0].strip(), parts[1].strip()
-            if _ID_RE.fullmatch(vid) and title:
-                key = _normalize_title_for_match(title)
-                playlist.setdefault(key, []).append(vid)
+        with proc.stdout:
+            for line in proc.stdout:
+                if cancel_event is not None and cancel_event.is_set():
+                    try: proc.terminate()
+                    except Exception as e: _log.debug("swallowed: %s", e)
+                    break
+                if pause_event is not None and pause_event.is_set():
+                    try: proc.terminate()
+                    except Exception as e: _log.debug("swallowed: %s", e)
+                    break
+                parts = line.rstrip().split("\t", 1)
+                if len(parts) != 2:
+                    continue
+                vid, title = parts[0].strip(), parts[1].strip()
+                if _ID_RE.fullmatch(vid) and title:
+                    key = _normalize_title_for_match(title)
+                    playlist.setdefault(key, []).append(vid)
         try: proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.terminate()
@@ -443,9 +447,17 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         try: proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.terminate()
+            # Reap the zombie so it doesn't linger until GC (audit:
+            # metadata/core.py L42). 5s cap matches our other
+            # terminate-then-wait patterns.
+            try: proc.wait(timeout=5)
+            except Exception: pass
     except Exception as e:
         stream.emit_dim(f" (stats read error: {e})")
-        try: proc.terminate()
+        try:
+            proc.terminate()
+            try: proc.wait(timeout=5)
+            except Exception: pass
         except Exception as e: _log.debug("swallowed: %s", e)
     # If the call returned nothing useful, surface whatever yt-dlp put
     # on stderr as a verbose-only line so users in Verbose mode can
@@ -1272,7 +1284,11 @@ def backfill_video_ids(channel: dict[str, Any],
         _local_day = ""
         try:
             import datetime as _dt
-            _local_day = _dt.datetime.fromtimestamp(
+            # UTC to match the canonical reader at core.py:1174.
+            # Mixed UTC/local readers route the same mtime into two
+            # different day buckets at TZ boundaries, causing
+            # double-write to two JSONLs (audit: core.py H80).
+            _local_day = _dt.datetime.utcfromtimestamp(
                 os.path.getmtime(_fp)).strftime("%Y%m%d")
         except Exception:
             _local_day = ""
@@ -1362,7 +1378,8 @@ def backfill_video_ids(channel: dict[str, Any],
             _nt0 = _norm_title_for_match(_t0)
             try:
                 import datetime as _dt
-                _ld0 = _dt.datetime.fromtimestamp(
+                # UTC (audit: core.py H80) — same fix as line 1275.
+                _ld0 = _dt.datetime.utcfromtimestamp(
                     os.path.getmtime(_fp0)).strftime("%Y%m%d")
             except Exception:
                 _ld0 = ""

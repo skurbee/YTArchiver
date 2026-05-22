@@ -22,7 +22,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .log import get_logger
 from .log_stream import LogStreamer
+
+_log = get_logger(__name__)
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
                ".wav", ".mp3", ".m4a", ".flac")
@@ -266,11 +269,13 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             f"volumes — move manually to avoid a non-atomic copy+delete.")
         return False
     try:
-        shutil.move(str(video), str(dst))
-        # track sidecar failures so a partial orphan state
-        # is visible instead of silently swallowed. Each failed
-        # sidecar leaves metadata behind in the old folder; the user
-        # needs a line in the log to know about it.
+        # Move sidecars FIRST, then the video. Reversed from prior
+        # order so a sidecar failure leaves the video in the source
+        # folder (recoverable: next reorg pass retries cleanly)
+        # rather than at the destination with stranded sidecars in
+        # the source (audit: reorg H125). Shared sidecars are still
+        # copied (not moved) because the source video sticks around
+        # for the same-folder sibling.
         _sc_failed: list[tuple[str, str]] = []
         for sc in sidecars:
             sc_dst = target_dir / sc.name
@@ -302,13 +307,19 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             except OSError as _sce:
                 _sc_failed.append((sc.name, str(_sce)))
         if _sc_failed:
-            # Warn once per video with all failures. Non-fatal — the
-            # primary move succeeded — but the user can investigate
-            # (usually a file lock or permissions issue).
+            # Sidecar move(s) failed — abort the video move so we
+            # don't end up with a dest-side video missing its
+            # sidecars. The partial sidecars at the destination
+            # will be cleaned up on the next reorg pass when both
+            # the video AND its remaining sidecars try to move
+            # together again (audit: reorg H125).
             _names = ", ".join(n for n, _ in _sc_failed)
             stream.emit_error(
-                f"Sidecar move failed for {video.name}: {_names} "
-                f"(video moved; metadata left in old folder)")
+                f" [skip] {video.name}: sidecar move failed "
+                f"({_names}) — video left in source folder for retry")
+            return False
+        # Sidecars are at the destination — now move the video.
+        shutil.move(str(video), str(dst))
         return True
     except OSError as e:
         stream.emit_error(f"Move failed for {video.name}: {e}")

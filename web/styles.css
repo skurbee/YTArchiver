@@ -13,7 +13,9 @@
 
   /* Text */
   --c-text: #dde1e8;
-  --c-dim: #4a4f5a;
+  /* WCAG contrast bump: prior #4a4f5a on #0f1012 was ~3.3:1 (fails
+     AA 4.5:1 on small fonts). #7a8190 gets us ~5.1:1 (audit: L143). */
+  --c-dim: #7a8190;
   --c-accent: #a0aabb;
 
   /* Buttons */
@@ -36,7 +38,9 @@
   --c-log-txt: #7a8494;
   --c-log-green: #3dd68c;
   --c-log-blue: #6cb4ee;
-  --c-log-dim: #272a2f;
+  /* Lifted from #272a2f to #3a4047 (~2.5:1 on --c-log-bg) so .t-dim
+     log lines aren't nearly invisible (audit: L144). */
+  --c-log-dim: #3a4047;
   --c-log-red: #ff6b6b;
   --c-log-head: #a0aabb;
   --c-log-sum: #f5a623;
@@ -59,6 +63,16 @@
   /* Fonts */
   --font-ui: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
   --font-log: "Consolas", "Cascadia Mono", "Courier New", monospace;
+
+  /* Four variables referenced via var() in styles-browse.css +
+     styles-dialogs.css that were never defined here, so every use
+     fell through to its inline fallback or to inherited color
+     (audit: H258). Define explicitly so palette tweaks land in one
+     place. */
+  --c-bg-soft: #14161a;
+  --c-card: #1c1e21;
+  --c-hover: #232629;
+  --c-btn-hvr: #303339;
 }
 
 * {

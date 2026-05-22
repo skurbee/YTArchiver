@@ -106,9 +106,15 @@ def wait_for_resume(
 ) -> bool:
     """Block while pause_event is set. Returns True if cancelled.
 
-    Uses pause_event.wait(tick) so cancel + resume can both wake the
-    loop within `tick` seconds. tick=0.25 matches sync.py's existing
-    rate; tick=0.5 matches repair_captions / punct_restore.
+    Polls every `tick` seconds for resume (pause_event cleared) or
+    cancel. tick=0.25 matches sync.py's existing rate; tick=0.5
+    matches repair_captions / punct_restore.
+
+    NOTE: previously this used `pause_event.wait(timeout=tick)` which
+    returns IMMEDIATELY when the event is already set — turning the
+    while-loop into a 100% CPU busy spin while paused. `time.sleep`
+    is the correct primitive: resume sets it free on the next tick,
+    cancel within `tick` seconds (audit: pause_helpers.py C21).
     """
     if pause_event is None or not pause_event.is_set():
         return False
@@ -116,7 +122,7 @@ def wait_for_resume(
         if cancel_event is not None and cancel_event.is_set():
             return True
         try:
-            pause_event.wait(timeout=tick)
+            time.sleep(tick)
         except Exception:
             time.sleep(tick)
     return False

@@ -207,6 +207,18 @@ class ArchiveMixin:
                                  encoding="utf-8", errors="replace",
                                  bufsize=1, startupinfo=sync_backend._startupinfo)
             except OSError as e:
+                # Update the in-place [Dwnld] row with a final failed
+                # state so it doesn't sit forever showing just the URL.
+                # Use the same marker so the inplace selector finds and
+                # replaces it (audit: archive_mixin H17).
+                try:
+                    self._log_stream.emit([
+                        ["[Dwnld] ", ["red", _marker_tag]],
+                        [f"{_state['fname']} - failed (Launch failed: {e})\n",
+                         ["red", _marker_tag]],
+                    ])
+                except Exception:
+                    pass
                 self._log_stream.emit_error(f"Launch failed: {e}")
                 # Release the in-flight lock on launch failure so a
                 # retry isn't blocked forever.
@@ -283,6 +295,18 @@ class ArchiveMixin:
                             proc.wait(timeout=2)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
+                    # Also update the in-place [Dwnld] row with the
+                    # failed state so the user sees it resolved
+                    # instead of stuck at "downloading..." forever
+                    # (audit: archive_mixin H17).
+                    try:
+                        self._log_stream.emit([
+                            ["[Dwnld] ", ["red", _marker_tag]],
+                            [f"{_state['fname']} - failed (watchdog timeout)\n",
+                             ["red", _marker_tag]],
+                        ])
+                    except Exception:
+                        pass
                     self._log_stream.emit_error(
                         f"[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
                 # audit DT-1: only write to URL history now that the

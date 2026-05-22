@@ -113,8 +113,20 @@ def _stdin_reader():
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
-            with _request_lock:
-                _request_queue.append({"path": line, "duration": 0, "language": "en"})
+            # A torn/partial write from the parent or a UTF-8 BOM at
+            # pipe start would land here. Previously the bytes were
+            # interpreted as a filepath and enqueued as a transcribe
+            # job — risk of treating garbage as a path and stalling
+            # the request/response stream (audit: whisper_worker H49).
+            # Emit an error response and drop the line.
+            try:
+                sys.stdout.write(json.dumps({
+                    "status": "error",
+                    "text": "malformed request (not valid JSON)",
+                }) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
             continue
         if obj.get("command") == "cancel":
             _cancel_flag.set()
@@ -279,11 +291,20 @@ while True:
                 words = t.split()
                 n_chunks = max(2, int(dur / _MAX_SEG) + (1 if dur % _MAX_SEG > 0 else 0))
                 chunk_dur = dur / n_chunks
-                wpc = max(1, len(words) // n_chunks)
+                # Distribute remainder across first chunks so the last
+                # chunk isn't lopsidedly bigger than the rest (audit:
+                # whisper_worker H63). Previously `wpc = len(words)//n`
+                # left a possibly-huge tail in the final chunk.
+                _base = len(words) // n_chunks
+                _extra = len(words) % n_chunks
+                wi0 = 0
                 for ci in range(n_chunks):
-                    wi0 = ci * wpc
-                    wi1 = wi0 + wpc if ci < n_chunks - 1 else len(words)
+                    _take = _base + (1 if ci < _extra else 0)
+                    if _take == 0:
+                        continue
+                    wi1 = wi0 + _take
                     chunk_text = " ".join(words[wi0:wi1])
+                    wi0 = wi1
                     if not chunk_text:
                         continue
                     cs = round(seg.start + ci * chunk_dur, 2)

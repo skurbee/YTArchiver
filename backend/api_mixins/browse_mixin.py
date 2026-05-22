@@ -594,10 +594,23 @@ class BrowseMixin:
                 for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mov"):
                     cand = base + ext
                     if os.path.isfile(cand):
+                        # Derive channel from path so the Watch view
+                        # has the context it needs for downstream
+                        # browse_get_video_metadata + thumbnails
+                        # (audit: browse_mixin H2). Standard layout
+                        # is <output_dir>/<channel>/<file>, so the
+                        # parent folder name is the channel.
+                        _ch_guess = ""
+                        try:
+                            _ch_guess = os.path.basename(
+                                os.path.dirname(cand)) or ""
+                        except Exception:
+                            pass
                         return {
                             "ok": True,
                             "filepath": cand,
                             "title": title or os.path.basename(base),
+                            "channel": _ch_guess,
                             "video_id": video_id or "",
                         }
             # Fallback — search the videos table by video_id.

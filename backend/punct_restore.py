@@ -207,7 +207,8 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                                  cancel_event: threading.Event | None = None,
                                  pause_event: threading.Event | None = None,
                                  queues=None,
-                                 scope_url: str | None = None) -> dict:
+                                 scope_url: str | None = None,
+                                 shared_punct_mgr=None) -> dict:
     """Run the punctuation pass across the archive (or a subset).
 
     Same shape as repair_captions.repair_archive — emits progress per
@@ -230,11 +231,17 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
         log_stream.flush()
         return {"ok": False, "error": "archive root not found"}
 
-    # Spin up the punct subprocess once for the whole pass. The first
-    # punctuate() call loads the model (~5-15s); subsequent calls are
-    # quick. If Python 3.11 isn't installed the manager fails early and
-    # we bail with a clear error.
-    punct_mgr = PunctuationManager(log_stream)
+    # Prefer the process-singleton manager so we share VRAM with the
+    # live transcribe worker. Two managers each load the CUDA model
+    # and can OOM low-VRAM GPUs (audit: H44).
+    if shared_punct_mgr is not None:
+        punct_mgr = shared_punct_mgr
+    else:
+        try:
+            from .transcribe.punct_manager import get_shared_punct_manager
+            punct_mgr = get_shared_punct_manager(log_stream)
+        except Exception:
+            punct_mgr = PunctuationManager(log_stream)
     if not punct_mgr.is_available():
         log_stream.emit_error(
             " — Restore punctuation: Python 3.11 + punctuation worker "
@@ -377,8 +384,20 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 continue
 
             # Skip if the concatenated text already looks punctuated.
-            # Cheap O(1) check that lets modern videos sail through.
-            joined = " ".join((s.get("text") or "")[:120] for s in segs[:8])
+            # Sample beginning + middle + end so a sparse intro (music,
+            # "[Music]", greetings) doesn't false-trigger a full
+            # re-punctuation, and a punctuated-only-at-start video
+            # doesn't false-skip the body (audit: punct_restore L2 —
+            # mirrors repair_captions H71 fix). Window bumped to 180
+            # chars per segment for a stronger signal.
+            _n = len(segs)
+            _slices = list(segs[:8])
+            if _n > 16:
+                _mid = (_n - 8) // 2
+                _slices.extend(segs[_mid:_mid + 8])
+            if _n > 24:
+                _slices.extend(segs[-8:])
+            joined = " ".join((s.get("text") or "")[:180] for s in _slices)
             if _already_punctuated(joined):
                 skip_count += 1
                 short = (title[:55] + "…") if len(title) > 58 else title

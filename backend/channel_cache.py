@@ -74,7 +74,10 @@ def get_cached_ids(url: str) -> list[str] | None:
         if not rec:
             return None
         age = time.time() - float(rec.get("last_refreshed", 0))
-        if age > STALE_AFTER_SEC:
+        # Negative age = system clock went backwards (NTP, VM time
+        # warp). Treat as stale so a clock skew doesn't make the
+        # cache appear fresh forever (audit: channel_cache L46).
+        if age < 0 or age > STALE_AFTER_SEC:
             return None
         ids = rec.get("ids", [])
         return list(ids) if isinstance(ids, list) else None

@@ -731,6 +731,17 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
             pass
     if not os.path.isfile(dl_path):
         return dest # Fall back to whatever yt-dlp reported
+    # Sanity: confirm the resolved path actually lives under temp_dir.
+    # A malicious upload_date / title template could try to escape via
+    # ../ or absolute path — refuse to return anything outside the
+    # temp dir (audit: redownload H105).
+    try:
+        _temp_real = os.path.realpath(temp_dir)
+        _dest_real = os.path.realpath(dl_path)
+        if os.path.commonpath([_temp_real, _dest_real]) != _temp_real:
+            return None
+    except (ValueError, OSError):
+        return None
     return dl_path
 
 
@@ -823,7 +834,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
         return {"ok": False, "cancelled": True}
 
     # 2. Fetch YouTube catalog (with internet-block protection)
-    if not block_if_down(cancel_ev):
+    if not block_if_down(stream=stream, check_cancel=cancel_ev.is_set):
         return {"ok": False, "cancelled": True}
     stream.emit([["  \u2014", "simpleline_redwnl"],
                  [" Fetching YouTube video list\u2026\n", "simpleline"]])
@@ -1202,49 +1213,12 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     f"{new_ext} instead of {orig_ext}. Sidecar rename "
                     f"unsupported — skipping to avoid metadata orphans.")
                 continue
-                # Two-phase commit so a failed os.replace doesn't lose
-                # the original. Pre-fix path: os.remove(fp) then
-                # os.replace(new_fp, target_fp). If replace failed
-                # (permission, target exists from concurrent write,
-                # etc.) the original was gone and the new file was
-                # stranded in temp. Now we rename the original aside
-                # first; if replace succeeds, drop the aside; if it
-                # fails, rename the aside back.
-                target_fp = os.path.splitext(fp)[0] + new_ext
-                aside_fp = fp + ".old"
-                aside_valid = False
-                try:
-                    os.rename(fp, aside_fp)
-                    aside_valid = True
-                except OSError:
-                    # Original rename failed — try the old-behavior
-                    # unlink path as a fallback (same risk window as
-                    # before, no worse). Most likely cause of failure
-                    # here is cross-device rename, which a plain
-                    # remove also can't fix.
-                    try: os.remove(fp)
-                    except OSError: pass
-                try:
-                    os.replace(new_fp, target_fp)
-                except OSError:
-                    # Replace failed — roll back if we have an aside,
-                    # AND clean up the abandoned new_fp so we don't
-                    # leak a multi-GB orphan in _REDOWNLOAD_TEMP/. The
-                    # previous code rolled back the aside but left
-                    # new_fp on disk forever (rmdir at end-of-pass
-                    # only succeeds on an empty dir).
-                    if aside_valid:
-                        try: os.rename(aside_fp, fp)
-                        except OSError: pass
-                    try:
-                        if os.path.isfile(new_fp):
-                            os.remove(new_fp)
-                    except OSError: pass
-                    raise
-                # Replace succeeded — drop the aside.
-                if aside_valid:
-                    try: os.remove(aside_fp)
-                    except OSError: pass
+                # NOTE (audit: redownload H101): the two-phase-commit
+                # block that previously lived here was unreachable
+                # (the `continue` above always fires for cross-
+                # extension yt-dlp output). Removed to eliminate
+                # confusion — same-extension replace runs in the
+                # `else` branch below.
             else:
                 # Same-extension replace path. Apply the same
                 # retry+jitter loop the cross-extension path has — a
@@ -1430,8 +1404,10 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
 
         from . import autorun as _ar
         _now = _dt.now()
-        _ts = (_now.strftime("%-I:%M%p") if os.name != "nt"
-               else _now.strftime("%I:%M%p").lstrip("0")).lower()
+        # `%-I` is glibc-only; musl + Windows reject it. Use the
+        # cross-platform `lstrip("0")` workaround everywhere (audit:
+        # redownload L48).
+        _ts = _now.strftime("%I:%M%p").lstrip("0").lower()
         _date = _now.strftime("%b %d").replace(" 0", " ")
         _elapsed = int(_t.time() - _t_start)
         if _elapsed >= 3600:

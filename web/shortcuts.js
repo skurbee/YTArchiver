@@ -36,6 +36,15 @@
       if (_modalOpen && e.key !== "Escape" && e.key !== "Enter") {
         return;
       }
+      // Block Ctrl+S/F/K/P + F5 from firing while the user is typing
+      // into an input/textarea/contenteditable — these shortcuts
+      // would otherwise hijack the keystroke and surprise the user
+      // by losing unsaved input (audit: shortcuts.js H136, H145).
+      if (editing) {
+        if ((e.ctrlKey || e.metaKey)
+            && ["s", "f", "k", "p"].includes(e.key)) return;
+        if (e.key === "F5") return;
+      }
 
       // Ctrl+Q: quit (close window via tray-quit path)
       if ((e.ctrlKey || e.metaKey) && e.key === "q") {
@@ -113,15 +122,20 @@
         document.getElementById("btn-sync-tasks")?.click();
         return;
       }
-      // Number keys 1-5: switch tabs (Download / Subs / Recent / Settings / Browse)
-      if (!editing && /^[1-5]$/.test(e.key)) {
+      // Number keys 1-4: switch tabs (Download / Subs / Browse / Settings).
+      // Was `[1-5]` — only 4 tabs exist in index.html, so `5` did
+      // nothing (audit: shortcuts.js H138).
+      if (!editing && /^[1-4]$/.test(e.key)) {
         const tabs = document.querySelectorAll(".tab");
         const idx = parseInt(e.key, 10) - 1;
         if (tabs[idx]) tabs[idx].click();
         return;
       }
-      // Escape: close context menus, popovers, dialogs
-      if (e.key === "Escape") {
+      // Escape: close context menus, popovers, dialogs — but ONLY
+      // when no modal is open. With a modal up, Esc should reach
+      // the modal's own handler instead of closing popovers behind
+      // it (audit: shortcuts.js L67).
+      if (e.key === "Escape" && !_modalOpen) {
         window.closeContextMenu?.();
         document.querySelectorAll(".queue-popover.open").forEach(p => p.classList.remove("open"));
       }

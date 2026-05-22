@@ -40,15 +40,60 @@ def _pick_by_prefix(thumbs, prefix: str) -> dict[str, Any] | None:
     return best
 
 
+# Magic-byte signatures for accepted image formats. Reject HTML / text
+# / partially-fetched garbage that a 200-OK error page may serve.
+_IMG_MAGIC = (
+    b"\xff\xd8\xff",        # JPEG
+    b"\x89PNG\r\n\x1a\n",   # PNG
+    b"RIFF",                # WEBP (further check on bytes 8-12 == "WEBP")
+    b"GIF87a",
+    b"GIF89a",
+)
+_HTTP_MAX_BYTES = 20 * 1024 * 1024  # 20 MB cap on art downloads
+
+
+def _looks_like_image(data: bytes) -> bool:
+    if not data or len(data) < 12:
+        return False
+    if any(data.startswith(sig) for sig in _IMG_MAGIC if sig != b"RIFF"):
+        return True
+    # WEBP needs the "WEBP" tag at offset 8
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
 def _http_get(url: str, dest: str, timeout: int = 30) -> bool:
+    """Atomically fetch `url` into `dest`. Tmp-then-replace + magic-byte
+    validation + size cap so a crash, network reset, or 200-OK HTML
+    error page can't leave a corrupt sidecar that the 30-day refresh
+    skip logic refuses to revisit (audit: channel_art.py C12).
+    """
+    tmp = dest + ".tmp"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-        with open(dest, "wb") as f:
+            data = resp.read(_HTTP_MAX_BYTES + 1)
+        if not data or len(data) > _HTTP_MAX_BYTES:
+            return False
+        if not _looks_like_image(data):
+            return False
+        with open(tmp, "wb") as f:
             f.write(data)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, dest)
+        try:
+            hide_file_win(dest)
+        except Exception:
+            pass
         return True
     except Exception:
+        try: os.remove(tmp)
+        except OSError: pass
         return False
 
 

@@ -378,6 +378,14 @@
 .t-simplestatus_reorg { color: var(--c-log-reorg); font-weight: 700; }
 
 .t-simpleline { color: var(--c-text); }
+/* Subordinate detail in transcription done-lines: the
+   "(auto-captions, took 2s, 133.0x realtime)" / "(Whisper small, took
+   55sec, 12.3x realtime)" tail. `.t-dim` was so close to the log
+   background that the detail was effectively unreadable, but full text
+   color reads like primary info. This sits between the two so the
+   parens are easy to scan without competing with the main "✓
+   Transcription" label next to them. */
+.t-tx_detail { color: #8a96a8; }
 /* In-place "Loading· " status line during startup sweep. Rendered dim so
    it reads as a transient status, not archived log output. Ticks via
    backend timer in main.py _run_startup_sequence. */

@@ -527,9 +527,23 @@
             // Chromium (audit: watchView.js:480-485). Modern
             // Chrome silently clamps; clamp explicitly for cross-
             // browser consistency.
-            const _dur = Number.isFinite(vEl.duration) ? vEl.duration : secs;
-            vEl.currentTime = Math.min(secs, _dur);
-            vEl.play().catch(() => {});
+            // If metadata hasn't loaded yet, vEl.duration is NaN and
+            // the fallback `secs` is a guess — clamping to itself is
+            // a no-op and an oversize seek would error/silent-fail.
+            // Defer the seek until loadedmetadata fires when possible
+            // (audit: watchView.js H156).
+            if (Number.isFinite(vEl.duration)) {
+              vEl.currentTime = Math.min(secs, vEl.duration);
+              vEl.play().catch(() => {});
+            } else {
+              const _onMeta = () => {
+                vEl.removeEventListener("loadedmetadata", _onMeta);
+                const _d = Number.isFinite(vEl.duration) ? vEl.duration : secs;
+                vEl.currentTime = Math.min(secs, _d);
+                vEl.play().catch(() => {});
+              };
+              vEl.addEventListener("loadedmetadata", _onMeta);
+            }
           } catch {}
         });
         el.appendChild(span);
@@ -643,6 +657,21 @@
         vEl.removeAttribute("src");
         if (typeof vEl.load === "function") vEl.load();
       } catch { /* noop */ }
+      // Re-check token + view IMMEDIATELY before assigning src. The
+      // earlier check at the start of this branch can pass, then the
+      // teardown above yields the microtask, and a Back click in that
+      // gap can run _stopWatchVideo before this assignment lands —
+      // restarting playback in a hidden Watch view (audit:
+      // watchView.js C25).
+      const _stillOnSameVideo2 = (
+        typeof window._watchOpenToken !== "number"
+        || window._watchOpenToken === _entryToken);
+      const _stillOnWatchView2 = (
+        !window._browseState
+        || window._browseState.view === "watch");
+      if (!_stillOnSameVideo2 || !_stillOnWatchView2) {
+        return;
+      }
       vEl.src = url;
       vEl.style.display = "";
       if (ph) {
@@ -823,7 +852,12 @@
       }
       // Schedule the next frame as long as the video is still loaded.
       // The unbind path cancels the in-flight rAF so this never leaks.
-      if (vEl.isConnected) {
+      // Stop the rAF loop when the Watch view is hidden — it
+      // otherwise runs at 60fps wastefully while user is on
+      // another tab / view (audit: watchView.js H155).
+      const _watchView = document.getElementById("view-watch");
+      const _hidden = _watchView && _watchView.style.display === "none";
+      if (vEl.isConnected && !_hidden) {
         _karaokeRafId = requestAnimationFrame(_tick);
       }
     };
@@ -886,6 +920,50 @@
     return t;
   }
 
+  // Build the flat per-word array once so we can rebuild cues without
+  // re-walking the nested transcript structure on every mode flip.
+  function _flattenWords(transcript) {
+    const out = [];
+    if (!Array.isArray(transcript)) return out;
+    for (const seg of transcript) {
+      const words = (Array.isArray(seg.words) && seg.words.length)
+        ? seg.words
+        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
+      if (words) {
+        for (const w of words) {
+          const s = Number(w.s);
+          const e = Number(w.e);
+          const text = (w.w || "").trim();
+          if (!text) continue;
+          if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+          if (e <= s) continue;
+          out.push({ s, e, text });
+        }
+      }
+    }
+    return out;
+  }
+
+  // Stash the segment-level fallback list (no per-word timing — entire
+  // segment is the unit). Used when phrase3 mode is unsupported for the
+  // transcript (we just emit per-segment cues like before).
+  function _flattenSegments(transcript) {
+    const out = [];
+    if (!Array.isArray(transcript)) return out;
+    for (const seg of transcript) {
+      const words = (Array.isArray(seg.words) && seg.words.length)
+        ? seg.words
+        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
+      if (words) continue;
+      const s = Number(seg.s);
+      const e = Number(seg.e);
+      const text = (seg.t || seg.text || "").trim();
+      if (!text || !Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
+      out.push({ s, e, text });
+    }
+    return out;
+  }
+
   function _setCueTrackFromTranscript(vEl, transcript) {
     const t = _ensureCapTrack(vEl);
     if (!t) return;
@@ -898,8 +976,14 @@
     // un-removable cues stay (extremely rare, and at worst hidden
     // behind the new cues' time ranges).
     if (t.cues) {
+      // Scale the attempt cap to the actual cue count so long
+      // transcripts (3hr+ videos = 30k+ cues) don't leave stale
+      // cues from the previous video (audit: watchView H152/H178).
+      // 2x current length is plenty since each iteration removes
+      // either head or tail.
+      const _cap = Math.max(5000, t.cues.length * 2);
       let _attempts = 0;
-      while (t.cues.length && _attempts < 5000) {
+      while (t.cues.length && _attempts < _cap) {
         _attempts++;
         try {
           t.removeCue(t.cues[0]);
@@ -917,33 +1001,51 @@
     if (!Array.isArray(transcript)) return;
     const Cue = window.VTTCue || window.TextTrackCue;
     if (!Cue) return;
-    for (const seg of transcript) {
-      const words = (Array.isArray(seg.words) && seg.words.length)
-        ? seg.words
-        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
-      if (words) {
-        for (const w of words) {
-          const s = Number(w.s);
-          const e = Number(w.e);
-          const text = (w.w || "").trim();
-          if (!text) continue;
-          if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
-          if (e <= s) continue;
-          try { t.addCue(new Cue(s, e, text)); } catch {}
+    // Stash so a later setCaptionPref("mode", …) can rebuild without
+    // walking the transcript pane again.
+    vEl._capTranscript = transcript;
+    const words = _flattenWords(transcript);
+    const segs = _flattenSegments(transcript);
+    const mode = (window._captionPrefs && window._captionPrefs.mode) || "single";
+    // Word-level path: per-word cues. In phrase3 mode each cue text
+    // becomes "<c.dim>prev</c.dim> current <c.dim>next</c.dim>" so the
+    // browser renders previous/next dimmed via the ::cue(.dim) rule.
+    // VTT class spans (`<c.classname>…</c>`) are the standard way to
+    // get per-span styling inside a single cue.
+    if (words.length) {
+      for (let i = 0; i < words.length; i++) {
+        const w = words[i];
+        let text;
+        if (mode === "phrase3") {
+          const prev = words[i - 1]?.text || "";
+          const next = words[i + 1]?.text || "";
+          const parts = [];
+          if (prev) parts.push(`<c.dim>${_vttEscape(prev)}</c>`);
+          parts.push(_vttEscape(w.text));
+          if (next) parts.push(`<c.dim>${_vttEscape(next)}</c>`);
+          text = parts.join(" ");
+        } else {
+          text = w.text;
         }
-      } else {
-        // Coarse fallback for transcripts without per-word timing
-        // (e.g. unpunctuated YT captions where each "segment" is the
-        // whole displayed line). One cue per segment is the right
-        // granularity here — the karaoke loop also degrades to
-        // segment-level highlighting in this case.
-        const s = Number(seg.s);
-        const e = Number(seg.e);
-        const text = (seg.t || seg.text || "").trim();
-        if (!text || !Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
-        try { t.addCue(new Cue(s, e, text)); } catch {}
+        try { t.addCue(new Cue(w.s, w.e, text)); } catch {}
       }
     }
+    // Segment-level fallback for transcripts without per-word timing
+    // (e.g. unpunctuated YT captions where each "segment" is the whole
+    // displayed line). One cue per segment — no phrase3 styling
+    // available here since there's no word boundary.
+    for (const seg of segs) {
+      try { t.addCue(new Cue(seg.s, seg.e, seg.text)); } catch {}
+    }
+  }
+
+  // VTT-class spans treat "&", "<", ">" specially; escape so weird
+  // transcript text can't break the cue.
+  function _vttEscape(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
   }
 
   // Read the cached prefs (set by app.js when the user changes the
@@ -965,10 +1067,15 @@
   // select. We update the cache + apply to the currently-loaded video.
   window.setCaptionPref = function (key, value) {
     window._captionPrefs = window._captionPrefs || {};
-    if (key === "size" || key === "bg") {
+    if (key === "size" || key === "bg" || key === "mode") {
       window._captionPrefs[key] = value;
     }
     const vEl = document.getElementById("watch-video");
-    if (vEl) _applyCaptionPrefs(vEl);
+    if (!vEl) return;
+    _applyCaptionPrefs(vEl);
+    // Mode change requires re-emitting cues — cue text is mode-dependent.
+    if (key === "mode" && Array.isArray(vEl._capTranscript)) {
+      _setCueTrackFromTranscript(vEl, vEl._capTranscript);
+    }
   };
 })();

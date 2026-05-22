@@ -32,6 +32,47 @@ _log = get_logger(__name__)
 
 
 _db_lock = threading.RLock()
+
+# Pending tx_status='transcribed' retries — coalesces the burst that
+# arrives when ingest races sync_write_video INSERTs (audit: index.py
+# H109). One drain thread processes all pending fps serially instead
+# of spawning a daemon thread per ingest.
+_tx_retry_set: set = set()
+_tx_retry_lock = threading.Lock()
+_tx_retry_thread: "threading.Thread | None" = None
+def _enqueue_tx_retry(fp: str) -> None:
+    global _tx_retry_thread
+    with _tx_retry_lock:
+        _tx_retry_set.add(fp)
+        if _tx_retry_thread is not None and _tx_retry_thread.is_alive():
+            return
+        def _drain():
+            import time as _t
+            _t.sleep(0.5)
+            while True:
+                with _tx_retry_lock:
+                    if not _tx_retry_set:
+                        return
+                    _batch = list(_tx_retry_set)
+                    _tx_retry_set.clear()
+                try:
+                    _main = _open()
+                    if _main is None:
+                        return
+                    with _db_lock:
+                        for _fp in _batch:
+                            try:
+                                _main.execute(
+                                    "UPDATE videos SET tx_status='transcribed' "
+                                    "WHERE filepath=? COLLATE NOCASE", (_fp,))
+                            except Exception as e:
+                                _log.debug("tx retry one failed: %s", e)
+                        _main.commit()
+                except Exception as e:
+                    _log.debug("tx retry batch failed: %s", e)
+        _tx_retry_thread = threading.Thread(target=_drain, daemon=True,
+                                             name="tx-retry-coalesce")
+        _tx_retry_thread.start()
 _conn: sqlite3.Connection | None = None
 # Per-jsonl_path locks used by ingest_jsonl. When a caller passes their
 # own connection (_conn_override) we skip _db_lock for throughput, but
@@ -554,19 +595,41 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         return False
 
 
-def mark_video_transcribed(filepath: str) -> bool:
-    conn = _open()
-    if conn is None:
-        return False
+def mark_video_transcribed(filepath: str,
+                            _conn_override: "sqlite3.Connection | None" = None) -> bool:
+    """Flip the tx_status flag for `filepath` to 'transcribed'.
+
+    `_conn_override` lets the caller pass an independent connection
+    (from `_open_independent()`) so this UPDATE doesn't queue behind
+    a sync writer holding `_db_lock`. Matches the register_video /
+    ingest_jsonl override pattern (audit: index.py H104).
+    """
     fp = os.path.normpath(filepath)
+    use_override = _conn_override is not None
+    # Acquire the connection INSIDE the lock to close the re-check
+    # race the old code had between `_open()` and `with _db_lock:`
+    # — between those two lines another thread could close + reopen
+    # the connection (audit: index.py H107).
     try:
-        with _db_lock:
-            conn.execute("UPDATE videos SET tx_status='transcribed' WHERE filepath=? COLLATE NOCASE", (fp,))
-            # Look up the channel so we can invalidate just its cache.
+        if use_override:
+            conn = _conn_override
+            conn.execute("UPDATE videos SET tx_status='transcribed' "
+                          "WHERE filepath=? COLLATE NOCASE", (fp,))
             row = conn.execute(
                 "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
                 (fp,)).fetchone()
             conn.commit()
+        else:
+            with _db_lock:
+                conn = _open()
+                if conn is None:
+                    return False
+                conn.execute("UPDATE videos SET tx_status='transcribed' "
+                              "WHERE filepath=? COLLATE NOCASE", (fp,))
+                row = conn.execute(
+                    "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
+                    (fp,)).fetchone()
+                conn.commit()
         if row and row[0]:
             try: invalidate_channel_videos(row[0])
             except Exception as e: _log.debug("swallowed: %s", e)
@@ -734,24 +797,11 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
             # so the row, once committed, still ends up flagged. Best
             # effort: skip silently if anything fails.
             if _tx_rowcount == 0:
-                def _retry_tx_flag(_fp=fp):
-                    import time as _t
-                    _t.sleep(0.5)
-                    try:
-                        _main = _open()
-                        if _main is None:
-                            return
-                        with _db_lock:
-                            _main.execute(
-                                "UPDATE videos SET tx_status='transcribed' "
-                                "WHERE filepath=? COLLATE NOCASE", (_fp,))
-                            _main.commit()
-                    except Exception as e:
-                        _log.debug("swallowed: %s", e)
-                try:
-                    threading.Thread(target=_retry_tx_flag, daemon=True).start()
-                except Exception as e:
-                    _log.debug("swallowed: %s", e)
+                # Coalesce retries onto a single pending set keyed by
+                # filepath so a burst of ingests racing the boot sweep
+                # doesn't spawn N daemon threads (audit: index.py
+                # H109). One worker thread drains the set serially.
+                _enqueue_tx_retry(fp)
         # Bug [53]: return the actually-inserted row count, not the
         # raw segment count from the JSONL. Empty-text segments and
         # malformed entries are filtered out above (lines 442-451) but
@@ -1082,7 +1132,13 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         # Earlier bug: walked up the FIRST dirname found, which
         # was just the year folder, so the channel-wide scan only
         # saw one year's .Thumbnails/.
+        # Compute candidate channel roots across ALL rows and pick the
+        # MOST-COMMON one — first-row-wins was wrong when the first
+        # video happened to be in an orphan subfolder, misrouting the
+        # whole channel's thumbnail walk (audit: index.py H117).
         _ch_root = None
+        _year_re = re.compile(r"^[12][0-9]{3}$")
+        _root_votes: dict[str, int] = {}
         for _row in out:
             _fp = _row.get("filepath") or ""
             if not _fp or not os.path.isfile(_fp):
@@ -1091,19 +1147,16 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
             _gp = os.path.dirname(_parent)
             _parent_name = os.path.basename(_parent)
             _gp_name = os.path.basename(_gp)
-            _year_re = re.compile(r"^[12][0-9]{3}$")
             if _year_re.match(_parent_name):
-                # parent is "<year>" → channel root is grandparent
-                _ch_root = _gp
+                _cand = _gp
             elif _year_re.match(_gp_name):
-                # grandparent is "<year>" → great-grandparent is root
-                _ch_root = os.path.dirname(_gp)
+                _cand = os.path.dirname(_gp)
             else:
-                # No year-bucketing → mp4 lives directly under channel root
-                _ch_root = _parent
-            if _ch_root and os.path.isdir(_ch_root):
-                break
-            _ch_root = None
+                _cand = _parent
+            if _cand and os.path.isdir(_cand):
+                _root_votes[_cand] = _root_votes.get(_cand, 0) + 1
+        if _root_votes:
+            _ch_root = max(_root_votes.items(), key=lambda kv: kv[1])[0]
         if _ch_root and os.path.isdir(_ch_root):
             # Per-channel thumb index cache. The walk over a large
             # channel root (with many year/month subdirs each

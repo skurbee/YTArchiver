@@ -150,6 +150,10 @@ def quick_check_new_uploads(ch_url: str, archived_ids,
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=float(timeout_sec),
             encoding="utf-8", errors="replace",
+            # stdin=DEVNULL so a signal sent to the parent doesn't
+            # propagate into yt-dlp via shared stdin and abort the
+            # quick-check (audit: quickcheck L20).
+            stdin=subprocess.DEVNULL,
             creationflags=(0x08000000 if os.name == "nt" else 0),
             env=_utils.utf8_subprocess_env(),
         )

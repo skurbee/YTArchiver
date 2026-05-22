@@ -24,17 +24,25 @@
   "use strict";
 
   // ── Header version label ─────────────────────────────────────────
+  // Bounded retry + once-only guard so a stuck pywebview bind doesn't
+  // spin setTimeout forever, and so the double-event wiring (both
+  // pywebviewready AND DOMContentLoaded) doesn't fire the API twice
+  // (audit: chrome.js H129, H139).
+  let _hdrVerTries = 0;
+  let _hdrVerDone = false;
   function _updateHeaderVersion() {
+    if (_hdrVerDone) return;
     const el = document.getElementById("header-version");
     if (!el) return;
     const api = window.pywebview?.api;
     if (!api || !api.get_header_version) {
-      // Retry shortly — pywebview may not have bound the api yet.
+      if (_hdrVerTries++ > 40) return;  // ~8s of retries, then give up
       setTimeout(_updateHeaderVersion, 200);
       return;
     }
     api.get_header_version().then((r) => {
       if (!r) return;
+      _hdrVerDone = true;
       const v = r.version || "";
       const d = r.date || "";
       el.textContent = d ? `${v} - ${d}` : v;
@@ -73,11 +81,17 @@
         // and clicking "Delete Selected" operates on rows the user
         // thought they deselected.
         try {
-          document.querySelectorAll("tr.row-selected, .row-selected")
-            .forEach(r => r.classList.remove("row-selected"));
-          // Also hide the "Delete File" / "Delete N files" button tied
-          // to the Recent table selection state — its visibility is
-          // driven by row selection; clearing selection should hide it.
+          // Scope the clear to ONLY rows in the panel being LEFT.
+          // The previous document-wide query nuked intentional
+          // selections in panels the user wasn't actively touching
+          // (audit: chrome.js H144). The Delete button stays hidden
+          // because its visibility tracks the visible panel's
+          // selection state.
+          const leavingPanel = document.getElementById("panel-" + currentlyActive);
+          if (leavingPanel) {
+            leavingPanel.querySelectorAll("tr.row-selected, .row-selected")
+              .forEach(r => r.classList.remove("row-selected"));
+          }
           const delBtn = document.getElementById("btn-delete-file");
           if (delBtn) delBtn.hidden = true;
         } catch (_e) { /* non-fatal */ }
@@ -105,23 +119,46 @@
       e.preventDefault();
     });
 
+    // Cache container height at mousedown so we don't read layout
+    // on every mousemove (audit: chrome.js L74). rAF batches style
+    // writes so 60 mousemoves per second collapse into one paint.
+    let _splitContainerH = 0;
+    splitter.addEventListener("mousedown", () => {
+      _splitContainerH = container.getBoundingClientRect().height;
+    });
+    let _mmPending = false;
+    let _mmLastY = 0;
     window.addEventListener("mousemove", (e) => {
       if (!dragging) return;
-      const dy = e.clientY - startY;
-      const containerH = container.getBoundingClientRect().height;
-      const splitterH = 6;
-      const minTop = 32;
-      const maxTop = containerH - 80 - splitterH;
-      let newH = Math.max(minTop, Math.min(maxTop, startTopH + dy));
-      top.style.flex = `0 0 ${newH}px`;
+      _mmLastY = e.clientY;
+      if (_mmPending) return;
+      _mmPending = true;
+      requestAnimationFrame(() => {
+        _mmPending = false;
+        if (!dragging) return;
+        const dy = _mmLastY - startY;
+        const containerH = _splitContainerH
+          || container.getBoundingClientRect().height;
+        const splitterH = 6;
+        const minTop = 32;
+        const maxTop = containerH - 80 - splitterH;
+        const newH = Math.max(minTop, Math.min(maxTop, startTopH + dy));
+        top.style.flex = `0 0 ${newH}px`;
+      });
     });
 
-    window.addEventListener("mouseup", () => {
+    function _endDrag() {
       if (dragging) {
         dragging = false;
         document.body.style.cursor = "";
       }
-    });
+    }
+    window.addEventListener("mouseup", _endDrag);
+    // Also end the drag if the mouse is released outside the window
+    // (audit: chrome.js H130) — `mouseup` doesn't fire in that case
+    // and the splitter would stay in drag mode until the next click.
+    window.addEventListener("blur", _endDrag);
+    document.addEventListener("mouseleave", _endDrag);
   }
   window.initSplitter = initSplitter;
 })();

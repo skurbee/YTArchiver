@@ -35,9 +35,14 @@ class BookmarkMixin:
         channel, start_time (seconds into the video), the snippet text
         the user highlighted, and an optional note. Returns the new row
         id so the UI can refer to this bookmark later (for edit/remove)."""
+        payload = payload or {}
+        try:
+            start_time = float(payload.get("start_time", 0) or 0)
+        except (TypeError, ValueError):
+            start_time = 0.0
         bid = index_backend.bookmark_add(
             payload.get("video_id", ""), payload.get("title", ""),
-            payload.get("channel", ""), float(payload.get("start_time", 0)),
+            payload.get("channel", ""), start_time,
             payload.get("text", ""), payload.get("note", ""),
         )
         return {"ok": bid is not None, "id": bid}
@@ -46,13 +51,21 @@ class BookmarkMixin:
     def bookmark_remove(self, bm_id):
         """JS bridge: delete a transcript bookmark by row id. Called by
         the bookmark list's `×` button."""
-        return {"ok": index_backend.bookmark_remove(int(bm_id))}
+        try:
+            rid = int(bm_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid bookmark id"}
+        return {"ok": index_backend.bookmark_remove(rid)}
 
 
     def bookmark_update_note(self, bm_id, note):
         """JS bridge: replace the free-text note on an existing bookmark.
         Used by the inline note-edit textbox in the bookmark list."""
-        return {"ok": index_backend.bookmark_update_note(int(bm_id), note or "")}
+        try:
+            rid = int(bm_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid bookmark id"}
+        return {"ok": index_backend.bookmark_update_note(rid, note or "")}
 
 
     def bookmark_export_csv(self):

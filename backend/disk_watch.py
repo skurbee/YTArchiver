@@ -48,10 +48,14 @@ _DISK_ERROR_PATTERNS = [
     # associated path to end in a media/partial extension so yt-dlp's
     # age-gate / cookie-expired errors don't trip the watchdog (they
     # say "Permission denied" with no file path).
-    r"Permission denied:.*\.(part|temp|ytdl|mp4|mkv|webm|m4a)",
+    # Sidecar extensions (.info.json, .description, .jpg, .vtt, .srt)
+    # added so yt-dlp metadata-write failures also trigger the
+    # watchdog instead of slipping through silently (audit:
+    # disk_watch L50).
+    r"Permission denied:.*\.(part|temp|ytdl|mp4|mkv|webm|m4a|info\.json|description|jpg|jpeg|png|webp|vtt|srt)",
     r"(?:writ|output|file|disk|save).*Permission denied",
     # Windows variant of the same error.
-    r"Access is denied.*\.(part|temp|ytdl|mp4|mkv|webm|m4a)",
+    r"Access is denied.*\.(part|temp|ytdl|mp4|mkv|webm|m4a|info\.json|description|jpg|jpeg|png|webp|vtt|srt)",
     # HTTP 5xx REMOVED — it was flagging YouTube's
     # upstream errors as "DISK ERROR" and pausing every worker for
     # 5 minutes on transient 502s from YouTube. Disk and upstream

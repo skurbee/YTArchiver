@@ -141,6 +141,22 @@ class ChannelMixin:
         from backend.sync import channel_folder_name as _cfn
         folder = os.path.join(base, _cfn(ch))
 
+        # Per-channel in-flight dedupe so rapid clicks don't spawn N
+        # concurrent yt-dlp processes hitting the same channel URL and
+        # racing each other on the same .ChannelArt/*.jpg writes
+        # (audit: channel_mixin H23). Pattern matches
+        # archive_mixin's _archive_single_inflight.
+        _key = (ch.get("url") or name or folder).strip().lower()
+        if not hasattr(self, "_chan_art_inflight") or \
+                self._chan_art_inflight is None:
+            self._chan_art_inflight = set()
+            self._chan_art_lock = threading.Lock()
+        with self._chan_art_lock:
+            if _key in self._chan_art_inflight:
+                return {"ok": False,
+                        "error": "Already fetching art for this channel"}
+            self._chan_art_inflight.add(_key)
+
         def _run():
             # Surface failures explicitly. Old code let any exception
             # escape the thread silently — the user clicked "Fetch
@@ -159,6 +175,12 @@ class ChannelMixin:
                 except Exception:
                     pass
                 _log.debug("chan_fetch_art swallowed: %s", e)
+            finally:
+                try:
+                    with self._chan_art_lock:
+                        self._chan_art_inflight.discard(_key)
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
         return {"ok": True, "started": True}
@@ -280,6 +302,15 @@ class ChannelMixin:
             import uuid as _uuid
             bulk_id = _uuid.uuid4().hex[:12]
             bulk_total = len(bulk)
+            # Dedupe above is best-effort: the lock was released after
+            # the `queued_paths` snapshot, so between the snapshot and
+            # the loop below a worker can complete one of our paths
+            # and we'd re-enqueue. TranscribeManager.enqueue accepts
+            # the duplicate; the worker then re-runs Whisper on an
+            # already-fresh transcript, which is wasted compute but
+            # not data-corrupting (audit: channel_mixin H15 PARTIAL —
+            # documented rather than fixed; a stricter dedupe would
+            # require an enqueue-time check in TranscribeManager).
             for idx, (video, title) in enumerate(bulk):
                 self._transcribe.enqueue(video, title, channel=name,
                                          bulk_id=bulk_id, bulk_total=bulk_total,
@@ -670,16 +701,28 @@ class ChannelMixin:
                                 mismatch += 1
                         except Exception:
                             continue
+                import time as _t_mod
                 with self._pending_res_scans_lock:
                     self._pending_res_scans[token] = {
                         "done": True,
+                        "_ts": _t_mod.time(),
                         "result": {"ok": True, "mismatch": mismatch,
                                    "total": total, "scanned": scanned,
                                    "target": target_h},
                     }
 
+            # Sweep abandoned entries (>10 min old) on every new submit
+            # so the dict can't grow unbounded if the user navigates
+            # away mid-scan (audit: channel_mixin H10).
+            import time as _t_mod
+            _now_ts = _t_mod.time()
             with self._pending_res_scans_lock:
-                self._pending_res_scans[token] = {"done": False}
+                _stale = [k for k, v in self._pending_res_scans.items()
+                          if isinstance(v, dict)
+                          and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
+                for k in _stale:
+                    self._pending_res_scans.pop(k, None)
+                self._pending_res_scans[token] = {"done": False, "_ts": _now_ts}
             threading.Thread(target=_scan_worker, daemon=True,
                              name="chan_scan_resolution").start()
             return {"ok": True, "started": True, "token": token}
@@ -786,6 +829,14 @@ class ChannelMixin:
                     })
                 try: self._on_queue_changed()
                 except Exception as e: _log.debug("swallowed: %s", e)
+                # Branch on `_already` so the second click on the same
+                # channel doesn't get the same "queued" message that
+                # the first click got — the second click did NOT
+                # actually enqueue, and the user deserves to know
+                # (audit: channel_mixin H3).
+                if _already:
+                    return {"ok": False,
+                            "error": "Redownload already queued for this channel."}
                 return {"ok": False,
                         "error": "Sync pipeline running — redownload queued. "
                                  "It will start when the current sync ends."}

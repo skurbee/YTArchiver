@@ -238,7 +238,10 @@ def emit_metadata_activity_row(stream: LogStreamer,
                 else now.strftime("%I:%M%p").lstrip("0")).lower()
     date_str = now.strftime("%b %d").replace(" 0", " ")
     took = _fmt_duration(elapsed)
-    row_id = f"metdta_{channel_name}_{int(time.time())}"
+    # Use nanosecond-precision so two metadata tasks completing in
+    # the same second don't collide on row_id and overwrite each
+    # other's activity row (audit: log_rows L24).
+    row_id = f"metdta_{channel_name}_{time.time_ns()}"
     # Kind label is "Metdta" (6 chars, matches the existing classic
     # rows emitted by fetch_channel_metadata's legacy path). Row tag
     # is hist_pink — metadata-kind rows have always rendered pink in

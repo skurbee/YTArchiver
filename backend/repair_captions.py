@@ -377,11 +377,13 @@ def _update_db_words(video_id: str,
                 (json.dumps(w_val, ensure_ascii=False), video_id,
                  float(s_val or 0), float(e_val or 0)))
             updated += cur.rowcount
-            # Commit per-segment so a mid-loop error doesn't roll back
-            # earlier successful updates. The previous single-commit
-            # at end meant one bad row wiped every row's update in
-            # that _repair_one_video call.
-            conn.commit()
+        # Commit ONCE per video instead of per-segment — per-segment
+        # commits across an 80k-video corpus produced up to 4M commits
+        # and dominated wall time. A single commit per video preserves
+        # the prior "one bad row doesn't wipe siblings" property
+        # because each video gets its own atomic transaction (audit:
+        # repair_captions H57).
+        conn.commit()
         return updated, None
     except sqlite3.Error as e:
         try: conn.rollback()
@@ -402,9 +404,26 @@ def _looks_punctuated(segments: list, sample: int = 8) -> bool:
 
     Sentence-ending punctuation OR a multi-letter capitalized word in the
     first N segments => punctuated. The legacy raw format has neither.
+
+    Sample from BOTH ends + the middle so a video with a sparse intro
+    (music, "[music]", single-word reactions) isn't falsely classified
+    as unpunctuated and downgraded. The old version only looked at the
+    first N segments, so any punctuated video with a music-only intro
+    failed the heuristic (audit: repair_captions H71).
     """
-    text = " ".join((s.get("t") or s.get("text") or "")
-                    for s in segments[:sample])
+    if not segments:
+        return False
+    _n = len(segments)
+    _samples: list = []
+    _samples.extend(segments[:sample])
+    if _n > sample:
+        # Middle slice
+        _mid = max(sample, (_n - sample) // 2)
+        _samples.extend(segments[_mid:_mid + sample])
+    if _n > sample * 2:
+        # Last slice
+        _samples.extend(segments[-sample:])
+    text = " ".join((s.get("t") or s.get("text") or "") for s in _samples)
     if not text.strip():
         return False
     if _PUNCT_CHARS_RE.search(text):

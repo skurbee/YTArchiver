@@ -429,18 +429,29 @@ def prune_missing_videos() -> dict[str, int]:
                         # inherit the stale FTS tokens — making a brand
                         # new video's text alias under an old text's
                         # search hits. Mirrors index.py:564 pattern.
+                        # Skip the segments DELETE if the FTS detach
+                        # failed — otherwise we leave orphan FTS rows
+                        # whose rowids will be recycled by a later
+                        # INSERT, aliasing a new video's text under
+                        # the deleted one's search hits (audit:
+                        # index_maintenance H113).
+                        _fts_ok = False
                         try:
                             conn.execute(
                                 "INSERT INTO segments_fts(segments_fts, rowid, text) "
                                 "SELECT 'delete', id, text FROM segments "
                                 "WHERE video_id=?",
                                 (vid,))
+                            _fts_ok = True
                         except Exception as e:
-                            _log.debug("swallowed: %s", e)
-                        c1 = conn.execute(
-                            "DELETE FROM segments WHERE video_id=?",
-                            (vid,))
-                        segs_removed += c1.rowcount or 0
+                            _log.warning("FTS detach failed for %s: %s — "
+                                         "skipping segments DELETE to avoid "
+                                         "orphan FTS rows", vid, e)
+                        if _fts_ok:
+                            c1 = conn.execute(
+                                "DELETE FROM segments WHERE video_id=?",
+                                (vid,))
+                            segs_removed += c1.rowcount or 0
                 c2 = conn.execute(
                     "DELETE FROM videos WHERE filepath=? COLLATE NOCASE",
                     (fp,))

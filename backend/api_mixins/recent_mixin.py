@@ -269,6 +269,17 @@ class RecentMixin:
         fp = self._recent_lookup_path(title, channel)
         if not fp:
             return {"ok": False, "error": "File not found"}
+        # Refuse the destructive os.remove if config writes are blocked
+        # — otherwise we delete the file but can't update the
+        # recent_downloads list, leaving the user with a stale entry
+        # pointing at a missing file with no way to clean it up
+        # (audit: recent_mixin H22).
+        if not config_is_writable():
+            return {"ok": False,
+                    "error": "Config is currently read-only "
+                             "(write-gate or read-only filesystem). "
+                             "Refusing to delete file when the recent "
+                             "list can't be updated."}
         try:
             os.remove(fp)
         except OSError as e:

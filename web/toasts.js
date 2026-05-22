@@ -94,22 +94,32 @@
         }
       } catch {}
     }
-    const ttl = opts.ttlMs ?? (opts.kind === "error" ? 4500 : 2500);
+    // Errors get longer read-time so a multi-line message isn't
+    // dismissed before the user finishes reading it (audit:
+    // toasts.js L77). Was 4500ms, now 8000ms.
+    const ttl = opts.ttlMs ?? (opts.kind === "error" ? 8000 : 2500);
     const el = document.createElement("div");
     el.className = "toast " + (opts.kind || "");
     const msgEl = document.createElement("span");
     msgEl.textContent = opts.msg || "";
     el.appendChild(msgEl);
+    // Defer the action-button wiring until AFTER `dismiss` is defined
+    // below (closure capture). Was: bare `el.remove()` here that
+    // bypassed dismiss() — leaking the timer + the visibilitychange
+    // listener registered later (audit: toasts.js H131).
+    let _wireActionBtn = null;
     if (opts.action) {
       const btn = document.createElement("button");
       btn.className = "toast-action";
       btn.textContent = opts.action.label || "Undo";
       btn.style.cssText = "margin-left:10px;background:transparent;border:none;color:var(--c-log-blue);cursor:pointer;text-decoration:underline;font-size:inherit;";
-      btn.addEventListener("click", () => {
-        try { opts.action.onClick?.(); } catch {}
-        el.remove();
-      });
       el.appendChild(btn);
+      _wireActionBtn = (dismissFn) => {
+        btn.addEventListener("click", () => {
+          try { opts.action.onClick?.(); } catch {}
+          dismissFn();
+        });
+      };
     }
     root.appendChild(el);
     // Visibility-aware auto-dismiss — pauses the countdown while the
@@ -129,7 +139,11 @@
     };
     const schedule = () => {
       startedAt = Date.now();
-      timer = setTimeout(dismiss, remaining);
+      // Enforce a 400ms minimum after re-show so a toast that was
+      // already nearly dismissed before visibilitychange doesn't
+      // flash and immediately disappear when the user comes back
+      // (audit: toasts.js L66).
+      timer = setTimeout(dismiss, Math.max(remaining, 400));
     };
     const onVis = () => {
       if (document.visibilityState === "hidden") {
@@ -144,5 +158,6 @@
     };
     document.addEventListener("visibilitychange", onVis);
     if (document.visibilityState !== "hidden") schedule();
+    if (_wireActionBtn) _wireActionBtn(dismiss);
   };
 })();

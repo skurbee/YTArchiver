@@ -176,16 +176,20 @@ def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:
 # refresh) writing the same jsonl_path used to race on os.replace
 # — one writer's full entries-dict would land, the other's would
 # disappear (audit: metadata_io.py:123-144).
-_write_locks: dict[str, threading.Lock] = {}
+# Uses RLock so callers can take the lock externally (to span a
+# read+merge+write critical section) and the inner _write_metadata_jsonl
+# can still re-acquire it on the same thread without deadlocking
+# (audit: refresh_views.py C15).
+_write_locks: dict[str, "threading.RLock"] = {}
 _write_locks_global = threading.Lock()
 
 
-def _lock_for(path: str) -> threading.Lock:
+def _lock_for(path: str) -> "threading.RLock":
     key = os.path.normcase(os.path.abspath(path))
     with _write_locks_global:
         lk = _write_locks.get(key)
         if lk is None:
-            lk = threading.Lock()
+            lk = threading.RLock()
             _write_locks[key] = lk
         return lk
 
@@ -205,13 +209,20 @@ def _write_metadata_jsonl(jsonl_path: str,
         if os.name == "nt" and os.path.isfile(jsonl_path):
             _unhide_file_win(jsonl_path)
         tmp_path = jsonl_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for _vid, data in entries_dict.items():
-                f.write(json.dumps(data, ensure_ascii=False) + "\n")
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_path, jsonl_path)
+        # Clean up tmp on any failure so a partial write doesn't sit
+        # next to the real file forever (audit: metadata_io H92).
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for _vid, data in entries_dict.items():
+                    f.write(json.dumps(data, ensure_ascii=False) + "\n")
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path, jsonl_path)
+        except Exception:
+            try: os.remove(tmp_path)
+            except OSError: pass
+            raise
         _hide_file_win(jsonl_path)

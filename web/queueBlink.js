@@ -198,8 +198,13 @@
   function _isPipelinePending(s) {
     if (!s.paused || !s.running) return false;
     if (!s.pausedActive) return true;
-    if (s.pausedAtMs && (Date.now() - s.pausedAtMs) < _PAUSE_PENDING_MIN_MS) {
-      return true;
+    // Clamp the elapsed delta to >=0 so a backwards clock skew (NTP
+    // adjustment, user changed system time) doesn't produce a
+    // negative diff that's always < threshold and lock the pause
+    // pending state on forever (audit: queueBlink.js H189).
+    if (s.pausedAtMs) {
+      const _elapsed = Math.max(0, Date.now() - s.pausedAtMs);
+      if (_elapsed < _PAUSE_PENDING_MIN_MS) return true;
     }
     return false;
   }

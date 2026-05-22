@@ -179,7 +179,18 @@ class InfoMixin:
             del hist[20:]
             cfg["url_history"] = hist
             from backend.ytarchiver_config import save_config as _sc
-            _sc(cfg)
+            _ok = _sc(cfg)
+            # Don't silently drop the URL if the save fails (write-gate
+            # toggled off mid-call, disk full). Emit a dim line so the
+            # user can investigate why their autocomplete history isn't
+            # updating (audit: info_mixin H13).
+            if not _ok:
+                try:
+                    self._log_stream.emit_dim(
+                        f"URL history save failed (config write-gate or disk) "
+                        f"— '{(url or '')[:60]}' not added to autocomplete.")
+                except Exception:
+                    pass
 
 
     # ─── Last Full Sync live label ──────────────────────────────────────

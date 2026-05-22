@@ -274,9 +274,23 @@ class LogStreamer:
             # Escape closing </script> in JSON before injection
             js_payload = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
             self._window.evaluate_js(f"window._logBatch({js_payload})")
+            # Reset the consecutive-drop counter on success.
+            self._drop_count = 0
         except Exception:
-            # Window may be gone; drop silently so we don't deadlock workers
-            pass
+            # Window may be gone; drop silently so we don't deadlock
+            # workers. Track consecutive drops so a real problem
+            # (oversized payload, devtools paused, evaluate_js
+            # exception storm) surfaces after a threshold instead of
+            # disappearing entirely (audit: log_stream H123).
+            self._drop_count = getattr(self, "_drop_count", 0) + 1
+            if self._drop_count in (10, 100, 1000):
+                try:
+                    import logging as _lg
+                    _lg.getLogger(__name__).warning(
+                        "log_stream: %d consecutive evaluate_js drops "
+                        "(window may be unresponsive)", self._drop_count)
+                except Exception:
+                    pass
 
     # ── helpers ──
 

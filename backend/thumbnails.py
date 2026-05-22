@@ -77,7 +77,14 @@ def _download_thumbnail(url: str, thumb_dir: str,
     """
     if not url or not video_id:
         return
-    safe_title = re.sub(r'[<>:"/\\|?*]', '_', title or "")[:100]
+    # Also strip control chars (incl. NUL) and trim trailing dots /
+    # spaces so the resulting filename is valid on NTFS — bare
+    # `[<>:"/\\|?*]` substitution missed those classes (audit:
+    # thumbnails H84).
+    _src_title = title or ""
+    _safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', _src_title)
+    _safe = _safe.rstrip(". ")[:100] or "untitled"
+    safe_title = _safe
     fname = f"{safe_title} [{video_id}].jpg"
     fpath = os.path.join(thumb_dir, fname)
     if os.path.isfile(fpath):

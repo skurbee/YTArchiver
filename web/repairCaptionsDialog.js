@@ -79,6 +79,15 @@
           channel: chanSel.value || "",
           dry_run: !!dryEl?.checked,
         };
+        // Confirm a destructive all-channels live run (audit:
+        // repairCaptionsDialog H236).
+        if (!payload.channel && !payload.dry_run) {
+          const _ok = window.confirm(
+            "Repair YT captions — ALL channels with dry-run OFF.\n\n" +
+            "This rewrites every YT-captioned transcript in every " +
+            "channel and can take hours.\n\nProceed?");
+          if (!_ok) return;
+        }
         try {
           const res = await api.repair_yt_captions(payload);
           if (res?.ok && res.queued) {

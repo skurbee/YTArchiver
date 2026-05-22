@@ -505,6 +505,11 @@
       document.getElementById("edit-folder-org").value = defs.folder_org || "years";
       const rangeRadio = document.querySelector(`input[name="edit-range"][value="${defs.mode === 'full' ? 'all' : defs.mode || 'subscribe'}"]`);
       if (rangeRadio) { rangeRadio.checked = true; rangeRadio.dispatchEvent(new Event("change")); }
+      // Fire the dirty-check explicitly so the Update button enables
+      // after a Restore Defaults — only compress fires `change`
+      // events, so other fields' programmatic value-writes never
+      // reached the input/change listener (audit: editChannel L88).
+      try { _checkEditChanges?.(); } catch {}
       window._showToast?.("Defaults restored.", "ok");
     });
 

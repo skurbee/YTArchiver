@@ -66,13 +66,21 @@
   }
 
   // ── "Native mode required" toast (deduped) ───────────────────────
-  let _lastToastAt = 0;
+  // Dedupe BY MESSAGE so two different error texts within 1s don't
+  // silently swallow the second one (audit: bridge.js H146).
+  const _lastToastAtBy = new Map();
   function _toastNativeRequired(msg) {
     const text = msg || "Native mode required.";
-    // Dedupe — repeated handler calls within 1s only show one toast.
     const now = Date.now();
-    if (now - _lastToastAt < 1000) return;
-    _lastToastAt = now;
+    const _prev = _lastToastAtBy.get(text) || 0;
+    if (now - _prev < 1000) return;
+    _lastToastAtBy.set(text, now);
+    // Cap the map size so a flood of unique error strings can't grow
+    // it unbounded.
+    if (_lastToastAtBy.size > 50) {
+      const _oldest = [..._lastToastAtBy.entries()].sort((a, b) => a[1] - b[1])[0];
+      if (_oldest) _lastToastAtBy.delete(_oldest[0]);
+    }
     if (typeof window._showToast === "function") {
       window._showToast(text, "warn");
     } else {
@@ -162,10 +170,22 @@
         for (const rec of _records) {
           for (const node of rec.addedNodes) {
             if (node.nodeType !== 1) continue;
+            // Fast bail for the hot path: log lines are added at
+            // hundreds per second during heavy sync and never carry
+            // [data-needs-ready]. Cheap class-based filter so the
+            // expensive querySelectorAll only runs on potentially-
+            // matching subtrees (audit: bridge.js H137).
+            if (node.classList && (
+                node.classList.contains("log-line")
+                || node.classList.contains("activity-row"))) {
+              continue;
+            }
             if (node.hasAttribute && node.hasAttribute("data-needs-ready")) {
               _applyReadyTo(node, _readyState);
             }
-            if (node.querySelectorAll) {
+            if (node.querySelectorAll
+                && node.outerHTML
+                && node.outerHTML.indexOf("data-needs-ready") !== -1) {
               node.querySelectorAll("[data-needs-ready]").forEach(el => {
                 _applyReadyTo(el, _readyState);
               });

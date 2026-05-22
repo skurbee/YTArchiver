@@ -89,7 +89,8 @@ class TranscribeMixin:
         return {"ok": True, "started": True}
 
 
-    def transcribe_retranscribe(self, path, title="", video_id=""):
+    def transcribe_retranscribe(self, path, title="", video_id="",
+                                 _on_complete_extra=None):
         """Queue a re-transcription of a video with the current Whisper model.
         Mirrors YTArchiver.py:16369 `_run_retranscribe_job`.
 
@@ -118,6 +119,20 @@ class TranscribeMixin:
             except Exception:
                 pass
             return {"ok": False, "error": "File not found"}
+        # Extension check — Whisper would otherwise spend minutes
+        # failing on a JSON sidecar or arbitrary text file passed via
+        # a malformed call (audit: transcribe_mixin H19).
+        _MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov",
+                       ".avi", ".mp3", ".wav", ".flac", ".m4v", ".wmv")
+        if not path.lower().endswith(_MEDIA_EXTS):
+            try:
+                self._log_stream.emit_text(
+                    f" — Re-transcribe rejected: not a media file — "
+                    f"{title or path}", "red")
+            except Exception:
+                pass
+            return {"ok": False,
+                    "error": "Not a media file (expected .mp4/.mkv/.webm/etc)"}
         # Best-effort derive the video_id if the caller didn't supply one.
         # The replace helpers use it to catch title-drifted stale entries
         # that a title-only match would miss. Lookup order mirrors
@@ -179,13 +194,20 @@ class TranscribeMixin:
         _path = os.path.normpath(path)
         def _on_done(_result):
             try:
-                if _self._window is None:
-                    return
-                import json as _json
-                payload = _json.dumps({"video_id": _vid, "filepath": _path})
-                _self._window.evaluate_js(
-                    f"if (window._onRetranscribeComplete) "
-                    f"window._onRetranscribeComplete({payload});")
+                if _self._window is not None:
+                    import json as _json
+                    payload = _json.dumps({"video_id": _vid, "filepath": _path})
+                    _self._window.evaluate_js(
+                        f"if (window._onRetranscribeComplete) "
+                        f"window._onRetranscribeComplete({payload});")
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            # Extra hook for callers (e.g. _handle_retranscribe model
+            # restore — audit: main.py H20). Always fires whether or
+            # not the JS push above succeeded.
+            try:
+                if callable(_on_complete_extra):
+                    _on_complete_extra(_result)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         ok = self._transcribe.enqueue(
@@ -196,6 +218,15 @@ class TranscribeMixin:
             video_id=vid_id,
             on_complete=_on_done,
         )
+        # If enqueue rejected the job (queue full, manager down), fire
+        # the completion hook synchronously so the JS Watch view's
+        # pending state clears instead of spinning forever (audit:
+        # transcribe_mixin H19).
+        if not ok:
+            try:
+                _on_done({"ok": False, "error": "enqueue rejected"})
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         # Visible log line so the user can see the click was honored,
         # even when Whisper isn't loading immediately (GPU Auto off,
         # already-running job, etc.). Previously a successful enqueue

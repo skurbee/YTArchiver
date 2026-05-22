@@ -117,16 +117,31 @@ class MediaOpsMixin:
             self._drift_scan_results = {}
         if not hasattr(self, "_drift_scan_lock"):
             self._drift_scan_lock = threading.Lock()
+        # Sweep abandoned entries (>10 min) so the dict can't grow
+        # unbounded if user navigates away mid-scan (audit:
+        # media_ops_mixin H10).
+        import time as _t_mod
+        _now_ts = _t_mod.time()
         with self._drift_scan_lock:
-            self._drift_scan_results[token] = {"ok": True, "pending": True}
+            _stale = [k for k, v in self._drift_scan_results.items()
+                      if isinstance(v, dict)
+                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
+            for k in _stale:
+                self._drift_scan_results.pop(k, None)
+            self._drift_scan_results[token] = {
+                "ok": True, "pending": True, "_ts": _now_ts}
         def _run():
             try:
                 res = _ds.scan_channel(ch, output_dir)
+                if isinstance(res, dict):
+                    res["_ts"] = _t_mod.time()
                 with self._drift_scan_lock:
                     self._drift_scan_results[token] = res
             except Exception as e:
                 with self._drift_scan_lock:
-                    self._drift_scan_results[token] = {"ok": False, "error": str(e)}
+                    self._drift_scan_results[token] = {
+                        "ok": False, "error": str(e),
+                        "_ts": _t_mod.time()}
         threading.Thread(target=_run, daemon=True,
                          name="drift-scan-channel").start()
         return {"ok": True, "pending": True, "token": token}
@@ -185,8 +200,17 @@ class MediaOpsMixin:
             self._drift_apply_results = {}
         if not hasattr(self, "_drift_apply_lock"):
             self._drift_apply_lock = threading.Lock()
+        # TTL sweep (audit: media_ops_mixin H10).
+        import time as _t_mod
+        _now_ts = _t_mod.time()
         with self._drift_apply_lock:
-            self._drift_apply_results[token] = {"ok": True, "pending": True}
+            _stale = [k for k, v in self._drift_apply_results.items()
+                      if isinstance(v, dict)
+                      and (_now_ts - (v.get("_ts") or _now_ts)) > 600]
+            for k in _stale:
+                self._drift_apply_results.pop(k, None)
+            self._drift_apply_results[token] = {
+                "ok": True, "pending": True, "_ts": _now_ts}
         def _run():
             try:
                 result = _ds.apply_channel(
@@ -215,7 +239,19 @@ class MediaOpsMixin:
                             "dim")
                     self._log_stream.flush()
                     if a.get("retranscribe_queued", 0) > 0:
-                        self._maybe_autostart_sync()
+                        # Surface a breadcrumb when the autostart
+                        # loses the lock race against another caller
+                        # (UI Sync click, autorun, etc.) so the user
+                        # has a clue why "drift fixed + queued" was
+                        # followed by no sync activity (audit:
+                        # media_ops_mixin H21).
+                        if not self._maybe_autostart_sync():
+                            try:
+                                self._log_stream.emit_dim(
+                                    " — (autostart skipped — another sync "
+                                    "start is already in flight)")
+                            except Exception:
+                                pass
                 with self._drift_apply_lock:
                     self._drift_apply_results[token] = result
             except Exception as e:

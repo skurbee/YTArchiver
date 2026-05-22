@@ -34,7 +34,7 @@ from . import core as _core
 from .core import sync_channel
 
 # Helpers used by sync_all
-from .active_state import fire_metadata_changed_hook
+from .active_state import fire_channel_synced_hook, fire_metadata_changed_hook
 from .display_push import clear_sync_progress
 from .log_rows import (
     _ROW_EMIT_PASS_ID,
@@ -74,6 +74,12 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     if not channels:
         stream.emit(_bracket_segments("Sync") +
                     [["No channels subscribed.\n", "simpleline"]])
+        # Clear any leftover sync_progress file from a prior pass
+        # — the finalizer at end-of-function won't run when we
+        # early-return here, leaving the companion display showing
+        # stale "in progress" state (audit: sync_all L25).
+        try: clear_sync_progress()
+        except Exception as e: _log.debug("swallowed: %s", e)
         return {"ok": False, "reason": "no channels", "total": 0}
 
     # ENQUEUE DECISION:
@@ -220,6 +226,14 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     # YTArchiver _load_archived_ids + _quick_check_new_uploads pairing.
     _known_ids: set = set()
     _archive_malformed = 0
+    # YouTube video IDs are exactly 11 chars from [A-Za-z0-9_-]. We
+    # `errors="replace"` to survive a torn line, but a U+FFFD inside
+    # the id field would land an unmatchable string in `_known_ids`,
+    # defeating quick_check_new_uploads. Validate after split so both
+    # torn-line AND encoding-corruption cases get counted as malformed
+    # (audit: sync_all.py H34).
+    import re as _re_id
+    _VID_RE = _re_id.compile(r'^[A-Za-z0-9_-]{11}$')
     try:
         if os.path.isfile(ARCHIVE_FILE):
             with open(ARCHIVE_FILE, "r", encoding="utf-8", errors="replace") as _af:
@@ -229,7 +243,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                     if not _stripped:
                         continue
                     _parts = _stripped.split(None, 1)
-                    if len(_parts) == 2:
+                    if len(_parts) == 2 and _VID_RE.match(_parts[1]):
                         _known_ids.add(_parts[1])
                     else:
                         # Non-empty line that didn't parse — count and
@@ -290,7 +304,21 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         from ..pause_helpers import wait_for_resume
         # queue-flag flipping + wait loop delegated to
         # pause_helpers.wait_for_resume; row-repaint stays here.
-        cancelled = wait_for_resume(pause_event, cancel_event, tick=0.25)
+        # Loop the wait so a re-pause that lands in the gap between
+        # wait_for_resume returning and us clearing the flag re-enters
+        # the wait instead of falling through (audit: sync_all H30).
+        cancelled = False
+        while True:
+            cancelled = wait_for_resume(pause_event, cancel_event, tick=0.25)
+            if cancelled:
+                break
+            # Re-check pause_event under no lock — best-effort. If it
+            # got set again immediately after wait_for_resume returned,
+            # loop and wait again. If it's clear, fall through to
+            # clearing paused_active and emitting "Resumed".
+            if pause_event.is_set():
+                continue
+            break
         # Always clear the active flag (resumed OR cancelled).
         if queues is not None:
             try: queues.set_sync_paused_active(False)
@@ -480,8 +508,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 if (pause_event is not None and pause_event.is_set()
                         and queues is not None):
                     try:
-                        queues.sync.insert(0, ch)
-                        queues._notify()
+                        queues.sync_requeue_front(ch)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                     _sync_row_emit(stream, i, total, ch_name,
@@ -604,8 +631,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 if (pause_event is not None and pause_event.is_set()
                         and queues is not None):
                     try:
-                        queues.sync.insert(0, ch)
-                        queues._notify()
+                        queues.sync_requeue_front(ch)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                     _sync_row_emit(stream, i, total, ch_name,
@@ -739,8 +765,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                 if (pause_event is not None and pause_event.is_set()
                         and queues is not None):
                     try:
-                        queues.sync.insert(0, ch)
-                        queues._notify()
+                        queues.sync_requeue_front(ch)
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                     _sync_row_emit(stream, i, total, ch_name,
@@ -971,8 +996,7 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         if (pause_event is not None and pause_event.is_set()
                 and queues is not None):
             try:
-                queues.sync.insert(0, ch)
-                queues._notify()
+                queues.sync_requeue_front(ch)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
             _sync_row_emit(stream, i, total, ch_name,
@@ -990,6 +1014,13 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         # Clear the "live" marker so a pause between channels doesn't
         # re-paint this row (which is now DONE with a summary).
         _last_live["name"] = ""
+        # Notify any registered listener that this channel's per-channel
+        # state just changed. Main.py wires this to a JS push so the
+        # Subs tab's "Last Sync" column updates live as the pass
+        # advances — without it the column stays frozen at its boot-time
+        # values until the user clicks away and back.
+        try: fire_channel_synced_hook()
+        except Exception as e: _log.debug("swallowed: %s", e)
         # If this was a batch-limited bootstrap run, apply the next cooldown.
         # We only set cooldown when the channel hadn't finished initializing
         # and this pass hit the BATCH_LIMIT threshold.
@@ -1061,6 +1092,23 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
     emit_parts.append([f"took {_fmt_duration(elapsed)} ", "simpleline"])
     emit_parts.append(["===\n", "simplestatus_green"])
     stream.emit(emit_parts)
+    # Global "Last Full Sync" timestamp \u2014 written here at pass
+    # completion (and only for a download-kind pass, and only when not
+    # cancelled) so the UI's "Last Full Sync: \u2026" label genuinely means
+    # "a full Sync Subbed pass finished at this time". Previously this
+    # was written inside sync_channel whenever any channel downloaded,
+    # so the label advanced mid-pass after the first channel with new
+    # videos \u2014 making it look like a sync "completed" at the moment the
+    # FIRST channel finished a download, not at the actual end of pass.
+    _cancelled_for_ts = (cancel_event is not None and cancel_event.is_set())
+    if _label == "Sync pass" and not _cancelled_for_ts:
+        try:
+            _cfg_end = load_config()
+            _cfg_end["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            from ..ytarchiver_config import save_config as _save_cfg
+            _save_cfg(_cfg_end)
+        except Exception as _ce:
+            _log.debug("end-of-pass last_sync write failed: %s", _ce)
     # Clean up: clear the running-slot and pass-progress decoration.
     # Only flush remaining queued items when the loop drained
     # NATURALLY (no cancel). On cancel, leave the queue alone so
@@ -1072,8 +1120,14 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         if not _cancelled:
             try: queues.sync_clear()
             except Exception as e: _log.debug("swallowed: %s", e)
-        try: queues.set_current_sync(None)
-        except Exception as e: _log.debug("swallowed: %s", e)
+        # Don't drop the in-flight item from `current_sync` on cancel
+        # — that's what `save_now` writes into the `resuming` dict
+        # so the next app launch can pick it back up. Clearing it
+        # here meant a cancelled-mid-channel run lost the in-flight
+        # channel from the resume entry-point (audit: sync_all H27).
+        if not _cancelled:
+            try: queues.set_current_sync(None)
+            except Exception as e: _log.debug("swallowed: %s", e)
         try: queues.set_sync_pass_progress(0, 0)
         except Exception as e: _log.debug("swallowed: %s", e)
     # Clear the sync-progress file so any companion display goes idle.

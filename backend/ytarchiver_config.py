@@ -488,6 +488,21 @@ def save_config(cfg: dict[str, Any]) -> bool:
             tmp = CONFIG_FILE.with_suffix(".json.tmp")
             _tmp_path = _long_path(str(tmp))
             _cfg_path = _long_path(str(CONFIG_FILE))
+            # Capture the pre-existing hidden attribute on Windows so
+            # we can re-apply it after os.replace, which otherwise
+            # exposes a previously-hidden config file in Explorer
+            # (audit: ytarchiver_config H120). FILE_ATTRIBUTE_HIDDEN
+            # is bit 0x02; getfileattributes returns -1 if missing.
+            _was_hidden = False
+            if os.name == "nt":
+                try:
+                    import ctypes as _ctypes
+                    _attrs = _ctypes.windll.kernel32.GetFileAttributesW(
+                        _cfg_path)
+                    if _attrs != 0xFFFFFFFF and (_attrs & 0x02):
+                        _was_hidden = True
+                except Exception:
+                    pass
             with open(_tmp_path, "w", encoding="utf-8") as f:
                 json.dump(cfg_for_write, f, indent=2)
                 # flush + fsync before closing so the
@@ -499,6 +514,13 @@ def save_config(cfg: dict[str, Any]) -> bool:
                 except OSError:
                     pass
             os.replace(_tmp_path, _cfg_path)
+            if _was_hidden and os.name == "nt":
+                try:
+                    import ctypes as _ctypes
+                    _ctypes.windll.kernel32.SetFileAttributesW(
+                        _cfg_path, 0x02)
+                except Exception:
+                    pass
             # fsync the parent directory entry too so a power loss
             # immediately after replace doesn't leave the directory
             # pointing at a half-committed inode. Only POSIX supports

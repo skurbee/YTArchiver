@@ -67,10 +67,17 @@
       // should close it instead of popping another on top. Detect via
       // the shared `ctx-menu-root` container the context-menu helper
       // appends into.
+      // Only close-and-bail when the open menu is OUR menu — otherwise
+      // clicking Clear while a different context menu is open would
+      // hijack it (audit: clearButton.js H132). Tag with data-source.
       const ctxRoot = document.getElementById("ctx-menu-root");
-      if (ctxRoot && ctxRoot.childElementCount > 0) {
+      if (ctxRoot && ctxRoot.querySelector('[data-source="clear-menu"]')) {
         ctxRoot.innerHTML = "";
         return;
+      }
+      if (ctxRoot && ctxRoot.childElementCount > 0) {
+        // Different menu is open — close it and proceed to open ours.
+        ctxRoot.innerHTML = "";
       }
       // Only surface the options that correspond to logs with actual
       // content. If the main log is empty, no "Clear log" item. If the
@@ -98,6 +105,12 @@
       const rect = btn.getBoundingClientRect();
       if (window.showContextMenu) {
         window.showContextMenu(rect.left, rect.bottom + 2, items);
+        // Tag the newly-opened menu so the toggle path above can
+        // identify it (audit: clearButton.js H132).
+        const _cm = document.getElementById("ctx-menu-root");
+        if (_cm && _cm.firstElementChild) {
+          _cm.firstElementChild.setAttribute("data-source", "clear-menu");
+        }
       }
     });
   }

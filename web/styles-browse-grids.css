@@ -327,7 +327,9 @@
   filter: grayscale(0) brightness(1);
 }
 .video-card.video-card-removed .video-card-title {
-  color: #c4a8a8;
+  /* Was hardcoded #c4a8a8 — use palette token so theme tweaks
+     follow (audit: L172). */
+  color: var(--c-bad-fg);
 }
 .video-card-body {
   padding: 8px 10px;

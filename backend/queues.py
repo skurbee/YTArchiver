@@ -40,11 +40,13 @@ class QueueState:
     def __init__(self):
         self._lock = threading.RLock()
         self.sync: list[dict[str, Any]] = []
-        self.reorg: list[list] = []
-        self.video: list[list] = []
-        self.transcribe: list[list] = []
-        self.redownload: list[dict[str, Any]] = []
-        self.metadata: list[dict[str, Any]] = []
+        # LOW FIX (audit 5.23 LOW-3): removed five vestigial sub-queue
+        # lists (reorg, video, transcribe, redownload, metadata). They
+        # were initialized, persisted, loaded, and counted, but no code
+        # outside this file ever appended to or popped from them.
+        # Redownload / transcribe / comments-refresh / etc. all ride
+        # `self.sync` with a `kind="..."` discriminator (see
+        # _task_label_sync). Verified by grep across the entire repo.
         self.gpu: list[dict[str, Any]] = []
         self.order: list[list] = [] # [[kind, id], ...]
         self.gpu_paused: bool = False
@@ -63,8 +65,10 @@ class QueueState:
         # Current in-flight items (not yet re-queued, but shown in popover)
         self.current_sync: dict[str, Any] | None = None
         self.current_gpu: dict[str, Any] | None = None
-        self.current_redownload: dict[str, Any] | None = None
-        self.current_metadata: dict[str, Any] | None = None
+        # LOW FIX (audit 5.23 LOW-3): current_redownload / current_metadata
+        # removed alongside their parent lists. No code assigned them, so
+        # save_now never populated the corresponding `resuming` keys and
+        # requeue_resuming's redownload/metadata branches were unreachable.
 
         # Sync-pass progress: when "Sync Subbed" runs, we don't enqueue 103
         # individual channel items into `self.sync` — we iterate them
@@ -139,7 +143,14 @@ class QueueState:
             return dict(self._loaded_resuming or {})
 
     def add_listener(self, fn: Callable[[], None]):
-        self._listeners.append(fn)
+        # LOW FIX (audit 5.23 LOW-4): hold _lock around the listener-list
+        # mutation. Today listeners are only added once at startup so the
+        # race is theoretical, but the rest of QueueState's invariant is
+        # "any shared mutable state goes through _lock" — keep this site
+        # consistent so a future caller that registers a listener mid-run
+        # can't race the snapshot in _notify.
+        with self._lock:
+            self._listeners.append(fn)
 
     def _notify(self):
         # Fire listeners on a background thread so the mutation path
@@ -152,7 +163,11 @@ class QueueState:
         # idempotent and run on a short-lived daemon thread; ordering
         # is preserved because we snapshot the listener list before
         # dispatching.
-        snapshot = list(self._listeners)
+        # LOW FIX (audit 5.23 LOW-4): snapshot under _lock to pair with
+        # the locked add_listener above. Cheap (single list copy) and
+        # closes the theoretical add-during-snapshot race.
+        with self._lock:
+            snapshot = list(self._listeners)
         if not snapshot:
             return
         def _fire():
@@ -197,11 +212,11 @@ class QueueState:
             return False
         with self._lock:
             self.sync = list(data.get("sync", []))
-            self.reorg = list(data.get("reorg", []))
-            self.video = list(data.get("video", []))
-            self.transcribe = list(data.get("transcribe", []))
-            self.redownload = list(data.get("redownload", []))
-            self.metadata = list(data.get("metadata", []))
+            # LOW FIX (audit 5.23 LOW-3): no longer load five dead lists
+            # (reorg / video / transcribe / redownload / metadata). If an
+            # old queue file on disk still has those keys, they're silently
+            # ignored. None of those kinds carried real items in practice
+            # — they all ride the sync queue with a `kind=` discriminator.
             self.gpu = list(data.get("gpu", []))
             self.order = list(data.get("order", []))
             self.gpu_paused = bool(data.get("gpu_paused", False))
@@ -230,7 +245,10 @@ class QueueState:
                 # twice (once as a resuming candidate AND again as a
                 # normal head item).
                 self._loaded_resuming = {}
-                for key in ("sync", "redownload", "metadata", "gpu"):
+                # LOW FIX (audit 5.23 LOW-3): removed redownload / metadata
+                # from this loop — those attributes no longer exist and
+                # they never carried real items in practice anyway.
+                for key in ("sync", "gpu"):
                     lst = getattr(self, key, None)
                     if (lst and isinstance(lst, list)
                             and isinstance(lst[0], dict)
@@ -244,13 +262,13 @@ class QueueState:
         if not config_is_writable():
             return False
         with self._lock:
+            # LOW FIX (audit 5.23 LOW-3): payload no longer writes
+            # five always-empty arrays (reorg / video / transcribe /
+            # redownload / metadata). Saves a few bytes per write and
+            # removes a foot-gun: a future contributor reading the
+            # JSON file would assume those queues are wired up.
             payload = {
                 "sync": copy.deepcopy(self.sync),
-                "reorg": copy.deepcopy(self.reorg),
-                "video": copy.deepcopy(self.video),
-                "transcribe": copy.deepcopy(self.transcribe),
-                "redownload": copy.deepcopy(self.redownload),
-                "metadata": copy.deepcopy(self.metadata),
                 "gpu": copy.deepcopy(self.gpu),
                 "order": copy.deepcopy(self.order),
                 "gpu_paused": self.gpu_paused,
@@ -269,10 +287,10 @@ class QueueState:
             resuming: dict[str, Any] = {}
             if self.current_sync is not None:
                 resuming["sync"] = copy.deepcopy(self.current_sync)
-            if self.current_redownload is not None:
-                resuming["redownload"] = copy.deepcopy(self.current_redownload)
-            if self.current_metadata is not None:
-                resuming["metadata"] = copy.deepcopy(self.current_metadata)
+            # LOW FIX (audit 5.23 LOW-3): removed current_redownload /
+            # current_metadata writes — those attributes no longer exist
+            # (nothing ever assigned them, so the corresponding resuming
+            # keys never landed in practice).
             if self.current_gpu is not None:
                 resuming["gpu"] = copy.deepcopy(self.current_gpu)
             if resuming:
@@ -899,29 +917,27 @@ class QueueState:
     # ── stats ───────────────────────────────────────────────────────
 
     def counts(self) -> dict[str, int]:
-        # include transcribe + video counts so the UI
-        # badge totals don't silently undercount. Old counts() only
-        # returned sync/gpu/redownload/metadata/reorg, so items on
-        # transcribe/video lists were invisible to any caller using
-        # this dict for summaries.
+        # LOW FIX (audit 5.23 LOW-3): trimmed redownload/metadata/reorg/
+        # transcribe/video keys. Those lists no longer exist (see __init__
+        # comment) and were always zero. No production caller reads this
+        # method today (grep showed zero hits) but keep sync + gpu around
+        # in case a future caller does.
         with self._lock:
             return {
                 "sync": len(self.sync) + (1 if self.current_sync else 0),
                 "gpu": len(self.gpu) + (1 if self.current_gpu else 0),
-                "redownload": len(self.redownload),
-                "metadata": len(self.metadata),
-                "reorg": len(self.reorg),
-                "transcribe": len(self.transcribe),
-                "video": len(self.video),
             }
 
     # ── restore-on-launch helpers ───────────────────────────────────
     def has_sync_pipeline_items(self) -> bool:
-        """True if sync/reorg/transcribe/redownload/metadata/video has items.
-        Used after load() to decide whether to force-pause (Project rule: launching with items in queue must never auto-start)."""
+        """True if the sync queue has items.
+        Used after load() to decide whether to force-pause (Project rule: launching with items in queue must never auto-start).
+
+        LOW FIX (audit 5.23 LOW-3): used to OR-check five other queue
+        lists; those are gone now, so this collapses to just self.sync.
+        """
         with self._lock:
-            return bool(self.sync or self.reorg or self.transcribe
-                        or self.redownload or self.metadata or self.video)
+            return bool(self.sync)
 
     def has_gpu_items(self) -> bool:
         with self._lock:

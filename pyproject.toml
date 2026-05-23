@@ -15,7 +15,11 @@
 
 [project]
 name = "ytarchiver"
-version = "74.1"
+# Source of truth for the runtime version is backend/version.py
+# (APP_VERSION). The field below is kept loosely in sync for tooling
+# discoverability — the deploy workflow does not auto-bump it, so
+# treat the runtime APP_VERSION as authoritative if these ever drift.
+version = "75.3"
 description = "Subscription-based YouTube channel archiver with local Whisper transcription, FTS5 transcript search, and a pywebview UI."
 readme = "README.md"
 license = { file = "LICENSE" }

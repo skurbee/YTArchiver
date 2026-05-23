@@ -15,7 +15,7 @@
 # - backend/whisper_worker.py (runs under bundled/system Python 3.11)
 #
 # Whisper itself stays out-of-tree: we invoke Python 3.11's venv at runtime
-# (find_python311 in transcribe.py) so we don't re-bundle CUDA + CTranslate2.
+# (find_python311 in backend/transcribe/) so we don't re-bundle CUDA + CTranslate2.
 
 import os
 from pathlib import Path

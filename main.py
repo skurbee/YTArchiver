@@ -566,20 +566,31 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
 
         def _push_indicator(slot, text):
             """Push text to the given UI slot ("sweep" or "preload"),
-            or `None`/`""` to hide it. Visible in Simple + Verbose."""
+            or `None`/`""` to hide it. Visible in Simple + Verbose.
+
+            LOW FIX (audit 5.23 LOW-5): use json.dumps to encode the
+            text argument. The previous manual replace-chain escaped
+            `\\` and `'` only — a literal newline / carriage return
+            inside a channel folder name would produce broken JS
+            (unescaped newline inside a quoted string is a
+            SyntaxError) which evaluate_js then silently swallowed
+            into the outer except below, leaving the indicator
+            stuck on its last value for the affected tick.
+            """
+            import json as _json
             try:
                 w = self._window
                 if w is None:
                     return
                 if text:
-                    safe = (text.replace("\\", "\\\\").replace("'", "\\'"))
+                    safe = _json.dumps(text)  # returns a fully-quoted JS string literal
                     w.evaluate_js(
                         f"window._setIndicator && "
-                        f"window._setIndicator('{slot}', '{safe}')")
+                        f"window._setIndicator({_json.dumps(slot)}, {safe})")
                 else:
                     w.evaluate_js(
                         f"window._setIndicator && "
-                        f"window._setIndicator('{slot}', null)")
+                        f"window._setIndicator({_json.dumps(slot)}, null)")
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 

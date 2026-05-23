@@ -6,6 +6,50 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v75.3 — 2026-05-23
+
+Conservative ship: small set of verified user-visible fixes on top of
+v74.8. A larger audit pass was deferred when a regression surfaced
+that couldn't be cleanly isolated; the un-shipped audit work remains
+on a local branch for future re-landing.
+
+### Fixed
+- **Fully-synced channels reported a spurious "— 1 error" summary
+  on every pass.** yt-dlp returns exit code `101` when
+  `--break-on-existing` aborts a multi-playlist iteration, which
+  happens on every fully-synced channel-root URL (the root expands
+  to Videos + Shorts as a multi-playlist). The classifier now
+  recognizes `101` as a normal exit alongside `0` and `1`.
+- **"yt-dlp crashed with no output" diagnostic** demoted from Simple
+  mode to Verbose-only — these crashes are almost always transient
+  (network blip, cookie expiry) and the channel row's "— N error"
+  summary stays visible either way so the failure isn't invisible.
+- **"⏳ Metadata queued…" placeholder under-indented by 5 spaces**
+  relative to its eventual "✓ Metadata downloaded" replacement.
+  Now aligned with both the replacement line and the existing
+  "Transcription queued…" sibling.
+
+### Changed (internal)
+- Removed five vestigial sub-queue lists (`reorg`, `video`,
+  `transcribe`, `redownload`, `metadata`) from `QueueState`. They
+  were initialized, persisted, loaded, and counted, but no code
+  outside `queues.py` ever appended to or popped from them.
+  Redownload / transcribe / metadata-refresh tasks all ride the
+  `sync` queue with a `kind=` discriminator. ~50 lines of dead
+  state removed.
+- `QueueState.add_listener` + `_notify` snapshot now both acquire
+  `_lock` so the rest of the class's "all shared mutable state
+  goes through the lock" invariant is consistent.
+- `_push_indicator` uses `json.dumps` for JS string encoding
+  rather than a manual `\\` / `'` escape chain — handles control
+  characters in folder names safely.
+- `pyproject.toml`'s `version` field bumped in sync with
+  `backend/version.py`'s `APP_VERSION`; a comment notes that
+  `version.py` is the authoritative source.
+- `YTArchiver.spec` comment about the Python 3.11 venv location
+  no longer references the long-removed `backend/transcribe.py`
+  (the module is now `backend/transcribe/`).
+
 ## v74.6 — 2026-05-20
 
 ### Fixed

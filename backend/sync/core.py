@@ -1409,8 +1409,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         # rows. Mirrors the tx_done_<vid> pattern.
                         _meta_marker = f"meta_done_{vid}" if vid else ""
                         if _meta_marker:
+                            # Indent to match the eventual " — ✓ Metadata
+                            # downloaded" / " — ✓ Transcription (...)" lines
+                            # nested under the parent video row (6 leading
+                            # spaces). Mirrors the same indent already applied
+                            # to the "Transcription queued…" placeholder ~80
+                            # lines below — without it, the queued line
+                            # appeared one level shallower than the done line
+                            # that replaces it.
                             stream.emit([
-                                [" — ⏳ ",
+                                ["      — ⏳ ",
                                  ["meta_bracket", _meta_marker]],
                                 ["Metadata queued…\n",
                                  ["simpleline", _meta_marker]],
@@ -2411,12 +2419,22 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # derive _ok from ANY pass's returncode instead of
     # reading the last proc.returncode (which could be None if the loop
     # broke via terminate, and could belong to a /streams pass that
-    # failed even if the main pass succeeded). 0 = clean exit;
-    # 1 = "some entries failed" (already counted in errors). Anything
-    # else = crash. If all rcs are None (cancelled/paused before any
-    # pass finished) treat as ok-but-partial when downloaded > 0.
-    _good_rcs = [rc for rc in _pass_returncodes if rc in (0, 1)]
-    _crashed = [rc for rc in _pass_returncodes if rc is not None and rc not in (0, 1)]
+    # failed even if the main pass succeeded). Normal yt-dlp exit codes:
+    #   0   = clean exit
+    #   1   = "some entries failed" (already counted in errors)
+    # 101   = --break-on-existing aborted a multi-playlist iteration.
+    #         This happens on EVERY fully-synced channel root URL (no
+    #         /videos suffix) because the channel root expands to Videos
+    #         + Shorts as a "multi-playlist", and yt-dlp returns 101 when
+    #         it aborts the outer iteration after the first inner playlist
+    #         hits the break. NOT a crash. Without 101 in the OK set, the
+    #         H31 emit below flags every fully-synced channel as having
+    #         "1 error" (audit 5.23 sync regression).
+    # Anything else = real crash. If all rcs are None (cancelled/paused
+    # before any pass finished) treat as ok-but-partial when downloaded > 0.
+    _NORMAL_RCS = (0, 1, 101)
+    _good_rcs = [rc for rc in _pass_returncodes if rc in _NORMAL_RCS]
+    _crashed = [rc for rc in _pass_returncodes if rc is not None and rc not in _NORMAL_RCS]
     # If yt-dlp crashed before emitting any output (corrupt exe,
     # antivirus quarantine, DLL missing), the readline loop saw zero
     # ERROR: lines and `errors` stayed 0 — the per-channel summary
@@ -2427,7 +2445,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         errors = max(errors, 1)
         try:
             _rc_hex = ", ".join(f"0x{(rc & 0xFFFFFFFF):08X}" for rc in _crashed)
-            stream.emit_error(
+            # Verbose-only: these are almost always transient (network
+            # blip, YouTube rate-limit, cookie expiry) — not actionable
+            # for a Simple-mode user. The channel row's "— N error"
+            # summary stays visible in both modes so the failure isn't
+            # invisible; Verbose users still get the exit-code detail.
+            stream.emit_dim(
                 f"yt-dlp crashed with no output (exit {_rc_hex}) — "
                 "no videos checked.")
         except Exception as _e:

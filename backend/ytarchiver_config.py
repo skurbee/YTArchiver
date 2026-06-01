@@ -791,6 +791,18 @@ def recent_for_ui(cfg: dict[str, Any]):
         key=lambda r: (r.get("download_ts") or 0),
         reverse=True,
     )[:200]
+    # Set of tracked-subscription channel identifiers (name + folder),
+    # case-folded. Used to flag each row as `tracked` so the Recent grid
+    # menu can hide the channel-only actions (Refresh metadata, Redownload)
+    # for loose manual single-video downloads, whose uploader isn't a
+    # subscription. Those two actions hard-fail with "Channel not in
+    # subscriptions" on untracked rows.
+    _tracked_channels = set()
+    for _c in (cfg.get("channels", []) or []):
+        for _k in ("name", "folder"):
+            _v = (_c.get(_k) or "").strip().lower()
+            if _v:
+                _tracked_channels.add(_v)
     for r in _sorted_recent:
         # Prefer download_ts for the "time ago" column; fall back to any
         # already-formatted `time` field an older config might carry.
@@ -853,6 +865,12 @@ def recent_for_ui(cfg: dict[str, Any]):
             # in Watch view with the real video file.
             "filepath": fp,
             "video_id": vid,
+            # True when this row's channel is a tracked subscription.
+            # The Recent grid menu hides Refresh metadata + Redownload
+            # for untracked (manual single-video) downloads since both
+            # require a subscription channel and otherwise hard-fail.
+            "tracked": (r.get("channel", "") or "").strip().lower()
+                        in _tracked_channels,
             # Grid-card extras (ignored by the list view).
             "thumbnail_url": thumbnail_url,
             "size_bytes": size_bytes,

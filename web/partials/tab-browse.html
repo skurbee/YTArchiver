@@ -88,9 +88,28 @@
         <div class="browse-view" id="view-watch" style="display:none;">
           <div class="watch-layout">
             <div class="watch-video-wrap">
-              <video class="watch-video-el" id="watch-video" controls preload="metadata"
-                     playsinline
-                     style="display:none;width:100%;background:#000;border-radius:4px;"></video>
+              <!-- Stage wraps the <video> + the pinned caption overlay +
+                   our fullscreen button. Fullscreen targets the STAGE (not
+                   the bare <video>) so the overlay rides along — a
+                   fullscreened <video> can't show sibling DOM. The native
+                   fullscreen button is removed (controlslist + CSS shadow
+                   pseudo-element) so there's exactly one fullscreen control.
+                   This markup is STATIC (not built at runtime) so the live
+                   <video> is never reparented — reparenting it was killing
+                   Chromium's native click-to-play/pause on the video body. -->
+              <div class="watch-video-stage" id="watch-video-stage">
+                <video class="watch-video-el" id="watch-video" controls preload="metadata"
+                       playsinline controlslist="nofullscreen nodownload noplaybackrate noremoteplayback"
+                       disablepictureinpicture
+                       style="display:none;"></video>
+                <div class="cap-ovl" id="watch-cap-ovl" aria-hidden="true">
+                  <span class="cap-ovl-cell cap-ovl-prev"></span>
+                  <span class="cap-ovl-cell cap-ovl-cur"></span>
+                  <span class="cap-ovl-cell cap-ovl-next"></span>
+                </div>
+                <button type="button" class="cap-fs-btn" id="watch-fs-btn"
+                        title="Fullscreen" aria-label="Fullscreen">&#9974;</button>
+              </div>
               <div class="watch-video-placeholder" id="watch-video-placeholder">
                 <div class="watch-play-icon">&#9654;</div>
                 <div class="watch-placeholder-text">Select a video to play</div>

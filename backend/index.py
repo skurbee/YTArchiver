@@ -503,7 +503,8 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         # this whole feature exists to bypass.
         from contextlib import nullcontext as _nullctx
         _ctx = _nullctx() if use_override else _db_lock
-        with _ctx:
+
+        def _do_register_write():
             # preserve `added_ts` on re-register.
             # INSERT OR REPLACE silently wiped it every time sweep
             # re-registered an existing video, making "new in last 7
@@ -571,6 +572,27 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                  fp, time.time(), upload_ts),
             )
             conn.commit()
+
+        # Retry on a transient "database is locked"/"busy" — a concurrent
+        # disk scan can hold the writer lock past the connection timeout,
+        # which previously made register_video silently return False and
+        # drop a just-downloaded video from the index. Back off and retry
+        # so the registration actually lands. Non-transient sqlite errors
+        # fall through to the outer handler immediately.
+        _attempts = 6
+        for _attempt in range(_attempts):
+            try:
+                with _ctx:
+                    _do_register_write()
+                break
+            except sqlite3.OperationalError as _oe:
+                _msg = str(_oe).lower()
+                if ("locked" in _msg or "busy" in _msg) and _attempt < _attempts - 1:
+                    print(f"[index] register_video DB busy, retry "
+                          f"{_attempt + 1}/{_attempts}: {_oe}")
+                    time.sleep(0.5 * (_attempt + 1))
+                    continue
+                raise
         # Drop the browse-list cache for this channel so the next grid
         # click picks up the newly-registered video.
         try: invalidate_channel_videos(channel)

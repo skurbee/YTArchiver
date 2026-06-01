@@ -435,3 +435,8 @@
 
 .t-dl_white { color: #ffffff; }
 
+/* Single-video download finished but couldn't be indexed (e.g. locked DB
+   during a concurrent disk scan). Amber, not red — the file IS on disk,
+   it just needs a Rescan to show up in Browse/Watch. */
+.t-dlwarn { color: var(--c-log-reorg); font-weight: 700; }
+

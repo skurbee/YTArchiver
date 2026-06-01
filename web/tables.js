@@ -323,6 +323,12 @@
         }
       };
       const card = build(v, onClick);
+      // Flag untracked (manual single-video) downloads so the right-click
+      // menu can hide the channel-only actions (Refresh metadata,
+      // Redownload) that hard-fail on loose downloads. Default to tracked
+      // when the field is absent (legacy rows) so nothing is hidden
+      // unexpectedly.
+      card.dataset.tracked = (r.tracked === false) ? "0" : "1";
       frag.appendChild(card);
     }
     grid.appendChild(frag);

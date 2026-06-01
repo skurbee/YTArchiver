@@ -63,7 +63,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                              video_id: str = "",
                              upload_date: str = "",
                              size_bytes: int | None = None,
-                             duration_secs: float | None = None) -> None:
+                             duration_secs: float | None = None) -> bool:
     """Push a fresh entry onto config['recent_downloads'] (newest first).
 
     Keeps the list capped at 500 entries. Silently no-ops when the write
@@ -89,10 +89,10 @@ def _record_recent_download(filepath: str, channel: str, title: str,
     several seconds per download.
     """
     if not filepath:
-        return
+        return False
     from ..ytarchiver_config import config_is_writable, load_config, save_config
     if not config_is_writable():
-        return
+        return False
     try:
         # Raw bytes — read as `int(size)`. Must be a plain integer
         # string, NOT a human-readable "5.2 MB".
@@ -211,5 +211,7 @@ def _record_recent_download(filepath: str, channel: str, title: str,
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             _thr.Thread(target=_bg_sweep, daemon=True).start()
+        return True
     except Exception as e:
         _log.debug("swallowed: %s", e)
+        return False

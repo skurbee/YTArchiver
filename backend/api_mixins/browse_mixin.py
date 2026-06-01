@@ -666,15 +666,17 @@ class BrowseMixin:
                 return {"ok": False, "error": f"Not found: {fp}"}
             if os.name == "nt":
                 import subprocess
-                # audit SV-7: on Windows, `explorer /select,<path>`
-                # with a path that contains spaces failed to select
-                # the file when passed as separate argv. Windows
-                # parses `/select,` plus the path as one string.
-                # Use a single joined string via cmd.exe so quoting
-                # works even on UNC or space-heavy paths.
-                subprocess.Popen(
-                    ["explorer", f"/select,{fp}"],
-                    close_fds=True)
+                # On Windows, `explorer /select,<path>` must keep the
+                # `/select,` switch UNQUOTED with only the path quoted:
+                #   explorer /select,"C:\dir with spaces\file.mp4"
+                # Passing ["explorer", "/select,<path>"] as a list made
+                # Python quote the whole `/select,<path>` element when the
+                # path had spaces, so Explorer stopped recognizing the
+                # switch and just opened a default window without selecting
+                # the file. Pass one raw command string instead so the
+                # switch stays bare. (Windows filenames can't contain `"`,
+                # so wrapping the path in quotes is always safe.)
+                subprocess.Popen(f'explorer /select,"{fp}"', close_fds=True)
             elif sys.platform == "darwin":
                 import subprocess
                 subprocess.Popen(["open", "-R", fp])

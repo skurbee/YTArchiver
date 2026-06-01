@@ -328,7 +328,14 @@
         const channel = card.dataset.channel || "";
         const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
         const api = window.pywebview?.api;
-        showContextMenu(e.clientX, e.clientY, [
+        // Loose manual single-video downloads aren't part of a tracked
+        // subscription. Refresh metadata + Redownload both require a
+        // subscription channel and hard-fail ("Channel not in
+        // subscriptions") on these rows, so omit them. Everything else
+        // (Show in Explorer, Transcribe, Re-transcribe, etc.) works on a
+        // loose file. Default to tracked when the flag is absent.
+        const tracked = card.dataset.tracked !== "0";
+        const items = [
           { label: "Play video", action: () => {
             // The label promises the in-app Watch view (embedded HTML5
             // video + karaoke transcript), not the system default
@@ -357,7 +364,7 @@
             if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
           }},
           { sep: true },
-          { label: "Refresh metadata", action: async () => {
+          ...(tracked ? [{ label: "Refresh metadata", action: async () => {
             if (!api?.browse_refresh_video_metadata) {
               window._showToast?.("Refresh unavailable.", "warn");
               return;
@@ -381,7 +388,7 @@
               window._showToast?.(
                 `Refresh failed: ${e?.message || e}`, "error");
             }
-          }},
+          }}] : []),
           { label: "Transcribe now", action: async () => {
             if (filepath && api?.transcribe_enqueue) {
               const model = await (window._askWhisperModel?.(`"${title}"`));
@@ -399,15 +406,16 @@
               `Queued ${model} re-transcription.`, "ok");
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
-          { label: "Redownload…", action: async () => {
+          ...(tracked ? [{ label: "Redownload…", action: async () => {
             const _res = await (window._askRedownload?.(title));
             if (!_res) return;
             bridgeCall("video_redownload", videoId, title, _res);
-          }},
+          }}] : []),
           { sep: true },
           { label: "Delete file", cls: "dim",
             action: () => bridgeCall("video_delete_file", filepath) },
-        ]);
+        ];
+        showContextMenu(e.clientX, e.clientY, items);
       });
     }
 

@@ -173,8 +173,13 @@ class ArchiveMixin:
         ).hexdigest()[:12]
 
         def _run():
-            # Initial state — no filename known yet; show the URL.
-            _state = {"fname": url, "last_pct": -1}
+            # Initial state — no title known yet; show the URL until the
+            # DLPRE (before_dl) line arrives with the real title + channel.
+            _state = {"fname": url, "last_pct": -1,
+                      "have_title": False, "final_size": 0,
+                      "registered": False, "recorded": False,
+                      "final_path": ""}
+            _killed = False
 
             def _emit_dwnld(suffix=""):
                 """Replace the inplace [Dwnld] line. suffix is e.g.
@@ -196,6 +201,12 @@ class ArchiveMixin:
                 cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
             cmd += [
                 "--output", out_tpl,
+                # before_dl fires after extraction but BEFORE the first byte
+                # downloads, so the log row can show "Title - Channel" (what
+                # the user wants to see) instead of the raw URL while the
+                # download runs.
+                "--print",
+                "before_dl:DLPRE:::%(title)s:::%(uploader)s",
                 "--print",
                 "after_video:DLTRACK:::%(title)s:::%(uploader)s:::%(upload_date)s:::%(filesize,filesize_approx)s:::%(duration)s:::%(id)s",
                 *sync_backend._find_cookie_source(),
@@ -206,7 +217,7 @@ class ArchiveMixin:
                                  stdout=_sp.PIPE, stderr=_sp.STDOUT,
                                  encoding="utf-8", errors="replace",
                                  bufsize=1, startupinfo=sync_backend._startupinfo)
-            except OSError as e:
+            except Exception as e:
                 # Update the in-place [Dwnld] row with a final failed
                 # state so it doesn't sit forever showing just the URL.
                 # Use the same marker so the inplace selector finds and
@@ -246,12 +257,28 @@ class ArchiveMixin:
                     self._log_stream.emit_dim(" " + _line)
                     if _line.startswith("DLTRACK:::"):
                         _dltrack = _line
-                    # Capture filename from yt-dlp's Destination line
-                    # and switch the inplace [Dwnld] line to show it.
+                    # before_dl line — switch the row to "Title - Channel"
+                    # as soon as yt-dlp resolves the video, before the
+                    # download bytes start. Fires once per format (video +
+                    # audio for a merge) but the assignment is idempotent.
+                    if _line.startswith("DLPRE:::"):
+                        _pp = _line.split(":::")
+                        _t = _pp[1].strip() if len(_pp) > 1 else ""
+                        _u = _pp[2].strip() if len(_pp) > 2 else ""
+                        if _t and not _state["have_title"]:
+                            _state["fname"] = f"{_t} - {_u}" if _u else _t
+                            _state["have_title"] = True
+                            _emit_dwnld(
+                                f" - {_state['last_pct']}%"
+                                if _state["last_pct"] >= 0 else "")
+                        continue
+                    # Capture filename from yt-dlp's Destination line — only
+                    # as a fallback when DLPRE never gave us a title.
                     _m_dest = _dest_re.match(_line)
                     if _m_dest:
-                        _state["fname"] = os.path.basename(_m_dest.group(1).strip())
-                        _emit_dwnld()
+                        if not _state["have_title"]:
+                            _state["fname"] = os.path.basename(_m_dest.group(1).strip())
+                            _emit_dwnld()
                     else:
                         # Parse progress percentage and update inplace
                         # line at 5% boundaries (mirrors compress.py).
@@ -284,6 +311,7 @@ class ArchiveMixin:
                 try:
                     proc.wait(timeout=900)
                 except _sp.TimeoutExpired:
+                    _killed = True
                     try:
                         proc.terminate()
                         proc.wait(timeout=5)
@@ -389,22 +417,28 @@ class ArchiveMixin:
                         except Exception as e:
                             _log.debug("swallowed: %s", e)
                         if final_path and os.path.isfile(final_path):
+                            _state["final_path"] = final_path
+                            try:
+                                _state["final_size"] = os.path.getsize(final_path)
+                            except OSError:
+                                pass
                             _channel_name = _uploader or "Single Videos"
                             try:
                                 from backend import index as _idx
-                                _idx.register_video(
+                                _state["registered"] = bool(_idx.register_video(
                                     final_path, _channel_name, _title,
                                     tx_status="no_captions",
-                                    video_id=_vid)
-                            except Exception as _re:
+                                    video_id=_vid))
+                            except Exception as _re_err:
                                 self._log_stream.emit_dim(
-                                    f" (index register failed: {_re})")
+                                    f" (index register failed: {_re_err})")
                             try:
-                                sync_backend._record_recent_download(
-                                    final_path, _channel_name, _title, _vid)
-                            except Exception as _re:
+                                _state["recorded"] = bool(
+                                    sync_backend._record_recent_download(
+                                        final_path, _channel_name, _title, _vid))
+                            except Exception as _re_err:
                                 self._log_stream.emit_dim(
-                                    f" (recent downloads write failed: {_re})")
+                                    f" (recent downloads write failed: {_re_err})")
                             # Drop from deferred livestream journal if
                             # this was a previously-deferred premiere
                             # that's now finished (matches bug C-3).
@@ -417,12 +451,66 @@ class ArchiveMixin:
                     except Exception as _pe:
                         self._log_stream.emit_dim(
                             f" (DLTRACK post-processing failed: {_pe})")
-                # if a DLTRACK line never arrived AND yt-dlp
-                # logged a known-failure pattern, report that to the
-                # user via a visible error line + toast so they know
-                # why their download vanished.
-                if not _dltrack and _stderr_errors:
-                    _reason = _stderr_errors[0]
+                # Resolve the [Dwnld] row to a definitive end state. yt-dlp
+                # reporting returncode 0 + a DLTRACK line is NOT enough to
+                # claim success — the file can vanish from disk afterward,
+                # or the index registration can silently fail (locked DB),
+                # leaving a row that reads "106 MB" while the Watch view
+                # shows "File not found" and the video is in no list. So
+                # re-verify the file is on disk at decision time and only
+                # declare success when it ALSO landed in the index.
+                # The watchdog branch already emitted its own failure line.
+                _dl_ok = (proc.returncode == 0) and bool(_dltrack)
+                _fp_now = _state.get("final_path") or ""
+                _file_exists = bool(_fp_now) and os.path.isfile(_fp_now)
+                _registered = bool(_state.get("registered"))
+                _recorded = bool(_state.get("recorded"))
+                if _killed:
+                    pass
+                elif _dl_ok and _file_exists and _registered:
+                    _sz = _state.get("final_size") or 0
+                    if _sz > 0:
+                        from backend.utils import format_bytes as _fmtb
+                        _emit_dwnld(f" - {_fmtb(_sz)}")
+                    else:
+                        _emit_dwnld(" - Done.")
+                    # File is on disk and indexed, but the Recent-tab entry
+                    # failed to write — note it without downgrading success.
+                    if not _recorded:
+                        self._log_stream.emit_dim(
+                            " (not added to Recent — try Rescan)")
+                elif _dl_ok and _file_exists and not _registered:
+                    # Downloaded fine but the index write was dropped (most
+                    # likely a locked DB during a concurrent disk scan). The
+                    # file is on disk but won't appear in Browse/Watch until
+                    # a Rescan picks it up. Make that visible — don't claim
+                    # a clean success.
+                    self._log_stream.emit([
+                        ["[Dwnld] ", ["dlwarn", _marker_tag]],
+                        [f"{_state['fname']} — downloaded but not "
+                         "indexed; run Rescan to add it.\n",
+                         ["dlwarn", _marker_tag]],
+                    ])
+                    try:
+                        if self._window is not None:
+                            import json as _json
+                            self._window.evaluate_js(
+                                "window._showToast && window._showToast("
+                                f"{_json.dumps('Downloaded but not indexed — run Rescan')},"
+                                " 'warn');")
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+                else:
+                    # Either yt-dlp itself failed, or it reported success but
+                    # the file is missing from disk at decision time.
+                    if _dl_ok and not _file_exists:
+                        _reason = "file missing after download"
+                    elif _stderr_errors:
+                        _reason = _stderr_errors[0]
+                    elif proc.returncode not in (0, None):
+                        _reason = f"yt-dlp exited with code {proc.returncode}"
+                    else:
+                        _reason = "no video was produced"
                     # Replace the inplace [Dwnld] line with a red failure.
                     self._log_stream.emit([
                         ["[Dwnld] ", ["red", _marker_tag]],
@@ -438,14 +526,26 @@ class ArchiveMixin:
                                 " 'error');")
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
-                else:
-                    _emit_dwnld(" - Done.")
                 self._log_stream.flush()
                 # Push a Recent-tab refresh so the new video appears
                 # immediately instead of waiting for the next tab
                 # switch. Matches the channel-sync push hook.
                 try:
                     self._push_recent_refresh()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            except Exception as _ue:
+                # Any unhandled error in the stream/parse loop must still
+                # resolve the [Dwnld] row — otherwise the thread dies in
+                # finally (releasing the lock) and the row sits forever
+                # showing just the URL with no result.
+                try:
+                    self._log_stream.emit([
+                        ["[Dwnld] ", ["red", _marker_tag]],
+                        [f"{_state['fname']} — failed ({_ue}).\n",
+                         ["red", _marker_tag]],
+                    ])
+                    self._log_stream.flush()
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             finally:

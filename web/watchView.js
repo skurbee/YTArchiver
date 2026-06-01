@@ -125,6 +125,10 @@
     const ph = document.getElementById("watch-video-placeholder");
     if (!title || !meta || !tr) return;
 
+    // Ensure the pinned-overlay stage + overlay element exist around the
+    // <video> before we (re)load the source or bind the karaoke loop.
+    _ensureCapOverlay(vEl);
+
     // `opts.skipVideoReload`: set by _onRetranscribeComplete so the
     // <video> element isn't re-sourced (which would restart playback
     // from 0). We only need to refresh the transcript + source banner
@@ -159,11 +163,9 @@
     if (!transcript || transcript.length === 0) {
       tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
       _unbindKaraoke(vEl);
-      // Clear caption cues too — previously a failed retranscribe left
-      // the previous video's cues on the TextTrack so they kept
-      // appearing as overlay while the still-playing video kept going
-      // (audit: watchView.js:88-91).
-      try { _setCueTrackFromTranscript(vEl, []); } catch { /* ignore */ }
+      // Hide the on-video overlay so a stale phrase doesn't linger over
+      // the still-playing video after a failed retranscribe.
+      try { vEl._capOverlay && vEl._capOverlay.classList.remove("show"); } catch { /* ignore */ }
       return;
     }
 
@@ -254,13 +256,14 @@
     });
     frag.appendChild(body);
     tr.appendChild(frag);
-    _bindKaraoke(vEl, tr, segEls);
-    // Build (or refresh) the WebVTT caption track for the video overlay.
-    // Uses the same per-word timing the karaoke loop reads from the DOM,
-    // but delivered as VTTCues so the browser handles fullscreen display
-    // for free — no custom-controls rebuild needed when the user goes
-    // fullscreen on the <video> element.
-    _setCueTrackFromTranscript(vEl, transcript);
+    // Flat list of every .word span (document order) so the karaoke loop
+    // can pull the active word's neighbours for the pinned video overlay.
+    const allWordEls = Array.from(body.querySelectorAll(".word"));
+    const wordIndex = new Map();
+    for (let i = 0; i < allWordEls.length; i++) wordIndex.set(allWordEls[i], i);
+    _bindKaraoke(vEl, tr, segEls, allWordEls, wordIndex);
+    // The on-video overlay is a pinned DOM overlay (see _ensureCapOverlay)
+    // driven by the karaoke loop above — no WebVTT cue track needed.
     _applyCaptionPrefs(vEl);
   };
 
@@ -796,11 +799,14 @@
     _karaokeHandler = null;
   }
 
-  function _bindKaraoke(vEl, trWrap, segEls) {
+  function _bindKaraoke(vEl, trWrap, segEls, allWordEls, wordIndex) {
     _unbindKaraoke(vEl);
     if (!vEl || !segEls.length) return;
     let lastSegIdx = -1;
     let lastWordEl = null;
+    // Repaint the pinned overlay immediately (e.g. when the user flips
+    // overlay size/mode while paused) without waiting for the next tick.
+    vEl._capForceRefresh = () => _updateCapOverlay(vEl, lastWordEl, allWordEls, wordIndex);
 
     const _tick = () => {
       const t = vEl.currentTime;
@@ -830,25 +836,23 @@
         }
         lastSegIdx = idx;
       }
-      // Word highlight within the active segment
+      // Active word within the active segment (null between words / in
+      // gaps so the pinned overlay clears instead of freezing on a word).
+      let newWordEl = null;
       if (idx >= 0 && segEls[idx]) {
-        const seg = segEls[idx];
-        const words = seg.querySelectorAll(".word");
-        let newWordEl = null;
+        const words = segEls[idx].querySelectorAll(".word");
         for (const w of words) {
           const s = parseFloat(w.dataset.s || "0");
           const e = parseFloat(w.dataset.e || "0");
-          if (s <= t && t <= e) {
-            newWordEl = w;
-            break;
-          }
+          if (s <= t && t <= e) { newWordEl = w; break; }
           if (s > t) break;
         }
-        if (newWordEl !== lastWordEl) {
-          if (lastWordEl) lastWordEl.classList.remove("active");
-          if (newWordEl) newWordEl.classList.add("active");
-          lastWordEl = newWordEl;
-        }
+      }
+      if (newWordEl !== lastWordEl) {
+        if (lastWordEl) lastWordEl.classList.remove("active");
+        if (newWordEl) newWordEl.classList.add("active");
+        _updateCapOverlay(vEl, newWordEl, allWordEls, wordIndex);
+        lastWordEl = newWordEl;
       }
       // Schedule the next frame as long as the video is still loaded.
       // The unbind path cancels the in-flight rAF so this never leaks.
@@ -894,6 +898,13 @@
   }
 
   // ─── Video overlay captions (karaoke word-by-word) ─────────────────
+  //
+  // DEPRECATED / UNUSED as of the pinned-overlay change: the on-video
+  // overlay is now a DOM overlay (see _ensureCapOverlay / _updateCapOverlay
+  // further down) so the highlighted word can stay pinned to centre. The
+  // native-cue helpers below (_ensureCapTrack, _flattenWords,
+  // _flattenSegments, _setCueTrackFromTranscript, _vttEscape) are no longer
+  // called and can be deleted in a cleanup pass.
   //
   // Uses the native TextTrack API + VTTCues so the browser draws the
   // caption itself. Benefits over a custom DOM overlay:
@@ -1048,6 +1059,98 @@
       .replace(/>/g, "&gt;");
   }
 
+  // ─── Pinned on-video overlay (replaces the native ::cue overlay) ───
+  //
+  // The overlay is a 3-column grid [1fr | auto | 1fr]: the CURRENT word
+  // sits in the centre column and stays pinned to the video's horizontal
+  // centre, while the previous / next words grow outward into the side
+  // columns. The old native ::cue approach centred the whole
+  // "prev current next" line, so the middle word drifted left/right
+  // whenever the neighbours differed in width.
+  //
+  // The overlay + stage + fullscreen button are STATIC markup (in
+  // partials/tab-browse.html), NOT built here. An earlier version created
+  // the stage at runtime and reparented the live <video> into it, which
+  // broke Chromium's native click-to-play/pause on the video body. This
+  // helper now just grabs the static refs and wires the fullscreen button
+  // once. Fullscreen targets the stage (not the bare <video>) so the
+  // overlay rides along — a fullscreened <video> can't show sibling DOM.
+  function _ensureCapOverlay(vEl) {
+    if (!vEl) return null;
+    if (vEl._capOverlay) return vEl._capOverlay;
+    const stage = document.getElementById("watch-video-stage")
+                  || vEl.closest(".watch-video-stage");
+    vEl._capStage = stage;
+    const ovl = document.getElementById("watch-cap-ovl");
+    vEl._capOverlay = ovl;
+
+    const fsBtn = document.getElementById("watch-fs-btn");
+    if (fsBtn && stage && !fsBtn._wired) {
+      fsBtn._wired = true;
+      fsBtn.addEventListener("click", (e) => {
+        // Don't let the click fall through to the video's native
+        // click-to-play handler underneath.
+        e.stopPropagation();
+        try {
+          if (document.fullscreenElement === stage) document.exitFullscreen();
+          else stage.requestFullscreen();
+        } catch { /* fullscreen unsupported / blocked */ }
+      });
+    }
+
+    // Explicit click-to-play/pause on the video body. Chromium normally
+    // gives <video controls> this for free, but in this WebView2 embed the
+    // click-on-body toggle doesn't fire, so we wire it ourselves.
+    //
+    // Bulletproof against double-toggle: a debounce guard means that even
+    // if the engine's own click-to-play DOES fire for the same physical
+    // click, the two collapse into exactly one toggle. We deliberately do
+    // NOT use an invisible click-catch overlay for this — a pointer-events
+    // layer over the <video> would also swallow mousemove and stop the
+    // native control bar from auto-showing on hover.
+    //
+    // Clicks on the bottom control-bar strip are ignored so the native
+    // scrubber / play button / volume keep working untouched.
+    if (vEl && !vEl._clickToggleWired) {
+      vEl._clickToggleWired = true;
+      let _lastToggle = 0;
+      vEl.addEventListener("click", (e) => {
+        const rect = vEl.getBoundingClientRect();
+        if (!rect.height) return;
+        const CONTROL_STRIP = 48; // native control bar height (approx)
+        if (e.clientY >= rect.bottom - CONTROL_STRIP) return;
+        const now = (window.performance && performance.now)
+          ? performance.now() : 0;
+        if (now && now - _lastToggle < 300) return; // collapse double-fire
+        _lastToggle = now;
+        if (vEl.paused) vEl.play().catch(() => {});
+        else vEl.pause();
+      });
+    }
+    return ovl;
+  }
+
+  // Copy the active word (+ neighbours in 3-word mode) into the overlay
+  // cells. `curEl` is the active `.word` span from the transcript pane,
+  // or null when playback is between words — in which case we hide the
+  // overlay. `allWordEls`/`wordIndex` give O(1) neighbour lookup.
+  function _updateCapOverlay(vEl, curEl, allWordEls, wordIndex) {
+    const ovl = vEl && vEl._capOverlay;
+    if (!ovl) return;
+    const p = window._captionPrefs || {};
+    const on = p.size && p.size !== "off";
+    if (!on || !curEl) { ovl.classList.remove("show"); return; }
+    const mode = p.mode || "single";
+    const i = wordIndex ? wordIndex.get(curEl) : -1;
+    const has = (j) => allWordEls && j >= 0 && j < allWordEls.length;
+    const prevEl = (mode === "phrase3" && has(i - 1)) ? allWordEls[i - 1] : null;
+    const nextEl = (mode === "phrase3" && has(i + 1)) ? allWordEls[i + 1] : null;
+    ovl.children[0].textContent = prevEl ? prevEl.textContent.trim() : "";
+    ovl.children[1].textContent = curEl.textContent.trim();
+    ovl.children[2].textContent = nextEl ? nextEl.textContent.trim() : "";
+    ovl.classList.add("show");
+  }
+
   // Read the cached prefs (set by app.js when the user changes the
   // toolbar selects, and on boot from settings_load) and apply them
   // to a freshly-rendered <video>. Called from renderWatchView so the
@@ -1057,10 +1160,12 @@
     const p = window._captionPrefs || {};
     const size = p.size || "off";
     const bg = p.bg || "translucent";
-    vEl.dataset.capSize = (size === "off") ? "" : size;
-    vEl.dataset.capBg = bg;
-    const t = vEl._capTrack;
-    if (t) t.mode = (size === "off") ? "hidden" : "showing";
+    const ovl = vEl._capOverlay;
+    if (ovl) {
+      ovl.dataset.capSize = (size === "off") ? "" : size;
+      ovl.dataset.capBg = bg;
+      if (size === "off") ovl.classList.remove("show");
+    }
   }
 
   // Public setter — app.js calls this when the user changes a toolbar
@@ -1073,9 +1178,8 @@
     const vEl = document.getElementById("watch-video");
     if (!vEl) return;
     _applyCaptionPrefs(vEl);
-    // Mode change requires re-emitting cues — cue text is mode-dependent.
-    if (key === "mode" && Array.isArray(vEl._capTranscript)) {
-      _setCueTrackFromTranscript(vEl, vEl._capTranscript);
-    }
+    // Repaint the overlay right away so size/mode/bg changes are visible
+    // even while the video is paused.
+    try { vEl._capForceRefresh && vEl._capForceRefresh(); } catch { /* ignore */ }
   };
 })();

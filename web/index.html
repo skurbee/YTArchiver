@@ -66,11 +66,11 @@
        Channels / Search / Graph / Bookmarks so all "library navigation"
        lives in one place. See the `panel-browse` sidebar below for the
        new location. -->
-  <div class="tab-row" role="tablist" aria-label="Main navigation">
-    <div class="tab active" data-tab="download" role="tab" tabindex="0" aria-selected="true" aria-controls="panel-download">Download</div>
-    <div class="tab" data-tab="subs" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-subs">Subs</div>
-    <div class="tab browse-tab" data-tab="browse" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-browse">Browse</div>
-    <div class="tab settings-tab" data-tab="settings" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-settings">Settings</div>
+  <div class="tab-row">
+    <div class="tab active" data-tab="download">Download</div>
+    <div class="tab" data-tab="subs">Subs</div>
+    <div class="tab browse-tab" data-tab="browse">Browse</div>
+    <div class="tab settings-tab" data-tab="settings">Settings</div>
   </div>
   <!-- Download tab -->
   <div class="tab-panel active" id="panel-download">
@@ -1158,30 +1158,61 @@
         <div class="browse-view" id="view-watch" style="display:none;">
           <div class="watch-layout">
             <div class="watch-video-wrap">
-              <video class="watch-video-el" id="watch-video" controls preload="metadata"
-                     playsinline
-                     style="display:none;width:100%;background:#000;border-radius:4px;"></video>
+              <!-- Stage wraps the <video> + the pinned caption overlay +
+                   our fullscreen button. Fullscreen targets the STAGE (not
+                   the bare <video>) so the overlay rides along — a
+                   fullscreened <video> can't show sibling DOM. The native
+                   fullscreen button is removed (controlslist + CSS shadow
+                   pseudo-element) so there's exactly one fullscreen control.
+                   This markup is STATIC (not built at runtime) so the live
+                   <video> is never reparented — reparenting it was killing
+                   Chromium's native click-to-play/pause on the video body. -->
+              <div class="watch-video-stage" id="watch-video-stage">
+                <video class="watch-video-el" id="watch-video" controls preload="metadata"
+                       playsinline controlslist="nofullscreen nodownload noplaybackrate noremoteplayback"
+                       disablepictureinpicture
+                       style="display:none;"></video>
+                <div class="cap-ovl" id="watch-cap-ovl" aria-hidden="true">
+                  <span class="cap-ovl-cell cap-ovl-prev"></span>
+                  <span class="cap-ovl-cell cap-ovl-cur"></span>
+                  <span class="cap-ovl-cell cap-ovl-next"></span>
+                </div>
+                <button type="button" class="cap-fs-btn" id="watch-fs-btn"
+                        title="Fullscreen" aria-label="Fullscreen">&#9974;</button>
+              </div>
               <div class="watch-video-placeholder" id="watch-video-placeholder">
                 <div class="watch-play-icon">&#9654;</div>
                 <div class="watch-placeholder-text">Select a video to play</div>
               </div>
               <h2 class="watch-title" id="watch-title">Video Title</h2>
               <div class="watch-meta" id="watch-meta">Channel · upload date · duration</div>
-              <div class="watch-actions">
+              <!-- Compact two-row layout. Row 1 = primary actions; Row 2 =
+                   playback/overlay/follow controls. Splitting the row
+                   keeps everything reachable at narrow window widths
+                   instead of falling off / wrapping unpredictably.
+                   Less-used actions (Redownload, Re-transcribe, Refresh
+                   metadata) live behind the ⋮ More button to keep the
+                   visible toolbar uncluttered — same context-menu
+                   pattern used on grid cards, so users see consistent
+                   places for those actions. -->
+              <div class="watch-actions watch-actions-row1">
                 <button class="btn btn-ghost btn-thin" id="btn-open-external"
                         title="Open in system default player (VLC etc.)">Open in player</button>
                 <button class="btn btn-ghost btn-thin" id="btn-bookmark-now"
                         title="Bookmark current segment (B)">Bookmark</button>
-                <!-- Redownload + Re-transcribe, matches the grid-card right-
-                     click actions. Same flows, just buttons on the Watch view
-                     so you don't have to go back to the grid. -->
-                <button class="btn btn-ghost btn-thin" id="btn-watch-redownload"
-                        title="Re-download this video at a different resolution">Redownload&hellip;</button>
-                <button class="btn btn-ghost btn-thin" id="btn-watch-retranscribe"
-                        title="Force re-transcribe this video (deletes current transcript)">Re-transcribe&hellip;</button>
-                <button class="btn btn-ghost btn-thin" id="btn-watch-refresh-meta"
-                        title="Re-fetch views, likes, description, and top comments for this video">Refresh metadata</button>
-                <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Speed:</label>
+                <button class="btn btn-ghost btn-thin watch-more-btn" id="btn-watch-more"
+                        title="More actions (Redownload, Re-transcribe, Refresh metadata)">More&hellip;</button>
+                <!-- Hidden originals kept in the DOM so the existing
+                     click handlers in watchActions.js can keep firing
+                     through the More menu without rewiring everything.
+                     The More menu's `action` callbacks just .click()
+                     these. -->
+                <button class="hidden-action" id="btn-watch-redownload" aria-hidden="true" tabindex="-1"></button>
+                <button class="hidden-action" id="btn-watch-retranscribe" aria-hidden="true" tabindex="-1"></button>
+                <button class="hidden-action" id="btn-watch-refresh-meta" aria-hidden="true" tabindex="-1"></button>
+              </div>
+              <div class="watch-actions watch-actions-row2">
+                <label class="ctl-label ctl-label-thin">Speed:</label>
                 <select class="ctl-select" id="watch-speed"
                         title="Playback speed">
                   <option value="0.5">0.5×</option>
@@ -1192,7 +1223,7 @@
                   <option value="2">2×</option>
                 </select>
                 <label class="ctl-label ctl-label-thin" style="margin-left:10px;"
-                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay transcript:</label>
+                       title="Show the current transcript word overlaid on the video.&#10;Works in windowed and fullscreen.">Overlay:</label>
                 <select class="ctl-select" id="watch-cap-size"
                         title="Overlay text size — Off hides the overlay">
                   <option value="off" selected>Off</option>
@@ -1205,6 +1236,11 @@
                   <option value="translucent" selected>Translucent</option>
                   <option value="outline">Outline</option>
                   <option value="none">None</option>
+                </select>
+                <select class="ctl-select" id="watch-cap-mode"
+                        title="1 word: just the spoken word.&#10;3 words: previous + current + next (neighbors dimmer).">
+                  <option value="single" selected>1 word</option>
+                  <option value="phrase3">3 words</option>
                 </select>
                 <div class="spacer"></div>
                 <label class="checkbox-label" title="Keep transcript scrolled to current line">
@@ -1266,11 +1302,9 @@
                 <span class="find-count" id="watch-find-count"></span>
                 <button class="btn btn-ghost btn-thin find-nav"
                         id="watch-find-prev"
-                        aria-label="Previous match"
                         title="Previous match (Shift+Enter)" tabindex="-1">&#x25B2;</button>
                 <button class="btn btn-ghost btn-thin find-nav"
                         id="watch-find-next"
-                        aria-label="Next match"
                         title="Next match (Enter)" tabindex="-1">&#x25BC;</button>
               </div>
               <div class="watch-transcript" id="watch-transcript"></div>
@@ -1347,9 +1381,11 @@
               <button class="search-op-btn" data-op="*"
                       title="Append * for prefix match (e.g. bake* matches baker, bakery, baking)">word*</button>
               <span class="search-hint-label" style="margin-left:10px;">Year:</span>
-              <input type="text" class="ctl-input search-year-input" id="search-year-from" placeholder="from"
+              <input type="text" class="ctl-input" id="search-year-from" placeholder="from"
+                     class="search-year-input"
                      title="Limit to segments from this year onward" />
-              <input type="text" class="ctl-input search-year-input" id="search-year-to" placeholder="to"
+              <input type="text" class="ctl-input" id="search-year-to" placeholder="to"
+                     class="search-year-input"
                      title="Limit to segments through this year" />
               <span class="search-hint-label" style="margin-left:10px;">Sort:</span>
               <select class="ctl-select" id="search-sort"
@@ -1849,11 +1885,10 @@
        CSS `.yt-modal` rule uses `display: flex` or something that
        would otherwise override the bare `hidden` attribute. JS that
        opens the modal sets style.display explicitly. -->
-  <div id="welcome-modal" class="yt-modal" hidden style="display:none;"
-       role="dialog" aria-modal="true" aria-labelledby="welcome-modal-title">
+  <div id="welcome-modal" class="yt-modal" hidden style="display:none;">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body" style="min-width:460px; max-width:560px;">
-      <div class="yt-modal-title" id="welcome-modal-title">Pick an archive folder</div>
+      <div class="yt-modal-title">Pick an archive folder</div>
       <div class="yt-modal-sub">
         YTArchiver saves each subscribed channel as
         <code>&lt;archive&gt;/&lt;ChannelName&gt;/</code>. Metadata,
@@ -1882,11 +1917,10 @@
        fills/shows it. Buttons call api.redownload_sample_confirm(). -->
   <!-- audit E-26: same inline display:none belt-and-suspenders as
        welcome-modal above. -->
-  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;"
-       role="dialog" aria-modal="true" aria-labelledby="redwnl-sample-title">
+  <div id="redwnl-sample-modal" class="yt-modal" hidden style="display:none;">
     <div class="yt-modal-backdrop"></div>
     <div class="yt-modal-body">
-      <div class="yt-modal-title" id="redwnl-sample-title">Sample Complete</div>
+      <div class="yt-modal-title">Sample Complete</div>
       <div class="yt-modal-sub" id="redwnl-sample-sub"></div>
       <div class="yt-modal-stats" id="redwnl-sample-stats"></div>
       <div class="yt-modal-countdown" id="redwnl-sample-countdown"></div>

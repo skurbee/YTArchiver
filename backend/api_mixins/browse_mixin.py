@@ -464,7 +464,8 @@ class BrowseMixin:
             return {"ok": False, "error": str(e)}
 
 
-    def browse_search(self, query, channel=None, limit=200, sort="relevance"):
+    def browse_search(self, query, channel=None, limit=200, sort="relevance",
+                      year_from=None, year_to=None):
         """FTS5 search across transcript segments.
 
         `channel` accepts either a single channel-folder string, a list
@@ -476,12 +477,17 @@ class BrowseMixin:
         `sort` controls result ordering — "relevance" (default, FTS5
         bm25 rank), "newest", "oldest", "channel", or "title". The UI
         sort dropdown passes the user's pick through.
+
+        `year_from` / `year_to` (inclusive) constrain results to segments
+        in that upload-year window; either may be None for an open bound.
         """
         return index_backend.search_fts(query, channel=channel,
-                                         limit=limit, sort=sort)
+                                         limit=limit, sort=sort,
+                                         year_from=year_from, year_to=year_to)
 
 
-    def browse_search_titles(self, query, channel=None, limit=200, sort="newest"):
+    def browse_search_titles(self, query, channel=None, limit=200, sort="newest",
+                             year_from=None, year_to=None):
         """Global video search by title across every channel (or a
         subset). `channel` follows the same accept-string-or-list rule
         as `browse_search` so the new search UI can apply its channel
@@ -490,9 +496,13 @@ class BrowseMixin:
         `sort` controls result ordering — "newest" (default), "oldest",
         "channel", or "title". Title-only search defaults to newest
         because there's no FTS5 relevance score for LIKE-based matches.
+
+        `year_from` / `year_to` (inclusive) constrain results to that
+        upload-year window; either may be None for an open bound.
         """
         return index_backend.search_video_titles(
-            query, channel=channel, limit=limit, sort=sort)
+            query, channel=channel, limit=limit, sort=sort,
+            year_from=year_from, year_to=year_to)
 
 
     def browse_graph(self, word, channel=None, bucket="month", normalize=False):

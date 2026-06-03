@@ -22,12 +22,11 @@ import json
 import os
 import re
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..log import get_logger
-from ..metadata_io import _get_metadata_jsonl_path
+from ..metadata_io import _get_metadata_jsonl_path, _year_month_from_path
 from ..thumbnails import _channel_fingerprint
 from ..utils import sqlite_like_escape as _like_esc
 
@@ -69,8 +68,11 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
          the `by_id` map was empty, the caller treated every ID as
          new, and 642 blank-title log rows scrolled past.
 
-    Year/month come from the file's mtime (yt-dlp `--mtime` makes mtime =
-    upload date). This matches how OLD groups files for metadata writing.
+    Year/month come from the file's OWN folder (via `_year_month_from_path`)
+    so the metadata JSONL + thumbnail bucket co-locates with the mp4. The
+    download foldered it by `upload_date`; reading the folder back avoids
+    yt-dlp's `--mtime` drifting into a different month for premieres /
+    scheduled uploads. Falls back to UTC mtime for flat layouts.
     """
     out = []
     if not folder.is_dir():
@@ -142,15 +144,11 @@ def _scan_channel_videos(folder: Path) -> list[tuple[str, str, int | None, int |
             # if it was a fake one — we still don't want it in the
             # title display.
             title = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", stem) or stem
-            try:
-                # Read mtime as UTC — yt-dlp --mtime stamps files in UTC,
-                # and the metadata JSONL bucket lookup elsewhere is UTC.
-                # Using local time here would route near-midnight uploads
-                # into the wrong bucket and cause duplicate entries.
-                mtime = datetime.fromtimestamp(os.path.getmtime(fp), tz=timezone.utc)
-                year, month = mtime.year, mtime.month
-            except OSError:
-                year, month = None, None
+            # Year/month from the file's OWN folder so the metadata JSONL +
+            # thumbnail bucket tracks where the mp4 actually lives (matches
+            # the download's upload_date foldering). Falls back to UTC mtime
+            # for flat / unparseable layouts. See _year_month_from_path.
+            year, month = _year_month_from_path(fp)
             out.append((vid_id, title, year, month, fp))
     if _fp > 0:
         with _scan_videos_cache_lock:

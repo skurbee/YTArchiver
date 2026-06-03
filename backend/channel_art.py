@@ -216,6 +216,12 @@ def fetch_channel_art(ch_url: str, folder_path: str, force: bool = False
         _sentinel = os.path.join(art_dir, ".last_attempt")
         with open(_sentinel, "w", encoding="utf-8") as _sf:
             _sf.write("ok\n")
+        # A leading-dot name isn't hidden on Windows — stamp the hidden
+        # attribute so this marker doesn't clutter the .ChannelArt folder.
+        try:
+            hide_file_win(_sentinel)
+        except Exception:
+            pass
     except OSError:
         pass
     got = {"ok": True, "avatar_path": None, "banner_path": None,
@@ -302,6 +308,14 @@ def _make_thumb(src: str, dst: str, max_w: int) -> bool:
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
             im.save(dst, "JPEG", quality=82, optimize=True, progressive=True)
+        # Match avatar.jpg / banner.jpg — keep the generated *_small.jpg
+        # thumbnail hidden so the whole .ChannelArt folder stays invisible.
+        # (Previously only the full-size art got the hidden attribute, so
+        # the _small variants showed up in the folder.)
+        try:
+            hide_file_win(dst)
+        except Exception:
+            pass
         return True
     except Exception:
         return False

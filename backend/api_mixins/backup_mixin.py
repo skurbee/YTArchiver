@@ -198,6 +198,11 @@ class BackupMixin:
             paths = self._window.create_file_dialog(
                 _wv.SAVE_DIALOG,
                 save_filename=f"ytarchiver_backup_{ts}.zip",
+                # Default to *.zip so Export matches the Restore open-dialog
+                # filter (Restore filters to "Backup ZIP (*.zip)"). Without
+                # this the save dialog defaulted to "All files" — a confusing
+                # round-trip mismatch.
+                file_types=("Backup ZIP (*.zip)", "All files (*.*)"),
             )
             if not paths:
                 return {"ok": False, "cancelled": True}

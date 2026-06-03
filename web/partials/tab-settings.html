@@ -215,6 +215,14 @@
                       title="Check yt-dlp, ffmpeg, Python 3.11, GPU, etc.">Diagnostics&hellip;</button>
             </div>
 
+            <!-- Re-open the first-run setup wizard (archive folder picker +
+                 dependency installer for yt-dlp / ffmpeg / Whisper). -->
+            <label class="edit-gl">Setup</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-run-setup"
+                      title="Re-run first-time setup: archive folder + install yt-dlp / ffmpeg / Whisper">Run setup again&hellip;</button>
+            </div>
+
             <!-- feature F8: projected compress savings dry-run.
                  Reads duration + size from the index DB and shows how
                  much disk would be saved at each quality tier &mdash; no

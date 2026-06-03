@@ -995,16 +995,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         # bare-stripped in the .f137 sub-track filename
                         # but as fullwidth `＂` in the merged .mp4
                         # output → path-match misses → DLTRACK orphan).
-                        # The "youngest pending" entry in _title_announced
-                        # is this video (yt-dlp processes sequentially
-                        # within a subprocess) so cloning its counter
-                        # under the Merger path repairs the join.
-                        for _pp, _pv in _title_announced.items():
-                            if _pv == "pending":
-                                _existing_n = _path_to_counter.get(_pp)
-                                if _existing_n is not None:
-                                    _path_to_counter[merge_dest_path] = _existing_n
-                                break
+                        # Join on the CURRENT video id (stamped against this
+                        # video's counter at its Destination line) — a reliable
+                        # key. The old "first pending" scan grabbed a STALE
+                        # pending entry left by an EARLIER video whose
+                        # Destination key never cleared to True: an illegal
+                        # char like `"` sanitizes differently in the .fNNN
+                        # track vs the merged .mp4, so the Destination key and
+                        # the DLTRACK key diverge and the pending entry lingers
+                        # forever — cross-stamping every later video onto the
+                        # first `"`-video's counter and collapsing all the
+                        # download rows into one. Fall back to the pending scan
+                        # only when no vid is known.
+                        _cs_n = (_vid_to_counter.get(current_vid_id)
+                                 if current_vid_id else None)
+                        if _cs_n is None:
+                            for _pp, _pv in _title_announced.items():
+                                if _pv == "pending":
+                                    _cs_n = _path_to_counter.get(_pp)
+                                    break
+                        if _cs_n is not None:
+                            _path_to_counter[merge_dest_path] = _cs_n
                 stream.emit([[f" {s}\n", "dim"]])
                 continue
 
@@ -1102,12 +1113,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # for [Merger] variants that didn't hit the suppress
                 # filter (e.g. tools that wrap yt-dlp output with
                 # additional prefixes), so it needs the same cross-stamp.
-                for _pp, _pv in _title_announced.items():
-                    if _pv == "pending":
-                        _existing_n = _path_to_counter.get(_pp)
-                        if _existing_n is not None:
-                            _path_to_counter[merge_dest_path] = _existing_n
-                        break
+                # Same vid-first join as the primary site (a stale "pending"
+                # entry from an earlier illegal-char title would otherwise
+                # poison the first-pending scan).
+                _cs_n = (_vid_to_counter.get(current_vid_id)
+                         if current_vid_id else None)
+                if _cs_n is None:
+                    for _pp, _pv in _title_announced.items():
+                        if _pv == "pending":
+                            _cs_n = _path_to_counter.get(_pp)
+                            break
+                if _cs_n is not None:
+                    _path_to_counter[merge_dest_path] = _cs_n
                 # Also cover Remuxer / FixupM3u8 — same semantic meaning.
                 # Fall through so the line still gets logged.
 
@@ -1327,6 +1344,21 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 # ticks (late 100% etc) will be dropped
                                 # so they can't clobber this done line.
                                 _closed_dlrows.add(_dlrow_n)
+                                # Belt-and-suspenders: clear any STALE
+                                # "pending" entry that maps to this now-closed
+                                # counter. When an illegal-char title (e.g. a
+                                # `"`) sanitizes differently in the .fNNN track
+                                # than in the merged .mp4, this video's
+                                # Destination key never gets flipped to True by
+                                # the `_title_announced[final_path] = True`
+                                # above (which keys off the MERGED path). Left
+                                # pending, it poisons the first-pending
+                                # cross-stamp for LATER videos. Resolve it here.
+                                for _pp in list(_title_announced.keys()):
+                                    if (_title_announced.get(_pp) == "pending"
+                                            and _path_to_counter.get(_pp)
+                                            == _dlrow_n):
+                                        _title_announced[_pp] = True
                             stream.emit([
                                 [" ", ["dim", _done_kind]],
                                 ["\u2014 \u2713 ", ["simpleline_green", _done_kind]],

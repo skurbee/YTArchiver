@@ -401,6 +401,16 @@
       sortWrap.style.display = "none";
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
       if (findWrap) findWrap.style.display = "";
+      // Re-render the grid to match the just-cleared filter. Without this,
+      // a grid left filtered from a previous visit (or a stale per-channel
+      // scope) persisted while the filter box read empty \u2014 so the user saw
+      // only a subset (sometimes a single channel) of their channels until
+      // they manually typed into and cleared the filter. Guarded on the
+      // channel list being primed so we don't clobber the boot-time initial
+      // render with an empty grid.
+      if (Array.isArray(_browseState.channels) && _browseState.channels.length) {
+        filterCurrentView("");
+      }
     } else if (viewName === "videos") {
       document.getElementById("view-videos").style.display = "";
       title.textContent = _browseState.currentChannel?.folder || "Videos";

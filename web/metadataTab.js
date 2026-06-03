@@ -790,6 +790,12 @@
         const days = btn.dataset.days; // string or undefined
         _closeRowMenu();
         await _runRowAct(act, ident, days);
+        // The refresh runs server-side (queued); re-pull the table shortly
+        // after so a quick views/likes refresh on a small channel shows up
+        // without the user manually hitting Reload. Harmless if the job is
+        // still running — the row just re-renders with the current backend
+        // state. (Full completion for big channels still needs a Reload.)
+        setTimeout(() => { try { window._refreshMetadataTab?.(); } catch (e) {} }, 2000);
       });
 
       document.body.appendChild(menu);

@@ -11,6 +11,7 @@ from .info_mixin import InfoMixin
 from .livestreams_mixin import LivestreamsMixin
 from .media_ops_mixin import MediaOpsMixin
 from .metadata_mixin import MetadataMixin
+from .onboarding_mixin import OnboardingMixin
 from .queue_mixin import QueueMixin
 from .recent_mixin import RecentMixin
 from .redownload_mixin import RedownloadMixin
@@ -35,6 +36,7 @@ __all__ = [
     "LivestreamsMixin",
     "MediaOpsMixin",
     "MetadataMixin",
+    "OnboardingMixin",
     "QueueMixin",
     "RecentMixin",
     "RedownloadMixin",

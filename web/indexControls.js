@@ -86,13 +86,33 @@
         // the multi-second index-DB query that follows.
         statsEl.innerHTML = _renderLines(c, null);
         statsEl.dataset.populated = "1";
-        // Async-fetch the slow index-DB stats. Re-render once they
-        // arrive. If the API doesn't exist (older backend), the
-        // spinner placeholders just keep spinning.
+        // Async-fetch the slow index-DB stats. Re-render once they arrive.
         if (api.get_index_db_stats) {
+          let _dbArrived = false;
+          const _fallback = { segments: null, hours: null, index_db_size_label: "—" };
           api.get_index_db_stats().then((db) => {
-            if (db) statsEl.innerHTML = _renderLines(c, db);
-          }).catch(() => {});
+            if (db) { _dbArrived = true; statsEl.innerHTML = _renderLines(c, db); }
+          }).catch((err) => {
+            // On error, don't leave the three rows spinning "loading…"
+            // forever — collapse them to "—".
+            _dbArrived = true;
+            statsEl.innerHTML = _renderLines(c, _fallback);
+            try { console.warn("get_index_db_stats failed:", err); } catch (e) {}
+          });
+          // Safety net: on a very large/busy archive this COUNT+JOIN
+          // aggregate can run a long time (and if the bridge call stalls,
+          // it may never resolve) — which left the rows spinning "loading…"
+          // indefinitely. After a grace period, collapse the spinners to
+          // "—" with a note. If the real numbers DO arrive later, the
+          // .then above still upgrades them in place (innerHTML reset).
+          setTimeout(() => {
+            if (_dbArrived) return;
+            statsEl.innerHTML = _renderLines(c, _fallback);
+            const note = document.createElement("div");
+            note.style.cssText = "color:var(--c-dim);font-size:11px;margin-top:4px;";
+            note.textContent = "(segment / hours / DB-size stats still computing — reopen Index later to refresh)";
+            statsEl.appendChild(note);
+          }, 30000);
         }
       } catch (e) {
         statsEl.textContent = `Stats unavailable: ${e}`;

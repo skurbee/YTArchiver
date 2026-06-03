@@ -1521,6 +1521,121 @@ def find_thumbnail(video_filepath: str,
     return None
 
 
+# Regexes for the channel-wide thumbnail index below. Module-level so they
+# compile once and are shared by both the Browse grid path
+# (list_videos_for_channel) and the Recent tab path
+# (find_thumbnail_channelwide).
+_THUMB_VID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
+_YEAR_DIR_RE = re.compile(r"^[12][0-9]{3}$")
+
+
+def _build_channel_thumb_index(ch_root: str) -> dict[str, str]:
+    """Walk a channel root once and return ``{video_id: thumb_path}`` for
+    every ``.Thumbnails/*[<id>].(jpg|jpeg|webp|png)`` anywhere beneath it.
+
+    Cached per channel-root by the root's mtime in the module-level
+    ``_thumb_index_cache`` — the SAME cache ``list_videos_for_channel``
+    uses — so the Browse grid and the Recent tab resolve thumbnails
+    identically and never walk the same tree twice. Returns ``{}`` when the
+    root is missing or unwalkable.
+
+    (Mirrors the inline walk in ``list_videos_for_channel``; both populate
+    and read the shared cache, so a hit from one path serves the other.)
+    """
+    if not ch_root or not os.path.isdir(ch_root):
+        return {}
+    try:
+        ch_mtime = os.path.getmtime(ch_root)
+    except OSError:
+        ch_mtime = 0.0
+    key = os.path.normpath(ch_root)
+    with _thumb_index_cache_lock:
+        cached = _thumb_index_cache.get(key)
+    if cached is not None and ch_mtime > 0 and cached.get("mtime") == ch_mtime:
+        return dict(cached.get("thumbs") or {})
+    thumbs: dict[str, str] = {}
+    try:
+        for _dp, _dns, _fns in os.walk(ch_root):
+            if os.path.basename(_dp) != ".Thumbnails":
+                continue
+            for _fn in _fns:
+                if not _fn.lower().endswith((".jpg", ".jpeg", ".webp", ".png")):
+                    continue
+                _m = _THUMB_VID_RE.search(_fn)
+                if _m:
+                    thumbs[_m.group(1)] = os.path.normpath(
+                        os.path.join(_dp, _fn))
+    except OSError:
+        pass
+    if ch_mtime > 0:
+        with _thumb_index_cache_lock:
+            _thumb_index_cache[key] = {"mtime": ch_mtime, "thumbs": dict(thumbs)}
+    return thumbs
+
+
+def _channel_root_from_filepath(video_filepath: str) -> str | None:
+    """Infer the channel-root directory from ONE video's filepath.
+
+    Mirrors the per-row root detection in ``list_videos_for_channel``::
+
+        <root>/<file>                  -> <root>
+        <root>/<year>/<file>           -> <root>
+        <root>/<year>/<month>/<file>   -> <root>
+
+    A directory named exactly four digits (1900-2099 range) is treated as a
+    year bucket; its parent (or grandparent, for year/month layouts) is the
+    channel root. Returns ``None`` if the inferred root isn't a real dir.
+    """
+    if not video_filepath:
+        return None
+    parent = os.path.dirname(video_filepath)
+    gp = os.path.dirname(parent)
+    if _YEAR_DIR_RE.match(os.path.basename(parent)):
+        cand = gp
+    elif _YEAR_DIR_RE.match(os.path.basename(gp)):
+        cand = os.path.dirname(gp)
+    else:
+        cand = parent
+    return cand if (cand and os.path.isdir(cand)) else None
+
+
+def find_thumbnail_channelwide(video_filepath: str,
+                               video_id: str | None = None) -> str | None:
+    """Resolve a thumbnail the way the Browse grid does: if the cheap up-walk
+    misses, scan the WHOLE channel tree by video_id.
+
+    Needed because a video's thumbnail can live in a different year/month
+    ``.Thumbnails/`` than where its mp4 currently sits. Real case: an mp4
+    foldered under the download month (``2026/06 June/``) while its
+    thumbnail was foldered under the upload month
+    (``2026/05 May/.Thumbnails/``). ``find_thumbnail`` only walks UP from the
+    mp4, so it never crosses into the sibling month and the Recent card fell
+    back to a gradient placeholder — even though the Browse grid (which does
+    a channel-wide walk) showed the thumbnail fine.
+
+    Ordered narrow-first for speed: the common case (thumbnail co-located on
+    the mp4's own path) is a handful of stats via ``find_thumbnail`` and
+    never triggers the channel-wide walk. Only genuinely-misplaced rows pay
+    for the tree walk, and that result is cached + shared with Browse.
+    """
+    if not video_filepath:
+        return None
+    # 1. Cheap narrow up-walk first — handles correctly co-located thumbs.
+    tp = find_thumbnail(video_filepath, video_id)
+    if tp:
+        return tp
+    # 2. Miss — thumbnail may be in a sibling year/month .Thumbnails/. Use
+    #    the channel-wide by-id index (cached, shared with the Browse grid).
+    vid = (video_id or "").strip()
+    if vid:
+        ch_root = _channel_root_from_filepath(video_filepath)
+        if ch_root:
+            tp = _build_channel_thumb_index(ch_root).get(vid)
+            if tp and os.path.isfile(tp):
+                return os.path.normpath(tp)
+    return None
+
+
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                  title: str | None = None) -> list[dict[str, Any]]:
     """Return ordered segments for a video.

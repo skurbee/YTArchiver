@@ -80,83 +80,34 @@
           // renderRecentTable step renders into the correct view and
           // the alternate frame is hidden before first paint.
           window._applyRecentViewMode?.(info.recent_view_mode || "list");
-          // First-launch archive-root picker. Blocking modal — no
-          // Cancel button, no ESC dismissal, no outside-click close.
-          // The user MUST pick a folder before the app does anything
-          // useful. Replaces the old two-step confirm+picker flow
-          // which let users silently leave the app in a half-
-          // configured state (default `~/Channel Archives` baked in).
-          if (info.has_real_config === false || !info.output_dir) {
-            await new Promise((resolve) => {
-              const modal = document.getElementById("welcome-modal");
-              const pathEl = document.getElementById("welcome-path");
-              const browseBtn = document.getElementById("welcome-browse");
-              const continueBtn = document.getElementById("welcome-continue");
-              if (!modal || !pathEl || !browseBtn || !continueBtn) {
-                resolve(); return;
+          // First-run onboarding wizard. Driven by the backend-confirmed
+          // `onboarded` flag (set once the user finishes/skips the wizard),
+          // with missing-output_dir / no-config-file fallbacks so a half-
+          // set-up config still triggers it. This replaces the old
+          // welcome-modal that could silently no-op (the bug a brand-new
+          // machine hit: no folder picker, just dependency errors in the
+          // log). The wizard is a full-screen blocking overlay
+          // (web/onboarding.js); it owns its own archive-folder picker +
+          // dependency installer. Wrapped so a failure here can't sink the
+          // rest of seedLogs.
+          const _needsOnboarding =
+            (info.onboarded === false) ||
+            !info.output_dir ||
+            info.has_config_file === false;
+          if (_needsOnboarding) {
+            console.info("[seed] first run detected — launching onboarding wizard",
+              { onboarded: info.onboarded, output_dir: info.output_dir,
+                has_config_file: info.has_config_file });
+            if (typeof window._startOnboarding === "function") {
+              try {
+                await window._startOnboarding({ firstRun: true });
+              } catch (e) {
+                console.error("[seed] onboarding wizard failed to start:", e);
               }
-              let pickedPath = "";
-              modal.hidden = false;
-              // Block ESC from closing while this modal is up. The
-              // existing askq/context-menu ESC handlers only fire on
-              // elements they own, so this listener just makes sure
-              // nothing else hijacks ESC to close the modal.
-              const escBlock = (e) => {
-                // Skip auto-repeat events (holding Esc) — running
-                // the comparison + preventDefault 30+ times/sec is
-                // wasteful (audit: seedLogs L132).
-                if (e.repeat) return;
-                if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); }
-              };
-              document.addEventListener("keydown", escBlock, true);
-
-              browseBtn.addEventListener("click", async () => {
-                // Guard against double-click spawning two picker
-                // dialogs — disable the button for the duration.
-                if (browseBtn.disabled) return;
-                browseBtn.disabled = true;
-                try {
-                  const picked = await api.pick_folder("Choose archive root");
-                  if (picked?.ok && picked.path) {
-                    pickedPath = picked.path;
-                    pathEl.value = pickedPath;
-                    continueBtn.disabled = false;
-                  } else if (picked && picked.ok === false && picked.error) {
-                    // Picker refused / failed with an explicit error.
-                    window._showToast?.(
-                      "Folder picker failed: " + picked.error, "error");
-                  }
-                  // picked?.ok === false without .error means user
-                  // hit Cancel — silent no-op is correct.
-                } catch (e) {
-                  // pywebview bridge error (process detached, picker
-                  // crash, etc.). Pre-fix this was silently swallowed
-                  // and the Browse button appeared dead with no hint.
-                  window._showToast?.(
-                    "Folder picker failed: " + String(e), "error");
-                } finally {
-                  browseBtn.disabled = false;
-                }
-              });
-              continueBtn.addEventListener("click", async () => {
-                if (!pickedPath) return;
-                try {
-                  const saved = await api.set_parent_folder(pickedPath);
-                  if (saved?.ok) {
-                    modal.hidden = true;
-                    document.removeEventListener("keydown", escBlock, true);
-                    window._showToast?.(
-                      "Archive root saved: " + pickedPath, "ok");
-                    resolve();
-                  } else {
-                    window._showToast?.(
-                      saved?.error || "Could not save folder.", "error");
-                  }
-                } catch (e) {
-                  window._showToast?.(String(e), "error");
-                }
-              });
-            });
+            } else {
+              console.error("[seed] _startOnboarding missing — onboarding.js "
+                + "did not load; cannot show first-run wizard");
+            }
           }
         });
 

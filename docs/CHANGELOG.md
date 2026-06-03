@@ -6,6 +6,49 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v75.7 — 2026-06-03
+
+Restores first-run onboarding and lands a batch of UI/correctness fixes.
+
+### Added
+- **First-run setup wizard.** A guided first-launch flow: pick an
+  archive folder, then install the required download tools (yt-dlp +
+  ffmpeg/ffprobe, fetched into an app-managed folder that's added to
+  PATH) and, optionally, the AI-transcription stack (Python 3.11 +
+  faster-whisper + torch, with a CUDA build when a GPU is present).
+  Re-openable any time from **Settings ▸ Tools ▸ "Run setup again"**.
+  This replaces the dependency-install onboarding that was lost in an
+  earlier rewrite, where a fresh machine only saw "missing dependency"
+  errors with no in-app way to install them.
+
+### Fixed
+- **Browse ▸ Search "Year" filter did nothing.** The from/to year
+  inputs now constrain both transcript and title results.
+- **Title search treated `%` and `_` as wildcards** — they now match
+  literally (proper LIKE-escaping).
+- **Result count was silently capped** with no hint; it now shows
+  "N+ (capped)" when more matches exist than are displayed.
+- **Settings ▸ Tools ▸ About** threw a script error instead of showing
+  version/info.
+- **Transcript-drift "Scan & fix" channel picker** listed every entry
+  as "(channel name missing)"; channels now populate correctly.
+- **Index Statistics** could spin "loading…" indefinitely on large
+  archives; it now falls back gracefully after a grace period.
+- **Bookmark CSV export** wrote an unsubstituted placeholder in the
+  "created" column; it now writes a real timestamp.
+- **Per-video "Redownload"** showed "undefinedp" and reused the
+  whole-channel dialog; it now has a proper per-video resolution picker.
+- **Browse ▸ Channels** could show only one channel on entry until the
+  filter was toggled; the grid now resets to show all channels.
+- Zero-result searches left the previous transcript in the reader pane.
+- "1 matches" → "1 match" (pluralization).
+- "Open folder in Explorer" relabeled to "Open folder" (the OS default
+  file manager is used, which isn't always Explorer).
+- Channel-art thumbnails and the art-cache marker file now get the
+  hidden attribute consistently.
+- Full-backup **Export** now defaults to a `.zip` filter, matching the
+  Restore dialog.
+
 ## v75.3 — 2026-05-23
 
 Conservative ship: small set of verified user-visible fixes on top of

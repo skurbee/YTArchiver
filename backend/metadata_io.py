@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +115,56 @@ def _get_metadata_jsonl_path(ch_name: str, folder_path: str,
         return (os.path.join(subfolder, fname), subfolder)
     fname = f".{ch_name} Metadata.jsonl"
     return (os.path.join(folder_path, fname), folder_path)
+
+
+# Year/month folder parsing. `_YEAR_DIR_RE` matches a 4-digit year folder
+# (1000-2999); `_MONTH_PREFIX_RE` pulls the leading number off a
+# "06 June"-style month folder. Used by `_year_month_from_path`.
+_YEAR_DIR_RE = re.compile(r"^[12][0-9]{3}$")
+_MONTH_PREFIX_RE = re.compile(r"^(\d{1,2})\b")
+
+
+def _year_month_from_path(file_path: str) -> tuple[int | None, int | None]:
+    """Derive the (year, month) bucket for a video's metadata JSONL +
+    thumbnail from the mp4's OWN folder, so they always co-locate with the
+    video file.
+
+    The download `-o` template folders videos by `upload_date`
+    (`<root>/<YYYY>/<MM Month>/`), and reorg keeps that in sync. Reading the
+    folder back — rather than re-deriving from yt-dlp's `--mtime`, which can
+    drift days from the publish date for premieres / scheduled uploads —
+    means the thumbnail never splits off into a different month folder than
+    the mp4 it belongs to (the bug where an mp4 in `2026/06 June/` had its
+    thumbnail land in `2026/05 May/.Thumbnails/`).
+
+    Returns:
+      (year, month) when the mp4 sits in a `<YYYY>/<MM Month>/` path,
+      (year, None)  when it sits directly in a `<YYYY>/` path,
+      (mtime.year, mtime.month) as a fallback when the path encodes no
+        year folder (flat channel, or an "Unknown Year" download).
+
+    When the channel isn't split by year/month, `_get_metadata_jsonl_path`
+    ignores these values (it routes to the channel root), so the mtime
+    fallback is harmless in that case.
+    """
+    parent = os.path.dirname(file_path)
+    parent_name = os.path.basename(parent)
+    gp_name = os.path.basename(os.path.dirname(parent))
+    # <root>/<YYYY>/<MM Month>/<file>
+    if _YEAR_DIR_RE.match(gp_name):
+        m = _MONTH_PREFIX_RE.match(parent_name)
+        if m:
+            return int(gp_name), int(m.group(1))
+    # <root>/<YYYY>/<file>
+    if _YEAR_DIR_RE.match(parent_name):
+        return int(parent_name), None
+    # Flat / unparseable — fall back to the file's UTC mtime (yt-dlp
+    # --mtime is UTC; the rest of the metadata bucketing reads UTC too).
+    try:
+        mt = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
+        return mt.year, mt.month
+    except OSError:
+        return None, None
 
 
 def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:

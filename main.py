@@ -125,6 +125,7 @@ from backend.api_mixins import (
     LivestreamsMixin,
     MediaOpsMixin,
     MetadataMixin,
+    OnboardingMixin,
     QueueMixin,
     RecentMixin,
     RedownloadMixin,
@@ -139,7 +140,7 @@ from backend.api_mixins import (
 )
 
 
-class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TranscribeMixin, VideoMixin, WindowMixin):
+class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, DiagnosticsMixin, IndexMixin, InfoMixin, LivestreamsMixin, MediaOpsMixin, MetadataMixin, OnboardingMixin, QueueMixin, RecentMixin, RedownloadMixin, SettingsMixin, StartupMixin, SubsMixin, SyncMixin, ThumbnailMixin, TranscribeMixin, VideoMixin, WindowMixin):
     """
     Exposed to JS as window.pywebview.api.*
 
@@ -923,6 +924,18 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
 
 
 def main():
+    # Put the app-managed bin dir (%APPDATA%/YTArchiver/bin) on PATH FIRST,
+    # before any shutil.which() / dependency probe runs. This is where the
+    # first-run onboarding installer drops yt-dlp.exe + ffmpeg/ffprobe, so
+    # they resolve everywhere (sync, compress, redownload, diagnostics) with
+    # no other changes. Appended (not prepended) so a user's own system
+    # tools keep winning — see deps_installer.ensure_bin_on_path.
+    try:
+        from backend import deps_installer as _deps_boot
+        _deps_boot.ensure_bin_on_path()
+    except Exception as e:
+        _log.debug("ensure_bin_on_path failed (non-fatal): %s", e)
+
     # Start the network-down monitor in the background
     try:
         net_backend.start_monitor()

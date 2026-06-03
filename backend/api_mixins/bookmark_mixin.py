@@ -78,11 +78,30 @@ class BookmarkMixin:
             bms = index_backend.bookmark_list()
             if not bms:
                 return {"ok": False, "error": "No bookmarks to export"}
+            import datetime as _dt
+
+            def _fmt_created(v):
+                """Render the bookmark's `created` value as a readable
+                'YYYY-MM-DD HH:MM:SS'. Accepts a unix-epoch number (or a
+                numeric string). Legacy rows may hold the bare placeholder
+                string "%s" (an old DEFAULT bug) — those, and anything else
+                non-numeric, render as blank rather than leaking junk."""
+                try:
+                    ts = float(v)
+                except (TypeError, ValueError):
+                    return ""
+                if ts <= 0:
+                    return ""
+                try:
+                    return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+                except (OverflowError, OSError, ValueError):
+                    return ""
+
             buf = io.StringIO()
             w = csv.writer(buf)
             w.writerow(["created", "channel", "title", "start_time", "text", "note", "video_id"])
             for b in bms:
-                w.writerow([b.get("created"), b.get("channel"), b.get("title"),
+                w.writerow([_fmt_created(b.get("created")), b.get("channel"), b.get("title"),
                             b.get("start_time"), b.get("text"), b.get("note"),
                             b.get("video_id")])
             if self._window is None:

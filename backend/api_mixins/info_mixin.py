@@ -59,6 +59,22 @@ class InfoMixin:
             "output_dir": (cfg.get("output_dir") or "").strip(),
             "first_run": not bool((cfg.get("output_dir") or "").strip()
                                   and cfg.get("channels")),
+            # Authoritative first-run-wizard gate. True once the user has
+            # completed (or skipped through) onboarding. The wizard trigger
+            # in seedLogs.js keys off this (plus a missing output_dir as a
+            # belt-and-suspenders fallback) rather than the old output_dir-
+            # only check that could silently skip.
+            #
+            # MIGRATION: existing installs set up before the wizard existed
+            # have a config with output_dir already set but NO `onboarded`
+            # key (defaults to False). Treat "has an archive folder" as
+            # already-onboarded so the wizard never nags users who were
+            # already up and running. Brand-new machines (no output_dir)
+            # still get the wizard.
+            "onboarded": bool(cfg.get("onboarded"))
+                         or bool((cfg.get("output_dir") or "").strip()),
+            # No real config on disk yet == brand-new machine.
+            "has_config_file": self._config is not None,
             # Subs-table column visibility toggle — piggybacked on runtime
             # info so the JS can apply the class BEFORE the first
             # renderSubsTable call and avoid a flash of the hidden column.

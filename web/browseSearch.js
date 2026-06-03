@@ -387,12 +387,21 @@
       const sortSel = document.getElementById("search-sort");
       const sortKey = (sortSel?.value || "relevance");
       const sortKeyTitles = (sortKey === "relevance") ? "newest" : sortKey;
+      // Year window (inclusive). Blank / non-numeric → no bound. These
+      // were previously collected by the UI but never sent, so the filter
+      // did nothing; now both legs receive them.
+      const _parseYear = (el) => {
+        const n = parseInt((el?.value || "").trim(), 10);
+        return Number.isFinite(n) ? n : null;
+      };
+      const yearFrom = _parseYear(document.getElementById("search-year-from"));
+      const yearTo = _parseYear(document.getElementById("search-year-to"));
       try {
         const promises = [];
         // Transcripts leg — FTS5 against segments.
         if (wantTranscripts) {
           promises.push(
-            Promise.resolve(api.browse_search(q, selectedChannels, 200, sortKey))
+            Promise.resolve(api.browse_search(q, selectedChannels, 200, sortKey, yearFrom, yearTo))
               .then(rs => (rs || []).map(r => ({ ...r, _match_kind: "transcript" })))
               .catch(() => [])
           );
@@ -403,7 +412,7 @@
         // like a transcript hit so the renderer below stays unified.
         if (wantTitles) {
           promises.push(
-            Promise.resolve(api.browse_search_titles?.(q, selectedChannels, 200, sortKeyTitles))
+            Promise.resolve(api.browse_search_titles?.(q, selectedChannels, 200, sortKeyTitles, yearFrom, yearTo))
               .then(rs => (rs || []).map(r => ({
                 ...r,
                 text: r.title || "",
@@ -419,6 +428,13 @@
         }
         const [txRows, tiRows] = await Promise.all(promises);
         if (myId !== _searchSeq) return; // user kicked off a newer search; drop stale results
+        // Each leg is server-capped at 200 rows. If a leg came back full,
+        // there are almost certainly more matches than we're showing — flag
+        // it so the count reads "N+ … (capped)" instead of implying N is the
+        // true total. (The cap keeps common-word searches snappy.)
+        const _LEG_CAP = 200;
+        const capped = (Array.isArray(txRows) && txRows.length >= _LEG_CAP) ||
+                       (Array.isArray(tiRows) && tiRows.length >= _LEG_CAP);
         let rows = [...txRows, ...tiRows];
         // Re-sort the merged list by the user's chosen sort key. Each
         // leg was sorted server-side, but a naive [...txRows, ...tiRows]
@@ -465,9 +481,22 @@
           const errMsg = (rows && rows[0] && rows[0].error) ? `Search error: ${rows[0].error}` : "No matches.";
           results.innerHTML = `<div class="browse-empty">${escapeHtml(errMsg)}</div>`;
           counter.textContent = "0 matches";
+          // Clear the right-hand reader pane — otherwise the previously
+          // selected result's transcript lingers next to a "No matches".
+          const _vBody = document.getElementById("search-viewer-body");
+          const _vTitle = document.getElementById("search-viewer-title");
+          const _vMeta = document.getElementById("search-viewer-meta");
+          if (_vBody) _vBody.innerHTML = "";
+          if (_vTitle) _vTitle.textContent = "Select a result to read";
+          if (_vMeta) _vMeta.textContent = "";
+          const _vEarlier = document.getElementById("search-viewer-earlier");
+          if (_vEarlier) _vEarlier.hidden = true;
           return;
         }
-        counter.textContent = `${rows.length.toLocaleString()} matches`;
+        const _matchWord = rows.length === 1 ? "match" : "matches";
+        counter.textContent = capped
+          ? `${rows.length.toLocaleString()}+ ${_matchWord} (capped)`
+          : `${rows.length.toLocaleString()} ${_matchWord}`;
         const frag = document.createDocumentFragment();
         for (const r of rows) {
           const row = document.createElement("div");

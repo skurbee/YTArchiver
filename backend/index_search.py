@@ -44,6 +44,8 @@ def search_video_titles(query: str,
                           channel: Any | None = None,
                           limit: int = 200,
                           sort: str = "newest",
+                          year_from: int | None = None,
+                          year_to: int | None = None,
                           ) -> list[dict[str, Any]]:
     """Global title-only search across the archive's videos.
 
@@ -75,8 +77,17 @@ def search_video_titles(query: str,
     parts = [p.strip() for p in query.strip().split() if p.strip()]
     if not parts:
         return []
-    where_clauses = " AND ".join(["title LIKE ? COLLATE NOCASE"] * len(parts))
-    args: list[Any] = [f"%{p}%" for p in parts]
+    # Escape LIKE wildcards so a query containing % or _ matches those
+    # characters literally instead of acting as a wildcard (which made
+    # e.g. "%" match every title). ESCAPE '\' tells SQLite that a
+    # backslash-prefixed %/_/\ is a literal.
+    def _esc_like(s: str) -> str:
+        return (s.replace("\\", "\\\\")
+                 .replace("%", "\\%")
+                 .replace("_", "\\_"))
+    where_clauses = " AND ".join(
+        ["title LIKE ? COLLATE NOCASE ESCAPE '\\'"] * len(parts))
+    args: list[Any] = [f"%{_esc_like(p)}%" for p in parts]
     # Channel scope: accept string (legacy) or list (new multi-select).
     chan_sql = ""
     if isinstance(channel, str) and channel.strip():
@@ -88,6 +99,16 @@ def search_video_titles(query: str,
             placeholders = ",".join(["?"] * len(_names))
             chan_sql = f" AND channel IN ({placeholders})"
             args.extend(_names)
+    # Year scope (inclusive). Mirror the FTS leg: OR-include year IS NULL
+    # so videos we couldn't date yet aren't silently dropped when the
+    # user sets a year window.
+    year_sql = ""
+    if year_from is not None:
+        year_sql += " AND (year >= ? OR year IS NULL)"
+        args.append(int(year_from))
+    if year_to is not None:
+        year_sql += " AND (year <= ? OR year IS NULL)"
+        args.append(int(year_to))
     args.append(int(limit))
     # Translate sort key → SQL ORDER BY clause.
     order_sql = {
@@ -102,7 +123,8 @@ def search_video_titles(query: str,
                 f"SELECT video_id, title, channel, filepath, year, "
                 f"COALESCE(upload_ts, added_ts, 0) AS ts "
                 f"FROM videos WHERE {where_clauses}"
-                f"{chan_sql} "
+                f"{chan_sql}"
+                f"{year_sql} "
                 f"AND is_duplicate_of IS NULL "
                 f"ORDER BY {order_sql} LIMIT ?",
                 args)

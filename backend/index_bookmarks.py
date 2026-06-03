@@ -24,11 +24,20 @@ def bookmark_add(video_id: str, title: str, channel: str,
     conn = _idx._open()
     if conn is None:
         return None
+    # Set `created` explicitly (unix epoch) rather than leaning on the
+    # column DEFAULT. Older index DBs were created with a literal
+    # `DEFAULT '%s'` (the strftime wrapper was lost), so new rows inherited
+    # the bare placeholder string "%s" — which then showed up verbatim in
+    # the CSV export's "created" column. `CREATE TABLE IF NOT EXISTS` can't
+    # repair an existing table's baked-in default, so we write the value
+    # ourselves and bypass the default entirely.
+    import time as _time
+    created = _time.time()
     with _idx._db_lock:
         cur = conn.execute(
-            "INSERT INTO bookmarks (video_id, title, channel, start_time, text, note) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (video_id, title, channel, start_time, text, note),
+            "INSERT INTO bookmarks (video_id, title, channel, start_time, text, note, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (video_id, title, channel, start_time, text, note, created),
         )
         conn.commit()
         return cur.lastrowid

@@ -1,0 +1,191 @@
+/* styles-onboarding.css — first-run setup wizard (web/onboarding.js +
+   partials/onboarding.html). Uses the app's theme vars with hardcoded
+   fallbacks so the wizard renders even if it shows before the main
+   stylesheet's :root vars resolve. */
+
+.onb-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(2px);
+}
+.onb-overlay[hidden] { display: none; }
+
+.onb-card {
+  width: min(620px, 92vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--c-bg, #1c1c1e);
+  color: var(--c-text, #e6e6e6);
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 10px;
+  box-shadow: 0 14px 50px rgba(0, 0, 0, 0.55);
+  font-family: var(--font-ui, system-ui, "Segoe UI", sans-serif);
+  overflow: hidden;
+}
+
+/* Header */
+.onb-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--c-border, #3a3a3d);
+}
+.onb-logo {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  font-size: 14px;
+  color: var(--c-accent, #3ea06a);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.onb-logo-sub {
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  font-size: 11px;
+  color: var(--c-dim, #8a8a8e);
+}
+.onb-steps { display: flex; gap: 8px; }
+.onb-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--c-border, #3a3a3d);
+  transition: background 0.2s, transform 0.2s;
+}
+.onb-dot.active { background: var(--c-accent, #3ea06a); transform: scale(1.25); }
+.onb-dot.done { background: var(--c-accent, #3ea06a); opacity: 0.55; }
+
+/* Body */
+.onb-body { padding: 24px 26px; overflow-y: auto; }
+.onb-title { font-size: 21px; font-weight: 650; margin: 0 0 10px; }
+.onb-text { font-size: 13.5px; line-height: 1.5; color: var(--c-text, #d8d8d8); margin: 0 0 14px; }
+.onb-list { margin: 0; padding-left: 20px; line-height: 1.9; font-size: 13.5px; }
+.onb-list li::marker { color: var(--c-accent, #3ea06a); }
+.onb-hint { font-size: 12px; color: var(--c-dim, #8a8a8e); margin-top: 10px; min-height: 16px; }
+
+/* Folder picker */
+.onb-folder-row { display: flex; gap: 8px; margin-top: 6px; }
+.onb-input {
+  flex: 1 1 auto;
+  background: var(--c-input, #2a2a2d);
+  color: var(--c-text, #e6e6e6);
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 5px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+/* Dependency groups */
+.onb-dep-group {
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.onb-dep-group-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 8px;
+}
+.onb-dep-group-name { font-weight: 600; font-size: 13.5px; }
+.onb-tag {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; padding: 2px 6px; border-radius: 4px; margin-left: 6px;
+  vertical-align: middle;
+}
+.onb-req { background: rgba(210, 120, 70, 0.18); color: #e0995f; }
+.onb-opt { background: rgba(120, 130, 150, 0.18); color: #9aa3b3; }
+
+.onb-dep-rows { display: flex; flex-direction: column; gap: 4px; }
+.onb-dep-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.onb-dep-icon { width: 16px; text-align: center; flex: 0 0 16px; }
+.onb-dep-label { font-weight: 550; min-width: 150px; }
+.onb-dep-detail { color: var(--c-dim, #8a8a8e); font-size: 11.5px; }
+.onb-ok { color: #4cc47e; font-weight: 700; }
+.onb-no { color: #d2785f; font-weight: 700; }
+.onb-unknown { color: var(--c-dim, #8a8a8e); font-weight: 700; }
+
+.onb-whisper-note {
+  font-size: 11.5px; line-height: 1.5; color: var(--c-dim, #9a9a9e);
+  margin-top: 10px;
+  border-left: 2px solid var(--c-border, #3a3a3d);
+  padding-left: 10px;
+}
+
+/* Progress */
+.onb-progress { margin-top: 10px; }
+.onb-progress-bar {
+  height: 7px; border-radius: 4px;
+  background: var(--c-input, #2a2a2d);
+  overflow: hidden;
+}
+.onb-progress-fill {
+  height: 100%; width: 0%;
+  background: var(--c-accent, #3ea06a);
+  border-radius: 4px;
+  transition: width 0.2s ease;
+}
+.onb-progress-msg { font-size: 11px; color: var(--c-dim, #8a8a8e); margin-top: 5px; min-height: 14px; word-break: break-word; }
+.onb-msg-error { color: #e0795f !important; }
+
+/* Indeterminate sweep for no-percentage (pip) steps */
+.onb-fill-indef {
+  width: 40% !important;
+  background: linear-gradient(90deg, transparent, var(--c-accent, #3ea06a), transparent);
+  animation: onb-sweep 1.2s ease-in-out infinite;
+}
+@keyframes onb-sweep {
+  0% { margin-left: -45%; }
+  100% { margin-left: 105%; }
+}
+
+/* Spinner for in-progress dep rows */
+.onb-spin {
+  display: inline-block; width: 11px; height: 11px;
+  border: 2px solid var(--c-border, #3a3a3d);
+  border-top-color: var(--c-accent, #3ea06a);
+  border-radius: 50%;
+  animation: onb-rot 0.7s linear infinite;
+  vertical-align: -1px;
+}
+@keyframes onb-rot { to { transform: rotate(360deg); } }
+
+.onb-link {
+  background: none; border: none; color: var(--c-dim, #8a8a8e);
+  font-size: 12px; cursor: pointer; text-decoration: underline; padding: 4px 0;
+}
+.onb-link:hover { color: var(--c-text, #d8d8d8); }
+
+/* Footer */
+.onb-foot {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--c-border, #3a3a3d);
+}
+.onb-foot-spacer { flex: 1 1 auto; }
+.onb-btn {
+  background: var(--c-input, #2a2a2d);
+  color: var(--c-text, #e6e6e6);
+  border: 1px solid var(--c-border, #3a3a3d);
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+.onb-btn:hover:not(:disabled) { background: var(--c-border, #3a3a3d); }
+.onb-btn:disabled { opacity: 0.5; cursor: default; }
+.onb-btn-primary {
+  background: var(--c-accent, #3ea06a);
+  border-color: var(--c-accent, #3ea06a);
+  color: #fff; font-weight: 600;
+}
+.onb-btn-primary:hover:not(:disabled) { filter: brightness(1.1); background: var(--c-accent, #3ea06a); }
+.onb-btn-ghost { background: transparent; }

@@ -58,7 +58,7 @@
           : "Recheck metadata";
         showContextMenu(e.clientX, e.clientY, [
           { label: "Open videos", action: () => card.click() },
-          { label: "Show in Explorer", action: () => api?.chan_open_folder?.(name) },
+          { label: "Open folder", action: () => api?.chan_open_folder?.(name) },
           { label: "Open channel on YouTube", action: () => api?.chan_open_url?.(name) },
           { sep: true },
           { label: "Sync now", action: () => api?.sync_one_channel?.({ name }) },
@@ -297,14 +297,15 @@
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
           { label: "Redownload\u2026", action: async () => {
-            // prompt for resolution first (mirrors the
-            // Watch view's video_redownload flow). Previously the
-            // right-click Redownload fired with no resolution arg
-            // so the backend used its default rather than the
-            // resolution the user wanted.
-            const _res = await (window._askRedownload?.(title));
+            // Per-VIDEO resolution picker (mirrors the Watch view's
+            // video_redownload flow), then queue the single-video
+            // redownload. Uses _askVideoRedownload \u2014 NOT _askRedownload,
+            // which is the whole-channel confirm/executor and produced the
+            // "undefinedp" / "redownload every video in <title>" bug.
+            const _res = await (window._askVideoRedownload?.(title));
             if (!_res) return;
             bridgeCall("video_redownload", videoId, title, _res);
+            window._showToast?.(`Redownload queued at ${_res}.`, "ok");
           }},
           { sep: true },
           { label: "Delete file", cls: "dim",
@@ -407,9 +408,13 @@
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
           }},
           ...(tracked ? [{ label: "Redownload…", action: async () => {
-            const _res = await (window._askRedownload?.(title));
+            // Per-VIDEO picker (see note on the other Redownload item) —
+            // _askVideoRedownload returns the resolution; _askRedownload
+            // was the wrong (whole-channel) function.
+            const _res = await (window._askVideoRedownload?.(title));
             if (!_res) return;
             bridgeCall("video_redownload", videoId, title, _res);
+            window._showToast?.(`Redownload queued at ${_res}.`, "ok");
           }}] : []),
           { sep: true },
           { label: "Delete file", cls: "dim",

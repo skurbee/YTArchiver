@@ -52,6 +52,7 @@
   <link rel="stylesheet" href="styles-browse-grids.css?v=1" />
   <link rel="stylesheet" href="styles-watch.css?v=1" />
   <link rel="stylesheet" href="styles-dialogs.css?v=1" />
+  <link rel="stylesheet" href="styles-onboarding.css?v=1" />
 </head>
 <body>
 
@@ -806,6 +807,14 @@
                       title="App version and config info">About&hellip;</button>
               <button class="btn btn-ghost btn-thin" id="btn-diagnostics"
                       title="Check yt-dlp, ffmpeg, Python 3.11, GPU, etc.">Diagnostics&hellip;</button>
+            </div>
+
+            <!-- Re-open the first-run setup wizard (archive folder picker +
+                 dependency installer for yt-dlp / ffmpeg / Whisper). -->
+            <label class="edit-gl">Setup</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-run-setup"
+                      title="Re-run first-time setup: archive folder + install yt-dlp / ffmpeg / Whisper">Run setup again&hellip;</button>
             </div>
 
             <!-- feature F8: projected compress savings dry-run.
@@ -1953,6 +1962,195 @@
     </div>
   </div>
 
+  <!-- First-run onboarding wizard. Blocking full-screen overlay shown on
+
+       first launch (gated on the backend `onboarded` flag) and re-openable
+
+       from Settings > Tools > "Run setup again". Restores the dependency-
+
+       install + archive-root setup that was lost in the tkinter -> pywebview
+
+       migration. Controller: web/onboarding.js. -->
+
+  <div id="onboarding-overlay" class="onb-overlay" hidden>
+
+    <div class="onb-card">
+
+      <div class="onb-head">
+
+        <div class="onb-logo">YT&nbsp;ARCHIVER<span class="onb-logo-sub">first-time setup</span></div>
+
+        <div class="onb-steps" id="onb-steps">
+
+          <span class="onb-dot" data-step="1"></span>
+
+          <span class="onb-dot" data-step="2"></span>
+
+          <span class="onb-dot" data-step="3"></span>
+
+          <span class="onb-dot" data-step="4"></span>
+
+        </div>
+
+      </div>
+
+
+      <div class="onb-body">
+
+        <!-- Step 1: Welcome -->
+
+        <section class="onb-step" data-step="1">
+
+          <h1 class="onb-title">Welcome to YTArchiver</h1>
+
+          <p class="onb-text">Let's get you set up &mdash; this only takes a minute.</p>
+
+          <ul class="onb-list">
+
+            <li>Choose where your archive lives</li>
+
+            <li>Install the download tools (<b>yt-dlp</b> + <b>ffmpeg</b>)</li>
+
+            <li>Optionally set up AI transcription (<b>Whisper</b>)</li>
+
+          </ul>
+
+        </section>
+
+
+        <!-- Step 2: Archive folder -->
+
+        <section class="onb-step" data-step="2" hidden>
+
+          <h1 class="onb-title">Pick an archive folder</h1>
+
+          <p class="onb-text">YTArchiver saves each subscribed channel as a subfolder
+
+            here. Choose an empty folder (or an existing YTArchiver archive). You can
+
+            change it later in Settings.</p>
+
+          <div class="onb-folder-row">
+
+            <input type="text" id="onb-folder-path" class="onb-input" readonly
+
+                   placeholder="No folder selected" />
+
+            <button class="onb-btn" id="onb-folder-browse">Browse&hellip;</button>
+
+          </div>
+
+          <div class="onb-hint" id="onb-folder-hint"></div>
+
+        </section>
+
+
+        <!-- Step 3: Dependencies -->
+
+        <section class="onb-step" data-step="3" hidden>
+
+          <h1 class="onb-title">Install dependencies</h1>
+
+
+          <div class="onb-dep-group">
+
+            <div class="onb-dep-group-head">
+
+              <span class="onb-dep-group-name">Download tools
+
+                <span class="onb-tag onb-req">required</span></span>
+
+              <button class="onb-btn" id="onb-install-core">Install</button>
+
+            </div>
+
+            <div class="onb-dep-rows" id="onb-core-rows"></div>
+
+            <div class="onb-progress" id="onb-core-progress" hidden>
+
+              <div class="onb-progress-bar"><div class="onb-progress-fill" id="onb-core-fill"></div></div>
+
+              <div class="onb-progress-msg" id="onb-core-msg"></div>
+
+            </div>
+
+          </div>
+
+
+          <div class="onb-dep-group">
+
+            <div class="onb-dep-group-head">
+
+              <span class="onb-dep-group-name">AI transcription
+
+                <span class="onb-tag onb-opt">optional</span></span>
+
+              <button class="onb-btn" id="onb-install-whisper">Install</button>
+
+            </div>
+
+            <div class="onb-dep-rows" id="onb-whisper-rows"></div>
+
+            <div class="onb-whisper-note">
+
+              Sets up Python&nbsp;3.11 + faster-whisper + torch. <b>Large download</b>
+
+              (~3&nbsp;GB with GPU acceleration) &mdash; it runs in the background and
+
+              you can keep using the app. Safe to skip and set up later;
+
+              downloading videos works without it.
+
+            </div>
+
+            <div class="onb-progress" id="onb-whisper-progress" hidden>
+
+              <div class="onb-progress-bar"><div class="onb-progress-fill onb-fill-indef" id="onb-whisper-fill"></div></div>
+
+              <div class="onb-progress-msg" id="onb-whisper-msg"></div>
+
+            </div>
+
+          </div>
+
+
+          <button class="onb-link" id="onb-recheck">Re-check installed tools</button>
+
+        </section>
+
+
+        <!-- Step 4: Done -->
+
+        <section class="onb-step" data-step="4" hidden>
+
+          <h1 class="onb-title">You're all set</h1>
+
+          <p class="onb-text">YTArchiver is ready. Add channels on the <b>Subs</b> tab,
+
+            or paste a video URL on the <b>Download</b> tab to grab a single video.</p>
+
+          <div class="onb-dep-rows" id="onb-done-summary"></div>
+
+          <div class="onb-hint" id="onb-done-warn"></div>
+
+        </section>
+
+      </div>
+
+
+      <div class="onb-foot">
+
+        <button class="onb-btn onb-btn-ghost" id="onb-back" hidden>Back</button>
+
+        <div class="onb-foot-spacer"></div>
+
+        <button class="onb-btn onb-btn-primary" id="onb-next">Get started</button>
+
+      </div>
+
+    </div>
+
+  </div>
   <!-- Chart.js for Browse > Graph sub-mode (vendored locally &mdash; no CDN) -->
   <script src="vendor/chart.umd.min.js"></script>
   <!-- UI helper modules load before logs.js + app.js so their exports are ready. -->
@@ -2000,6 +2198,7 @@
   <script src="scanArchive.js?v=1"></script>
   <script src="activityLogVis.js?v=1"></script>
   <script src="bookmarks.js?v=1"></script>
+  <script src="onboarding.js?v=1"></script>
   <script src="seedLogs.js?v=1"></script>
   <script src="missingFolders.js?v=1"></script>
   <script src="redownloadSampleModal.js?v=1"></script>

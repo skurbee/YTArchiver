@@ -42,24 +42,31 @@
       const _loadChannels = async () => {
         try {
           const api = window.pywebview?.api;
-          const list = await api?.get_subs_channels?.();
-          const channels = Array.isArray(list) ? list : (list?.channels || []);
+          const resp = await api?.get_subs_channels?.();
+          // get_subs_channels returns a (rows, total_label) TUPLE — which
+          // arrives in JS as [rowsArray, "label string"]. The old code
+          // treated the whole tuple as the channel list and iterated
+          // [rowsArray, label] (2 items, neither with a usable name), so
+          // EVERY dropdown entry rendered "(channel name missing)".
+          // Unwrap rows[0]. Also: the row dicts key the channel's display
+          // name under `folder` (there is no `name` key), so read that.
+          let channels = [];
+          if (Array.isArray(resp) && Array.isArray(resp[0])) channels = resp[0];
+          else if (Array.isArray(resp)) channels = resp;
+          else channels = (resp && resp.channels) || [];
           chanSel.innerHTML = "";
+          const _nm = (c) => (c && (c.folder || c.name)) || "";
           // Sort alphabetically by name for picker sanity.
           const sorted = [...channels].sort((a, b) =>
-            (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
+            _nm(a).toLowerCase().localeCompare(_nm(b).toLowerCase()));
           for (const ch of sorted) {
+            const nm = _nm(ch);
             const opt = document.createElement("option");
-            opt.value = JSON.stringify({ name: ch.name || "",
-                                          folder: ch.folder || "" });
-            // Fall back to a clearer hint than "(unnamed)" — that
-            // text was confusing when it appeared as the FIRST item
-            // in the dropdown (looked like a placeholder for "pick
-            // a channel"). Real cases with neither name nor folder
-            // are rare; on those the fallback reads as a problem
-            // to fix, which is what we want.
-            opt.textContent = ch.name || ch.folder
-              || "(channel name missing — check config)";
+            // drift_scan resolves the on-disk folder via
+            // folder → folder_override → name; the Subs row only carries
+            // the display name, so pass it in both slots.
+            opt.value = JSON.stringify({ name: nm, folder: nm });
+            opt.textContent = nm || "(channel name missing — check config)";
             chanSel.appendChild(opt);
           }
           if (!sorted.length) {

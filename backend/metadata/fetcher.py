@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from ..log import get_logger
@@ -40,6 +40,7 @@ from ..metadata_io import (
     _get_metadata_jsonl_path,
     _read_metadata_jsonl,
     _write_metadata_jsonl,
+    _year_month_from_path,
 )
 from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
@@ -284,18 +285,14 @@ def fetch_single_video_metadata(channel: dict[str, Any],
     split_years = bool(channel.get("split_years"))
     split_months = bool(channel.get("split_months"))
 
-    # Compute year/month from file mtime — yt-dlp --mtime sets mtime to
-    # the YouTube upload date IN UTC, so we must read it as UTC too.
-    # Using local time here would file near-midnight-UTC uploads under
-    # the wrong day/month/year bucket (asymmetric with the UTC reader
-    # elsewhere, producing duplicate JSONL entries).
-    year: int | None = None
-    month: int | None = None
-    try:
-        mt = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
-        year, month = mt.year, mt.month
-    except OSError:
-        pass
+    # Year/month for the metadata-JSONL + thumbnail folder. Derive from the
+    # mp4's ACTUAL folder (the download foldered it by upload_date and reorg
+    # keeps that in sync) so the metadata + thumbnail always co-locate with
+    # the video. Re-deriving from yt-dlp's --mtime here was wrong: --mtime
+    # can land days off the publish date for premieres / scheduled uploads,
+    # which filed the thumbnail under a different month than the mp4 (mp4 in
+    # "06 June" but thumbnail in "05 May/.Thumbnails").
+    year, month = _year_month_from_path(file_path)
 
     jp, subfolder = _get_metadata_jsonl_path(
         name, str(folder), split_years, split_months, year, month)

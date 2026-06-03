@@ -66,6 +66,12 @@ DEFAULT_CONFIG = {
     "chan_col_widths": {},
     "recent_col_widths": {},
     "deps_checked": False,
+    # First-run wizard completion flag. False -> the blocking onboarding
+    # wizard (archive-folder picker + dependency installer) is shown on
+    # launch. Set True once the user finishes (or skips through) the
+    # wizard. Drives a backend-confirmed first-run check so the wizard
+    # can't silently no-op the way the old output_dir-only check could.
+    "onboarded": False,
     "auto_index_enabled": False,
     "auto_index_threshold": 10,
     "downloads_since_last_index": 0,
@@ -751,15 +757,21 @@ def recent_for_ui(cfg: dict[str, Any]):
     `download_ts` as Unix epoch. We format those into the display strings
     the Recent tab expects.
 
-    Also resolves each row's thumbnail sidecar (via `backend.index.find_thumbnail`)
-    and exposes it as `thumbnail_url` so the optional grid-card Recent view
-    can render real thumbnails. The legacy table view ignores these extras.
+    Also resolves each row's thumbnail sidecar (via
+    `backend.index.find_thumbnail_channelwide`, the same channel-wide lookup
+    the Browse grid uses) and exposes it as `thumbnail_url` so the grid-card
+    Recent view can render real thumbnails. The legacy table view ignores
+    these extras.
     """
     # Pull thumbnail resolver lazily — avoids import-cycle risk since
     # backend.index already imports this module for some helpers.
     try:
         from .index import _file_url as _thumb_url
-        from .index import find_thumbnail as _find_thumb
+        # Channel-wide resolver (not the narrow find_thumbnail): catches
+        # thumbnails that live in a sibling year/month .Thumbnails/ folder,
+        # which the Recent tab otherwise rendered as a gradient placeholder
+        # even though the Browse grid showed them fine.
+        from .index import find_thumbnail_channelwide as _find_thumb
     except Exception:
         _find_thumb = None
         _thumb_url = None
@@ -815,7 +827,10 @@ def recent_for_ui(cfg: dict[str, Any]):
         vid = r.get("video_id") or _extract_video_id(r.get("video_url", ""))
 
         # Thumbnail resolution for the grid-card view. Best-effort — if the
-        # sidecar isn't on disk the grid falls back to its gradient placeholder.
+        # sidecar isn't on disk the grid falls back to its gradient
+        # placeholder. Channel-wide so a thumbnail foldered under a different
+        # year/month than the mp4 (upload-month vs download-month split)
+        # still resolves, matching the Browse grid.
         thumbnail_url = ""
         if fp and _find_thumb and _thumb_url:
             try:

@@ -439,7 +439,7 @@
             }
           }},
         { label: "Edit settings", action: () => window._editChannelFromContext?.(chan) },
-        { label: "Open folder in Explorer", action: () => api?.chan_open_folder?.(chan) },
+        { label: "Open folder", action: () => api?.chan_open_folder?.(chan) },
         { label: "Open URL in browser", action: () => api?.chan_open_url?.(chan) },
         { sep: true },
         { label: "Reorg folder",

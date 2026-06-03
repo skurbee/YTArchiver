@@ -13,6 +13,15 @@
   const askQuestion = window.askQuestion;
   const askChoice = window.askChoice;
   const askTextInput = window.askTextInput;
+  // escapeHtml lives in util.js under window.YT.util (with a window._escapeHtml
+  // back-compat shim). This IIFE never imported it, so the bare `escapeHtml`
+  // calls below threw "escapeHtml is not defined" and the About dialog showed
+  // "Error loading: ReferenceError...". Bind a local ref with a self-contained
+  // fallback — same pattern driftScanDialog.js already uses.
+  const escapeHtml = (window.YT && window.YT.util && window.YT.util.escapeHtml)
+    || window._escapeHtml
+    || ((s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);

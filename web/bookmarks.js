@@ -224,8 +224,47 @@
     }
   }
 
+  // Per-VIDEO resolution picker → returns the chosen resolution string,
+  // or null if cancelled. Mirrors the Watch view's redownload picker
+  // (watchActions.js). This is SEPARATE from _askRedownload, which is the
+  // whole-CHANNEL redownload confirm+executor. The per-video right-click
+  // "Redownload…" was wrongly calling _askRedownload(title), which:
+  //   • rendered "${undefined}p" → "undefinedp" as the resolution,
+  //   • showed a "Redownload every video in «<title>»" channel dialog, and
+  //   • on confirm fired chan_redownload(title, undefined) — the wrong API,
+  //     keyed by the video title — while returning undefined, so the
+  //     intended video_redownload never ran.
+  // Returning the resolution lets the caller fire video_redownload itself.
+  async function _askVideoRedownload(videoTitle) {
+    const pick = await (window.askChoice ? window.askChoice({
+      title: "Redownload at…",
+      message: `Replace the local file for "${videoTitle || "this video"}" ` +
+               `with a new download at the chosen resolution. This keeps the ` +
+               `existing filename so transcripts and bookmarks still match.`,
+      choices: [
+        { label: "360p", value: "360" },
+        { label: "480p", value: "480" },
+        { label: "720p", value: "720" },
+        { label: "1080p", value: "1080" },
+        { label: "1440p", value: "1440" },
+        { label: "2160p (4K)", value: "2160" },
+        { label: "Best available", value: "best", primary: true },
+      ],
+    }) : null);
+    if (!pick) return null;
+    const _VALID_RES = new Set(
+      ["audio", "144", "240", "360", "480", "720",
+       "1080", "1440", "2160", "best"]);
+    if (!_VALID_RES.has(pick)) {
+      window._showToast?.(`Invalid resolution: ${pick}`, "error");
+      return null;
+    }
+    return pick;
+  }
+
   window.refreshBookmarks = refreshBookmarks;
   window._primeBrowse = _primeBrowse;
   window._refreshBrowseWeekSummary = _refreshBrowseWeekSummary;
   window._askRedownload = _askRedownload;
+  window._askVideoRedownload = _askVideoRedownload;
 })();

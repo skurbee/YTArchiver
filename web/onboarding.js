@@ -92,6 +92,23 @@
     }
   }
 
+  function renderCookieRows(deps) {
+    const c = (deps && deps.cookies) || {};
+    // "YouTube cookies" row: ✓ when signed in (or at least YT cookies found
+    // in Firefox), ✗ when Firefox is missing or not signed into YouTube.
+    let ytState, ytDetail;
+    if (c.signed_in) { ytState = true; ytDetail = "signed into YouTube in Firefox"; }
+    else if (c.has_yt_cookies) { ytState = true; ytDetail = "Firefox YouTube cookies found"; }
+    else if (c.installed) { ytState = false; ytDetail = "Firefox found — not signed into YouTube"; }
+    else { ytState = false; ytDetail = "needs Firefox (Chrome cookies aren't supported)"; }
+    const rows = [
+      depRow("Firefox", !!c.installed, c.installed ? "installed" : "not installed — get it from mozilla.org"),
+      depRow("YouTube cookies", ytState, ytDetail),
+    ];
+    const el = $("onb-cookie-rows");
+    if (el) el.innerHTML = rows.join("");
+  }
+
   function renderDeps(deps) {
     deps = deps || _deps || {};
     // Preserve a previously-verified whisper result if the incoming probe
@@ -104,6 +121,7 @@
     _deps = deps;
     renderCoreRows(_deps);
     renderWhisperRows(_deps);
+    renderCookieRows(_deps);
   }
 
   // Auto-verify the whisper import the first time the user reaches the
@@ -124,6 +142,7 @@
     } finally {
       _whisperChecking = false;
       renderWhisperRows(_deps);
+      renderCookieRows(_deps);   // re-probe also refreshed cookie status
     }
   }
 
@@ -137,6 +156,12 @@
                (d.ytdlp?.ok && d.ffmpeg?.ok && d.ffprobe?.ok) ? "ready" : "missing — set up later in Settings"),
         depRow("AI transcription", d.whisper?.ok,
                d.whisper?.ok ? "ready" : "optional — not set up"),
+        depRow("YouTube sign-in (Firefox)",
+               !!(d.cookies && (d.cookies.signed_in || d.cookies.has_yt_cookies)),
+               d.cookies && d.cookies.signed_in ? "signed in"
+                 : (d.cookies && d.cookies.installed
+                    ? "Firefox found — sign into YouTube"
+                    : "install Firefox + sign into YouTube")),
       ].join("");
     }
     const warn = $("onb-done-warn");

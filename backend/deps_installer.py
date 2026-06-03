@@ -167,6 +167,77 @@ def detect_gpu() -> dict:
     return {"ok": False, "name": ""}
 
 
+def firefox_cookie_status() -> dict:
+    """Detect whether Firefox is present and holds YouTube cookies.
+
+    YTArchiver authenticates yt-dlp via **Firefox** cookies. Chromium
+    browsers (Chrome/Brave/Edge/…) use app-bound cookie encryption on
+    Windows that yt-dlp can't read — so on a machine without Firefox the
+    cookie probe falls through to Chrome and downloads fail with a
+    "could not get chrome cookies" error. This lets onboarding warn up
+    front instead of at first download.
+
+    Returns {installed, has_yt_cookies, signed_in, profile, detail}.
+    """
+    res = {"installed": False, "has_yt_cookies": False, "signed_in": False,
+           "profile": "", "detail": ""}
+    try:
+        appdata = os.environ.get("APPDATA") or ""
+        prof_dir = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
+        if not prof_dir.is_dir():
+            res["detail"] = "Firefox not installed"
+            return res
+        res["installed"] = True
+        cookie_dbs = sorted(prof_dir.glob("*/cookies.sqlite"))
+        if not cookie_dbs:
+            res["detail"] = "Firefox found, but no profile cookies yet"
+            return res
+        import sqlite3 as _sql
+        # Cookie names that indicate an actual signed-in YouTube/Google
+        # session (vs. just having visited youtube.com).
+        AUTH = ("__Secure-3PSID", "__Secure-1PSID", "SID", "SAPISID",
+                "SSID", "LOGIN_INFO")
+        for db in cookie_dbs:
+            try:
+                # immutable=1 → read even while Firefox holds the DB open,
+                # without taking locks (it won't change under us).
+                uri = db.as_uri() + "?mode=ro&immutable=1"
+                con = _sql.connect(uri, uri=True, timeout=2.0)
+                try:
+                    yt_n = con.execute(
+                        "SELECT COUNT(*) FROM moz_cookies "
+                        "WHERE host LIKE '%youtube.com%'").fetchone()[0]
+                    ph = ",".join("?" * len(AUTH))
+                    auth_n = con.execute(
+                        "SELECT COUNT(*) FROM moz_cookies WHERE "
+                        "(host LIKE '%youtube.com%' OR host LIKE '%google.com%') "
+                        f"AND name IN ({ph})", AUTH).fetchone()[0]
+                finally:
+                    con.close()
+                if yt_n > 0:
+                    res["has_yt_cookies"] = True
+                    res["profile"] = db.parent.name
+                if auth_n > 0:
+                    res["signed_in"] = True
+                    res["has_yt_cookies"] = True
+                    res["profile"] = db.parent.name
+                    break  # a signed-in profile is the best answer
+            except Exception as e:
+                _log.debug("firefox cookie db read failed (%s): %s", db, e)
+                continue
+        if res["signed_in"]:
+            res["detail"] = "signed into YouTube in Firefox"
+        elif res["has_yt_cookies"]:
+            res["detail"] = "Firefox has YouTube cookies (sign-in not detected)"
+        else:
+            res["detail"] = "no YouTube cookies — sign into YouTube in Firefox"
+        return res
+    except Exception as e:
+        _log.debug("firefox_cookie_status failed: %s", e)
+        res["detail"] = "could not check Firefox cookies"
+        return res
+
+
 def _whisper_ready(py311: str | None) -> bool:
     """True if the given Python 3.11 can import faster_whisper + torch."""
     if not py311 or not os.path.isfile(py311):
@@ -198,6 +269,12 @@ def probe(check_whisper_import: bool = False) -> dict:
     whisper_ok = False
     if check_whisper_import:
         whisper_ok = _whisper_ready(py311)
+    try:
+        cookies = firefox_cookie_status()
+    except Exception as e:
+        _log.debug("cookie status failed: %s", e)
+        cookies = {"installed": False, "has_yt_cookies": False,
+                   "signed_in": False, "detail": "check failed"}
     return {
         "bin_dir": str(managed_bin_dir()),
         "ytdlp": {"ok": bool(ytdlp), "path": ytdlp or ""},
@@ -210,6 +287,8 @@ def probe(check_whisper_import: bool = False) -> dict:
                               else ("Python 3.11 found - packages not verified"
                                     if py311 else "Python 3.11 not found")},
         "gpu": gpu,
+        # YouTube auth: Firefox cookies (Chromium not supported on Windows).
+        "cookies": cookies,
         # Convenience: are the must-haves for downloading present?
         "core_ok": bool(ytdlp and ffmpeg and ffprobe),
     }

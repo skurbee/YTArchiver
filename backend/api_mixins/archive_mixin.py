@@ -302,7 +302,7 @@ class ArchiveMixin:
                         elif "video unavailable" in _ll or "this video is unavailable" in _ll:
                             _stderr_errors.append("video unavailable (deleted or region-locked)")
                         elif "cookies are missing" in _ll or "sign in to confirm" in _ll:
-                            _stderr_errors.append("YouTube wants a sign-in (Firefox/Chrome cookies not found or expired)")
+                            _stderr_errors.append("YouTube wants a sign-in (sign into YouTube in Firefox; its cookies are missing or expired)")
                 # Wait with a generous watchdog timeout (15 minutes).
                 # Without this, a wedged yt-dlp (network stall, post-
                 # processor hang, sign-in prompt) keeps the in-flight

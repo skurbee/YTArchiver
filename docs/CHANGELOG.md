@@ -6,6 +6,25 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v75.8 — 2026-06-03
+
+### Added
+- **Onboarding now surfaces YouTube sign-in status.** The setup wizard
+  shows whether Firefox is installed and whether it holds YouTube cookies,
+  and explains up front that YTArchiver authenticates to YouTube via
+  Firefox cookies — so users learn about a missing/expired sign-in during
+  setup rather than hitting a cryptic error at first download.
+
+### Changed
+- **Cookie source is now Firefox-only.** Chromium browsers
+  (Chrome/Brave/Edge/Vivaldi/Opera) are no longer auto-selected for cookie
+  extraction — their cookie stores are app-bound-encrypted on Windows and
+  can't be read, which previously surfaced as a confusing "could not get
+  chrome cookies" error at download time on machines without Firefox. The
+  app now uses Firefox cookies if present, a user-provided `cookies.txt`
+  (dropped in the app's config folder) if not, or runs unauthenticated
+  (public content) otherwise.
+
 ## v75.7 — 2026-06-03
 
 Restores first-run onboarding and lands a batch of UI/correctness fixes.

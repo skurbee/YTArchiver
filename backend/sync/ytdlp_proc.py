@@ -44,11 +44,14 @@ RESOLUTION_OPTIONS = ["audio", "144", "240", "360", "480", "720",
 
 
 # ── Cookie source discovery ───────────────────────────────────────────
-# YTArchiver hardcoded --cookies-from-browser firefox. That breaks on
-# machines without Firefox. Try each browser in order, fall back to a
-# user-provided cookies.txt file in %APPDATA%\YTArchiver\cookies.txt.
+# Firefox is the ONLY browser we extract cookies from. Chromium browsers
+# (Chrome/Brave/Edge/Vivaldi/Opera) use app-bound cookie encryption on
+# Windows that yt-dlp cannot read — auto-selecting one just produced a
+# confusing "could not get chrome cookies" error at download time. So the
+# order is: Firefox if present → else a user-provided cookies.txt in
+# %APPDATA%\YTArchiver\cookies.txt → else unauthenticated (public only).
 
-_COOKIE_BROWSERS = ("firefox", "chrome", "brave", "edge", "vivaldi", "opera")
+_COOKIE_BROWSERS = ("firefox",)
 _cookie_source_cached: list[str] | None = None
 # Audit #7: lock around the cache so probe + reset from different
 # worker threads (sync worker, transcribe worker, JS bridge thread)
@@ -77,16 +80,11 @@ def _find_cookie_source() -> list[str]:
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
-        # Probe each browser's profile directory to see if it exists
+        # Firefox only (Chromium browsers intentionally NOT probed — their
+        # cookies are unreadable on Windows; see note at top of section).
         appdata = os.environ.get("APPDATA") or ""
-        localdata = os.environ.get("LOCALAPPDATA") or ""
         known_paths = {
             "firefox": os.path.join(appdata, "Mozilla", "Firefox", "Profiles"),
-            "chrome": os.path.join(localdata, "Google", "Chrome", "User Data"),
-            "brave": os.path.join(localdata, "BraveSoftware", "Brave-Browser", "User Data"),
-            "edge": os.path.join(localdata, "Microsoft", "Edge", "User Data"),
-            "vivaldi": os.path.join(localdata, "Vivaldi", "User Data"),
-            "opera": os.path.join(appdata, "Opera Software", "Opera Stable"),
         }
         for browser in _COOKIE_BROWSERS:
             p = known_paths.get(browser)
@@ -94,7 +92,7 @@ def _find_cookie_source() -> list[str]:
                 _cookie_source_cached = ["--cookies-from-browser", browser]
                 return list(_cookie_source_cached)
 
-        # No cookies available — yt-dlp will just hit public content without auth
+        # No Firefox + no cookies.txt — run unauthenticated (public content).
         _cookie_source_cached = []
         return list(_cookie_source_cached)
 

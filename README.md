@@ -86,4 +86,3 @@ Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whi
 * [Project map](docs/PROJECT_MAP.md) — file-by-file index
 
 
-Line by line, it's roughly 90% Claude-Code, 5% Copilot, 5% me :)

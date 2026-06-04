@@ -2,9 +2,6 @@
 
 Download, organize, transcribe, search, compress, and browse entire channels.
 
-
-## Screenshots
-
 A tour of the UI is on the [**wiki**](https://github.com/skurbee/YTArchiver/wiki).
 
 
@@ -88,10 +85,5 @@ Built on **yt-dlp** + **ffmpeg** for downloading, **OpenAI Whisper** (faster-whi
 * [Changelog](docs/CHANGELOG.md) — release notes
 * [Project map](docs/PROJECT_MAP.md) — file-by-file index
 
-## License
-
-[MIT](LICENSE)
-
----
 
 Line by line, it's roughly 90% Claude-Code, 5% Copilot, 5% me :)

@@ -295,10 +295,10 @@
       const st = await api.queue_is_paused();
       if (st?.gpu) {
         await api.queue_resume("gpu");
-        window._showToast?.("GPU queue resumed.", "ok");
+        window._showToast?.("Processing queue resumed.", "ok");
       } else {
         await api.queue_pause("gpu");
-        window._showToast?.("GPU queue paused \u2014 current job will finish.", "warn");
+        window._showToast?.("Processing queue paused \u2014 current job will finish.", "warn");
       }
     });
     document.getElementById("btn-cancel-gpu-queue")?.addEventListener("click", async () => {
@@ -306,7 +306,7 @@
       if (!api) return;
       const choice = await (window.askChoice
         ? askChoice({
-            title: "Stop the GPU queue?",
+            title: "Stop the processing queue?",
             message: "Pause keeps the queue. Clear Queue empties it and " +
                      "cancels the current job.",
             buttons: [
@@ -316,16 +316,16 @@
             cancel: "Cancel",
             cancelPlacement: "right",
           })
-        : Promise.resolve(confirm("Clear the GPU queue?") ? "clear" : null));
+        : Promise.resolve(confirm("Clear the processing queue?") ? "clear" : null));
       if (choice === "clear") {
         const res = await api.gpu_clear_queue?.();
         const n = res?.removed || 0;
         window._showToast?.(
-          n > 0 ? `GPU queue cleared (${n} pending).`
-                : "GPU queue cleared.", "warn");
+          n > 0 ? `Processing queue cleared (${n} pending).`
+                : "Processing queue cleared.", "warn");
       } else if (choice === "pause") {
         await api.queue_pause?.("gpu");
-        window._showToast?.("GPU queue paused \u2014 current job will finish.", "warn");
+        window._showToast?.("Processing queue paused \u2014 current job will finish.", "warn");
       }
     });
   }

@@ -76,6 +76,8 @@
           mins: st.mins,
           waiting_for_sync: !!st.waiting_for_sync,
           seconds_remaining: st.seconds_remaining,
+          mode: st.mode || "timer",
+          next_fire_ts: st.next_fire_ts || null,
           anchored_at_ms: Date.now(),
         };
         if (sel.value !== st.label) sel.value = st.label;
@@ -91,6 +93,14 @@
       const st = _anchor;
       if (st.mins > 0 && st.waiting_for_sync) {
         cd.textContent = "waiting for queue\u2026";
+      } else if (st.mins > 0 && st.mode === "clock" && st.next_fire_ts) {
+        // Clock-aligned mode: show the absolute fire time, e.g. "Next at 7:00pm".
+        cd.textContent = `Next at ${_fmtClock(st.next_fire_ts)}`;
+        const sec = Math.max(0, Math.floor(st.next_fire_ts - Date.now() / 1000));
+        if (sec === 0 && !_fetchInFlight) {
+          _fetchInFlight = true;
+          fetchAnchor().finally(() => { _fetchInFlight = false; });
+        }
       } else if (st.mins > 0 && st.seconds_remaining != null) {
         const elapsed = Math.floor((Date.now() - st.anchored_at_ms) / 1000);
         const sec = Math.max(0, st.seconds_remaining - elapsed);
@@ -144,6 +154,15 @@
     if (sec < 60) return `${sec}s`;
     if (sec < 3600) return `${Math.floor(sec/60)}m ${sec%60}s`;
     return `${Math.floor(sec/3600)}h ${Math.floor((sec%3600)/60)}m`;
+  }
+
+  function _fmtClock(ts) {
+    const d = new Date(ts * 1000);
+    let h = d.getHours();
+    const m = d.getMinutes();
+    const ap = h >= 12 ? "pm" : "am";
+    h = h % 12; if (h === 0) h = 12;
+    return `${h}:${String(m).padStart(2, "0")}${ap}`;
   }
 
   window.initAutorun = initAutorun;

@@ -59,6 +59,9 @@ DEFAULT_CONFIG = {
     "channels": [],
     "recent_downloads": [],
     "autorun_interval": 0,
+    # Auto-sync firing mode: "timer" (countdown from now) or "clock"
+    # (snap to wall-clock boundaries aligned from midnight).
+    "autorun_mode": "timer",
     "autorun_history": [],
     "log_mode": "Simple",
     "autorun_gpu": False,

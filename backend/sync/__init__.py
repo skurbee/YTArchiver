@@ -40,6 +40,7 @@ from .core import (  # noqa: F401
     _persist_row_history,
     _record_recent_download,
     _resolve_final_mp4,
+    _resolve_path_for_vid,
     _scan_recent_video,
     _short_summary,
     _should_batch_limit,

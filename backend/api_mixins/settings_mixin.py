@@ -77,6 +77,14 @@ class SettingsMixin:
     def autorun_state(self):
         return self._autorun.get_state()
 
+    def autorun_set_mode(self, mode):
+        """Switch auto-sync firing between 'timer' (countdown) and 'clock'
+        (wall-clock aligned). Persists + reschedules the pending fire."""
+        try:
+            return self._autorun.set_mode(mode)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
 
     # ─── Settings dialog: load / save all tunables ─────────────────────
 

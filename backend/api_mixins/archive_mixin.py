@@ -362,9 +362,16 @@ class ArchiveMixin:
                                 f" (DLTRACK parsing: only {len(parts)} "
                                 f"parts, expected 7 — indexing skipped)")
                             raise ValueError("dltrack parse")
-                        _title = parts[1] if len(parts) > 1 else ""
-                        _uploader = parts[2] if len(parts) > 2 else ""
-                        _vid = parts[6] if len(parts) > 6 else ""
+                        # Anchor on the trailing 5 fixed fields
+                        # (uploader/date/size/duration/id) and rejoin the
+                        # middle as the title, so a title containing a
+                        # literal ':::' can't shift the id field. Mirrors
+                        # the proven sync-side DLTRACK parse; the old
+                        # positional parts[6] silently grabbed the wrong
+                        # field (and thus a bad/blank id) on such titles.
+                        _uploader = parts[-5]
+                        _vid = (parts[-1] or "").strip()
+                        _title = ":::".join(parts[1:-5]).strip()
                         # Resolve the final filepath on disk. Template
                         # was `<title> (MM.DD.YY).ext` or `<title>.ext`
                         # under `base`. Scan `base` for something
@@ -416,6 +423,40 @@ class ArchiveMixin:
                                     final_path = _title_candidates[0]
                         except Exception as e:
                             _log.debug("swallowed: %s", e)
+                        # GUARANTEED binding fallback. The id was captured
+                        # from DLTRACK but neither id-in-filename nor the
+                        # sanitized-title match found the file (unicode /
+                        # trim-filenames / punctuation oddities). A single-
+                        # video download produces exactly one fresh file, so
+                        # the newest media file just written under `base` is
+                        # it — bind the id through it instead of dropping it.
+                        # (_scan_recent_video uses ctime on Windows, so the
+                        # --mtime upload-date stamp can't defeat the recency
+                        # check.)
+                        if (not final_path or not os.path.isfile(final_path)) and _vid:
+                            try:
+                                _rp = sync_backend._scan_recent_video(base)
+                                if _rp and os.path.isfile(_rp):
+                                    final_path = _rp
+                                    _log.info(
+                                        "single-video bind via recent-scan: "
+                                        "vid=%s -> %s", _vid, _rp)
+                            except Exception as _se:
+                                _log.debug("recent-scan bind failed: %s", _se)
+                        if _vid and (not final_path
+                                     or not os.path.isfile(final_path)):
+                            # Never silently drop an authoritative id.
+                            _log.error(
+                                "single-video download captured id %s but "
+                                "could not bind a file under %s — id at risk",
+                                _vid, base)
+                            try:
+                                self._log_stream.emit_dim(
+                                    f" ⚠ downloaded {_vid} but could not match "
+                                    f"it to a file — video ID not recorded; "
+                                    f"re-download to capture it")
+                            except Exception as _be:
+                                _log.debug("single-video orphan warn failed: %s", _be)
                         if final_path and os.path.isfile(final_path):
                             _state["final_path"] = final_path
                             try:

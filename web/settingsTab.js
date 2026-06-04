@@ -26,7 +26,6 @@
   // always in sync with what's on disk.
   function initSettingsTab() {
     const panel = document.getElementById("panel-settings");
-    const save = document.getElementById("settings-save");
     const browseOut = document.getElementById("settings-browse-output");
     const browseVid = document.getElementById("settings-browse-video");
     const ytdlpBtn = document.getElementById("btn-ytdlp-update");
@@ -35,6 +34,47 @@
     const bkExpBtn = document.getElementById("btn-export-backup");
     const bkImpBtn = document.getElementById("btn-import-backup");
     if (!panel) return;
+
+    // ─── Auto-save ──────────────────────────────────────────────────
+    // No Save button: every editable field persists itself the moment it
+    // changes. settings_save() is key-guarded server-side (each field only
+    // writes when present in the payload) and serialized under a lock, so
+    // sending a single {key: value} merges cleanly without disturbing the
+    // others. The footer note flashes "Saved ✓" so the user gets the same
+    // confirmation the Save toast used to give.
+    let _flashTimer = null;
+    function flashSaved(ok = true, msg) {
+      const el = document.getElementById("settings-autosave-note");
+      if (!el) return;
+      if (_flashTimer) { clearTimeout(_flashTimer); _flashTimer = null; }
+      el.textContent = msg || (ok ? "Saved ✓" : "Save failed");
+      el.classList.toggle("is-saved", ok);
+      el.classList.toggle("is-error", !ok);
+      _flashTimer = setTimeout(() => {
+        el.textContent = "Changes are saved automatically";
+        el.classList.remove("is-saved", "is-error");
+        _flashTimer = null;
+      }, 1600);
+    }
+    async function saveField(key, value) {
+      const api = window.pywebview?.api;
+      if (!api?.settings_save) return;
+      try {
+        const res = await api.settings_save({ [key]: value });
+        if (res?.ok) {
+          flashSaved(true);
+        } else {
+          flashSaved(false);
+          window._showToast?.(res?.error || "Save failed.", "error");
+        }
+      } catch (e) {
+        flashSaved(false);
+        window._showToast?.("Save failed: " + e, "error");
+      }
+    }
+    // Last-persisted disk-staleness, so a blur on an invalid/blank value
+    // can revert the field instead of saving garbage.
+    let _diskLastGood = "24";
 
     // RAM estimate: each cached video row is ~1 KB of Python objects
     // (title + filepath strings + small numbers + dict overhead). We
@@ -89,7 +129,7 @@
         document.getElementById("settings-log-mode").value = s.log_mode || "Simple";
         // Startup knobs
         const stEl = document.getElementById("settings-disk-staleness");
-        if (stEl) stEl.value = String(s.disk_scan_staleness_hours ?? 24);
+        if (stEl) { stEl.value = String(s.disk_scan_staleness_hours ?? 24); _diskLastGood = stEl.value; }
         const paEl = document.getElementById("settings-preload-all");
         if (paEl) paEl.checked = !!s.browse_preload_all;
         const avgEl = document.getElementById("settings-show-avg-size");
@@ -97,13 +137,7 @@
         // Apply current toggle to the Subs table right away so opening
         // Settings doesn't require a save to see the effect.
         window._applySubsAvgVisibility?.(s.show_avg_size !== false);
-        // Recent view radios — stored value is "list" | "grid".
-        const rvMode = (s.recent_view_mode === "grid") ? "grid" : "list";
-        const rvList = document.getElementById("settings-recent-view-list");
-        const rvGrid = document.getElementById("settings-recent-view-grid");
-        if (rvList) rvList.checked = (rvMode === "list");
-        if (rvGrid) rvGrid.checked = (rvMode === "grid");
-        window._applyRecentViewMode?.(rvMode);
+        // (Recent view List/Grid radios removed — Videos view is grid-only.)
         // X-button behavior — "ask" | "tray" | "quit". Default "ask"
         // so a user who never opens Settings still gets the modal.
         const cbEl = document.getElementById("settings-close-behavior");
@@ -111,6 +145,15 @@
           const cb = (s.close_behavior || "ask").toLowerCase();
           cbEl.value = ["ask","tray","quit"].includes(cb) ? cb : "ask";
         }
+        // Auto-sync timing mode — read from the live scheduler state
+        // (not the settings blob, since it's applied immediately).
+        try {
+          const amEl = document.getElementById("settings-autorun-mode");
+          if (amEl && api.autorun_state) {
+            const ast = await api.autorun_state();
+            amEl.value = (ast && ast.mode === "clock") ? "clock" : "timer";
+          }
+        } catch (e) { /* ignore */ }
         // BUG FIX (2026-05-14): the custom `.yt-dd` widget mirrors a
         // hidden <select> via its own div trigger. When JS sets
         // sel.value programmatically there's no change event, so the
@@ -143,25 +186,65 @@
       } catch (e) { console.warn("settings load:", e); }
     }
 
-    // Update hint text live when the toggle flips.
-    document.getElementById("settings-preload-all")
-      ?.addEventListener("change", _updatePreloadHints);
+    // ── Per-field auto-save wiring ──────────────────────────────────
+    // Selects: persist the new value immediately on change.
+    document.getElementById("settings-whisper-model")
+      ?.addEventListener("change", (e) => saveField("whisper_model", e.target.value));
+    document.getElementById("settings-default-res")
+      ?.addEventListener("change", (e) => saveField("default_resolution", e.target.value));
+    document.getElementById("settings-log-mode")
+      ?.addEventListener("change", (e) => saveField("log_mode", e.target.value));
+    document.getElementById("settings-close-behavior")
+      ?.addEventListener("change", (e) => saveField("close_behavior", e.target.value));
 
-    // Apply Avg-column visibility live — no need to hit Save to preview.
-    // Persistence still happens on Save; this just updates the current DOM.
+    // Preload-all toggle: update the live hint AND persist.
+    document.getElementById("settings-preload-all")
+      ?.addEventListener("change", (e) => {
+        _updatePreloadHints();
+        saveField("browse_preload_all", !!e.target.checked);
+      });
+
+    // Avg-size toggle: live-apply to the Subs table AND persist.
     document.getElementById("settings-show-avg-size")
       ?.addEventListener("change", (e) => {
         window._applySubsAvgVisibility?.(!!e.target.checked);
+        saveField("show_avg_size", !!e.target.checked);
       });
 
-    // Recent view radios — live-preview the mode swap without needing
-    // to hit Save. Persistence still goes through settings_save.
-    const _rvApply = () => {
-      const grid = document.getElementById("settings-recent-view-grid")?.checked;
-      window._applyRecentViewMode?.(grid ? "grid" : "list");
-    };
-    document.getElementById("settings-recent-view-list")?.addEventListener("change", _rvApply);
-    document.getElementById("settings-recent-view-grid")?.addEventListener("change", _rvApply);
+    // Disk-scan staleness: commit on blur (the `change` event) or Enter.
+    // Validate first — a blank / negative / non-numeric value used to be
+    // silently mapped to 0 ("always rescan"); now it's rejected and the
+    // field reverts to the last persisted value so nothing bad is saved.
+    const _diskEl = document.getElementById("settings-disk-staleness");
+    _diskEl?.addEventListener("change", () => {
+      const _v = _diskEl.value;
+      const _n = parseInt(_v, 10);
+      if (_v == null || _v === "" || !Number.isFinite(_n) || _n < 0) {
+        window._showToast?.(
+          "Disk-scan staleness must be a non-negative number.", "error");
+        _diskEl.value = _diskLastGood;   // revert the bad input
+        return;
+      }
+      _diskEl.value = String(_n);
+      _diskLastGood = _diskEl.value;
+      saveField("disk_scan_staleness_hours", _n);
+    });
+    _diskEl?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); _diskEl.blur(); }
+    });
+
+    // Auto-sync timing mode — applied immediately via its own scheduler
+    // call (not settings_save), so the countdown/clock label updates right
+    // away. Flash the same "Saved" confirmation for consistency.
+    document.getElementById("settings-autorun-mode")?.addEventListener("change", async (e) => {
+      const _api = window.pywebview?.api;
+      try {
+        await _api?.autorun_set_mode?.(e.target.value);
+        flashSaved(true);
+      } catch (err) {
+        flashSaved(false);
+      }
+    });
 
     // Reload fields whenever the user switches to the Settings tab.
     // initTabs wires clicks on .tab elements; we listen on the tab itself.
@@ -374,78 +457,24 @@
       });
     })();
 
-    save?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      // Force a blur on the focused element first so an in-progress
-      // typed value commits through any input/change handlers
-      // (validation, formatters) before we snapshot it. Without this,
-      // a Save click that lands while the user is still typing into
-      // a numeric input persisted whatever intermediate state was in
-      // the DOM at click time (audit: settingsTab.js:386).
-      try {
-        const _focused = document.activeElement;
-        if (_focused && typeof _focused.blur === "function"
-            && _focused !== document.body) {
-          _focused.blur();
-        }
-      } catch { /* ignore */ }
-      const payload = {
-        output_dir: document.getElementById("settings-output-dir").value,
-        video_out_dir: document.getElementById("settings-video-dir").value,
-        whisper_model: document.getElementById("settings-whisper-model").value,
-        default_resolution: document.getElementById("settings-default-res").value,
-        log_mode: document.getElementById("settings-log-mode").value,
-        // Startup knobs. Clearing the input or typing non-numeric
-        // text previously got silently mapped to 0 (= "always
-        // rescan"). Validate and refuse to save when blank/invalid;
-        // the user sees a toast and can correct.
-        disk_scan_staleness_hours: (() => {
-          const _v = document.getElementById("settings-disk-staleness")?.value;
-          if (_v == null || _v === "") {
-            window._showToast?.("Disk-scan staleness can't be empty.", "error");
-            throw new Error("invalid disk-staleness");
-          }
-          const _n = parseInt(_v, 10);
-          if (!Number.isFinite(_n) || _n < 0) {
-            window._showToast?.("Disk-scan staleness must be a non-negative number.", "error");
-            throw new Error("invalid disk-staleness");
-          }
-          return _n;
-        })(),
-        browse_preload_all:
-          !!document.getElementById("settings-preload-all")?.checked,
-        show_avg_size:
-          !!document.getElementById("settings-show-avg-size")?.checked,
-        recent_view_mode:
-          document.getElementById("settings-recent-view-grid")?.checked ? "grid" : "list",
-        // X-button: "ask" (modal) | "tray" (minimize) | "quit" (exit).
-        // Validated server-side in main.py:5618.
-        close_behavior:
-          document.getElementById("settings-close-behavior")?.value || "ask",
-      };
-      // Bug [68]: disable Save during in-flight call so a fast double-
-      // click doesn't queue duplicate writes.
-      if (save) save.disabled = true;
-      try {
-        const res = await api?.settings_save?.(payload);
-        if (res?.ok) window._showToast?.("Settings saved.", "ok");
-        else window._showToast?.(res?.error || "Save failed.", "error");
-      } catch (e) {
-        window._showToast?.("Save failed: " + e, "error");
-      } finally {
-        if (save) save.disabled = false;
-      }
-    });
-
+    // (Save button removed — every field auto-saves. The path fields are
+    // readonly and only change via the Browse pickers below, so they
+    // persist right after a folder is chosen.)
     browseOut?.addEventListener("click", async () => {
       const cur = document.getElementById("settings-output-dir").value;
       const res = await window.pywebview?.api?.pick_folder?.("Archive root", cur);
-      if (res?.ok && res.path) document.getElementById("settings-output-dir").value = res.path;
+      if (res?.ok && res.path) {
+        document.getElementById("settings-output-dir").value = res.path;
+        saveField("output_dir", res.path);
+      }
     });
     browseVid?.addEventListener("click", async () => {
       const cur = document.getElementById("settings-video-dir").value;
       const res = await window.pywebview?.api?.pick_folder?.("Single-video downloads", cur);
-      if (res?.ok && res.path) document.getElementById("settings-video-dir").value = res.path;
+      if (res?.ok && res.path) {
+        document.getElementById("settings-video-dir").value = res.path;
+        saveField("video_out_dir", res.path);
+      }
     });
 
     ytdlpBtn?.addEventListener("click", async () => {

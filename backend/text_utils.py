@@ -188,7 +188,15 @@ def extract_video_id(
 
     if hint:
         h = hint.strip()
-        if _ok(h):
+        # An explicit hint is AUTHORITATIVE (yt-dlp's DLTRACK %(id)s, or a
+        # caller's known id) — validate by SHAPE only, never by the
+        # `reject_alpha_only` heuristic. That heuristic exists to stop an
+        # 11-letter *filename* bracket (a channel handle like `[SomeName]`)
+        # from being mistaken for an id; it must NEVER reject a real
+        # YouTube id handed to us directly, and real ids CAN be all
+        # letters. Applying it to the hint silently dropped authoritative
+        # ids → NULL video_id (a real contributor to the missing-id bug).
+        if h and _ID_RE_11.fullmatch(h):
             return h
 
     try:

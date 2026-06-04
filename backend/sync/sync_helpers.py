@@ -9,11 +9,13 @@ Public surface (re-exported via sync/__init__.py for back-compat):
     _sweep_orphan_vtts(channel_folder) -> int
     _scan_recent_video(channel_dir) -> str | None
     _resolve_final_mp4(dest_path) -> str | None
+    _resolve_path_for_vid(channel_dir, vid) -> str | None
     _fmt_duration(seconds) -> str
     _fmt_size(size_bytes) -> str
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -159,6 +161,81 @@ def _resolve_final_mp4(dest_path: str) -> str | None:
     final = p.parent / f"{stem}{_target_ext}"
     # Return regardless of existence — file may still be writing when we enqueue
     return str(final)
+
+
+# Media containers a merged yt-dlp download can land in.
+_RESOLVE_MEDIA_EXTS = (".mp4", ".mkv", ".webm")
+
+
+def _resolve_path_for_vid(channel_dir, vid: str) -> str | None:
+    """GUARANTEED YouTube-id → file binding for a freshly-downloaded video.
+
+    The DLTRACK line ALWAYS carries the authoritative YouTube id, but the
+    normal path resolution (Merger line → Destination strip → recent-file
+    scan) can miss on unicode / format / FixupM3u8 oddities — the "DLTRACK
+    orphan". When that happens the old code silently dropped a known id and
+    let the disk sweep re-register the file later with no id at all.
+
+    This closes the gap. Because the sync ALWAYS runs yt-dlp with
+    `--write-info-json`, yt-dlp has — milliseconds before DLTRACK fires —
+    written a `<base>.info.json` next to the merged media file, and that
+    JSON's `"id"` field is the authoritative YouTube id (the same id that
+    is in the DLTRACK line). We find the `.info.json` whose id == vid and
+    return the co-located media file. Newest-first ordering makes the
+    just-downloaded orphan's sidecar the very first one we parse, so the
+    common case is effectively O(1) even in a multi-thousand-video folder.
+
+    Returns the media file path, or None if no matching sidecar/file is
+    found (genuinely pathological — caller surfaces that loudly).
+    """
+    try:
+        channel_dir = str(channel_dir)
+        vid = (vid or "").strip()
+        if not vid or not channel_dir or not os.path.isdir(channel_dir):
+            return None
+        cands = []
+        for dp, _dns, fns in os.walk(channel_dir):
+            bn = os.path.basename(dp)
+            if bn in (".Thumbnails", ".ChannelArt"):
+                continue
+            for fn in fns:
+                if fn.endswith(".info.json"):
+                    cands.append(os.path.join(dp, fn))
+        # Newest sidecar first — a just-downloaded orphan sorts to the top,
+        # so we match on the first parse instead of walking thousands.
+        try:
+            cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        except OSError:
+            pass
+        for jpath in cands:
+            try:
+                with open(jpath, "r", encoding="utf-8") as jf:
+                    jd = json.load(jf) or {}
+            except Exception:
+                continue
+            if str(jd.get("id") or "").strip() != vid:
+                continue
+            dp = os.path.dirname(jpath)
+            base = os.path.basename(jpath)[: -len(".info.json")]
+            # 1) Co-located media file sharing the sidecar's base name —
+            #    yt-dlp writes `<base>.info.json` next to `<base>.<ext>`.
+            for ext in _RESOLVE_MEDIA_EXTS:
+                cand = os.path.join(dp, base + ext)
+                if os.path.isfile(cand):
+                    return cand
+            # 2) The JSON's own recorded final path, if the media got
+            #    renamed away from the sidecar base by a post-processor.
+            for key in ("_filename", "filename"):
+                rec = jd.get(key)
+                if rec and os.path.isfile(str(rec)):
+                    return str(rec)
+            for rd in (jd.get("requested_downloads") or []):
+                rec = rd.get("filepath") or rd.get("_filename")
+                if rec and os.path.isfile(str(rec)):
+                    return str(rec)
+        return None
+    except Exception:
+        return None
 
 
 def _fmt_duration(seconds: float) -> str:

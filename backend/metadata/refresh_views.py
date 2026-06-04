@@ -591,6 +591,17 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
             full.update(entries)
             try:
                 _write_metadata_jsonl(jp, full)
+                # Mirror the refreshed view/like counts into the index DB so
+                # the global Videos view can sort the whole archive by
+                # views/likes off an indexed column (no sidecar walk at
+                # query time). Best-effort — never block the refresh.
+                try:
+                    from .. import index as _idx_db
+                    _idx_db.update_video_stats(
+                        [(vid, e.get("view_count"), e.get("like_count"))
+                         for vid, e in entries.items() if vid])
+                except Exception as _se:
+                    _log.debug("index stats mirror failed: %s", _se)
             except OSError as e:
                 stream.emit_dim(f" (metadata write failed for {os.path.basename(jp)}: {e})")
 

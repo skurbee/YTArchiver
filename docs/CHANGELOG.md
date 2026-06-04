@@ -6,6 +6,40 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v76.2 — 2026-06-03
+
+### Added
+- **Auto-sync timing modes.** Choose between a *timer* (counts down a
+  fixed interval from the last run) and *clock-aligned* (fires at fixed
+  wall-clock times, e.g. on the hour). The next-run indicator updates live.
+- **Channel sort options in Browse.** Sort the channel grid
+  alphabetically or by most-recently-downloaded.
+- **Global "Videos" view.** Browse and sort every archived video in one
+  place — by date added, upload date, view count, or like count — with
+  lazy loading so large archives stay responsive.
+
+### Changed
+- **Settings now save automatically.** The Save button is gone; every
+  field persists the moment you change it (selects and checkboxes on
+  change, the folder fields when you pick a folder, the disk-staleness
+  field on commit), with a small "Saved" confirmation in the footer. An
+  invalid staleness value now reverts instead of silently saving.
+- **"GPU tasks" renamed to "Processing tasks"** across the UI and tray,
+  since the queue covers more than GPU work.
+
+### Fixed
+- **A downloaded video's YouTube ID is now reliably captured at download
+  time.** Closed the gaps where a freshly-downloaded file could be
+  recorded without its ID (which broke thumbnails and metadata refetch):
+  the ID is bound to the file through yt-dlp's own download metadata when
+  filename matching misses, an explicitly-provided ID is no longer
+  rejected, and a routine re-scan can no longer overwrite a known ID with
+  a blank one. If a file genuinely can't be matched, it's logged loudly
+  rather than silently dropping the ID.
+- **Settings dropdowns no longer show a horizontal scrollbar** at narrow
+  window widths — the menu grows to fit its options instead of clipping
+  them behind a scrollbar.
+
 ## v75.8 — 2026-06-03
 
 ### Added

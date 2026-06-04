@@ -35,6 +35,22 @@ class BrowseMixin:
         )
         from backend.index import _file_url
         from backend.sync import channel_folder_name as _cfn
+        # Per-channel most-recent download timestamp, for the "recently
+        # downloaded" sort in the channel grid. One grouped query over the
+        # index, keyed by lowercased channel name.
+        last_added: dict[str, float] = {}
+        try:
+            from backend import index as _idx
+            _conn = _idx._reader_open()
+            if _conn is not None:
+                with _idx._reader_lock:
+                    for _cn, _mx in _conn.execute(
+                            "SELECT channel, MAX(added_ts) FROM videos "
+                            "WHERE is_duplicate_of IS NULL GROUP BY channel"):
+                        if _cn:
+                            last_added[_cn.strip().lower()] = float(_mx or 0)
+        except Exception as e:
+            _log.debug("last_added query failed: %s", e)
         out = []
         for ch in channels:
             st = archive_scan.stats_for_channel(ch, cache)
@@ -77,6 +93,7 @@ class BrowseMixin:
                 "size_bytes": st["size_bytes"],
                 "size_gb": st["size_gb"],
                 "size": archive_scan._fmt_size(st["size_bytes"]),
+                "last_added_ts": last_added.get((name or "").strip().lower(), 0),
                 "avatar_url": avatar_url,
                 "banner_url": banner_url,
                 # Pending counters for live-count context-menu labels.

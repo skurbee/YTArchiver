@@ -53,6 +53,13 @@ class AutorunScheduler:
         # hold the countdown visible-but-paused via get_state().
         self._sync_busy_fn = sync_busy_fn
         self._interval_mins = 0
+        # Timer mode (default): next fire = now + interval. Clock mode:
+        # next fire snaps to a wall-clock boundary aligned from midnight
+        # (30 min → :00/:30, 1 hr → top of hour, 6 hr → 00/06/12/18, …).
+        try:
+            self._clock_mode = (load_config().get("autorun_mode") == "clock")
+        except Exception:
+            self._clock_mode = False
         self._lock = threading.RLock()
         self._timer: threading.Timer | None = None
         self._next_fire_ts: float | None = None
@@ -87,6 +94,26 @@ class AutorunScheduler:
         else:
             persisted = False
         return {"ok": True, "mins": self._interval_mins, "persisted": persisted}
+
+    def set_mode(self, mode: str) -> dict[str, Any]:
+        """Switch between 'timer' (countdown) and 'clock' (wall-clock
+        aligned) firing, persist it, and reschedule the pending fire."""
+        clock = (str(mode).lower() == "clock")
+        with self._lock:
+            self._clock_mode = clock
+            if self._interval_mins > 0:
+                self._cancel_timer_locked()
+                self._waiting_for_sync_done = False
+                self._schedule_next_locked()
+        persisted = True
+        if config_is_writable():
+            cfg = load_config()
+            cfg["autorun_mode"] = "clock" if clock else "timer"
+            persisted = bool(save_config(cfg))
+        else:
+            persisted = False
+        return {"ok": True, "mode": "clock" if clock else "timer",
+                "persisted": persisted}
 
     def get_state(self) -> dict[str, Any]:
         # Check sync busy state OUTSIDE the lock — the callback may
@@ -125,6 +152,10 @@ class AutorunScheduler:
                 "seconds_remaining": remaining,
                 "overdue_seconds": overdue,
                 "waiting_for_sync": waiting,
+                # Clock-aligned mode: the UI shows "Next at 7:00pm" using
+                # next_fire_ts (epoch seconds) instead of a countdown.
+                "mode": "clock" if self._clock_mode else "timer",
+                "next_fire_ts": self._next_fire_ts,
             }
 
     # ── scheduling ──────────────────────────────────────────────────
@@ -138,15 +169,42 @@ class AutorunScheduler:
             self._timer = None
         self._next_fire_ts = None
 
+    def _next_clock_aligned(self, now_ts: float, interval_mins: int) -> float:
+        """Next wall-clock boundary that is a multiple of `interval_mins`,
+        aligned from local midnight, strictly after `now_ts`. All the
+        AUTORUN_OPTIONS intervals divide 1440 evenly so boundaries land
+        cleanly (e.g. 30→:00/:30, 60→top of hour, 360→00/06/12/18)."""
+        import math
+        if interval_mins <= 0:
+            return now_ts
+        dt = datetime.fromtimestamp(now_ts)
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        mins_since = (now_ts - midnight) / 60.0
+        next_mult = (math.floor(mins_since / interval_mins) + 1) * interval_mins
+        return midnight + next_mult * 60
+
     def _schedule_next_locked(self, sec: int | None = None):
         """Schedule the next _fire(). `sec` defaults to the configured
         interval; callers pass an explicit value (e.g. 60) to postpone a
-        fire without changing the interval the user configured."""
+        fire without changing the interval the user configured.
+
+        With `sec=None` and clock mode on, the next fire snaps to the next
+        wall-clock boundary instead of `now + interval`. Explicit `sec`
+        (the 60s busy-retry) always counts from now regardless of mode."""
         if sec is None:
-            sec = self._interval_mins * 60
-        if sec <= 0:
-            return
-        self._next_fire_ts = time.time() + sec
+            if self._clock_mode and self._interval_mins > 0:
+                target = self._next_clock_aligned(time.time(), self._interval_mins)
+                self._next_fire_ts = target
+                sec = max(1, int(round(target - time.time())))
+            else:
+                sec = self._interval_mins * 60
+                if sec <= 0:
+                    return
+                self._next_fire_ts = time.time() + sec
+        else:
+            if sec <= 0:
+                return
+            self._next_fire_ts = time.time() + sec
         t = threading.Timer(sec, self._fire)
         t.daemon = True
         t.start()

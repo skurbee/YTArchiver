@@ -76,10 +76,6 @@
           // renderSubsTable step doesn't flash the column in and then
           // hide it. info.show_avg_size defaults true on missing key.
           window._applySubsAvgVisibility?.(info.show_avg_size !== false);
-          // Pre-seed the Recent view mode so the upcoming
-          // renderRecentTable step renders into the correct view and
-          // the alternate frame is hidden before first paint.
-          window._applyRecentViewMode?.(info.recent_view_mode || "list");
           // First-run onboarding wizard. Driven by the backend-confirmed
           // `onboarded` flag (set once the user finishes/skips the wizard),
           // with missing-output_dir / no-config-file fallbacks so a half-
@@ -126,10 +122,8 @@
           }
         });
 
-        await step("recent_downloads", async () => {
-          const rows = await api.get_recent_downloads();
-          if (rows) window.renderRecentTable(rows);
-        });
+        // (Recent-downloads boot render removed — the Videos view now
+        // self-loads from api.list_all_videos when its submode is opened.)
 
         await step("index_summary", async () => {
           const idx = await api.get_index_summary();

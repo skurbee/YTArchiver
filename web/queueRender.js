@@ -39,7 +39,7 @@
   /** Render the queue popovers for Sync Tasks + GPU Tasks. */
   window.renderQueues = function (queues) {
     renderTaskList("sync-tasks-body", queues.sync, "No sync tasks queued.", "sync");
-    renderTaskList("gpu-tasks-body", queues.gpu, "No GPU tasks queued.", "gpu");
+    renderTaskList("gpu-tasks-body", queues.gpu, "No processing tasks queued.", "gpu");
     _updateBadge("badge-sync", (queues.sync || []).length);
     _updateBadge("badge-gpu", (queues.gpu || []).length);
   };
@@ -356,7 +356,7 @@
           // Cross-queue drop: no-op. Show a brief toast so the user
           // knows the drag was registered but rejected on purpose.
           window._showToast?.(
-            "Can't drag tasks between Sync and GPU queues.", "warn");
+            "Can't drag tasks between Sync and Processing queues.", "warn");
           return;
         }
         const dstIdx = Number(row.dataset.idx);

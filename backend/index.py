@@ -332,6 +332,14 @@ def _open() -> sqlite3.Connection | None:
                 # as Video IDs — no disk walk on every page open. NULL
                 # = "not yet checked", 0 = no thumb, 1 = thumb on disk.
                 "ALTER TABLE videos ADD COLUMN has_thumbnail INTEGER",
+                # View / like counts, materialized from the per-channel
+                # Metadata.jsonl sidecars so the global "Videos" view can
+                # sort the whole archive by views/likes with an indexed
+                # query (instead of walking ~100 sidecar files per load).
+                # Written by the metadata refresh pass + a one-time
+                # backfill (backfill_video_stats). NULL = not yet known.
+                "ALTER TABLE videos ADD COLUMN view_count INTEGER",
+                "ALTER TABLE videos ADD COLUMN like_count INTEGER",
             ):
                 try:
                     _conn.execute(stmt)
@@ -365,6 +373,12 @@ def _open() -> sqlite3.Connection | None:
                 # index instead of a full scan. Noticeable difference
                 # once videos crosses 100k rows.
                 "CREATE INDEX IF NOT EXISTS idx_vid_video_id_channel ON videos(video_id, channel)",
+                # Global "Videos" view sorts: keep the whole-archive
+                # ORDER BY ... LIMIT/OFFSET pagination off a full table scan.
+                "CREATE INDEX IF NOT EXISTS idx_vid_added_ts ON videos(added_ts)",
+                "CREATE INDEX IF NOT EXISTS idx_vid_upload_ts ON videos(upload_ts)",
+                "CREATE INDEX IF NOT EXISTS idx_vid_view_count ON videos(view_count)",
+                "CREATE INDEX IF NOT EXISTS idx_vid_like_count ON videos(like_count)",
             ):
                 try:
                     _conn.execute(stmt)
@@ -443,6 +457,102 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
     return year, month
 
 
+# ── Content-based video-id recovery from .info.json sidecars ─────────────
+# yt-dlp writes a `<name>.info.json` next to every download whose JSON
+# contains the real `id` AND the actual output filename it used (`_filename`).
+# The old recovery matched the sidecar to the video by *filename stem*, which
+# breaks whenever yt-dlp sanitized/trimmed the .mp4 and the .info.json names
+# differently (titles with punctuation — SNL etc.). This resolves the id by
+# reading the JSON *content* instead: match on the recorded output filename,
+# falling back to a normalized-title match. The id is always inside the JSON,
+# so it's recoverable regardless of what the sidecar file is named.
+_VIDID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_sidecar_id_cache: dict[str, tuple[float, dict]] = {}
+_sidecar_id_cache_lock = threading.Lock()
+
+
+def _alnum_key(s: str) -> str:
+    """Aggressive normalize for title<->stem matching: lowercase, alnum-only.
+    Collapses the punctuation/whitespace/sanitization differences between a
+    raw title and a filesystem-sanitized stem."""
+    return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+def _build_sidecar_id_map(dir_path: str) -> dict:
+    """Map a directory's .info.json sidecars: {by_name, by_title} -> id."""
+    by_name: dict[str, str] = {}
+    by_title: dict[str, str] = {}
+    try:
+        names = os.listdir(dir_path)
+    except OSError:
+        return {"by_name": by_name, "by_title": by_title}
+    for fn in names:
+        if not fn.endswith(".info.json"):
+            continue
+        try:
+            with open(os.path.join(dir_path, fn), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        vid = str(data.get("id") or "").strip()
+        if not _VIDID_RE.fullmatch(vid):
+            continue
+        # The exact output filename yt-dlp used (authoritative).
+        rec = data.get("_filename") or data.get("filename") or ""
+        if not rec:
+            rd = data.get("requested_downloads")
+            if isinstance(rd, list) and rd and isinstance(rd[0], dict):
+                rec = rd[0].get("filepath") or rd[0].get("_filename") or ""
+        if rec:
+            by_name.setdefault(os.path.basename(str(rec)).lower(), vid)
+        tkey = _alnum_key(str(data.get("title") or ""))
+        if tkey:
+            by_title.setdefault(tkey, vid)
+    return {"by_name": by_name, "by_title": by_title}
+
+
+def _resolve_id_from_sidecars(filepath: str) -> str:
+    """Recover a video's YouTube id from the .info.json sidecars in its
+    folder, matched by JSON *content* (recorded filename, then title).
+    Returns "" if nothing matches. Per-directory cached (dir mtime keyed)."""
+    try:
+        d = os.path.dirname(filepath)
+        if not d:
+            return ""
+        try:
+            mt = os.path.getmtime(d)
+        except OSError:
+            mt = 0.0
+        with _sidecar_id_cache_lock:
+            cached = _sidecar_id_cache.get(d)
+            if cached is None or cached[0] != mt:
+                m = _build_sidecar_id_map(d)
+                _sidecar_id_cache[d] = (mt, m)
+                # Cap the cache so a full-archive backfill doesn't grow it
+                # without bound.
+                if len(_sidecar_id_cache) > 400:
+                    _sidecar_id_cache.pop(next(iter(_sidecar_id_cache)))
+            else:
+                m = cached[1]
+        base = os.path.basename(filepath).lower()
+        if base in m["by_name"]:
+            return m["by_name"][base]
+        stem_key = _alnum_key(os.path.splitext(os.path.basename(filepath))[0])
+        if stem_key:
+            if stem_key in m["by_title"]:
+                return m["by_title"][stem_key]
+            # Trim-tolerant: yt-dlp's --trim-filenames may have truncated the
+            # stem, so a sidecar title that STARTS WITH the stem is a match
+            # (require a reasonable length to avoid false positives).
+            if len(stem_key) >= 16:
+                for tkey, vid in m["by_title"].items():
+                    if tkey.startswith(stem_key):
+                        return vid
+    except Exception as e:
+        _log.debug("sidecar id resolve failed (%s): %s", filepath, e)
+    return ""
+
+
 def register_video(filepath: str, channel: str, title: str | None = None,
                    tx_status: str = "pending",
                    video_id: str | None = None,
@@ -481,6 +591,15 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         reject_alpha_only=True,
         info_json_fallback=True,
     ) or None
+    # Content-based recovery: extract_video_id's sidecar step matches by
+    # exact filename stem, which misses when yt-dlp named the .mp4 and the
+    # .info.json differently (punctuation-heavy titles). This reads the id
+    # out of the .info.json *content* in the same folder — the id yt-dlp
+    # recorded is always in there, regardless of the sidecar's filename.
+    if not vid_id:
+        _sc_vid = _resolve_id_from_sidecars(fp)
+        if _sc_vid:
+            vid_id = _sc_vid
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
     # Single os.stat() call rather than separate isfile + getsize +
@@ -541,8 +660,13 @@ def register_video(filepath: str, channel: str, title: str | None = None,
                      channel=excluded.channel,
                      year=excluded.year,
                      month=excluded.month,
-                     video_id=excluded.video_id,
-                     video_url=excluded.video_url,
+                     /* NEVER overwrite a known id with NULL. The disk sweep
+                        re-registers existing files WITHOUT an id; the old
+                        `video_id=excluded.video_id` then wiped a good id
+                        captured at download time. COALESCE keeps the
+                        existing id when the re-register didn't resolve one. */
+                     video_id=COALESCE(excluded.video_id, videos.video_id),
+                     video_url=COALESCE(excluded.video_url, videos.video_url),
                      size_bytes=excluded.size_bytes,
                      duration_s=COALESCE(excluded.duration_s, videos.duration_s),
                      /* tx_status: preserve any non-'pending' value on
@@ -1634,6 +1758,249 @@ def find_thumbnail_channelwide(video_filepath: str,
             if tp and os.path.isfile(tp):
                 return os.path.normpath(tp)
     return None
+
+
+# ── Global "Videos" view: materialized view/like stats + paginated list ──
+
+def update_video_stats(updates) -> int:
+    """Batch-write view_count/like_count into the videos table.
+
+    `updates`: iterable of (video_id, view_count, like_count). None counts
+    are skipped for that field. Called by the metadata-refresh pass (so the
+    DB stays current) and by backfill_video_stats. Returns rows updated.
+    """
+    rows = [u for u in (updates or []) if u and u[0]]
+    if not rows:
+        return 0
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return 0
+            n = 0
+            for vid, vc, lc in rows:
+                try:
+                    cur = conn.execute(
+                        "UPDATE videos SET "
+                        "view_count = COALESCE(?, view_count), "
+                        "like_count = COALESCE(?, like_count) "
+                        "WHERE video_id = ?",
+                        (vc, lc, vid))
+                    n += cur.rowcount or 0
+                except sqlite3.Error:
+                    continue
+            conn.commit()
+            return n
+    except sqlite3.Error:
+        return 0
+
+
+def backfill_video_stats(progress=None) -> dict:
+    """One-time: populate videos.view_count/like_count from the per-channel
+    Metadata.jsonl sidecars so the global Videos view can sort the whole
+    archive by views/likes off an indexed column. Idempotent; safe to re-run.
+    """
+    try:
+        from .ytarchiver_config import load_config
+        from .metadata_io import _folder_for_channel, _read_metadata_jsonl
+    except Exception as e:
+        return {"ok": False, "error": f"import: {e}", "updated": 0}
+    channels = (load_config().get("channels") or [])
+    total_updated = 0
+    n_ch = len(channels)
+    for i, ch in enumerate(channels):
+        try:
+            folder = _folder_for_channel(ch)
+        except Exception:
+            folder = None
+        if folder is None:
+            continue
+        seen: dict[str, tuple] = {}
+        try:
+            for dp, _dns, fns in os.walk(str(folder)):
+                for fn in fns:
+                    if not fn.endswith("Metadata.jsonl"):
+                        continue
+                    try:
+                        data = _read_metadata_jsonl(os.path.join(dp, fn))
+                    except Exception:
+                        continue
+                    for vid, entry in data.items():
+                        if not vid:
+                            continue
+                        vc = entry.get("view_count")
+                        lc = entry.get("like_count")
+                        if vc is None and lc is None:
+                            continue
+                        try: vc = int(vc) if vc is not None else None
+                        except (TypeError, ValueError): vc = None
+                        try: lc = int(lc) if lc is not None else None
+                        except (TypeError, ValueError): lc = None
+                        seen[vid] = (vc, lc)
+        except Exception as e:
+            _log.debug("backfill walk failed (%s): %s", folder, e)
+        if seen:
+            total_updated += update_video_stats(
+                [(vid, vc, lc) for vid, (vc, lc) in seen.items()])
+        if progress:
+            try:
+                progress({"done": i + 1, "total": n_ch, "updated": total_updated})
+            except Exception:
+                pass
+    return {"ok": True, "updated": total_updated, "channels": n_ch}
+
+
+def backfill_video_stats_if_needed(progress=None) -> dict:
+    """Run the view/like backfill only if the videos table has NO view_count
+    data yet (i.e. first launch after the columns were added). No-op once
+    populated, so it's safe to call on every boot."""
+    try:
+        conn = _reader_open()
+        if conn is None:
+            return {"ok": False, "skipped": True}
+        with _reader_lock:
+            row = conn.execute(
+                "SELECT 1 FROM videos WHERE view_count IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if row:
+            return {"ok": True, "skipped": True, "reason": "already populated"}
+    except sqlite3.Error:
+        return {"ok": False, "skipped": True}
+    return backfill_video_stats(progress=progress)
+
+
+def backfill_video_ids_from_sidecars(progress=None) -> dict:
+    """Recover video_id for rows where it's NULL/'' by reading the
+    .info.json sidecars in each video's folder, matched by content (the id
+    yt-dlp recorded, regardless of the sidecar's filename). No network.
+    Fixes the 'downloaded but no id' rows so thumbnail fetch + metadata
+    refetch work again. Idempotent; safe to re-run."""
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return {"ok": False, "error": "no db", "fixed": 0}
+            rows = conn.execute(
+                "SELECT id, filepath FROM videos "
+                "WHERE (video_id IS NULL OR video_id = '') "
+                "AND filepath IS NOT NULL "
+                "ORDER BY filepath"  # group rows by directory for cache hits
+            ).fetchall()
+    except sqlite3.Error as e:
+        return {"ok": False, "error": str(e), "fixed": 0}
+    total = len(rows)
+    fixed = 0
+    pending: list[tuple] = []
+
+    def _flush():
+        nonlocal fixed, pending
+        if not pending:
+            return
+        try:
+            with _db_lock:
+                c = _open()
+                if c is not None:
+                    c.executemany(
+                        "UPDATE videos SET video_id=?, video_url=? WHERE id=?",
+                        pending)
+                    c.commit()
+                    fixed += len(pending)
+        except sqlite3.Error as e:
+            _log.debug("id backfill flush failed: %s", e)
+        pending = []
+
+    for i, (rid, fp) in enumerate(rows):
+        vid = _resolve_id_from_sidecars(fp) if fp else ""
+        if vid:
+            pending.append((vid, f"https://www.youtube.com/watch?v={vid}", rid))
+            if len(pending) >= 500:
+                _flush()
+        if progress and (i % 1000 == 0 or i == total - 1):
+            try: progress({"done": i + 1, "total": total, "fixed": fixed})
+            except Exception: pass
+    _flush()
+    return {"ok": True, "fixed": fixed, "null_rows": total}
+
+
+def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
+                    include_thumbs: bool = True) -> dict:
+    """Paginated global video list across the whole archive (the Videos view).
+
+    Sorts off materialized DB columns (added_ts / upload_ts / view_count /
+    like_count / size_bytes), so no sidecar walks. Returns
+    {rows, has_more, offset}. Rows are shaped for the Browse video-card
+    renderer (show_channel=True since channels are mixed).
+    """
+    conn = _reader_open()
+    if conn is None:
+        return {"rows": [], "has_more": False, "offset": offset}
+    order = {
+        "recent":  "COALESCE(added_ts, 0) DESC, id DESC",
+        "newest":  "(upload_ts IS NULL) ASC, upload_ts DESC, COALESCE(added_ts, 0) DESC",
+        "oldest":  "(upload_ts IS NULL) ASC, upload_ts ASC, COALESCE(added_ts, 0) ASC",
+        "title":   "title COLLATE NOCASE ASC",
+        "channel": "channel COLLATE NOCASE ASC, (upload_ts IS NULL) ASC, upload_ts DESC",
+        "views":   "(view_count IS NULL) ASC, view_count DESC, COALESCE(added_ts, 0) DESC",
+        "likes":   "(like_count IS NULL) ASC, like_count DESC, COALESCE(added_ts, 0) DESC",
+        "largest": "COALESCE(size_bytes, 0) DESC",
+    }.get((sort or "recent").lower(), "COALESCE(added_ts, 0) DESC, id DESC")
+    try:
+        lim = max(1, int(limit)); off = max(0, int(offset))
+    except (TypeError, ValueError):
+        lim, off = 60, 0
+    try:
+        with _reader_lock:
+            cur = conn.execute(
+                "SELECT title, channel, filepath, video_id, size_bytes, year, month, "
+                "tx_status, added_ts, upload_ts, view_count, like_count, "
+                "removed_from_yt_ts, duration_s "
+                "FROM videos WHERE is_duplicate_of IS NULL "
+                f"ORDER BY {order} LIMIT ? OFFSET ?",
+                (lim + 1, off))
+            raw = cur.fetchall()
+    except sqlite3.Error as e:
+        _log.debug("list_all_videos query failed: %s", e)
+        return {"rows": [], "has_more": False, "offset": offset}
+    has_more = len(raw) > lim
+    raw = raw[:lim]
+
+    def _fmt_dur(s):
+        try: s = int(float(s or 0))
+        except (TypeError, ValueError): return ""
+        if s <= 0: return ""
+        h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+    out = []
+    for r in raw:
+        (title, channel, fp, vid, size_b, yr, mo, tx, added, upts,
+         vc, lc, rem, dur_s) = r
+        d = {
+            "title": title or "", "channel": channel or "", "filepath": fp or "",
+            "video_id": vid or "", "size_bytes": size_b or 0,
+            "year": yr, "month": mo, "tx_status": tx, "added_ts": added,
+            "upload_ts": upts, "view_count": vc, "like_count": lc,
+            "duration": _fmt_dur(dur_s),
+            "removed_from_yt": bool(rem), "show_channel": True,
+        }
+        if upts:
+            try:
+                from datetime import datetime as _dt
+                d["uploaded"] = _dt.fromtimestamp(upts).strftime("%Y-%m-%d")
+            except (OverflowError, OSError, ValueError):
+                pass
+        if vc:
+            d["views"] = (f"{vc/1_000_000:.1f}M" if vc >= 1_000_000
+                          else f"{vc/1_000:.1f}K" if vc >= 1_000 else str(vc))
+        if include_thumbs and fp:
+            try:
+                tp = find_thumbnail_channelwide(fp, vid)
+                if tp:
+                    d["thumbnail_url"] = _file_url(tp)
+            except Exception:
+                pass
+        out.append(d)
+    return {"rows": out, "has_more": has_more, "offset": off}
 
 
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,

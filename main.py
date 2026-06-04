@@ -451,7 +451,7 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
             if tray is not None:
                 if gpu_working:
                     job = payload['gpu'][0] if payload['gpu'] else {}
-                    label = (job.get("kind") or "").title() or "GPU"
+                    label = (job.get("kind") or "").title() or "Processing"
                     target = job.get("name") or job.get("title") or ""
                     tip = f"YT Archiver \u2014 {label}"
                     if target:
@@ -1551,6 +1551,15 @@ def main():
         try:
             from backend.index import backfill_upload_ts as _backfill
             _backfill()
+        except Exception as e: _log.debug("swallowed: %s", e)
+        # View/like backfill for the global Videos view — materializes
+        # view_count/like_count from the per-channel Metadata.jsonl sidecars
+        # into the index DB so the whole archive can be sorted by views/
+        # likes off an indexed column. Idempotent no-op once populated; own
+        # daemon thread so the one-time ~minute pass never blocks boot.
+        try:
+            from backend.index import backfill_video_stats_if_needed as _bvs
+            threading.Thread(target=_bvs, daemon=True).start()
         except Exception as e: _log.debug("swallowed: %s", e)
     # Defer startup checks until pywebview has actually rendered the
     # window. Previously this thread started BEFORE webview.start(), so

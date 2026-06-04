@@ -165,7 +165,33 @@
     document.getElementById("browse-filter")?.addEventListener("input", (e) => {
       filterCurrentView(e.target.value);
     });
+
+    // Channel-grid sort dropdown
+    document.getElementById("browse-channel-sort")?.addEventListener("change", (e) => {
+      window._setChannelSort?.(e.target.value);
+    });
   }
+
+  // Browse > Channels grid sort. Default A–Z. Keys map to fields the
+  // backend (browse_list_channels) returns: name/folder, last_added_ts,
+  // n_vids, size_bytes.
+  let _channelSort = "name";
+  function _sortChannels(list) {
+    const arr = (list || []).slice();
+    const by = _channelSort;
+    arr.sort((a, b) => {
+      if (by === "recent") return (b.last_added_ts || 0) - (a.last_added_ts || 0);
+      if (by === "videos") return (Number(b.n_vids) || 0) - (Number(a.n_vids) || 0);
+      if (by === "size")   return (b.size_bytes || 0) - (a.size_bytes || 0);
+      return String(a.folder || a.name || "").localeCompare(
+             String(b.folder || b.name || ""), undefined, { sensitivity: "base" });
+    });
+    return arr;
+  }
+  window._setChannelSort = (key) => {
+    _channelSort = key || "name";
+    filterCurrentView(document.getElementById("browse-filter")?.value || "");
+  };
 
   // Live filter for the channel grid + video grid (Browse tab's
   // top-right search box). Previously lived in indexControls.js where
@@ -177,7 +203,7 @@
       const filtered = !q
         ? _browseState.channels
         : _browseState.channels.filter(c => (c.folder || "").toLowerCase().includes(q));
-      window.renderChannelGrid(filtered, (c) => {
+      window.renderChannelGrid(_sortChannels(filtered), (c) => {
         _browseState.currentChannel = c;
         if (typeof window.loadVideosFor === "function") window.loadVideosFor(c);
         showView("videos");
@@ -220,6 +246,10 @@
     // use the top-level Browse filter. Previously only the input was
     // being hidden, leaving a floating 🔍 with nothing to filter.
     const findWrap = filter?.closest(".browse-find-wrap");
+    // Channel-sort dropdown belongs to the Channels grid only; hide it for
+    // every submode here — showView("channels") re-shows it below.
+    const chanSortWrap = document.getElementById("browse-channel-sort-wrap");
+    if (chanSortWrap) chanSortWrap.style.display = "none";
 
     if (mode === "channels") {
       // Restart in channel grid
@@ -235,11 +265,13 @@
       // find-wrap entirely (wrap, not just input — otherwise the
       // icon orphans).
       document.getElementById("view-recent").style.display = "";
-      title.textContent = "Recent downloads";
+      title.textContent = "Videos";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
       if (findWrap) findWrap.style.display = "none";
       _browseState.view = "recent";
+      // Load (or reload) the global Videos list for the current sort.
+      if (typeof window._loadVideosView === "function") window._loadVideosView();
     } else if (mode === "search") {
       // Search view has its own search input inside #view-search, so
       // hide the top-level find-wrap too (same orphan-icon bug as
@@ -391,6 +423,7 @@
     const title = document.getElementById("browse-main-title");
     const backBtn = document.getElementById("browse-back-btn");
     const sortWrap = document.getElementById("browse-sort-wrap");
+    const chanSortWrap = document.getElementById("browse-channel-sort-wrap");
     const filter = document.getElementById("browse-filter");
     const findWrap = filter?.closest(".browse-find-wrap");
 
@@ -399,6 +432,7 @@
       title.textContent = "Channels";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
+      if (chanSortWrap) chanSortWrap.style.display = "";
       if (filter) { filter.placeholder = "Filter channels\u2026"; filter.value = ""; }
       if (findWrap) findWrap.style.display = "";
       // Re-render the grid to match the just-cleared filter. Without this,
@@ -416,6 +450,7 @@
       title.textContent = _browseState.currentChannel?.folder || "Videos";
       backBtn.style.display = "";
       sortWrap.style.display = "";
+      if (chanSortWrap) chanSortWrap.style.display = "none";
       if (filter) { filter.placeholder = "Filter videos\u2026"; filter.value = ""; }
       if (findWrap) findWrap.style.display = "";
     } else if (viewName === "watch") {
@@ -423,6 +458,7 @@
       title.textContent = _browseState.currentVideo?.title || "Watch";
       backBtn.style.display = "";
       sortWrap.style.display = "none";
+      if (chanSortWrap) chanSortWrap.style.display = "none";
       // Hide the whole wrap (input + icon), not just the input —
       // otherwise a lone magnifying glass sits in the header with
       // nothing to filter.

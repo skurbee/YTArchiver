@@ -7,7 +7,7 @@
       <div class="browse-sidebar">
         <div class="library-label">LIBRARY</div>
         <div class="submode-btn active" data-submode="channels">Channels</div>
-        <div class="submode-btn" data-submode="recent">Recent</div>
+        <div class="submode-btn" data-submode="recent">Videos</div>
         <div class="submode-btn" data-submode="search">Search</div>
         <div class="submode-btn" data-submode="graph">Graph</div>
         <div class="submode-btn" data-submode="bookmarks">Bookmarks</div>
@@ -30,6 +30,18 @@
           <button class="back-btn" id="browse-back-btn" style="display:none;">&#8592; Back</button>
           <span class="browse-main-title" id="browse-main-title">Channels</span>
           <div class="spacer"></div>
+          <!-- Channel-grid sort. Visible by default because Channels is the
+               default Browse view; browseNavigate()/showView() hide it when
+               switching to other submodes/views. -->
+          <div class="browse-sort-wrap" id="browse-channel-sort-wrap">
+            <label class="ctl-label ctl-label-thin">Sort:</label>
+            <select class="ctl-select" id="browse-channel-sort">
+              <option value="name">A&ndash;Z</option>
+              <option value="recent">Recently downloaded</option>
+              <option value="videos">Most videos</option>
+              <option value="size">Largest</option>
+            </select>
+          </div>
           <div class="browse-sort-wrap" id="browse-sort-wrap" style="display:none;">
             <label class="ctl-label ctl-label-thin">Sort:</label>
             <select class="ctl-select" id="browse-sort">
@@ -434,66 +446,41 @@
              place. Same DOM ids (recent-table / recent-table-body /
              recent-filter / recent-mini-log) so the existing JS keeps
              working without rewire. -->
+        <!-- Videos view: every video in the archive, sorted + lazy-loaded.
+             Driven by web/videosView.js via api.list_all_videos. The id
+             stays `view-recent` so existing show/hide wiring keeps working. -->
         <div class="browse-view" id="view-recent" style="display:none;">
           <div class="recent-area">
             <div class="recent-header">
-              <span class="recent-label">Recently downloaded videos</span>
-              <div class="subs-filter-wrap" style="margin-left:10px;">
-                <span class="search-icon" aria-hidden="true">&#128269;</span>
-                <input type="text" class="ctl-input subs-filter-input" id="recent-filter"
-                       placeholder="Filter by title / channel&hellip;" />
-              </div>
+              <span class="recent-label">All videos in the archive</span>
               <div class="spacer"></div>
-              <button class="btn btn-ghost btn-thin" id="btn-delete-file" hidden>Delete File</button>
-              <button class="btn btn-warn btn-thin" id="btn-clear-recent" hidden
-                      title="Clear the recent downloads list (files on disk are not deleted)">Clear list</button>
+              <label class="ctl-label ctl-label-thin">Sort:</label>
+              <select class="ctl-select" id="videos-sort"
+                      title="Sort every video in the archive">
+                <option value="recent">Recently downloaded</option>
+                <option value="newest">Newest uploaded</option>
+                <option value="oldest">Oldest uploaded</option>
+                <option value="views">Most viewed</option>
+                <option value="likes">Most liked</option>
+                <option value="title">Title (A&ndash;Z)</option>
+                <option value="channel">Channel</option>
+                <option value="largest">Largest file</option>
+              </select>
             </div>
 
-            <!-- Two mutually-exclusive views: the legacy table and the
-                 new thumbnail grid. JS flips the display based on the
-                 `recent_view_mode` setting. Only one renders at a time so
-                 sort / filter / selection handlers don't collide. -->
-            <div class="recent-table-frame" id="recent-list-frame">
-              <table class="recent-table" id="recent-table">
-                <colgroup>
-                  <col class="col-title"/>
-                  <col class="col-channel"/>
-                  <col class="col-time"/>
-                  <col class="col-length"/>
-                  <col class="col-size"/>
-                </colgroup>
-                <thead>
-                  <tr>
-                    <th class="col-title" data-sort="title">Title</th>
-                    <th class="col-channel" data-sort="channel">Channel</th>
-                    <th class="col-time" data-sort="time">Downloaded</th>
-                    <th class="col-length right" data-sort="duration">Length</th>
-                    <th class="col-size right" data-sort="size">Size</th>
-                  </tr>
-                </thead>
-                <tbody id="recent-table-body">
-                  <!-- Loading placeholder; renderRecentTable clears tbody on
-                       first render so this is removed once data arrives. -->
-                  <tr class="grid-loading-row">
-                    <td colspan="5">
-                      <div class="grid-loading">
-                        <div class="grid-spinner"></div>
-                        <span class="grid-loading-label">Loading recent downloads&hellip;</span>
-                      </div>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <!-- Grid variant &mdash; reuses the Browse video-grid CSS. Hidden
-                 by default (list view is the default mode). -->
-            <div class="recent-grid-frame" id="recent-grid-frame" style="display:none;">
+            <!-- Thumbnail grid (reuses Browse video-grid CSS) + a sentinel
+                 the lazy-loader observes to fetch the next page on scroll. -->
+            <div class="recent-grid-frame" id="recent-grid-frame">
               <div class="video-grid" id="recent-grid">
                 <div class="grid-loading">
                   <div class="grid-spinner"></div>
-                  <span class="grid-loading-label">Loading recent downloads&hellip;</span>
+                  <span class="grid-loading-label">Loading videos&hellip;</span>
                 </div>
+              </div>
+              <div id="videos-load-sentinel" style="height:1px;"></div>
+              <div id="videos-load-more" class="grid-loading" hidden>
+                <div class="grid-spinner"></div>
+                <span class="grid-loading-label">Loading more&hellip;</span>
               </div>
             </div>
           </div>

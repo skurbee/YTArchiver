@@ -23,6 +23,18 @@ class RecentMixin:
         return recent_for_ui(cfg)
 
 
+    def list_all_videos(self, sort="recent", limit=60, offset=0):
+        """Paginated global video list for the Videos view — every video in
+        the archive, sorted by recent/newest/oldest/title/channel/views/likes/
+        largest. Returns {rows, has_more, offset}."""
+        try:
+            return index_backend.list_all_videos(
+                sort=str(sort or "recent"),
+                limit=int(limit or 60), offset=int(offset or 0))
+        except Exception as e:
+            return {"rows": [], "has_more": False, "offset": offset, "error": str(e)}
+
+
     def clear_recent_downloads(self):
         """Empty the recent_downloads list. Files on disk are untouched.
 
@@ -61,12 +73,13 @@ class RecentMixin:
             # to disk; self._config may be stale.
             try: self._reload_config()
             except Exception as e: _log.debug("swallowed: %s", e)
-            rows = self.get_recent_downloads() or []
-            # default=str so a Path or datetime sneaking into a row
-            # doesn't raise TypeError, silently freeze the Recent tab
-            # (audit: recent_mixin.py:64-65).
-            js = f"window.renderRecentTable && window.renderRecentTable({_json.dumps(rows, default=str)});"
-            self._window.evaluate_js(js)
+            # A new download just landed (and was registered in the index),
+            # so reload the Videos view if it's currently showing. The view
+            # pulls from api.list_all_videos (whole archive), not the old
+            # recent_downloads config list.
+            self._window.evaluate_js(
+                "window._refreshVideosViewIfActive && "
+                "window._refreshVideosViewIfActive();")
         except Exception as e:
             # Best-effort — never let a UI push crash the download pipeline.
             try: self._log_stream.emit_dim(f"(recent refresh push failed: {e})")

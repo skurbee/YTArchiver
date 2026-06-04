@@ -82,6 +82,17 @@
               <option value="tray">Minimize to tray</option>
               <option value="quit">Quit immediately</option>
             </select>
+
+            <!-- Auto-sync firing mode. Timer = countdown ("next in 14m");
+                 Clock = snap to wall-clock boundaries ("Next at 7:00pm").
+                 Applied immediately via autorun_set_mode (not the bulk
+                 settings Save). -->
+            <label class="edit-gl">Auto-sync timing</label>
+            <select class="ctl-select" id="settings-autorun-mode"
+                    title="Timer counts down a fixed interval from now; Clock-aligned fires at wall-clock boundaries (e.g. every :00/:30)">
+              <option value="timer">Timer (countdown)</option>
+              <option value="clock">Clock-aligned (fixed times)</option>
+            </select>
           </div>
         </div>
 
@@ -132,20 +143,8 @@
               </label>
             </div>
 
-            <!-- Recent tab view mode &mdash; legacy tabular list vs. a video-grid
-                 card view (thumbnails + title + meta, same layout as a
-                 channel's video grid). -->
-            <label class="edit-gl">Recent view</label>
-            <div class="edit-gv-stack">
-              <label class="edit-gv-inline" style="gap:10px;cursor:pointer;">
-                <input type="radio" name="settings-recent-view" value="list" id="settings-recent-view-list" />
-                <span>List (legacy)</span>
-              </label>
-              <label class="edit-gv-inline" style="gap:10px;cursor:pointer;">
-                <input type="radio" name="settings-recent-view" value="grid" id="settings-recent-view-grid" />
-                <span>Grid (thumbnails)</span>
-              </label>
-            </div>
+            <!-- (Recent view List/Grid toggle removed — the Videos view is
+                 always the thumbnail grid now.) -->
 
             <!-- Log mode &mdash; was originally on the General tab, moved
                  here per UI feedback. Simple = high-level human-readable
@@ -468,11 +467,15 @@
           </div>
         </div>
 
-        <!-- Shared Save button footer &mdash; applies to every sub-view's
-             editable fields (saves the full settings payload). Hidden on
-             the Index view since it has its own Build / Rebuild actions. -->
+        <!-- Auto-save footer. Every editable field persists itself the
+             moment it changes (selects/checkboxes on change, the staleness
+             field on commit, the path fields when a folder is picked) via a
+             key-guarded settings_save call — so there's no Save button to
+             forget. This note confirms persistence and flashes "Saved ✓" on
+             each write. Hidden on the Index/Metadata views (their own
+             controls auto-save through settingsInfra). -->
         <div class="settings-actions" id="settings-actions-footer">
-          <button class="btn btn-primary" id="settings-save">Save</button>
+          <span class="settings-autosave-note" id="settings-autosave-note">Changes are saved automatically</span>
         </div>
       </div>
     </div>

@@ -124,6 +124,7 @@ from .sync_helpers import (  # noqa: F401
     _fmt_size,
     _hide_sidecar_win,
     _resolve_final_mp4,
+    _resolve_path_for_vid,
     _scan_recent_video,
     _sweep_orphan_vtts,
 )
@@ -1181,6 +1182,38 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     if (not final_path or not os.path.isfile(final_path)):
                         # Fallback directory scan — mirrors OLD line 18350.
                         final_path = _scan_recent_video(ch_dir)
+                    if (not final_path or not os.path.isfile(final_path)) and vid:
+                        # GUARANTEED id→path binding. Merger/Destination/
+                        # recent-scan all missed ("DLTRACK orphan"), but the
+                        # id is authoritative and yt-dlp just wrote a
+                        # `<base>.info.json` carrying that same id next to the
+                        # merged file. Bind through it so a known YouTube id is
+                        # NEVER dropped to be re-registered later without one.
+                        _ip = _resolve_path_for_vid(ch_dir, vid)
+                        if _ip:
+                            final_path = _ip
+                            _log.info(
+                                "DLTRACK orphan recovered via .info.json: "
+                                "vid=%s -> %s", vid, _ip)
+                    if (vid and (not final_path
+                                 or not os.path.isfile(final_path))):
+                        # Pathological: we hold an authoritative YouTube id
+                        # from DLTRACK but could not bind it to ANY file on
+                        # disk — not via Merger/Destination/scan, not even via
+                        # the freshly-written .info.json. NEVER swallow this:
+                        # surface it loudly so the user can re-sync, instead of
+                        # silently registering the file later with no id.
+                        _log.error(
+                            "DLTRACK could not bind a file for vid=%s "
+                            "title=%r in %s — id at risk of being lost",
+                            vid, t, ch_dir)
+                        try:
+                            stream.emit_dim(
+                                f" ⚠ downloaded {vid} but could not match it to "
+                                f"a file on disk — re-sync this channel to "
+                                f"capture its video ID")
+                        except Exception as _be:
+                            _log.debug("orphan bind warn emit failed: %s", _be)
                     if final_path and os.path.isfile(final_path) and vid:
                         # First DLTRACK per final_path wins — counts the
                         # download, emits the "\u2014 \u2713" confirmation with

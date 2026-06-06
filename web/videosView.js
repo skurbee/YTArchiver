@@ -8,8 +8,15 @@
  *
  * Public:
  *   window._loadVideosView()            — (re)load page 1 with the current sort
- *   window._refreshVideosViewIfActive() — reload if the view is showing
- *                                          (called when a new download lands)
+ *   window._refreshVideosViewIfActive() — if the view is showing, re-query
+ *                                          page 1 and re-render ONLY if it
+ *                                          actually changed. Called when the
+ *                                          user returns to the Browse tab so a
+ *                                          download that landed while they were
+ *                                          on another tab shows up without a
+ *                                          manual sort change. No-op (no flash,
+ *                                          scroll preserved) when nothing was
+ *                                          added.
  */
 (function () {
   "use strict";
@@ -21,6 +28,10 @@
   let _hasMore = true;
   let _seq = 0;          // stale-load guard: a newer sort/reset wins
   let _wired = false;
+  // Signature (joined ids/paths) of the page-1 rows currently rendered.
+  // Used by _refreshVideosViewIfActive to decide whether a return-to-tab
+  // re-render is actually needed, so an unchanged grid isn't torn down.
+  let _firstPageSig = "";
 
   const $ = (id) => document.getElementById(id);
   const grid = () => $("recent-grid");
@@ -74,6 +85,9 @@
       const res = await api.list_all_videos(_sort, PAGE, _offset);
       if (myId !== _seq) return;  // superseded by a newer sort/reset
       const rows = (res && res.rows) || [];
+      if (reset) {
+        _firstPageSig = rows.map(r => r.video_id || r.filepath || "").join("|");
+      }
       if (reset && g) g.innerHTML = "";
       const frag = document.createDocumentFragment();
       for (const r of rows) { const c = _cardFor(r); if (c) frag.appendChild(c); }
@@ -116,7 +130,28 @@
   }
 
   window._loadVideosView = function () { wireOnce(); loadPage(true); };
-  window._refreshVideosViewIfActive = function () { if (isActive()) loadPage(true); };
+
+  // Cheap "did page 1 change?" check. Re-query the first page with the
+  // current sort and compare its id/path signature to what's rendered.
+  // Re-render only on a real difference — so flipping Download↔Browse with
+  // no new downloads leaves the grid (and scroll position) untouched, while
+  // a download that landed while away shows up immediately on return. The
+  // page-1 query is backend-cached, so the unchanged case is a fast cache
+  // hit. _firstPageSig is keyed implicitly to the current sort because
+  // loadPage() always rebuilds it for whatever sort is active.
+  window._refreshVideosViewIfActive = async function () {
+    if (!isActive() || _loading) return;
+    const api = window.pywebview && window.pywebview.api;
+    if (!api || !api.list_all_videos) return;
+    const sortAtCall = _sort;
+    try {
+      const res = await api.list_all_videos(sortAtCall, PAGE, 0);
+      if (sortAtCall !== _sort || _loading) return;  // superseded meanwhile
+      const rows = (res && res.rows) || [];
+      const sig = rows.map(r => r.video_id || r.filepath || "").join("|");
+      if (sig !== _firstPageSig) loadPage(true);
+    } catch (_e) { /* non-fatal — leave the current grid as-is */ }
+  };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", wireOnce);

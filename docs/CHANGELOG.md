@@ -6,6 +6,16 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v77.9 — 2026-06-06
+
+### Fixed
+- **Browse → Videos refreshes on return.** The Videos grid renders once and
+  didn't re-query when you left and came back to it, so a download that
+  finished while you were on another tab wouldn't appear until you changed
+  the sort. Returning to the Browse tab now re-checks the first page and
+  re-renders only when it actually changed — no flash or scroll jump when
+  nothing was added.
+
 ## v77.8 — 2026-06-06
 
 ### Fixed

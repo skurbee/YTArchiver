@@ -75,6 +75,17 @@
         document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
         const panel = document.getElementById("panel-" + target);
         if (panel) panel.classList.add("active");
+        // Returning to Browse: the Videos sub-grid is a one-time render that
+        // doesn't re-query on its own, so a download that landed while the
+        // user was on another tab wouldn't appear until they changed the sort.
+        // Re-check page 1 on return and re-render only if it actually changed
+        // (no-op + no flash when nothing was added). rAF so the panel's
+        // visibility has settled before the active-view check runs.
+        if (target === "browse" && typeof window._refreshVideosViewIfActive === "function") {
+          requestAnimationFrame(() => {
+            try { window._refreshVideosViewIfActive(); } catch (_e) { /* non-fatal */ }
+          });
+        }
         // Clear any lingering row-selected highlights when switching
         // tabs. Without this, rows selected in Recent / Browse grid
         // stay selected behind the scenes; coming back to that tab

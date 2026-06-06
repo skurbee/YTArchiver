@@ -6,6 +6,15 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v77.8 — 2026-06-06
+
+### Fixed
+- **Activity log stays visible once it has content.** The activity-log
+  pane auto-hides while empty, but rows added at runtime (download / sync
+  activity) weren't re-triggering that check — so a pane that started
+  empty stayed hidden even after it filled up (you could "Clear activity"
+  but never see it). It now re-evaluates visibility on any content change.
+
 ## v77.7 — 2026-06-05
 
 Rollup of everything since the last public release. Highlights:

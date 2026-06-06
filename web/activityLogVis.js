@@ -52,4 +52,22 @@
   // Exposed so app.js / logs.js / autorun-history hooks can re-evaluate
   // visibility whenever activity-log content changes.
   window._syncActivityLogVisibility = syncActivityLogVisibility;
+
+  // Auto-re-evaluate on EVERY change to the activity log's children. The
+  // runtime append paths (appendActivityLog + the batched _logBatch
+  // handler + renderActivityLog) add rows WITHOUT calling
+  // syncActivityLogVisibility, so an activity log that started empty (frame
+  // auto-hidden) stayed hidden even after an overnight autorun filled it
+  // with downloads — you could "Clear activity" but never SEE it. A
+  // childList observer covers every add path at once. Setting frame.hidden
+  // doesn't touch #activity-log's children, so this can't loop.
+  try {
+    const _watch = document.getElementById("activity-log");
+    if (_watch && typeof MutationObserver === "function") {
+      new MutationObserver(syncActivityLogVisibility)
+        .observe(_watch, { childList: true });
+      // Sync once now in case content is already present at load.
+      syncActivityLogVisibility();
+    }
+  } catch (_e) { /* non-fatal */ }
 })();

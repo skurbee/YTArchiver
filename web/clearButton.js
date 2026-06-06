@@ -17,6 +17,24 @@
     return undefined;
   }
 
+  // Hide the whole "Clear ▾" button when there's nothing to clear (BOTH the
+  // activity log and the main log are empty). Otherwise clicking it pops an
+  // empty menu / does nothing, which reads as broken. Re-shown the instant
+  // either log gets a line. (Implements the visibility sync that the click
+  // handler's comment referenced but which was never actually defined.)
+  // style.display is used rather than the [hidden] attribute because the
+  // .btn class sets a display value that would override [hidden].
+  function syncClearButtonVisibility() {
+    const btn = document.getElementById("btn-clear-menu");
+    if (!btn) return;
+    const mainLog = document.getElementById("main-log");
+    const actLog = document.getElementById("activity-log");
+    const hasMain = !!(mainLog && mainLog.childElementCount > 0);
+    const hasAct = !!(actLog && actLog.childElementCount > 0);
+    btn.style.display = (hasMain || hasAct) ? "" : "none";
+  }
+  window._syncClearButtonVisibility = syncClearButtonVisibility;
+
   // ─── Clear button wiring (consolidated dropdown) ─────────────────────
   function initClearLog() {
     // Single "Clear ▾" button (next to the Pause button in the main
@@ -27,6 +45,19 @@
     // row "Clear") that used to take up space in different places.
     const btn = document.getElementById("btn-clear-menu");
     if (!btn) return;
+
+    // Keep the button's visibility synced to log content: observe both log
+    // containers for childList changes (append / bulk render / clear / trim)
+    // so the button shows or vanishes automatically, then set the initial
+    // state once now.
+    try {
+      const _obs = new MutationObserver(() => syncClearButtonVisibility());
+      ["main-log", "activity-log"].forEach((id) => {
+        const t = document.getElementById(id);
+        if (t) _obs.observe(t, { childList: true });
+      });
+    } catch (_e) { /* observer is best-effort; initial sync still applies */ }
+    syncClearButtonVisibility();
 
     async function doClearMainLog() {
       const ok = await askConfirm(

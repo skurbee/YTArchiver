@@ -45,10 +45,31 @@
         typeBtns.forEach(x => x.classList.remove("active"));
         b.classList.add("active");
         _graphType = b.dataset.type || "line";
-        // Re-render from cached data if we have any
-        if (_graphLastData) drawGraphFromData(_graphLastData);
+        // Re-render on type switch. Word Cloud is independent of the Line/Bar
+        // query (it needs no word) and previously showed "No words." until the
+        // user clicked Plot — so when switching TO it, re-use a cached cloud if
+        // we have one, otherwise fetch it now. Line/Bar only re-render when the
+        // cache actually holds series data (not a cloud), since they require a
+        // word in the box.
+        if (_graphType === "wordcloud") {
+          if (_graphLastData && Array.isArray(_graphLastData.cloud)) {
+            drawGraphFromData(_graphLastData);
+          } else {
+            drawGraph();
+          }
+        } else if (_graphLastData && !_graphLastData.cloud) {
+          drawGraphFromData(_graphLastData);
+        } else {
+          // Leaving word cloud (or a cold start) with no cached series:
+          // re-query so Line/Bar actually renders instead of leaving the
+          // stale word cloud sitting on the canvas. drawGraph() toasts
+          // "Enter a word to plot." if the Word box is empty.
+          drawGraph();
+        }
+        _syncGraphWordField();
       });
     });
+    _syncGraphWordField();
     // Normalize toggle re-runs the query (the divisor is server-side).
     document.getElementById("graph-normalize")?.addEventListener("change", () => {
       if ((document.getElementById("graph-word")?.value || "").trim()) {
@@ -64,6 +85,19 @@
       try { _graphChart.destroy(); } catch {}
       _graphChart = null;
     }
+  }
+
+  // In Word-cloud mode the Word field is ignored (the cloud is a global
+  // top-words view), so grey it out + add a tooltip explaining why; it's
+  // re-enabled for Line/Bar where a word is required.
+  function _syncGraphWordField() {
+    const wordEl = document.getElementById("graph-word");
+    if (!wordEl) return;
+    const cloud = _graphType === "wordcloud";
+    wordEl.disabled = cloud;
+    wordEl.title = cloud
+      ? "Word cloud shows the most-spoken words across the whole scope — the Word field is ignored here."
+      : "";
   }
 
   async function drawGraph() {

@@ -126,8 +126,33 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
     base = (cfg.get("output_dir") or "").strip()
     if not base:
         return {"n_vids": 0, "size_bytes": 0, "size_gb": 0.0}
-    from pathlib import Path as _P
-    n_vids, total_bytes = scan_channel_folder(_P(base), channel)
+    # Fast path: aggregate count + size straight from the index DB (indexed
+    # query, ~1s) instead of an os.walk + per-file stat of the whole channel
+    # folder. On a 28k-video channel on pooled storage that walk took ~2
+    # MINUTES, and the sync calls this after every download — the dominant
+    # part of the post-download "hang" on large channels. The index stores
+    # size_bytes per video and is kept current by register_video / sweep /
+    # prune, so its totals match the walk. Fall back to the walk when the DB
+    # has no rows for this channel yet (brand-new / unindexed) or is down.
+    n_vids = total_bytes = None
+    try:
+        from . import index as _idx
+        _conn = _idx._reader_open()
+        if _conn is not None:
+            _nm = (channel.get("name") or channel.get("folder") or "").strip()
+            if _nm:
+                with _idx._reader_lock:
+                    _row = _conn.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) "
+                        "FROM videos WHERE channel=? COLLATE NOCASE",
+                        (_nm,)).fetchone()
+                if _row and _row[0]:
+                    n_vids, total_bytes = int(_row[0]), int(_row[1])
+    except Exception:
+        n_vids = total_bytes = None
+    if n_vids is None:
+        from pathlib import Path as _P
+        n_vids, total_bytes = scan_channel_folder(_P(base), channel)
     cache = load_disk_cache()
     url = channel.get("url", "").strip()
     if url:

@@ -88,6 +88,76 @@ class MediaOpsMixin:
         return {"ok": True, "started": True}
 
 
+    # ─── Video-length backfill (manual local ffprobe pass) ────────────
+
+    def video_lengths_missing_count(self):
+        """How many archived videos have no stored length yet. Read-only;
+        the Settings 'Check / fix video lengths' button calls this first to
+        show the count before kicking off the (potentially long) pass."""
+        try:
+            from ..metadata.core import count_missing_durations
+            return {"ok": True, "missing": int(count_missing_durations())}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "missing": 0}
+
+    def video_lengths_backfill_running(self):
+        """Whether a backfill pass is active (so the button can show Stop vs
+        Check/fix even after a page reload)."""
+        return {"ok": True,
+                "running": bool(getattr(self, "_dur_backfill_running", False))}
+
+    def video_lengths_backfill_start(self):
+        """Fill every missing video length by ffprobing the files locally
+        (no YouTube). Runs in the background; progress streams to the main
+        log; stop via video_lengths_backfill_cancel. Idempotent / resumable
+        — only touches rows still missing a length, so a stopped run
+        continues where it left off next start."""
+        if getattr(self, "_dur_backfill_running", False):
+            return {"ok": True, "already_running": True}
+        self._dur_backfill_running = True
+        self._dur_backfill_cancel = threading.Event()
+
+        def _run():
+            try:
+                from ..metadata.core import backfill_missing_durations
+                res = backfill_missing_durations(
+                    self._log_stream, self._dur_backfill_cancel)
+                # Always notify the UI on completion so the Settings button
+                # flips back to idle; pass the count filled so the frontend
+                # can refresh the Videos grid only when something changed.
+                if self._window is not None:
+                    try:
+                        _n = int(res.get("resolved") or 0)
+                        self._window.evaluate_js(
+                            "if(window._onVideoLengthsBackfilled)"
+                            f"window._onVideoLengthsBackfilled({_n});")
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
+            except Exception as e:
+                try:
+                    self._log_stream.emit_error(f"Video-length fix failed: {e}")
+                except Exception as _e2:
+                    _log.debug("swallowed: %s", _e2)
+            finally:
+                self._dur_backfill_running = False
+                try:
+                    self._log_stream.flush()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+
+        threading.Thread(target=_run, name="dur-backfill", daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def video_lengths_backfill_cancel(self):
+        """Stop an in-progress video-length fix. Lengths filled so far are
+        kept; re-running resumes the rest."""
+        ev = getattr(self, "_dur_backfill_cancel", None)
+        if ev is not None:
+            ev.set()
+        return {"ok": True,
+                "running": bool(getattr(self, "_dur_backfill_running", False))}
+
+
     # ─── Transcript drift scan (feature H-2) ──────────────────────────
 
     def drift_scan_channel(self, identity):

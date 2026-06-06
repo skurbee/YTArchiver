@@ -63,7 +63,26 @@
       }
       const input = document.querySelector("#panel-download .ctl-input");
       if (input) input.value = trimmed;
-      if (window.pywebview?.api?.archive_single_video) {
+      const api = window.pywebview?.api;
+      if (api?.archive_single_video) {
+        // Already-archived warning — same gate as the URL-submit flow, so a
+        // dropped URL for a video already in the archive prompts before
+        // re-downloading. Any failure falls through and allows the download.
+        try {
+          if (api.single_video_archived && askConfirm) {
+            const chk = await api.single_video_archived(trimmed);
+            if (chk?.ok && chk.archived) {
+              const what = chk.title ? `"${chk.title}"` : "This video";
+              const where = chk.channel ? ` in "${chk.channel}"` : "";
+              const go = await askConfirm(
+                "Already archived",
+                `${what} is already archived${where}.\n\n` +
+                `Download it again anyway?`,
+                { confirm: "Download anyway" });
+              if (!go) return;
+            }
+          }
+        } catch { /* non-fatal — allow the download */ }
         // pass the same readVideoOptions() dict the URL-
         // submit flow does, so dropped URLs honor the user's
         // resolution / save-to / custom-name fields instead of
@@ -72,7 +91,7 @@
         // is scoped to that file's IIFE and not visible here.
         const opts = (typeof window._readVideoOptions === "function")
             ? window._readVideoOptions() : {};
-        await window.pywebview.api.archive_single_video(trimmed, opts);
+        await api.archive_single_video(trimmed, opts);
         window._showToast?.("Queued: " + trimmed.slice(0, 60), "ok");
       }
     });

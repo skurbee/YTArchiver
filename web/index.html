@@ -86,7 +86,7 @@
              The backend api.url_history() returns the list. -->
         <input type="text" class="ctl-input" id="url-input"
                list="url-history-list"
-               placeholder="https://www.youtube.com/watch?v=..." />
+               placeholder="Paste a YouTube video URL" />
         <datalist id="url-history-list"></datalist>
         <!-- "▶ Download" button moved into the video-opts panel below,
              inline with the custom-filename row, vertically spanning
@@ -883,6 +883,18 @@
               <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
                       title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
             </div>
+
+            <!-- Fill missing video lengths by ffprobing each file locally
+                 (no YouTube). The disk-sweep / import paths register videos
+                 without a duration, so the Videos grid shows no length badge
+                 for them; this reads the true runtime from the file itself.
+                 Local only; progress streams to the main log; stoppable and
+                 resumable (re-run picks up the rest). -->
+            <label class="edit-gl">Video lengths</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
+                      title="Read each video's true length with ffprobe (local, no YouTube) to fill in missing lengths shown in Browse &gt; Videos. Progress streams to the log; you can Stop and re-run to resume.">Check / fix&hellip;</button>
+            </div>
           </div>
         </div>
 
@@ -1544,9 +1556,6 @@
                 <option value="oldest">Oldest uploaded</option>
                 <option value="views">Most viewed</option>
                 <option value="likes">Most liked</option>
-                <option value="title">Title (A&ndash;Z)</option>
-                <option value="channel">Channel</option>
-                <option value="largest">Largest file</option>
               </select>
             </div>
 
@@ -1651,7 +1660,7 @@
   <!-- About dialog -->
   <div class="askq-backdrop" id="about-backdrop" style="display:none;">
     <div class="askq-dialog" style="min-width:420px;">
-      <div class="askq-header">About YT Archiver</div>
+      <div class="askq-header">About YTArchiver</div>
       <div class="askq-body" id="about-body">Loading&hellip;</div>
       <div class="askq-buttons">
         <button class="btn btn-primary" id="about-close">Close</button>
@@ -1981,6 +1990,20 @@
           <span class="onb-dot" data-step="4"></span>
 
         </div>
+
+        <!-- Close (X): only shown when the wizard is re-opened from
+
+             Settings > Tools ("Run setup again"). Genuine first-run keeps
+
+             the wizard non-dismissable (Esc blocked, no X) so setup isn't
+
+             skipped by accident. Wired in onboarding.js. -->
+
+        <button type="button" class="onb-close" id="onb-close"
+
+                title="Close setup (you can re-run it any time from Settings)"
+
+                aria-label="Close setup" hidden>&times;</button>
 
       </div>
 

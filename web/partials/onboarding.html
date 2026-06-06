@@ -13,6 +13,13 @@
         <span class="onb-dot" data-step="3"></span>
         <span class="onb-dot" data-step="4"></span>
       </div>
+      <!-- Close (X): only shown when the wizard is re-opened from
+           Settings > Tools ("Run setup again"). Genuine first-run keeps
+           the wizard non-dismissable (Esc blocked, no X) so setup isn't
+           skipped by accident. Wired in onboarding.js. -->
+      <button type="button" class="onb-close" id="onb-close"
+              title="Close setup (you can re-run it any time from Settings)"
+              aria-label="Close setup" hidden>&times;</button>
     </div>
 
     <div class="onb-body">

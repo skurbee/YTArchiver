@@ -217,6 +217,119 @@ _config_write_lock = threading.Lock()
 # source of truth shared with compress.py and transcribe.py).
 from ..subprocess_util import make_startupinfo as _make_startupinfo
 
+# Post-download channel maintenance (orphan-caption sweep + thumbnail
+# sweep) does full os.walks of the channel folder. On large channels (tens
+# of thousands of files on pooled storage) each walk takes minutes, and
+# running them inline blocked the whole sync pass after every download (the
+# "stuck 5-8 minutes after a big channel downloads" report). Run them in a
+# background daemon thread so the sync moves straight to the next channel.
+# A single module lock serializes them so several downloading channels
+# don't thrash the disk with parallel walks. Best-effort cleanup, so silent
+# failure / app-exit mid-run is harmless.
+_post_sync_maint_lock = threading.Lock()
+
+
+def _bg_channel_maintenance(label: str, fn, *args, **kwargs) -> None:
+    """Run a post-download maintenance op in a serialized background thread."""
+    def _runner():
+        try:
+            with _post_sync_maint_lock:
+                fn(*args, **kwargs)
+        except Exception as _e:
+            _log.debug("bg maintenance %s failed: %s", label, _e)
+    try:
+        threading.Thread(target=_runner, name=f"yta-maint-{label}",
+                         daemon=True).start()
+    except Exception as _te:
+        _log.debug("bg maintenance %s spawn failed: %s", label, _te)
+
+
+# ── Robust network-timeout give-up (immune to the shared-config save race) ──
+# The failed_video_ids retry counter lives in the shared config dict, which
+# concurrent channel-sync threads load-modify-save — the count kept getting
+# clobbered, so a permanently-unreachable video's strikes never reached 3 and
+# it nagged "Couldn't reach YouTube" on EVERY sync forever. This dedicated
+# little store is written ONLY here, so nothing else can stomp it. After 3
+# syncs of network-timeout on the same video we archive it (the channel walk
+# then skips it) and stop the nagging.
+_timeout_strikes_lock = threading.Lock()
+
+
+def _timeout_strikes_path() -> str:
+    return os.path.join(os.path.dirname(ARCHIVE_FILE),
+                        "failed_timeout_strikes.json")
+
+
+def _record_timeout_strike(vid: str, stream) -> bool:
+    """Bump the per-video network-timeout strike count; at 3, archive the
+    video + emit a give-up line. Returns True if it gave up this call."""
+    if not vid:
+        return False
+    import json as _json
+    gave_up = False
+    with _timeout_strikes_lock:
+        d: dict = {}
+        try:
+            with open(_timeout_strikes_path(), encoding="utf-8") as _f:
+                _loaded = _json.load(_f)
+                if isinstance(_loaded, dict):
+                    d = _loaded
+        except Exception:
+            d = {}
+        n = int(d.get(vid, 0) or 0) + 1
+        gave_up = n >= 3
+        if gave_up:
+            d.pop(vid, None)
+        else:
+            d[vid] = n
+        try:
+            _p = _timeout_strikes_path()
+            _tmp = _p + ".tmp"
+            with open(_tmp, "w", encoding="utf-8") as _f:
+                _json.dump(d, _f)
+            os.replace(_tmp, _p)
+        except Exception as _se:
+            _log.debug("timeout-strike save failed: %s", _se)
+    if gave_up:
+        try:
+            with _archive_write_lock:
+                with open(ARCHIVE_FILE, "ab") as _af:
+                    _af.write(f"youtube {vid}\n".encode("utf-8"))
+                    try: _af.flush()
+                    except OSError: pass
+        except OSError as _ae:
+            _log.debug("timeout-strike archive write failed: %s", _ae)
+        try:
+            stream.emit([
+                [" ⛔ Gave up on ", "red"],
+                [f"https://youtube.com/watch?v={vid}", "red"],
+                [" after 3 failed syncs — couldn't reach it. Won't auto-retry; "
+                 "paste its URL in the Download tab to try again.\n", "red"],
+            ])
+        except Exception as _ee:
+            _log.debug("swallowed: %s", _ee)
+    return gave_up
+
+
+def _clear_timeout_strike(vid: str) -> None:
+    """Drop a video's strike count after it finally downloads successfully."""
+    if not vid:
+        return
+    import json as _json
+    with _timeout_strikes_lock:
+        try:
+            with open(_timeout_strikes_path(), encoding="utf-8") as _f:
+                d = _json.load(_f)
+            if isinstance(d, dict) and vid in d:
+                d.pop(vid, None)
+                _p = _timeout_strikes_path()
+                _tmp = _p + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as _f:
+                    _json.dump(d, _f)
+                os.replace(_tmp, _p)
+        except Exception:
+            pass
+
 _startupinfo = _make_startupinfo()
 
 
@@ -417,6 +530,16 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     cmd = [
         yt,
         "--newline", "--no-quiet",
+        # Bound the connection retries/timeout. yt-dlp's defaults (10
+        # retries × ~20s connect timeout, ×each stream) mean an
+        # UNREACHABLE CDN host silently burns 3+ minutes before giving up
+        # — the "frozen log" stalls. 3 retries × 15s = a fast ~45s failure
+        # so the sync moves on. --fragment-retries is deliberately left at
+        # the default so a genuine mid-download blip on a big file still
+        # recovers (a stalled fragment is caught by the no-output watchdog
+        # instead).
+        "--retries", "3",
+        "--socket-timeout", "15",
         "--mtime", # file mtime = YT upload date (matches original)
         # --continue lets yt-dlp resume a partial .part
         # file if the app crashes or is restarted mid-download.
@@ -588,6 +711,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # --break-on-existing skips past chronologically-newer successes
     # and these videos are silently lost.
     _failed_this_run: set = set()
+    _net_warned: set = set()   # vids already shown a "couldn't reach" notice
     current_title = ""
     dest_path = ""
     # Path captured from `[Merger] Merging formats into "PATH"` — this is
@@ -911,9 +1035,47 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         if proc is None:
             continue # streams pass launch failed — skip, main pass completed
 
+        # No-output watchdog. readline() below BLOCKS while yt-dlp silently
+        # grinds through connection retries, so one unreachable video can
+        # freeze the whole pass — and pause/cancel (checked per-line) stop
+        # responding too. This thread force-kills the proc if it emits
+        # nothing for _NO_OUTPUT_KILL_SEC, or the instant cancel/pause is
+        # requested. Killing it makes readline() return b"" so the loop
+        # exits cleanly. 120s sits well above any real gap (downloads stream
+        # progress lines via --newline; `-c copy` merges finish in seconds)
+        # but far below the multi-minute stalls a dead CDN host caused.
+        _NO_OUTPUT_KILL_SEC = 120
+        _last_out = [time.time()]
+        _wd_stop = threading.Event()
+        _wd_stalled = {"hit": False}
+        def _download_watchdog(_p=proc):
+            while not _wd_stop.wait(3.0):
+                if _p.poll() is not None:
+                    return
+                if (cancel_event is not None and cancel_event.is_set()) or \
+                   (pause_event is not None and pause_event.is_set()):
+                    try: _p.kill()
+                    except Exception: pass
+                    return
+                if time.time() - _last_out[0] > _NO_OUTPUT_KILL_SEC:
+                    _wd_stalled["hit"] = True
+                    try:
+                        stream.emit([[f" ⚠ No response for "
+                                      f"{_NO_OUTPUT_KILL_SEC}s — skipping this "
+                                      f"download and moving on.\n", "red"]])
+                        stream.flush()
+                    except Exception:
+                        pass
+                    try: _p.kill()
+                    except Exception: pass
+                    return
+        threading.Thread(target=_download_watchdog,
+                         name="dl-watchdog", daemon=True).start()
+
         # Manual line iteration on the bytes stream so we can apply our
         # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
         for _line_bytes in iter(proc.stdout.readline, b""):
+            _last_out[0] = time.time()   # watchdog heartbeat
             line = _utils.decode_subprocess_line(_line_bytes)
             if cancel_event is not None and cancel_event.is_set():
                 try:
@@ -1195,15 +1357,45 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             _log.info(
                                 "DLTRACK orphan recovered via .info.json: "
                                 "vid=%s -> %s", vid, _ip)
+                    # yt-dlp's DLTRACK id field (%(id)s) can come back EMPTY
+                    # for some videos. We may still have bound the downloaded
+                    # file (via Merger / Destination / recent-scan above), and
+                    # yt-dlp wrote a `<base>.info.json` beside it carrying the
+                    # real id. Recover it by JSON CONTENT (robust to the
+                    # filename-stem mismatch the stem-based resolver trips on —
+                    # e.g. titles sanitized to a fullwidth colon) so the video
+                    # registers WITH its id instead of dropping to a NULL-id
+                    # row that the sweep then skips forever (id + metadata
+                    # never captured). The .info.json fallback must NOT depend
+                    # on DLTRACK having produced an id.
+                    if not vid and final_path and os.path.isfile(final_path):
+                        try:
+                            from .. import index as _idx
+                            _sc_id = _idx._resolve_id_from_sidecars(final_path)
+                        except Exception as _sce:
+                            _sc_id = ""
+                            _log.debug("DLTRACK sidecar id recovery failed: %s",
+                                       _sce)
+                        if _sc_id:
+                            vid = _sc_id
+                            if vid not in downloaded_ids:
+                                downloaded_ids.append(vid)
+                            _log.info(
+                                "DLTRACK empty id recovered via .info.json: "
+                                "%s -> %s", os.path.basename(final_path), vid)
                     if (vid and (not final_path
                                  or not os.path.isfile(final_path))):
                         # Pathological: we hold an authoritative YouTube id
                         # from DLTRACK but could not bind it to ANY file on
                         # disk — not via Merger/Destination/scan, not even via
-                        # the freshly-written .info.json. NEVER swallow this:
-                        # surface it loudly so the user can re-sync, instead of
-                        # silently registering the file later with no id.
-                        _log.error(
+                        # the freshly-written .info.json. Often just a failed
+                        # download (network timeout) where yt-dlp still printed
+                        # the after_video line — so log at DEBUG (verbose-only,
+                        # tagged "dim") instead of ERROR. ERROR rendered as a
+                        # red "[ytarchiver.backend.sync.core] …" line that
+                        # leaked into Simple mode; the user already sees the
+                        # friendly "Couldn't reach YouTube" notice there.
+                        _log.debug(
                             "DLTRACK could not bind a file for vid=%s "
                             "title=%r in %s — id at risk of being lost",
                             vid, t, ch_dir)
@@ -1948,7 +2140,54 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         except OSError:
                             pass
                     continue
-                stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
+                # How this error line is DISPLAYED depends on the log mode;
+                # the counting + retry-tracking below is unchanged (only the
+                # visible text differs). In Simple mode, collapse yt-dlp's
+                # technical network-failure spew — e.g. "(<HTTPSConnection
+                # host='rr3---...googlevideo.com'> ... timed out (connect
+                # timeout=20.0)). Giving up after 10 retries" — plus the bare
+                # "ERROR:" header line into a single plain-English notice. The
+                # failed video is still tracked + retried next pass (see
+                # below), which the message states. Verbose mode keeps the raw
+                # text, which is useful for diagnosing which CDN host failed.
+                _net_frags = (
+                    "timed out", "timeout=", "connection to ",
+                    "httpsconnection", "httpconnection", "connection reset",
+                    "connection refused", "connection aborted",
+                    "max retries exceeded", "getaddrinfo failed",
+                    "failed to establish a new connection",
+                    "temporary failure in name resolution",
+                    "network is unreachable", "name or service not known",
+                    "urlopen error",
+                )
+                _is_net_err = any(_f in low for _f in _net_frags)
+                if (getattr(stream, "simple_mode", False)
+                        and (_is_net_err or low.strip() in ("error:", "error"))):
+                    # Show ONE friendly line on the final give-up; the bare
+                    # "ERROR:" header and any mid-retry partials render
+                    # nothing in Simple mode.
+                    if "giving up" in low or "max retries exceeded" in low:
+                        # One failed video can emit several "giving up" lines
+                        # (separate video + audio streams) — show the friendly
+                        # notice only ONCE per video.
+                        if not (current_vid_id
+                                and current_vid_id in _net_warned):
+                            _gave_up_now = False
+                            if current_vid_id:
+                                _net_warned.add(current_vid_id)
+                                # Robust strike count (dedicated store) — at 3
+                                # syncs it archives the video + emits give-up,
+                                # so it stops nagging every single sync.
+                                _gave_up_now = _record_timeout_strike(
+                                    current_vid_id, stream)
+                            if not _gave_up_now:
+                                stream.emit([
+                                    [" ⚠ Couldn't reach YouTube (network "
+                                     "timeout) — will retry on the next "
+                                     "sync.\n", "red"],
+                                ])
+                else:
+                    stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
                 if "error" in low:
                     errors += 1
                     # capture the video ID that failed so we
@@ -1965,9 +2204,23 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     # natural-language 11-letter words ("permissions",
                     # "downloading") that would otherwise get stuffed
                     # into the failed list and re-tried as a yt-dlp URL.
-                    _err_vid_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
-                    if _err_vid_m and not _err_vid_m.group(1).isalpha():
-                        _failed_this_run.add(_err_vid_m.group(1))
+                    # Prefer the authoritative current_vid_id (captured from
+                    # yt-dlp's "[youtube] <id>:" lines) over scraping an
+                    # 11-char token out of the raw error text. A network
+                    # timeout names the CDN host
+                    # (rr3---sn-vgqsknzl.googlevideo.com); its 11-char
+                    # fragment "sn-vgqsknzl" was being mis-captured as the
+                    # video id — poisoning failed_video_ids with a phantom
+                    # retry, printing a bogus give-up URL, and (worst) never
+                    # tracking the REAL failer, so an unreachable video was
+                    # re-discovered and re-tried every single sync forever.
+                    # Fall back to the scrape only when no current id is known.
+                    if current_vid_id:
+                        _failed_this_run.add(current_vid_id)
+                    else:
+                        _err_vid_m = re.search(r"\b([A-Za-z0-9_-]{11})\b", s)
+                        if _err_vid_m and not _err_vid_m.group(1).isalpha():
+                            _failed_this_run.add(_err_vid_m.group(1))
                 # Rate-limit detection: 429 or HTTP 429 in the output → pause
                 # for 30s before continuing. yt-dlp retries internally but we
                 # want the log to show we're waiting rather than hammering.
@@ -1984,6 +2237,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
             # Default: dim
             stream.emit([[f" {s}\n", "dim"]])
+
+        # Stop the watchdog. If it killed a stalled download, count the
+        # in-flight video as failed so the 3-strike give-up advances toward
+        # permanently skipping it.
+        try: _wd_stop.set()
+        except Exception as _wde: _log.debug("swallowed: %s", _wde)
+        if _wd_stalled.get("hit") and current_vid_id:
+            _failed_this_run.add(current_vid_id)
 
         try:
             proc.wait(timeout=10)
@@ -2075,17 +2336,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # failures during the bulk download path. Runs after metadata so
     # the JSONL is current.
     if downloaded > 0 and not _post_sync_cancelled:
+        # Backgrounded — this walks the channel's .Thumbnails tree, which is
+        # minutes on a large channel; running it inline blocked the sync.
         try:
             from .. import metadata as _md
-            _sweep = _md.sweep_missing_thumbnails(
-                channel, stream=stream, cancel_event=cancel_event)
-            if _sweep.get("fetched"):
-                stream.emit_dim(
-                    f" (thumbnail sweep: {_sweep['fetched']} fetched, "
-                    f"{_sweep['missing']} still missing)")
+            _bg_channel_maintenance(
+                "thumbs", _md.sweep_missing_thumbnails,
+                channel, stream=None, cancel_event=cancel_event)
         except Exception as _ts_e:
-            stream.emit_dim(
-                f" (thumbnail sweep skipped: {_ts_e})")
+            _log.debug("thumbnail sweep spawn skipped: %s", _ts_e)
 
     # persist the updated failed_video_ids list.
     # - Successful retries (vid appears in downloaded_ids) get removed.
@@ -2094,22 +2353,57 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     #   give up on permanently-broken IDs and stop log spam).
     try:
         _next_failed: dict[str, int] = {}
+        _gave_up: list[str] = []   # failed 3 syncs in a row → stop trying
         for _v, _c in (_prior_failed or {}).items():
             if not isinstance(_v, str) or not isinstance(_c, int):
                 continue
             if _v in downloaded_ids:
                 continue  # retry succeeded — drop
             if _v in _failed_this_run:
-                _next_failed[_v] = min(3, _c + 1)
+                # Failed AGAIN this sync. 3rd strike in a row → give up.
+                if _c + 1 >= 3:
+                    _gave_up.append(_v)
+                else:
+                    _next_failed[_v] = _c + 1
             elif _c < 3:
                 _next_failed[_v] = _c  # retry pending; not seen this run
         for _v in _failed_this_run:
             if _v in downloaded_ids:
                 continue  # error line but DLTRACK fired later — succeeded
-            if _v in _next_failed:
+            if _v in _next_failed or _v in _gave_up:
                 continue  # already accounted for above
             _next_failed[_v] = 1
-        # Drop IDs that hit the retry cap so they stop being attempted.
+        # FAILSAFE: permanently give up on IDs that failed 3 syncs in a row.
+        # Write them to the download-archive so the channel walk stops
+        # re-discovering them every sync — the OLD code just dropped them
+        # from the retry list, but the next walk re-found the still-missing
+        # video and restarted the 3-strike cycle forever (the user's
+        # "stuck on this video" report). Emit a clear give-up line so it's
+        # visible, not a silent stall. To try again later: paste the URL
+        # in the Download tab (single-URL download ignores this archive).
+        for _v in _gave_up:
+            try:
+                with _archive_write_lock:
+                    with open(ARCHIVE_FILE, "ab") as _af:
+                        _af.write(f"youtube {_v}\n".encode("utf-8"))
+                        try: _af.flush()
+                        except OSError: pass
+            except OSError as _ae:
+                _log.debug("gave-up archive write failed: %s", _ae)
+            try:
+                stream.emit([
+                    [" ⛔ Gave up on ", "red"],
+                    [f"https://youtube.com/watch?v={_v}", "red"],
+                    [" after 3 failed syncs — couldn't reach it. Won't "
+                     "auto-retry; paste its URL in the Download tab to try "
+                     "again.\n", "red"],
+                ])
+            except Exception as _ee:
+                _log.debug("swallowed: %s", _ee)
+        if _gave_up:
+            try: stream.flush()
+            except Exception as _fe: _log.debug("swallowed: %s", _fe)
+        # Safety net: counts in _next_failed are already < 3 by construction.
         _next_failed = {v: c for v, c in _next_failed.items() if c < 3}
         # Only write if something actually changed (avoid config churn
         # on every successful sync).
@@ -2422,13 +2716,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # config). If orphan .vtt accumulation ever happens outside a
     # download event, it gets caught on the next pass that does download.
     if downloaded > 0:
+        # Backgrounded — full os.walk of the channel folder (minutes on a
+        # large channel); inline it blocked the sync after each download.
         try:
-            _swept = _sweep_orphan_vtts(str(ch_dir), cancel_event=cancel_event)
-            if _swept > 0:
-                stream.emit([[" ", "dim"],
-                             [f"Swept {_swept} orphan caption file(s).\n", "dim"]])
+            _bg_channel_maintenance(
+                "vtt", _sweep_orphan_vtts, str(ch_dir),
+                cancel_event=cancel_event)
         except Exception as _sve:
-            stream.emit_dim(f" (vtt sweep skipped: {_sve})")
+            _log.debug("vtt sweep spawn skipped: %s", _sve)
 
     # Also refresh the channel's avatar/banner art. Internal 30-day
     # threshold on channel_art.fetch_channel_art means this is near-free

@@ -600,6 +600,24 @@ def register_video(filepath: str, channel: str, title: str | None = None,
         _sc_vid = _resolve_id_from_sidecars(fp)
         if _sc_vid:
             vid_id = _sc_vid
+    if not vid_id:
+        # Final, dead-simple, CACHE-FREE guarantee: yt-dlp writes
+        # "<stem>.info.json" with the SAME stem as the video file and the
+        # real id inside it. Read that exact sibling directly — no filename/
+        # title matching, no per-directory cache — so a video is NEVER
+        # registered id-less when its own sidecar is sitting right beside it.
+        # The resolvers above can trip on punctuation / fullwidth-colon names
+        # (extract_video_id's stem logic) or a stale dir-mtime cache
+        # (_resolve_id_from_sidecars); this can't.
+        try:
+            _direct_info = os.path.splitext(fp)[0] + ".info.json"
+            if os.path.isfile(_direct_info):
+                with open(_direct_info, "r", encoding="utf-8") as _jf:
+                    _jid = str((json.load(_jf) or {}).get("id") or "").strip()
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", _jid):
+                    vid_id = _jid
+        except Exception as _je:
+            _log.debug("direct .info.json id read failed (%s): %s", fp, _je)
     vid_url = f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None
     year, month = _parse_year_month_from_path(fp)
     # Single os.stat() call rather than separate isfile + getsize +
@@ -1004,6 +1022,18 @@ def list_recent_videos(limit: int = 200, channel: str | None = None
 _browse_videos_cache: dict[tuple[str, str, int, bool], list[dict[str, Any]]] = {}
 _browse_cache_lock = threading.Lock()
 
+# Global "Videos" (all-videos) view cache. list_all_videos runs its own
+# cross-channel query + per-row thumbnail resolution — and that thumbnail
+# pass is the ~10s cost on a cold open. Unlike the per-channel grids
+# (cached above), the Videos view had no result cache, so it re-paid that
+# cost every open even after the Browse preload finished. Cache the
+# fully-resolved page (incl. thumbnail URLs) keyed by
+# (sort, limit, offset, include_thumbs) so re-opening is instant and
+# survives OS file-cache eviction. Cleared wholesale by
+# invalidate_channel_videos (any video add/delete/re-transcribe in any
+# channel can change the global list). Shares _browse_cache_lock.
+_all_videos_cache: dict[tuple[str, int, int, bool], dict[str, Any]] = {}
+
 # Per-channel thumbnail index cache. Keyed by channel-root path, value
 # is {"mtime": float, "thumbs": {vid_id: thumb_path}}. The audit
 # previously required a full os.walk of every Browse first-click; with
@@ -1023,6 +1053,10 @@ def invalidate_channel_videos(channel: str | None = None) -> None:
             for key in list(_browse_videos_cache.keys()):
                 if key[0] == channel:
                     del _browse_videos_cache[key]
+        # The global Videos view spans every channel, so any per-channel
+        # change can shift it — always clear it wholesale (it's tiny: a
+        # few pages of the default sort).
+        _all_videos_cache.clear()
 
 
 def preload_channel_videos(channel: str,
@@ -1081,6 +1115,17 @@ def preload_all_channels(channel_names: list[str],
         except Exception:
             active = False
         _t.sleep(0.2 if active else 0.03)
+    # Warm the global "Videos" view's first page now that every channel's
+    # thumbnail data is hot. list_all_videos has its own result cache
+    # (_all_videos_cache) but no warmer, so without this the first
+    # Browse>Videos click still paid the cold ~10s per-row thumbnail walk.
+    # Match videosView.js's default request exactly: sort="recent",
+    # PAGE=60, offset=0, include_thumbs=True.
+    if not (cancel_ev is not None and cancel_ev.is_set()):
+        try:
+            list_all_videos("recent", 60, 0, include_thumbs=True)
+        except Exception as e:
+            _log.debug("preload all-videos first page failed: %s", e)
     return out
 
 
@@ -1948,6 +1993,15 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
         lim = max(1, int(limit)); off = max(0, int(offset))
     except (TypeError, ValueError):
         lim, off = 60, 0
+    # Result-cache hit (see _all_videos_cache). Skips the per-row thumbnail
+    # disk-walk that makes a cold open ~10s. Return copies so callers can't
+    # mutate the cached page.
+    _ck = ((sort or "recent").lower(), lim, off, bool(include_thumbs))
+    with _browse_cache_lock:
+        _hit = _all_videos_cache.get(_ck)
+    if _hit is not None:
+        return {"rows": [dict(r) for r in _hit["rows"]],
+                "has_more": _hit["has_more"], "offset": _hit["offset"]}
     try:
         with _reader_lock:
             cur = conn.execute(
@@ -2000,7 +2054,45 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
             except Exception:
                 pass
         out.append(d)
+    # Store a copy in the result cache so the next open is instant.
+    with _browse_cache_lock:
+        _all_videos_cache[_ck] = {"rows": [dict(r) for r in out],
+                                  "has_more": has_more, "offset": off}
     return {"rows": out, "has_more": has_more, "offset": off}
+
+
+def find_archived_by_video_id(video_id: str) -> dict | None:
+    """Return {title, channel, filepath} for an archived video matching this
+    YouTube id, or None if it isn't in the index.
+
+    Used by the single-URL Download pre-check to warn before re-downloading
+    something already archived. Deliberately queries the live index
+    (videos.video_id) rather than a separate "already-downloaded" list, so the
+    warning always reflects what is ACTUALLY archived right now (delete the
+    file and it correctly stops reporting as archived). Rows flagged as
+    duplicates are ignored. Never raises.
+    """
+    vid = (video_id or "").strip()
+    if not vid:
+        return None
+    conn = _reader_open()
+    if conn is None:
+        return None
+    try:
+        with _reader_lock:
+            cur = conn.execute(
+                "SELECT title, channel, filepath FROM videos "
+                "WHERE video_id = ? AND is_duplicate_of IS NULL "
+                "ORDER BY (filepath IS NOT NULL) DESC, id ASC LIMIT 1",
+                (vid,))
+            row = cur.fetchone()
+    except sqlite3.Error as e:
+        _log.debug("find_archived_by_video_id query failed: %s", e)
+        return None
+    if not row:
+        return None
+    return {"title": row[0] or "", "channel": row[1] or "",
+            "filepath": row[2] or ""}
 
 
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,

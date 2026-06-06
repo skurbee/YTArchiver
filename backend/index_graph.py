@@ -194,6 +194,14 @@ def graph_word_frequency(word: str, channel: str | None = None,
     if conn is None or not word.strip():
         return {"labels": [], "values": []}
     word = word.strip()
+    # Normalize the same way Search does so hyphenated / punctuated terms
+    # (e.g. "well-known") plot real data instead of silently rendering an
+    # empty chart. Lazy import to avoid any import cycle at module load.
+    try:
+        from .index_search import _normalize_fts_query as _norm_fts
+        word = _norm_fts(word)
+    except Exception:
+        pass
     if bucket == "week":
         # LEFT JOIN so segments with NULL video_id (common
         # for legacy rows and drop-in-mode archives without .info.json)
@@ -216,7 +224,14 @@ def graph_word_frequency(word: str, channel: str | None = None,
         if channel:
             sql += " AND s.channel=?"
             args.append(channel)
-        # No GROUP BY here — we aggregate in Python using isocalendar().
+        # GROUP BY upload_ts so each video returns its own (ts, count) row.
+        # Without it the bare COUNT(*) aggregate collapses the ENTIRE result
+        # to a single row (one arbitrary ts + the full match total), which
+        # rendered the week plot as one wildly-inflated bogus bucket per word
+        # (e.g. "2015-W12 ~80k"). ISO-week grouping is still done in Python
+        # below so year-boundary weeks (e.g. 2024-12-30 → 2025-W01) don't
+        # split across two labels.
+        sql += " GROUP BY v.upload_ts"
     else:
         # FTS5 MATCH to find segments containing the word
         group_col = ("year || '-' || printf('%02d', month)"

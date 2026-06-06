@@ -618,6 +618,10 @@
       try {
       const payload = collectPayload();
       if (!payload.folder) { flashError("Folder name is required."); return; }
+      if (/[\\/:*?"<>|]/.test(payload.folder)) {
+        flashError('Folder name can’t contain any of \\ / : * ? " < > |');
+        return;
+      }
       if (!payload.url) { flashError("Channel URL is required."); return; }
       const api = window.pywebview?.api;
       if (!api) { flashError("Not running in native mode — writes disabled."); return; }

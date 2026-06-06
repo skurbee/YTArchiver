@@ -431,8 +431,17 @@
         const seg = e.target.closest(".seg");
         if (!seg) return;
         e.preventDefault();
-        const ts = seg.querySelector(".timestamp")?.textContent || "";
-        const text = seg.textContent.replace(ts, "").trim();
+        // The Watch transcript renders as flowing text with NO ".timestamp"
+        // element — each segment/word carries its start time in data-s
+        // (seconds), the same source the click-to-seek path uses. Derive the
+        // moment from the clicked word (most precise), falling back to the
+        // segment start. Previously this read a non-existent ".timestamp"
+        // node → "" → 0, so bookmarks recorded the player head (0:00 on an
+        // un-played video) instead of where the text is actually spoken.
+        const wordEl = e.target.closest(".word");
+        const start = parseFloat((wordEl && wordEl.dataset.s) || seg.dataset.s) || 0;
+        const ts = _fmtTs(start);
+        const text = seg.textContent.trim();
         const api = window.pywebview?.api;
         const v = _browseState.currentVideo || {};
         showContextMenu(e.clientX, e.clientY, [
@@ -441,7 +450,6 @@
           { sep: true },
           { label: "Bookmark this moment\u2026", action: async () => {
             if (!api?.bookmark_add) return;
-            const start = _parseTs(ts.replace(/[\[\]]/g, ""));
             // right-click on a transcript segment always
             // creates a timestamped bookmark with no note prompt.
             const res = await api.bookmark_add({
@@ -470,6 +478,17 @@
     if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
     if (parts.length === 2) return parts[0]*60 + parts[1];
     return 0;
+  }
+
+  // seconds -> "m:ss" (or "h:mm:ss"); inverse of _parseTs, for the copy /
+  // bookmark labels now that the transcript stores time in data-s seconds.
+  function _fmtTs(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const mm = h ? String(m).padStart(2, "0") : String(m);
+    return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
   }
 
   window.initBrowseContextMenus = initBrowseContextMenus;

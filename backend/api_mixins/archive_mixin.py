@@ -22,6 +22,39 @@ _archive_init_lock = threading.Lock()
 
 class ArchiveMixin:
 
+    # ─── Already-archived pre-check (Download-tab warning) ──────────────
+
+    def single_video_archived(self, url):
+        """Does this pasted URL point to a video already in the archive?
+
+        Lightweight, read-only pre-check for the Download tab — it NEVER
+        downloads anything. Returns
+        ``{ok, archived, video_id, title, channel}``. The frontend uses it to
+        warn ("already archived — download anyway?") before calling
+        archive_single_video.
+
+        We resolve the YouTube id from the URL and look it up in the live
+        index (videos.video_id) rather than tracking a separate
+        "already-downloaded" id list, so the answer always reflects what is
+        actually archived right now. On any failure we report not-archived so
+        the check can never block a legitimate download.
+        """
+        try:
+            from ..view_format import _extract_video_id
+            vid = _extract_video_id((url or "").strip())
+            if not vid:
+                return {"ok": True, "archived": False, "video_id": ""}
+            from .. import index as _idx
+            hit = _idx.find_archived_by_video_id(vid)
+            if not hit:
+                return {"ok": True, "archived": False, "video_id": vid}
+            return {"ok": True, "archived": True, "video_id": vid,
+                    "title": hit.get("title", ""),
+                    "channel": hit.get("channel", "")}
+        except Exception as e:
+            _log.debug("single_video_archived check failed: %s", e)
+            return {"ok": True, "archived": False, "video_id": ""}
+
     # ─── Single-URL archive (Enter on URL field) ───────────────────────
 
     def archive_single_video(self, url, options=None):
@@ -193,7 +226,13 @@ class ArchiveMixin:
             _emit_dwnld()
             # Mirror YTArchiver.py:17327 build_video_cmd exactly — skip the
             # mp4 merge args when downloading audio-only.
-            cmd = [yt, "--newline", "--no-quiet", "--continue"]
+            cmd = [yt, "--newline", "--no-quiet", "--continue",
+                   # Bound the per-connection wait the same way the sync path
+                   # does (sync/core.py). Without these, a single-URL download
+                   # of a CDN-unreachable video grinds for many minutes on
+                   # yt-dlp's defaults (~10 retries x ~20s connect timeout)
+                   # instead of giving up in ~45s.
+                   "--retries", "3", "--socket-timeout", "15"]
             if date_file:
                 cmd.append("--mtime")
             cmd += ["--trim-filenames", "200", "--format", fmt]

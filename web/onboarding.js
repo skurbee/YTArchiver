@@ -27,6 +27,7 @@
   let _whisperBusy = false;
   let _whisperChecking = false; // auto import-verify in flight
   let _deps = null;           // last probe snapshot
+  let _force = false;         // true when re-opened from Settings (dismissable)
 
   const STEP_NEXT_LABEL = { 1: "Get started", 2: "Continue", 3: "Continue", 4: "Finish" };
 
@@ -308,9 +309,27 @@
     document.removeEventListener("keydown", _escBlock, true);
   }
 
+  // Hide the wizard WITHOUT finalizing setup. Used by the close (X) button
+  // and by Escape when the wizard was re-opened from Settings ({force:true}).
+  // Deliberately does NOT call onboarding_finish — only the Finish button
+  // finalizes — so re-running setup and bailing leaves the existing
+  // onboarded state untouched.
+  function dismiss() {
+    const ov = $("onboarding-overlay");
+    if (ov) ov.hidden = true;
+    document.removeEventListener("keydown", _escBlock, true);
+  }
+
   function _escBlock(e) {
     if (e.repeat) return;
-    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      // Genuine first-run stays trapped (deliberate — don't let setup be
+      // skipped by a stray Esc). When re-opened from Settings ("Run setup
+      // again"), Escape closes it like any other inspectable dialog.
+      if (_force) dismiss();
+    }
   }
 
   let _wired = false;
@@ -326,6 +345,7 @@
       if (_step < 4) gotoStep(_step + 1);
       else finish();
     });
+    $("onb-close")?.addEventListener("click", dismiss);
   }
 
   // ── entry point ───────────────────────────────────────────────────────
@@ -334,6 +354,11 @@
     if (!ov) { console.warn("[onboarding] overlay element missing"); return; }
     wireOnce();
     _step = 1; _folder = ""; _coreBusy = false; _whisperBusy = false; _whisperChecking = false;
+    // Re-opened from Settings > Tools ("Run setup again") → dismissable
+    // (show the X, allow Esc). Genuine first-run (no force) stays gated.
+    _force = !!(opts && opts.force);
+    const closeBtn = $("onb-close");
+    if (closeBtn) closeBtn.hidden = !_force;
     // Seed state from the backend (best-effort; the wizard still works if
     // this fails — the user can Browse + Re-check manually).
     try {

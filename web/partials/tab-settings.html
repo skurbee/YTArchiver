@@ -289,6 +289,18 @@
               <button class="btn btn-ghost btn-thin" id="btn-reset-sync-state"
                       title="Reset a channel's bootstrap/sync state so the next sync walks from scratch">Reset channel&hellip;</button>
             </div>
+
+            <!-- Fill missing video lengths by ffprobing each file locally
+                 (no YouTube). The disk-sweep / import paths register videos
+                 without a duration, so the Videos grid shows no length badge
+                 for them; this reads the true runtime from the file itself.
+                 Local only; progress streams to the main log; stoppable and
+                 resumable (re-run picks up the rest). -->
+            <label class="edit-gl">Video lengths</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-fix-video-lengths"
+                      title="Read each video's true length with ffprobe (local, no YouTube) to fill in missing lengths shown in Browse &gt; Videos. Progress streams to the log; you can Stop and re-run to resume.">Check / fix&hellip;</button>
+            </div>
           </div>
         </div>
 

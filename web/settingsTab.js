@@ -457,6 +457,80 @@
       });
     })();
 
+    // Video-length backfill (Settings > Tools). ffprobes files locally to
+    // fill missing lengths in the Videos grid. The button toggles between
+    // "Check / fix" and "Stop" depending on whether a pass is running.
+    (function wireFixVideoLengths() {
+      const btn = document.getElementById("btn-fix-video-lengths");
+      if (!btn) return;
+      const IDLE = "Check / fix…";
+      let running = false;
+      const setRunning = (r) => {
+        running = r;
+        btn.textContent = r ? "Stop" : IDLE;
+        btn.classList.toggle("btn-danger", r);
+      };
+      // Reflect a pass already in progress (e.g. user re-opened Settings).
+      (async () => {
+        try {
+          const s = await window.pywebview?.api?.video_lengths_backfill_running?.();
+          if (s?.running) setRunning(true);
+        } catch (_e) { /* non-fatal */ }
+      })();
+      // Backend calls this on completion (with the count filled): flip the
+      // button back to idle and refresh the Videos grid if anything changed.
+      window._onVideoLengthsBackfilled = function (filled) {
+        setRunning(false);
+        if (filled && window._loadVideosView) {
+          try { window._loadVideosView(); } catch (_e) {}
+        }
+      };
+      btn.addEventListener("click", async () => {
+        const api = window.pywebview?.api;
+        if (!api?.video_lengths_backfill_start) {
+          window._showToast?.("Native mode required.", "warn");
+          return;
+        }
+        if (running) {
+          try { await api.video_lengths_backfill_cancel?.(); } catch (_e) {}
+          window._showToast?.("Stopping… lengths filled so far are kept; re-run to resume.", "ok");
+          setRunning(false);
+          return;
+        }
+        let missing = 0;
+        try {
+          const c = await api.video_lengths_missing_count?.();
+          if (c?.ok) missing = c.missing || 0;
+        } catch (_e) { /* non-fatal */ }
+        if (!missing) {
+          window._showToast?.("Every video already has a length.", "ok");
+          return;
+        }
+        const ok = await (window.askConfirm
+          ? window.askConfirm("Check / fix video lengths",
+              `${missing.toLocaleString()} video(s) have no stored length.\n\n`
+              + "I'll read the true length from each file locally with ffprobe "
+              + "(no YouTube). It runs in the background — progress shows in "
+              + "the log, and you can Stop any time and re-run to resume.\n\n"
+              + "Large archives can take ~15–30 minutes.",
+              { confirm: "Fix now" })
+          : Promise.resolve(true));
+        if (!ok) return;
+        try {
+          const r = await api.video_lengths_backfill_start();
+          if (r?.ok) {
+            setRunning(true);
+            window._showToast?.(
+              `Filling ${missing.toLocaleString()} length(s) — progress in the log.`, "ok");
+          } else {
+            window._showToast?.(r?.error || "Couldn't start.", "warn");
+          }
+        } catch (e) {
+          window._showToast?.(`Couldn't start: ${e}`, "warn");
+        }
+      });
+    })();
+
     // (Save button removed — every field auto-saves. The path fields are
     // readonly and only change via the Browse pickers below, so they
     // persist right after a folder is chosen.)

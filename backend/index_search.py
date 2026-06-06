@@ -40,6 +40,60 @@ def _sanitize_fts_query(q: str) -> str:
     return cleaned
 
 
+def _normalize_fts_query(raw: str) -> str:
+    """Make a user-typed query safe for FTS5 MATCH *without* breaking the
+    supported operators.
+
+    The Search UI exposes five operators that arrive as literal text in the
+    box: AND / OR / NOT, "exact phrase" (double quotes) and word* (trailing
+    wildcard). Everything else is a plain term — but FTS5 treats characters
+    like '-' (inside "well-known"), stray quotes, ':' and '^' as query
+    syntax, so a hyphenated word errors out / matches nothing (the reported
+    bug) and a stray quote aborts the parse.
+
+    Tokenize (keeping balanced "phrases" intact), pass operator keywords /
+    phrases / trailing wildcards through unchanged, and wrap any bare term
+    containing FTS5-special characters in double quotes so FTS5 treats it as
+    a literal phrase: "well-known" -> "well known" (adjacent), exactly what
+    the user expects. The except-retry sanitizer in search_fts stays as a
+    last-ditch fallback. Verified against a live FTS5 table across all five
+    operators plus hyphen / apostrophe / percent / unbalanced-quote inputs.
+    """
+    import re as _re
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+    _OPS = {"AND", "OR", "NOT", "NEAR"}
+    _TOKENS = _re.compile(r'"[^"]*"|\S+')
+    _CLEAN = _re.compile(r'[^\W_]+', _re.UNICODE)  # bareword: alnum + non-ASCII
+
+    def _tok(t: str) -> str:
+        # Balanced "exact phrase" — keep as written (drop if empty).
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"' and t.count('"') % 2 == 0:
+            return "" if t.strip('"').strip() == "" else t
+        if t in _OPS:                      # bare operator keyword — keep
+            return t
+        lead = ""                          # peel grouping parens so "(a OR b)" survives
+        while t[:1] == "(":
+            lead += "("; t = t[1:]
+        trail = ""
+        while t[-1:] == ")":
+            trail = ")" + trail; t = t[:-1]
+        star = ""                          # preserve a trailing wildcard
+        if t[-1:] == "*":
+            star = "*"; t = t[:-1]
+        t = t.replace('"', "")             # drop stray quotes from a bare term
+        if t == "":
+            return lead + trail
+        if _CLEAN.fullmatch(t):            # plain word — leave bare
+            return lead + t + star + trail
+        return lead + '"' + t + '"' + star + trail   # specials → literal phrase
+
+    out = [x for x in (_tok(t) for t in _TOKENS.findall(raw)) if x]
+    result = " ".join(out).strip()
+    return result or raw
+
+
 def search_video_titles(query: str,
                           channel: Any | None = None,
                           limit: int = 200,
@@ -239,9 +293,15 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
             cur = conn.execute(q + suffix, [q_text] + args_suffix)
             return cur.fetchall()
 
+    # Proactively normalize so plain terms containing FTS5-special chars
+    # (e.g. the hyphen in "well-known", a stray quote, "%") match literally
+    # instead of erroring / silently matching nothing — while the supported
+    # AND/OR/NOT/"phrase"/word* operators pass through untouched. The
+    # except-retry below remains as a last-ditch fallback.
     rows: list[Any] = []
+    _qnorm = _normalize_fts_query(query)
     try:
-        rows = _run(query)
+        rows = _run(_qnorm)
     except sqlite3.Error:
         # Roll back any aborted txn state on the shared reader
         # connection before retrying — otherwise the second _run

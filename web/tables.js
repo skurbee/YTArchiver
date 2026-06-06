@@ -81,12 +81,27 @@
       // explains the legend, but cell-level tips give a 1-line spec to
       // the exact value the user is hovering — without these, "A ✓"
       // is opaque to anyone who hasn't read the header carefully.
+      // Decode the compact mark shorthand into a plain-English tooltip.
+      // Backend (_mark) emits: "A ✓" = auto on + caught up; "✓" = done
+      // manually; a trailing " -N" = N videos still waiting; "—" = not
+      // enabled. The pending suffix can ride along with ANY prefix
+      // ("A ✓ -3" = auto on but 3 behind), so check it first — the old
+      // logic reported "fully transcribed" for "A ✓ -N" because it matched
+      // the prefix before noticing the -N.
       const _markTip = (label, v) => {
         const s = String(v || "").trim();
-        if (s.startsWith("A ")) return `${label}: auto-${label.toLowerCase()} is ON and the channel is fully ${label.toLowerCase()}d`;
-        if (s.startsWith("✓") || s.startsWith("✓")) return `${label}: complete (auto-${label.toLowerCase()} is OFF — done manually)`;
-        if (s.includes("-")) return `${label}: ${s.match(/-(\d+)/)?.[1] || "?"} videos behind`;
-        if (s === "—" || s === "—") return `${label}: not configured for this channel`;
+        const lc = label.toLowerCase();
+        const verb = lc === "metadata" ? "fetched" : "transcribed";
+        const behind = parseInt((s.match(/-(\d+)\s*$/) || [])[1] || "0", 10);
+        const autoOn = s.startsWith("A ");
+        if (behind > 0) {
+          return `${label}: ${behind} video${behind === 1 ? "" : "s"} waiting to be ${verb}`
+               + (autoOn ? " (auto is on — will catch up next sync)"
+                         : ` (auto-${lc} is off)`);
+        }
+        if (autoOn) return `${label}: auto-${lc} is ON — up to date`;
+        if (s.includes("✓")) return `${label}: complete (done manually; auto-${lc} is off)`;
+        if (s === "—") return `${label}: not enabled for this channel`;
         return label;
       };
       const _compressTip = (v) => {

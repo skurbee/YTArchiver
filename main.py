@@ -384,7 +384,11 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
     def set_window(self, w):
         self._window = w
         self._log_stream.set_window(w)
-        _get_logger("startup").info(f"YTArchiver {APP_VERSION} started")
+        # NOTE: the "YTArchiver <ver> started" banner is emitted at the TOP
+        # of _run_startup_sequence (not here) so it always precedes the
+        # "Startup checks complete" milestone. Emitting it here logged it
+        # AFTER the buffered startup output flushed, so "checks complete"
+        # rendered above "started" — making the checks look fake.
 
     def _on_queue_changed(self):
         """Push updated queue state to the UI whenever anything changes."""
@@ -525,6 +529,15 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         """
         import time as _time
         s = self._log_stream
+
+        # App-started banner FIRST — must precede the "Startup checks
+        # complete" milestone below. (Moved here from set_window, whose log
+        # fired after this buffered output flushed, so "checks complete"
+        # appeared above "started" and made the checks look instantaneous.)
+        try:
+            s.emit_text(f"YTArchiver {APP_VERSION} started", None)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
         def _flush_now():
             try: s.flush()

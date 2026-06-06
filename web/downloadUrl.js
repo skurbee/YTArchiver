@@ -68,6 +68,19 @@
         const def = (s?.video_out_dir || s?.output_dir || "").trim();
         const saveInput = document.getElementById("vo-save-to");
         if (saveInput && def) saveInput.placeholder = def;
+        // Default the Resolution dropdown to Settings → General "Default
+        // resolution" (e.g. 720p) on a FRESH field. It was hardcoded to
+        // 1080p in markup and only ever overridden by a last-used value, so
+        // it ignored the user's configured default. A saved last-used choice
+        // still wins (this runs after the localStorage restore below).
+        const _selRes = document.getElementById("vo-resolution");
+        let _savedRes = null;
+        try { _savedRes = localStorage.getItem("ytarch.vo.resolution"); } catch {}
+        const _defRes = s?.default_resolution != null ? String(s.default_resolution) : "";
+        if (_selRes && !_savedRes && _defRes &&
+            [..._selRes.options].some(o => o.value === _defRes)) {
+          _selRes.value = _defRes;
+        }
       } catch { /* non-fatal */ }
     })();
 
@@ -190,12 +203,31 @@
         window._showToast?.("Paste a YouTube video URL first.", "warn");
         return;
       }
-      if (!window.pywebview?.api?.archive_single_video) {
+      const api = window.pywebview?.api;
+      if (!api?.archive_single_video) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
+      // Already-archived warning. Checked against the live index by video id
+      // (not a separate list), so it reflects what's actually archived now.
+      // Any failure falls through and allows the download. User can override.
+      try {
+        if (api.single_video_archived && askConfirm) {
+          const chk = await api.single_video_archived(url);
+          if (chk?.ok && chk.archived) {
+            const what = chk.title ? `"${chk.title}"` : "This video";
+            const where = chk.channel ? ` in "${chk.channel}"` : "";
+            const go = await askConfirm(
+              "Already archived",
+              `${what} is already archived${where}.\n\n` +
+              `Download it again anyway?`,
+              { confirm: "Download anyway" });
+            if (!go) return;
+          }
+        }
+      } catch { /* non-fatal — allow the download */ }
       const opts = readVideoOptions();
-      await window.pywebview.api.archive_single_video(url, opts);
+      await api.archive_single_video(url, opts);
       window._showToast?.("Queued: " + url.slice(0, 60), "ok");
       input.value = "";
       updateBtnVisibility();

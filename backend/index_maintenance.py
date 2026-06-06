@@ -94,6 +94,7 @@ def sweep_new_videos(output_dir: str, channels: list,
                    ".wav", ".mp3", ".m4a", ".flac")
     registered = 0
     ingested = 0
+    id_backfilled = 0
 
     # `existing` is built per-channel inside the loop below — was
     # previously a single SELECT-fetchall across the entire videos
@@ -200,13 +201,17 @@ def sweep_new_videos(output_dir: str, channels: list,
         # Load `existing` scoped to JUST this channel so the membership
         # check below is fast without holding every filepath in memory
         # across the entire sweep. Uses idx_vid_channel.
-        existing = {
-            r[0].lower()
-            for r in sweep_conn.execute(
-                "SELECT filepath FROM videos WHERE channel=? COLLATE NOCASE",
-                (ch_name,)).fetchall()
-            if r[0]
-        }
+        existing = set()
+        noid = set()
+        for _er in sweep_conn.execute(
+                "SELECT filepath, video_id FROM videos "
+                "WHERE channel=? COLLATE NOCASE", (ch_name,)).fetchall():
+            if not _er[0]:
+                continue
+            _efpl = _er[0].lower()
+            existing.add(_efpl)
+            if not (_er[1] or "").strip():
+                noid.add(_efpl)
         # Use scandir directly so we get DirEntry objects with cached
         # stat info — avoids a separate `os.path.getsize` disk round
         # trip per file. Walk recursively by yielding directories
@@ -254,6 +259,21 @@ def sweep_new_videos(output_dir: str, channels: list,
                     fp = _os.path.normpath(entry.path)
                     fp_lower = fp.lower()
                     if fp_lower in existing:
+                        # Already registered but with NO video_id — re-register
+                        # so register_video's direct .info.json read backfills
+                        # the id. The sweep would otherwise skip this row
+                        # forever, leaving the id (and thus metadata)
+                        # permanently missing. Scoped to NULL-id rows only, so
+                        # it's near-free on a healthy archive.
+                        if fp_lower in noid:
+                            try:
+                                _idx.register_video(fp, ch_name,
+                                                    _conn_override=sweep_conn)
+                                id_backfilled += 1
+                                noid.discard(fp_lower)
+                            except Exception as _bfe:
+                                _log.debug("sweep id-backfill failed (%s): %s",
+                                           fp, _bfe)
                         # Already registered; check if a .jsonl
                         # sidecar is present and not yet ingested.
                         # `indexed_jsonls` check first (pure set
@@ -326,6 +346,7 @@ def sweep_new_videos(output_dir: str, channels: list,
         _log.debug("swallowed: %s", e)
 
     return {"registered": registered, "ingested": ingested,
+            "id_backfilled": id_backfilled,
             "skipped_unchanged": skipped_unchanged,
             "walked": total_ch - skipped_unchanged}
 

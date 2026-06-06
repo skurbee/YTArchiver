@@ -232,12 +232,16 @@ class AutorunScheduler:
         if busy:
             if self._stream:
                 self._stream.emit_text(
-                    "\u2014 Autorun: sync still running, checking again in 60s\u2026",
+                    "\u2014 Autorun: a manual sync is running \u2014 skipping "
+                    "this run; will run at the next scheduled time.",
                     "simpleline_dim")
             with self._lock:
                 self._waiting_for_sync_done = False
                 if self._interval_mins > 0:
-                    self._schedule_next_locked(sec=60)
+                    # Skip to the NEXT scheduled fire (next clock boundary /
+                    # full interval) instead of nagging every 60s while the
+                    # user's manual sync runs.
+                    self._schedule_next_locked()
             return
         # Path A: interval elapsed + sync idle → kick the sync. Entering
         # waiting-for-completion state means the countdown holds at

@@ -26,6 +26,18 @@
         window._showToast?.("Native mode required.", "warn");
         return;
       }
+      // Confirm first \u2014 this is a heavy, DB-mutating pass (it prunes index
+      // rows for files no longer on disk), and previously an accidental
+      // click ran it silently with no prompt.
+      const ok = await (askConfirm
+        ? askConfirm(
+            "Rescan archive?",
+            "Walks every channel folder for files added or removed outside " +
+            "the app and prunes index entries for videos no longer on disk. " +
+            "Safe, but it rewrites index state \u2014 continue?",
+            "Rescan")
+        : Promise.resolve(true));
+      if (!ok) return;
       await api.archive_rescan();
       window._showToast?.("Archive rescan started \u2014 check the log.", "ok");
     });

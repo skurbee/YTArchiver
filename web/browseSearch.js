@@ -394,8 +394,18 @@
         const n = parseInt((el?.value || "").trim(), 10);
         return Number.isFinite(n) ? n : null;
       };
-      const yearFrom = _parseYear(document.getElementById("search-year-from"));
-      const yearTo = _parseYear(document.getElementById("search-year-to"));
+      let yearFrom = _parseYear(document.getElementById("search-year-from"));
+      let yearTo = _parseYear(document.getElementById("search-year-to"));
+      // Inverted range (from > to) used to be silently ignored (fell back to
+      // all years). Auto-swap to the obviously-intended window, and reflect
+      // the swap back into the inputs so the correction is visible, not silent.
+      if (yearFrom != null && yearTo != null && yearFrom > yearTo) {
+        const _tmp = yearFrom; yearFrom = yearTo; yearTo = _tmp;
+        const _fEl = document.getElementById("search-year-from");
+        const _tEl = document.getElementById("search-year-to");
+        if (_fEl) _fEl.value = String(yearFrom);
+        if (_tEl) _tEl.value = String(yearTo);
+      }
       try {
         const promises = [];
         // Transcripts leg — FTS5 against segments.
@@ -639,6 +649,16 @@
     // selection.
     document.getElementById("search-sort")?.addEventListener("change", () => {
       if ((input?.value || "").trim()) doSearch();
+    });
+    // Auto-apply the Year bounds: re-run when either field is committed
+    // (blur / Enter / spinner step), so the user doesn't have to click back
+    // into the main box and press Enter. Uses "change" (commit), NOT "input",
+    // so typing a year digit-by-digit (2 → 20 → 202 → 2026) doesn't fire a
+    // search on each partial value. Only re-runs when the query box has text.
+    ["search-year-from", "search-year-to"].forEach((id) => {
+      document.getElementById(id)?.addEventListener("change", () => {
+        if ((input?.value || "").trim()) doSearch();
+      });
     });
 
     // FTS5 operator buttons — click-to-insert at the current cursor position

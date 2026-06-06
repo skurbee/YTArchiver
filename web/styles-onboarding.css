@@ -61,6 +61,25 @@
 }
 .onb-dot.active { background: var(--c-accent, #3ea06a); transform: scale(1.25); }
 .onb-dot.done { background: var(--c-accent, #3ea06a); opacity: 0.55; }
+/* Close (X) — only present when re-opened from Settings ("Run setup
+   again"). Lives as the 3rd flex child of .onb-head; when hidden the head
+   falls back to the original logo|steps space-between layout. The
+   [hidden] guard is required because display:flex would otherwise
+   override the hidden attribute's display:none. */
+.onb-close {
+  flex: 0 0 auto;
+  width: 28px; height: 28px;
+  display: flex; align-items: center; justify-content: center;
+  margin-left: 12px;
+  padding: 0;
+  font-size: 20px; line-height: 1;
+  background: transparent;
+  color: var(--c-dim, #8a8a8e);
+  border: none; border-radius: 6px;
+  cursor: pointer;
+}
+.onb-close[hidden] { display: none; }
+.onb-close:hover { background: var(--c-border, #3a3a3d); color: var(--c-text, #e6e6e6); }
 
 /* Body */
 .onb-body { padding: 24px 26px; overflow-y: auto; }

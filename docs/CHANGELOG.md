@@ -6,6 +6,56 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v77.7 — 2026-06-05
+
+Rollup of everything since the last public release. Highlights:
+
+### Added
+- **New maintenance tools** (Settings → Tools): back-fill missing video
+  durations (local ffprobe, no network), repair legacy auto-caption
+  transcripts, restore sentence punctuation to transcripts, scan & fix
+  transcript/index drift, and reset a channel's sync state. Each shows a
+  dry-run / confirm step before doing anything.
+- **Fix-missing-video-IDs tool** (Settings → Metadata) to backfill IDs for
+  older archived videos from their `.info.json` sidecars.
+- **Search year-range filter** with auto-apply and inverted-range handling.
+
+### Fixed
+- **Sync no longer stalls after a large channel downloads.** Post-download
+  maintenance (folder-size recount + caption/thumbnail cleanup) used to run
+  inline and walk the entire channel folder on every download — several
+  minutes on very large channels. The size recount now uses an indexed
+  lookup, and the cleanup passes run in the background, so the pass moves on
+  immediately.
+- **Unreachable videos give up after 3 tries.** A video that repeatedly
+  can't be reached (network/CDN timeout) is now retried for three syncs,
+  then skipped and recorded — instead of erroring on every sync forever.
+  The strike count is stored independently so a concurrent write can't lose
+  it.
+- **Reliable video-ID capture at download.** Newly downloaded videos always
+  record their ID (with an `.info.json` sidecar fallback), so metadata,
+  search, and the Browse views work for them. The disk sweep also backfills
+  the ID for any older entry that's missing one.
+- **Search matches hyphenated / punctuated terms.** Queries like
+  "well-known", "co-op", or ones containing quotes or "%" now return
+  results instead of silently matching nothing — in both the Search box and
+  the word-frequency Graph. The `AND` / `OR` / `NOT` / `"phrase"` / `word*`
+  operators are unchanged.
+- **Graph:** switching the chart type back from Word Cloud to Line/Bar now
+  re-renders correctly, and the weekly bucket plots real per-week data.
+- **Watch → Back** returns to where you opened the video from (Search,
+  Graph, or Bookmarks) instead of always the Videos grid.
+- **Bookmarks** save the clicked transcript moment's real timestamp instead
+  of 0:00.
+- **Browse** sidebar shows the transcript-segment count; the Download tab's
+  resolution defaults to the configured default resolution.
+- Single-URL downloads use the same network-timeout bounds as the sync path.
+
+### Changed
+- "Rescan archive" now confirms before running (it mutates the index).
+- Adding a channel rejects illegal characters in the folder name.
+- About dialog wording normalized to "YTArchiver".
+
 ## v76.2 — 2026-06-03
 
 ### Added

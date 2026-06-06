@@ -281,12 +281,16 @@
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
       if (findWrap) findWrap.style.display = "none";
+      // Record origin so Watch's "← Back" returns to Search (browseGoBack
+      // re-clicks the submode) instead of dumping the user on Videos.
+      _browseState.view = "search";
     } else if (mode === "graph") {
       document.getElementById("view-graph").style.display = "";
       title.textContent = "Word frequency";
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
       if (findWrap) findWrap.style.display = "none";
+      _browseState.view = "graph";
       populateGraphChannels();
     } else if (mode === "bookmarks") {
       document.getElementById("view-bookmarks").style.display = "";
@@ -294,6 +298,7 @@
       backBtn.style.display = "none";
       sortWrap.style.display = "none";
       if (findWrap) findWrap.style.display = "none";
+      _browseState.view = "bookmarks";
       refreshBookmarks();
     } else if (mode === "index") {
       // Browse > Index sub-mode was removed; the Index controls now

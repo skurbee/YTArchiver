@@ -41,14 +41,14 @@
       primary: m === currentDefault,
     }));
     const msg = contextLabel
-      ? `Pick a Whisper model for ${contextLabel}.`
-      : "Pick a Whisper model for this job.";
+      ? `YouTube auto-captions are used first when available. Pick the Whisper model to fall back to for ${contextLabel}.`
+      : "YouTube auto-captions are used first when available. Pick the Whisper model to fall back to.";
     const pick = await askChoice({
-      title: "Transcribe \u2014 Whisper model",
+      title: "Transcribe \u2014 Whisper fallback model",
       message: msg,
       choices,
       countdownSecs: 60,
-      countdownLabel: `Auto-selecting ${currentDefault} in`,
+      countdownLabel: `Defaulting to ${currentDefault} in`,
     });
     if (pick === null) return null;
     // Swap the running whisper process for the next job ONLY — do NOT
@@ -741,6 +741,27 @@
     // Sidebar stats as well
     setText("stat-channels", (c.channels ?? "").toLocaleString?.() ?? "");
     setText("stat-videos", (c.videos ?? "").toLocaleString?.() ?? "");
+    // Segment count isn't in the summary cards (it's an expensive full-DB
+    // aggregate), so fetch it once via the same call Settings → Index uses
+    // and fill the sidebar "segments" badge when it resolves — otherwise it
+    // sits at "—" the whole session. (This lives here, not in the
+    // indexControls compat shim, because browseContent.js loads last and
+    // overwrites window._applyIndexSummary.)
+    if (!window.__segStatFetched) {
+      window.__segStatFetched = true;
+      const _api = window.pywebview?.api;
+      if (_api?.get_index_db_stats) {
+        _api.get_index_db_stats().then((db) => {
+          if (db && db.segments != null) {
+            setText("stat-segments", Number(db.segments).toLocaleString());
+          } else {
+            window.__segStatFetched = false;
+          }
+        }).catch(() => { window.__segStatFetched = false; });
+      } else {
+        window.__segStatFetched = false;
+      }
+    }
 
     // Per-channel table
     if (Array.isArray(idx.per_channel)) {

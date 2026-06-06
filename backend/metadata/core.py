@@ -660,6 +660,73 @@ def _probe_durations_bulk(filepaths: list[str], stream: LogStreamer,
     return out
 
 
+def count_missing_durations() -> int:
+    """How many archived videos have no stored duration_s. Read-only."""
+    try:
+        from .. import index as _idx
+        conn = _idx._reader_open()
+        if conn is None:
+            return 0
+        with _idx._reader_lock:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM videos "
+                "WHERE duration_s IS NULL OR duration_s<=0").fetchone()[0])
+    except Exception as e:
+        _log.debug("count_missing_durations failed: %s", e)
+        return 0
+
+
+def backfill_missing_durations(stream: LogStreamer,
+                               cancel_event: threading.Event | None = None,
+                               pause_event: threading.Event | None = None,
+                               ) -> dict:
+    """Fill videos.duration_s for every archived file that's missing it by
+    ffprobing the file locally (no YouTube). The on-disk file is the only
+    accurate source — the disk-sweep/import paths register rows without a
+    duration. Idempotent: only touches rows still NULL/0, so a cancelled run
+    resumes cleanly on the next start. Progress + the actual duration_s
+    writes are handled by _probe_durations_bulk. Returns
+    {ok, total, resolved, cancelled}."""
+    from .. import index as _idx
+    conn = _idx._reader_open()
+    if conn is None:
+        return {"ok": False, "error": "index unavailable",
+                "total": 0, "resolved": 0}
+    with _idx._reader_lock:
+        rows = conn.execute(
+            "SELECT filepath FROM videos "
+            "WHERE (duration_s IS NULL OR duration_s<=0) "
+            "AND filepath IS NOT NULL AND filepath!='' "
+            "ORDER BY rowid").fetchall()
+    filepaths = [r[0] for r in rows if r and r[0]]
+    total = len(filepaths)
+    if not total:
+        try:
+            stream.emit([["  — Every video already has a length. Nothing to "
+                          "do.\n", "simpleline"]])
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        return {"ok": True, "total": 0, "resolved": 0, "cancelled": False}
+    try:
+        stream.emit([[f" Checking video lengths — {total:,} missing. "
+                      f"Reading each file with ffprobe…\n", "header"]])
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    probed = _probe_durations_bulk(filepaths, stream, cancel_event, pause_event)
+    resolved = sum(1 for v in probed.values() if v and v > 0)
+    cancelled = bool(cancel_event and cancel_event.is_set())
+    try:
+        _verb = "Stopped — " if cancelled else "Done — "
+        stream.emit([[f" {_verb}filled {resolved:,} of {total:,} video "
+                      f"length(s)" + (" (re-run to finish the rest)."
+                      if cancelled or resolved < total else ".") + "\n",
+                      "simpleline_green"]])
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+    return {"ok": True, "total": total, "resolved": resolved,
+            "cancelled": cancelled}
+
+
 def _fetch_per_video_upload_dates(yt: str, vids: list[str],
                                    stream: LogStreamer,
                                    cancel_event: threading.Event | None = None,

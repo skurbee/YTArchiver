@@ -69,6 +69,13 @@
               <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
                      placeholder="Custom filename" disabled />
             </div>
+            <div class="vo-row vo-row-checks">
+              <label class="vo-check"
+                     title="Also save the video's metadata (.info.json) + thumbnail next to the file, so it gets a grid thumbnail and a Watch-view description. Both stay hidden — the folder still shows only the video.">
+                <input type="checkbox" id="vo-grab-metadata" />
+                <span>Also fetch metadata + thumbnail</span>
+              </label>
+            </div>
           </div>
           <button class="btn btn-primary vo-download-btn" id="btn-download-single"
                   title="Download the video from the URL above" hidden>&#9654; Download</button>

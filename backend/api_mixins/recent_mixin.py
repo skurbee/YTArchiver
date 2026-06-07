@@ -23,14 +23,16 @@ class RecentMixin:
         return recent_for_ui(cfg)
 
 
-    def list_all_videos(self, sort="recent", limit=60, offset=0):
+    def list_all_videos(self, sort="recent", limit=60, offset=0, query=""):
         """Paginated global video list for the Videos view — every video in
         the archive, sorted by recent/newest/oldest/title/channel/views/likes/
-        largest. Returns {rows, has_more, offset}."""
+        largest. `query` filters by title/channel substring. Returns
+        {rows, has_more, offset}."""
         try:
             return index_backend.list_all_videos(
                 sort=str(sort or "recent"),
-                limit=int(limit or 60), offset=int(offset or 0))
+                limit=int(limit or 60), offset=int(offset or 0),
+                query=str(query or ""))
         except Exception as e:
             return {"rows": [], "has_more": False, "offset": offset, "error": str(e)}
 

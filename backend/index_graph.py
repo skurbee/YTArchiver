@@ -46,6 +46,44 @@ def bucket_totals(bucket: str = "month",
     conn = _idx._reader_open()
     if conn is None:
         return {}
+    if bucket == "week":
+        # Week totals MUST be keyed by the same ISO-week label that
+        # word_frequency() emits ("YYYY-Www"), computed in Python from
+        # videos.upload_ts. segments only store year+month, so the old
+        # fall-through grouped by YEAR and returned year keys ("2015")
+        # that never matched the week-keyed word counts — so Normalize +
+        # Week divided every bucket by a missing denominator and the
+        # chart rendered all zeros. Mirror word_frequency's week JOIN +
+        # isocalendar() bucketing exactly so the keys line up.
+        sql = (
+            "SELECT v.upload_ts, COUNT(*) "
+            " FROM segments s "
+            " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
+            " WHERE v.upload_ts IS NOT NULL"
+        )
+        args: list[Any] = []
+        if channel:
+            sql += " AND s.channel=?"
+            args.append(channel)
+        sql += " GROUP BY v.upload_ts"
+        try:
+            with _idx._reader_lock:
+                rows = conn.execute(sql, args).fetchall()
+        except sqlite3.Error:
+            return {}
+        import datetime as _dt_w
+        totals: dict[str, int] = {}
+        for ts, cnt in rows:
+            if ts is None:
+                continue
+            try:
+                _dtobj = _dt_w.datetime.fromtimestamp(float(ts))
+                iso = _dtobj.isocalendar()
+                key = f"{iso.year:04d}-W{iso.week:02d}"
+            except Exception:
+                continue
+            totals[key] = totals.get(key, 0) + int(cnt or 0)
+        return totals
     group_col = "year || '-' || printf('%02d', month)" if bucket == "month" else "year"
     sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
            " FROM segments")
@@ -216,7 +254,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
             "SELECT v.upload_ts, COUNT(*) "
             " FROM segments_fts fts "
             " JOIN segments s ON s.id = fts.rowid "
-            " LEFT JOIN videos v ON v.video_id = s.video_id "
+            " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
             " WHERE fts.text MATCH ? "
             " AND v.upload_ts IS NOT NULL"
         )

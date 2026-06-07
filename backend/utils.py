@@ -474,6 +474,126 @@ def unhide_file_win(path) -> None:
         _log.debug("swallowed: %s", e)
 
 
+# ── Stray-sidecar hider (whitelist sweep) ──────────────────────────────
+
+# The ONLY files an archive folder should show with Explorer's "hidden
+# files" off: the videos themselves + the conjoined `… Transcript.txt`.
+# Everything else (.info.json, .description, stray thumbnails, .jsonl
+# sidecars, .last_attempt state, etc.) gets the Windows HIDDEN attribute.
+# Keep the media set aligned with archive_scan._CHANNEL_VIDEO_EXTS.
+_VISIBLE_MEDIA_EXTS = (
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
+    ".mp3", ".m4a", ".flac", ".wav", ".opus", ".ogg",
+)
+
+
+def _archive_file_should_be_visible(name: str) -> bool:
+    """Whitelist test: True for video/media files and the conjoined
+    `… Transcript.txt`. Everything else is a sidecar that must be hidden.
+    Matches the user contract: an archive folder shows only the videos +
+    one transcript .txt when 'show hidden files' is off."""
+    low = name.lower()
+    if low.endswith(_VISIBLE_MEDIA_EXTS):
+        return True
+    if low.endswith("transcript.txt"):
+        return True
+    return False
+
+
+def _set_hidden_if_needed(path, entry=None) -> bool:
+    """Set FILE_ATTRIBUTE_HIDDEN on `path` only if it isn't already
+    hidden, preserving other attribute bits. Returns True iff the item
+    was visible and is now hidden (so callers can count real changes).
+
+    When `entry` is an os.DirEntry, its cached `st_file_attributes`
+    (populated for free by the directory scan on Windows) is used to
+    test the hidden bit without an extra GetFileAttributesW syscall —
+    so a sweep over an already-clean archive costs ~one syscall per
+    *new* stray, not per file."""
+    if os.name != "nt":
+        return False
+    FILE_ATTRIBUTE_HIDDEN = 0x02
+    INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+    attrs = None
+    if entry is not None:
+        try:
+            attrs = entry.stat(follow_symlinks=False).st_file_attributes
+        except (OSError, AttributeError, ValueError):
+            attrs = None
+    try:
+        p = str(path)
+        if attrs is None:
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(p)
+            if attrs == INVALID_FILE_ATTRIBUTES:
+                return False
+        if attrs & FILE_ATTRIBUTE_HIDDEN:
+            return False  # already hidden
+        ok = ctypes.windll.kernel32.SetFileAttributesW(
+            p, attrs | FILE_ATTRIBUTE_HIDDEN)
+        if not ok:
+            err = ctypes.windll.kernel32.GetLastError()
+            _log.warning("hide stray failed for %s (err=%s)", p, err)
+            return False
+        return True
+    except Exception as e:
+        _log.debug("swallowed: %s", e)
+        return False
+
+
+def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
+    """Sweep `folder` and set the Windows HIDDEN attribute on every file
+    that is NOT a video/media file and NOT a `… Transcript.txt`, plus any
+    dot-prefixed subdirectory (`.Thumbnails`, `.ChannelArt`). This is the
+    bulletproof enforcement of the archive-folder contract — robust to
+    any sidecar naming oddity (e.g. yt-dlp's double-dot
+    `Title..info.json`) because it's a whitelist, not a name-reconstruct.
+
+    Returns the count of items NEWLY hidden (were visible, now hidden).
+    No-op on non-Windows. Idempotent and cheap on a clean archive: uses
+    os.scandir so already-hidden items cost no extra syscall. Dot-dirs
+    are hidden but not descended into (a hidden parent hides its whole
+    subtree in Explorer)."""
+    if os.name != "nt":
+        return 0
+    folder = str(folder)
+    if not folder or not os.path.isdir(folder):
+        return 0
+    newly = 0
+    stack = [folder]
+    while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                try:
+                    name = entry.name
+                    if entry.is_dir(follow_symlinks=False):
+                        if name.startswith("."):
+                            # Hide the dot-dir; don't descend — a hidden
+                            # parent already hides its whole subtree.
+                            if _set_hidden_if_needed(entry.path, entry):
+                                newly += 1
+                            continue
+                        if recursive:
+                            stack.append(entry.path)
+                        continue
+                    # Regular file.
+                    if _archive_file_should_be_visible(name):
+                        continue
+                    if _set_hidden_if_needed(entry.path, entry):
+                        newly += 1
+                except OSError:
+                    continue
+    return newly
+
+
 # ── Video sidecar cleanup ──────────────────────────────────────────────
 
 def delete_video_sidecars(filepath: str) -> None:

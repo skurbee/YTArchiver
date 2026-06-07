@@ -202,6 +202,19 @@
                       title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
             </div>
 
+            <!-- Bug 5: enforce the hidden-sidecars contract. Walks every
+                 channel folder + the archive root and sets the Windows
+                 HIDDEN attribute on any visible sidecar (.info.json,
+                 .description, stray thumbs, .jsonl, etc.) so each folder
+                 shows only the videos + the conjoined Transcript.txt when
+                 Explorer's "show hidden files" is off. Non-destructive —
+                 only flips the hidden bit; never moves or deletes. -->
+            <label class="edit-gl">Hidden sidecars</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
+                      title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
+            </div>
+
             <!-- bug W-3: About + Diagnostics dialogs existed in the
                  HTML + JS but had no UI buttons to trigger them. Both
                  handlers (app.js:6436 / 6471) use getElementById which

@@ -1968,7 +1968,7 @@ def backfill_video_ids_from_sidecars(progress=None) -> dict:
 
 
 def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
-                    include_thumbs: bool = True) -> dict:
+                    include_thumbs: bool = True, query: str = "") -> dict:
     """Paginated global video list across the whole archive (the Videos view).
 
     Sorts off materialized DB columns (added_ts / upload_ts / view_count /
@@ -1996,21 +1996,34 @@ def list_all_videos(sort: str = "recent", limit: int = 60, offset: int = 0,
     # Result-cache hit (see _all_videos_cache). Skips the per-row thumbnail
     # disk-walk that makes a cold open ~10s. Return copies so callers can't
     # mutate the cached page.
-    _ck = ((sort or "recent").lower(), lim, off, bool(include_thumbs))
+    _q = (query or "").strip()
+    _ck = ((sort or "recent").lower(), lim, off, bool(include_thumbs), _q.lower())
     with _browse_cache_lock:
         _hit = _all_videos_cache.get(_ck)
     if _hit is not None:
         return {"rows": [dict(r) for r in _hit["rows"]],
                 "has_more": _hit["has_more"], "offset": _hit["offset"]}
     try:
+        where = "WHERE is_duplicate_of IS NULL"
+        params: list[Any] = []
+        if _q:
+            # Filter by title OR channel (substring, case-insensitive via
+            # LIKE). Escape LIKE metacharacters so a literal % / _ in the
+            # query doesn't act as a wildcard.
+            esc = _q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{esc}%"
+            where += (" AND (title LIKE ? ESCAPE '\\' "
+                      "OR channel LIKE ? ESCAPE '\\')")
+            params.extend([like, like])
+        params.extend([lim + 1, off])
         with _reader_lock:
             cur = conn.execute(
                 "SELECT title, channel, filepath, video_id, size_bytes, year, month, "
                 "tx_status, added_ts, upload_ts, view_count, like_count, "
                 "removed_from_yt_ts, duration_s "
-                "FROM videos WHERE is_duplicate_of IS NULL "
+                f"FROM videos {where} "
                 f"ORDER BY {order} LIMIT ? OFFSET ?",
-                (lim + 1, off))
+                params)
             raw = cur.fetchall()
     except sqlite3.Error as e:
         _log.debug("list_all_videos query failed: %s", e)

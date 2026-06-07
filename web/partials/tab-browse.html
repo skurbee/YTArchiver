@@ -454,7 +454,15 @@
             <div class="recent-header">
               <span class="recent-label">All videos in the archive</span>
               <div class="spacer"></div>
-              <label class="ctl-label ctl-label-thin">Sort:</label>
+              <!-- Filter the whole archive by title/channel (server-side,
+                   so it matches across every page, not just loaded cards). -->
+              <div class="browse-find-wrap">
+                <span class="search-icon">&#128269;</span>
+                <input type="text" class="ctl-input find-input" id="videos-filter"
+                       placeholder="Filter by title or channel&hellip;"
+                       title="Filter every video in the archive by title or channel name" />
+              </div>
+              <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Sort:</label>
               <select class="ctl-select" id="videos-sort"
                       title="Sort every video in the archive">
                 <option value="recent">Recently downloaded</option>

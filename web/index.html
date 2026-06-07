@@ -144,6 +144,13 @@
               <input type="text" class="vo-input vo-custom-name" id="vo-custom-name"
                      placeholder="Custom filename" disabled />
             </div>
+            <div class="vo-row vo-row-checks">
+              <label class="vo-check"
+                     title="Also save the video's metadata (.info.json) + thumbnail next to the file, so it gets a grid thumbnail and a Watch-view description. Both stay hidden — the folder still shows only the video.">
+                <input type="checkbox" id="vo-grab-metadata" />
+                <span>Also fetch metadata + thumbnail</span>
+              </label>
+            </div>
           </div>
           <button class="btn btn-primary vo-download-btn" id="btn-download-single"
                   title="Download the video from the URL above" hidden>&#9654; Download</button>
@@ -794,6 +801,19 @@
             <div class="edit-gv-inline" style="gap:6px;">
               <button class="btn btn-ghost btn-thin" id="btn-scan-archive"
                       title="Re-scan archive folders for new files added outside the app">Rescan archive&hellip;</button>
+            </div>
+
+            <!-- Bug 5: enforce the hidden-sidecars contract. Walks every
+                 channel folder + the archive root and sets the Windows
+                 HIDDEN attribute on any visible sidecar (.info.json,
+                 .description, stray thumbs, .jsonl, etc.) so each folder
+                 shows only the videos + the conjoined Transcript.txt when
+                 Explorer's "show hidden files" is off. Non-destructive —
+                 only flips the hidden bit; never moves or deletes. -->
+            <label class="edit-gl">Hidden sidecars</label>
+            <div class="edit-gv-inline" style="gap:6px;">
+              <button class="btn btn-ghost btn-thin" id="btn-hide-sidecars"
+                      title="Scan the whole archive and hide any stray sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) so each folder shows only the videos + the Transcript.txt. Only sets the Windows hidden attribute — nothing is moved or deleted.">Scan &amp; repair&hellip;</button>
             </div>
 
             <!-- bug W-3: About + Diagnostics dialogs existed in the
@@ -1548,7 +1568,15 @@
             <div class="recent-header">
               <span class="recent-label">All videos in the archive</span>
               <div class="spacer"></div>
-              <label class="ctl-label ctl-label-thin">Sort:</label>
+              <!-- Filter the whole archive by title/channel (server-side,
+                   so it matches across every page, not just loaded cards). -->
+              <div class="browse-find-wrap">
+                <span class="search-icon">&#128269;</span>
+                <input type="text" class="ctl-input find-input" id="videos-filter"
+                       placeholder="Filter by title or channel&hellip;"
+                       title="Filter every video in the archive by title or channel name" />
+              </div>
+              <label class="ctl-label ctl-label-thin" style="margin-left:10px;">Sort:</label>
               <select class="ctl-select" id="videos-sort"
                       title="Sort every video in the archive">
                 <option value="recent">Recently downloaded</option>

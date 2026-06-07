@@ -568,6 +568,11 @@
                 if (res.channel) video.channel = res.channel;
               }
             } catch { /* leave video.filepath undefined */ }
+            // Record the origin so Watch ▸ Back returns to the search
+            // results (this list-row path bypasses _openVideoInWatch, so
+            // it must set watchReturnTo itself — otherwise Back fell
+            // through to the channel grid).
+            _browseState.watchReturnTo = _browseState.submode || "search";
             _browseState.currentVideo = video;
             showView("watch");
             try {

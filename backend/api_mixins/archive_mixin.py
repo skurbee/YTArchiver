@@ -195,6 +195,11 @@ class ArchiveMixin:
 
         # Option: date_file — apply YT upload date as file mtime (default: True)
         date_file = opts.get("date_file", True)
+        # Option: grab_metadata — also fetch the .info.json + thumbnail so a
+        # one-off download isn't a bare .mp4 (enables the Watch metadata
+        # drawer + a grid thumbnail). Both sidecars are hidden after the
+        # download so the folder still shows only the video (+ transcript).
+        grab_metadata = bool(opts.get("grab_metadata", False))
 
         # Per-URL inplace-replace marker so the "[Dwnld] ..." line stays
         # at the same scroll position from URL → filename → NN% → Done.
@@ -238,6 +243,13 @@ class ArchiveMixin:
             cmd += ["--trim-filenames", "200", "--format", fmt]
             if res != "audio":
                 cmd += ["--merge-output-format", "mp4", "--ppa", "Merger:-c copy"]
+            # Optional metadata + thumbnail for one-off downloads. yt-dlp
+            # writes "<base>.info.json" + "<base>.jpg" next to the video;
+            # find_thumbnail resolves the co-located .jpg directly, and the
+            # sidecars are hidden post-download (see below).
+            if grab_metadata:
+                cmd += ["--write-info-json", "--write-thumbnail",
+                        "--convert-thumbnails", "jpg"]
             cmd += [
                 "--output", out_tpl,
                 # before_dl fires after extraction but BEFORE the first byte
@@ -519,6 +531,17 @@ class ArchiveMixin:
                             except Exception as _re_err:
                                 self._log_stream.emit_dim(
                                     f" (recent downloads write failed: {_re_err})")
+                            # Hide the freshly-written metadata/thumbnail
+                            # sidecars so the loose-download folder still
+                            # shows only the video (+ any Transcript.txt).
+                            if grab_metadata:
+                                try:
+                                    from .. import utils as _u
+                                    _u.hide_stray_sidecars(
+                                        os.path.dirname(final_path),
+                                        recursive=False)
+                                except Exception as _he:
+                                    _log.debug("swallowed: %s", _he)
                             # Drop from deferred livestream journal if
                             # this was a previously-deferred premiere
                             # that's now finished (matches bug C-3).

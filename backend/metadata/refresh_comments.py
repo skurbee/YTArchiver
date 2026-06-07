@@ -241,7 +241,7 @@ def refresh_channel_comments(channel: dict[str, Any],
             # type-error bugs aren't hidden behind a generic counter
             # bump (audit: refresh_comments H89).
             _log.warning("refresh_comments per-video failed for %s: %s",
-                         vid_id, _re)
+                         vid, _re)
             errors += 1
     _clear_active()
 

@@ -23,6 +23,7 @@
 
   const PAGE = 60;
   let _sort = "recent";
+  let _filter = "";      // title/channel substring filter (server-side)
   let _offset = 0;
   let _loading = false;
   let _hasMore = true;
@@ -82,7 +83,7 @@
         + '<span class="grid-loading-label">Loading videos…</span></div>';
     } else if (moreEl) { moreEl.hidden = false; }
     try {
-      const res = await api.list_all_videos(_sort, PAGE, _offset);
+      const res = await api.list_all_videos(_sort, PAGE, _offset, _filter);
       if (myId !== _seq) return;  // superseded by a newer sort/reset
       const rows = (res && res.rows) || [];
       if (reset) {
@@ -95,7 +96,10 @@
       _offset += rows.length;
       _hasMore = !!(res && res.has_more);
       if (g && _offset === 0) {
-        g.innerHTML = '<div class="browse-empty">No videos in the archive yet.</div>';
+        g.innerHTML = _filter
+          ? `<div class="browse-empty">No videos match “${_filter
+              .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}”.</div>`
+          : '<div class="browse-empty">No videos in the archive yet.</div>';
       }
     } catch (e) {
       console.error("[videos] load failed", e);
@@ -125,6 +129,20 @@
       _sort = e.target.value || "recent";
       loadPage(true);
     });
+    // Title/channel filter — debounced so each keystroke doesn't fire a
+    // query. Reloads page 1 server-side (filters the WHOLE archive, not
+    // just the lazy-loaded cards already on screen).
+    let _filterTimer = null;
+    $("videos-filter")?.addEventListener("input", (e) => {
+      const val = e.target.value || "";
+      if (_filterTimer) clearTimeout(_filterTimer);
+      _filterTimer = setTimeout(() => {
+        const next = val.trim();
+        if (next === _filter) return;
+        _filter = next;
+        loadPage(true);
+      }, 220);
+    });
     $("recent-grid-frame")?.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("scroll", onScroll, { passive: true });
   }
@@ -144,9 +162,10 @@
     const api = window.pywebview && window.pywebview.api;
     if (!api || !api.list_all_videos) return;
     const sortAtCall = _sort;
+    const filterAtCall = _filter;
     try {
-      const res = await api.list_all_videos(sortAtCall, PAGE, 0);
-      if (sortAtCall !== _sort || _loading) return;  // superseded meanwhile
+      const res = await api.list_all_videos(sortAtCall, PAGE, 0, filterAtCall);
+      if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;  // superseded meanwhile
       const rows = (res && res.rows) || [];
       const sig = rows.map(r => r.video_id || r.filepath || "").join("|");
       if (sig !== _firstPageSig) loadPage(true);

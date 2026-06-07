@@ -38,6 +38,7 @@ from ..log_stream import LogStreamer
 from ..metadata_io import (
     _folder_for_channel,
     _get_metadata_jsonl_path,
+    _lock_for,
     _read_metadata_jsonl,
     _write_metadata_jsonl,
     _year_month_from_path,
@@ -326,10 +327,17 @@ def fetch_single_video_metadata(channel: dict[str, Any],
             ])
         return {"ok": False, "error": "yt-dlp dump-json failed"}
 
-    existing[video_id] = entry
     _jsonl_write_failed = False
     try:
-        _write_metadata_jsonl(jp, existing)
+        # Hold the per-path lock across read+merge+write so a concurrent
+        # metadata writer's just-landed entry isn't clobbered by our stale
+        # read (~line 300). The network fetch above ran OUTSIDE the lock;
+        # re-read fresh here under it (audit H2). RLock → the inner
+        # _write_metadata_jsonl re-acquires on this thread safely.
+        with _lock_for(jp):
+            existing = _read_metadata_jsonl(jp)
+            existing[video_id] = entry
+            _write_metadata_jsonl(jp, existing)
     except Exception as e:
         # Don't return early — still attempt the thumbnail so the
         # user gets SOMETHING (audit: fetcher H93). The caller sees
@@ -509,6 +517,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
         existing = _read_metadata_jsonl(jp)
         thumb_dir = _ensure_thumbnails_dir(g["subfolder"])
         changed = False
+        _changed_ids: set[str] = set()  # vids we mutate this group (audit H2)
 
         # Hoist the thumbnail listing once per group. Old code did
         # os.listdir() inside _has_thumbnail_for, called per-video,
@@ -805,6 +814,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                     old["thumbnail_url"] = entry["thumbnail_url"]
                 refreshed += 1
                 changed = True
+                _changed_ids.add(vid_id)
             elif needs_thumb_only:
                 # JSONL entry stays as-is; only the thumbnail is being
                 # backfilled. `changed` stays False so we don't rewrite
@@ -819,6 +829,7 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 existing[vid_id] = entry
                 fetched += 1
                 changed = True
+                _changed_ids.add(vid_id)
             if entry.get("thumbnail_url"):
                 _download_thumbnail(entry["thumbnail_url"], thumb_dir,
                                     title or entry.get("title", ""), vid_id,
@@ -826,7 +837,17 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
 
         if changed:
             try:
-                _write_metadata_jsonl(jp, existing)
+                # Re-read under the per-path lock and merge ONLY the vids we
+                # touched, so entries another metadata writer added between our
+                # read (~509) and now aren't clobbered (audit H2). The yt-dlp
+                # fetches above ran outside the lock; only this reload+merge+
+                # write is serialized.
+                with _lock_for(jp):
+                    _fresh = _read_metadata_jsonl(jp)
+                    for _cid in _changed_ids:
+                        if _cid in existing:
+                            _fresh[_cid] = existing[_cid]
+                    _write_metadata_jsonl(jp, _fresh)
             except Exception as e:
                 stream.emit_error(f"Could not write {jp}: {e}")
 

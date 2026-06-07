@@ -148,7 +148,18 @@
     const myToken = ++_watchOpenToken;
     // Ensure we're on the Browse tab and in Watch view.
     document.querySelector('.tab[data-tab="browse"]')?.click();
-    _browseState.watchReturnTo = _browseState.view || null;
+    // Record where Watch was entered FROM so Back returns there. Prefer
+    // the SUBMODE (recent / search / bookmarks / graph) — `view` only
+    // tracks the within-Channels view (channels|videos|watch), so for a
+    // search/bookmark/recent open it was "channels"/"videos" and Back
+    // fell through to the channel grid (the search-result Back bug). In
+    // the Channels submode the view ("videos" during a channel
+    // drilldown) is still the correct return target.
+    {
+      const _sm = _browseState.submode;
+      _browseState.watchReturnTo =
+        (_sm && _sm !== "channels") ? _sm : (_browseState.view || null);
+    }
     _browseState.currentVideo = video;
     showView("watch");
 

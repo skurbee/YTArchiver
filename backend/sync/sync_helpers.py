@@ -31,13 +31,33 @@ _F_SUFFIX_RE = re.compile(r"\.f\d+(?:-[A-Za-z0-9]+)?\.[A-Za-z0-9]+$")
 
 
 def _hide_sidecar_win(video_path: str) -> None:
-    """Set Windows HIDDEN attribute on a video's .info.json sidecar so
-    Explorer shows only the video + Transcript.txt in archive folders."""
+    """Set Windows HIDDEN on a freshly-downloaded video's sidecars so
+    Explorer shows only the video + Transcript.txt in archive folders.
+
+    Globs the video's base name (`<base>.*`) rather than reconstructing
+    a single `<stem>.info.json` — so it catches EVERY sidecar yt-dlp
+    emits (.info.json, .description, .live_chat.json, language-coded
+    caption variants) including the double-dot `Title..info.json` form
+    that a `stem + '.info.json'` reconstruct silently misses when a
+    title ends in a period. The video itself / any media sibling and the
+    conjoined Transcript.txt are skipped (they must stay visible)."""
     if not video_path:
         return
-    sidecar = os.path.splitext(video_path)[0] + ".info.json"
-    if os.path.isfile(sidecar):
-        _utils.hide_file_win(sidecar)
+    import glob as _glob
+    base = os.path.splitext(video_path)[0]
+    try:
+        sibs = _glob.glob(_glob.escape(base) + ".*")
+    except Exception:
+        sibs = []
+    for sc in sibs:
+        low = sc.lower()
+        if low.endswith(_utils._VISIBLE_MEDIA_EXTS) or low.endswith("transcript.txt"):
+            continue
+        try:
+            if os.path.isfile(sc):
+                _utils.hide_file_win(sc)
+        except OSError:
+            pass
 
 
 def _sweep_orphan_vtts(channel_folder: str, cancel_event=None) -> int:

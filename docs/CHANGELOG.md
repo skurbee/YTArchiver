@@ -6,6 +6,48 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v78.1 — 2026-06-07
+
+### Fixed
+- **Back from a search result returns to your search.** Opening a video from
+  the Search results (or the reader pane) and then pressing Back dropped you
+  on the channel grid instead of your results. Watch now remembers where it
+  was entered from (Search / Videos / Bookmarks / Graph) and returns there.
+- **Standalone (one-off) downloads now get a transcript on disk.** Manually
+  transcribing a loose video wrote only to the search index, not to disk. It
+  now writes a conjoined `… Transcript.txt` (plus a hidden segment sidecar)
+  right next to the video, the same as channel videos.
+- **Graph: Normalize + Week no longer plots all zeros.** Per-week
+  normalization was dividing by year-keyed totals that never matched, so
+  every bar came out zero. Week totals are now keyed per ISO-week.
+- **Emptied channels repopulate.** A channel whose files were deleted
+  wouldn't re-download because the global download-archive still listed the
+  IDs. An "Entire channel" sync of an empty folder now bypasses that archive
+  and refills from scratch.
+- **Hidden sidecars are now bulletproof.** Sidecar files (metadata JSON,
+  thumbnails, segment data, etc.) are reliably flagged hidden so a folder
+  shows only the videos and the transcript file — fixing a case where a
+  metadata file with an unusual name stayed visible. Adds a **Settings →
+  Hidden sidecars → Scan & repair** tool to clean an existing archive in one
+  pass.
+- **Edit-channel panel no longer keeps stale fields.** The from-date and
+  compress options from a previously-opened channel could linger; the form
+  now fully resets on every open.
+- **Concurrency hardening:** removing a channel can no longer race a live
+  sync's writes, metadata sidecar writes are serialized per file, and
+  start-up locks are pre-initialized to prevent rare double-spawns.
+
+### Added / Improved
+- **Realign thumbnails** now streams per-channel progress to the log, has a
+  live **Stop** control, and reports a completion summary for the survey
+  pass (previously it ran silently with no feedback).
+- **Filter box on the Videos list** — filter the entire archive by title or
+  channel name (server-side, so it matches across every page).
+- **One-off downloads can fetch metadata + a thumbnail** (optional checkbox)
+  so a single download isn't a bare video file. Both sidecars are kept
+  hidden.
+- **Add-channel auto-fills the folder name** from the channel URL's handle.
+
 ## v77.9 — 2026-06-06
 
 ### Fixed

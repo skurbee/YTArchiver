@@ -88,6 +88,96 @@ class MediaOpsMixin:
         return {"ok": True, "started": True}
 
 
+    def archive_repair_hidden_sidecars(self):
+        """Settings tool: walk the whole archive and set the Windows
+        HIDDEN attribute on any sidecar that is currently visible —
+        enforcing the contract that each archive folder shows only the
+        videos + the conjoined Transcript.txt when Explorer's 'show
+        hidden files' is off. Catches .info.json (incl. yt-dlp's
+        double-dot `Title..info.json`), .description, stray thumbnails,
+        .jsonl sidecars, .last_attempt state, etc.
+
+        Idempotent and safe to run any time — already-hidden files are
+        skipped with no extra syscall. Streams per-channel progress + a
+        final tally to the main log. Runs in the background.
+        """
+        if getattr(self, "_hide_repair_running", False):
+            return {"ok": True, "already_running": True}
+        self._hide_repair_running = True
+
+        def _run():
+            try:
+                from .. import utils as _u
+                cfg = self._config or load_config()
+                output_dir = (cfg.get("output_dir") or "").strip()
+                if not output_dir or not os.path.isdir(output_dir):
+                    self._log_stream.emit_error(
+                        "Hidden-sidecar repair: no valid output_dir configured.")
+                    return
+                channels = sorted(
+                    cfg.get("channels", []) or [],
+                    key=lambda c: (c.get("name") or c.get("folder") or "").lower())
+                self._log_stream.emit_text(
+                    f"Hidden-sidecar repair: scanning {len(channels)} channel "
+                    f"folder(s) for visible sidecars…", "simpleline_blue")
+                self._log_stream.flush()
+                total_hidden = 0
+                folders_touched = 0
+                seen_dirs = set()
+                for ch in channels:
+                    name = (ch.get("name") or ch.get("folder") or "").strip()
+                    if not name:
+                        continue
+                    folder = os.path.join(output_dir, name)
+                    if not os.path.isdir(folder):
+                        continue
+                    key = os.path.normcase(os.path.normpath(folder))
+                    if key in seen_dirs:
+                        continue
+                    seen_dirs.add(key)
+                    try:
+                        n = _u.hide_stray_sidecars(folder, recursive=True)
+                    except Exception as _pe:
+                        self._log_stream.emit_error(
+                            f"  - {name}: scan failed ({_pe})")
+                        continue
+                    if n > 0:
+                        total_hidden += n
+                        folders_touched += 1
+                        self._log_stream.emit_text(
+                            f"  - {name}: hid {n} sidecar(s)", "simpleline_green")
+                        self._log_stream.flush()
+                # Loose singles + anything directly under the archive root
+                # (non-recursive — channel subfolders were handled above).
+                try:
+                    n_root = _u.hide_stray_sidecars(output_dir, recursive=False)
+                    if n_root > 0:
+                        total_hidden += n_root
+                        folders_touched += 1
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                if total_hidden > 0:
+                    self._log_stream.emit_text(
+                        f"— Hidden-sidecar repair complete: hid "
+                        f"{total_hidden} previously-visible sidecar(s) across "
+                        f"{folders_touched} folder(s). Archive folders now "
+                        f"show only videos + transcripts.", "simpleline_green")
+                else:
+                    self._log_stream.emit_text(
+                        "— Hidden-sidecar repair: all clean — every "
+                        "sidecar is already hidden.", "simpleline_green")
+                self._log_stream.flush()
+            except Exception as e:
+                self._log_stream.emit_error(f"Hidden-sidecar repair failed: {e}")
+            finally:
+                self._hide_repair_running = False
+                self._log_stream.flush()
+
+        threading.Thread(target=_run, daemon=True,
+                         name="hide-sidecar-repair").start()
+        return {"ok": True, "started": True}
+
+
     # ─── Video-length backfill (manual local ffprobe pass) ────────────
 
     def video_lengths_missing_count(self):

@@ -131,6 +131,7 @@
       date_file: "ytarch.vo.date_file",
       add_date: "ytarch.vo.add_date",
       use_yt_title: "ytarch.vo.use_yt_title",
+      grab_metadata: "ytarch.vo.grab_metadata",
     };
     try {
       const _load = (k, fallback) => {
@@ -151,6 +152,9 @@
       const _ut = document.getElementById("vo-use-yt-title");
       const _v_ut = localStorage.getItem(_VO_KEYS.use_yt_title);
       if (_ut && _v_ut != null) _ut.checked = _v_ut === "1";
+      const _gm = document.getElementById("vo-grab-metadata");
+      const _v_gm = localStorage.getItem(_VO_KEYS.grab_metadata);
+      if (_gm && _v_gm != null) _gm.checked = _v_gm === "1";
     } catch {}
     // Persist on every change.
     const _persistVoField = (id, key, kind) => {
@@ -170,6 +174,7 @@
     _persistVoField("vo-date-file", _VO_KEYS.date_file, "bool");
     _persistVoField("vo-add-date", _VO_KEYS.add_date, "bool");
     _persistVoField("vo-use-yt-title", _VO_KEYS.use_yt_title, "bool");
+    _persistVoField("vo-grab-metadata", _VO_KEYS.grab_metadata, "bool");
 
     // Read the Video-options panel into a plain dict to send to the backend.
     const readVideoOptions = () => {
@@ -179,6 +184,7 @@
       const addDate = !!document.getElementById("vo-add-date")?.checked;
       const useYtTitle = !!document.getElementById("vo-use-yt-title")?.checked;
       const customName = document.getElementById("vo-custom-name")?.value?.trim() || "";
+      const grabMeta = !!document.getElementById("vo-grab-metadata")?.checked;
       return {
         save_to: saveTo,
         resolution: res,
@@ -186,6 +192,7 @@
         add_date: addDate,
         use_yt_title: useYtTitle,
         custom_name: customName,
+        grab_metadata: grabMeta,
       };
     };
     // Expose on window so cross-IIFE callers (e.g. downloadDragDrop.js

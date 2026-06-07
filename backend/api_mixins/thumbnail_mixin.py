@@ -64,21 +64,87 @@ class ThumbnailMixin:
         return {"ok": True, "started": True}
 
 
-    def realign_misplaced_thumbnails(self, dry_run=True):
-        """Survey (and optionally move) thumbnails that ended up in the
-        wrong year/month folder. Same-volume os.replace so no copy/
-        delete cycle. Returns survey counts. `dry_run=True` (default)
-        just reports; pass False to actually move.
-        """
+    def realign_start(self, dry_run=True):
+        """Start a thumbnail realign pass (survey when dry_run=True, move
+        when False) on a worker thread and return a token. The pass
+        streams per-channel progress to the main log and can be stopped
+        via realign_cancel(token); poll realign_poll(token) for the
+        result. Background-threaded so the long os.walk over a multi-TB
+        archive doesn't block the bridge (the old synchronous call ran
+        for minutes with the UI showing only a frozen 'Scanning…')."""
         try:
-            from backend import metadata as _md
-            res = _md.realign_misplaced_thumbnails(
-                channels=(self._config or load_config() or {}).get("channels", []),
-                dry_run=bool(dry_run),
-                stream=self._log_stream if not dry_run else None)
-            return res
+            import uuid as _uuid
+            if not hasattr(self, "_realign_jobs"):
+                self._realign_jobs = {}
+                self._realign_jobs_lock = threading.Lock()
+            token = _uuid.uuid4().hex
+            cancel_ev = threading.Event()
+            now = time.time()
+            with self._realign_jobs_lock:
+                # Sweep abandoned entries (>15 min) so the dict can't grow.
+                stale = [k for k, v in self._realign_jobs.items()
+                         if isinstance(v, dict)
+                         and (now - (v.get("_ts") or now)) > 900]
+                for k in stale:
+                    self._realign_jobs.pop(k, None)
+                self._realign_jobs[token] = {
+                    "done": False, "cancel": cancel_ev, "_ts": now}
+
+            def _worker():
+                try:
+                    from backend import metadata as _md
+                    res = _md.realign_misplaced_thumbnails(
+                        channels=(self._config or load_config()
+                                  or {}).get("channels", []),
+                        dry_run=bool(dry_run),
+                        stream=self._log_stream,
+                        cancel_event=cancel_ev)
+                except Exception as _e:
+                    res = {"ok": False, "error": str(_e)}
+                with self._realign_jobs_lock:
+                    self._realign_jobs[token] = {
+                        "done": True, "result": res, "cancel": cancel_ev,
+                        "_ts": time.time()}
+
+            threading.Thread(target=_worker, daemon=True,
+                             name="thumb-realign").start()
+            return {"ok": True, "started": True, "token": token}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+
+    def realign_poll(self, token):
+        """Poll a realign_start token. Returns {pending: True} while
+        running, or the final result payload (with ok/scanned/misaligned/
+        moved/per_channel/cancelled) when done. The token is forgotten
+        once the final payload is returned."""
+        if not hasattr(self, "_realign_jobs"):
+            return {"ok": False, "error": "unknown token"}
+        with self._realign_jobs_lock:
+            entry = self._realign_jobs.get(token)
+            if entry is None:
+                return {"ok": False, "error": "unknown token"}
+            if not entry.get("done"):
+                return {"ok": True, "pending": True}
+            self._realign_jobs.pop(token, None)
+            return entry.get("result") or {"ok": False, "error": "no result"}
+
+
+    def realign_cancel(self, token):
+        """Signal a running realign pass (by token) to stop at the next
+        channel / directory boundary. Idempotent; safe on an unknown or
+        already-finished token."""
+        if not hasattr(self, "_realign_jobs"):
+            return {"ok": True}
+        with self._realign_jobs_lock:
+            entry = self._realign_jobs.get(token)
+            ev = entry.get("cancel") if isinstance(entry, dict) else None
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+        return {"ok": True}
 
 
     def refetch_thumbnails_all(self):

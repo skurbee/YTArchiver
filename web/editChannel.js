@@ -47,14 +47,32 @@
     if (!box) return;
 
     const resetFields = () => {
-      ["edit-folder","edit-url","edit-min-dur","edit-max-dur"].forEach(id => {
+      // Clear every text/number field — INCLUDING the YYYY/MM/DD date
+      // parts, which were previously left untouched. That omission let a
+      // from-date (and other conditionally-populated fields) from a
+      // previously-edited channel bleed into the next channel's panel.
+      ["edit-folder","edit-url","edit-min-dur","edit-max-dur",
+       "edit-date-year","edit-date-month","edit-date-day"].forEach(id => {
         const el = document.getElementById(id); if (el) el.value = "";
       });
       ["edit-transcribe","edit-compress"].forEach(id => {
         const el = document.getElementById(id); if (el) el.checked = false;
       });
-      document.getElementById("edit-metadata").checked = true;
-      document.getElementById("edit-resolution").value = "720";
+      const _meta = document.getElementById("edit-metadata");
+      if (_meta) _meta.checked = true;
+      const _res = document.getElementById("edit-resolution");
+      if (_res) _res.value = "720";
+      const _org = document.getElementById("edit-folder-org");
+      if (_org) _org.value = "years";
+      // Compress sub-fields back to defaults so the prior channel's
+      // level / output-res / batch size don't linger.
+      const _cq = document.getElementById("edit-compress-quality");
+      if (_cq) _cq.value = _cq.querySelector("option[selected]")?.value
+                         || _cq.options[0]?.value || "Generous";
+      const _cr = document.getElementById("edit-compress-res");
+      if (_cr) _cr.value = "720";
+      const _cb = document.getElementById("edit-compress-batch");
+      if (_cb) _cb.value = "";
       const subs = document.querySelector('input[name="edit-range"][value="subscribe"]');
       if (subs) { subs.checked = true; subs.dispatchEvent(new Event("change")); }
       document.getElementById("edit-compress")?.dispatchEvent(new Event("change"));
@@ -89,6 +107,38 @@
     _editUrlField?.addEventListener("paste", () => setTimeout(_updateEditUrlNudge, 10));
     _updateEditUrlNudge();
 
+    // UX: in ADD mode, auto-fill the Folder Name from the channel URL's
+    // @handle (or /c/Name, /user/Name) so the user doesn't have to retype
+    // it. Only fills when the folder field is empty and we're adding a new
+    // channel — never clobbers the user's own text or an existing
+    // channel's name while editing.
+    const _deriveFolderFromUrl = (url) => {
+      if (!url) return "";
+      let m = url.match(/youtube\.com\/@([^/?#\s]+)/i);
+      if (m) return decodeURIComponent(m[1]);
+      m = url.match(/youtube\.com\/(?:c|user)\/([^/?#\s]+)/i);
+      if (m) return decodeURIComponent(m[1]);
+      return "";
+    };
+    const _maybeAutoFillFolder = () => {
+      if (_editingIdentity) return;          // editing an existing channel
+      const folderEl = document.getElementById("edit-folder");
+      const urlEl = document.getElementById("edit-url");
+      if (!folderEl || !urlEl) return;
+      if ((folderEl.value || "").trim()) return;  // don't clobber user input
+      const guess = _deriveFolderFromUrl((urlEl.value || "").trim());
+      if (!guess) return;
+      // Sanitize to a valid Windows folder name.
+      const clean = guess.replace(/[\\/:*?"<>|]/g, "_")
+                         .replace(/\s+/g, " ").trim();
+      if (!clean) return;
+      folderEl.value = clean;
+      folderEl.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    _editUrlField?.addEventListener("input", _maybeAutoFillFolder);
+    _editUrlField?.addEventListener("paste",
+      () => setTimeout(_maybeAutoFillFolder, 15));
+
     document.getElementById("btn-edit-url-to-download")?.addEventListener("click", () => {
       const url = (_editUrlField?.value || "").trim();
       if (!url) return;
@@ -110,6 +160,11 @@
 
     const openPanel = (mode, channel) => {
       const ds = document.getElementById("edit-diskstats");
+      // Always start from a clean slate so NO field from a previously
+      // opened channel (folder name, from-date, compress sub-fields, …)
+      // lingers. The edit branch then repopulates from `channel`; the
+      // add branch leaves these cleared defaults in place.
+      resetFields();
       if (mode === "edit" && channel) {
         label.textContent = `Edit channel — ${channel.folder}`;
         // Single folder field: prefer folder_override (on-disk name)

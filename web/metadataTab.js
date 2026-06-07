@@ -439,7 +439,7 @@
         // \u22EF button is gone.
         return `<tr data-identity='${escapeHtml(ident)}' class="md-row-clickable${needsFix ? ' md-row-needs-fix' : ''}" title="Click for channel actions (or right-click)">
           <td class="md-col-name">${escapeHtml(r.name)}</td>
-          <td class="md-col-num">${r.video_count.toLocaleString()}</td>
+          <td class="md-col-num">${(r.video_count || 0).toLocaleString()}</td>
           <td class="md-col-ids">${idHtml}</td>
           <td class="md-col-ids">${thumbHtml}</td>
           <td class="md-col-onyt">${onYtHtml}</td>

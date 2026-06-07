@@ -31,6 +31,9 @@ ignore = [
     "E501",   # line-too-long: project has many wide docstrings + URLs
     "E731",   # lambda-assignment: we use lambdas as ad-hoc helpers
     "E741",   # ambiguous-variable-name (l, I, O): legacy code uses these
+    "E402",   # module-import-not-at-top: deliberate lazy/conditional imports
+    "E701",   # one-line `try: ... except:` (colon-compound) is house style
+    "E702",   # one-line semicolon-compound statements: same house style
     "B007",   # unused loop control variable: common style here
     "B008",   # function-call-in-default-argument: deliberate for some helpers
     "B024",   # abstract-base-class-without-abstract-method: not our pattern
@@ -46,6 +49,11 @@ ignore = [
 "backend/transcribe/__init__.py" = ["F401", "F403"]
 "backend/metadata/__init__.py" = ["F401", "F403"]
 "backend/api_mixins/_shared.py" = ["F401", "F403"]
+# Every api_mixin does `from ._shared import *`, so F405 (use of a name that
+# *might* come from a star import) fires across all of them. The star-import
+# surface is intentional (see backend/api_mixins/README.md), so silence F403/
+# F405 there — this is what was burying the real B023/F821 findings.
+"backend/api_mixins/*.py" = ["F401", "F403", "F405"]
 
 [lint.isort]
 known-first-party = ["backend"]

@@ -271,10 +271,17 @@ class SubsMixin:
                     self._sync_mutation_lock = threading.RLock()
                 with self._sync_mutation_lock:
                     try:
-                        active_sync = (self._current_sync_channel
-                                       if hasattr(self, "_current_sync_channel")
-                                       else "")
-                        if active_sync and _target_url and active_sync == _target_url:
+                        # The OLD guard read self._current_sync_channel, which is
+                        # never assigned anywhere — so it always saw "" and never
+                        # fired, letting rmtree race a live sync's writes. Compare
+                        # the delete target against the REAL active-sync state
+                        # (QueueState.current_sync, set via set_current_sync()).
+                        _cur = getattr(self._queues, "current_sync", None) or {}
+                        _cur_url = (_cur.get("url") or "").strip()
+                        _cur_name = (_cur.get("name") or "").strip()
+                        _t_name = (ch_snap.get("name") or "").strip()
+                        if ((_target_url and _cur_url and _cur_url == _target_url)
+                                or (_t_name and _cur_name and _cur_name == _t_name)):
                             return {
                                 "ok": False,
                                 "error": ("Sync is currently running on this "

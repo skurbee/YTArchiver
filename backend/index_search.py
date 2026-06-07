@@ -237,7 +237,7 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     q = ("SELECT s.id, s.video_id, s.title, s.channel, s.start_time, s.text, "
          " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip "
          " FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
-         " LEFT JOIN videos v ON v.video_id = s.video_id "
+         " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
          " WHERE segments_fts MATCH ?")
     args_suffix: list[Any] = []
     suffix = ""

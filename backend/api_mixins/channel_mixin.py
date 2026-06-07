@@ -975,8 +975,16 @@ class ChannelMixin:
         # checks used by reorg_channel_folder.
         ch_name = ch.get("name") or ch.get("folder", "")
         try:
-            cur_sync = self._queues.current_sync_channel() or ""
-            cur_gpu  = self._queues.current_gpu_channel() or ""
+            # QueueState exposes current_sync / current_gpu as dict ATTRIBUTES,
+            # not methods. The old calls current_sync_channel() /
+            # current_gpu_channel() don't exist — they raised, were swallowed
+            # below, and the guard never fired (audit #3). Read the real channel
+            # identity: a sync carries "name"/"folder", a GPU task carries
+            # "channel".
+            _cs = self._queues.current_sync or {}
+            _cg = self._queues.current_gpu or {}
+            cur_sync = (_cs.get("name") or _cs.get("folder") or "")
+            cur_gpu  = (_cg.get("channel") or "")
         except Exception:
             cur_sync = cur_gpu = ""
         if ch_name and (cur_sync == ch_name or cur_gpu == ch_name):

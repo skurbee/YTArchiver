@@ -310,33 +310,68 @@
       const btn = document.getElementById("btn-thumb-realign");
       if (!btn || btn._wired) return;
       btn._wired = true;
+      const orig = btn.textContent;
+      let activeToken = null;
+      let stopMode = false;   // when true, clicking the button cancels
+
+      const setStop = (label) => {
+        stopMode = true; btn.disabled = false; btn.textContent = label;
+      };
+      const reset = () => {
+        stopMode = false; activeToken = null;
+        btn.disabled = false; btn.textContent = orig;
+      };
+      // Poll a token until the pass finishes; resolves with the final
+      // payload (progress streams to the Download log meanwhile).
+      const pollUntilDone = async (api, token) => {
+        const deadline = Date.now() + 60 * 60 * 1000;  // 1h safety
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 600));
+          let p;
+          try { p = await api.realign_poll(token); }
+          catch (e) { return { ok: false, error: String(e) }; }
+          if (p && !p.pending) return p;
+        }
+        return { ok: false, error: "Timed out." };
+      };
+
       btn.addEventListener("click", async () => {
         const api = window.pywebview?.api;
-        if (!api?.realign_misplaced_thumbnails) {
+        if (!api?.realign_start) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
-        btn.disabled = true;
-        const orig = btn.textContent;
-        btn.textContent = "Scanning…";
-        let preview;
-        try {
-          preview = await api.realign_misplaced_thumbnails(true);
-        } catch (err) {
-          window._showToast?.(String(err), "error");
-          btn.disabled = false; btn.textContent = orig;
+        // Mid-pass: the button acts as a Stop control.
+        if (stopMode && activeToken) {
+          try { await api.realign_cancel(activeToken); } catch {}
+          btn.disabled = true; btn.textContent = "Stopping…";
           return;
         }
-        btn.disabled = false; btn.textContent = orig;
-        if (!preview?.ok) {
-          window._showToast?.(preview?.error || "Scan failed.", "error");
+        // ── Survey (dry run) ──
+        let start;
+        try { start = await api.realign_start(true); }
+        catch (e) { window._showToast?.(String(e), "error"); return; }
+        if (!start?.ok || !start.token) {
+          window._showToast?.(start?.error || "Couldn't start scan.", "error");
           return;
+        }
+        activeToken = start.token;
+        setStop("⏹ Stop scan");
+        window._showToast?.(
+          "Scanning thumbnails — progress in the Download log…", "ok");
+        const preview = await pollUntilDone(api, activeToken);
+        reset();
+        if (!preview?.ok) {
+          window._showToast?.(preview?.error || "Scan failed.", "error"); return;
+        }
+        if (preview.cancelled) {
+          window._showToast?.("Thumbnail scan stopped.", "warn"); return;
         }
         const n = preview.misaligned || 0;
         const dups = preview.skipped_dest_exists || 0;
         const chans = Object.keys(preview.per_channel || {}).length;
         if (n === 0) {
           window._showToast?.(
-            `All thumbnails aligned (${preview.aligned.toLocaleString()} checked). Nothing to do.`,
+            `All thumbnails aligned (${(preview.aligned||0).toLocaleString()} checked). Nothing to do.`,
             "ok");
           return;
         }
@@ -357,24 +392,86 @@
           choices: [{ label: `Move ${n.toLocaleString()} thumbnail(s)`, value: "go", kind: "primary" }],
         });
         if (!go) return;
-        btn.disabled = true; btn.textContent = "Moving…";
+        // ── Move ──
+        let mv;
+        try { mv = await api.realign_start(false); }
+        catch (e) { window._showToast?.(String(e), "error"); return; }
+        if (!mv?.ok || !mv.token) {
+          window._showToast?.(mv?.error || "Couldn't start move.", "error"); return;
+        }
+        activeToken = mv.token;
+        setStop("⏹ Stop move");
+        window._showToast?.(
+          "Moving thumbnails — progress in the Download log…", "ok");
+        const res = await pollUntilDone(api, activeToken);
+        reset();
+        if (!res?.ok) {
+          window._showToast?.(res?.error || "Move failed.", "error"); return;
+        }
+        if (res.cancelled) {
+          window._showToast?.(
+            `Stopped — moved ${(res.moved||0).toLocaleString()} before stopping.`,
+            "warn");
+          return;
+        }
+        window._showToast?.(
+          `Moved ${(res.moved||0).toLocaleString()} thumbnail(s) `
+          + `across ${Object.keys(res.per_channel || {}).length} channel(s). `
+          + (res.skipped_dest_exists > 0
+             ? `${res.skipped_dest_exists} skipped (duplicate already at target).`
+             : ""),
+          "ok");
+      });
+    })();
+
+    // Bug 5: "Scan & repair hidden sidecars" — walk the whole archive
+    // and set the Windows HIDDEN attribute on any visible sidecar so
+    // each folder shows only the videos + the Transcript.txt. Idempotent
+    // and non-destructive (only flips the hidden bit). Progress streams
+    // to the Download log.
+    (function wireHideSidecars() {
+      const btn = document.getElementById("btn-hide-sidecars");
+      if (!btn || btn._wired) return;
+      btn._wired = true;
+      btn.addEventListener("click", async () => {
+        const api = window.pywebview?.api;
+        if (!api?.archive_repair_hidden_sidecars) {
+          window._showToast?.("Native mode required.", "warn"); return;
+        }
+        const go = await window.askChoice({
+          title: "Scan & repair hidden sidecars",
+          message:
+            "Walk every channel folder + the archive root and hide any stray "
+            + "sidecar files (.info.json, leftover thumbnails, .jsonl, etc.) "
+            + "that are currently visible.\n\n"
+            + "This only sets the Windows ‘hidden’ attribute — no files are "
+            + "moved or deleted, and your videos + Transcript.txt stay "
+            + "visible. Progress streams to the Download log.\n\nProceed?",
+          choices: [{ label: "Scan & repair", value: "go", kind: "primary" }],
+        });
+        if (!go) return;
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = "Repairing…";
         try {
-          const res = await api.realign_misplaced_thumbnails(false);
-          if (!res?.ok) {
-            window._showToast?.(res?.error || "Move failed.", "error");
-          } else {
+          const res = await api.archive_repair_hidden_sidecars();
+          if (res?.already_running) {
             window._showToast?.(
-              `Moved ${res.moved.toLocaleString()} thumbnail(s) `
-              + `across ${Object.keys(res.per_channel || {}).length} channel(s). `
-              + (res.skipped_dest_exists > 0
-                 ? `${res.skipped_dest_exists} skipped (duplicate already at target).`
-                 : ""),
-              "ok");
+              "A repair pass is already running — see the log.", "warn");
+          } else if (res?.ok) {
+            window._showToast?.(
+              "Hidden-sidecar repair started — see the Download log for "
+              + "progress.", "ok");
+          } else {
+            window._showToast?.(res?.error || "Could not start repair.",
+              "error");
           }
         } catch (err) {
           window._showToast?.(String(err), "error");
         } finally {
-          btn.disabled = false; btn.textContent = orig;
+          // Work runs in the background; re-enable the button shortly.
+          setTimeout(() => { btn.disabled = false; btn.textContent = orig; },
+            1500);
         }
       });
     })();

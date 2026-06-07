@@ -126,7 +126,7 @@
                                   "○";
 
       // Color the verb (Downloading/Transcribing/Metadata) in tag color
-      const nameHtml = colorizeTaskName(t.name);
+      const nameHtml = colorizeTaskName(t.name || t.title || "");
 
       // Cycling dots after the active task's name ("..."/".. "/". ") —
       // pure CSS animation via ::after content keyframes. Matches
@@ -394,6 +394,7 @@
   }
 
   function colorizeTaskName(name) {
+    name = name || "";   // GPU tasks may carry `title` but no `name`; never deref undefined
     // Color the action verb in its tag color — mirrors YTArchiver's
     // log palette so Downloading=green, Metadata=pink, Transcribing=blue,
     // Redownloading=chartreuse, Encoding/Compressing=purple, Moving/Reorg=orange.

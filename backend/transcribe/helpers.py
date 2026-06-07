@@ -191,6 +191,30 @@ def _resolve_transcript_paths(video_path: str, title: str,
         upload_date = ""
         now = datetime.now()
         year, month = now.year, now.month
+    # Loose / orphan video: not under a known channel folder (e.g. a
+    # one-off single download sitting directly at the archive root, or a
+    # video in a folder that isn't a subscription). The channel-folder
+    # derivation above points at a bogus path like "<root>/<root_basename>"
+    # and would strand the transcript in a phantom folder away from the
+    # video — so the loose .mp4 appeared to get NO on-disk transcript.
+    # Detect that (video not under the resolved folder + no matching
+    # subscription) and write a per-video CONJOINED sidecar NEXT TO the
+    # video: a visible "<stem> Transcript.txt" + hidden
+    # ".<stem> Transcript.jsonl". Channel videos are unaffected (their
+    # video IS under the resolved channel folder).
+    _video_dir = os.path.dirname(os.path.abspath(video_path))
+    try:
+        _nf = os.path.normcase(os.path.normpath(folder_path))
+        _nv = os.path.normcase(os.path.normpath(_video_dir))
+        _under = (_nv == _nf or _nv.startswith(_nf + os.sep))
+    except Exception:
+        _under = True
+    if not ch and not _under:
+        _stem = os.path.splitext(os.path.basename(video_path))[0]
+        _stem = re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$", "", _stem) or _stem
+        _txt = os.path.join(_video_dir, f"{_stem} Transcript.txt")
+        return (_txt, _get_jsonl_sidecar(_txt), year, month, upload_date)
+
     # combined rule:
     # override True → always combined
     # override False → always per-year

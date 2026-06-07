@@ -199,7 +199,8 @@ def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
 
 def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
                                   dry_run: bool = True,
-                                  stream=None) -> dict[str, Any]:
+                                  stream=None,
+                                  cancel_event=None) -> dict[str, Any]:
     """Survey + (optionally) move thumbnails that ended up in a different
     year/month folder than the mp4 they belong to.
 
@@ -296,8 +297,22 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
     id_re = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
     scanned = aligned = misaligned = moved = skipped_dest = orphan = 0
     per_channel: dict[str, dict[str, int]] = {}
+    _total_ch = len(channels)
+    if stream:
+        try:
+            stream.emit_text(
+                f" — Thumbnail realign {'survey' if dry_run else 'move'} "
+                f"starting across {_total_ch} channel(s)…", "simpleline_pink")
+            stream.flush()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
 
-    for ch in channels:
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    for _ci, ch in enumerate(channels, 1):
+        if _cancelled():
+            break
         name = ch.get("name") or ch.get("folder") or ""
         folder = ch.get("folder_override") or ch.get("folder") or name
         if not folder:
@@ -305,9 +320,21 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
         ch_root = os.path.join(out_dir, folder)
         if not os.path.isdir(ch_root):
             continue
+        # Per-channel progress so the (potentially many-minute) survey
+        # isn't silent — the user can watch it move through the archive.
+        if stream:
+            try:
+                stream.emit_text(
+                    f"  - [{_ci}/{_total_ch}] {name}…", "simpleline")
+                if _ci % 5 == 0 or _ci == _total_ch:
+                    stream.flush()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         pc = {"misaligned": 0, "moved": 0, "skipped_dest_exists": 0,
               "orphan_no_db": 0}
         for dp, _dns, fns in os.walk(ch_root):
+            if _cancelled():
+                break
             if os.path.basename(dp) != ".Thumbnails":
                 continue
             thumb_parent = os.path.normpath(os.path.dirname(dp))
@@ -374,19 +401,34 @@ def realign_misplaced_thumbnails(channels: list[dict[str, Any]] | None = None,
         if any(v > 0 for v in pc.values()):
             per_channel[name] = pc
 
-    if stream and not dry_run:
+    _was_cancelled = _cancelled()
+    if stream:
         try:
-            stream.emit_text(
-                f" — Realigned {moved} misplaced thumbnail(s) across "
-                f"{len(per_channel)} channel(s). "
-                f"({skipped_dest} skipped — duplicate at target.)",
-                "simpleline_pink")
+            if _was_cancelled:
+                stream.emit_text(
+                    f" — Thumbnail realign stopped: "
+                    f"{scanned} thumbnail(s) scanned, "
+                    f"{misaligned} misplaced found so far.",
+                    "simpleline_pink")
+            elif dry_run:
+                stream.emit_text(
+                    f" — Thumbnail realign survey complete: "
+                    f"{misaligned} misplaced of {scanned} scanned across "
+                    f"{len(per_channel)} channel(s).",
+                    "simpleline_pink")
+            else:
+                stream.emit_text(
+                    f" — Realigned {moved} misplaced thumbnail(s) across "
+                    f"{len(per_channel)} channel(s). "
+                    f"({skipped_dest} skipped — duplicate at target.)",
+                    "simpleline_pink")
             stream.flush()
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
     return {
         "ok": True,
+        "cancelled": _was_cancelled,
         "scanned": scanned,
         "aligned": aligned,
         "misaligned": misaligned,
@@ -539,13 +581,13 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         # hits the SQL fast path instead of re-walking. Bulk UPDATE
         # by `video_id` (channel-scoped to avoid cross-channel
         # collisions if two channels happen to share an id).
-        rows_for_db: list[tuple[int, str]] = []
+        rows_for_db: list[tuple[int, str, str]] = []
         try:
             for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
                 total += 1
                 has = 1 if (vid_id and vid_id in all_thumb_vids) else 0
                 if vid_id:
-                    rows_for_db.append((has, vid_id))
+                    rows_for_db.append((has, vid_id, name))
                 if has:
                     with_thumb += 1
         except Exception as e:
@@ -559,7 +601,7 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
                     with _idx._db_lock:
                         _conn.executemany(
                             "UPDATE videos SET has_thumbnail=? "
-                            "WHERE video_id=?",
+                            "WHERE video_id=? AND channel=?",
                             rows_for_db)
                         _conn.commit()
         except Exception as e:

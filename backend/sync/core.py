@@ -610,7 +610,35 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # OLD, full mode means "first sync grabs everything, subsequent
     # syncs only grab new uploads". The download-archive file is what
     # prevents re-downloading across runs.
-    cmd += ["--download-archive", str(ARCHIVE_FILE)]
+    #
+    # REPOPULATION FIX: the global download-archive also BLOCKS refilling
+    # an emptied channel. If a channel's files were deleted from disk, the
+    # video IDs linger in ytarchiver_archive.txt and yt-dlp skips them
+    # forever — so a channel set to "Entire channel" range with an empty
+    # folder silently downloads nothing, and neither Reset-sync-state nor
+    # Remove+Re-add helps (the archive is global and survives both).
+    # Detect that exact case — full ("Entire channel") mode with ZERO
+    # videos on disk — and bypass the archive so the channel refills.
+    # yt-dlp's own existing-file check still prevents dupes for anything
+    # already present (nothing, here), and downloaded IDs are re-appended
+    # to the archive afterwards so normal incremental syncs resume once
+    # the folder is populated again.
+    _repopulate_empty = False
+    if mode == "full":
+        try:
+            from ..fs_search import walk_channel_videos as _wcv
+            _repopulate_empty = not any(True for _ in _wcv(str(ch_dir)))
+        except Exception:
+            _repopulate_empty = False
+    if _repopulate_empty:
+        try:
+            stream.emit_dim(
+                " (Entire-channel folder is empty — bypassing the "
+                "download archive to repopulate from scratch)")
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    else:
+        cmd += ["--download-archive", str(ARCHIVE_FILE)]
     # sync_complete default flipped False → True was
     # wrong. A channel missing this key (import, migration, or a
     # legacy config) had its fast-path gated on True-by-default,
@@ -1801,12 +1829,21 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                                 # instead (audit: sync/core.py H37).
                                 try:
                                     from .. import compress as _cmp
-                                    def _do_compress():
+                                    # Bind the per-video values as defaults so a
+                                    # later loop iteration that reassigns
+                                    # final_path/_comp_lvl/_comp_res can't make
+                                    # this fire-and-forget daemon compress the
+                                    # WRONG file (audit H4 / ruff B023). stream
+                                    # and cancel_event are channel-scoped, not
+                                    # per-video, so closing over them is safe.
+                                    def _do_compress(_path=final_path,
+                                                     _q=_comp_lvl,
+                                                     _res=_comp_res):
                                         try:
                                             _cmp.compress_video(
-                                                final_path, stream,
-                                                quality=_comp_lvl,
-                                                output_res=_comp_res,
+                                                _path, stream,
+                                                quality=_q,
+                                                output_res=_res,
                                                 cancel_event=cancel_event)
                                         except Exception as _e:
                                             try:
@@ -2724,6 +2761,19 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 cancel_event=cancel_event)
         except Exception as _sve:
             _log.debug("vtt sweep spawn skipped: %s", _sve)
+        # Safety net for the hidden-sidecars contract: after new
+        # downloads, ensure every freshly-written sidecar (.info.json —
+        # incl. yt-dlp's double-dot `Title..info.json` that the per-video
+        # name-reconstruct hider misses — .description, stray thumbs,
+        # etc.) carries the Windows HIDDEN attribute, so the folder shows
+        # only the videos + Transcript.txt. scandir-based + idempotent,
+        # so re-sweeping an already-clean channel is near-free.
+        try:
+            _bg_channel_maintenance(
+                "hide", _utils.hide_stray_sidecars, str(ch_dir),
+                cancel_event=cancel_event)
+        except Exception as _hve:
+            _log.debug("hide sweep spawn skipped: %s", _hve)
 
     # Also refresh the channel's avatar/banner art. Internal 30-day
     # threshold on channel_art.fetch_channel_art means this is near-free

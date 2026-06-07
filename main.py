@@ -177,13 +177,32 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         self._pending_res_scans: dict = {}
         self._pending_res_scans_lock = threading.Lock()
         self._delete_transcripts_lock = threading.Lock()
+        # Pair each lock with its running-flag. index_mixin only created
+        # these flags inside `if not hasattr(self, "_..._lock")`, but since
+        # the lock is pre-init'd here that block is skipped — leaving the
+        # flag undefined and the maintenance buttons raising AttributeError
+        # on first read (audit: index_mixin H/Codex). Init them here too.
+        self._delete_transcripts_running = False
         self._fts_rebuild_lock = threading.Lock()
+        self._fts_rebuild_running = False
         self._pending_previews: dict = {}
         self._pending_previews_lock = threading.Lock()
         self._drift_scan_results: dict = {}
         self._drift_apply_results: dict = {}
         self._drift_scan_lock = threading.Lock()
         self._drift_apply_lock = threading.Lock()
+        # Audit H5: the remaining mixin shared state that was still
+        # lazy-init'd via `if not hasattr(...)`. Pre-init up-front so two
+        # concurrent JS-bridge first-callers can't both create-and-clobber
+        # the lock/map (sync_mixin could otherwise double-spawn a sync).
+        # The mixins' hasattr branches stay as harmless fallbacks (they
+        # also cover the rare reset-to-None paths).
+        self._sync_start_lock = threading.Lock()
+        self._sync_mutation_lock = threading.RLock()
+        self._chan_art_inflight: set = set()
+        self._chan_art_lock = threading.Lock()
+        self._pending_metadata_choices: dict = {}
+        self._redwnl_samples: dict = {}
         # Lock for the session-download counter + tray badge update
         # below — read-modify-write under contention from multiple log
         # scanner threads (audit: HIGH H14).

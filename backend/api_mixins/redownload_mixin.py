@@ -154,7 +154,7 @@ class RedownloadMixin:
             _rd.redownload_channel(
                 ch.get("name", ""), ch.get("url", ""), folder, new_res,
                 stream=self._log_stream,
-                cancel_ev=self._sync_cancel,
+                cancel_ev=self._redwnl_cancel,
                 pause_ev=self._sync_pause,
                 confirm_cb=_confirm,
                 queues=self._queues,

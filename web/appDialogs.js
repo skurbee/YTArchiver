@@ -22,6 +22,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // Triggered by Python via evaluate_js — same three semantics as the
   // pre-rewrite tkinter dialog. "new" → Check for New (only fetch IDs
   // not already on disk; fast). "refresh" → Refresh Counts (re-hit
@@ -97,22 +107,29 @@
       backdrop.remove();
       // Cancel = pure dismiss. Window stays open, no config change
       // (we deliberately ignore the Remember box here — saving "Cancel"
-      // as the default close behavior makes no sense).
-      if (action === "cancel") return;
+      // as the default close behavior makes no sense). The backend
+      // call below MUST still happen: confirm_close is what releases
+      // the reentrant-X guard (_close_dialog_pending) — skipping it
+      // left the X button dead for the rest of the session after any
+      // Cancel/Esc/backdrop dismissal.
+      if (action === "cancel") {
+        try { if (nativeBridgeUp()) bridgeCall("confirm_close", "cancel", false); } catch {}
+        return;
+      }
       try {
-        await window.pywebview?.api?.confirm_close?.(action, rem);
+        if (nativeBridgeUp()) await bridgeCall("confirm_close", action, rem);
       } catch {}
     };
     backdrop.querySelector('[data-act="cancel"]').addEventListener("click", () => choose("cancel"));
     backdrop.querySelector('[data-act="tray"]').addEventListener("click", () => choose("tray"));
     backdrop.querySelector('[data-act="quit"]').addEventListener("click", () => choose("quit"));
     backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) backdrop.remove();
+      if (e.target === backdrop) choose("cancel");
     });
     document.addEventListener("keydown", function onKey(e) {
       if (e.key === "Escape") {
         document.removeEventListener("keydown", onKey);
-        backdrop.remove();
+        choose("cancel");
       }
     });
     setTimeout(() => backdrop.querySelector('[data-act="quit"]')?.focus(), 30);

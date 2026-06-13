@@ -35,7 +35,6 @@
  *   - window.refreshBookmarks (app.js, optional)
  *   - window.setCaptionPref (logs.js)
  *   - window.YT.bridge.bridgeCall (bridge.js)
- *   - window.pywebview.api.* (native bridge)
  */
 (function () {
   "use strict";
@@ -44,6 +43,10 @@
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
     return undefined;
+  }
+
+  function _nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
   }
 
   function initWatchActions() {
@@ -139,7 +142,7 @@
     document.getElementById("btn-open-external")?.addEventListener("click", () => {
       const v = _browseState.currentVideo;
       if (!v?.filepath) { window._showToast?.("No file loaded.", "warn"); return; }
-      window.pywebview?.api?.browse_open_video?.(v.filepath);
+      _bridgeCall("browse_open_video", v.filepath);
     });
 
     // Redownload current video — resolution picker, then video_redownload.
@@ -184,8 +187,7 @@
         return;
       }
       const btn = document.getElementById("btn-watch-refresh-meta");
-      const api = window.pywebview?.api;
-      if (!api?.browse_refresh_video_metadata) {
+      if (!_nativeBridgeUp()) {
         window._showToast?.("Refresh unavailable in browser-preview mode.", "warn");
         return;
       }
@@ -199,7 +201,7 @@
       const _origText = (btn && btn.dataset.label) || "Refresh metadata";
       if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
       try {
-        const res = await api.browse_refresh_video_metadata({
+        const res = await _bridgeCall("browse_refresh_video_metadata", {
           filepath: v.filepath || "",
           video_id: v.video_id || "",
           title: v.title || "",
@@ -234,11 +236,10 @@
       document.documentElement.style.setProperty(
         "--watch-transcript-fz", v.toFixed(1) + "px");
       try { localStorage.setItem(_txFontKey, String(v)); } catch {}
-      const _api = window.pywebview?.api;
-      if (_api?.settings_save) {
+      if (_nativeBridgeUp()) {
         if (_txFontSaveTimer) clearTimeout(_txFontSaveTimer);
         _txFontSaveTimer = setTimeout(() => {
-          try { _api.settings_save({ transcript_font_size: v }); }
+          try { _bridgeCall("settings_save", { transcript_font_size: v }); }
           catch {}
         }, 300);
       }
@@ -249,7 +250,8 @@
     } catch {}
     (async () => {
       try {
-        const s = await window.pywebview?.api?.settings_load?.();
+        if (!_nativeBridgeUp()) return;
+        const s = await _bridgeCall("settings_load");
         const v = parseFloat(s?.transcript_font_size);
         if (Number.isFinite(v) && v > 0) _applyTxFontSize(v);
       } catch {}
@@ -278,9 +280,8 @@
       const sel = document.getElementById("watch-cap-size");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capSizeKey, v); } catch {}
-      const _api = window.pywebview?.api;
-      if (_api?.settings_save) {
-        try { _api.settings_save({ caption_overlay_size: v }); } catch {}
+      if (_nativeBridgeUp()) {
+        try { _bridgeCall("settings_save", { caption_overlay_size: v }); } catch {}
       }
     }
     function _applyCapBg(bg) {
@@ -289,9 +290,8 @@
       const sel = document.getElementById("watch-cap-bg");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capBgKey, v); } catch {}
-      const _api = window.pywebview?.api;
-      if (_api?.settings_save) {
-        try { _api.settings_save({ caption_overlay_bg: v }); } catch {}
+      if (_nativeBridgeUp()) {
+        try { _bridgeCall("settings_save", { caption_overlay_bg: v }); } catch {}
       }
     }
     function _applyCapMode(mode) {
@@ -300,9 +300,8 @@
       const sel = document.getElementById("watch-cap-mode");
       if (sel && sel.value !== v) sel.value = v;
       try { localStorage.setItem(_capModeKey, v); } catch {}
-      const _api = window.pywebview?.api;
-      if (_api?.settings_save) {
-        try { _api.settings_save({ caption_overlay_mode: v }); } catch {}
+      if (_nativeBridgeUp()) {
+        try { _bridgeCall("settings_save", { caption_overlay_mode: v }); } catch {}
       }
     }
     try {
@@ -315,7 +314,8 @@
     } catch {}
     (async () => {
       try {
-        const s = await window.pywebview?.api?.settings_load?.();
+        if (!_nativeBridgeUp()) return;
+        const s = await _bridgeCall("settings_load");
         if (s?.caption_overlay_size && _CAP_SIZES.has(s.caption_overlay_size)) {
           _applyCapSize(s.caption_overlay_size);
         }
@@ -365,9 +365,12 @@
       try { localStorage.setItem(_txWidthKey, String(v)); } catch {}
     }
     function _persistTxWidth(px) {
-      const _api = window.pywebview?.api;
-      if (_api?.settings_save) {
-        try { _api.settings_save({ transcript_pane_width: parseInt(px, 10) }); }
+      if (_nativeBridgeUp()) {
+        try {
+          _bridgeCall("settings_save", {
+            transcript_pane_width: parseInt(px, 10),
+          });
+        }
         catch {}
       }
     }
@@ -377,7 +380,8 @@
     } catch {}
     (async () => {
       try {
-        const s = await window.pywebview?.api?.settings_load?.();
+        if (!_nativeBridgeUp()) return;
+        const s = await _bridgeCall("settings_load");
         const v = parseInt(s?.transcript_pane_width, 10);
         if (Number.isFinite(v) && v > 0) _applyTxWidth(v);
       } catch {}
@@ -453,9 +457,12 @@
 
     document.getElementById("btn-watch-retranscribe")?.addEventListener("click", async () => {
       const v = _browseState.currentVideo;
-      const api = window.pywebview?.api;
-      if (!api?.transcribe_retranscribe || !v?.filepath) {
+      if (!v?.filepath) {
         window._showToast?.("No file loaded.", "warn");
+        return;
+      }
+      if (!_nativeBridgeUp()) {
+        window._showToast?.("Native mode required.", "warn");
         return;
       }
       const vid = v.video_id || "";
@@ -485,7 +492,7 @@
       }
       let res;
       try {
-        res = await api.transcribe_retranscribe(
+        res = await _bridgeCall("transcribe_retranscribe",
           v.filepath, v.title || "", vid);
       } catch (e) {
         if (vid) window._inflightRetranscribes.delete(vid);
@@ -547,7 +554,11 @@
     document.getElementById("btn-bookmark-now")?.addEventListener("click", async () => {
       const _vEl = document.getElementById("watch-video");
       const v = _browseState.currentVideo;
-      if (!v || !window.pywebview?.api?.bookmark_add) {
+      if (!v) {
+        window._showToast?.("No video loaded.", "warn");
+        return;
+      }
+      if (!_nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -565,7 +576,7 @@
           }
         }
       }
-      const res = await window.pywebview.api.bookmark_add({
+      const res = await _bridgeCall("bookmark_add", {
         video_id: v.video_id || "",
         title: v.title || "",
         channel: v.channel || "",

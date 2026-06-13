@@ -583,6 +583,15 @@ def compress_video(input_path: str, stream: LogStreamer,
         # clock interval. Jitter range is small (0..1s) so total retry
         # window is still bounded.
         import random as _random
+        # Capture the original's timestamps BEFORE the replace — file
+        # mtime is the YouTube upload date everywhere in this app
+        # (reorg's year/month sorting, redownload's date matcher), and
+        # os.replace would otherwise leave the encode-finish time on
+        # every compressed video.
+        try:
+            _orig_st = os.stat(input_path)
+        except OSError:
+            _orig_st = None
         for _try in range(3):
             try:
                 os.replace(temp_path, input_path)
@@ -632,6 +641,17 @@ def compress_video(input_path: str, stream: LogStreamer,
                     "error": f"post-replace size mismatch: wrote={new_size} "
                              f"on_disk={_stat_size}",
                     "data_loss": True}
+
+        # Restore the original's upload-date mtime onto the encode —
+        # best-effort, but say so loudly if it fails (date integrity
+        # drives reorg and redownload matching).
+        if _orig_st is not None:
+            try:
+                os.utime(input_path, (_orig_st.st_atime, _orig_st.st_mtime))
+            except OSError as _ue:
+                stream.emit_error(
+                    f"Could not restore upload-date mtime on "
+                    f"{input_path}: {_ue}")
 
     # Per-file done line. Same _marker_tag as the progress bars so it
     # REPLACES the bar in place (issue #146) instead of appending at

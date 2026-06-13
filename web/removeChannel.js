@@ -23,9 +23,17 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   window._removeChannelWithPrompt = async function (name) {
-    const api = window.pywebview?.api;
-    if (!api?.subs_remove_channel) {
+    if (!nativeBridgeUp()) {
       window._showToast?.("Native mode required.", "warn");
       return null;
     }
@@ -49,7 +57,7 @@
     const deleteFiles = wantDelete === "yes";
     let res;
     try {
-      res = await api.subs_remove_channel({ name }, deleteFiles);
+      res = await bridgeCall("subs_remove_channel", { name }, deleteFiles);
     } catch (e) {
       window._showToast?.("Remove failed: " + e, "error");
       return { ok: false, error: String(e) };

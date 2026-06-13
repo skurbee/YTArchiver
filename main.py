@@ -100,6 +100,7 @@ from backend.log import get_logger as _get_logger
 from backend.log import install as _install_log_bridge
 from backend.log_stream import LogStreamer
 from backend.queues import QueueState
+from backend.services import AppServices, BridgeEventBus
 from backend.transcribe import TranscribeManager
 from backend.tray import TrayController
 from backend.ytarchiver_config import (
@@ -155,6 +156,12 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         _install_log_bridge(self._log_stream)
         self._sync_thread = None
         self._sync_cancel = threading.Event()
+        # Redownloads get their OWN cancel event. They used to borrow
+        # _sync_cancel, which every sync-stop leaves SET until the next
+        # sync starts — so redownloads begun in that window ghost-
+        # cancelled instantly, and one per-channel redownload cancel
+        # killed the whole queued chain. Global stop paths set BOTH.
+        self._redwnl_cancel = threading.Event()
         self._sync_pause = threading.Event() # set == paused; worker blocks
         self._sync_skip = threading.Event() # set == skip current item
         # Pending redownload chain — right-clicking "Continue Redownload"
@@ -249,6 +256,15 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # to "large-v3" regardless of what the user picked in Settings.
         _init_model = (load_config() or {}).get("whisper_model") or "small"
         self._transcribe = TranscribeManager(self._log_stream, model=_init_model)
+        self._event_bus = BridgeEventBus(lambda: self._window)
+        self.services = AppServices(
+            load_config=load_config,
+            save_config=save_config,
+            queues=self._queues,
+            log_stream=self._log_stream,
+            transcribe=self._transcribe,
+            event_bus=self._event_bus,
+        )
 
         from backend.disk_watch import DiskErrorMonitor
         self._disk_mon = DiskErrorMonitor(
@@ -297,6 +313,27 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         # internal `_jobs` list is invisible to the UI (a bug:
         # auto-transcribe on a channel, no task appeared in GPU Tasks).
         self._transcribe.attach_queues(self._queues, cfg_loader=load_config)
+        # Requeue any in-flight items persisted at last shutdown/crash.
+        # save_now writes current_sync/current_gpu into a `resuming`
+        # dict and load() stashes them via get_loaded_resuming() — but
+        # nothing ever consumed the stash, so the mid-channel sync and
+        # the mid-flight GPU job silently vanished on every relaunch.
+        # Restore them BEFORE the force-pause check below so the
+        # never-auto-start rule applies to restored items too.
+        try:
+            _resuming = self._queues.get_loaded_resuming()
+            _rs = _resuming.get("sync")
+            if isinstance(_rs, dict):
+                _rs.pop("_in_flight", None)
+                self._queues.sync_requeue_front(_rs)
+            _rg = _resuming.get("gpu")
+            if isinstance(_rg, dict):
+                _rg.pop("_in_flight", None)
+                self._queues.gpu_enqueue(_rg)
+            if isinstance(_rs, dict) or isinstance(_rg, dict):
+                _log.info("restored in-flight queue item(s) from last session")
+        except Exception as e:
+            _log.debug("resuming-restore failed: %s", e)
         # Project rule: launching with items already in the queue must never
         # auto-start on its own — the user explicitly hits Resume. Mirrors
         # YTArchiver.py:34190-34200 (_sync_pipeline_restored logic).
@@ -414,7 +451,6 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
         if self._window is None:
             return
         try:
-            import json as _json
             payload = self._queues.to_ui_payload()
             # Tray + tooltip uses "actively-working" semantics: is a channel
             # or GPU job currently being processed right now?
@@ -456,17 +492,18 @@ class Api(ArchiveMixin, BackupMixin, BookmarkMixin, BrowseMixin, ChannelMixin, D
                                         payload.get('sync_paused')))
             _gpu_pa = bool(payload.get('gpu_paused_active',
                                        payload.get('gpu_paused')))
-            js = (
-                f"if (window.renderQueues) window.renderQueues({_json.dumps(payload)});"
-                f"if (window.setQueueState) window.setQueueState("
-                f" {{sync: {{running: {str(sync_running).lower()}, "
-                f"paused: {str(payload['sync_paused']).lower()}, "
-                f"pausedActive: {str(_sync_pa).lower()}}},"
-                f" gpu: {{running: {str(gpu_running).lower()}, "
-                f"paused: {str(payload['gpu_paused']).lower()}, "
-                f"pausedActive: {str(_gpu_pa).lower()}}}}});"
-            )
-            self._window.evaluate_js(js)
+            self.services.event_bus.update_queues(payload, {
+                "sync": {
+                    "running": sync_running,
+                    "paused": bool(payload["sync_paused"]),
+                    "pausedActive": _sync_pa,
+                },
+                "gpu": {
+                    "running": gpu_running,
+                    "paused": bool(payload["gpu_paused"]),
+                    "pausedActive": _gpu_pa,
+                },
+            })
             # Drive tray icon spin + tooltip with current task name.
             # Uses the narrower *_working semantics so the tray shows idle
             # (not spinning) while a pass is paused between channels.
@@ -1149,16 +1186,16 @@ def main():
 
     # Load saved window state (position / size / maximized)
     ws = winstate.load_window_state()
-    kwargs = dict(
-        title="YTArchiver",
-        url=str(INDEX),
-        js_api=api,
-        width=int(ws.get("width") or 1100),
-        height=int(ws.get("height") or 780),
-        min_size=(640, 480),
-        background_color="#0f1012",
-        resizable=True,
-    )
+    kwargs = {
+        "title": "YTArchiver",
+        "url": str(INDEX),
+        "js_api": api,
+        "width": int(ws.get("width") or 1100),
+        "height": int(ws.get("height") or 780),
+        "min_size": (640, 480),
+        "background_color": "#0f1012",
+        "resizable": True,
+    }
     if ws.get("x") is not None and ws.get("y") is not None:
         kwargs["x"] = int(ws["x"])
         kwargs["y"] = int(ws["y"])
@@ -1290,10 +1327,21 @@ def main():
             pass
         def _show_modal():
             try:
-                window.evaluate_js(
-                    "window._showCloseDialog && window._showCloseDialog()")
+                _shown = window.evaluate_js(
+                    "(function(){ if (window._showCloseDialog) {"
+                    " window._showCloseDialog(); return true; }"
+                    " return false; })()")
+                if not _shown:
+                    # appDialogs.js not loaded yet (X-click during the
+                    # boot window) — no modal will ever appear, so
+                    # release the reentrant guard or the X button
+                    # stays dead for the whole session.
+                    try: api._close_dialog_pending = False
+                    except Exception: pass
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+                try: api._close_dialog_pending = False
+                except Exception: pass
         try:
             threading.Thread(target=_show_modal, daemon=True).start()
         except Exception as e:
@@ -1323,6 +1371,8 @@ def main():
             # code and journal a partial-file row to the DB before
             # checking _sync_cancel.
             try: api._sync_cancel.set()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            try: api._redwnl_cancel.set()
             except Exception as e: _log.debug("swallowed: %s", e)
             # Brief join window so an in-flight worker iteration can
             # see the cancel and bail.
@@ -1417,6 +1467,14 @@ def main():
             # Matches OLD's
             # YTArchiver.py:34306 _clear_sync_progress() shutdown call.
             try: sync_backend.clear_sync_progress()
+            except Exception as e: _log.debug("swallowed: %s", e)
+            # 7. Checkpoint + close the SQLite index now that the sync/GPU
+            # workers + subprocesses are stopped. main() ends in os._exit(0),
+            # which bypasses index.py's atexit hook, so call it explicitly here
+            # — otherwise the checkpoint never runs (audit r2). Best-effort.
+            try:
+                from backend import index as _idx
+                _idx._shutdown_index()
             except Exception as e: _log.debug("swallowed: %s", e)
         except Exception as e:
             _log.debug("swallowed: %s", e)

@@ -16,6 +16,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── URL field + Download button ────────────────────────────────────
   //
@@ -45,9 +48,8 @@
     // via api.url_history(); frontend just populates the <option>s.
     (async () => {
       try {
-        const api = window.pywebview?.api;
-        if (!api?.url_history) return;
-        const hist = await api.url_history();
+        if (!nativeBridgeUp()) return;
+        const hist = await bridgeCall("url_history");
         const dl = document.getElementById("url-history-list");
         if (!dl || !Array.isArray(hist)) return;
         dl.innerHTML = "";
@@ -63,8 +65,8 @@
     // folder so users don't have to remember what they set it to.
     (async () => {
       try {
-        const api = window.pywebview?.api;
-        const s = await api?.settings_load?.();
+        if (!nativeBridgeUp()) return;
+        const s = await bridgeCall("settings_load");
         const def = (s?.video_out_dir || s?.output_dir || "").trim();
         const saveInput = document.getElementById("vo-save-to");
         if (saveInput && def) saveInput.placeholder = def;
@@ -210,8 +212,7 @@
         window._showToast?.("Paste a YouTube video URL first.", "warn");
         return;
       }
-      const api = window.pywebview?.api;
-      if (!api?.archive_single_video) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -219,8 +220,8 @@
       // (not a separate list), so it reflects what's actually archived now.
       // Any failure falls through and allows the download. User can override.
       try {
-        if (api.single_video_archived && askConfirm) {
-          const chk = await api.single_video_archived(url);
+        if (askConfirm) {
+          const chk = await bridgeCall("single_video_archived", url);
           if (chk?.ok && chk.archived) {
             const what = chk.title ? `"${chk.title}"` : "This video";
             const where = chk.channel ? ` in "${chk.channel}"` : "";
@@ -234,7 +235,7 @@
         }
       } catch { /* non-fatal — allow the download */ }
       const opts = readVideoOptions();
-      await api.archive_single_video(url, opts);
+      await bridgeCall("archive_single_video", url, opts);
       window._showToast?.("Queued: " + url.slice(0, 60), "ok");
       input.value = "";
       updateBtnVisibility();
@@ -269,21 +270,20 @@
 
     // Save-to folder Browse button → pywebview native folder picker
     document.getElementById("vo-save-to-browse")?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.pick_folder) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       const saveInput = document.getElementById("vo-save-to");
       const current = saveInput?.value || "";
-      const res = await api.pick_folder("Save video to…", current);
+      const res = await bridgeCall("pick_folder", "Save video to…", current);
       if (res?.ok && res.path) {
         // if the user picks a path outside the archive tree,
         // the downloaded file won't show up in Browse / Search / FTS
         // because the scanner only walks output_dir. Warn before
         // committing so users aren't surprised later.
         try {
-          const s = await api.settings_load?.();
+          const s = await bridgeCall("settings_load");
           const archiveRoot = (s?.output_dir || "").replace(/[\\/]+$/, "");
           const picked = String(res.path || "").replace(/[\\/]+$/, "");
           if (archiveRoot && picked &&
@@ -306,7 +306,7 @@
     // Channel-nudge button: swap to Subs tab + pre-fill the Add Channel URL
     // field (edit-url — the new Subs panel collapses to edit-form, there's
     // no separate "Add" form). Mirrors YTArchiver.py:4462 _go_to_add_channel.
-    document.getElementById("btn-channel-nudge-add")?.addEventListener("click", () => {
+    const goToAddChannel = () => {
       const url = (input.value || "").trim();
       if (!url) return;
       // Switch to Subs tab
@@ -324,6 +324,14 @@
       // Clear the Download-tab URL so the nudge hides
       input.value = "";
       updateBtnVisibility();
+    };
+    // The whole nudge box is clickable (it looked actionable but only the
+    // button worked); the button stops propagation so the box handler
+    // doesn't double-fire.
+    document.getElementById("channel-nudge-panel")?.addEventListener("click", goToAddChannel);
+    document.getElementById("btn-channel-nudge-add")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      goToAddChannel();
     });
 
     // Initial sync in case there's a value restored from somewhere

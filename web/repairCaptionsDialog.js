@@ -15,6 +15,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initRepairCaptionsDialog() {
       const btn = document.getElementById("btn-repair-yt-captions");
       const bd = document.getElementById("repair-yt-backdrop");
@@ -26,9 +36,15 @@
 
       const _loadChannels = async () => {
         try {
-          const api = window.pywebview?.api;
-          const list = await api?.get_subs_channels?.();
-          const channels = Array.isArray(list) ? list : (list?.channels || []);
+          if (!nativeBridgeUp()) return;
+          const list = await bridgeCall("get_subs_channels");
+          // get_subs_channels returns a [rows, totalLabel] tuple —
+          // unwrap rows like driftScanDialog does, or the dropdown
+          // fills with two garbage entries.
+          let channels = [];
+          if (Array.isArray(list) && Array.isArray(list[0])) channels = list[0];
+          else if (Array.isArray(list)) channels = list;
+          else channels = list?.channels || [];
           chanSel.innerHTML = "";
           // "All channels" is the default — full-archive fix is the
           // most common case for a one-shot repair.
@@ -70,8 +86,7 @@
       });
 
       runBtn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.repair_yt_captions) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Repair API not available.", "warn");
           return;
         }
@@ -93,7 +108,7 @@
           if (!_ok) return;
         }
         try {
-          const res = await api.repair_yt_captions(payload);
+          const res = await bridgeCall("repair_yt_captions", payload);
           if (res?.ok && res.queued) {
             const msg = res.started
               ? "Repair queued — running now. Watch the main log."

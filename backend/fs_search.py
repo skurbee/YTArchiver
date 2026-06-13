@@ -40,6 +40,13 @@ AUDIO_EXTS: frozenset[str] = frozenset({
 
 VIDEO_AND_AUDIO_EXTS: frozenset[str] = VIDEO_EXTS_EXTENDED | AUDIO_EXTS
 
+# Tuple form for str.endswith()/`in` callers (membership order is irrelevant).
+# Single source of truth so archive_scan / index_maintenance / metadata.scan /
+# reorg all classify the same files as media — earlier each kept its own tuple
+# and they drifted (.flv/.wmv in reorg but not the disk-count) (audit:
+# VIDEO_EXTS divergence).
+MEDIA_EXTS_TUPLE: tuple[str, ...] = tuple(sorted(VIDEO_AND_AUDIO_EXTS))
+
 
 _PARTIAL_FRAG_RE = re.compile(
     r"\.f\d{1,4}(?:-\d+)?\.[a-z0-9]{3,4}$", re.IGNORECASE)

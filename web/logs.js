@@ -534,24 +534,13 @@
     } catch (_e) { /* non-fatal */ }
     const cap = 30000, keep = 25000;
     if (el.childElementCount > cap) {
-      const toRemove = el.childElementCount - keep;
+      let toRemove = el.childElementCount - keep;
+      // Remove an EVEN number so zebra-stripe parity never shifts on the kept
+      // rows — then we never need the O(n) re-stripe walk over ~25k rows that
+      // used to stall the main thread on ~every other trim under heavy
+      // overnight log throughput (audit r2 / logs.js C30).
+      if (toRemove % 2 === 1) toRemove++;
       for (let i = 0; i < toRemove; i++) el.removeChild(el.firstChild);
-      // audit LG-2: re-compute zebra-stripe parity on the kept
-      // rows so the alternating background stays coherent after
-      // a trim. Only re-walk when the removed count is ODD (parity
-      // actually shifted); when EVEN, every kept row's existing
-      // .hist_row_alt class is still on the right parity. Avoids a
-      // multi-second main-thread block re-styling 25k rows on every
-      // trim under heavy sync log throughput (audit: logs.js C30).
-      if (toRemove % 2 === 1) {
-        try {
-          const rows = el.querySelectorAll(".log-line");
-          for (let i = 0; i < rows.length; i++) {
-            if (i % 2 === 1) rows[i].classList.add("hist_row_alt");
-            else rows[i].classList.remove("hist_row_alt");
-          }
-        } catch (_e) { /* non-fatal */ }
-      }
     }
     maybeSnapToBottom(el);
   };

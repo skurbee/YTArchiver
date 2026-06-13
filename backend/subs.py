@@ -67,7 +67,7 @@ def normalize_channel_url(url: str) -> str:
         return f"https://www.youtube.com{url}"
     # no scheme → add https
     if not url.startswith(("http://", "https://")):
-        if url.startswith("youtube.com") or url.startswith("www.youtube.com"):
+        if url.startswith(("youtube.com", "www.youtube.com")):
             return "https://" + url.lstrip("/")
         if url.startswith("/"):
             return "https://www.youtube.com" + url
@@ -425,6 +425,19 @@ def update_channel(identity: dict[str, str], payload: dict[str, Any]) -> dict[st
     # rebuild the whole dict from DEFAULTS — that would silently wipe the
     # URL / auto_transcribe / mode / etc. Detect sparse payloads and
     # merge on top of the existing channel so unmentioned fields survive.
+    # URL hygiene — add_channel validates, edits previously didn't:
+    # a present-but-blank url flipped the payload onto the full rebuild
+    # path AND persisted url='' (a channel that can never sync again);
+    # a typo'd watch/playlist URL was persisted unchecked.
+    if "url" in payload:
+        _u = (payload.get("url") or "").strip()
+        if not _u:
+            payload = dict(payload)
+            payload.pop("url", None)  # keep the existing URL
+        else:
+            _ok_u, _why_u = validate_channel_url(_u)
+            if not _ok_u:
+                raise SubsError(f"Invalid channel URL: {_why_u}")
     sparse_payload = not payload.get("url") and "url" not in payload
     if sparse_payload:
         # Merge: start from existing, overlay payload keys directly
@@ -582,7 +595,6 @@ def remove_channel(identity: dict[str, str],
     is best-effort; if it partially fails the subscription is still removed
     so the user isn't stuck with a broken record.
     """
-    import shutil
     cfg = load_config()
     channels = cfg.setdefault("channels", [])
     idx = _find_channel(channels, identity)
@@ -609,37 +621,19 @@ def remove_channel(identity: dict[str, str],
                 # that doesn't live INSIDE output_dir. A malformed
                 # channel name with .. traversal characters could
                 # otherwise yield a path outside the archive root.
-                # Use os.path.commonpath to detect escapes.
-                _base_abs = os.path.abspath(base)
-                _folder_abs = os.path.abspath(folder_path)
-                try:
-                    _common = os.path.commonpath([_folder_abs, _base_abs])
-                except ValueError:
-                    _common = ""
-                if _common != _base_abs:
-                    raise ValueError(
-                        f"refused to delete folder outside output_dir: "
-                        f"{folder_path}")
-                if os.path.isdir(folder_path):
-                    # Track partial-failure paths so the user sees
-                    # which sub-files survived a botched rmtree. The
-                    # ignore_errors=False path stops at first failure;
-                    # using onerror lets us continue and report.
-                    _failed_paths: list[tuple[str, str]] = []
-                    def _onerr(_fn, _p, _exc):
-                        try:
-                            _failed_paths.append((_p, str(_exc[1])))
-                        except Exception:
-                            _failed_paths.append((str(_p), "?"))
-                    shutil.rmtree(folder_path, onerror=_onerr)
-                    if _failed_paths:
-                        result["delete_error"] = (
-                            f"{len(_failed_paths)} item(s) could not be "
-                            f"removed (first: {_failed_paths[0][0]})")
-                        result["delete_partial_failures"] = _failed_paths
-                    else:
-                        result["deleted_folder"] = True
-                    result["folder_path"] = folder_path
+                from backend.services.file_ops import safe_rmtree_channel_folder
+                delete_result = safe_rmtree_channel_folder(
+                    folder_path,
+                    require_config_writable=True,
+                    reason="subs_remove_channel",
+                )
+                result.update({
+                    k: v for k, v in delete_result.items()
+                    if k not in {"ok", "reason"}
+                })
+                if not delete_result.get("ok"):
+                    raise ValueError(delete_result.get("error")
+                                     or "folder delete failed")
             except Exception as e:
                 # Delete failed — surface the error but STILL drop the
                 # subs-list entry. The alternative (keeping it in the

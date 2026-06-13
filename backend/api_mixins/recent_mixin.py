@@ -284,24 +284,23 @@ class RecentMixin:
         fp = self._recent_lookup_path(title, channel)
         if not fp:
             return {"ok": False, "error": "File not found"}
+        # Defense-in-depth: refuse to os.remove a path resolving OUTSIDE the
+        # archive roots this app manages (audit: recent_mixin containment).
+        from backend.services.file_ops import (
+            safe_remove_file,
+            safe_remove_sidecars,
+        )
+        removed = safe_remove_file(
+            fp, require_config_writable=True, reason="recent_delete_file")
+        if not removed.get("ok"):
+            return removed
+        safe_remove_sidecars(fp)
         # Refuse the destructive os.remove if config writes are blocked
         # — otherwise we delete the file but can't update the
         # recent_downloads list, leaving the user with a stale entry
         # pointing at a missing file with no way to clean it up
         # (audit: recent_mixin H22).
-        if not config_is_writable():
-            return {"ok": False,
-                    "error": "Config is currently read-only "
-                             "(write-gate or read-only filesystem). "
-                             "Refusing to delete file when the recent "
-                             "list can't be updated."}
-        try:
-            os.remove(fp)
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
         # Drop sidecars. audit F-24 list lives in utils.delete_video_sidecars.
-        from backend.utils import delete_video_sidecars
-        delete_video_sidecars(fp)
         # Mirror video_mixin.video_delete_file's index cleanup so the
         # FTS / videos rows tied to this filepath are dropped too.
         # Without this, Browse + Search kept returning "file not
@@ -309,14 +308,15 @@ class RecentMixin:
         # 226-246).
         try:
             from backend import index as _idx
+            # FTS-safe, video_id-keyed segment removal (works in the
+            # aggregated layout; the old per-video jsonl_path DELETE
+            # matched zero rows there and skipped the FTS5 'delete'
+            # sync on legacy rows). Must run BEFORE the videos row is
+            # dropped — the helper resolves video_id from it.
+            _idx.delete_segments_for_video(fp)
             _conn = _idx._open()
             if _conn is not None:
-                _stem, _ext = os.path.splitext(fp)
-                _sidecar = _stem + ".jsonl"
                 with _idx._db_lock:
-                    _conn.execute(
-                        "DELETE FROM segments WHERE jsonl_path = ? COLLATE NOCASE",
-                        (_sidecar,))
                     _conn.execute(
                         "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
                         (fp,))

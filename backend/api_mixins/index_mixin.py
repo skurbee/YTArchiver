@@ -63,13 +63,18 @@ class IndexMixin:
                 for fn in fns:
                     fl = fn.lower()
                     fp = os.path.join(dp, fn)
-                    if ((fl.endswith("transcript.txt") or
-                         fl.endswith("transcription.txt"))
+                    if (fl.endswith(("transcript.txt", "transcription.txt"))
                             and not fn.startswith(".")):
                         txt_count += 1
                         try: total_bytes += os.path.getsize(fp)
                         except OSError: pass
-                    elif fl.endswith(".jsonl") and fn.startswith("."):
+                    elif (fl.endswith(".jsonl") and fn.startswith(".")
+                            and not fl.endswith("metadata.jsonl")):
+                        # metadata.jsonl exclusion: aggregated metadata
+                        # sidecars (".{ch} Metadata.jsonl" etc.) are
+                        # hidden dot-jsonls too — they are NOT
+                        # transcripts and must never be counted (or
+                        # deleted) by this feature.
                         jsonl_count += 1
                         try: total_bytes += os.path.getsize(fp)
                         except OSError: pass
@@ -98,6 +103,14 @@ class IndexMixin:
             folder = (cfg.get("output_dir") or "").strip()
         if not folder or not os.path.isdir(folder):
             return {"ok": False, "error": "Folder not found"}
+        # Containment: this is the most destructive bridge method (recursive
+        # delete of transcripts + a full FTS wipe). The `folder` arg crosses
+        # the JS trust boundary, so refuse anything outside the archive roots
+        # this app manages — incl. tp_archive_roots (audit r2).
+        from backend.utils import is_within_managed_roots
+        if not is_within_managed_roots(folder):
+            return {"ok": False,
+                    "error": "Refusing to delete transcripts outside the archive."}
         # Re-entry guard — double-click on the button or rapid retries
         # used to launch parallel sweeps over the same tree, racing on
         # os.remove + on the DELETE FROM segments.
@@ -121,18 +134,30 @@ class IndexMixin:
                     fl = fn.lower()
                     fp = os.path.join(dp, fn)
                     hit = False
-                    if (fl.endswith("transcript.txt") or fl.endswith("transcription.txt")) \
+                    if fl.endswith(("transcript.txt", "transcription.txt")) \
                             and not fn.startswith("."):
                         hit = True
-                    elif fl.endswith(".jsonl") and fn.startswith("."):
+                    elif (fl.endswith(".jsonl") and fn.startswith(".")
+                            and not fl.endswith("metadata.jsonl")):
+                        # NEVER touch metadata sidecars: the aggregated
+                        # ".{ch} Metadata.jsonl" files are hidden
+                        # dot-jsonls too, and the blanket pattern used
+                        # to delete the ENTIRE metadata archive
+                        # (descriptions/comments/counts — unrecoverable
+                        # for removed videos) along with transcripts.
                         hit = True
                     if not hit:
                         continue
                     try:
-                        # Un-hide so Python can remove it on Windows
-                        from backend.utils import unhide_file_win
-                        unhide_file_win(fp)
-                        os.remove(fp)
+                        from backend.services.file_ops import safe_remove_file
+                        result = safe_remove_file(
+                            fp,
+                            require_config_writable=False,
+                            reason="index_delete_all_transcripts",
+                            unhide_first=True,
+                        )
+                        if not result.get("ok"):
+                            raise OSError(result.get("error") or "delete failed")
                         deleted += 1
                         if deleted % 100 == 0:
                             self._log_stream.emit_dim(f" deleted {deleted}\u2026")

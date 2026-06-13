@@ -378,35 +378,43 @@ def _write_transcript_entry_plain(txt_path: str, title: str, date_str: str,
         pass
     header = f"===({title}), ({date_str}), ({duration_str}), ({source_tag})==="
     body = text.rstrip() + "\n\n"
-    # Atomic read-append-tmp-replace pattern. The previous open("a")
-    # path was vulnerable to interleaving when an active transcribe
-    # passed simultaneously appended to the SAME aggregated .txt
-    # (drift_apply runs concurrent with sync's transcribe writers).
-    # Read once, append in memory, write to .tmp, os.replace.
+    # Read-append-tmp-replace, SERIALIZED with the transcribe writers
+    # via their shared per-path lock. The atomic-replace alone did NOT
+    # fix interleaving — a snapshot-replace with no shared lock
+    # guarantees that any entry a transcribe worker appends between
+    # our read and our os.replace is silently erased (drift_apply runs
+    # on a worker thread concurrent with sync's transcribe writers).
     try:
+        from backend.transcribe.transcribe_files import txt_lock_for as _tlf
+        _lk = _tlf(txt_path)
+    except Exception:
+        import threading as _th
+        _lk = _th.RLock()
+    with _lk:
         try:
-            with open(txt_path, "r", encoding="utf-8") as fh:
-                existing = fh.read()
-        except FileNotFoundError:
-            existing = ""
-        new_content = existing + header + "\n" + body
-        tmp = txt_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(new_content)
-                try:
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                except OSError as e:
-                    _log.debug("swallowed: %s", e)
-            os.replace(tmp, txt_path)
+            try:
+                with open(txt_path, "r", encoding="utf-8") as fh:
+                    existing = fh.read()
+            except FileNotFoundError:
+                existing = ""
+            new_content = existing + header + "\n" + body
+            tmp = txt_path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(new_content)
+                    try:
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    except OSError as e:
+                        _log.debug("swallowed: %s", e)
+                os.replace(tmp, txt_path)
+            except OSError:
+                try: os.remove(tmp)
+                except OSError: pass
+                return False
+            return True
         except OSError:
-            try: os.remove(tmp)
-            except OSError: pass
             return False
-        return True
-    except OSError:
-        return False
 
 
 def _rebuild_txt_from_jsonl_entries(jsonl_path: str,
@@ -537,14 +545,8 @@ def apply_channel(channel: dict[str, Any], output_dir: str,
             mt = os.path.getmtime(jsonl_path)
             ts_struct = time.localtime(mt)
             date_str = time.strftime("%m.%d.%Y", ts_struct)
-            # `%-I` is GNU/Linux glibc only; macOS BSD libc accepts
-            # it but Linux musl + Windows do not. Use the cross-
-            # platform `lstrip("0")` workaround so Linux glibc-free
-            # builds don't ValueError (audit: drift_scan H115).
-            time_str = time.strftime("%I:%M", ts_struct).lstrip("0") or "12:00"
         except Exception:
             date_str = "00.00.0000"
-            time_str = "0:00"
         for title, data in rebuilt.items():
             src_tag = "RECOVERED-FROM-JSONL"
             dur_str = _fmt_duration_hms(float(data.get("duration_s") or 0))

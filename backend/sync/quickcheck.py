@@ -14,7 +14,7 @@ Patch 18 phase 3 (v68.8): extracted from sync/legacy.py. Contains:
   - `set_batch_cooldown(ch_url)` — write the 72h timestamp.
 
 Module-level constants `_BATCH_LIMIT` and `_BATCH_COOLDOWN_HOURS` are
-also defined here (legacy.py re-imports both).
+also defined here (re-exported via the sync package).
 """
 from __future__ import annotations
 

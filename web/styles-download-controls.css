@@ -170,6 +170,10 @@
   border: 1px solid rgba(245, 160, 35, 0.3);
   border-radius: 4px;
   font-size: 12px;
+  cursor: pointer;            /* whole box is clickable -> jumps to Subs */
+}
+.channel-nudge-panel:hover {
+  background: rgba(245, 160, 35, 0.14);
 }
 .channel-nudge-icon { font-size: 14px; }
 .channel-nudge-text { color: var(--c-text); }
@@ -195,6 +199,12 @@
 }
 .ctl-input::placeholder {
   color: var(--c-dim);
+}
+/* Disabled input (e.g. the Graph Word field in word-cloud mode) reads as
+   clearly inert against the dark theme, not just Chromium's faint default. */
+.ctl-input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* Flash an input green after an auto-fill (e.g. URL probe -> Name field) */

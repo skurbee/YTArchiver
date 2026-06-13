@@ -155,7 +155,21 @@ class BrowseMixin:
                 payload.get("video_id") or "")
         except Exception:
             src_info = {"source": "unknown", "raw": ""}
-        return {"ok": True, "segments": segs, "source": src_info}
+        # When there are NO segments, look up the video's tx_status so the
+        # Watch view can distinguish a genuinely-silent video ('no_speech',
+        # Whisper ran and found nothing) from one that simply hasn't been
+        # transcribed yet — both render zero segments otherwise. Only on the
+        # empty path so the common (has-transcript) case stays a single query.
+        tx_status = ""
+        if not segs:
+            try:
+                tx_status = index_backend.video_tx_status(
+                    video_id=payload.get("video_id") or "",
+                    title=payload.get("title") or "")
+            except Exception:
+                tx_status = ""
+        return {"ok": True, "segments": segs, "source": src_info,
+                "tx_status": tx_status}
 
 
     def _classify_transcript_source(self, title, jsonl_path, video_id):
@@ -355,7 +369,6 @@ class BrowseMixin:
         try:
             filepath = (payload or {}).get("filepath") or ""
             video_id = (payload or {}).get("video_id") or ""
-            title = (payload or {}).get("title") or ""
             channel = (payload or {}).get("channel") or ""
             if not video_id:
                 import re as _re
@@ -562,7 +575,7 @@ class BrowseMixin:
                 totals = {}
             def _norm(labels, values):
                 out = []
-                for lbl, v in zip(labels, values):
+                for lbl, v in zip(labels, values, strict=False):
                     tot = totals.get(str(lbl), 0)
                     if tot > 0:
                         out.append(round((v * 1000.0) / tot, 2))

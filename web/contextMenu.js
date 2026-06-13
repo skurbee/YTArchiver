@@ -47,6 +47,7 @@
       const row = document.createElement("div");
       row.className = "ctx-menu-item" + (it.cls ? " " + it.cls : "");
       row.textContent = it.label;
+      if (it.title) row.title = it.title;   // hover tooltip (e.g. why disabled)
       if (it.submenu) {
         row.classList.add("ctx-submenu-wrap");
         const sub = document.createElement("div");

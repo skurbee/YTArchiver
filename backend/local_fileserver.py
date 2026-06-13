@@ -103,10 +103,10 @@ def _is_under_allowed_root(path: str) -> bool:
         # os.path.normcase ensures case-insensitive prefix match on
         # Windows. The + os.sep guard prevents "/ArchiveBad" from
         # matching an allowed root "/Archive".
-        if p == root or p.startswith(root + os.sep) or p.startswith(root + "/"):
+        root_prefixes = (root + os.sep, root + "/")
+        if p == root or p.startswith(root_prefixes):
             # Belt + suspenders: also require the realpath under root.
-            if (_real == root or _real.startswith(root + os.sep)
-                    or _real.startswith(root + "/")):
+            if _real == root or _real.startswith(root_prefixes):
                 return True
             try:
                 _log.warning(

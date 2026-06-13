@@ -565,6 +565,7 @@
   max-width: 520px;
   max-height: 70vh;
   background: var(--c-raised);
+  color: var(--c-text);
   border: 1px solid var(--c-border);
   border-radius: 4px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
@@ -642,7 +643,8 @@
   overflow-y: auto;
   max-height: 260px;
   padding: 4px 0;
-  background: var(--c-raised);
+  background: #1b1f25;
+  color: var(--c-text);
 }
 .queue-popover-body .queue-task-row {
   display: grid;
@@ -652,12 +654,12 @@
   padding: 4px 10px;
   font-family: var(--font-log);
   font-size: 12px;
-  color: var(--c-text);
+  color: #e8edf5;
   cursor: grab;
   border-left: 2px solid transparent;
 }
 .queue-popover-body .queue-task-row:hover {
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(255, 255, 255, 0.06);
 }
 .queue-popover-body .queue-task-row.drag-src {
   opacity: 0.35;
@@ -678,7 +680,7 @@
   border-left-color: var(--c-log-sum);
 }
 .queue-task-index {
-  color: var(--c-dim);
+  color: #98a2b3;
   font-size: 11px;
   text-align: right;
 }
@@ -690,6 +692,12 @@
 }
 .queue-task-state.paused { color: var(--c-log-sum); }
 .queue-task-state.queued { color: var(--c-dim); }
+.queue-task-name {
+  color: #e8edf5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* Cycling dots on the active task row. Pure CSS keyframes cycle through
    three content values so there's no JS timer churn. Matches
@@ -710,11 +718,6 @@
 .queue-task-dots::after {
   content: "\00B7 \00B7 \00B7";
   animation: queue-dots-kf 1.2s steps(1, end) infinite;
-}
-.queue-task-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .queue-task-name em {
   color: var(--c-log-blue);
@@ -743,7 +746,7 @@
 .queue-task-close:hover { color: var(--c-log-red); }
 .queue-empty {
   padding: 18px 14px;
-  color: var(--c-dim);
+  color: #aab4c3;
   font-style: italic;
   text-align: center;
   font-size: 12px;

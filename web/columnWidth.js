@@ -18,6 +18,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Column width persistence (Subs + Recent) ───────────────────────
   function persistColumnWidths() {
     // Wire resize handles immediately — these don't need the API.
@@ -32,9 +36,8 @@
     // Without this, saved widths were silently dropped on every boot
     // (reported: Subs column widths don't persist across restart).
     const applySaved = () => {
-      const api = window.pywebview?.api;
-      if (!api?.window_state_load) return false;
-      api.window_state_load().then((st) => {
+      if (!nativeBridgeUp()) return false;
+      bridgeCall("window_state_load").then((st) => {
         if (!st || !st.col_widths) return;
         _applyColWidths(".subs-table", st.col_widths.subs);
         _applyColWidths(".recent-table", st.col_widths.recent);
@@ -131,12 +134,11 @@
               widths[key] = parseInt(col.style.width);
             }
           });
-          const api = window.pywebview?.api;
-          if (api?.window_state_save) {
-            api.window_state_load().then((st) => {
+          if (nativeBridgeUp()) {
+            bridgeCall("window_state_load").then((st) => {
               const cw = (st && st.col_widths) || {};
               cw[saveKey] = widths;
-              api.window_state_save({ col_widths: cw });
+              bridgeCall("window_state_save", { col_widths: cw });
             });
           }
         };
@@ -160,12 +162,11 @@
     const btn = document.getElementById("btn-bookmarks-export");
     if (!btn) return;
     btn.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.bookmark_export_csv) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required for export.", "warn");
         return;
       }
-      const res = await api.bookmark_export_csv();
+      const res = await bridgeCall("bookmark_export_csv");
       if (res?.ok) {
         window._showToast?.(`Exported ${res.count} bookmark(s) to CSV.`, "ok");
       } else if (res?.cancelled) {

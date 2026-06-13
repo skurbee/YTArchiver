@@ -126,6 +126,9 @@ class LogStreamer:
         # Optional line-by-line scanners (e.g. disk-error watchdog). Each
         # callable receives the concatenated text of one emitted line.
         self._line_scanners: list = []
+        # Consecutive evaluate_js drop counter — declared here so it isn't
+        # lazily materialized on the error path (see _do_flush).
+        self._drop_count = 0
 
     def set_window(self, window):
         self._window = window
@@ -267,13 +270,17 @@ class LogStreamer:
     def _do_flush(self, main_batch, act_batch):
         if not main_batch and not act_batch:
             return
-        if self._window is None:
+        # Snapshot the window reference once: it's set/cleared from other
+        # threads (set_window / shutdown), so re-reading self._window after
+        # the None-check could see it flip mid-flush.
+        win = self._window
+        if win is None:
             return
         try:
             payload = {"main": main_batch, "activity": act_batch}
             # Escape closing </script> in JSON before injection
             js_payload = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-            self._window.evaluate_js(f"window._logBatch({js_payload})")
+            win.evaluate_js(f"window._logBatch({js_payload})")
             # Reset the consecutive-drop counter on success.
             self._drop_count = 0
         except Exception:
@@ -282,7 +289,7 @@ class LogStreamer:
             # (oversized payload, devtools paused, evaluate_js
             # exception storm) surfaces after a threshold instead of
             # disappearing entirely (audit: log_stream H123).
-            self._drop_count = getattr(self, "_drop_count", 0) + 1
+            self._drop_count += 1
             if self._drop_count in (10, 100, 1000):
                 try:
                     import logging as _lg

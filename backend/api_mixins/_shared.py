@@ -36,7 +36,7 @@ import time  # noqa: F401
 import urllib.request  # noqa: F401
 from datetime import datetime, timedelta  # noqa: F401
 from pathlib import Path  # noqa: F401
-from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401,UP035
 
 # Third-party
 try:

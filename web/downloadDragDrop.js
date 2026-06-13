@@ -16,6 +16,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Drag-and-drop URL on Download tab ───────────────────────────────
   function initDragDropUrl() {
@@ -63,14 +66,13 @@
       }
       const input = document.querySelector("#panel-download .ctl-input");
       if (input) input.value = trimmed;
-      const api = window.pywebview?.api;
-      if (api?.archive_single_video) {
+      if (nativeBridgeUp()) {
         // Already-archived warning — same gate as the URL-submit flow, so a
         // dropped URL for a video already in the archive prompts before
         // re-downloading. Any failure falls through and allows the download.
         try {
-          if (api.single_video_archived && askConfirm) {
-            const chk = await api.single_video_archived(trimmed);
+          if (askConfirm) {
+            const chk = await bridgeCall("single_video_archived", trimmed);
             if (chk?.ok && chk.archived) {
               const what = chk.title ? `"${chk.title}"` : "This video";
               const where = chk.channel ? ` in "${chk.channel}"` : "";
@@ -91,7 +93,7 @@
         // is scoped to that file's IIFE and not visible here.
         const opts = (typeof window._readVideoOptions === "function")
             ? window._readVideoOptions() : {};
-        await api.archive_single_video(trimmed, opts);
+        await bridgeCall("archive_single_video", trimmed, opts);
         window._showToast?.("Queued: " + trimmed.slice(0, 60), "ok");
       }
     });

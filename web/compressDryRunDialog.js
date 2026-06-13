@@ -14,6 +14,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const askConfirm = window.askConfirm;
 
   function initCompressDryRunDialog() {
@@ -36,10 +46,13 @@
         return pct > 0 ? ` (-${pct}%)` : ` (+${-pct}%)`;
       };
       const _render = (data) => {
+        const escapeHtml = window._escapeHtml || ((s) =>
+          String(s).replace(/[&<>"']/g, c => (
+            {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
         if (!data?.ok) {
           body.innerHTML =
             `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
-            + `${data?.error || "Dry run failed."}</div>`;
+            + `${escapeHtml(data?.error || "Dry run failed.")}</div>`;
           if (summary) summary.textContent = "";
           return;
         }
@@ -56,9 +69,6 @@
         }
         // Build a simple table. Per-channel rows sorted by current_gb
         // desc (matches backend query); grand total pinned at top.
-        const escapeHtml = window._escapeHtml || ((s) =>
-          String(s).replace(/[&<>"']/g, c => (
-            {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])));
         let html = "";
         html += `<table style="width:100%;border-collapse:collapse;">`;
         html += `<thead><tr style="border-bottom:1px solid #2a3140;text-align:right;">`;
@@ -72,7 +82,7 @@
         html += `</tr></thead><tbody>`;
         // Grand totals first, highlighted.
         html += `<tr style="background:rgba(96,160,255,0.08);font-weight:bold;">`;
-        html += `<td style="padding:4px 6px;">ALL CHANNELS (${data.output_res}p target)</td>`;
+        html += `<td style="padding:4px 6px;">ALL CHANNELS (${escapeHtml(String(data.output_res))}p target)</td>`;
         html += `<td style="padding:4px 6px;text-align:right;">${(t.videos || 0).toLocaleString()}</td>`;
         html += `<td style="padding:4px 6px;text-align:right;">${(t.hours || 0).toLocaleString()}</td>`;
         html += `<td style="padding:4px 6px;text-align:right;">${_fmt(t.current_gb)}</td>`;
@@ -115,12 +125,11 @@
         if (summary) summary.textContent = "";
         _computeInFlight = true;
         try {
-          const api = window.pywebview?.api;
-          if (!api?.compress_dry_run) {
+          if (!nativeBridgeUp()) {
             _render({ ok: false, error: "Native mode required." });
             return;
           }
-          const res = await api.compress_dry_run(resSel?.value || "720");
+          const res = await bridgeCall("compress_dry_run", resSel?.value || "720");
           _render(res);
         } catch (e) {
           _render({ ok: false, error: String(e) });

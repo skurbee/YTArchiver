@@ -248,7 +248,11 @@ class SyncMixin:
                         with self._redwnl_lock:
                             if self._redwnl_pending:
                                 self._redwnl_pending.pop(0)
-                        self.chan_redownload(ch, new_res)
+                        # Carry the original scope (year/month) so a scoped
+                        # redownload queued during a sync doesn't drain as a
+                        # WHOLE-channel redownload (audit r2).
+                        self.chan_redownload(ch, new_res,
+                                             scope=first.get("scope"))
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 try: threading.Timer(0.6, _maybe_drain_redwnl).start()
@@ -299,6 +303,10 @@ class SyncMixin:
             with self._redwnl_lock:
                 _drained = len(self._redwnl_pending)
                 self._redwnl_pending.clear()
+                # Global cancel stops the IN-FLIGHT redownload too.
+                # Set under _redwnl_lock so the chain worker's per-item
+                # clear (same lock) can't interleave and wipe this.
+                self._redwnl_cancel.set()
             if _drained:
                 # Notify the UI so the queue popover clears visually.
                 self._on_queue_changed()
@@ -320,6 +328,18 @@ class SyncMixin:
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._sync_cancel.set()
+        # Clear Queue must also drain + stop the redownload chain.
+        # sync_clear() above already emptied its UI rows; leaving
+        # _redwnl_pending populated would let the worker resurrect and
+        # run items the user just cleared (previously the stale shared
+        # cancel event aborted them invisibly — an accident, not a
+        # design). Drain + set under _redwnl_lock, same as sync_cancel.
+        try:
+            with self._redwnl_lock:
+                self._redwnl_pending.clear()
+                self._redwnl_cancel.set()
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         self._on_queue_changed()
         return {"ok": True, "removed": removed}
 
@@ -355,6 +375,10 @@ class SyncMixin:
         try:
             with self._redwnl_lock:
                 self._redwnl_pending.clear()
+                # Force-stop kills the in-flight redownload too — set
+                # under _redwnl_lock so the chain worker's per-item
+                # clear can't interleave.
+                self._redwnl_cancel.set()
         except Exception as e:
             _log.debug("swallowed: %s", e)
         self._sync_cancel.set()
@@ -738,6 +762,20 @@ class SyncMixin:
                 except Exception as e: _log.debug("swallowed: %s", e)
                 self._log_stream.flush()
                 self._on_queue_changed()
+                # Refresh the in-memory config snapshot + the Subs table so the
+                # just-synced channel's row shows the fresh last_sync / # Vids
+                # instead of staying "Never" / "—". Mirrors sync_start_all,
+                # which reloads config at completion (line ~206); single-channel
+                # "Sync now" previously skipped this, leaving the row stale
+                # until a full Sync Subbed or an app restart.
+                try: self._reload_config()
+                except Exception as e: _log.debug("swallowed: %s", e)
+                try:
+                    if self._window is not None:
+                        self._window.evaluate_js(
+                            "if (window.refreshSubsTable) "
+                            "window.refreshSubsTable();")
+                except Exception as e: _log.debug("swallowed: %s", e)
                 # Reset autorun countdown so it doesn't keep showing
                 # "Syncing..." now that this single-channel sync finished.
                 try: self._autorun.notify_sync_done()

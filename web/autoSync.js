@@ -17,6 +17,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Auto-sync dropdown + countdown ──────────────────────────────────
   function initAutorun() {
@@ -42,7 +45,7 @@
       if (autorunIsOn) {
         if (!syncCB.checked) {
           syncCB.checked = true;
-          window.pywebview?.api?.queue_auto_set?.("sync", true);
+          if (nativeBridgeUp()) bridgeCall("queue_auto_set", "sync", true);
         }
         if (!syncCB.disabled) syncCB.disabled = true;
         if (wrap && wrap.title !== "Auto-Sync enabled") {
@@ -66,10 +69,9 @@
     // and on user actions; decrement locally every 1s.
     let _anchor = null;
     const fetchAnchor = async () => {
-      const api = window.pywebview?.api;
-      if (!api?.autorun_state) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const st = await api.autorun_state();
+        const st = await bridgeCall("autorun_state");
         if (!st) { _anchor = null; return; }
         _anchor = {
           label: st.label,
@@ -82,7 +84,13 @@
         };
         if (sel.value !== st.label) sel.value = st.label;
         reconcileSyncAutoLock(st.label !== "Off");
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        // Null the anchor so a failed fetch doesn't leave a stale
+        // sec===0 state that re-triggers fetchAnchor every paint()
+        // tick (1 IPC/sec burst while the backend is unresponsive).
+        // The 60s anchor interval + visibilitychange refetch recover.
+        _anchor = null;
+      }
     };
     // Gate the sec===0 anchor re-fetch with an in-flight flag so the
     // 1Hz paint() can't spam fetchAnchor every tick while the
@@ -120,11 +128,10 @@
     let _selChangeInFlight = false;
     sel.addEventListener("change", async () => {
       if (_selChangeInFlight) return;
-      const api = window.pywebview?.api;
-      if (!api?.autorun_set) return;
+      if (!nativeBridgeUp()) return;
       _selChangeInFlight = true;
       try {
-        await api.autorun_set(sel.value);
+        await bridgeCall("autorun_set", sel.value);
         window._showToast?.(sel.value === "Off" ? "Auto-sync off." : `Auto-sync every ${sel.value}.`, "ok");
         await fetchAnchor();
         paint();

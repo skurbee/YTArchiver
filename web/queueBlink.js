@@ -365,9 +365,13 @@
     // visibility next paint after the popover closes.
     const syncFooter = _bdom("sync-tasks-footer");
     if (syncFooter) {
-      const _pop = _bdom("sync-tasks-popover");
-      const _popOpen = !!(_pop && _pop.style.display !== "none"
-        && !_pop.hasAttribute("hidden"));
+      // The popover's real id is "popover-sync-tasks" (see queuePopovers.js /
+      // index.html), and open-state is tracked via the "open" class — NOT
+      // inline display. The old "sync-tasks-popover" lookup was always null,
+      // so this keep-open guard never fired and the footer collapsed even
+      // while the popover was open.
+      const _pop = _bdom("popover-sync-tasks");
+      const _popOpen = !!(_pop && _pop.classList.contains("open"));
       syncFooter.style.display =
         (_blinkState.sync.count > 0 || _popOpen) ? "" : "none";
     }

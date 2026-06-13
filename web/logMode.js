@@ -17,6 +17,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Log mode dropdown (Simple / Verbose) ────────────────────────────
   // Matches YTArchiver's ttk.Combobox with values=["Simple","Verbose"].
@@ -32,8 +35,8 @@
     sel.addEventListener("change", (e) => {
       const mode = e.target.value;
       document.body.dataset.logMode = mode;
-      if (window.pywebview?.api?.set_log_mode) {
-        window.pywebview.api.set_log_mode(mode);
+      if (nativeBridgeUp()) {
+        bridgeCall("set_log_mode", mode);
       }
     });
   }

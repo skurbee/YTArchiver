@@ -58,12 +58,6 @@ from .scan import _scan_channel_videos
 _log = get_logger(__name__)
 
 
-# TTL cache for the Video-IDs GROUP-BY query (mirrored from legacy.py).
-_VIDEO_ID_CACHE_TTL_SEC = 60.0
-_video_id_cache_state: dict[str, Any] = {"ts": 0.0, "rows": {}}
-_video_id_cache_lock = threading.Lock()
-
-
 def sweep_missing_thumbnails(channel: dict[str, Any], stream=None,
                               cancel_event=None) -> dict[str, int]:
     """Issue #147/#158: scan a channel folder for .mp4 files that lack a
@@ -582,12 +576,17 @@ def count_thumbnail_status_bulk(channels: list[dict[str, Any]],
         # by `video_id` (channel-scoped to avoid cross-channel
         # collisions if two channels happen to share an id).
         rows_for_db: list[tuple[int, str, str]] = []
+        # DB param must be ORIGINAL case — videos.channel has no COLLATE
+        # NOCASE (the lowercased cache key matches zero rows, so the
+        # backfill never sticks). The sibling UPDATEs in this file
+        # (sweep_missing_thumbnails, realign) already pass original case.
+        db_name = ch.get("name") or ch.get("folder") or ""
         try:
             for vid_id, _title, _y, _m, path in _scan_channel_videos(folder):
                 total += 1
                 has = 1 if (vid_id and vid_id in all_thumb_vids) else 0
                 if vid_id:
-                    rows_for_db.append((has, vid_id, name))
+                    rows_for_db.append((has, vid_id, db_name))
                 if has:
                     with_thumb += 1
         except Exception as e:

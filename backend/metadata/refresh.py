@@ -28,6 +28,6 @@ from ._refresh_proxies import (  # noqa: F401
     backfill_video_ids,
     existing_info_ids,
 )
-from .refresh_views import bulk_refresh_views_likes  # noqa: F401
 from .refresh_comments import refresh_channel_comments  # noqa: F401
 from .refresh_fetch import fetch_channel_metadata  # noqa: F401
+from .refresh_views import bulk_refresh_views_likes  # noqa: F401

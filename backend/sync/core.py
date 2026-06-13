@@ -79,6 +79,11 @@ _log = get_logger(__name__)
 # keep resolving them as before.
 # Patch 18 phase 4 (v69.4): log row emitters moved to log_rows.py.
 # Re-imported so internal callers in this file keep resolving them.
+# ── Patch 18 phase 3 (v68.8): display-push + quickcheck moved out ─────
+from .display_push import (
+    clear_sync_progress,
+    write_sync_progress,
+)
 from .log_rows import (  # noqa: F401  (re-exports for backend.sync surface)
     _ROW_EMIT_PASS_ID,
     _bracket_segments,
@@ -92,13 +97,20 @@ from .log_rows import (  # noqa: F401  (re-exports for backend.sync surface)
     pop_pending_dwnld_row,
     register_pending_dwnld_row,
 )
+from .options import (
+    build_match_filter,
+    build_output_template,
+    normalize_channel_sync_options,
+    normalized_date_after,
+)
 from .quickcheck import (
-    _check_batch_cooldown,
-    _should_batch_limit,
+    _check_batch_cooldown,  # noqa: F401
+    _should_batch_limit,  # noqa: F401
     prefetch_channel_total,
     quick_check_new_uploads,
     set_batch_cooldown,
 )
+
 # Recent-tab download tracking lives in its own module so the hook
 # global + setter + record function travel together. Re-imported here
 # so internal callers (sync_channel's DLTRACK handler) keep resolving
@@ -106,12 +118,6 @@ from .quickcheck import (
 from .recent_track import (  # noqa: F401
     _record_recent_download,
     set_recent_changed_hook,
-)
-
-# ── Patch 18 phase 3 (v68.8): display-push + quickcheck moved out ─────
-from .display_push import (
-    clear_sync_progress,
-    write_sync_progress,
 )
 
 # Patch 14 (v71.6): file/format helpers moved to sync_helpers.py.
@@ -128,6 +134,11 @@ from .sync_helpers import (  # noqa: F401
     _scan_recent_video,
     _sweep_orphan_vtts,
 )
+from .ytdlp_events import (
+    YTDLP_VIDEO_ID_RE,
+    extract_video_id_from_line,
+    is_verbose_chatter_line,
+)
 from .ytdlp_proc import (  # noqa: F401  (re-exports for backend.sync surface)
     RESOLUTION_OPTIONS,
     _ensure_videos_tab,
@@ -140,7 +151,11 @@ from .ytdlp_proc import (  # noqa: F401  (re-exports for backend.sync surface)
     reset_cookie_cache,
     sanitize_folder,
 )
-
+from .ytdlp_session import (
+    finish_ytdlp_process,
+    popen_ytdlp_process,
+    start_download_watchdog,
+)
 
 _ID_IN_FILENAME = re.compile(r"\[([A-Za-z0-9_-]{11})\]")
 
@@ -169,7 +184,7 @@ _DOWNLOADING_RE = re.compile(r"\[info\]\s+([^:]+):\s+Downloading\s+\d+\s+format"
 # `[youtube:tab]` (channel/playlist enumeration) which has a `:` inside
 # the brackets — `\]` after the tag name keeps `[youtube:tab]` from
 # matching.
-_VIDID_RE = re.compile(r"\[(?:youtube|info|download)\]\s+([A-Za-z0-9_-]{11}):")
+_VIDID_RE = YTDLP_VIDEO_ID_RE
 
 # Module-level download-row counter. The `dlrow_<N>` inplace kind must be
 # globally unique across the whole sync run (NOT per-channel), otherwise
@@ -294,7 +309,7 @@ def _record_timeout_strike(vid: str, stream) -> bool:
         try:
             with _archive_write_lock:
                 with open(ARCHIVE_FILE, "ab") as _af:
-                    _af.write(f"youtube {vid}\n".encode("utf-8"))
+                    _af.write(f"youtube {vid}\n".encode())
                     try: _af.flush()
                     except OSError: pass
         except OSError as _ae:
@@ -370,10 +385,32 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # Python flags the read in the DLTRACK `_done_kind` line as "name
     # used prior to global declaration".
     global _DLROW_COUNTER
-    name = channel.get("name") or channel.get("folder") or "?"
-    url = channel.get("url", "").strip()
-    resolution = channel.get("resolution", "720")
-    auto_tx = bool(channel.get("auto_transcribe"))
+    def _persist_duration_migration(
+            migrated_url: str, migrated_min: bool, migrated_max: bool) -> None:
+        try:
+            with _config_write_lock:
+                _cfgm = load_config()
+                _our_url = (migrated_url or "").strip()
+                for _ch in _cfgm.get("channels", []):
+                    if (_ch.get("url") or "").strip() == _our_url:
+                        if migrated_min:
+                            _ch["min_duration"] = 60
+                        if migrated_max:
+                            _ch["max_duration"] = 60
+                        break
+                save_config(_cfgm)
+        except Exception as e:
+            _log.debug("min/max migration persist swallowed: %s", e)
+
+    opts = normalize_channel_sync_options(
+        channel,
+        stream=stream,
+        persist_migration=_persist_duration_migration,
+    )
+    name = opts.name
+    url = opts.url
+    resolution = opts.resolution
+    auto_tx = opts.auto_transcribe
     # Mark the channel as "sync in progress" so the transcribe worker's
     # _flush_batch_stats skips it — sync_channel will emit the final
     # consolidated [Dwnld] row at its end with the transcribe count
@@ -381,61 +418,12 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # auto-captions finish before sync_channel ends, flush fired first
     # and emitted a duplicate [Trnscr] row.
     set_sync_active(name)
-    # YTArchiver stores min/max as SECONDS on disk (e.g. 180 = 3 minutes).
-    # UI shows/accepts minutes; conversion happens in subs.py / main.py.
-    # Migration: values < 60 are legacy raw seconds from the v1 schema, bump
-    # to 60 so a "30 s" entry becomes 1 min instead of being lost to 0.
-    min_dur = int(channel.get("min_duration") or 0)
-    max_dur = int(channel.get("max_duration") or 0)
-    # Bug [40]: surface the legacy migration so users know why their
-    # filter changed. Previously silent — a user who set min_duration=30
-    # years ago would wake up to find sub-1-min videos no longer
-    # downloading with no log entry explaining why.
-    _migrated_min = False
-    _migrated_max = False
-    if 0 < min_dur < 60:
-        try:
-            stream.emit_dim(f" (legacy min_duration {min_dur}s upgraded to 60s)")
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        min_dur = 60
-        _migrated_min = True
-    if 0 < max_dur < 60:
-        try:
-            stream.emit_dim(f" (legacy max_duration {max_dur}s upgraded to 60s)")
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        max_dur = 60
-        _migrated_max = True
-    # Persist the upgraded values so the migration line doesn't fire on
-    # every sync pass forever (audit: sync/core.py:266). Match channel
-    # by URL only (same key the failed_video_ids writer uses).
-    if _migrated_min or _migrated_max:
-        try:
-            with _config_write_lock:
-                _cfgm = load_config()
-                _our_url = (channel.get("url") or "").strip()
-                for _ch in _cfgm.get("channels", []):
-                    if (_ch.get("url") or "").strip() == _our_url:
-                        if _migrated_min:
-                            _ch["min_duration"] = 60
-                        if _migrated_max:
-                            _ch["max_duration"] = 60
-                        break
-                save_config(_cfgm)
-            # Update the in-memory channel too so this pass uses the
-            # bumped values without re-reading the config.
-            if _migrated_min:
-                channel["min_duration"] = 60
-            if _migrated_max:
-                channel["max_duration"] = 60
-        except Exception as e:
-            _log.debug("min/max migration persist swallowed: %s", e)
-    mode = (channel.get("mode") or "new").lower() # "new" | "full" | "fromdate"
-    from_date = (channel.get("from_date") or "").strip()
-    # Folder-org flags: matches YTArchiver.py:17257 split_years / split_months
-    split_years = bool(channel.get("split_years"))
-    split_months = bool(channel.get("split_months"))
+    min_dur = opts.min_duration
+    max_dur = opts.max_duration
+    mode = opts.mode
+    from_date = opts.from_date
+    split_years = opts.split_years
+    split_months = opts.split_months
 
     if not url:
         return SyncResult(ok=False, reason="No URL", downloaded=0, errors=0)
@@ -515,17 +503,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # suffix — this keeps the file naming identical to what the original
     # tkinter app produces, so we're a drop-in replacement that touches
     # the user's archive without creating dupes.
-    if split_years and split_months:
-        output_template = str(ch_dir
-            / "%(upload_date>%Y|Unknown Year)s"
-            / "%(upload_date>%m %B|Unknown Month)s"
-            / "%(title)s.%(ext)s")
-    elif split_years:
-        output_template = str(ch_dir
-            / "%(upload_date>%Y|Unknown Year)s"
-            / "%(title)s.%(ext)s")
-    else:
-        output_template = str(ch_dir / "%(title)s.%(ext)s")
+    output_template = build_output_template(
+        ch_dir, split_years=split_years, split_months=split_months)
 
     cmd = [
         yt,
@@ -653,10 +632,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     if _is_init and _sync_ok:
         cmd.append("--break-on-existing")
     # Date modes additionally constrain by upload date.
-    if mode in ("fromdate", "date") and from_date:
-        _d = from_date.replace("-", "").replace("/", "")
-        if len(_d) >= 8 and _d[:8].isdigit():
-            cmd += ["--dateafter", _d[:8]]
+    if _date_after := normalized_date_after(mode, from_date):
+        cmd += ["--dateafter", _date_after]
 
     # ── Duration + liveness filter ──────────────────────────────
     # min_dur / max_dur are SECONDS (matches YTArchiver's on-disk schema);
@@ -670,12 +647,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
     # (matches the UI semantics where empty = unbounded). Don't add a
     # defensive duration>?0 floor — it would change behavior for existing
     # configs that rely on 0 = unbounded.
-    match_parts = ["!is_live", "!is_upcoming"]
-    if min_dur > 0:
-        match_parts.append(f"duration>?{min_dur}")
-    if max_dur > 0:
-        match_parts.append(f"duration<?{max_dur}")
-    cmd += ["--match-filter", " & ".join(match_parts)]
+    cmd += ["--match-filter", build_match_filter(min_dur, max_dur)]
 
     # Build the list of yt-dlp URLs to run. OLD does a second pass against
     # /streams after the main /videos enumeration (YTArchiver.py:6761) so
@@ -1027,27 +999,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # ourselves — yt-dlp.exe (frozen) doesn't always respect
                 # PYTHONIOENCODING, so we try UTF-8 first and fall back
                 # to cp1252 via `_utils.decode_subprocess_line` below.
-                proc = subprocess.Popen(
-                    cmd_this, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    # bufsize=0 (unbuffered) for the binary pipe. Old
-                    # bufsize=1 is line-buffering, which Python only
+                proc = popen_ytdlp_process(
+                    cmd_this, startupinfo=_startupinfo)
                     # honors in TEXT mode — in binary mode it falls
                     # back to block buffering with a DeprecationWarning,
-                    # causing yt-dlp's "Downloading <title> NN%"
-                    # inplace progress to arrive in bursts instead of
-                    # streaming (audit: sync/core.py:764).
-                    bufsize=0, startupinfo=_startupinfo,
-                    env=_utils.utf8_subprocess_env(),
-                )
-                # register with ProcessRegistry so
-                # shutdown's kill_all() reaps cleanly without the
-                # psutil child-scanning fallback.
-                try:
-                    from ..process_runner import PROCESS_REGISTRY
-                    PROCESS_REGISTRY.register(proc)
-                except Exception as _re:
-                    _log.debug("swallowed: %s", _re)
                 break
             except OSError as e:
                 if attempt == 2:
@@ -1073,11 +1028,20 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
         # progress lines via --newline; `-c copy` merges finish in seconds)
         # but far below the multi-minute stalls a dead CDN host caused.
         _NO_OUTPUT_KILL_SEC = 120
-        _last_out = [time.time()]
-        _wd_stop = threading.Event()
-        _wd_stalled = {"hit": False}
-        def _download_watchdog(_p=proc):
-            while not _wd_stop.wait(3.0):
+        _watchdog = start_download_watchdog(
+            proc,
+            stream,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            kill_sec=_NO_OUTPUT_KILL_SEC,
+        )
+        _last_out = _watchdog.last_output
+        _wd_stop = _watchdog.stop_event
+        _wd_stalled = _watchdog.stalled
+        def _download_watchdog(_p=proc, _stop=_wd_stop, _last=_last_out,
+                               _stalled=_wd_stalled,
+                               _kill_sec=_NO_OUTPUT_KILL_SEC):
+            while not _stop.wait(3.0):
                 if _p.poll() is not None:
                     return
                 if (cancel_event is not None and cancel_event.is_set()) or \
@@ -1085,11 +1049,11 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     try: _p.kill()
                     except Exception: pass
                     return
-                if time.time() - _last_out[0] > _NO_OUTPUT_KILL_SEC:
-                    _wd_stalled["hit"] = True
+                if time.time() - _last[0] > _kill_sec:
+                    _stalled["hit"] = True
                     try:
                         stream.emit([[f" ⚠ No response for "
-                                      f"{_NO_OUTPUT_KILL_SEC}s — skipping this "
+                                      f"{_kill_sec}s — skipping this "
                                       f"download and moving on.\n", "red"]])
                         stream.flush()
                     except Exception:
@@ -1097,8 +1061,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     try: _p.kill()
                     except Exception: pass
                     return
-        threading.Thread(target=_download_watchdog,
-                         name="dl-watchdog", daemon=True).start()
+        # Watchdog thread is started by start_download_watchdog().
 
         # Manual line iteration on the bytes stream so we can apply our
         # UTF-8-first-cp1252-fallback decoder (`_utils.decode_subprocess_line`).
@@ -1150,11 +1113,8 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # contain at least one non-letter. Rejecting all-alpha
             # candidates filters the "Destination" footgun without
             # rejecting legitimate IDs in practice.
-            _vid_m = _VIDID_RE.search(s)
-            if _vid_m:
-                _vid_cand = _vid_m.group(1)
-                if not _vid_cand.isalpha():
-                    current_vid_id = _vid_cand
+            if _vid_cand := extract_video_id_from_line(s):
+                current_vid_id = _vid_cand
 
             # yt-dlp emits informational chatter that looks
             # error-ish to users — [info] subtitle writes, [Merger] /
@@ -1165,13 +1125,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             # paths in some yt-dlp versions. Always tag as dim early so
             # `_line_is_verbose_only` reliably drops them in Simple mode.
             _s_strip = s.lstrip()
-            if (_s_strip.startswith("[info]")
-                    or _s_strip.startswith("[Merger]")
-                    or _s_strip.startswith("[Remuxer]")
-                    or _s_strip.startswith("[FixupM3u8]")
-                    or _s_strip.startswith("[ExtractAudio]")
-                    or _s_strip.startswith("[Metadata]")
-                    or _s_strip.startswith("Deleting original file")):
+            if is_verbose_chatter_line(s):
                 # Still capture [Merger] path before suppressing the
                 # visible line — downstream code reads merge_dest_path.
                 if _s_strip.startswith("[Merger]"):
@@ -1382,7 +1336,14 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         _ip = _resolve_path_for_vid(ch_dir, vid)
                         if _ip:
                             final_path = _ip
-                            _log.info(
+                            # DEBUG, not INFO: INFO maps to a None tag that
+                            # shows in BOTH log modes, so this internal id→path
+                            # recovery was leaking into the user's SIMPLE log as
+                            # jargon ("DLTRACK orphan recovered … vid=… -> <path>").
+                            # DEBUG is the 'dim'/verbose-only tag, so it stays in
+                            # Verbose mode; in Simple mode the clean "✓ <title>
+                            # (size)" download line below is the readable version.
+                            _log.debug(
                                 "DLTRACK orphan recovered via .info.json: "
                                 "vid=%s -> %s", vid, _ip)
                     # yt-dlp's DLTRACK id field (%(id)s) can come back EMPTY
@@ -1408,7 +1369,10 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             vid = _sc_id
                             if vid not in downloaded_ids:
                                 downloaded_ids.append(vid)
-                            _log.info(
+                            # DEBUG, not INFO — same Simple-mode leak as the
+                            # orphan-recovery line above; keep this plumbing in
+                            # Verbose only.
+                            _log.debug(
                                 "DLTRACK empty id recovered via .info.json: "
                                 "%s -> %s", os.path.basename(final_path), vid)
                     if (vid and (not final_path
@@ -1693,7 +1657,13 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         # than scrolling in below later channels'
                         # rows. Mirrors the tx_done_<vid> pattern.
                         _meta_marker = f"meta_done_{vid}" if vid else ""
-                        if _meta_marker:
+                        # Only emit the placeholder when a metadata
+                        # task will actually run — with auto_metadata
+                        # off, _meta_exec is None and _submit_inline_
+                        # metadata no-ops, so the "Metadata queued…"
+                        # line sat stuck forever (nothing resolves it;
+                        # the orphan sweep clears only dlrow_ markers).
+                        if _meta_marker and _meta_exec is not None:
                             # Indent to match the eventual " — ✓ Metadata
                             # downloaded" / " — ✓ Transcription (...)" lines
                             # nested under the parent video row (6 leading
@@ -2145,6 +2115,27 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # Without this filter the user sees a scary red "Got
                 # error" line for a download that completed fine, plus
                 # the error counter bumps incorrectly.
+                # Rate-limit backoff must run BEFORE the retrying(
+                # dim-and-continue below — yt-dlp's retry-phase lines
+                # ('Got server HTTP error 429. Retrying (2/10)...')
+                # were swallowed there, so the backoff only ever fired
+                # AFTER a video had already failed. 60s cooldown
+                # (module-global) so a 10-line retry storm doesn't
+                # stack 10 back-to-back 30s sleeps.
+                if ("http error 429" in low or "too many requests" in low):
+                    _now_429 = time.time()
+                    if _now_429 - globals().get("_LAST_429_BACKOFF_TS", 0.0) >= 60.0:
+                        globals()["_LAST_429_BACKOFF_TS"] = _now_429
+                        stream.emit_text(
+                            " ⏸ Rate-limited by YouTube — backing off 30s...",
+                            "red")
+                        for _ in range(30):
+                            if cancel_event is not None and cancel_event.is_set():
+                                break
+                            if pause_event is not None and pause_event.is_set():
+                                break  # pause flow takes over pacing
+                            time.sleep(1)
+                        stream.emit_text(" ▶ Resuming.", "simpleline_green")
                 if "retrying (" in low:
                     stream.emit([[f" {s}\n", "dim"]])
                     continue
@@ -2171,7 +2162,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                             with _archive_write_lock:
                                 with open(ARCHIVE_FILE, "ab") as _af:
                                     _af.write(
-                                        f"youtube {_vid_id}\n".encode("utf-8"))
+                                        f"youtube {_vid_id}\n".encode())
                                     try: _af.flush()
                                     except OSError: pass
                         except OSError:
@@ -2198,31 +2189,38 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                     "urlopen error",
                 )
                 _is_net_err = any(_f in low for _f in _net_frags)
+                _is_giveup = ("giving up" in low
+                              or "max retries exceeded" in low)
+                # Strike bookkeeping runs in BOTH log modes — it was
+                # nested inside the simple_mode DISPLAY branch below,
+                # so Verbose users silently lost the robust 3-strike
+                # give-up entirely (behavioral state depended on a
+                # log-rendering flag). One failed video can emit
+                # several "giving up" lines (separate video + audio
+                # streams) — record only once per video.
+                _first_giveup_for_vid = False
+                _gave_up_now = False
+                if (_is_net_err and _is_giveup and current_vid_id
+                        and current_vid_id not in _net_warned):
+                    _first_giveup_for_vid = True
+                    _net_warned.add(current_vid_id)
+                    # Robust strike count (dedicated store) — at 3
+                    # syncs it archives the video + emits give-up,
+                    # so it stops nagging every single sync.
+                    _gave_up_now = _record_timeout_strike(
+                        current_vid_id, stream)
                 if (getattr(stream, "simple_mode", False)
                         and (_is_net_err or low.strip() in ("error:", "error"))):
                     # Show ONE friendly line on the final give-up; the bare
                     # "ERROR:" header and any mid-retry partials render
                     # nothing in Simple mode.
-                    if "giving up" in low or "max retries exceeded" in low:
-                        # One failed video can emit several "giving up" lines
-                        # (separate video + audio streams) — show the friendly
-                        # notice only ONCE per video.
-                        if not (current_vid_id
-                                and current_vid_id in _net_warned):
-                            _gave_up_now = False
-                            if current_vid_id:
-                                _net_warned.add(current_vid_id)
-                                # Robust strike count (dedicated store) — at 3
-                                # syncs it archives the video + emits give-up,
-                                # so it stops nagging every single sync.
-                                _gave_up_now = _record_timeout_strike(
-                                    current_vid_id, stream)
-                            if not _gave_up_now:
-                                stream.emit([
-                                    [" ⚠ Couldn't reach YouTube (network "
-                                     "timeout) — will retry on the next "
-                                     "sync.\n", "red"],
-                                ])
+                    if (_is_giveup and _first_giveup_for_vid
+                            and not _gave_up_now):
+                        stream.emit([
+                            [" ⚠ Couldn't reach YouTube (network "
+                             "timeout) — will retry on the next "
+                             "sync.\n", "red"],
+                        ])
                 else:
                     stream.emit([[f" {s}\n", "red" if "error" in low else "filterskip"]])
                 if "error" in low:
@@ -2261,15 +2259,25 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 # Rate-limit detection: 429 or HTTP 429 in the output → pause
                 # for 30s before continuing. yt-dlp retries internally but we
                 # want the log to show we're waiting rather than hammering.
-                if "429" in low or "too many requests" in low or "rate limit" in low:
-                    stream.emit_text(
-                        " \u23F8 Rate-limited by YouTube \u2014 backing off 30s...",
-                        "red")
-                    for _ in range(30):
-                        if cancel_event is not None and cancel_event.is_set():
-                            break
-                        time.sleep(1)
-                    stream.emit_text(" \u25B6 Resuming.", "simpleline_green")
+                # Tightened from the old bare `"429" in low` substring \u2014
+                # which matched any video id/title containing "429".
+                # Same 60s module-global cooldown as the retry-phase
+                # check above so one storm can't stack sleeps.
+                if ("http error 429" in low or "too many requests" in low
+                        or "rate limit" in low or "rate-limit" in low):
+                    _now_429 = time.time()
+                    if _now_429 - globals().get("_LAST_429_BACKOFF_TS", 0.0) >= 60.0:
+                        globals()["_LAST_429_BACKOFF_TS"] = _now_429
+                        stream.emit_text(
+                            " \u23F8 Rate-limited by YouTube \u2014 backing off 30s...",
+                            "red")
+                        for _ in range(30):
+                            if cancel_event is not None and cancel_event.is_set():
+                                break
+                            if pause_event is not None and pause_event.is_set():
+                                break  # pause flow takes over pacing
+                            time.sleep(1)
+                        stream.emit_text(" \u25B6 Resuming.", "simpleline_green")
                 continue
 
             # Default: dim
@@ -2284,7 +2292,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             _failed_this_run.add(current_vid_id)
 
         try:
-            proc.wait(timeout=10)
+            finish_ytdlp_process(proc)
         except subprocess.TimeoutExpired:
             # terminate is async on Windows (TerminateProcess) — wait
             # briefly for the process to actually exit, then force-kill
@@ -2422,7 +2430,7 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
             try:
                 with _archive_write_lock:
                     with open(ARCHIVE_FILE, "ab") as _af:
-                        _af.write(f"youtube {_v}\n".encode("utf-8"))
+                        _af.write(f"youtube {_v}\n".encode())
                         try: _af.flush()
                         except OSError: pass
             except OSError as _ae:
@@ -2511,7 +2519,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                 except Exception as e:
                     _log.debug("swallowed: %s", e)
             else:
-                _meta_exec.shutdown(wait=True, cancel_futures=True)
+                # Happy path: DRAIN — wait for every queued per-video
+                # fetch to run. cancel_futures=True here contradicted
+                # the drain intent documented above: it cancelled all
+                # not-yet-started futures on the single worker, so
+                # videos downloaded late in the pass (or backed up
+                # behind a pause) silently never got their inline
+                # metadata and their "⏳ Metadata queued…" rows stuck
+                # in the log forever.
+                _meta_exec.shutdown(wait=True, cancel_futures=False)
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -2684,6 +2700,18 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
                         _dirty = True
                     if not c.get("sync_complete", False):
                         c["sync_complete"] = True
+                        _dirty = True
+                    # Graduate to the quick-check fast path too. The
+                    # flag is read in four places (sync_all
+                    # _fast_path_eligible, quickcheck, core) but no
+                    # current code ever WROTE it — so the documented
+                    # ~11s-per-channel flat-playlist skip could never
+                    # fire for channels bootstrapped by this codebase,
+                    # only for legacy-config carryovers. Same gate as
+                    # initialized/sync_complete: an uninterrupted,
+                    # meaningful walk.
+                    if not c.get("init_complete", False):
+                        c["init_complete"] = True
                         _dirty = True
                 elif _walked_meaningfully and _was_interrupted:
                     # Surface the interruption so the user knows why
@@ -2895,22 +2923,15 @@ def sync_channel(channel: dict[str, Any], stream: LogStreamer,
 
 
 from .active_state import (  # noqa: F401
-    set_sync_active,
     clear_sync_active,
-    is_sync_active,
-    is_any_sync_active,
-    set_metadata_changed_hook,
-    fire_metadata_changed_hook,
-    set_channel_synced_hook,
     fire_channel_synced_hook,
+    fire_metadata_changed_hook,
+    is_any_sync_active,
+    is_sync_active,
+    set_channel_synced_hook,
+    set_metadata_changed_hook,
+    set_sync_active,
 )
-
-
-
-
-
-
-
 
 # Patch 14 (v71.6): sync_all moved to sync_all.py. Re-import here so
 # `from backend.sync.core import sync_all` continues to resolve and

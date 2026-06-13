@@ -25,6 +25,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
@@ -47,8 +57,6 @@
     const bAllThumbs = document.getElementById("btn-md-refetch-all-thumbs");
     const bReload = document.getElementById("btn-md-reload");
     if (!tbody || !table) return;
-
-    const getApi = () => window.pywebview?.api;
 
     // Current dataset + sort state. Sort state persists across reloads.
     let _rows = [];
@@ -89,10 +97,9 @@
     // single quotes (because its value is JSON, which contains "), so an
     // unescaped apostrophe in a folder name (e.g. "Don't Tell Comedy")
     // would break out of the attribute and inject markup.
-    const escapeHtml = (s) => String(s || "")
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;").replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
+    const escapeHtml = window.YT?.util?.escapeHtml || window._escapeHtml
+      || ((s) => String(s ?? "").replace(/[&<>"']/g, c =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
 
     const sortRows = (rows) => {
       const mult = _sortDir === "asc" ? 1 : -1;
@@ -466,8 +473,7 @@
     };
 
     window._refreshMetadataTab = async () => {
-      const api = getApi();
-      if (!api?.get_channel_metadata_status) {
+      if (!nativeBridgeUp()) {
         tbody.innerHTML = '<tr><td colspan="8" class="md-empty">Native mode required.</td></tr>';
         return;
       }
@@ -505,7 +511,7 @@
       // spinner until the bulk walk completes.
       _thumbsLoaded = false;
       try {
-        const rows = await api.get_channel_metadata_status();
+        const rows = await bridgeCall("get_channel_metadata_status");
         _rows = Array.isArray(rows) ? rows : [];
         // Issue #154 (fix): thumbnail_status_bulk walks every channel
         // folder on disk (~100k probes on a 100-channel archive on a
@@ -513,8 +519,8 @@
         // Render the table immediately with a spinner in the Thumbnails
         // column, then kick the bulk walk in the background and patch
         // the column when it returns.
-        if (api?.thumbnail_status_bulk) {
-          api.thumbnail_status_bulk().then((thRes) => {
+        if (nativeBridgeUp()) {
+          bridgeCall("thumbnail_status_bulk").then((thRes) => {
             const thMap = thRes?.rows || {};
             for (const r of _rows) {
               const key = (r.name || r.folder || "").toLowerCase();
@@ -624,14 +630,13 @@
            : null;
     };
     const _runRowAct = async (act, ident, rowRefs) => {
-      const api = getApi();
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       if (act === "views") {
-        if (!api.metadata_refresh_views_channel) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         try {
-          const res = await api.metadata_refresh_views_channel(ident);
+          const res = await bridgeCall("metadata_refresh_views_channel", ident);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -642,7 +647,7 @@
           window._showToast?.(String(err), "error");
         }
       } else if (act === "backfill") {
-        if (!api.metadata_backfill_ids_channel) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         // Look up this channel's video count from the cached _rows
@@ -657,7 +662,7 @@
           _vc, `Channel: ${ident.folder || ident.url || ""}`);
         if (!_mode) return; // cancelled
         try {
-          const res = await api.metadata_backfill_ids_channel(ident, _mode);
+          const res = await bridgeCall("metadata_backfill_ids_channel", ident, _mode);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -672,11 +677,11 @@
         }
       } else if (act === "thumbs") {
         // refetch missing thumbnails for one channel.
-        if (!api.refetch_thumbnails) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         try {
-          const res = await api.refetch_thumbnails(ident);
+          const res = await bridgeCall("refetch_thumbnails", ident);
           if (res?.started) {
             window._showToast?.(
               "Thumbnail refetch started — check the log for progress.",
@@ -688,7 +693,7 @@
           window._showToast?.(String(err), "error");
         }
       } else if (act === "comments") {
-        if (!api.metadata_refresh_comments_channel) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         // Caller passes the time-scope directly as the `arg` parameter
@@ -697,7 +702,7 @@
         const pickN = parseInt(rowRefs, 10);
         const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : null;
         try {
-          const res = await api.metadata_refresh_comments_channel(ident, days);
+          const res = await bridgeCall("metadata_refresh_comments_channel", ident, days);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -857,8 +862,7 @@
     // Bulk buttons.
     if (bAllViews) {
       bAllViews.addEventListener("click", async () => {
-        const api = getApi();
-        if (!api?.metadata_queue_all) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         const ok = await (window.askChoice ? window.askChoice({
@@ -871,7 +875,7 @@
         // primary button, so proceed.
         if (!ok) return;
         try {
-          const res = await api.metadata_queue_all(true);
+          const res = await bridgeCall("metadata_queue_all", true);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -886,8 +890,7 @@
     }
     if (bAllComments) {
       bAllComments.addEventListener("click", async () => {
-        const api = getApi();
-        if (!api?.metadata_refresh_comments_all) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         const pick = await (window.askChoice ? window.askChoice({
@@ -904,7 +907,7 @@
         const pickN = parseInt(pick, 10);
         const days = (Number.isFinite(pickN) && pickN > 0) ? pickN : 0;
         try {
-          const res = await api.metadata_refresh_comments_all(days);
+          const res = await bridgeCall("metadata_refresh_comments_all", days);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -919,8 +922,7 @@
     }
     if (bAllBackfill) {
       bAllBackfill.addEventListener("click", async () => {
-        const api = getApi();
-        if (!api?.metadata_backfill_ids_all) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         // Show how many channels would be queued BEFORE asking so the
@@ -956,7 +958,7 @@
         if (!_mode) return;
         try {
           const onlyMissing = (pick === "missing");
-          const res = await api.metadata_backfill_ids_all(onlyMissing, _mode);
+          const res = await bridgeCall("metadata_backfill_ids_all", onlyMissing, _mode);
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -979,8 +981,7 @@
     // tell the user how big the job actually is.
     if (bAllThumbs) {
       bAllThumbs.addEventListener("click", async () => {
-        const api = getApi();
-        if (!api?.refetch_thumbnails_all) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         const nMissing = _rows.reduce(
@@ -1008,7 +1009,7 @@
         }) : Promise.resolve("go"));
         if (!ok) return;
         try {
-          const res = await api.refetch_thumbnails_all();
+          const res = await bridgeCall("refetch_thumbnails_all");
           if (!res?.ok) {
             window._showToast?.(res?.error || "Failed.", "error");
           } else {
@@ -1036,8 +1037,7 @@
     if (bRecheckThumbs) {
       bRecheckThumbs.addEventListener("click", async () => {
         if (bRecheckThumbs.disabled) return;
-        const api = getApi();
-        if (!api?.thumbnail_status_bulk || !api?.get_channel_metadata_status) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         bRecheckThumbs.disabled = true;
@@ -1062,8 +1062,8 @@
           // Fire both in parallel — they read separate sources (DB
           // vs filesystem) so they don't contend.
           const [metaRows, thRes] = await Promise.all([
-            api.get_channel_metadata_status(true),
-            api.thumbnail_status_bulk(true),
+            bridgeCall("get_channel_metadata_status", true),
+            bridgeCall("thumbnail_status_bulk", true),
           ]);
           _rows = Array.isArray(metaRows) ? metaRows : [];
           const thMap = thRes?.rows || {};

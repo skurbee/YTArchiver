@@ -24,7 +24,6 @@ Output file layout (must match YTArchiver.py for drop-in replacement):
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import queue
@@ -34,7 +33,6 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,20 +67,9 @@ _log = get_logger(__name__)
 # path + format + hide helpers moved to
 # transcribe_paths.py. Re-imported here so internal calls and external
 # `from backend.transcribe import _foo` callers keep working.
-from ..transcribe_paths import (
+from ..transcribe_paths import (  # noqa: F401
     _get_jsonl_sidecar,
     _get_transcript_filename,
-)
-
-# ── Patch 19 phase T1 (v68.9): file writers moved to transcribe_files.py ─
-# Internal callers (_transcribe_one, _write_outputs, retranscribe flows)
-# expect these names in this module's namespace.
-from .transcribe_files import (
-    _HEADER_RE,
-    _replace_jsonl_entry,
-    _replace_txt_entry,
-    _write_jsonl_entry,
-    _write_transcript_entry,
 )
 
 # Patch 16 (v71.8): pure helpers + PunctuationManager extracted to
@@ -105,6 +92,16 @@ from .helpers import (  # noqa: F401
 )
 from .punct_manager import PunctuationManager  # noqa: F401
 
+# ── Patch 19 phase T1 (v68.9): file writers moved to transcribe_files.py ─
+# Internal callers (_transcribe_one, _write_outputs, retranscribe flows)
+# expect these names in this module's namespace.
+from .transcribe_files import (
+    _HEADER_RE,  # noqa: F401
+    _replace_jsonl_entry,
+    _replace_txt_entry,
+    _write_jsonl_entry,
+    _write_transcript_entry,
+)
 
 # ── Patch 19 phase T2 (v68.9): VTT path moved to transcribe_vtt.py ───
 from .transcribe_vtt import (  # noqa: F401  (re-exports for backend.transcribe surface)
@@ -171,6 +168,10 @@ class TranscribeManager:
         # OOM early in a session stuck every later video in slow CPU
         # transcription for the rest of the run.
         self._cpu_fallback_active = False
+        # Deferred-swap flag: swap_model() sets this and the worker loop-top
+        # applies it when idle. Declared here so it isn't lazily materialized
+        # via getattr on first swap (audit r2).
+        self._pending_model_restart = False
         self._worker_thread: threading.Thread | None = None
         self._cancel_all = threading.Event()
         self._paused = threading.Event()
@@ -180,6 +181,10 @@ class TranscribeManager:
         # with done/err counts + elapsed time. Flushed when the worker
         # drains. Keyed by channel name.
         self._batch_stats: dict[str, dict[str, Any]] = {}
+        # Compress jobs get their OWN stats dict — mixed into
+        # _batch_stats they flushed as "N transcribed" rows and
+        # inflated the consolidated [Dwnld] transcribe count.
+        self._compress_stats: dict[str, dict[str, Any]] = {}
         # Reference to the shared QueueState. Attached by the app wrapper
         # after construction (main.py can't pass it in __init__ because
         # QueueState is constructed later). When None, the manager
@@ -250,12 +255,24 @@ class TranscribeManager:
         if new_model == self._model:
             return True  # already on this model; nothing to do
         self._model = new_model
-        # Kill the current subprocess so the next job triggers a restart
-        # with the new WHISPER_MODEL env var baked in.
-        try:
-            self._stop_subprocess()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        # Defer the subprocess restart to the worker thread's next idle
+        # loop-top instead of stopping it from this (UI/bridge) thread.
+        # Stopping here races _transcribe_one's read loop and kills an
+        # in-flight job mid-transcription (audit: swap_model race). The flag
+        # lets any in-flight job finish on the OLD model; the worker stops
+        # the subprocess when idle and the next job reloads the new model.
+        self._pending_model_restart = True
+        # If the worker isn't running (idle, no queued jobs), the loop-top
+        # won't apply the swap — stop the subprocess HERE so the old model
+        # doesn't linger in VRAM until the next enqueue. Safe: no job is in
+        # flight when the worker thread isn't alive (audit r2 idle-VRAM gap).
+        _wt = getattr(self, "_worker_thread", None)
+        if _wt is None or not _wt.is_alive():
+            try:
+                self._stop_subprocess()
+                self._pending_model_restart = False
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         self._stream.emit_text(
             f" \u2014 Whisper model queued to swap to '{new_model}' "
             f"on next job.", "simpleline_blue")
@@ -841,6 +858,19 @@ class TranscribeManager:
             self._jobs.clear()
         if self._current_job:
             self._current_job["cancel"].set()
+        # Kill the whisper subprocess like skip_current does. Leaving
+        # it alive mid-chunk let its late {"status":"ok"} response sit
+        # in _line_queue; the NEXT transcribe job reused the live
+        # process and accepted that stale result as its own — the OLD
+        # video's text was written into the NEW video's transcript
+        # (and FTS) and the new video marked transcribed. Stopping the
+        # process drops the line queue so no stale response can cross
+        # job boundaries, and releases the chunk WAV handle so temp
+        # cleanup stops leaking ~230MB files on cancelled chunks.
+        try:
+            self._stop_subprocess(force=True)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
         # also clear the shared GPU popover queue so the UI
         # doesn't keep showing phantom "pending" rows for tasks that
         # have been cancelled. The worker's finally-path would normally
@@ -960,6 +990,17 @@ class TranscribeManager:
                 except Exception as e: _log.debug("swallowed: %s", e)
             if self._cancel_all.is_set():
                 break
+            # Apply a deferred model swap now that we're idle (no job in
+            # flight): stop the old-model subprocess so the next job's
+            # start_subprocess reloads with the new self._model. Done here
+            # (worker thread, loop-top) rather than in swap_model (UI thread)
+            # to avoid killing an in-flight job mid-read (audit: swap_model race).
+            if getattr(self, "_pending_model_restart", False):
+                self._pending_model_restart = False
+                try:
+                    self._stop_subprocess()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             with self._jobs_lock:
                 if not self._jobs:
                     break
@@ -982,7 +1023,7 @@ class TranscribeManager:
             _job_kind = job.get("kind") or "transcribe"
             if self._queues is not None:
                 try:
-                    popped = self._queues.gpu_pop()
+                    self._queues.gpu_pop()
                     self._queues.set_current_gpu({
                         "kind": _job_kind,
                         "title": job.get("title", ""),
@@ -994,8 +1035,12 @@ class TranscribeManager:
             # Track per-channel stats so we can emit a [Trnscr] history
             # row when the worker drains. Matches OLD's _record_transcription.
             ch_name = (job.get("channel") or "").strip() or "\u2014"
-            stats = self._batch_stats.setdefault(ch_name,
-                {"start": time.time(), "done": 0, "err": 0})
+            if _job_kind == "compress":
+                stats = self._compress_stats.setdefault(ch_name,
+                    {"start": time.time(), "done": 0, "err": 0})
+            else:
+                stats = self._batch_stats.setdefault(ch_name,
+                    {"start": time.time(), "done": 0, "err": 0})
             crashed = False
             try:
                 if _job_kind == "compress":
@@ -1160,7 +1205,7 @@ class TranscribeManager:
           (b) Normal case: sync_channel already called
               `consume_channel_batch_stats()` and the entry is gone.
         """
-        if not self._batch_stats:
+        if not self._batch_stats and not self._compress_stats:
             return
         try:
             from .. import autorun as _ar
@@ -1244,6 +1289,40 @@ class TranscribeManager:
                     "took": f"took {int(elapsed)}s" if elapsed < 60
                                  else f"took {int(elapsed)//60}m {int(elapsed)%60}s",
                     "row_tag": "hist_blue" if done > 0 else "",
+                })
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+
+        # [Cmprss] rows \u2014 live compress jobs get their own history +
+        # activity rows (tag/kind matching ytarchiver_config's reload
+        # recolor). They previously flushed through the loop above as
+        # "N transcribed" and inflated the consolidated [Dwnld] count.
+        for ch_name in list(self._compress_stats.keys()):
+            s = self._compress_stats.pop(ch_name, None) or {}
+            done = int(s.get("done", 0))
+            err = int(s.get("err", 0))
+            if done == 0 and err == 0:
+                continue
+            elapsed = time.time() - float(s.get("start", time.time()))
+            primary = f"{done} compressed"
+            try:
+                _ar.append_history_entry(
+                    _ar.format_history_entry("Cmprss", ch_name,
+                                             primary, secondary="",
+                                             errors=err, took_sec=elapsed))
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            try:
+                self._stream.emit_activity({
+                    "kind": "Cmprss",
+                    "time_date": f"{time_str}, {date_str}",
+                    "channel": "" if ch_name == "\u2014" else ch_name,
+                    "primary": primary,
+                    "secondary": "",
+                    "errors": f"{err} errors",
+                    "took": f"took {int(elapsed)}s" if elapsed < 60
+                                 else f"took {int(elapsed)//60}m {int(elapsed)%60}s",
+                    "row_tag": "hist_compress" if done > 0 else "",
                 })
             except Exception as e:
                 _log.debug("swallowed: %s", e)
@@ -2117,6 +2196,19 @@ class TranscribeManager:
             (s.get("t") or s.get("text") or "").strip()
             for s in segs if isinstance(s, dict))
         if not text and not _has_any_seg_text:
+            # Persist a TERMINAL 'no_speech' status so this silent / music-
+            # only video is not re-attempted by auto + bulk transcribe passes,
+            # and so the Watch view can say "No speech detected" instead of the
+            # generic "No transcript available." We STILL raise below so the
+            # worker loop emits the benign "no speech detected" line and counts
+            # the job as done (not an error). Best-effort: a DB hiccup here
+            # must not turn a benign empty result into a hard crash.
+            try:
+                from .. import index as _idx
+                _idx.mark_video_no_speech(video_path)
+            except Exception as _nse:
+                _log.debug("mark_video_no_speech(%s) failed: %s",
+                           video_path, _nse)
             raise RuntimeError(
                 "Whisper returned an empty transcript "
                 "(no text, no non-empty segments) — refusing to "
@@ -2219,13 +2311,46 @@ class TranscribeManager:
                 # is notified with a clear message.
                 if _jsonl_backup is not None:
                     try:
-                        with open(jsonl_path, "wb") as _jw:
+                        # Atomic, hidden-aware roll-back. The old
+                        # in-place open('wb') NEVER worked here:
+                        # _replace_jsonl_entry re-hides the file in its
+                        # finally block, and on Windows CreateFileW
+                        # refuses to truncate a FILE_ATTRIBUTE_HIDDEN
+                        # file (PermissionError) — so the roll-back was
+                        # dead code for every hidden transcript .jsonl.
+                        import tempfile as _tf
+
+                        from ..transcribe_paths import _hide_file_win as _rb_hide
+                        _fd, _rb_tmp = _tf.mkstemp(
+                            suffix=".jsonl.tmp",
+                            dir=os.path.dirname(jsonl_path) or ".")
+                        with os.fdopen(_fd, "wb") as _jw:
                             _jw.write(_jsonl_backup)
+                            try:
+                                _jw.flush()
+                                os.fsync(_jw.fileno())
+                            except OSError:
+                                pass
+                        try: _rb_hide(_rb_tmp)
+                        except Exception: pass
+                        os.replace(_rb_tmp, jsonl_path)
+                        try: _rb_hide(jsonl_path)
+                        except Exception: pass
+                        self._stream.emit_error(
+                            f"Rolled {os.path.basename(jsonl_path)} back "
+                            f"— files consistent; retry retranscribe "
+                            f"when {os.path.basename(txt_path)} is "
+                            f"writable.")
                     except OSError as _re:
                         self._stream.emit_error(
                             f"Roll-back of {os.path.basename(jsonl_path)} "
                             f"FAILED: {_re}. Files may be out of sync; "
                             f"retry retranscribe when writable.")
+                # Either way, do NOT fall through to the FTS ingest —
+                # the txt update failed, so indexing the new segments
+                # (or re-marking the video transcribed) would certify
+                # a state the visible transcript doesn't match.
+                return
         else:
             if not _write_transcript_entry(txt_path, title, upload_date,
                                            duration, source_tag, text):

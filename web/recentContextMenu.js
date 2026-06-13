@@ -86,8 +86,8 @@
           "Delete");
         if (!ok) return;
         try {
-          await window.pywebview?.api?.recent_delete_file?.(title, channel);
-          const rows = await window.pywebview?.api?.get_recent_downloads?.();
+          await bridgeCall("recent_delete_file", title, channel);
+          const rows = await bridgeCall("get_recent_downloads");
           if (rows && typeof window.renderRecentTable === "function") {
             window.renderRecentTable(rows);
           }
@@ -95,7 +95,7 @@
       } else if (e.key === "Enter") {
         e.preventDefault();
         const fp = selected.dataset?.filepath || "";
-        if (fp) window.pywebview?.api?.browse_open_video?.(fp);
+        if (fp) bridgeCall("browse_open_video", fp);
       } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         const all = [...tbody.querySelectorAll("tr")];
@@ -142,11 +142,11 @@
               const t = row.querySelector(".col-title")?.textContent;
               const c = row.querySelector(".col-channel")?.textContent;
               try {
-                await window.pywebview?.api?.recent_delete_file?.(t, c);
+                await bridgeCall("recent_delete_file", t, c);
               } catch {}
             }
             try {
-              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              const rows = await bridgeCall("get_recent_downloads");
               if (rows && typeof window.renderRecentTable === "function") {
                 window.renderRecentTable(rows);
               }
@@ -156,12 +156,11 @@
         // "Play video" opens the Browse Watch view (embedded HTML5 <video>
         // + karaoke transcript), NOT a separate VLC window.
         { label: "Play video", action: async () => {
-          const api = window.pywebview?.api;
           // Resolve filepath + video_id via the recent lookup, then hand off
           // to the shared Watch-view opener used by the Browse grid.
           let fp = "", vid = "";
           try {
-            const res = await api?.recent_resolve?.(title, channel);
+            const res = await bridgeCall("recent_resolve", title, channel);
             if (res?.ok) { fp = res.filepath || ""; vid = res.video_id || ""; }
           } catch {}
           if (!fp) {
@@ -172,16 +171,16 @@
             title, channel, filepath: fp, video_id: vid,
           });
         }},
-        { label: "Play in external player", action: () => window.pywebview?.api?.recent_play?.(title, channel) },
-        { label: "Show in Explorer", action: () => window.pywebview?.api?.recent_show_in_explorer?.(title, channel) },
-        { label: "Open video on YouTube", action: () => window.pywebview?.api?.recent_open_youtube?.(title, channel) },
+        { label: "Play in external player", action: () => bridgeCall("recent_play", title, channel) },
+        { label: "Show in Explorer", action: () => bridgeCall("recent_show_in_explorer", title, channel) },
+        { label: "Open video on YouTube", action: () => bridgeCall("recent_open_youtube", title, channel) },
         { sep: true },
         // Re-queue download — fetches this video's URL from recent_downloads
         // and re-drives the single-video flow. Mirrors OLD's Recent menu
         // item (YTArchiver.py:33174 + friends).
         { label: "Re-queue download",
           action: async () => {
-            const r = await window.pywebview?.api?.recent_requeue?.(title, channel);
+            const r = await bridgeCall("recent_requeue", title, channel);
             if (r?.ok) {
               window._showToast?.("Re-queued download.", "ok");
             } else {
@@ -197,8 +196,8 @@
             // refresh Recent after delete so the row
             // disappears instantly instead of needing a tab switch.
             try {
-              await window.pywebview?.api?.recent_delete_file?.(title, channel);
-              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              await bridgeCall("recent_delete_file", title, channel);
+              const rows = await bridgeCall("get_recent_downloads");
               if (rows && typeof window.renderRecentTable === "function") {
                 window.renderRecentTable(rows);
               }
@@ -223,11 +222,11 @@
           "Clear list");
         if (!ok) return;
         try {
-          const res = await window.pywebview?.api?.clear_recent_downloads?.();
+          const res = await bridgeCall("clear_recent_downloads");
           if (res?.ok) {
             window._showToast?.("Recent list cleared.", "ok");
             try {
-              const rows = await window.pywebview?.api?.get_recent_downloads?.();
+              const rows = await bridgeCall("get_recent_downloads");
               if (typeof window.renderRecentTable === "function") {
                 window.renderRecentTable(rows || []);
               }

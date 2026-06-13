@@ -30,6 +30,7 @@ _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".m4a", ".mov")
 from .log import get_logger
 from .log_stream import LogStreamer
 from .net import block_if_down
+from .utils import sampled_files_equal
 from .utils import utf8_subprocess_env as _utf8_env
 
 _log = get_logger(__name__)
@@ -123,7 +124,7 @@ def _save_broken_counts(folder: str, counts: dict[str, int]) -> None:
         _log.debug("swallowed: %s", e)
 
 
-def _extract_id_from_filename(name: str) -> str | None:
+def _extract_id_from_filename(name: str, known_ids=None) -> str | None:
     """YTArchiver names videos like 'Title [VIDEOID].ext'. Extract VIDEOID if so."""
     # Look for bracketed 11-char token at the end of the filename (before ext).
     stem = os.path.splitext(name)[0]
@@ -131,9 +132,19 @@ def _extract_id_from_filename(name: str) -> str | None:
     m = re.search(r'\[([A-Za-z0-9_-]{11})\]\s*$', stem)
     if m:
         return m.group(1)
-    # Fallback: any 11-char token
+    # Fallback: any bare 11-char token — but when the caller supplies
+    # known_ids, only trust a candidate that actually exists in the
+    # catalog/metadata. Plain 11-letter words ('programming',
+    # 'information') match the shape; trusting them short-circuited
+    # the title-match ladder and produced permanent bogus-id download
+    # failures — with a nonzero chance of a wrong-video replace.
     m = _YT_ID_RE.search(stem)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    cand = m.group(1)
+    if known_ids is not None and cand not in known_ids:
+        return None
+    return cand
 
 
 def _scan_local_files(folder: str) -> dict[str, str]:
@@ -223,7 +234,17 @@ def _fetch_yt_catalog(ch_url: str, cancel_ev: threading.Event,
                 vid_id = vid_id.strip()
                 title = title.strip()
                 if re.fullmatch(r'[A-Za-z0-9_-]{11}', vid_id):
-                    result[title] = vid_id
+                    _prev = result.get(title)
+                    if _prev is not None and _prev != vid_id:
+                        # Duplicate title with a DIFFERENT id (weekly
+                        # shows, reuploads, 'Q&A'): last-wins used to
+                        # silently bind title-matched files to whichever
+                        # id enumerated last — the wrong-content-replace
+                        # class. Empty string = ambiguous sentinel; the
+                        # matcher refuses exact-title binding for these.
+                        result[title] = ""
+                    elif _prev is None:
+                        result[title] = vid_id
             else:
                 pm = _PAGE_RE.search(line)
                 if pm:
@@ -360,9 +381,35 @@ def _match_files_to_ids(local_files: dict[str, str],
     meta_by_title_norm = {_norm(k): v for k, v in meta_by_title.items()}
     meta_by_date = (meta_index or {}).get("by_date") or {}
     meta_by_id = (meta_index or {}).get("by_id") or {}
+    # Bare (un-bracketed) 11-char tokens are only trusted as IDs when
+    # they exist in the catalog or local metadata — see
+    # _extract_id_from_filename. ("" is the catalog's ambiguous-title
+    # sentinel, never a real id.)
+    _known_ids = (set(yt_title_to_id.values()) | set(meta_by_id.keys())) - {""}
+    # Ambiguous-title census for the LOCAL metadata side: by_title is
+    # last-wins-clobbered at build time, but by_id keeps every record,
+    # so collisions are recoverable here. A normalized title shared by
+    # two different ids must never exact-match ("rather missing than
+    # incorrect" — binding to the survivor replaces a file with the
+    # OTHER video's content).
+    from collections import Counter as _Counter
+    _meta_title_counts = _Counter(
+        _norm((rec or {}).get("title") or "")
+        for rec in meta_by_id.values())
+    _ambiguous_meta = {k for k, c in _meta_title_counts.items()
+                       if c > 1 and k}
+    # Loose form for step-4 title confirmation: strips the Windows-
+    # illegal chars (and their fullwidth lookalikes) that filename
+    # sanitization removes/replaces, so "Title: Part 2" (YT) still
+    # compares equal to "Title Part 2" (disk).
+    _illegal_re = re.compile(
+        r'[<>:"/\\|?*：？＂｜＜＞＊⧸⁄]')
+    def _loose(s: str) -> str:
+        s = _illegal_re.sub(" ", _norm(s))
+        return re.sub(r"\s+", " ", s).strip()
     for fname, fpath in local_files.items():
         stem = os.path.splitext(fname)[0]
-        vid_id = _extract_id_from_filename(fname)
+        vid_id = _extract_id_from_filename(fname, _known_ids)
         title = stem
         # 1. [VIDEOID] in filename — fast path
         if vid_id:
@@ -370,45 +417,72 @@ def _match_files_to_ids(local_files: dict[str, str],
                             "video_id": vid_id, "title": title})
             continue
         low = _norm(stem)
-        # 2. Exact title match in YT catalog
+        # 2. Exact title match in YT catalog. vid == "" is the
+        # duplicate-title sentinel from _fetch_yt_catalog — two videos
+        # share this title, so exact-title binding would be a coin
+        # flip; fall through to the date matcher instead.
         if low in yt_lower:
             t, vid = yt_lower[low]
-            matched.append({"filename": fname, "filepath": fpath,
-                            "video_id": vid, "title": t})
-            continue
-        # 3. Exact title match in LOCAL metadata (catches renames)
-        if low in meta_by_title_norm:
+            if vid:
+                matched.append({"filename": fname, "filepath": fpath,
+                                "video_id": vid, "title": t})
+                continue
+            _log.warning("redownload: %r title is ambiguous in the YT "
+                         "catalog (multiple ids) — not title-matching", fname)
+        # 3. Exact title match in LOCAL metadata (catches renames) —
+        # refused when the census above shows the title is shared by
+        # more than one id.
+        if low in meta_by_title_norm and low not in _ambiguous_meta:
             vid = meta_by_title_norm[low]
             t_orig = meta_by_id.get(vid, {}).get("title") or stem
             matched.append({"filename": fname, "filepath": fpath,
                             "video_id": vid, "title": t_orig})
             continue
-        # 4. MTIME-DATE fallback against local metadata
+        # 4. MTIME-DATE fallback against local metadata. The date is
+        # computed in UTC to match YouTube's upload_date convention —
+        # yt-dlp --mtime stamps the UTC upload timestamp, and the old
+        # LOCAL-time conversion shifted any 00:00-~06:00-UTC upload to
+        # the previous day, binding the file to the adjacent day's
+        # video with no title check at all.
         try:
             import datetime as _dt
             mt_date = _dt.datetime.fromtimestamp(
-                os.path.getmtime(fpath)).strftime("%Y%m%d")
+                os.path.getmtime(fpath),
+                tz=_dt.UTC).strftime("%Y%m%d")
         except OSError:
             mt_date = ""
         if mt_date and mt_date in meta_by_date:
             candidates = meta_by_date[mt_date]
+            stem_loose = _loose(stem)
             if len(candidates) == 1:
                 vid, t_orig = candidates[0]
-                matched.append({"filename": fname, "filepath": fpath,
-                                "video_id": vid, "title": t_orig or stem})
-                continue
-            # Multiple videos that day — pick the best substring match.
-            best = None
-            for vid, t_orig in candidates:
-                t_low = _norm(t_orig or "")
-                if t_low and (low in t_low or t_low in low):
-                    best = (vid, t_orig)
-                    break
-            if best:
-                vid, t_orig = best
-                matched.append({"filename": fname, "filepath": fpath,
-                                "video_id": vid, "title": t_orig or stem})
-                continue
+                t_loose = _loose(t_orig or "")
+                # Date alone is too weak to bind — require the titles
+                # to agree once sanitization differences are stripped.
+                if stem_loose and t_loose and (
+                        stem_loose == t_loose
+                        or stem_loose in t_loose
+                        or t_loose in stem_loose):
+                    matched.append({"filename": fname, "filepath": fpath,
+                                    "video_id": vid,
+                                    "title": t_orig or stem})
+                    continue
+            else:
+                # Multiple videos that day — pick the best loose-title
+                # match (loose form so punctuated titles still hit).
+                best = None
+                for vid, t_orig in candidates:
+                    t_loose = _loose(t_orig or "")
+                    if t_loose and stem_loose and (
+                            stem_loose in t_loose or t_loose in stem_loose):
+                        best = (vid, t_orig)
+                        break
+                if best:
+                    vid, t_orig = best
+                    matched.append({"filename": fname, "filepath": fpath,
+                                    "video_id": vid,
+                                    "title": t_orig or stem})
+                    continue
         # the previous step-5 substring fallback
         # ("if t_lower in low or low in t_lower") matched too aggressively
         # on common-prefix titles like "Episode 1" vs "Episode 11" and
@@ -730,7 +804,21 @@ def _download_one(video_id: str, new_res: str, out_dir: str,
         except OSError:
             pass
     if not os.path.isfile(dl_path):
-        return dest # Fall back to whatever yt-dlp reported
+        # dl_path (the -o forced path) is gone — fall back to yt-dlp's
+        # reported `dest`, but ONLY if it's a real file under temp_dir.
+        # `dest` is parsed from yt-dlp stdout (influenced by the title
+        # template), so apply the same containment guard as the dl_path
+        # branch below rather than trusting it blindly (audit: redownload
+        # return-dest containment).
+        try:
+            if dest and os.path.isfile(dest):
+                _temp_real = os.path.realpath(temp_dir)
+                _dest_real = os.path.realpath(dest)
+                if os.path.commonpath([_temp_real, _dest_real]) == _temp_real:
+                    return dest
+        except (ValueError, OSError):
+            pass
+        return None
     # Sanity: confirm the resolved path actually lives under temp_dir.
     # A malicious upload_date / title template could try to escape via
     # ../ or absolute path — refuse to return anything outside the
@@ -764,6 +852,7 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                        pause_ev: threading.Event | None = None,
                        confirm_cb: Callable[[float, str, str, int], str] | None = None,
                        queues=None,
+                       only_video_id: str = "",
                        ) -> dict[str, Any]:
     """Run the full redownload pipeline synchronously. Returns a summary.
 
@@ -845,15 +934,13 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     if not yt_titles:
         stream.emit([["  \u2014", "simpleline_redwnl"],
                      [" YouTube catalog fetch failed.\n", "red"]])
-        # clear the progress file so the next attempt
-        # doesn't resume against a stale catalog-vs-progress mapping.
-        # Leaving the old progress around meant the retry tried to
-        # skip videos whose IDs came from a different catalog view,
-        # producing silent mismatches.
-        try:
-            _clear_progress(folder)
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        # Keep the progress file. The old "stale catalog-vs-progress
+        # mapping" rationale for wiping it was wrong: done_ids are
+        # immutable YouTube video IDs, independent of any catalog
+        # view. Wiping on a transient network blip threw away
+        # thousands of completed-video records AND un-quarantined
+        # permanently-broken videos (their 3-strike marks live in
+        # `done` too), restarting their strike cycles.
         return {"ok": False, "done": 0, "errors": 1, "total": 0}
 
     # 3. Match. Load the aggregated `.{ch} Metadata.jsonl` files under
@@ -864,9 +951,13 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
     #    matching for low-upload-frequency channels.
     meta_index = _build_metadata_index(folder)
     matched = _match_files_to_ids(local, yt_titles, meta_index=meta_index)
-    stream.emit([["  \u2014", "simpleline_redwnl"],
-                 [f" Matched {len(matched)}/{len(local)} files to YouTube IDs.\n",
-                  "simpleline"]])
+    if only_video_id:
+        # Single-video redownload (Watch/Browse "Redownload" on ONE video):
+        # keep only the requested id so the per-video button doesn't
+        # re-download the ENTIRE channel (audit r2). Reuses the whole tested
+        # match/replace/containment pipeline for that one file.
+        matched = [m for m in matched
+                   if (m.get("video_id") or "") == only_video_id]
 
     # 4. Resume support
     done = _load_progress(folder, ch_url, new_res)
@@ -1039,6 +1130,11 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             continue
         # Emit / update the sticky active line for this video.
         _emit_active(file_num, _live_total)
+        # Capture the original's height BEFORE anything can replace it
+        # — the resolution guard below refuses quality downgrades.
+        orig_h = _height_from_metadata_jsonl(fp)
+        if orig_h is None:
+            orig_h = _ffprobe_height(fp)
         orig_size = 0
         try:
             orig_size = os.path.getsize(fp)
@@ -1128,49 +1224,12 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
             # "0% smaller" re-download entry.
             if (orig_size > 0 and new_size == orig_size
                     and os.path.isfile(fp)):
-                _ident = False
-                try:
-                    # replaced full-file chunked compare (10GB+
-                    # double disk read for every size-match) with a header
-                    # + tail sample. If both 1MB windows match, treat the
-                    # files as identical. The full-compare used to burn
-                    # hours of disk I/O on a mostly-at-target channel
-                    # rescan for vanishingly little correctness gain (two
-                    # videos with byte-identical size+header+tail but
-                    # different middles is a rounding-error-rare case).
-                    _ident = True
-                    _SAMPLE = 1 * 1024 * 1024
-                    _orig_sz = orig_size
-                    with open(fp, "rb") as _a, open(new_fp, "rb") as _b:
-                        if _a.read(_SAMPLE) != _b.read(_SAMPLE):
-                            _ident = False
-                        elif _orig_sz > _SAMPLE * 3:
-                            # Audit fix (redownload.py:1023-1066): head + tail
-                            # samples can both match while the middle differs
-                            # (different codecs, same container size). Add a
-                            # mid-file 1MB sample — three independent 1MB
-                            # windows make a same-size/different-content
-                            # collision astronomically unlikely without paying
-                            # the full chunked-compare cost.
-                            _mid_off = _orig_sz // 2 - _SAMPLE // 2
-                            _a.seek(_mid_off)
-                            _b.seek(_mid_off)
-                            if _a.read(_SAMPLE) != _b.read(_SAMPLE):
-                                _ident = False
-                            else:
-                                _tail_off = _orig_sz - _SAMPLE
-                                _a.seek(_tail_off)
-                                _b.seek(_tail_off)
-                                if _a.read(_SAMPLE) != _b.read(_SAMPLE):
-                                    _ident = False
-                        elif _orig_sz > _SAMPLE * 2:
-                            _tail_off = _orig_sz - _SAMPLE
-                            _a.seek(_tail_off)
-                            _b.seek(_tail_off)
-                            if _a.read(_SAMPLE) != _b.read(_SAMPLE):
-                                _ident = False
-                except OSError:
-                    _ident = False
+                # Head/mid/tail sampled compare (shared with reorg's dedup —
+                # see backend.utils.sampled_files_equal) instead of a full
+                # chunked compare: the original full-file read burned hours of
+                # disk I/O on a mostly-at-target rescan for a vanishingly rare
+                # same-size/different-content collision.
+                _ident = sampled_files_equal(fp, new_fp)
                 if _ident:
                     try: os.remove(new_fp)
                     except OSError: pass
@@ -1189,6 +1248,49 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
                     _save_progress(folder, ch_url, cur_res[0], done)
                     n_skipped += 1
                     continue
+            # Resolution guard — never replace an original with a WORSE
+            # copy. _already_at_target returning False only means
+            # "below target OR unknown"; without this check, a 4K file
+            # whose height couldn't be probed got replaced by a 1080
+            # download, and a 720p file whose video YouTube now serves
+            # at 360p max got silently downgraded. Permanent quality
+            # loss either way.
+            _new_h = _ffprobe_height(new_fp)
+            _tgt_h = 0
+            try:
+                _tgt_h = int(cur_res[0])
+            except Exception:
+                _tgt_h = 0  # "best" — only the orig-vs-new compare applies
+            _refuse = ""
+            if orig_h and _new_h:
+                if _new_h < orig_h:
+                    _refuse = (f"new copy is {_new_h}p, original is "
+                               f"{orig_h}p")
+            elif orig_h and not _new_h:
+                _refuse = (f"can't probe the new copy's resolution "
+                           f"(original is {orig_h}p)")
+            elif not orig_h and _tgt_h:
+                if _new_h and _new_h < _tgt_h - 8:
+                    _refuse = (f"original's resolution unknown and new "
+                               f"copy is only {_new_h}p (target {_tgt_h}p)")
+                elif not _new_h:
+                    _refuse = ("can't probe either file's resolution "
+                               "(ffprobe unavailable?)")
+            if _refuse:
+                try: os.remove(new_fp)
+                except OSError: pass
+                stream.emit([
+                    ["[", "simpleline_redwnl"],
+                    [str(file_num), "simpleline"],
+                    ["/", "simpleline_redwnl"],
+                    [str(_live_total), "simpleline"],
+                    ["] ", "simpleline_redwnl"],
+                    [f"{item['title']} — refusing replace: {_refuse} "
+                     f"— keeping original.\n", "red"],
+                ])
+                _emit_active(file_num, _live_total)
+                n_err += 1
+                continue
             new_ext = os.path.splitext(new_fp)[1].lower()
             orig_ext = os.path.splitext(fp)[1].lower()
             target_fp = fp
@@ -1375,7 +1477,10 @@ def redownload_channel(ch_name: str, ch_url: str, folder: str, new_res: str,
         pass
 
     # 6. Clear progress only if a full pass completed without cancel
-    if not cancel_ev.is_set():
+    # AND without errors — errored ids are not in `done`, so keeping
+    # the file makes the next run retry exactly the failures instead
+    # of re-downloading every previously completed video.
+    if not cancel_ev.is_set() and n_err == 0:
         _clear_progress(folder)
 
     # Drop the sticky redwnl_active line so the === Redownload

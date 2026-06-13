@@ -10,7 +10,6 @@ The "Refresh views" button on Settings → Metadata drives this.
 from __future__ import annotations
 
 import os
-import re
 import threading
 import time
 from datetime import datetime
@@ -27,25 +26,15 @@ from ..metadata_io import (
 from ..sync import find_yt_dlp
 from ..text_utils import normalize_title as _canon_norm_title
 from ..utils import sqlite_like_escape as _like_esc
+from ._refresh_proxies import (
+    _enter_pause_wait,
+    _exit_pause_wait,
+    _flat_playlist_bulk_stats,
+)
 from .fetcher import (
-    fetch_metadata_for_videos,
     fetch_single_video_metadata,
 )
 from .scan import _scan_channel_videos
-from ._refresh_proxies import (
-    _ID_RE,
-    _ID_RE_11,
-    _enter_pause_wait,
-    _exit_pause_wait,
-    _fetch_per_video_upload_dates,
-    _flat_playlist_bulk_stats,
-    _probe_durations_bulk,
-    _probe_file_duration,
-    _resolve_channel_id_url,
-    _resolve_ids_by_title,
-    backfill_video_ids,
-    existing_info_ids,
-)
 
 _log = get_logger(__name__)
 
@@ -318,6 +307,18 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
     # gone from YT" counter. Inverse: any file currently marked
     # removed whose vid HAS returned to the catalog gets the
     # timestamp cleared (uploader restored / unprivated the video).
+    # Only run detection on a COMPLETE catalog. A partial walk (cancel
+    # mid-walk, 60s stall, yt-dlp dying after streaming some rows)
+    # would make "not in bulk" flag thousands of perfectly-live videos
+    # as removed from YouTube.
+    _catalog_complete = bool(getattr(bulk, "complete", False))
+    if not _catalog_complete:
+        try:
+            stream.emit_dim(
+                " (catalog walk incomplete — skipping removed-from-YT "
+                "detection this pass)")
+        except Exception:
+            pass
     try:
         _now_rm = time.time()
         _newly_removed: list[str] = []
@@ -325,7 +326,7 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
         from .. import index as _idx
         # Read-only state lookup — reader path avoids queueing behind sweep.
         _conn_rm = _idx._reader_open()
-        if _conn_rm is not None:
+        if _catalog_complete and _conn_rm is not None:
             # Normalize the folder path to the SAME canonical form that
             # videos.filepath rows were inserted with (os.path.normpath
             # in register_video). Old _like_esc(str(folder)) used the
@@ -672,12 +673,20 @@ def bulk_refresh_views_likes(channel: dict[str, Any],
                 continue
             fp, title_hint = _pair
             try:
+                # refresh=True is REQUIRED here: changed-count and
+                # _no_flat_data videos by definition already have a
+                # jsonl entry, and without the flag the fetcher's
+                # existing-entry guard returned {ok, skipped} without
+                # fetching — so "full fetch on change" never actually
+                # updated comments/descriptions and _no_flat_data
+                # videos kept stale counts forever, while the summary
+                # claimed success.
                 res = fetch_single_video_metadata(
                     channel, vid, fp, title_hint, stream,
-                    emit_inline_log=False)
-                if res.get("ok"):
+                    emit_inline_log=False, refresh=True)
+                if res.get("ok") and not res.get("skipped"):
                     full_fetched += 1
-                elif not res.get("transient"):
+                elif not res.get("ok") and not res.get("transient"):
                     full_errors += 1
             except Exception as _e:
                 stream.emit_dim(f" (full fetch failed for {vid}: {_e})")

@@ -22,6 +22,40 @@ from .log import get_logger
 _log = get_logger(__name__)
 
 
+def _dedupe_segment_hits(rows: list[Any]) -> list[Any]:
+    """Collapse duplicate segment rows while preserving query order.
+
+    Some long-lived indexes contain the same transcript segment twice with
+    only path spelling changed (`Z:/...` vs `Z:\\...`). Search should show the
+    hit once; the first row keeps its segment id for context loading.
+    """
+    seen: set[tuple[Any, ...]] = set()
+    out: list[Any] = []
+    for r in rows:
+        video_key = (r[1] or "").strip().lower()
+        if not video_key:
+            video_key = "|".join((
+                (r[2] or "").strip().lower(),
+                (r[3] or "").strip().lower(),
+                (r[6] or "").replace("\\", "/").strip().lower(),
+            ))
+        try:
+            start_key: Any = round(float(r[4] or 0), 3)
+        except Exception:
+            start_key = r[4]
+        key = (
+            video_key,
+            start_key,
+            (r[5] or "").strip(),
+            (r[7] or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def _sanitize_fts_query(q: str) -> str:
     """Defensive fallback sanitizer for FTS5 MATCH queries.
 
@@ -153,17 +187,27 @@ def search_video_titles(query: str,
             placeholders = ",".join(["?"] * len(_names))
             chan_sql = f" AND channel IN ({placeholders})"
             args.extend(_names)
-    # Year scope (inclusive). Mirror the FTS leg: OR-include year IS NULL
-    # so videos we couldn't date yet aren't silently dropped when the
-    # user sets a year window.
+    # Year scope (inclusive). Mirror the FTS leg: prefer the video's
+    # UPLOAD year (upload_ts = file mtime = YT upload date), since the
+    # folder-derived `year` column is NULL for flat / non-year-organized
+    # channels — which made the old "(year >= ? OR year IS NULL)" filter a
+    # NO-OP. Fall back to `year` only when upload_ts is missing; stay
+    # lenient (include) only when both are unknown.
     year_sql = ""
     if year_from is not None:
-        year_sql += " AND (year >= ? OR year IS NULL)"
+        year_sql += (" AND (CAST(strftime('%Y', upload_ts, 'unixepoch') AS INTEGER) >= ?"
+                     " OR (upload_ts IS NULL AND year >= ?)"
+                     " OR (upload_ts IS NULL AND year IS NULL))")
+        args.append(int(year_from))
         args.append(int(year_from))
     if year_to is not None:
-        year_sql += " AND (year <= ? OR year IS NULL)"
+        year_sql += (" AND (CAST(strftime('%Y', upload_ts, 'unixepoch') AS INTEGER) <= ?"
+                     " OR (upload_ts IS NULL AND year <= ?)"
+                     " OR (upload_ts IS NULL AND year IS NULL))")
         args.append(int(year_to))
-    args.append(int(limit))
+        args.append(int(year_to))
+    requested_limit = max(1, int(limit))
+    args.append(requested_limit)
     # Translate sort key → SQL ORDER BY clause.
     order_sql = {
         "oldest":  "ts ASC",
@@ -234,11 +278,39 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
     # LEFT JOIN (not INNER) so rows without a matching videos entry
     # (legacy seed data, FTS phantoms) still appear; they sort to the
     # end on date sorts because upload_ts is NULL.
+    # When a year filter is active, ALSO resolve the upload date via a
+    # (channel, title) fallback for segments whose video_id is empty (and so
+    # don't join to their correctly-dated videos row). Without it those
+    # undated segments leak through any year window — e.g. a flat,
+    # Tesla-heavy channel still showed 2024 results under a 2008 filter even
+    # after the upload_ts fix, because ~4.6% of segments globally have an
+    # empty video_id. The derived table is pre-grouped (one row per
+    # channel+title) so it can never duplicate result rows, and it's only
+    # joined when a year filter is set, so plain searches pay no cost.
+    # Backed by idx_vid_chan_title(channel, title, upload_ts).
+    _year_active = (year_from is not None) or (year_to is not None)
+    _vt_join = (
+        " LEFT JOIN (SELECT channel, title, MIN(upload_ts) AS uts FROM videos "
+        " WHERE upload_ts IS NOT NULL GROUP BY channel, title) vt "
+        " ON v.upload_ts IS NULL AND vt.channel = s.channel AND vt.title = s.title "
+    ) if _year_active else ""
+    _ts_expr = (
+        "COALESCE(v.upload_ts, vt.uts, v.added_ts, 0)"
+        if _year_active else
+        "COALESCE(v.upload_ts, v.added_ts, 0)"
+    )
     q = ("SELECT s.id, s.video_id, s.title, s.channel, s.start_time, s.text, "
-         " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip "
+         " s.jsonl_path, snippet(segments_fts, 0, '<mark>', '</mark>', '...', 8) as snip, "
+         f" {_ts_expr} AS ts "
          " FROM segments_fts JOIN segments s ON s.id = segments_fts.rowid "
          " LEFT JOIN videos v ON s.video_id <> '' AND v.video_id = s.video_id "
+         + _vt_join +
          " WHERE segments_fts MATCH ?")
+    requested_limit = max(1, int(limit))
+    # Dedupe happens after SQLite returns rows because the duplicates differ
+    # only in index metadata. Pull a little extra so a duplicate-heavy index
+    # still fills the requested page with unique hits.
+    query_limit = min(requested_limit * 3, 1000)
     args_suffix: list[Any] = []
     suffix = ""
     # Channel scope: string (legacy single-channel) or list (new
@@ -255,18 +327,27 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
             placeholders = ",".join(["?"] * len(_names))
             suffix += f" AND s.channel IN ({placeholders})"
             args_suffix.extend(_names)
-    # OR-include s.year IS NULL when a year filter is set.
-    # Legacy rows (drop-in mode, pre-path-parsing, channels where the
-    # folder layout isn't year-organized) have segments.year=NULL;
-    # without the NULL clause the filter silently excluded them even
-    # though the user's intent was "all results within this window,
-    # including ones we can't place yet". Net effect: year-filtered
-    # searches now include NULL-year rows rather than missing them.
+    # Year filter. Prefer the video's UPLOAD year (v.upload_ts = file mtime
+    # = YT upload date) as the authoritative source. segments.year is
+    # folder-derived and is NULL for flat / drop-in / non-year-organized
+    # channels (the common case), which made the old
+    # "(s.year >= ? OR s.year IS NULL)" filter a NO-OP — every NULL-year
+    # segment passed, so the window never constrained anything (a "2008"
+    # filter still returned 2024 segments). Now: filter on the upload year
+    # when we have it, fall back to the folder-derived s.year when
+    # upload_ts is missing, and stay lenient (include the row) only when
+    # BOTH sources are unknown.
     if year_from is not None:
-        suffix += " AND (s.year >= ? OR s.year IS NULL)"
+        suffix += (" AND (CAST(strftime('%Y', COALESCE(v.upload_ts, vt.uts), 'unixepoch') AS INTEGER) >= ?"
+                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year >= ?)"
+                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year IS NULL))")
+        args_suffix.append(int(year_from))
         args_suffix.append(int(year_from))
     if year_to is not None:
-        suffix += " AND (s.year <= ? OR s.year IS NULL)"
+        suffix += (" AND (CAST(strftime('%Y', COALESCE(v.upload_ts, vt.uts), 'unixepoch') AS INTEGER) <= ?"
+                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year <= ?)"
+                   " OR (COALESCE(v.upload_ts, vt.uts) IS NULL AND s.year IS NULL))")
+        args_suffix.append(int(year_to))
         args_suffix.append(int(year_to))
     # Translate sort key → ORDER BY. For date sorts, NULLS LAST so
     # rows without an upload_ts (legacy data) don't dominate the top
@@ -284,9 +365,15 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
                    "v.upload_ts DESC, s.start_time ASC")
     elif _sort_key == "title":
         suffix += " ORDER BY s.title COLLATE NOCASE ASC, s.start_time ASC"
-    # else: relevance — leave FTS5's default rank ordering (no ORDER BY)
+    else:
+        # relevance: FTS5 does NOT rank by default — without an explicit
+        # ORDER BY rank it returns matches in ascending-rowid order
+        # (oldest-ingested first), which LIMIT then truncates to. `rank`
+        # is FTS5's bm25 auxiliary column; unambiguous here because
+        # segments_fts is the only FTS table in the query.
+        suffix += " ORDER BY rank"
     suffix += " LIMIT ?"
-    args_suffix.append(limit)
+    args_suffix.append(query_limit)
 
     def _run(q_text: str):
         with _idx._reader_lock:
@@ -328,7 +415,9 @@ def search_fts(query: str, channel: Any | None = None, limit: int = 200,
             try: print(f"[search_fts] Invalid FTS5 query: {query!r}")
             except Exception as e: _log.debug("swallowed: %s", e)
             return []
+    rows = _dedupe_segment_hits(rows)[:requested_limit]
     return [{
         "segment_id": r[0], "video_id": r[1], "title": r[2], "channel": r[3],
         "start_time": r[4], "text": r[5], "jsonl_path": r[6], "snippet": r[7],
+        "added_ts": r[8] or 0, "upload_ts": r[8] or 0,
     } for r in rows]

@@ -31,15 +31,23 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // "Last Full Sync: XX min ago" label, refreshed every 60s.
   function initLastSyncTicker() {
     const el = document.getElementById("last-full-sync");
     if (!el) return;
     const tick = async () => {
-      const api = window.pywebview?.api;
-      if (!api?.get_last_sync_label) return false;
+      if (!nativeBridgeUp()) return false;
       try {
-        const r = await api.get_last_sync_label();
+        const r = await bridgeCall("get_last_sync_label");
         if (r?.label) el.textContent = r.label;
         return true;
       } catch (e) { /* ignore */ return false; }
@@ -80,7 +88,7 @@
       clearTimeout(saveTimer);
       saveTimer = setTimeout(() => {
         const h = top.getBoundingClientRect().height;
-        window.pywebview?.api?.window_state_save?.({ splitter_top_px: Math.round(h) });
+        if (nativeBridgeUp()) bridgeCall("window_state_save", { splitter_top_px: Math.round(h) });
       }, 400);
     });
     obs.observe(top);
@@ -92,7 +100,7 @@
     });
     // Apply saved height on load. Guard the .then chain in case the
     // backend returns undefined (audit: smallInits.js H143).
-    const _p = window.pywebview?.api?.window_state_load?.();
+    const _p = nativeBridgeUp() ? bridgeCall("window_state_load") : undefined;
     if (_p && typeof _p.then === "function") {
       _p.then((st) => {
         if (st?.splitter_top_px && top) top.style.flex = `0 0 ${st.splitter_top_px}px`;
@@ -146,6 +154,16 @@
       syncClear();
       input.focus();
     });
+    // Expose a clear so switching back to the Subs tab starts fresh
+    // (matches Browse, which clears its filter on view-enter). Previously
+    // the Subs filter text persisted across tab switches, so re-typing
+    // doubled it (e.g. "NemeanNemean").
+    window._clearSubsFilter = () => {
+      if (!input.value) return;
+      input.value = "";
+      window._applySubsFilter?.("");
+      syncClear();
+    };
     syncClear();
   }
 

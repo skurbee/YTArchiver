@@ -12,23 +12,30 @@
   const askChoice = window.askChoice;
   const askTextInput = window.askTextInput;
   const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
+  // Capture like browseSearch.js does — bare _formatTs is a strict-mode
+  // ReferenceError that blanked the whole Bookmarks list as soon as a
+  // timed bookmark rendered.
+  const _formatTs = (sec) =>
+    (window._formatTs ? window._formatTs(sec) : String(sec));
   function bridgeCall(method, ...args) {
     const fn = window.YT?.bridge?.bridgeCall;
     if (fn) return fn(method, ...args);
     return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
   }
 
   // ─── Browse > Bookmarks sub-mode ─────────────────────────────────────
   async function refreshBookmarks() {
     const list = document.getElementById("bookmarks-list");
     if (!list) return;
-    const api = window.pywebview?.api;
-    if (!api?.bookmark_list) return;
+    if (!nativeBridgeUp()) return;
     try {
       // bookmark_list() now returns {ok: bool, rows: [...]} to match
       // the other bookmark_* methods' shape. Back-compat: if an older
       // build returns the raw array, fall back gracefully.
-      const res = await api.bookmark_list();
+      const res = await bridgeCall("bookmark_list");
       const rows = Array.isArray(res) ? res : (res?.rows || []);
       if (!rows || rows.length === 0) {
         list.innerHTML = '<div class="browse-empty">No bookmarks yet. Right-click a transcript segment in Watch view to add one.</div>';
@@ -62,15 +69,19 @@
         }
         row.querySelector("[data-remove]").addEventListener("click", async (e) => {
           e.stopPropagation();
+          // Whole-video bookmarks have no segment text; fall back to the
+          // title (like the row above) so the confirm shows the video name
+          // instead of empty quotes.
+          const _bmLabel = (b.text && b.text.trim()) ? b.text : (b.title || "(untitled)");
           const ok = await askDanger("Delete bookmark",
-            `Remove this bookmark?\n\n"${b.text?.slice(0, 100) || ''}"`, "Delete");
+            `Remove this bookmark?\n\n"${_bmLabel.slice(0, 100)}"`, "Delete");
           if (!ok) return;
           // audit SV-10: gate the success toast on the backend's
           // `{ok}` flag instead of firing it unconditionally. A
           // double-click would fire two "Bookmark removed" toasts
           // even though only the first actually deletes anything.
           try {
-            const res = await api.bookmark_remove(b.id);
+            const res = await bridgeCall("bookmark_remove", b.id);
             if (res && res.ok === false) {
               window._showToast?.(
                 res.error || "Couldn't delete (already gone?).", "warn");
@@ -97,12 +108,12 @@
           const title = b.title || "";
           // Resolve the actual video file via the title+channel index.
           // Tries (video_id → title → fuzzy) and opens Watch view.
-          if (!api?.recent_resolve) {
+          if (!nativeBridgeUp()) {
             window._showToast?.("Native mode required.", "warn");
             return;
           }
           try {
-            const r = await api.recent_resolve(title, b.channel || "");
+            const r = await bridgeCall("recent_resolve", title, b.channel || "");
             if (r?.ok && r.filepath) {
               const videoObj = {
                 filepath: r.filepath,
@@ -159,10 +170,9 @@
       (a.folder || "").localeCompare(b.folder || "", undefined, { sensitivity: "base" })
     );
     let enriched = basic;
-    const api = window.pywebview?.api;
-    if (api?.browse_list_channels) {
+    if (nativeBridgeUp()) {
       try {
-        const rich = await api.browse_list_channels();
+        const rich = await bridgeCall("browse_list_channels");
         if (Array.isArray(rich) && rich.length) enriched = rich;
       } catch { /* fall through to basic */ }
     }
@@ -179,10 +189,9 @@
   async function _refreshBrowseWeekSummary() {
     const bar = document.getElementById("browse-summary-bar");
     if (!bar) return;
-    const api = window.pywebview?.api;
-    if (!api?.browse_week_summary) return;
+    if (!nativeBridgeUp()) return;
     try {
-      const res = await api.browse_week_summary(7);
+      const res = await bridgeCall("browse_week_summary", 7);
       if (!res?.ok) return;
       const nv = res.new_videos || 0;
       const nc = res.new_channels || 0;
@@ -203,8 +212,7 @@
   window._refreshBrowseWeekSummary = _refreshBrowseWeekSummary;
 
   async function _askRedownload(channelName, resolution) {
-    const api = window.pywebview?.api;
-    if (!api?.chan_redownload) {
+    if (!nativeBridgeUp()) {
       window._showToast?.("Native mode required.", "warn");
       return;
     }
@@ -216,7 +224,7 @@
       "Progress is saved \u2014 you can cancel and resume later.",
       "Start redownload");
     if (!ok) return;
-    const res = await api.chan_redownload(channelName, resolution);
+    const res = await bridgeCall("chan_redownload", channelName, resolution);
     if (res?.ok) {
       window._showToast?.(`Redownload started (${label}).`, "ok");
     } else {

@@ -23,6 +23,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
       const tag = e.target.tagName;
@@ -49,7 +59,7 @@
       // Ctrl+Q: quit (close window via tray-quit path)
       if ((e.ctrlKey || e.metaKey) && e.key === "q") {
         e.preventDefault();
-        if (window.pywebview?.api?.window_quit) window.pywebview.api.window_quit();
+        if (nativeBridgeUp()) bridgeCall("window_quit");
         return;
       }
       // Ctrl+F: focus Browse > Search input. If Search view isn't
@@ -81,9 +91,8 @@
       // F11: fullscreen toggle (native via pywebview, HTML5 in browser preview)
       if (e.key === "F11") {
         e.preventDefault();
-        const api = window.pywebview?.api;
-        if (api?.window_toggle_fullscreen) {
-          api.window_toggle_fullscreen();
+        if (nativeBridgeUp()) {
+          bridgeCall("window_toggle_fullscreen");
         } else if (document.fullscreenElement) {
           document.exitFullscreen?.();
         } else {

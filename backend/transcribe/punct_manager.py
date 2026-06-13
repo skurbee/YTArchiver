@@ -32,10 +32,10 @@ _startupinfo = _make_startupinfo()
 # OOMs low-VRAM GPUs. Reuse one instance across both the live
 # transcribe worker AND the Restore-Punctuation pass (audit: H44).
 _singleton_lock = threading.Lock()
-_singleton: "PunctuationManager | None" = None
+_singleton: PunctuationManager | None = None
 
 
-def get_shared_punct_manager(stream: LogStreamer) -> "PunctuationManager":
+def get_shared_punct_manager(stream: LogStreamer) -> PunctuationManager:
     """Return the process-singleton PunctuationManager, constructing
     it on first call. Subsequent callers see the same instance even
     if they pass a different `stream` — the stream from the first

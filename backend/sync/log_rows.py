@@ -3,7 +3,7 @@ sync.log_rows — activity-log row emitters and pass-id state.
 
 Patch 18 phase 4 (v69.4): extracted from backend/sync/legacy.py.
 
-Public surface (re-imported into legacy.py):
+Public surface (re-exported via the sync package):
     _bracket_segments(label, ...)
         Build `[label]` log segments with the bracket/label tag split.
     _new_pass_id()
@@ -29,8 +29,8 @@ Module-level state owned here:
     _HIST_INDEX_BY_ROW_ID + _HIST_INDEX_LOCK
     _RECENT_DWNLD_ROWS + _RECENT_DWNLD_LOCK
 
-`_fmt_duration` (used by the [Metdta]/[Dwnld] emitters) stays in
-legacy.py for now — accessed via the proxy below.
+`_fmt_duration` (used by the [Metdta]/[Dwnld] emitters) lives in
+sync/core.py — accessed via the proxy below.
 """
 from __future__ import annotations
 

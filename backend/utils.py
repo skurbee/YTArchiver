@@ -480,11 +480,13 @@ def unhide_file_win(path) -> None:
 # files" off: the videos themselves + the conjoined `… Transcript.txt`.
 # Everything else (.info.json, .description, stray thumbnails, .jsonl
 # sidecars, .last_attempt state, etc.) gets the Windows HIDDEN attribute.
-# Keep the media set aligned with archive_scan._CHANNEL_VIDEO_EXTS.
-_VISIBLE_MEDIA_EXTS = (
-    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
-    ".mp3", ".m4a", ".flac", ".wav", ".opus", ".ogg",
-)
+# Derived from the single source of truth (fs_search.MEDIA_EXTS_TUPLE).
+# The old hand-copied tuple omitted .flv/.wmv, so the hide sweeps set
+# the HIDDEN attribute on real video files — and nothing ever unhides
+# media, so they vanished from Explorer permanently.
+from .fs_search import MEDIA_EXTS_TUPLE as _FS_MEDIA_EXTS
+
+_VISIBLE_MEDIA_EXTS = tuple(_FS_MEDIA_EXTS)
 
 
 def _archive_file_should_be_visible(name: str) -> bool:
@@ -595,6 +597,89 @@ def hide_stray_sidecars(folder, recursive=True, cancel_event=None) -> int:
 
 
 # ── Video sidecar cleanup ──────────────────────────────────────────────
+
+def is_within_managed_roots(path: str) -> bool:
+    """True if `path` resolves to a location under one of the archive roots
+    this app manages: the global output_dir, any per-channel output_dir, and
+    the tp_archive_roots (index-only roots). Used to gate destructive
+    os.remove calls that originate from the JS bridge (the trust boundary),
+    so a crafted/compromised filepath can't drive a delete outside the
+    archive. Fail-closed: returns False when no roots are configured or the
+    path can't be resolved. realpath is used on both sides so a symlink
+    can't tunnel out of an allowed root.
+    """
+    try:
+        from .ytarchiver_config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        return False
+    roots: list[str] = []
+    _g = (cfg.get("output_dir") or "").strip()
+    if _g:
+        roots.append(_g)
+    # (Channels don't store their own output_dir — their folders nest under
+    # the global output_dir added above, so no per-channel root is needed.)
+    for _r in (cfg.get("tp_archive_roots") or []):
+        if _r:
+            roots.append(str(_r))
+    if not roots:
+        return False
+    try:
+        target = os.path.normcase(os.path.realpath(path)).rstrip("/\\")
+    except (ValueError, OSError):
+        return False
+    if not target:
+        return False
+    for _root in roots:
+        try:
+            nr = os.path.normcase(os.path.realpath(_root)).rstrip("/\\")
+        except (ValueError, OSError):
+            continue
+        if not nr:
+            continue
+        if target == nr or target.startswith((nr + os.sep, nr + "/")):
+            return True
+    return False
+
+
+def sampled_files_equal(path_a: str, path_b: str, sample: int = 1 << 20) -> bool:
+    """Best-effort 'are these the same file' check: equal size + up to three
+    1MB content windows (head, mid, tail). Used before treating one file as a
+    duplicate of another and deleting/replacing the source. CONSERVATIVE — any
+    read error or size mismatch returns False (not equal), so a caller never
+    deletes on uncertainty. Three windows (vs head+tail only) guard the rare
+    'same size, identical head+tail, different middle' collision. Single source
+    of truth shared by redownload (replace) and reorg (dedup-delete) so the
+    delete path isn't weaker than the replace path (audit: sampled_files_equal).
+    """
+    try:
+        sz = os.path.getsize(path_a)
+        if sz != os.path.getsize(path_b):
+            return False
+    except OSError:
+        return False
+    try:
+        with open(path_a, "rb") as _a, open(path_b, "rb") as _b:
+            if _a.read(sample) != _b.read(sample):
+                return False
+            if sz > sample * 3:
+                _mid = sz // 2 - sample // 2
+                _a.seek(_mid); _b.seek(_mid)
+                if _a.read(sample) != _b.read(sample):
+                    return False
+                _tail = sz - sample
+                _a.seek(_tail); _b.seek(_tail)
+                if _a.read(sample) != _b.read(sample):
+                    return False
+            elif sz > sample * 2:
+                _tail = sz - sample
+                _a.seek(_tail); _b.seek(_tail)
+                if _a.read(sample) != _b.read(sample):
+                    return False
+    except OSError:
+        return False
+    return True
+
 
 def delete_video_sidecars(filepath: str) -> None:
     """Best-effort cleanup of sidecar files next to a video.

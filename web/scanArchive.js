@@ -17,12 +17,14 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Scan archive button (Browse tab toolbar) ───────────────────────
   function initScanArchive() {
     document.getElementById("btn-scan-archive")?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.archive_rescan) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -38,7 +40,7 @@
             "Rescan")
         : Promise.resolve(true));
       if (!ok) return;
-      await api.archive_rescan();
+      await bridgeCall("archive_rescan");
       window._showToast?.("Archive rescan started \u2014 check the log.", "ok");
     });
   }

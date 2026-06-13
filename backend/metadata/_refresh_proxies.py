@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 
-
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 _ID_RE_11 = re.compile(r"^[A-Za-z0-9_-]{11}$")
 

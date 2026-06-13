@@ -22,6 +22,15 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const escapeHtml = window._escapeHtml || ((s) => String(s ?? ""));
 
   /** Legacy tree renderer — no-op since Browse switched to the channel
@@ -325,8 +334,8 @@
       e.preventDefault();
       e.stopPropagation();
       if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
-      if (v.filepath && window.pywebview?.api?.browse_open_video) {
-        window.pywebview.api.browse_open_video(v.filepath);
+      if (v.filepath && nativeBridgeUp()) {
+        bridgeCall("browse_open_video", v.filepath);
       }
     });
     return card;

@@ -27,6 +27,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── About dialog ────────────────────────────────────────────────────
   function initAboutDialog() {
@@ -37,13 +40,12 @@
     if (!bd) return;
     const show = async () => {
       bd.style.display = "flex";
-      const api = window.pywebview?.api;
-      if (!api?.about_info) {
+      if (!nativeBridgeUp()) {
         body.textContent = "Native mode only.";
         return;
       }
       try {
-        const info = await api.about_info();
+        const info = await bridgeCall("about_info");
         // UI audit fix: parent .askq-body sets `white-space: pre-wrap`
         // (so plain text askQuestion messages render with line breaks).
         // For this rich HTML About content that creates double-spacing

@@ -17,13 +17,15 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Missing-folder reconcile flow ──────────────────────────────────
   async function _reconcileMissingFolders() {
-    const api = window.pywebview?.api;
-    if (!api?.check_channel_folders) return;
+    if (!nativeBridgeUp()) return;
     let res;
-    try { res = await api.check_channel_folders(); } catch { return; }
+    try { res = await bridgeCall("check_channel_folders"); } catch { return; }
     const missing = (res && res.missing) || [];
     if (!missing.length) return;
     for (const ch of missing) {
@@ -47,9 +49,9 @@
         ],
       });
       if (choice === "locate") {
-        const pick = await api.subs_browse_for_channel_folder?.(ch.name);
+        const pick = await bridgeCall("subs_browse_for_channel_folder", ch.name);
         if (pick?.ok && pick.folder_name) {
-          const r = await api.subs_relocate_channel?.(
+          const r = await bridgeCall("subs_relocate_channel",
             { name: ch.name, url: ch.url }, pick.folder_name);
           if (r?.ok) {
             window._showToast?.(
@@ -61,7 +63,7 @@
           window._showToast?.(pick.error || "Invalid folder.", "error");
         }
       } else if (choice === "remove") {
-        await api.subs_remove_channel?.({ name: ch.name, url: ch.url });
+        await bridgeCall("subs_remove_channel", { name: ch.name, url: ch.url });
         window._showToast?.(`Removed "${ch.name}" from subs.`, "warn");
       }
       // skip / cancel — leave as-is

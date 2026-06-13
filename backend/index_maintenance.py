@@ -25,11 +25,7 @@ Connection + lock primitives come from index.py via `_idx`.
 from __future__ import annotations
 
 import os
-import re
 import sqlite3
-import threading
-import time
-from pathlib import Path
 from typing import Any
 
 from . import index as _idx
@@ -90,8 +86,7 @@ def sweep_new_videos(output_dir: str, channels: list,
     if sweep_conn is None:
         return {"registered": 0, "ingested": 0}
 
-    _VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
-                   ".wav", ".mp3", ".m4a", ".flac")
+    from .fs_search import MEDIA_EXTS_TUPLE as _VIDEO_EXTS  # unified media set
     registered = 0
     ingested = 0
     id_backfilled = 0
@@ -331,10 +326,27 @@ def sweep_new_videos(output_dir: str, channels: list,
                     and "size_bytes" in existing_row):
                 existing_row["sweep_fingerprint"] = current_fp
 
-    # Persist the updated fingerprint cache.
+    # Persist the updated fingerprints by MERGING into a FRESH load —
+    # never by saving our start-of-sweep snapshot. The sweep walks for
+    # minutes while sync's update_disk_cache_for_channel and
+    # invalidate-rescans write per-channel stats; saving the stale
+    # snapshot clobbered every one of those updates (the recurring
+    # issue-#134 stale-stats class).
     if skipped_unchanged < total_ch:
         try:
-            _save_dc(_fp_cache)
+            from .archive_scan import _CACHE_LOCK as _dc_lock
+            with _dc_lock:
+                _fresh = _load_dc()
+                for _url, _row in _fp_cache.items():
+                    if not isinstance(_row, dict) \
+                            or "sweep_fingerprint" not in _row:
+                        continue
+                    _fr = _fresh.get(_url)
+                    if isinstance(_fr, dict):
+                        _fr["sweep_fingerprint"] = _row["sweep_fingerprint"]
+                    else:
+                        _fresh[_url] = _row
+                _save_dc(_fresh)
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -388,22 +400,39 @@ def prune_missing_videos() -> dict[str, int]:
             # next metadata recheck will title-resolve it properly
             # instead of treating 13 different files as duplicates of
             # one fake id.
+            # REWRITTEN (audit DATA-high): the old isalpha() heuristic
+            # nulled EVERY all-alphabetic 11-char id — but ~10% of
+            # genuine YouTube ids are purely alphabetic ((52/64)^11),
+            # so each Rescan destroyed the ids of tens of thousands of
+            # correctly-identified videos, the next metadata pass
+            # slowly re-resolved them, and the next Rescan nulled them
+            # again — a permanent churn loop degrading search joins,
+            # dup detection, and thumbnail association. Worse, the
+            # heuristic missed its own motivating case ([a-user-channel]
+            # contains hyphens, which isalpha() rejects). Now we null
+            # only on POSITIVE evidence of the parse error: the "id"
+            # equals the row's channel name (modulo spaces/-/_). No
+            # evidence → leave the id alone.
             fake_rows = conn.execute(
                 "SELECT id, channel, video_id FROM videos "
                 "WHERE video_id IS NOT NULL AND video_id != '' "
                 "AND length(video_id) = 11").fetchall()
-            fake_ids_to_null = [
-                rid for rid, _ch, _v in fake_rows if _v and _v.isalpha()
-            ]
-            if fake_ids_to_null:
-                for rid, _ch, _v in fake_rows:
-                    if _v and _v.isalpha():
-                        conn.execute(
-                            "UPDATE videos SET video_id=NULL, "
-                            "video_url=NULL WHERE id=?", (rid,))
-                        n_fake_id += 1
-                        if _ch:
-                            affected_channels.add(_ch)
+            for rid, _ch, _v, in fake_rows:
+                if not _v:
+                    continue
+                _vl = _v.lower()
+                _chl = (_ch or "").strip().lower()
+                if _chl and _vl in (
+                        _chl,
+                        _chl.replace(" ", ""),
+                        _chl.replace(" ", "-"),
+                        _chl.replace(" ", "_")):
+                    conn.execute(
+                        "UPDATE videos SET video_id=NULL, "
+                        "video_url=NULL WHERE id=?", (rid,))
+                    n_fake_id += 1
+                    if _ch:
+                        affected_channels.add(_ch)
             # Category 1 + 2: missing files and 0-byte files.
             rows = conn.execute(
                 "SELECT filepath FROM videos").fetchall()

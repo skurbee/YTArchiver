@@ -12,6 +12,14 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+  // Local escaper for the error path below. This IIFE never imported one,
+  // so `escapeHtml(...)` in the catch branch threw ReferenceError and the
+  // error UI silently broke. Bind the canonical helper with a hard fallback.
+  const escapeHtml = window.YT?.util?.escapeHtml || window._escapeHtml
+    || (s => String(s ?? ""));
 
   // ─── Diagnostics dialog ──────────────────────────────────────────────
   function initDiagnosticsDialog() {
@@ -30,13 +38,12 @@
       if (!rowsEl) return;
       rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Running self-check\u2026</div>';
       if (summaryEl) summaryEl.textContent = "";
-      const api = window.pywebview?.api;
-      if (!api?.diagnostics_run) {
+      if (!nativeBridgeUp()) {
         rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Native mode required.</div>';
         return;
       }
       try {
-        const res = await api.diagnostics_run();
+        const res = await bridgeCall("diagnostics_run");
         if (!res?.ok || !Array.isArray(res.rows)) {
           rowsEl.innerHTML = '<div class="browse-empty" style="padding:16px;">Self-check failed.</div>';
           return;

@@ -14,6 +14,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const modal = () => document.getElementById("redwnl-sample-modal");
   const sub = () => document.getElementById("redwnl-sample-sub");
   const stats = () => document.getElementById("redwnl-sample-stats");
@@ -50,9 +60,8 @@
     stopTick();
     const m = modal();
     if (m) m.hidden = true;
-    const api = window.pywebview?.api;
-    if (!api?.redownload_sample_confirm) return;
-    try { api.redownload_sample_confirm(choice); }
+    if (!nativeBridgeUp()) return;
+    try { bridgeCall("redownload_sample_confirm", choice); }
     catch (e) { console.error("redownload_sample_confirm failed:", e); }
   }
 

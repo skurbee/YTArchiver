@@ -31,6 +31,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   /** Retranscribe completion hook — called by Python via evaluate_js
    * when a `transcribe_retranscribe` job finishes. If the completed
    * video is the one currently on screen, refetch the transcript and
@@ -62,9 +72,8 @@
                  || (filepath && cur.filepath &&
                      _norm(filepath) === _norm(cur.filepath));
       if (!match) return;
-      const api = window.pywebview?.api;
-      if (!api?.browse_get_transcript) return;
-      const res = await api.browse_get_transcript({
+      if (!nativeBridgeUp()) return;
+      const res = await bridgeCall("browse_get_transcript", {
         video_id: cur.video_id || undefined,
         title: cur.title || "",
       });
@@ -82,11 +91,20 @@
       // retranscribe worked fine. Now explicitly replace with a
       // placeholder and show a warn toast so the failure is visible.
       if (!segments.length) {
+        // Carry tx_status so renderWatchView shows the right empty message.
+        if (res && !Array.isArray(res) && res.tx_status) {
+          cur.tx_status = res.tx_status;
+        }
         window.renderWatchView(cur, [], sourceInfo,
                                { skipVideoReload: true });
-        window._showToast?.(
-          "Re-transcription finished but produced no segments — check the log.",
-          "warn");
+        if (cur.tx_status === "no_speech") {
+          // Benign: Whisper ran and the video genuinely has no speech.
+          window._showToast?.("No speech detected — nothing to transcribe.", "ok");
+        } else {
+          window._showToast?.(
+            "Re-transcription finished but produced no segments — check the log.",
+            "warn");
+        }
         return;
       }
       const transcript = segments.map(seg => ({
@@ -161,7 +179,14 @@
 
     tr.innerHTML = "";
     if (!transcript || transcript.length === 0) {
-      tr.innerHTML = '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
+      // Distinguish a genuinely-silent video (Whisper ran, found no speech)
+      // from one that just hasn't been transcribed yet — both have zero
+      // segments. browse_get_transcript returns tx_status; callers stash it
+      // on `video`. 'no_speech' → say so plainly instead of the generic line.
+      const _noSpeech = !!(video && video.tx_status === "no_speech");
+      tr.innerHTML = _noSpeech
+        ? '<div style="color: var(--c-dim); font-style: italic;">No speech detected — this video has no spoken audio to transcribe.</div>'
+        : '<div style="color: var(--c-dim); font-style: italic;">No transcript available.</div>';
       _unbindKaraoke(vEl);
       // Hide the on-video overlay so a stale phrase doesn't linger over
       // the still-playing video after a failed retranscribe.
@@ -390,14 +415,13 @@
     if (commentsEl) commentsEl.innerHTML = "";
     if (countEl) countEl.textContent = "";
 
-    const api = window.pywebview?.api;
-    if (!api?.browse_get_video_metadata) {
+    if (!nativeBridgeUp()) {
       if (descEl) descEl.textContent = "(Metadata unavailable in browser-preview mode)";
       return;
     }
     let res;
     try {
-      res = await api.browse_get_video_metadata({
+      res = await bridgeCall("browse_get_video_metadata", {
         filepath: video.filepath || "",
         video_id: video.video_id || "",
         title: video.title || "",
@@ -585,7 +609,6 @@
   async function _loadVideoSource(video, vEl, ph) {
     if (!vEl) return;
     const fp = video.filepath || "";
-    const api = window.pywebview?.api;
     // Race-token check: capture _watchOpenToken at entry so we can
     // detect "user navigated away during URL fetch". Before this fix,
     // a video would start playback in the background after the user
@@ -614,9 +637,9 @@
     }
     let url = null;
     let errorDetail = "";
-    if (fp && api?.browse_video_url) {
+    if (fp && nativeBridgeUp()) {
       try {
-        const r = await api.browse_video_url(fp);
+        const r = await bridgeCall("browse_video_url", fp);
         if (r?.ok && r.url) url = r.url;
         else if (r && !r.ok) errorDetail = r.error || "unknown error";
       } catch (e) { errorDetail = String(e); }
@@ -705,12 +728,15 @@
         ph.style.display = "";
         if (errorDetail && errorDetail !== "unknown error") {
           const label = ph.querySelector(".placeholder-label") || ph;
-          // Escape minimally for safety since `fp` could contain
-          // anything; we only show the last path segment.
-          const leaf = fp ? fp.split(/[\\/]/).pop() : "";
+          // Escape both values before innerHTML. `fp`'s leaf is derived from
+          // the YouTube title at download time and `errorDetail` is a backend
+          // string — neither is trusted markup. (The comment used to promise
+          // escaping that wasn't actually applied.)
+          const _esc = window._escapeHtml || (s => String(s ?? ""));
+          const leaf = fp ? _esc(fp.split(/[\\/]/).pop()) : "";
           label.innerHTML =
             `<div style="font-size:13px;color:var(--c-log-red);margin-bottom:4px;">` +
-            `⚠ ${errorDetail}</div>` +
+            `⚠ ${_esc(errorDetail)}</div>` +
             (leaf
               ? `<div style="font-size:11px;color:var(--c-dim);">${leaf}</div>`
               : "") +
@@ -895,168 +921,6 @@
       else break;
     }
     return best;
-  }
-
-  // ─── Video overlay captions (karaoke word-by-word) ─────────────────
-  //
-  // DEPRECATED / UNUSED as of the pinned-overlay change: the on-video
-  // overlay is now a DOM overlay (see _ensureCapOverlay / _updateCapOverlay
-  // further down) so the highlighted word can stay pinned to centre. The
-  // native-cue helpers below (_ensureCapTrack, _flattenWords,
-  // _flattenSegments, _setCueTrackFromTranscript, _vttEscape) are no longer
-  // called and can be deleted in a cleanup pass.
-  //
-  // Uses the native TextTrack API + VTTCues so the browser draws the
-  // caption itself. Benefits over a custom DOM overlay:
-  //   • Fullscreen "just works" — native <video> fullscreen shows the
-  //     cue track, an absolute-positioned sibling div would not.
-  //   • Styling via `video::cue` with attribute selectors lets us
-  //     swap size/background by flipping data-cap-* attributes on the
-  //     <video> element — no per-cue restyle, no track rebuild.
-  //
-  // One TextTrack per video element, recycled across video changes:
-  //   tracks created via addTextTrack can't be detached, so we stash
-  //   the ref on the element and clear cues on each new transcript.
-  function _ensureCapTrack(vEl) {
-    if (!vEl) return null;
-    if (vEl._capTrack) return vEl._capTrack;
-    let t;
-    try {
-      t = vEl.addTextTrack("captions", "Overlay transcript", "en");
-    } catch { return null; }
-    vEl._capTrack = t;
-    // Default to hidden until prefs apply (avoids a flash of unstyled
-    // cues on first load when the user has the feature off).
-    t.mode = "hidden";
-    return t;
-  }
-
-  // Build the flat per-word array once so we can rebuild cues without
-  // re-walking the nested transcript structure on every mode flip.
-  function _flattenWords(transcript) {
-    const out = [];
-    if (!Array.isArray(transcript)) return out;
-    for (const seg of transcript) {
-      const words = (Array.isArray(seg.words) && seg.words.length)
-        ? seg.words
-        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
-      if (words) {
-        for (const w of words) {
-          const s = Number(w.s);
-          const e = Number(w.e);
-          const text = (w.w || "").trim();
-          if (!text) continue;
-          if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
-          if (e <= s) continue;
-          out.push({ s, e, text });
-        }
-      }
-    }
-    return out;
-  }
-
-  // Stash the segment-level fallback list (no per-word timing — entire
-  // segment is the unit). Used when phrase3 mode is unsupported for the
-  // transcript (we just emit per-segment cues like before).
-  function _flattenSegments(transcript) {
-    const out = [];
-    if (!Array.isArray(transcript)) return out;
-    for (const seg of transcript) {
-      const words = (Array.isArray(seg.words) && seg.words.length)
-        ? seg.words
-        : (Array.isArray(seg.w) && seg.w.length ? seg.w : null);
-      if (words) continue;
-      const s = Number(seg.s);
-      const e = Number(seg.e);
-      const text = (seg.t || seg.text || "").trim();
-      if (!text || !Number.isFinite(s) || !Number.isFinite(e) || e <= s) continue;
-      out.push({ s, e, text });
-    }
-    return out;
-  }
-
-  function _setCueTrackFromTranscript(vEl, transcript) {
-    const t = _ensureCapTrack(vEl);
-    if (!t) return;
-    // Clear prior cues. The old `break` on removeCue throw left the
-    // loop early at the first failure, stranding remaining cues from
-    // the previous video — they then bled into the next video's
-    // captions (visible as stale phrases overlaying unrelated
-    // footage). With continue-on-throw + a bounded retry counter
-    // we drain everything we can, accepting that some genuinely
-    // un-removable cues stay (extremely rare, and at worst hidden
-    // behind the new cues' time ranges).
-    if (t.cues) {
-      // Scale the attempt cap to the actual cue count so long
-      // transcripts (3hr+ videos = 30k+ cues) don't leave stale
-      // cues from the previous video (audit: watchView H152/H178).
-      // 2x current length is plenty since each iteration removes
-      // either head or tail.
-      const _cap = Math.max(5000, t.cues.length * 2);
-      let _attempts = 0;
-      while (t.cues.length && _attempts < _cap) {
-        _attempts++;
-        try {
-          t.removeCue(t.cues[0]);
-        } catch {
-          // Skip this cue; try removing from the end instead so we
-          // don't get stuck on cue[0] forever.
-          try {
-            t.removeCue(t.cues[t.cues.length - 1]);
-          } catch {
-            break;
-          }
-        }
-      }
-    }
-    if (!Array.isArray(transcript)) return;
-    const Cue = window.VTTCue || window.TextTrackCue;
-    if (!Cue) return;
-    // Stash so a later setCaptionPref("mode", …) can rebuild without
-    // walking the transcript pane again.
-    vEl._capTranscript = transcript;
-    const words = _flattenWords(transcript);
-    const segs = _flattenSegments(transcript);
-    const mode = (window._captionPrefs && window._captionPrefs.mode) || "single";
-    // Word-level path: per-word cues. In phrase3 mode each cue text
-    // becomes "<c.dim>prev</c.dim> current <c.dim>next</c.dim>" so the
-    // browser renders previous/next dimmed via the ::cue(.dim) rule.
-    // VTT class spans (`<c.classname>…</c>`) are the standard way to
-    // get per-span styling inside a single cue.
-    if (words.length) {
-      for (let i = 0; i < words.length; i++) {
-        const w = words[i];
-        let text;
-        if (mode === "phrase3") {
-          const prev = words[i - 1]?.text || "";
-          const next = words[i + 1]?.text || "";
-          const parts = [];
-          if (prev) parts.push(`<c.dim>${_vttEscape(prev)}</c>`);
-          parts.push(_vttEscape(w.text));
-          if (next) parts.push(`<c.dim>${_vttEscape(next)}</c>`);
-          text = parts.join(" ");
-        } else {
-          text = w.text;
-        }
-        try { t.addCue(new Cue(w.s, w.e, text)); } catch {}
-      }
-    }
-    // Segment-level fallback for transcripts without per-word timing
-    // (e.g. unpunctuated YT captions where each "segment" is the whole
-    // displayed line). One cue per segment — no phrase3 styling
-    // available here since there's no word boundary.
-    for (const seg of segs) {
-      try { t.addCue(new Cue(seg.s, seg.e, seg.text)); } catch {}
-    }
-  }
-
-  // VTT-class spans treat "&", "<", ">" specially; escape so weird
-  // transcript text can't break the cue.
-  function _vttEscape(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
   }
 
   // ─── Pinned on-video overlay (replaces the native ::cue overlay) ───

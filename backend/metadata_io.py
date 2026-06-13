@@ -23,7 +23,7 @@ import json
 import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -161,7 +161,7 @@ def _year_month_from_path(file_path: str) -> tuple[int | None, int | None]:
     # Flat / unparseable — fall back to the file's UTC mtime (yt-dlp
     # --mtime is UTC; the rest of the metadata bucketing reads UTC too).
     try:
-        mt = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
+        mt = datetime.fromtimestamp(os.path.getmtime(file_path), tz=UTC)
         return mt.year, mt.month
     except OSError:
         return None, None
@@ -232,11 +232,11 @@ def _read_metadata_jsonl(jsonl_path: str) -> dict[str, dict[str, Any]]:
 # read+merge+write critical section) and the inner _write_metadata_jsonl
 # can still re-acquire it on the same thread without deadlocking
 # (audit: refresh_views.py C15).
-_write_locks: dict[str, "threading.RLock"] = {}
+_write_locks: dict[str, threading.RLock] = {}
 _write_locks_global = threading.Lock()
 
 
-def _lock_for(path: str) -> "threading.RLock":
+def _lock_for(path: str) -> threading.RLock:
     key = os.path.normcase(os.path.abspath(path))
     with _write_locks_global:
         lk = _write_locks.get(key)

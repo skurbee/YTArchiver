@@ -25,6 +25,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const escapeHtml = window._escapeHtml || ((s) => String(s ?? ""));
   const escapeAttr = escapeHtml;
 
@@ -239,9 +249,9 @@
         // Switch to Browse tab + Watch view (call the helper in app.js).
         if (typeof window._openVideoInWatch === "function") {
           window._openVideoInWatch(v);
-        } else if (v.filepath && window.pywebview?.api?.browse_open_video) {
+        } else if (v.filepath && nativeBridgeUp()) {
           // Fallback — external player
-          window.pywebview.api.browse_open_video(v.filepath);
+          bridgeCall("browse_open_video", v.filepath);
         }
       });
       frag.appendChild(tr);
@@ -333,8 +343,8 @@
       const onClick = (vv) => {
         if (typeof window._openVideoInWatch === "function") {
           window._openVideoInWatch(vv);
-        } else if (vv.filepath && window.pywebview?.api?.browse_open_video) {
-          window.pywebview.api.browse_open_video(vv.filepath);
+        } else if (vv.filepath && nativeBridgeUp()) {
+          bridgeCall("browse_open_video", vv.filepath);
         }
       };
       const card = build(v, onClick);

@@ -6,6 +6,42 @@ internally we still use a per-push single-decimal counter (`vX.Y`)
 rather than full SemVer. Each version below describes what changed
 since the previous one.
 
+## v78.6 — 2026-06-13
+
+### Fixed
+- **Search → Watch now shows the transcript.** Opening a video from a search
+  result could land on a "No transcript available" Watch pane even though the
+  transcript was clearly in the index (and rendered fine in the result
+  preview). The Watch loader now resolves the transcript the way the search and
+  bookmark paths do, including a fallback for older entries whose segments
+  aren't keyed by video id.
+- **Word-frequency graph: the month axis no longer shows "YYYY-00".** Segments
+  with no month (videos filed by year only) produced an invalid `2024-00` tick
+  label; those buckets now show the year alone.
+- **Graph: clicking a point drills into search again.** The "Click a point to
+  drill into search" action targeted a stale element and silently did nothing;
+  it now switches to Search, pre-fills the word, and constrains the year to the
+  clicked bucket.
+- **Add channel: the folder name fills correctly when typing a URL.** Typing
+  (rather than pasting) a channel URL left the auto-derived folder name stuck on
+  the first character. It now keeps deriving the full handle as you type, until
+  you edit the name yourself.
+- **Transcribed % no longer rounds up to 100%.** A channel at 99.6% displayed
+  "(100%)"; it now floors so an incomplete channel never reads as done.
+
+### Added / Improved
+- **The graph re-plots when you change the chart type, channel, or word**
+  instead of leaving a stale chart until you press Plot; Enter in the word field
+  now plots.
+- **Word-cloud mode** now makes clear the word field is ignored.
+- **"Remove channel" is disabled during an active sync or processing**, with a
+  tooltip explaining why, so a removal can't race a running job.
+- **Metadata table:** the per-channel "Views" / "Comments" columns are
+  relabeled "Views refreshed" / "Comments refreshed" so it's clear they show the
+  last-refresh time, not a count.
+- **The "add channels in the Subs tab" hint is fully clickable**, not just its
+  button.
+
 ## v78.1 — 2026-06-07
 
 ### Fixed

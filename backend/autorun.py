@@ -256,7 +256,26 @@ class AutorunScheduler:
                 self._waiting_for_sync_done = True
                 self._next_fire_ts = None
                 self._timer = None
-            self._sync_trigger()
+            _ret = self._sync_trigger()
+            # sync_start_all can REFUSE without raising (already
+            # starting / already running / yt-dlp missing / Auto
+            # checkbox off → enqueue-only with started:False). In all
+            # those cases the worker whose finally block calls
+            # notify_sync_done never spawns, so waiting=True with no
+            # armed timer wedged the countdown at "Syncing..." forever.
+            # Treat any not-started result like the busy path: clear
+            # the wait and rearm.
+            if isinstance(_ret, dict) and not _ret.get(
+                    "started", _ret.get("ok", False)):
+                if self._stream:
+                    self._stream.emit_text(
+                        "— Autorun: sync didn't start "
+                        f"({_ret.get('error') or 'not started'}) "
+                        "— rearming timer.", "dim")
+                with self._lock:
+                    self._waiting_for_sync_done = False
+                    if self._interval_mins > 0:
+                        self._schedule_next_locked()
         except Exception as e:
             # If trigger itself blew up, unblock the wait so the scheduler
             # doesn't get stuck forever. Rearm with the full interval.
@@ -334,7 +353,12 @@ def clear_history() -> dict[str, Any]:
         cfg = load_config()
         removed = len(cfg.get("autorun_history") or [])
         cfg["autorun_history"] = []
-        save_config(cfg)
+        if not save_config(cfg):
+            return {
+                "ok": False,
+                "error": "config save failed",
+                "removed": 0,
+            }
         return {"ok": True, "removed": removed}
     except Exception as e:
         return {"ok": False, "error": str(e), "removed": 0}

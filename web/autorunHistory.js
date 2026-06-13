@@ -17,6 +17,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Autorun history full-view dialog ────────────────────────────────
   function initAutorunHistoryDialog() {
@@ -32,10 +35,9 @@
     const hide = () => { backdrop.style.display = "none"; };
 
     async function refreshHistory() {
-      const api = window.pywebview?.api;
-      if (!api?.get_activity_log_history) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const hist = await api.get_activity_log_history();
+        const hist = await bridgeCall("get_activity_log_history");
         const entries = Array.isArray(hist) ? hist : [];
         const body = document.getElementById("autorun-history-entries");
         const count = document.getElementById("autorun-history-count");
@@ -75,9 +77,8 @@
         return segs.map(s => (s && s[0]) || "").join("").trim();
       });
       const csv = "entry\n" + lines.map(l => `"${l.replace(/"/g, '""')}"`).join("\n");
-      const api = window.pywebview?.api;
-      if (api?.save_text_to_file) {
-        const r = await api.save_text_to_file("autorun_history.csv", csv);
+      if (nativeBridgeUp()) {
+        const r = await bridgeCall("save_text_to_file", "autorun_history.csv", csv);
         if (r?.ok) window._showToast?.("Saved.", "ok");
       } else {
         const blob = new Blob([csv], { type: "text/csv" });

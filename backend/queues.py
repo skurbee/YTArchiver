@@ -257,55 +257,35 @@ class QueueState:
         self._notify()
         return True
 
-    def save_now(self) -> bool:
-        """Serialize + atomically replace QUEUE_FILE. Gated by env var."""
-        if not config_is_writable():
-            return False
-        with self._lock:
-            # LOW FIX (audit 5.23 LOW-3): payload no longer writes
-            # five always-empty arrays (reorg / video / transcribe /
-            # redownload / metadata). Saves a few bytes per write and
-            # removes a foot-gun: a future contributor reading the
-            # JSON file would assume those queues are wired up.
-            payload = {
-                "sync": copy.deepcopy(self.sync),
-                "gpu": copy.deepcopy(self.gpu),
-                "order": copy.deepcopy(self.order),
-                "gpu_paused": self.gpu_paused,
-                "sync_paused": self.sync_paused,
-            }
-            # in-flight items now persist in a separate
-            # `resuming` dict instead of being inserted at the front of
-            # the regular queue lists. Old behavior re-popped the same
-            # item on next boot and treated it as a normal queued job,
-            # which silently re-processed it (partial downloads got
-            # re-run, retranscribes silently reverted to regular
-            # transcribes). Putting them in `resuming` means load()
-            # can emit a visible "restart notice" and requeue them in
-            # a controlled way rather than letting them race the fresh
-            # boot state.
-            resuming: dict[str, Any] = {}
-            if self.current_sync is not None:
-                resuming["sync"] = copy.deepcopy(self.current_sync)
-            # LOW FIX (audit 5.23 LOW-3): removed current_redownload /
-            # current_metadata writes — those attributes no longer exist
-            # (nothing ever assigned them, so the corresponding resuming
-            # keys never landed in practice).
-            if self.current_gpu is not None:
-                resuming["gpu"] = copy.deepcopy(self.current_gpu)
-            if resuming:
-                payload["resuming"] = resuming
-                payload["_schema_version"] = 2
-            # removed the legacy-style front-insertion
-            # that was being written ALONGSIDE the `resuming` dict.
-            # The duplicate write made every in-flight item appear
-            # TWICE on the next launch — once in `resuming` and once
-            # at the front of the regular queue list. `load()` would
-            # pick one path, and the OTHER would silently leak as a
-            # phantom queue item. Now writes are clean: items are in
-            # exactly ONE place.
-        # Serialize the file-write step so two save_now invocations
-        # can't both be partway through writing the same .tmp file.
+    def _build_save_payload_locked(self) -> dict[str, Any]:
+        """Build the QUEUE_FILE payload from current state. CALLER MUST HOLD
+        self._lock — building under a FRESH lock let a concurrent set_current_*
+        transition persist the WRONG in-flight `resuming` item (audit r2).
+
+        In-flight items go in a separate `resuming` dict (not at the front of
+        the queue lists) so load() requeues them in a controlled way instead of
+        re-popping + silently re-processing them.
+        """
+        payload: dict[str, Any] = {
+            "sync": copy.deepcopy(self.sync),
+            "gpu": copy.deepcopy(self.gpu),
+            "order": copy.deepcopy(self.order),
+            "gpu_paused": self.gpu_paused,
+            "sync_paused": self.sync_paused,
+        }
+        resuming: dict[str, Any] = {}
+        if self.current_sync is not None:
+            resuming["sync"] = copy.deepcopy(self.current_sync)
+        if self.current_gpu is not None:
+            resuming["gpu"] = copy.deepcopy(self.current_gpu)
+        if resuming:
+            payload["resuming"] = resuming
+            payload["_schema_version"] = 2
+        return payload
+
+    def _write_save_payload(self, payload: dict[str, Any]) -> bool:
+        """Atomically replace QUEUE_FILE. Serialized via _save_io_lock so two
+        writers can't interleave on the same .tmp."""
         with self._save_io_lock:
             try:
                 tmp = str(QUEUE_FILE) + ".tmp"
@@ -315,6 +295,14 @@ class QueueState:
                 return True
             except OSError:
                 return False
+
+    def save_now(self) -> bool:
+        """Serialize + atomically replace QUEUE_FILE. Gated by env var."""
+        if not config_is_writable():
+            return False
+        with self._lock:
+            payload = self._build_save_payload_locked()
+        return self._write_save_payload(payload)
 
     def save_debounced(self):
         """Schedule a save for _save_interval_sec from now (coalesces bursts).
@@ -333,6 +321,12 @@ class QueueState:
         unrelated debounce trigger or app shutdown.
         """
         with self._lock:
+            # Don't arm a timer once atexit has flushed — it could fire
+            # save_now() during interpreter teardown, writing QUEUE_FILE AFTER
+            # the final flush (audit r2). Checked under the same lock the
+            # atexit flag is now set under.
+            if getattr(self, "_atexit_disabled", False):
+                return
             if self._save_timer is not None:
                 try: self._save_timer.cancel()
                 except Exception as e: _log.debug("swallowed: %s", e)
@@ -345,6 +339,8 @@ class QueueState:
     def _do_debounced_save(self):
         with self._lock:
             self._save_timer = None
+            if getattr(self, "_atexit_disabled", False):
+                return
         self.save_now()
 
     def _atexit_flush(self):
@@ -358,14 +354,14 @@ class QueueState:
         """
         if getattr(self, "_atexit_disabled", False):
             return
-        # Set the disable flag FIRST so any concurrent
-        # save_debounced caller can't schedule a fresh timer between
-        # our cancel and the save_now (audit: queues H121). The
-        # `_save_io_lock` then guards against an already-firing
-        # save_now landing after us with stale data.
+        # Set the disable flag + cancel the pending timer ATOMICALLY under the
+        # lock so a concurrent save_debounced (which now checks the flag under
+        # the same lock) can't arm a fresh timer after our flush (audit r2 —
+        # the flag was previously set OUTSIDE the lock, so the H121 invariant
+        # didn't actually hold).
         try:
-            self._atexit_disabled = True
             with self._lock:
+                self._atexit_disabled = True
                 t = self._save_timer
                 self._save_timer = None
             if t is not None:
@@ -660,19 +656,21 @@ class QueueState:
     # ── current-task tracking ───────────────────────────────────────
 
     def set_current_sync(self, ch: dict[str, Any] | None):
+        # Snapshot the save payload INSIDE the same lock that sets the value,
+        # so we persist exactly what we set — not whatever a concurrent
+        # set_current_* leaves live when save_now would re-read (audit r2
+        # snapshot race). Persist immediately because a Windows force-kill
+        # skips atexit and a 0.5s debounce can lose this transition (H106).
         with self._lock:
             self.current_sync = copy.deepcopy(ch) if ch else None
+            _payload = (self._build_save_payload_locked()
+                        if config_is_writable() else None)
         self._notify()
-        # Persist immediately. Force-kill (Windows "End Task", power
-        # loss) doesn't run atexit, and a 0.5s debounce can lose this
-        # transition — meaning the "resuming" dict on next launch
-        # misses the in-flight channel (audit: queues H106). The
-        # transition rate is low (one per channel start/end), so the
-        # extra disk write is negligible.
-        try:
-            self.save_now()
-        except Exception:
-            self.save_debounced()
+        if _payload is not None:
+            try:
+                self._write_save_payload(_payload)
+            except Exception:
+                self.save_debounced()
 
     def set_sync_pass_progress(self, index: int, total: int) -> None:
         """Record `(index, total)` so the popover label reads
@@ -685,111 +683,137 @@ class QueueState:
         self._notify()
 
     def set_current_gpu(self, item: dict[str, Any] | None):
+        # Snapshot under the SAME lock that sets the value (audit r2 snapshot
+        # race) + persist immediately (H106). The GPU lane's in-flight item is
+        # the most expensive unit of work (a multi-minute Whisper run), so
+        # dropping it from `resuming` on a force-kill is costly.
         with self._lock:
             self.current_gpu = copy.deepcopy(item) if item else None
+            _payload = (self._build_save_payload_locked()
+                        if config_is_writable() else None)
         self._notify()
+        if _payload is not None:
+            try:
+                self._write_save_payload(_payload)
+            except Exception:
+                self.save_debounced()
 
     # ── UI payload ──────────────────────────────────────────────────
 
     def to_ui_payload(self) -> dict[str, Any]:
         """Return the shape the queue popovers expect (see web/logs.js renderQueues)."""
+        # Snapshot all needed state under the lock, then build the payload
+        # (label formatting + bulk coalescing + os.path.basename) OUTSIDE the
+        # lock. The master lock was being held across ~100 lines of pure CPU
+        # work, serializing the sync/GPU workers (sync_pop/gpu_pop) behind
+        # every UI render (audit: queues to_ui_payload lock-hold). deepcopy so
+        # the post-lock formatting can't race a concurrent dict mutation.
         with self._lock:
-            sync_list = []
-            if self.current_sync:
-                # When a Sync-Subbed pass is running, decorate the active
-                # channel label with "(N/total)" so the popover shows
-                # progress through the pass. Outside of a pass, we just
-                # render the channel name plain.
-                label = self._task_label_sync(self.current_sync, running=True)
-                if self.sync_pass_total > 0 and self.sync_pass_index > 0:
-                    label = f"{label} ({self.sync_pass_index}/{self.sync_pass_total})"
-                sync_list.append({
-                    "name": label,
-                    "status": "running",
-                    # Identifiers used by the right-click "Remove from
-                    # queue" context menu → api.queues_sync_remove.
-                    # Without these the JS fell back to the display name
-                    # which didn't match the backend's URL-keyed removal.
-                    "url": (self.current_sync.get("url") or "").strip(),
-                    "channel_name": (self.current_sync.get("name")
-                                      or self.current_sync.get("folder")
-                                      or "").strip(),
-                })
-            for ch in self.sync:
-                sync_list.append({
-                    "name": self._task_label_sync(ch, running=False),
-                    "status": "queued",
-                    "url": (ch.get("url") or "").strip(),
-                    "channel_name": (ch.get("name")
-                                      or ch.get("folder") or "").strip(),
-                })
+            # Shallow copies suffice: the post-lock formatting only READS
+            # scalar fields and builds new dicts (never mutates these), and
+            # queued task dicts are effectively immutable once enqueued. A
+            # shallow snapshot is race-safe AND avoids deep-copying the whole
+            # queue on every UI notify (audit r2: deepcopy was a perf regression).
+            cur_sync = dict(self.current_sync) if self.current_sync else None
+            sync_q = list(self.sync)
+            cur_gpu = dict(self.current_gpu) if self.current_gpu else None
+            gpu_q = list(self.gpu)
+            pass_total = self.sync_pass_total
+            pass_index = self.sync_pass_index
+            gpu_paused = self.gpu_paused
+            sync_paused = self.sync_paused
+            gpu_paused_active = self.gpu_paused_active
+            sync_paused_active = self.sync_paused_active
 
-            gpu_list = []
-            # Track which bulk_ids are being represented by the running
-            # item so the still-queued remainder from that bulk collapses
-            # into a single "Transcribe {ch} (N more)" row.
-            running_bulk_id = ""
-            if self.current_gpu:
-                running_bulk_id = str(self.current_gpu.get("bulk_id") or "")
-                gpu_list.append({
-                    "name": self._task_label_gpu(self.current_gpu, running=True,
-                                                 bulk_context=None),
-                    "status": "running",
-                    "path": (self.current_gpu.get("path") or "").strip(),
-                    "bulk_id": running_bulk_id,
-                })
-            # Coalesce queued items by bulk_id. First pass: count items per
-            # bulk_id. Second pass: emit one row per bulk (or per-item if
-            # no bulk_id).
-            bulk_counts: dict[str, int] = {}
-            bulk_channels: dict[str, str] = {}
-            for t in self.gpu:
-                bid = str(t.get("bulk_id") or "")
-                if bid:
-                    bulk_counts[bid] = bulk_counts.get(bid, 0) + 1
-                    if bid not in bulk_channels:
-                        bulk_channels[bid] = (t.get("channel") or "").strip()
-            seen_bulks: set = set()
-            for t in self.gpu:
-                bid = str(t.get("bulk_id") or "")
-                if bid and bid in seen_bulks:
-                    continue
-                if bid and bulk_counts.get(bid, 0) > 1:
-                    # Emit one condensed row for the whole bulk.
-                    ch_name = bulk_channels.get(bid) or (t.get("channel") or "?")
-                    remaining = bulk_counts[bid]
-                    # If part of this bulk is already the "running" slot,
-                    # the queued remainder is one short of bulk_total.
-                    if bid == running_bulk_id:
-                        label = f"Transcribe {ch_name} ({remaining} more)"
-                    else:
-                        label = f"Transcribe {ch_name} ({remaining} videos)"
-                    gpu_list.append({
-                        "name": label,
-                        "status": "queued",
-                        "bulk_id": bid,
-                        "bulk_count": remaining,
-                    })
-                    seen_bulks.add(bid)
+        sync_list = []
+        if cur_sync:
+            # When a Sync-Subbed pass is running, decorate the active channel
+            # label with "(N/total)" so the popover shows pass progress.
+            label = self._task_label_sync(cur_sync, running=True)
+            if pass_total > 0 and pass_index > 0:
+                label = f"{label} ({pass_index}/{pass_total})"
+            sync_list.append({
+                "name": label,
+                "status": "running",
+                # Identifiers used by the right-click "Remove from queue"
+                # context menu → api.queues_sync_remove (URL-keyed removal).
+                "url": (cur_sync.get("url") or "").strip(),
+                "channel_name": (cur_sync.get("name")
+                                  or cur_sync.get("folder") or "").strip(),
+            })
+        for ch in sync_q:
+            sync_list.append({
+                "name": self._task_label_sync(ch, running=False),
+                "status": "queued",
+                "url": (ch.get("url") or "").strip(),
+                "channel_name": (ch.get("name")
+                                  or ch.get("folder") or "").strip(),
+            })
+
+        gpu_list = []
+        # Track which bulk_ids are represented by the running item so the
+        # still-queued remainder collapses into one "Transcribe {ch} (N more)".
+        running_bulk_id = ""
+        if cur_gpu:
+            running_bulk_id = str(cur_gpu.get("bulk_id") or "")
+            gpu_list.append({
+                "name": self._task_label_gpu(cur_gpu, running=True,
+                                             bulk_context=None),
+                "status": "running",
+                "path": (cur_gpu.get("path") or "").strip(),
+                "bulk_id": running_bulk_id,
+            })
+        # Coalesce queued items by bulk_id. First pass: count per bulk_id.
+        # Second pass: emit one row per bulk (or per-item if no bulk_id).
+        bulk_counts: dict[str, int] = {}
+        bulk_channels: dict[str, str] = {}
+        for t in gpu_q:
+            bid = str(t.get("bulk_id") or "")
+            if bid:
+                bulk_counts[bid] = bulk_counts.get(bid, 0) + 1
+                if bid not in bulk_channels:
+                    bulk_channels[bid] = (t.get("channel") or "").strip()
+        seen_bulks: set = set()
+        for t in gpu_q:
+            bid = str(t.get("bulk_id") or "")
+            if bid and bid in seen_bulks:
+                continue
+            if bid and bulk_counts.get(bid, 0) > 1:
+                # Emit one condensed row for the whole bulk.
+                ch_name = bulk_channels.get(bid) or (t.get("channel") or "?")
+                remaining = bulk_counts[bid]
+                # If part of this bulk is the "running" slot, the queued
+                # remainder is one short of bulk_total.
+                if bid == running_bulk_id:
+                    label = f"Transcribe {ch_name} ({remaining} more)"
                 else:
-                    gpu_list.append({
-                        "name": self._task_label_gpu(t, running=False,
-                                                     bulk_context=None),
-                        "status": "queued",
-                        "path": (t.get("path") or "").strip(),
-                        "bulk_id": str(t.get("bulk_id") or ""),
-                    })
-            return {
-                "sync": sync_list,
-                "gpu": gpu_list,
-                "gpu_paused": self.gpu_paused,
-                "sync_paused": self.sync_paused,
-                # Pause-pending vs pause-active distinction so the UI
-                # can blink the Resume button between "user clicked
-                # pause" and "worker actually entered pause-wait".
-                "gpu_paused_active": self.gpu_paused_active,
-                "sync_paused_active": self.sync_paused_active,
-            }
+                    label = f"Transcribe {ch_name} ({remaining} videos)"
+                gpu_list.append({
+                    "name": label,
+                    "status": "queued",
+                    "bulk_id": bid,
+                    "bulk_count": remaining,
+                })
+                seen_bulks.add(bid)
+            else:
+                gpu_list.append({
+                    "name": self._task_label_gpu(t, running=False,
+                                                 bulk_context=None),
+                    "status": "queued",
+                    "path": (t.get("path") or "").strip(),
+                    "bulk_id": str(t.get("bulk_id") or ""),
+                })
+        return {
+            "sync": sync_list,
+            "gpu": gpu_list,
+            "gpu_paused": gpu_paused,
+            "sync_paused": sync_paused,
+            # Pause-pending vs pause-active distinction so the UI can blink
+            # the Resume button between "user clicked pause" and "worker
+            # actually entered pause-wait".
+            "gpu_paused_active": gpu_paused_active,
+            "sync_paused_active": sync_paused_active,
+        }
 
     @staticmethod
     def _task_label_sync(ch: dict[str, Any], running: bool) -> str:

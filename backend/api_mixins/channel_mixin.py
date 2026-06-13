@@ -270,14 +270,15 @@ class ChannelMixin:
             if conn is not None:
                 placeholders = ",".join(["?"] * len(pending_ids))
                 rows = conn.execute(
-                    f"SELECT video_id, filepath, title FROM videos "
+                    f"SELECT video_id, filepath, title, tx_status FROM videos "
                     f"WHERE video_id IN ({placeholders})",
                     pending_ids,
                 ).fetchall()
                 for r in rows:
                     vid, fp, title = r[0], (r[1] or ""), (r[2] or "")
+                    txs = (r[3] or "") if len(r) > 3 else ""
                     if vid and fp:
-                        id_to_path[vid] = (fp, title)
+                        id_to_path[vid] = (fp, title, txs)
         except Exception as e:
             _log.debug("swallowed: %s", e)
 
@@ -289,7 +290,14 @@ class ChannelMixin:
             if not info:
                 unresolved.append(vid)
                 continue
-            fp, title = info
+            fp, title, txs = info
+            # Skip genuinely-silent videos: already checked, Whisper found no
+            # speech. Re-running just yields nothing again. (Explicit
+            # right-click "Re-transcribe" still allows it; this is the
+            # auto/catch-up "Queue Pending" path.)
+            if txs == "no_speech":
+                skipped += 1
+                continue
             if not fp or not os.path.isfile(fp):
                 unresolved.append(vid)
                 continue
@@ -400,8 +408,8 @@ class ChannelMixin:
             has_existing = False
             if os.path.isdir(folder):
                 for dp, _dns, fns in os.walk(folder):
-                    if any(fn.endswith("Transcript.txt") or
-                           fn.endswith("Transcript.jsonl") for fn in fns):
+                    if any(fn.endswith(("Transcript.txt",
+                                        "Transcript.jsonl")) for fn in fns):
                         has_existing = True
                         break
             if not has_existing:
@@ -567,7 +575,12 @@ class ChannelMixin:
                 if ((cur.get("kind") or "").lower() == "redownload"
                         and (cur.get("url") or "").strip() == ch_url):
                     was_running = True
-                    self._sync_cancel.set()
+                    # Per-channel cancel sets the REDOWNLOAD event only
+                    # — setting the shared _sync_cancel here killed
+                    # every other queued chain item (the worker passes
+                    # the still-set event into each subsequent run) and
+                    # left later Reorg/Fix-dates ghost-cancelled.
+                    self._redwnl_cancel.set()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -791,6 +804,34 @@ class ChannelMixin:
         folder = os.path.join(base, _folder_name)
         if not os.path.isdir(folder):
             return {"ok": False, "error": f"Channel folder missing: {folder}"}
+        # Narrow to a year / month subfolder when requested — BEFORE the gate
+        # below. Previously this ran AFTER the gate, so a scoped redownload
+        # queued while a regular sync was running got stored with the whole-
+        # channel folder + an empty scope_label and later drained as a WHOLE-
+        # channel redownload (audit r2). The `_scan_local_files` walker handles
+        # any folder path, so pointing it at a subfolder just narrows the set.
+        scope_label = ""
+        if isinstance(scope, dict) and scope.get("year"):
+            y = str(scope["year"])
+            sub = os.path.join(folder, y)
+            if scope.get("month"):
+                try:
+                    m = int(scope["month"])
+                    from backend.reorg import _MONTH_FOLDERS
+                    mf = _MONTH_FOLDERS.get(m)
+                    if mf:
+                        sub = os.path.join(sub, mf)
+                        scope_label = f"{y} / {mf}"
+                    else:
+                        scope_label = f"{y}"
+                except Exception:
+                    scope_label = f"{y}"
+            else:
+                scope_label = f"{y}"
+            if not os.path.isdir(sub):
+                return {"ok": False,
+                        "error": f"Scope folder missing: {sub}"}
+            folder = sub
         # Gate behavior:
         #   - If a regular (non-redownload) sync is running, refuse.
         #   - If a redownload is running, QUEUE this request so the
@@ -823,7 +864,8 @@ class ChannelMixin:
                             "ch": dict(ch),
                             "folder": folder,
                             "new_res": new_res,
-                        "scope_label": "",
+                        "scope_label": scope_label,
+                        "scope": scope,
                         "rd_task": dict(ch, kind="redownload",
                                          redownload_res=new_res),
                     })
@@ -842,33 +884,9 @@ class ChannelMixin:
                                  "It will start when the current sync ends."}
             # Fall through into the enqueue path below.
 
-        # Narrow to a year / month subfolder when requested. The
-        # `_scan_local_files` walker already handles any folder path, so
-        # pointing it at a subfolder just narrows the redownload set.
-        scope_label = ""
-        if isinstance(scope, dict) and scope.get("year"):
-            y = str(scope["year"])
-            sub = os.path.join(folder, y)
-            if scope.get("month"):
-                try:
-                    m = int(scope["month"])
-                    from backend.reorg import _MONTH_FOLDERS
-                    mf = _MONTH_FOLDERS.get(m)
-                    if mf:
-                        sub = os.path.join(sub, mf)
-                        scope_label = f"{y} / {mf}"
-                    else:
-                        scope_label = f"{y}"
-                except Exception:
-                    scope_label = f"{y}"
-            else:
-                scope_label = f"{y}"
-            if not os.path.isdir(sub):
-                return {"ok": False,
-                        "error": f"Scope folder missing: {sub}"}
-            folder = sub
-
-        # Build a queue item + the UI-visible task dict.
+        # Build a queue item + the UI-visible task dict. (folder + scope_label
+        # were already narrowed above, before the gate; `scope` is carried so
+        # the sync-side drain can re-narrow correctly — audit r2.)
         _rd_task = dict(ch)
         _rd_task["kind"] = "redownload"
         _rd_task["redownload_res"] = new_res
@@ -877,6 +895,7 @@ class ChannelMixin:
             "folder": folder,
             "new_res": new_res,
             "scope_label": scope_label,
+            "scope": scope,
             "rd_task": _rd_task,
         }
 
@@ -908,6 +927,7 @@ class ChannelMixin:
             # showing a green ▶ "Resume" button while "Redownloading
             # ChannelName (480p)" was the active task.
             self._sync_cancel.clear()
+            self._redwnl_cancel.clear()
             self._sync_pause.clear()
             self._sync_skip.clear()
             try: self._queues.set_sync_paused(False)
@@ -923,6 +943,13 @@ class ChannelMixin:
                         if not self._redwnl_pending:
                             break
                         item = self._redwnl_pending.pop(0)
+                        # Fresh cancel state for EACH chain item — a
+                        # per-channel cancel of item N must not abort
+                        # items N+1.. at their first check. Done under
+                        # _redwnl_lock so a global stop (which drains
+                        # the list and sets the event under the same
+                        # lock) can't interleave between pop and clear.
+                        self._redwnl_cancel.clear()
                     # Remove the about-to-run item from the sync queue
                     # UI (moves it from "queued" to "running").
                     try:
@@ -992,10 +1019,14 @@ class ChannelMixin:
                     "error": f"\"{ch_name}\" is currently being synced or "
                              f"transcribed; try again when that finishes."}
 
+        # Per-run event — _sync_cancel stays set after any stopped sync
+        # until the next sync starts, which made Fix-file-dates abort
+        # instantly in that window (same ghost-cancel Reorg had).
+        _fixdates_cancel = threading.Event()
         def _run():
             try:
                 reorg_backend.fix_file_dates(folder, self._log_stream,
-                                             cancel_event=self._sync_cancel)
+                                             cancel_event=_fixdates_cancel)
             finally:
                 self._log_stream.flush()
 

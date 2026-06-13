@@ -23,8 +23,17 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initIndexControls() {
-    const getApi = () => window.pywebview?.api;
     const bBuild = document.getElementById("btn-idx-build");
     const bRebuild = document.getElementById("btn-idx-rebuild");
     const statsEl = document.getElementById("index-stats-text");
@@ -42,8 +51,7 @@
 
     const refreshStats = async () => {
       if (!statsEl) return;
-      const api = getApi();
-      if (!api?.get_index_summary) {
+      if (!nativeBridgeUp()) {
         // Preview / pre-ready state. Don't overwrite existing numbers once
         // we've already painted them (avoids a "flash of offline").
         if (!statsEl.dataset.populated) {
@@ -56,8 +64,14 @@
       const _zeroOK = (v) => (v == null ? "—" :
         (typeof v === "number" ? v.toLocaleString() : String(v)));
       const _renderLines = (c, db) => {
-        const pct = (c.transcribed_pct_channels != null)
-          ? c.transcribed_pct_channels.toFixed(1) + "%"
+        // Archive-wide transcription COVERAGE = transcribed videos / total
+        // videos (from the slow index-DB stats `db`), NOT the old "% of
+        // channels with auto-transcribe on". Shows loading until `db` arrives
+        // (same as Segments / Hours below). no_speech videos are NOT counted
+        // as transcribed, so a fully-checked archive with genuinely-silent
+        // videos correctly reads just below 100%.
+        const txPct = (db && db.total_videos)
+          ? ((db.transcribed_videos || 0) * 100.0 / db.total_videos).toFixed(1) + "%"
           : "—";
         // db may be null while the slow query is in flight — show
         // "loading…" for those fields so the user sees they're
@@ -66,31 +80,32 @@
         // via .textContent. Felt dead during the multi-second slow-
         // index query. Switched to innerHTML with an inline spinner
         // span on the pending rows so the user sees active motion.
-        const _esc = (s) => String(s).replace(/[&<>"']/g, ch => ({
-          "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
-        }[ch]));
+        const _esc = window.YT?.util?.escapeHtml || window._escapeHtml
+          || ((s) => String(s ?? "").replace(/[&<>"']/g, ch => ({
+            "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+          }[ch])));
         const _loading = '<span class="spinner-inline"></span>loading…';
         return [
           `Channels: ${_esc(fmt(c.channels))}`,
           `Videos: ${_esc(fmt(c.videos))}`,
           `Segments: ${db ? _esc(_zeroOK(db.segments)) : _loading}`,
           `Hours of video: ${db ? _esc(_zeroOK(db.hours)) : _loading}`,
-          `Transcribed: ${_esc(pct)}`,
+          `Transcribed: ${db ? _esc(txPct) : _loading}`,
           `Index DB size: ${db ? _esc(db.index_db_size_label || "—") : _loading}`,
         ].join("\n");
       };
       try {
-        const idx = await api.get_index_summary();
+        const idx = await bridgeCall("get_index_summary");
         const c = (idx && idx.cards) || {};
         // Render basics immediately so the panel isn't blank during
         // the multi-second index-DB query that follows.
         statsEl.innerHTML = _renderLines(c, null);
         statsEl.dataset.populated = "1";
         // Async-fetch the slow index-DB stats. Re-render once they arrive.
-        if (api.get_index_db_stats) {
+        if (nativeBridgeUp()) {
           let _dbArrived = false;
           const _fallback = { segments: null, hours: null, index_db_size_label: "—" };
-          api.get_index_db_stats().then((db) => {
+          bridgeCall("get_index_db_stats").then((db) => {
             if (db) { _dbArrived = true; statsEl.innerHTML = _renderLines(c, db); }
           }).catch((err) => {
             // On error, don't leave the three rows spinning "loading…"
@@ -120,15 +135,14 @@
     };
 
     bBuild?.addEventListener("click", async () => {
-      const api = getApi();
-      if (!api?.archive_rescan) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       if (progEl) progEl.textContent = "Building…";
       appendLog("Building / updating index…");
       try {
-        await api.archive_rescan();
+        await bridgeCall("archive_rescan");
         appendLog("Build complete.");
         if (progEl) progEl.textContent = "Done.";
         await refreshStats();
@@ -139,8 +153,7 @@
     });
 
     bRebuild?.addEventListener("click", async () => {
-      const api = getApi();
-      if (!api?.index_rebuild_fts) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -153,7 +166,7 @@
       if (progEl) progEl.textContent = "Rebuilding FTS…";
       appendLog("Rebuilding FTS index from scratch…");
       try {
-        await api.index_rebuild_fts();
+        await bridgeCall("index_rebuild_fts");
         appendLog("FTS rebuild complete.");
         if (progEl) progEl.textContent = "Done.";
         await refreshStats();
@@ -168,7 +181,7 @@
     window.addEventListener("pywebviewready", () => { refreshStats(); });
     // Defensive: if the event already fired before we wired it, a short
     // delayed poll catches that case too.
-    setTimeout(() => { if (getApi()?.get_index_summary) refreshStats(); }, 800);
+    setTimeout(() => { if (nativeBridgeUp()) refreshStats(); }, 800);
 
     // Expose so the Settings > Index sub-tab can trigger a refresh when
     // the user clicks back onto it (avoids stale "Loading…").

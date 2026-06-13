@@ -298,6 +298,24 @@ class SubsMixin:
                 result = subs_backend.remove_channel(
                     identity or {}, delete_files=bool(delete_files))
             ok = bool(result.get("ok"))
+            # When the files were physically deleted, also purge the channel's
+            # rows from the index DB (videos + transcript segments). Browse /
+            # Search / Videos read the index, not the disk — without this the
+            # removed channel's cards linger and 404 ("File not found — index
+            # entry may be stale") when clicked. Match every identifier the
+            # videos.channel column might hold (name / folder / override).
+            if ok and delete_files and ch_snap:
+                try:
+                    from backend import index as _idx
+                    _names = set()
+                    for _k in ("name", "folder", "folder_override"):
+                        _v = (ch_snap.get(_k) or "").strip()
+                        if _v:
+                            _names.add(_v)
+                    for _nm in _names:
+                        _idx.delete_channel_from_index(_nm)
+                except Exception as e:
+                    _log.debug("index purge after channel delete failed: %s", e)
             if ok and ch_snap and not delete_files:
                 if not hasattr(self, "_removed_channels_stack"):
                     self._removed_channels_stack = []
@@ -546,12 +564,19 @@ class SubsMixin:
                 if not ch:
                     failed.append({"name": n, "reason": "not found"})
                     continue
-                payload = dict(ch)
-                payload.update(clean)
-                # Preserve url so update_channel's identity match works
+                # Pass ONLY the whitelisted changes. `clean` carries no
+                # 'url' key, so update_channel takes its SPARSE merge
+                # path (subs.py) and every other field survives
+                # untouched. The old dict(ch)+update(clean) payload had
+                # a truthy url, which routed the full DISK-shape record
+                # through the UI-shape _payload_to_channel rebuild:
+                # min/max durations re-multiplied x60, mode forced to
+                # 'new', folder org forced to years, and _apply_defaults
+                # reset last_sync / pending_tx_ids / folder_override on
+                # every bulk-updated channel.
                 _res = subs_backend.update_channel(
                     {"url": ch.get("url", ""), "name": ch.get("name", "")},
-                    payload)
+                    dict(clean))
                 # Detect save failures the backend signals via
                 # `_write_blocked: True` (my Fix 10 made update_channel
                 # roll back its in-memory mutation and return that
@@ -614,16 +639,12 @@ class SubsMixin:
             self._log_stream.flush()
             try:
                 if self._window is not None:
-                    import json as _json
                     _msg = f"Removed {deleted} channel(s)."
                     if failed:
                         _msg += f" {len(failed)} failed."
                     _kind = "ok" if not failed else "warn"
-                    self._window.evaluate_js(
-                        f"window._showToast && window._showToast("
-                        f"{_json.dumps(_msg)}, {_json.dumps(_kind)});"
-                        f"window.refreshSubsTable && window.refreshSubsTable();"
-                    )
+                    self.services.event_bus.show_toast_and_refresh_subs(
+                        _msg, _kind)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -734,12 +755,8 @@ class SubsMixin:
             self._log_stream.flush()
             try:
                 if self._window is not None:
-                    import json as _json
-                    self._window.evaluate_js(
-                        f"window._showToast && window._showToast("
-                        f"{_json.dumps(_toast_msg)}, {_json.dumps(_toast_kind)});"
-                        f"window.refreshSubsTable && window.refreshSubsTable();"
-                    )
+                    self.services.event_bus.show_toast_and_refresh_subs(
+                        _toast_msg, _toast_kind)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -775,12 +792,8 @@ class SubsMixin:
             self._log_stream.flush()
             try:
                 if self._window is not None:
-                    import json as _json
-                    self._window.evaluate_js(
-                        f"window._showToast && window._showToast("
-                        f"{_json.dumps(f'Queued {queued} channels.')}, 'ok');"
-                        f"window.refreshSubsTable && window.refreshSubsTable();"
-                    )
+                    self.services.event_bus.show_toast_and_refresh_subs(
+                        f"Queued {queued} channels.", "ok")
             except Exception as e:
                 _log.debug("swallowed: %s", e)
 
@@ -804,6 +817,16 @@ class SubsMixin:
         base = (cfg.get("output_dir") or "").strip()
         if not base:
             return {"ok": False, "error": "output_dir not set"}
+        # Validate the INPUT shape: new_folder_name must be a single bare
+        # folder name (no separators, not absolute, not . / ..) so
+        # os.path.join below can't be coerced into escaping output_dir. The
+        # dirname check further down stays as the second layer (audit:
+        # subs_relocate_channel containment).
+        if (os.sep in new_folder_name or "/" in new_folder_name
+                or os.path.isabs(new_folder_name)
+                or new_folder_name in (".", "..")):
+            return {"ok": False,
+                    "error": "Folder name must be a single folder under output_dir."}
         target = os.path.normpath(os.path.join(base, new_folder_name))
         if not os.path.isdir(target):
             return {"ok": False, "error": f"Folder not found: {target}"}
@@ -812,9 +835,17 @@ class SubsMixin:
             return {"ok": False,
                     "error": "Target folder must live directly under output_dir"}
         try:
+            # Require a non-empty identity field and compare with truthiness
+            # guards — otherwise a folder-only identity makes both sides
+            # None == None → True and rewrites the FIRST channel's folder
+            # (audit r2).
+            _id_url = (identity.get("url") or "").strip()
+            _id_name = (identity.get("name") or "").strip()
+            if not _id_url and not _id_name:
+                return {"ok": False, "error": "identity needs a url or name"}
             for ch in cfg.get("channels", []):
-                if (ch.get("url") == identity.get("url")
-                        or ch.get("name") == identity.get("name")):
+                if ((_id_url and ch.get("url") == _id_url)
+                        or (_id_name and ch.get("name") == _id_name)):
                     ch["folder_override"] = os.path.basename(target)
                     break
             from backend.ytarchiver_config import save_config as _sc

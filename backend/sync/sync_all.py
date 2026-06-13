@@ -31,10 +31,10 @@ from ..ytarchiver_config import ARCHIVE_FILE, load_config
 # The flag is reset at pass start; mutate it via the imported module
 # object so the change is visible inside sync_channel.
 from . import core as _core
-from .core import sync_channel
 
 # Helpers used by sync_all
 from .active_state import fire_channel_synced_hook, fire_metadata_changed_hook
+from .core import sync_channel
 from .display_push import clear_sync_progress
 from .log_rows import (
     _ROW_EMIT_PASS_ID,
@@ -362,6 +362,12 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
             _initial_total = 0
     except Exception:
         _initial_total = 0
+    # `total` must be bound before the loop: if the first pop returns
+    # None (queue cleared/cancelled before we start) or the queue holds
+    # only redownload items (which `continue` before assignment), the
+    # return at the bottom would otherwise raise NameError and skip the
+    # whole end-of-pass cleanup.
+    total = _initial_total
     while True:
         # Clear stale cancel+skip flags from a previous iteration's
         # mid-channel skip request. sync_skip_current sets BOTH flags so
@@ -436,6 +442,16 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
                                name_tag="dim", summary_tag="dim")
                 continue
             stream.emit([["\n\u26d4 Pass cancelled.\n", "red"]])
+            # Requeue the just-popped (never-run) item \u2014 sync_pop
+            # removed it BEFORE this cancel check, and the end-of-pass
+            # block deliberately preserves the rest of the queue for
+            # Resume; without this, every mid-pass cancel silently
+            # lost exactly one pending task.
+            try:
+                if queues is not None and ch is not None:
+                    queues.sync_requeue_front(ch)
+            except Exception:
+                pass
             break
         # Batch cooldown check — skip channels still cooling down from a
         # bootstrap batch (>100k videos, not yet init_complete).
@@ -954,7 +970,13 @@ def sync_all(stream: LogStreamer, cancel_event: threading.Event | None = None,
         _fast_path_eligible = (
             ch.get("init_complete", False) and
             _ch_sync_ok and
-            _ch_mode == "full"
+            _ch_mode == "full" and
+            # Channels with failed videos pending retry must run the
+            # full sync_channel pass — retries are prepended only
+            # there, so quick-checking "no new videos" starved them
+            # forever (silent permanent archive gaps that never even
+            # reached the 3-strike give-up).
+            not (ch.get("failed_video_ids") or {})
         )
         if _known_ids and _ch_url and _fast_path_eligible:
             _qc = quick_check_new_uploads(

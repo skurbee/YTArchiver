@@ -130,7 +130,11 @@ class InfoMixin:
         try:
             if self._window is not None:
                 self._window.evaluate_js(
-                    "if (window.renderActivityLog) window.renderActivityLog([]);")
+                    "if (window.renderActivityLog) window.renderActivityLog([]);"
+                    "if (window._syncActivityLogVisibility) "
+                    "window._syncActivityLogVisibility();"
+                    "if (window._syncClearButtonVisibility) "
+                    "window._syncClearButtonVisibility();")
         except Exception as e:
             _log.debug("swallowed: %s", e)
         return res

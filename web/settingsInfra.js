@@ -26,6 +26,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
   const askQuestion = window.askQuestion;
@@ -78,7 +88,6 @@
   // delete-all-transcriptions right-click menu. Moved here from the
   // Browse > Index view per the user's request 2026-04-18.
   function initSettingsArchiveRoots() {
-    const getApi = () => window.pywebview?.api;
     const rootsList = document.getElementById("settings-roots-list");
     const bAdd = document.getElementById("btn-settings-add-root");
     const bRemove = document.getElementById("btn-settings-remove-root");
@@ -89,13 +98,12 @@
     let _selectedRoot = null;
 
     const _confirmDeleteAllTranscriptions = async (folder) => {
-      const api = getApi();
-      if (!api?.index_count_transcripts || !api?.index_delete_all_transcripts) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       window._showToast?.("Counting transcript files\u2026", "ok");
-      const count = await api.index_count_transcripts(folder);
+      const count = await bridgeCall("index_count_transcripts", folder);
       if (!count?.ok) {
         window._showToast?.(count?.error || "Count failed.", "error");
         return;
@@ -122,7 +130,7 @@
         "also be cleared. Sync will have to re-run Whisper on every video.",
         "Yes, DELETE EVERYTHING");
       if (!ok2) return;
-      const res = await api.index_delete_all_transcripts(folder, "YES-DELETE-ALL");
+      const res = await bridgeCall("index_delete_all_transcripts", folder, "YES-DELETE-ALL");
       if (res?.ok) {
         window._showToast?.("Transcripts deleted.", "warn");
       } else {
@@ -136,7 +144,7 @@
       let outDir = "";
       let extras = [];
       try {
-        const s = await getApi()?.settings_load?.();
+        const s = nativeBridgeUp() ? await bridgeCall("settings_load") : null;
         outDir = (s?.output_dir || "").trim();
         extras = Array.isArray(s?.tp_archive_roots) ? s.tp_archive_roots : [];
       } catch (_e) {}
@@ -173,19 +181,18 @@
     };
 
     bAdd?.addEventListener("click", async () => {
-      const api = getApi();
-      if (!api?.pick_folder) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
-      const res = await api.pick_folder("Select Archive Root Folder");
+      const res = await bridgeCall("pick_folder", "Select Archive Root Folder");
       if (!res?.ok || !res.path) return;
       try {
-        const s = await api.settings_load();
+        const s = await bridgeCall("settings_load");
         const extras = Array.isArray(s?.tp_archive_roots) ? s.tp_archive_roots : [];
         if (extras.includes(res.path)) return;
         extras.push(res.path);
-        await api.settings_save({ tp_archive_roots: extras });
+        await bridgeCall("settings_save", { tp_archive_roots: extras });
         await renderRoots();
       } catch (e) {
         window._showToast?.("Add root failed: " + e, "error");
@@ -193,14 +200,13 @@
     });
 
     bRemove?.addEventListener("click", async () => {
-      const api = getApi();
       if (!_selectedRoot) {
         window._showToast?.("Pick a root to remove first.", "warn");
         return;
       }
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const s = await api.settings_load();
+        const s = await bridgeCall("settings_load");
         const outDir = (s?.output_dir || "").trim();
         if (_selectedRoot === outDir) {
           window._showToast?.(
@@ -209,7 +215,7 @@
           return;
         }
         const extras = (s?.tp_archive_roots || []).filter(r => r !== _selectedRoot);
-        await api.settings_save({ tp_archive_roots: extras });
+        await bridgeCall("settings_save", { tp_archive_roots: extras });
         _selectedRoot = null;
         await renderRoots();
       } catch (e) {
@@ -218,15 +224,14 @@
     });
 
     const persistAuto = async () => {
-      const api = getApi();
-      if (!api?.settings_save) return;
+      if (!nativeBridgeUp()) return;
       const enabled = !!autoCB?.checked;
       let n = parseInt(autoThr?.value || "10", 10);
       if (!Number.isFinite(n) || n < 1) n = 10;
       if (n > 9999) n = 9999;
       if (autoThr) autoThr.value = String(n);
       try {
-        await api.settings_save({
+        await bridgeCall("settings_save", {
           auto_index_enabled: enabled,
           auto_index_threshold: n,
         });
@@ -234,7 +239,7 @@
     };
     const loadSavedAuto = async () => {
       try {
-        const s = await getApi()?.settings_load?.();
+        const s = nativeBridgeUp() ? await bridgeCall("settings_load") : null;
         if (s) {
           if (autoCB) autoCB.checked = !!s.auto_index_enabled;
           if (autoThr) autoThr.value = String(s.auto_index_threshold || 10);
@@ -256,7 +261,7 @@
       loadSavedAuto();
     });
     setTimeout(() => {
-      if (getApi()?.settings_load) { renderRoots(); loadSavedAuto(); }
+      if (nativeBridgeUp()) { renderRoots(); loadSavedAuto(); }
     }, 800);
   }
   window._initSettingsArchiveRoots = initSettingsArchiveRoots;

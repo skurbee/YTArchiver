@@ -94,6 +94,7 @@ _out.flush()
 # fragmented on Windows and degrades GPU memory availability over
 # repeated skip_current actions).
 import threading as _threading
+
 _cancel_flag = _threading.Event()
 _request_queue: list = []  # FIFO of pending {path, duration, language}
 _request_lock = _threading.Lock()
@@ -140,6 +141,7 @@ _threading.Thread(target=_stdin_reader, daemon=True,
 # Main loop: pull requests from the queue. Sleeps briefly when empty
 # so we don't burn CPU between jobs.
 import time as _time
+
 while True:
     line = None
     with _request_lock:
@@ -176,7 +178,7 @@ while True:
             language=language,
             beam_size=5,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            vad_parameters={"min_silence_duration_ms": 500},
             condition_on_previous_text=False,
             no_speech_threshold=0.6,
             word_timestamps=True,

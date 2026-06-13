@@ -19,6 +19,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Settings tab ───────────────────────────────────────────────────
   //
   // Settings is now a full tab (#panel-settings), not a modal. Switching
@@ -57,10 +61,9 @@
       }, 1600);
     }
     async function saveField(key, value) {
-      const api = window.pywebview?.api;
-      if (!api?.settings_save) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const res = await api.settings_save({ [key]: value });
+        const res = await bridgeCall("settings_save", { [key]: value });
         if (res?.ok) {
           flashSaved(true);
         } else {
@@ -87,10 +90,9 @@
     }
     async function _updatePreloadHints() {
       try {
-        const api = window.pywebview?.api;
         let nCh = 0, nVids = 0;
-        if (api?.get_index_summary) {
-          const idx = await api.get_index_summary();
+        if (nativeBridgeUp()) {
+          const idx = await bridgeCall("get_index_summary");
           nCh = idx?.cards?.channels ?? 0;
           nVids = idx?.cards?.videos ?? 0;
         }
@@ -118,10 +120,9 @@
     }
 
     async function load() {
-      const api = window.pywebview?.api;
-      if (!api?.settings_load) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const s = await api.settings_load();
+        const s = await bridgeCall("settings_load");
         document.getElementById("settings-output-dir").value = s.output_dir || "";
         document.getElementById("settings-video-dir").value = s.video_out_dir || "";
         document.getElementById("settings-whisper-model").value = s.whisper_model || "small";
@@ -149,8 +150,8 @@
         // (not the settings blob, since it's applied immediately).
         try {
           const amEl = document.getElementById("settings-autorun-mode");
-          if (amEl && api.autorun_state) {
-            const ast = await api.autorun_state();
+          if (amEl) {
+            const ast = await bridgeCall("autorun_state");
             amEl.value = (ast && ast.mode === "clock") ? "clock" : "timer";
           }
         } catch (e) { /* ignore */ }
@@ -180,7 +181,7 @@
         const vEl = document.getElementById("settings-ytdlp-version");
         if (vEl) vEl.textContent = "checking\u2026";
         try {
-          const v = await api.ytdlp_version();
+          const v = await bridgeCall("ytdlp_version");
           if (vEl) vEl.textContent = v?.ok ? v.version : (v?.error || "not found");
         } catch { if (vEl) vEl.textContent = "check failed"; }
       } catch (e) { console.warn("settings load:", e); }
@@ -237,9 +238,8 @@
     // call (not settings_save), so the countdown/clock label updates right
     // away. Flash the same "Saved" confirmation for consistency.
     document.getElementById("settings-autorun-mode")?.addEventListener("change", async (e) => {
-      const _api = window.pywebview?.api;
       try {
-        await _api?.autorun_set_mode?.(e.target.value);
+        await bridgeCall("autorun_set_mode", e.target.value);
         flashSaved(true);
       } catch (err) {
         flashSaved(false);
@@ -266,15 +266,14 @@
       if (metaQueueAll.disabled) return;
       metaQueueAll.disabled = true;
       try {
-        const api = window.pywebview?.api;
-        if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
+        if (!nativeBridgeUp()) { window._showToast?.("Native mode required.", "warn"); return; }
         const ok = await askConfirm("Queue all metadata",
           "Queue a metadata download for EVERY subscribed channel?\n\n" +
           "For a large library this can run for hours and will hammer the yt-dlp " +
           "queue. You can cancel mid-pass from the Sync popover.",
           { confirm: "Queue all" });
         if (!ok) return;
-        const res = await api.metadata_queue_all(false);
+        const res = await bridgeCall("metadata_queue_all", false);
         if (res?.ok) window._showToast?.(`Queued ${res.channels} channel(s).`, "ok");
         else window._showToast?.(res?.error || "Queue failed.", "error");
       } finally {
@@ -285,8 +284,7 @@
       if (metaRefresh.disabled) return;
       metaRefresh.disabled = true;
       try {
-        const api = window.pywebview?.api;
-        if (!api?.metadata_queue_all) { window._showToast?.("Native mode required.", "warn"); return; }
+        if (!nativeBridgeUp()) { window._showToast?.("Native mode required.", "warn"); return; }
         const ok = await askConfirm("Refresh views/likes",
           "Re-fetch view counts and like counts for every video on every channel?\n\n" +
           "Every on-disk video gets re-hit — previously-skipped failures too " +
@@ -294,7 +292,7 @@
           "so this is slow on a 100k-video archive.",
           { confirm: "Refresh" });
         if (!ok) return;
-        const res = await api.metadata_queue_all(true);
+        const res = await bridgeCall("metadata_queue_all", true);
         if (res?.ok) window._showToast?.(`Queued refresh for ${res.channels} channel(s).`, "ok");
         else window._showToast?.(res?.error || "Refresh failed.", "error");
       } finally {
@@ -323,12 +321,12 @@
       };
       // Poll a token until the pass finishes; resolves with the final
       // payload (progress streams to the Download log meanwhile).
-      const pollUntilDone = async (api, token) => {
+      const pollUntilDone = async (token) => {
         const deadline = Date.now() + 60 * 60 * 1000;  // 1h safety
         while (Date.now() < deadline) {
           await new Promise(r => setTimeout(r, 600));
           let p;
-          try { p = await api.realign_poll(token); }
+          try { p = await bridgeCall("realign_poll", token); }
           catch (e) { return { ok: false, error: String(e) }; }
           if (p && !p.pending) return p;
         }
@@ -336,19 +334,18 @@
       };
 
       btn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.realign_start) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         // Mid-pass: the button acts as a Stop control.
         if (stopMode && activeToken) {
-          try { await api.realign_cancel(activeToken); } catch {}
+          try { await bridgeCall("realign_cancel", activeToken); } catch {}
           btn.disabled = true; btn.textContent = "Stopping…";
           return;
         }
         // ── Survey (dry run) ──
         let start;
-        try { start = await api.realign_start(true); }
+        try { start = await bridgeCall("realign_start", true); }
         catch (e) { window._showToast?.(String(e), "error"); return; }
         if (!start?.ok || !start.token) {
           window._showToast?.(start?.error || "Couldn't start scan.", "error");
@@ -358,7 +355,7 @@
         setStop("⏹ Stop scan");
         window._showToast?.(
           "Scanning thumbnails — progress in the Download log…", "ok");
-        const preview = await pollUntilDone(api, activeToken);
+        const preview = await pollUntilDone(activeToken);
         reset();
         if (!preview?.ok) {
           window._showToast?.(preview?.error || "Scan failed.", "error"); return;
@@ -394,7 +391,7 @@
         if (!go) return;
         // ── Move ──
         let mv;
-        try { mv = await api.realign_start(false); }
+        try { mv = await bridgeCall("realign_start", false); }
         catch (e) { window._showToast?.(String(e), "error"); return; }
         if (!mv?.ok || !mv.token) {
           window._showToast?.(mv?.error || "Couldn't start move.", "error"); return;
@@ -403,7 +400,7 @@
         setStop("⏹ Stop move");
         window._showToast?.(
           "Moving thumbnails — progress in the Download log…", "ok");
-        const res = await pollUntilDone(api, activeToken);
+        const res = await pollUntilDone(activeToken);
         reset();
         if (!res?.ok) {
           window._showToast?.(res?.error || "Move failed.", "error"); return;
@@ -434,8 +431,7 @@
       if (!btn || btn._wired) return;
       btn._wired = true;
       btn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.archive_repair_hidden_sidecars) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn"); return;
         }
         const go = await window.askChoice({
@@ -454,7 +450,7 @@
         const orig = btn.textContent;
         btn.textContent = "Repairing…";
         try {
-          const res = await api.archive_repair_hidden_sidecars();
+          const res = await bridgeCall("archive_repair_hidden_sidecars");
           if (res?.already_running) {
             window._showToast?.(
               "A repair pass is already running — see the log.", "warn");
@@ -483,8 +479,7 @@
       const btn = document.getElementById("btn-reset-sync-state");
       if (!btn) return;
       btn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.subs_reset_sync_state) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn");
           return;
         }
@@ -493,7 +488,7 @@
         // minimum UI.
         let channels = [];
         try {
-          const data = await api.get_subs_channels?.();
+          const data = await bridgeCall("get_subs_channels");
           if (Array.isArray(data) && data.length === 2) channels = data[0] || [];
         } catch (_e) { /* fall through */ }
         if (!channels.length) {
@@ -539,7 +534,7 @@
           : Promise.resolve(false));
         if (!ok) return;
         try {
-          const res = await api.subs_reset_sync_state({
+          const res = await bridgeCall("subs_reset_sync_state", {
             url: ch.url, folder: ch.folder, name: ch.name,
           });
           if (res?.ok) {
@@ -570,7 +565,8 @@
       // Reflect a pass already in progress (e.g. user re-opened Settings).
       (async () => {
         try {
-          const s = await window.pywebview?.api?.video_lengths_backfill_running?.();
+          if (!nativeBridgeUp()) return;
+          const s = await bridgeCall("video_lengths_backfill_running");
           if (s?.running) setRunning(true);
         } catch (_e) { /* non-fatal */ }
       })();
@@ -583,20 +579,19 @@
         }
       };
       btn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.video_lengths_backfill_start) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required.", "warn");
           return;
         }
         if (running) {
-          try { await api.video_lengths_backfill_cancel?.(); } catch (_e) {}
+          try { await bridgeCall("video_lengths_backfill_cancel"); } catch (_e) {}
           window._showToast?.("Stopping… lengths filled so far are kept; re-run to resume.", "ok");
           setRunning(false);
           return;
         }
         let missing = 0;
         try {
-          const c = await api.video_lengths_missing_count?.();
+          const c = await bridgeCall("video_lengths_missing_count");
           if (c?.ok) missing = c.missing || 0;
         } catch (_e) { /* non-fatal */ }
         if (!missing) {
@@ -614,7 +609,7 @@
           : Promise.resolve(true));
         if (!ok) return;
         try {
-          const r = await api.video_lengths_backfill_start();
+          const r = await bridgeCall("video_lengths_backfill_start");
           if (r?.ok) {
             setRunning(true);
             window._showToast?.(
@@ -633,7 +628,7 @@
     // persist right after a folder is chosen.)
     browseOut?.addEventListener("click", async () => {
       const cur = document.getElementById("settings-output-dir").value;
-      const res = await window.pywebview?.api?.pick_folder?.("Archive root", cur);
+      const res = await bridgeCall("pick_folder", "Archive root", cur);
       if (res?.ok && res.path) {
         document.getElementById("settings-output-dir").value = res.path;
         saveField("output_dir", res.path);
@@ -641,7 +636,8 @@
     });
     browseVid?.addEventListener("click", async () => {
       const cur = document.getElementById("settings-video-dir").value;
-      const res = await window.pywebview?.api?.pick_folder?.("Single-video downloads", cur);
+      const res = await bridgeCall(
+        "pick_folder", "Single-video downloads", cur);
       if (res?.ok && res.path) {
         document.getElementById("settings-video-dir").value = res.path;
         saveField("video_out_dir", res.path);
@@ -653,16 +649,16 @@
         "Run `yt-dlp -U` to fetch the latest release?\n\nOutput streams to the main log.",
         { confirm: "Update" });
       if (!ok) return;
-      await window.pywebview?.api?.ytdlp_update?.();
+      await bridgeCall("ytdlp_update");
     });
 
     expBtn?.addEventListener("click", async () => {
-      const res = await window.pywebview?.api?.channels_export?.();
+      const res = await bridgeCall("channels_export");
       if (res?.ok) window._showToast?.(`Exported ${res.count} channels.`, "ok");
       else if (!res?.cancelled) window._showToast?.(res?.error || "Export failed.", "error");
     });
     impBtn?.addEventListener("click", async () => {
-      const res = await window.pywebview?.api?.channels_import?.();
+      const res = await bridgeCall("channels_import");
       if (res?.ok) {
         const skipped = res.skipped || 0;
         const reasons = Array.isArray(res.skipped_reasons) ? res.skipped_reasons : [];
@@ -671,9 +667,10 @@
           // the user can see WHY each channel was skipped (already
           // subscribed / missing URL / not a YouTube link / etc.).
           // Previously the toast just said "5 skipped" with no detail.
-          const _esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
-            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
-               '"': "&quot;", "'": "&#39;" }[c]));
+          const _esc = window.YT?.util?.escapeHtml || window._escapeHtml
+            || ((s) => String(s ?? "").replace(/[&<>"']/g, c =>
+              ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+                 '"': "&quot;", "'": "&#39;" }[c])));
           // Group by reason for a tidy summary.
           const byReason = {};
           for (const r of reasons) {
@@ -723,21 +720,18 @@
     });
 
     bkExpBtn?.addEventListener("click", async () => {
-      const res = await window.pywebview?.api?.export_full_backup?.();
+      const res = await bridgeCall("export_full_backup");
       if (res?.ok) window._showToast?.(`Backup saved (${res.files} files).`, "ok");
       else if (!res?.cancelled) window._showToast?.(res?.error || "Backup failed.", "error");
     });
     bkImpBtn?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       // Audit U-11: preview the backup BEFORE overwriting. Two-stage
       // flow: (1) preview returns the ZIP's manifest without writing
       // anything; (2) user reviews the file list + total size; (3) on
       // confirm, the same ZIP path is passed to import_full_backup
       // for the actual restore.
-      const prev = await (api.import_full_backup_preview
-        ? api.import_full_backup_preview()
-        : Promise.resolve(null));
+      const prev = await bridgeCall("import_full_backup_preview");
       if (!prev) {
         // Older backend without preview support \u2014 fall back to legacy
         // one-click flow with the strong-warning askDanger.
@@ -746,7 +740,7 @@
           "A snapshot of the current config is saved to backups/ first, so you can roll back.",
           "Pick ZIP\u2026");
         if (!okLegacy) return;
-        const res = await api.import_full_backup?.();
+        const res = await bridgeCall("import_full_backup");
         _handleImportResult(res);
         return;
       }
@@ -757,9 +751,10 @@
         return;
       }
       // Build the preview list. Each item: name, size, modified.
-      const _esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
-        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
-           '"': "&quot;", "'": "&#39;" }[c]));
+      const _esc = window.YT?.util?.escapeHtml || window._escapeHtml
+        || ((s) => String(s ?? "").replace(/[&<>"']/g, c =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;",
+             '"': "&quot;", "'": "&#39;" }[c])));
       const rows = (prev.items || []).map(it =>
         `<tr>
           <td>${_esc(it.name)}</td>
@@ -803,7 +798,7 @@
       } catch {}
       const confirmRestore = await previewPromise;
       if (!confirmRestore) return;
-      const res = await api.import_full_backup?.(prev.zip_path);
+      const res = await bridgeCall("import_full_backup", prev.zip_path);
       _handleImportResult(res);
     });
 
@@ -814,7 +809,7 @@
           `Restart to apply.`,
           "ok",
           { ttlMs: 10000, action: { label: "Restart now", onClick: () => {
-            window.pywebview?.api?.app_restart?.();
+            bridgeCall("app_restart");
           }}}
         );
       } else if (res?.write_blocked) {

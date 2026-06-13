@@ -30,10 +30,15 @@ import os
 import sqlite3
 from typing import Any
 
-from . import index as _idx
 from .log import get_logger
 
 _log = get_logger(__name__)
+
+
+def _index():
+    """Lazy import to avoid the index <-> index_graph re-export cycle."""
+    from . import index
+    return index
 
 
 def bucket_totals(bucket: str = "month",
@@ -43,7 +48,7 @@ def bucket_totals(bucket: str = "month",
     volume. Matches YTArchiver.py normalize logic that divides word counts
     by per-bucket total then multiplies by 1000.
     """
-    conn = _idx._reader_open()
+    conn = _index()._reader_open()
     if conn is None:
         return {}
     if bucket == "week":
@@ -67,7 +72,7 @@ def bucket_totals(bucket: str = "month",
             args.append(channel)
         sql += " GROUP BY v.upload_ts"
         try:
-            with _idx._reader_lock:
+            with _index()._reader_lock:
                 rows = conn.execute(sql, args).fetchall()
         except sqlite3.Error:
             return {}
@@ -84,7 +89,11 @@ def bucket_totals(bucket: str = "month",
                 continue
             totals[key] = totals.get(key, 0) + int(cnt or 0)
         return totals
-    group_col = "year || '-' || printf('%02d', month)" if bucket == "month" else "year"
+    # month can be NULL (path had no month subfolder); printf('%02d', NULL)
+    # yields '00' -> an invalid 'YYYY-00' tick label. Fall back to year-only.
+    group_col = ("CASE WHEN month IS NULL THEN year "
+                 "ELSE year || '-' || printf('%02d', month) END"
+                 if bucket == "month" else "year")
     sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
            " FROM segments")
     args: list[Any] = []
@@ -93,7 +102,7 @@ def bucket_totals(bucket: str = "month",
         args.append(channel)
     sql += " GROUP BY bucket"
     try:
-        with _idx._reader_lock:
+        with _index()._reader_lock:
             rows = conn.execute(sql, args).fetchall()
     except sqlite3.Error:
         return {}
@@ -134,7 +143,12 @@ def top_words(channel: str | None = None, top_n: int = 120,
     Returns a list of {word, count} sorted descending by count. Used by
     the Graph sub-mode's Word Cloud chart type.
     """
-    conn = _idx._reader_open()
+    # Use an INDEPENDENT connection (not the shared reader) so this 500k-row
+    # scan + Python word-aggregation doesn't hold _reader_lock and freeze every
+    # other reader (Browse / Search / Watch) for the whole duration of a
+    # Word-Cloud open on a huge archive (audit r2). WAL handles concurrent
+    # reads at the DB layer; we close the connection in finally.
+    conn = _index()._open_independent()
     if conn is None:
         return []
     sql = "SELECT text FROM segments"
@@ -145,21 +159,24 @@ def top_words(channel: str | None = None, top_n: int = 120,
     # Cap at a large but finite number so a huge archive doesn't OOM us.
     sql += " LIMIT 500000"
     import re as _re
-    word_re = _re.compile(r"[a-zA-Z][a-zA-Z']{%d,}" % (min_len - 1))
+    word_re = _re.compile(rf"[a-zA-Z][a-zA-Z']{{{min_len - 1},}}")
     counts: dict[str, int] = {}
     try:
-        with _idx._reader_lock:
-            cur = conn.execute(sql, args)
-            for (txt,) in cur:
-                if not txt:
+        cur = conn.execute(sql, args)
+        for (txt,) in cur:
+            if not txt:
+                continue
+            for raw in word_re.findall(txt):
+                w = raw.lower().rstrip("'")
+                if w in _STOP_WORDS:
                     continue
-                for raw in word_re.findall(txt):
-                    w = raw.lower().rstrip("'")
-                    if w in _STOP_WORDS:
-                        continue
-                    counts[w] = counts.get(w, 0) + 1
+                counts[w] = counts.get(w, 0) + 1
     except sqlite3.Error:
         return []
+    finally:
+        try: conn.close()
+        except Exception:
+            pass
     # Top-N
     items = sorted(counts.items(), key=lambda x: -x[1])[:int(top_n)]
     return [{"word": w, "count": c} for w, c in items]
@@ -181,14 +198,14 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
     # on a live sweep / ingest. The UPDATE phase needs the writer
     # connection — they have to be separate handles because the reader
     # has PRAGMA query_only=ON.
-    reader = _idx._reader_open()
-    writer = _idx._open()
+    reader = _index()._reader_open()
+    writer = _index()._open()
     if reader is None or writer is None:
         return {"filled": 0, "skipped": 0}
     filled = 0
     skipped = 0
     try:
-        with _idx._reader_lock:
+        with _index()._reader_lock:
             sql = "SELECT rowid, filepath FROM videos WHERE upload_ts IS NULL"
             if limit > 0:
                 sql += f" LIMIT {int(limit)}"
@@ -197,7 +214,7 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
             try:
                 if fp and os.path.isfile(fp):
                     mtime = os.path.getmtime(fp)
-                    with _idx._db_lock:
+                    with _index()._db_lock:
                         writer.execute(
                             "UPDATE videos SET upload_ts=? WHERE rowid=?",
                             (mtime, rowid))
@@ -206,7 +223,7 @@ def backfill_upload_ts(limit: int = 0) -> dict[str, int]:
                     skipped += 1
             except OSError:
                 skipped += 1
-        with _idx._db_lock:
+        with _index()._db_lock:
             writer.commit()
     except sqlite3.Error:
         pass
@@ -228,7 +245,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
                 upload_ts is NULL are skipped from the week plot; the
                 caller can trigger `backfill_upload_ts()` to populate.
     """
-    conn = _idx._reader_open()
+    conn = _index()._reader_open()
     if conn is None or not word.strip():
         return {"labels": [], "values": []}
     word = word.strip()
@@ -272,7 +289,10 @@ def graph_word_frequency(word: str, channel: str | None = None,
         sql += " GROUP BY v.upload_ts"
     else:
         # FTS5 MATCH to find segments containing the word
-        group_col = ("year || '-' || printf('%02d', month)"
+        # Keep this label expression IDENTICAL to bucket_totals() above so the
+        # Normalize denominator keys match (NULL month -> year-only, never -00).
+        group_col = ("CASE WHEN month IS NULL THEN year "
+                     "ELSE year || '-' || printf('%02d', month) END"
                      if bucket == "month" else "year")
         sql = (f"SELECT {group_col} AS bucket, COUNT(*) "
                f" FROM segments_fts fts "
@@ -284,7 +304,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
             args.append(channel)
         sql += " GROUP BY bucket ORDER BY bucket"
     try:
-        with _idx._reader_lock:
+        with _index()._reader_lock:
             rows = conn.execute(sql, args).fetchall()
     except sqlite3.Error as e:
         return {"labels": [], "values": [], "error": str(e)}
@@ -318,7 +338,7 @@ def graph_word_frequency(word: str, channel: str | None = None,
     backfill_pending = 0
     if bucket == "week":
         try:
-            with _idx._reader_lock:
+            with _index()._reader_lock:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM videos WHERE upload_ts IS NULL"
                 ).fetchone()
@@ -344,7 +364,7 @@ def graph_multi(words: list[str], channel: str | None = None,
     label_set = set()
     for w in words:
         r = graph_word_frequency(w, channel=channel, bucket=bucket)
-        mapping = dict(zip(r.get("labels", []), r.get("values", [])))
+        mapping = dict(zip(r.get("labels", []), r.get("values", []), strict=False))
         per_word[w] = mapping
         label_set.update(mapping.keys())
     labels = sorted(label_set)
@@ -353,11 +373,6 @@ def graph_multi(words: list[str], channel: str | None = None,
         m = per_word[w]
         series.append({"word": w, "values": [m.get(lbl, 0) for lbl in labels]})
     return {"labels": labels, "series": series}
-
-
-# Alias matching main.py's original call site (Session 11)
-graph_word_frequency_multi = graph_multi
-
 
 def graph_channel_overlay(word: str, channels: list[str],
                           bucket: str = "month") -> dict[str, Any]:
@@ -372,7 +387,7 @@ def graph_channel_overlay(word: str, channels: list[str],
     label_set = set()
     for ch in channels:
         r = graph_word_frequency(word, channel=ch, bucket=bucket)
-        mapping = dict(zip(r.get("labels", []), r.get("values", [])))
+        mapping = dict(zip(r.get("labels", []), r.get("values", []), strict=False))
         per_ch[ch] = mapping
         label_set.update(mapping.keys())
     labels = sorted(label_set)
@@ -392,7 +407,7 @@ def graph_word_frequency_multi(words: list[str], channel: str | None = None,
     all_labels = set()
     for w in words:
         r = graph_word_frequency(w, channel=channel, bucket=bucket)
-        per.append({"word": w, "data": dict(zip(r["labels"], r["values"]))})
+        per.append({"word": w, "data": dict(zip(r["labels"], r["values"], strict=False))})
         all_labels.update(r["labels"])
     labels = sorted(all_labels)
     out["labels"] = labels
@@ -406,9 +421,9 @@ def graph_word_frequency_multi(words: list[str], channel: str | None = None,
 
 def list_all_channels_in_db() -> list[str]:
     """Return the distinct set of channels that appear in the segments table."""
-    conn = _idx._reader_open()
+    conn = _index()._reader_open()
     if conn is None:
         return []
-    with _idx._reader_lock:
+    with _index()._reader_lock:
         cur = conn.execute("SELECT DISTINCT channel FROM segments ORDER BY channel COLLATE NOCASE")
         return [r[0] for r in cur.fetchall() if r[0]]

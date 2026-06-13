@@ -11,10 +11,9 @@ drives this.
 from __future__ import annotations
 
 import os
-import re
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..log import get_logger
@@ -22,21 +21,14 @@ from ..log_stream import LogStreamer
 from ..metadata_io import (
     _folder_for_channel,
     _read_metadata_jsonl,
-    _write_metadata_jsonl,
 )
 from ..sync import find_yt_dlp
-from ..text_utils import normalize_title as _canon_norm_title
-from ..utils import sqlite_like_escape as _like_esc
-from .fetcher import fetch_single_video_metadata
-from .scan import _scan_channel_videos
 from ._refresh_proxies import (
-    _ID_RE,
     _enter_pause_wait,
     _exit_pause_wait,
-    _flat_playlist_bulk_stats,
-    _resolve_ids_by_title,
-    backfill_video_ids,
 )
+from .fetcher import fetch_single_video_metadata
+from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
 
@@ -137,8 +129,7 @@ def refresh_channel_comments(channel: dict[str, Any],
                 _s = _s[:-1] + "+00:00"
             _dt = datetime.fromisoformat(_s)
             if _dt.tzinfo is None:
-                from datetime import timezone as _tz
-                _dt = _dt.replace(tzinfo=_tz.utc)
+                _dt = _dt.replace(tzinfo=UTC)
             ts = _dt.timestamp()
         except (ValueError, TypeError):
             return False

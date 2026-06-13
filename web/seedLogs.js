@@ -17,6 +17,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Seed logs from the Python bridge ───────────────────────────────
   //
@@ -26,7 +29,7 @@
     // Give pywebview a brief window to register its API before falling back.
     const pywebviewReady = () =>
       new Promise((resolve) => {
-        if (window.pywebview && window.pywebview.api) {
+        if (nativeBridgeUp()) {
           resolve(true);
           return;
         }
@@ -38,14 +41,13 @@
         };
         window.addEventListener("pywebviewready",
           () => finish(true), { once: true });
-        setTimeout(() => finish(!!(window.pywebview && window.pywebview.api)), 600);
+        setTimeout(() => finish(nativeBridgeUp()), 600);
       });
 
     const ready = await pywebviewReady();
 
     try {
       if (ready) {
-        const api = window.pywebview.api;
         // Each API call is isolated — one failure does NOT cascade.
         const step = async (name, fn) => {
           try { await fn(); }
@@ -62,11 +64,11 @@
         // The Python side guards re-entry via `_startup_fired`, so the
         // duplicate call at the end is a harmless no-op.
         step("startup_ready_early", async () => {
-          await api.startup_ready();
+          await bridgeCall("startup_ready");
         });
 
         await step("runtime_info", async () => {
-          const info = await api.get_runtime_info();
+          const info = await bridgeCall("get_runtime_info");
           if (!info) return;
           console.info("[api] runtime_info:", info);
           const sel = document.getElementById("log-mode-select");
@@ -108,13 +110,13 @@
         });
 
         await step("activity_log_history", async () => {
-          const history = await api.get_activity_log_history();
+          const history = await bridgeCall("get_activity_log_history");
           window.renderActivityLog(history || []);
           window._syncActivityLogVisibility?.();
         });
 
         await step("subs_channels", async () => {
-          const subsData = await api.get_subs_channels();
+          const subsData = await bridgeCall("get_subs_channels");
           if (Array.isArray(subsData) && subsData.length === 2) {
             window.renderSubsTable(subsData[0], subsData[1]);
             window._primeBrowse(subsData[0]);
@@ -126,17 +128,17 @@
         // self-loads from api.list_all_videos when its submode is opened.)
 
         await step("index_summary", async () => {
-          const idx = await api.get_index_summary();
+          const idx = await bridgeCall("get_index_summary");
           if (idx) window._applyIndexSummary?.(idx);
         });
 
         await step("queues", async () => {
-          const q = await api.get_queues();
+          const q = await bridgeCall("get_queues");
           if (q) window.renderQueues(q);
         });
 
         await step("startup_ready", async () => {
-          await api.startup_ready();
+          await bridgeCall("startup_ready");
         });
       } else {
         // pywebview never came up — log and bail. Phase 0's sample.json

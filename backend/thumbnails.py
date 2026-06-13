@@ -95,6 +95,11 @@ def _download_thumbnail(url: str, thumb_dir: str,
     # a duplicate. rename only if the existing file is recent
     # (<30 days); otherwise fall through to re-download so a stale thumb
     # from years ago gets refreshed with the current YouTube URL.
+    # The stale variant is deleted only AFTER the replacement download
+    # commits — deleting up front destroyed the only surviving copy
+    # whenever the fetch failed, and for removed/delisted videos the
+    # cached thumbnail_url 404s forever, making that loss deterministic.
+    _stale_old_thumb = None
     try:
         if os.path.isdir(thumb_dir):
             bracket = f"[{video_id}]"
@@ -111,26 +116,25 @@ def _download_thumbnail(url: str, thumb_dir: str,
                                       ) < (30 * 86400)
                     except OSError:
                         pass
-                    existing_ext = os.path.splitext(existing)[1]
-                    new_fname = f"{safe_title} [{video_id}]{existing_ext}"
-                    new_path = os.path.join(thumb_dir, new_fname)
-                    try:
-                        os.replace(existing_path, new_path)
-                        if _is_recent:
+                    if _is_recent:
+                        existing_ext = os.path.splitext(existing)[1]
+                        new_fname = f"{safe_title} [{video_id}]{existing_ext}"
+                        new_path = os.path.join(thumb_dir, new_fname)
+                        try:
+                            os.replace(existing_path, new_path)
                             return
-                        # Fall through to re-download (YT likely has
-                        # a newer thumbnail). Delete the renamed
-                        # backup so the new download doesn't end up
-                        # coexisting with it for the same video_id —
-                        # without this, _thumbnail_exists_for would
-                        # report True for both files and Browse
+                        except OSError:
+                            pass
+                    else:
+                        # Stale (>30d): leave it untouched on disk and
+                        # fall through to re-download. The success path
+                        # below removes it once the new file is
+                        # committed — otherwise _thumbnail_exists_for
+                        # would report True for both files and Browse
                         # picked arbitrarily (audit: thumbnails.py:
                         # 110-118).
-                        try: os.remove(new_path)
-                        except OSError: pass
+                        _stale_old_thumb = existing_path
                         break
-                    except OSError:
-                        pass
     except OSError:
         pass
 
@@ -201,6 +205,15 @@ def _download_thumbnail(url: str, thumb_dir: str,
         # the thumbnail IS on disk somewhere but find_thumbnail's
         # search path doesn't reach it.
         _log.debug("thumbnail written: %s", fpath)
+        # New download is committed — NOW drop the stale differently-
+        # titled variant for the same [video_id] (deferred from the
+        # dedup pass above so a failed fetch can never destroy the
+        # only surviving copy).
+        if _stale_old_thumb and _stale_old_thumb != fpath:
+            try:
+                os.remove(_stale_old_thumb)
+            except OSError:
+                pass
     except Exception as _te:
         # Non-fatal, but no longer invisible: emit a verbose-only
         # diagnostic so the user can see WHY a Browse thumbnail is

@@ -16,6 +16,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // Hide the whole "Clear ▾" button when there's nothing to clear (BOTH the
   // activity log and the main log are empty). Otherwise clicking it pops an
@@ -74,10 +77,9 @@
         "Permanently clear the activity-log history? This cannot be undone.",
         { confirm: "Clear", danger: true });
       if (!ok) return;
-      const api = window.pywebview?.api;
-      if (api?.autorun_history_clear) {
+      if (nativeBridgeUp()) {
         try {
-          const res = await api.autorun_history_clear();
+          const res = await bridgeCall("autorun_history_clear");
           if (!res?.ok) {
             window._showToast?.(res?.error || "Clear failed.", "error");
             return;
@@ -87,8 +89,10 @@
           return;
         }
       }
-      window.clearLog?.("activity-log");
+      if (window.renderActivityLog) window.renderActivityLog([]);
+      else window.clearLog?.("activity-log");
       try { window._syncActivityLogVisibility?.(); } catch (_e) {}
+      try { window._syncClearButtonVisibility?.(); } catch (_e) {}
       window._showToast?.("Activity log cleared.", "ok");
     }
 

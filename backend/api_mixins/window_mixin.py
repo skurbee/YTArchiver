@@ -75,16 +75,56 @@ class WindowMixin:
         def _kill_via_thread():
             import time as _t
             _t.sleep(0.10)  # let the API response return to JS
+            # WATCHDOG: Quit must ALWAYS quit. If the cleanup below
+            # hangs (Z: spinning up, stuck subprocess join), this
+            # timer pulls the plug unconditionally. 8s outlasts
+            # _shutdown_cleanup's own bounded waits with margin.
+            def _watchdog():
+                _t.sleep(8.0)
+                try:
+                    _ctypes.windll.kernel32.TerminateProcess(
+                        _ctypes.c_void_p(-1), 0)
+                except Exception:
+                    pass
+                import os as _os2
+                _os2._exit(0)
             try:
-                # Best-effort: persist queue state so we don't lose
-                # in-flight enqueue work. Bounded by a 200ms join.
-                save_t = threading.Thread(
-                    target=lambda: self._queues.save_now(),
-                    daemon=True)
-                save_t.start()
-                save_t.join(timeout=0.2)
+                threading.Thread(target=_watchdog, daemon=True).start()
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+            # Hide the window first so Quit FEELS instant even while
+            # cleanup runs (hide-from-bg-thread is the proven tray
+            # pattern).
+            try:
+                if self._window:
+                    self._window.hide()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            # Run the FULL shutdown sequence (queue persist, child-
+            # process kill, server stop, SQLite checkpoint). The old
+            # path skipped it entirely: TerminateProcess does NOT kill
+            # children on Windows, so in-flight yt-dlp/ffmpeg kept
+            # writing to the archive headless and the whisper worker
+            # lingered holding VRAM — and the queue save was capped at
+            # a 200ms join that a waking DrivePool routinely blew
+            # through, abandoning the write mid-flight.
+            _cb = getattr(self, "_shutdown_cleanup_fn", None)
+            if callable(_cb):
+                try:
+                    _cb()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+            else:
+                # Wiring missing (unusual init order) — at least give
+                # the queue save a real chance.
+                try:
+                    save_t = threading.Thread(
+                        target=lambda: self._queues.save_now(),
+                        daemon=True)
+                    save_t.start()
+                    save_t.join(timeout=2.0)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             # Kill the process. TerminateProcess with current
             # process handle (-1 == GetCurrentProcess()) is
             # equivalent to TerminateProcess(GetCurrentProcess(), 0)
@@ -221,13 +261,16 @@ class WindowMixin:
 
 
     def window_quit(self):
-        """Clean-shutdown trigger from JS (Ctrl+Q). Destroys the window."""
-        try:
-            if self._window:
-                self._window.destroy()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
-        return {"ok": True}
+        """Clean-shutdown trigger from JS (Ctrl+Q).
+
+        Routes through confirm_close("quit") — the deferred path with
+        the watchdog + full cleanup. The old direct
+        self._window.destroy() ran on the JS bridge thread, which is
+        the EXACT documented deadlock confirm_close was rewritten to
+        avoid in 2026-05-13 (full freeze, task-manager kill), and it
+        also skipped queue save + child-process cleanup entirely.
+        """
+        return self.confirm_close("quit", False)
 
 
     def app_restart(self):
@@ -246,6 +289,29 @@ class WindowMixin:
             # would race the new instance's port-bind (~2.5s kill
             # vs new instance startup), so dropping it here also
             # eliminates the brief two-instance window.
+            # Release the single-instance mutex BEFORE launching the
+            # child. The old instance held it through its multi-second
+            # teardown, so the child's import-time CreateMutexW saw
+            # ERROR_ALREADY_EXISTS and exited — "restart" silently
+            # became "quit" (deterministically under `python main.py`,
+            # a coin flip for the frozen exe). Accessed via
+            # sys.modules["__main__"]: `import main` here would
+            # RE-EXECUTE main.py's module level — including the mutex
+            # check — inside this very process. (If the Popen below
+            # fails, we keep running without the mutex; acceptable —
+            # the user just retries the restart.)
+            try:
+                import ctypes as _ct
+                _main_mod = sys.modules.get("__main__")
+                _mx = getattr(_main_mod, "_INSTANCE_MUTEX", None)
+                if _mx:
+                    _ct.windll.kernel32.CloseHandle(_mx)
+                    try:
+                        _main_mod._INSTANCE_MUTEX = None
+                    except Exception:
+                        pass
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             if getattr(sys, "frozen", False):
                 # Running as PyInstaller exe — relaunch the .exe itself.
                 subprocess.Popen([sys.executable],

@@ -347,6 +347,28 @@ def load_config() -> dict[str, Any]:
                             CONFIG_FILE.rename(_corrupt_path)
                         except OSError:
                             pass
+                        # Persist the recovered snapshot back to
+                        # CONFIG_FILE immediately. After the sideline
+                        # rename above CONFIG_FILE no longer exists, so
+                        # without this every later load — same session
+                        # or next launch — short-circuits to factory
+                        # defaults at the top of this function, and the
+                        # first save_config from any caller would
+                        # permanently commit the wiped state.
+                        try:
+                            if save_config(merged):
+                                _log.warning(
+                                    "recovered config persisted back "
+                                    "to %s", CONFIG_FILE.name)
+                            else:
+                                _log.error(
+                                    "recovered config could NOT be "
+                                    "persisted — restore %s manually "
+                                    "from backups/ before changing any "
+                                    "settings", CONFIG_FILE)
+                        except Exception as _pe:
+                            _log.error(
+                                "recovered-config save failed: %s", _pe)
                         return merged
                     except (json.JSONDecodeError, OSError):
                         continue
@@ -379,8 +401,16 @@ def config_transaction():
     transactions don't deadlock — but the inner transaction will see
     the outer's mutations and its save fires when IT exits, not when
     the outer exits.
+
+    Holds _config_lock for the WHOLE block (load + mutate + save) too, so a
+    plain save_config() from another thread is excluded for the transaction's
+    duration. Without it, the transaction (which took _config_tx_lock) and a
+    bare save_config (which takes _config_lock) raced and lost updates (audit
+    r2). Both are RLocks acquired in a consistent order, and load_config/
+    save_config re-acquire _config_lock reentrantly. Keep transaction blocks
+    short — they run while holding _config_lock.
     """
-    with _config_tx_lock:
+    with _config_tx_lock, _config_lock:
         cfg = load_config()
         try:
             yield cfg
@@ -583,7 +613,6 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
     for ch in channels:
         folder = ch.get("name", "") or ch.get("folder", "")
         res = (ch.get("resolution", "") or "").strip() or "—"
-        mode = ch.get("mode", "")
         # YTArchiver stores min/max as SECONDS on disk (180 = 3 minutes).
         # Display in minutes to match the original UI + user expectation.
         # sub-minute durations used to floor to "0m" which the
@@ -645,8 +674,9 @@ def channels_for_subs_ui(cfg: dict[str, Any]):
         _pending_tx_list = ch.get("pending_tx_ids") or []
         _pending_tx_n = len(_pending_tx_list) if isinstance(_pending_tx_list, list) else 0
 
-        def _mark(auto_key: str, enabled: bool, behind: int = 0) -> str:
-            is_auto = bool(ch.get(auto_key))
+        def _mark(auto_key: str, enabled: bool, behind: int = 0,
+                  _ch=ch) -> str:
+            is_auto = bool(_ch.get(auto_key))
             delta = f" -{behind}" if behind > 0 else ""
             if enabled and is_auto: return f"A \u2713{delta}"
             if enabled: return f"\u2713{delta}"
@@ -770,6 +800,7 @@ def recent_for_ui(cfg: dict[str, Any]):
     # backend.index already imports this module for some helpers.
     try:
         from .index import _file_url as _thumb_url
+
         # Channel-wide resolver (not the narrow find_thumbnail): catches
         # thumbnails that live in a sibling year/month .Thumbnails/ folder,
         # which the Recent tab otherwise rendered as a gradient placeholder

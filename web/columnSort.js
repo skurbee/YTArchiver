@@ -13,6 +13,15 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Column sort on Subs + Recent tables ─────────────────────────────
   function initColumnSort() {
     // Subs table
@@ -188,7 +197,6 @@
   function _wireSubsBulkButtons() {
     const tbody = document.getElementById("subs-table-body");
     if (!tbody) return;
-    const api = () => window.pywebview?.api;
     const clear = () => {
       tbody.querySelectorAll("tr.row-selected")
         .forEach(r => r.classList.remove("row-selected"));
@@ -218,7 +226,7 @@
           ],
         }) : null);
         if (!pick) return;
-        const res = await api()?.subs_bulk_update?.(names, { resolution: pick });
+        const res = await bridgeCall("subs_bulk_update", names, { resolution: pick });
         if (res?.ok) {
           window._showToast?.(
             `Updated ${res.updated} channel(s) to ${pick}.`, "ok");
@@ -245,7 +253,7 @@
         }) : null);
         if (!pick) return;
         const changes = { auto_transcribe: pick === "on" };
-        const res = await api()?.subs_bulk_update?.(names, changes);
+        const res = await bridgeCall("subs_bulk_update", names, changes);
         if (res?.ok) {
           window._showToast?.(
             `Updated ${res.updated} channel(s).`, "ok");
@@ -267,7 +275,7 @@
           `fires as soon as the current sync is idle.`,
           { confirm: "Queue all" });
         if (!ok) return;
-        const res = await api()?.subs_bulk_queue_metadata?.(names, true);
+        const res = await bridgeCall("subs_bulk_queue_metadata", names, true);
         if (res?.ok) {
           window._showToast?.(
             `Queued metadata refresh for ${res.queued} channel(s).`, "ok");
@@ -295,7 +303,7 @@
         }) : null);
         if (!choice) return;
         const deleteFiles = choice === "delete";
-        const res = await api()?.subs_bulk_delete?.(names, deleteFiles);
+        const res = await bridgeCall("subs_bulk_delete", names, deleteFiles);
         if (res?.ok) {
           window._showToast?.(
             `Removed ${res.deleted} channel(s).`, "ok");
@@ -404,7 +412,6 @@
       const chan = tr.dataset.channelName
         || (tr.querySelector(".col-folder")?.textContent || "").trim();
 
-      const api = window.pywebview?.api;
       // Dynamic-label helpers — peek at live queue state so menu items
       // reflect what's already queued. Matches OLD's _chan_ctx_menu label
       // mutation (YTArchiver.py:5596 — "Add to Sync List" → "Already in
@@ -425,13 +432,18 @@
                      : _gpuState === "queued" ? "Already queued for transcribe"
                                                : "Transcribe channel";
       const _txDisabled = Boolean(_gpuState);
+      // Removing a channel while a sync/transcribe is active can race the
+      // running pipeline, so block Remove (with an explanatory tooltip) until
+      // the queues are idle. (Previously the item was only cosmetically dimmed
+      // and still fired during a sync.)
+      const _removeBlocked = (window._anySyncRunning?.() || false) || Boolean(_gpuState);
       // Match YTArchiver.py _chan_ctx_menu (line 5596-6180): 15-item menu
       // with sub-menus for organization mode + redownload quality.
       showContextMenu(e.clientX, e.clientY, [
         { label: _syncLabel, cls: _syncDisabled ? "dim" : "",
           action: async () => {
             if (_syncDisabled) return;
-            const r = await api?.sync_one_channel?.({ name: chan });
+            const r = await bridgeCall("sync_one_channel", { name: chan });
             if (r?.ok && r?.queued) {
               window._showToast?.(`Added "${r.name || chan}" to sync queue.`, "ok");
             } else if (r?.error) {
@@ -439,15 +451,15 @@
             }
           }},
         { label: "Edit settings", action: () => window._editChannelFromContext?.(chan) },
-        { label: "Open folder", action: () => api?.chan_open_folder?.(chan) },
-        { label: "Open URL in browser", action: () => api?.chan_open_url?.(chan) },
+        { label: "Open folder", action: () => bridgeCall("chan_open_folder", chan) },
+        { label: "Open URL in browser", action: () => bridgeCall("chan_open_url", chan) },
         { sep: true },
         { label: "Reorg folder",
           submenu: [
-            { label: "Flat (no split)", action: () => api?.reorg_channel_folder?.({ name: chan }, false, false, false) },
-            { label: "Split by year", action: () => api?.reorg_channel_folder?.({ name: chan }, true, false, false) },
-            { label: "Split by year + month", action: () => api?.reorg_channel_folder?.({ name: chan }, true, true, false) },
-            { label: "Re-apply organization", action: () => api?.reorg_channel_folder?.({ name: chan }, null, null, false) },
+            { label: "Flat (no split)", action: () => bridgeCall("reorg_channel_folder", { name: chan }, false, false, false) },
+            { label: "Split by year", action: () => bridgeCall("reorg_channel_folder", { name: chan }, true, false, false) },
+            { label: "Split by year + month", action: () => bridgeCall("reorg_channel_folder", { name: chan }, true, true, false) },
+            { label: "Re-apply organization", action: () => bridgeCall("reorg_channel_folder", { name: chan }, null, null, false) },
             // Recheck-dates + fix-file-dates are long operations — OLD app
             // shows an all-caps warning dialog. YTArchiver.py:5721-5742.
             { label: "Re-check dates + year/month", action: async () => {
@@ -456,7 +468,7 @@
                 `\u26A0\uFE0F WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS`,
                 "Re-check dates");
               if (!ok) return;
-              api?.reorg_channel_folder?.({ name: chan }, true, true, true);
+              bridgeCall("reorg_channel_folder", { name: chan }, true, true, true);
             }},
             { label: "Fix file dates only", action: async () => {
               const ok = await askDanger("Fix file dates",
@@ -465,7 +477,7 @@
                 `\u26A0\uFE0F WARNING: THIS CAN TAKE MULTIPLE HOURS ON LARGE CHANNELS`,
                 "Fix dates");
               if (!ok) return;
-              api?.chan_fix_file_dates?.({ name: chan });
+              bridgeCall("chan_fix_file_dates", { name: chan });
             }},
           ]},
         // "Fetch channel art" used to live here but the user flagged it as
@@ -486,7 +498,7 @@
               + `Whisper ${model}?\n\nThis can take hours on large channels.`,
             "Queue all");
           if (!ok) return;
-          const res = await api?.transcribe_retranscribe_channel?.(
+          const res = await bridgeCall("transcribe_retranscribe_channel",
             { name: chan }, model);
           if (res?.ok) {
             window._showToast?.(
@@ -497,7 +509,7 @@
                                 "error");
           }
         }},
-        { label: "Download metadata", action: () => api?.metadata_recheck_channel?.({ name: chan }) },
+        { label: "Download metadata", action: () => bridgeCall("metadata_recheck_channel", { name: chan }) },
         { sep: true },
         // Pending-redownload swap: when `_redownload_progress.json` is
         // present for this channel (flagged by the backend via
@@ -515,7 +527,7 @@
               const res = tr.dataset.redownloadRes || "";
               if (!res) return;
               try {
-                const r = await api?.chan_redownload?.({ name: chan }, res);
+                const r = await bridgeCall("chan_redownload", { name: chan }, res);
                 if (!r) return;
                 if (!r.ok) {
                   window._showToast?.(r.error || "Redownload failed", "error");
@@ -545,13 +557,17 @@
             ]},
         ]),
         { sep: true },
-        { label: "Remove channel", cls: "dim", action: async () => {
+        { label: "Remove channel",
+          cls: _removeBlocked ? "disabled" : "dim",
+          title: _removeBlocked ? "Can't remove while syncing or processing" : "",
+          action: async () => {
+          if (_removeBlocked) return;
           // Two-step (subscription → optional disk delete) via shared helper.
           const res = await window._removeChannelWithPrompt(chan);
           if (!res || !res.ok) return;
           // Refresh Subs data without a full page reload, so the undo toast survives
-          if (api?.get_subs_channels) {
-            const data = await api.get_subs_channels();
+          if (nativeBridgeUp()) {
+            const data = await bridgeCall("get_subs_channels");
             if (Array.isArray(data) && data.length === 2) {
               window.renderSubsTable(data[0], data[1]);
               window._primeBrowse?.(data[0]);
@@ -565,10 +581,10 @@
               action: {
                 label: "Undo",
                 onClick: async () => {
-                  const u = await api.subs_undo_remove();
+                  const u = await bridgeCall("subs_undo_remove");
                   if (u?.ok) {
                     window._showToast?.("Channel restored.", "ok");
-                    const data = await api.get_subs_channels();
+                    const data = await bridgeCall("get_subs_channels");
                     if (Array.isArray(data) && data.length === 2) {
                       window.renderSubsTable(data[0], data[1]);
                       window._primeBrowse?.(data[0]);

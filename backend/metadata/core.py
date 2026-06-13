@@ -361,6 +361,12 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
     _stdout_thread.start()
     # If no new line arrives for 60s, treat as stall and terminate.
     _STALL_TIMEOUT_S = 60.0
+    # Completeness tracking: consumers (refresh_views removed-from-YT
+    # detection) must be able to tell a FULL catalog walk from one cut
+    # short by cancel / stall / yt-dlp dying mid-walk — treating a
+    # partial dict as complete mass-flagged thousands of live videos
+    # as "removed from YouTube".
+    _walk_complete = False
     try:
         while True:
             try:
@@ -374,6 +380,7 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
                 except Exception as e: _log.debug("swallowed: %s", e)
                 break
             if raw is _STDOUT_SENTINEL:
+                _walk_complete = True  # natural EOF — full walk
                 break
             if cancel_event is not None and cancel_event.is_set():
                 try: proc.terminate()
@@ -447,12 +454,14 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
         try: proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.terminate()
+            _walk_complete = False
             # Reap the zombie so it doesn't linger until GC (audit:
             # metadata/core.py L42). 5s cap matches our other
             # terminate-then-wait patterns.
             try: proc.wait(timeout=5)
             except Exception: pass
     except Exception as e:
+        _walk_complete = False
         stream.emit_dim(f" (stats read error: {e})")
         try:
             proc.terminate()
@@ -504,7 +513,16 @@ def _flat_playlist_bulk_stats(yt: str, ch_url: str,
             return _flat_playlist_bulk_stats(
                 yt, canonical, stream, cancel_event, pause_event,
                 queues=queues, progress_cb=progress_cb)
-    return out
+    # Attach the completeness flag out-of-band (dict subclass) so the
+    # by-id mapping shape every consumer iterates stays untouched.
+    class _BulkResult(dict):
+        complete = False
+    _res = _BulkResult(out)
+    try:
+        _res.complete = bool(_walk_complete and proc.returncode == 0)
+    except Exception:
+        _res.complete = False
+    return _res
 
 
 def _resolve_channel_id_url(yt: str, handle_url: str) -> str:
@@ -754,6 +772,18 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
     _t0 = time.time()
 
     def _fetch_one(vid: str) -> tuple[str, str]:
+        # Honor pause/cancel HERE — executor worker threads keep
+        # pulling queued tasks regardless of what the as_completed
+        # loop does (as_completed only OBSERVES futures), so this is
+        # the only place pause can actually stop new fetches from
+        # launching and cancel can stop the queue from draining at
+        # full network rate.
+        if cancel_event is not None and cancel_event.is_set():
+            return (vid, "")
+        while pause_event is not None and pause_event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                return (vid, "")
+            time.sleep(0.25)
         url = f"https://www.youtube.com/watch?v={vid}"
         cmd = [yt, "--skip-download", "--no-warnings",
                "--print", "%(upload_date)s",
@@ -787,6 +817,15 @@ def _fetch_per_video_upload_dates(yt: str, vids: list[str],
         fut_to_vid = {ex.submit(_fetch_one, v): v for v in vids}
         for fut in as_completed(fut_to_vid):
             if cancel_event is not None and cancel_event.is_set():
+                # Drop everything still queued NOW — exiting the
+                # with-block runs shutdown(wait=True) with
+                # cancel_futures=False, which would let every queued
+                # 30s yt-dlp fetch run to completion anyway
+                # (multi-minute "hung" cancel + pointless YT traffic).
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
                 break
             if pause_event is not None and pause_event.is_set():
                 # Worker threads don't honor pause mid-call (they're
@@ -1009,6 +1048,35 @@ def backfill_video_ids(channel: dict[str, Any],
     # YT vid whose duration is within ±2s of the local file's, OR ""
     # if zero / multiple candidates exist (with title-similarity
     # tiebreak for the multi case when there's a clear winner).
+    # Lazy one-shot set of vids ALREADY bound to an on-disk file in the
+    # videos table. The weak single-candidate strategies (date-only,
+    # duration-only) must never bind a file to a vid whose own file is
+    # already resolved — that is exactly how archived-then-deleted
+    # videos got stamped with a DIFFERENT video's id (then pruned as
+    # "duplicates" or redownload-replaced with the wrong content).
+    _db_bound_vids: set = set()
+    _db_bound_loaded = [False]
+    def _load_db_bound():
+        if _db_bound_loaded[0]:
+            return
+        _db_bound_loaded[0] = True
+        try:
+            from .. import index as _idx_db
+            _c_db = _idx_db._reader_open()
+            if _c_db is not None:
+                _chn_db = (channel.get("name")
+                           or channel.get("folder") or "")
+                with _idx_db._reader_lock:
+                    for _r in _c_db.execute(
+                            "SELECT video_id FROM videos "
+                            "WHERE channel=? COLLATE NOCASE "
+                            "AND video_id IS NOT NULL AND video_id != '' "
+                            "AND filepath IS NOT NULL AND filepath != ''",
+                            (_chn_db,)):
+                        _db_bound_vids.add(_r[0])
+        except Exception as _dbe:
+            _log.debug("swallowed: %s", _dbe)
+
     def _find_duration_match(local_dur: float | None,
                               needle_nt: str) -> str:
         if local_dur is None or local_dur <= 0:
@@ -1034,6 +1102,12 @@ def backfill_video_ids(channel: dict[str, Any],
                 seen.add(_v)
                 uniq.append(_v)
         if len(uniq) == 1:
+            # Refuse a candidate whose own file is already bound —
+            # this file's video is likely deleted-from-YT and absent
+            # from the catalog entirely.
+            _load_db_bound()
+            if uniq[0] in _db_bound_vids:
+                return ""
             return uniq[0]
         # Multiple duration-near-ties. Only accept if there's a clear
         # title-similarity winner — otherwise fall through to other
@@ -1056,6 +1130,9 @@ def backfill_video_ids(channel: dict[str, Any],
         if scored[0][1] < 0.50:
             return ""
         if len(scored) >= 2 and (scored[0][1] - scored[1][1]) < 0.15:
+            return ""
+        _load_db_bound()
+        if scored[0][0] in _db_bound_vids:
             return ""
         return scored[0][0]
 
@@ -1178,7 +1255,7 @@ def backfill_video_ids(channel: dict[str, Any],
         # Strip ambiguous titles from both the lookup and the search set.
         for _amb in _ambiguous_titles:
             _title_to_vid_local.pop(_amb, None)
-        _shortlist_titles = [t for t in _title_to_vid_local.keys()]
+        _shortlist_titles = list(_title_to_vid_local)
         from difflib import SequenceMatcher, get_close_matches
         # Ask for more matches than before (5 instead of 3) so the
         # date-based tiebreak has room to operate when several
@@ -1267,7 +1344,29 @@ def backfill_video_ids(channel: dict[str, Any],
         if not cands:
             return ""
         if len(cands) == 1:
-            return cands[0][0]
+            _cv, _cnt, _cyd = cands[0]
+            # Date alone is too weak to bind: the catalog only holds
+            # videos still ON YouTube, and the files reaching this
+            # strategy are disproportionately archived-then-deleted
+            # ones whose real video can't be in the catalog at all.
+            # Require the candidate to be unbound AND confirmed by
+            # duration (±2s) or title similarity.
+            _load_db_bound()
+            if _cv in _db_bound_vids:
+                return ""
+            if (local_dur is not None and local_dur > 0
+                    and _cyd is not None and _cyd > 0):
+                return _cv if abs(_cyd - local_dur) <= 2.0 else ""
+            try:
+                from difflib import SequenceMatcher as _SM
+                _fn_nt = _norm_title_for_match(
+                    os.path.splitext(os.path.basename(filepath))[0])
+                if (_fn_nt and _cnt
+                        and _SM(None, _fn_nt, _cnt).ratio() >= 0.50):
+                    return _cv
+            except Exception:
+                pass
+            return ""
         if local_dur is None or local_dur <= 0:
             return ""
         best = ""
@@ -1281,6 +1380,10 @@ def backfill_video_ids(channel: dict[str, Any],
                 best = _v
             elif abs(_diff - best_diff) < 0.5 and best:
                 # Two videos same day, near-equal duration — ambiguous.
+                return ""
+        if best:
+            _load_db_bound()
+            if best in _db_bound_vids:
                 return ""
         return best
 

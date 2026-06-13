@@ -234,6 +234,12 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
     # Prefer the process-singleton manager so we share VRAM with the
     # live transcribe worker. Two managers each load the CUDA model
     # and can OOM low-VRAM GPUs (audit: H44).
+    # Track whether WE created this manager. The shared/singleton manager is
+    # also used by the live transcribe worker (one CUDA model, shared VRAM —
+    # audit H44); _stop()-ing it in our finally would kill the punctuation
+    # subprocess out from under a concurrent sync/transcribe pass. Only a
+    # privately-created fallback instance is ours to stop.
+    _punct_mgr_private = False
     if shared_punct_mgr is not None:
         punct_mgr = shared_punct_mgr
     else:
@@ -242,6 +248,7 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
             punct_mgr = get_shared_punct_manager(log_stream)
         except Exception:
             punct_mgr = PunctuationManager(log_stream)
+            _punct_mgr_private = True
     if not punct_mgr.is_available():
         log_stream.emit_error(
             " — Restore punctuation: Python 3.11 + punctuation worker "
@@ -379,8 +386,9 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 log_stream.emit_error(
                     f"   [{i}/{len(work)}] FAIL {vid}  {short} — "
                     f"no DB segments\n")
-                if scope_url and not dry_run:
-                    _append_progress(scope_url, vid)
+                # Do NOT persist FAILs to the progress file — failures
+                # must be retried on the next resume, not silently
+                # skipped forever (same policy as repair_captions).
                 continue
 
             # Skip if the concatenated text already looks punctuated.
@@ -477,8 +485,11 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 log_stream.emit_error(
                     f"   [{i}/{len(work)}] FAIL {vid}  {short} — "
                     f"write-back: {e}\n")
-                if scope_url:
-                    _append_progress(scope_url, vid)
+                # Do NOT persist FAILs to the progress file — a
+                # transient lock/disk failure would otherwise exclude
+                # this video from punct restore forever (and could
+                # freeze a JSONL/DB text divergence in place). Retried
+                # on the next resume, same policy as repair_captions.
                 continue
 
             ok_count += 1
@@ -501,10 +512,13 @@ def restore_punctuation_archive(*, output_dir: str, log_stream,
                 try: queues.set_sync_pass_progress(i, len(work))
                 except Exception as e: _log.debug("swallowed: %s", e)
     finally:
-        try:
-            punct_mgr._stop()
-        except Exception as e:
-            _log.debug("swallowed: %s", e)
+        # Only stop a manager WE created privately — never the shared singleton,
+        # which may be serving a live transcribe pass (see acquisition above).
+        if _punct_mgr_private:
+            try:
+                punct_mgr._stop()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
         try:
             conn.close()
         except Exception as e:

@@ -20,6 +20,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initLogContextMenu() {
     const handlers = [
       { el: document.getElementById("main-log"), label: "Main log" },
@@ -58,8 +68,8 @@
         items.push({ label: "Save to file…",
           action: async () => {
             const text = el.innerText;
-            if (window.pywebview?.api?.save_text_to_file) {
-              const res = await window.pywebview.api.save_text_to_file("ytarchiver_log.txt", text);
+            if (nativeBridgeUp()) {
+              const res = await bridgeCall("save_text_to_file", "ytarchiver_log.txt", text);
               if (res?.ok) window._showToast?.("Log saved.", "ok");
               else window._showToast?.(res?.error || "Save failed.", "error");
             } else {

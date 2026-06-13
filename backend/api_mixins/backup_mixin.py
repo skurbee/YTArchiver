@@ -177,13 +177,18 @@ class BackupMixin:
                 APP_DATA_DIR / "ytarchiver_livestream_defer.json",
                 APP_DATA_DIR / "ytarchiver_pending_transcribe.json",
             ]
-            # opt-in include of the FTS DB if it fits.
+            # opt-in include of the FTS DB if it fits. NOTE: the DB is
+            # NOT appended to `candidates` — it gets a safe sqlite3
+            # backup-API snapshot below instead of a raw file copy
+            # (raw copy of a live WAL-mode DB misses every transaction
+            # still in the -wal and can tear mid-read).
             _fts_skipped_reason = ""
+            _include_fts = False
             try:
                 if TRANSCRIPTION_DB.exists():
                     _fts_sz = TRANSCRIPTION_DB.stat().st_size
                     if _fts_sz < 2 * 1024 * 1024 * 1024:
-                        candidates.append(TRANSCRIPTION_DB)
+                        _include_fts = True
                     else:
                         _fts_skipped_reason = (
                             f"FTS DB skipped — too large "
@@ -221,6 +226,35 @@ class BackupMixin:
                         if p.exists():
                             zf.write(str(p), arcname=p.name)
                             n += 1
+                    if _include_fts:
+                        # Consistent point-in-time snapshot of the live
+                        # WAL-mode DB via sqlite3's backup API. zipping
+                        # the .db file raw silently dropped the -wal's
+                        # committed transactions and could produce a
+                        # torn (unreadably corrupt) copy if a
+                        # checkpoint ran mid-read — discovered only at
+                        # restore time.
+                        import sqlite3 as _sq3
+                        import tempfile as _tf
+                        _fd, _snap = _tf.mkstemp(suffix=".db")
+                        os.close(_fd)
+                        try:
+                            _src = _sq3.connect(
+                                f"file:{TRANSCRIPTION_DB}?mode=ro",
+                                uri=True, timeout=60)
+                            try:
+                                _dst = _sq3.connect(_snap)
+                                try:
+                                    _src.backup(_dst)
+                                finally:
+                                    _dst.close()
+                            finally:
+                                _src.close()
+                            zf.write(_snap, arcname=TRANSCRIPTION_DB.name)
+                            n += 1
+                        finally:
+                            try: os.remove(_snap)
+                            except OSError: pass
                     backup_dir = APP_DATA_DIR / "backups"
                     if backup_dir.is_dir():
                         snaps = sorted(backup_dir.glob("config_*.json"),
@@ -423,8 +457,7 @@ class BackupMixin:
                     # the raw name, which on Windows can contain
                     # drive-qualified paths that write anywhere.
                     _bad_chars = (".." in name.split("/")
-                                  or name.startswith("/")
-                                  or name.startswith("\\")
+                                  or name.startswith(("/", "\\"))
                                   or (len(name) > 1 and name[1] == ":"))
                     if _bad_chars:
                         skipped.append(f"{name} (rejected — suspicious path)")

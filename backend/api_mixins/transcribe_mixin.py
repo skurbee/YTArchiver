@@ -17,8 +17,32 @@ class TranscribeMixin:
 
     def transcribe_enqueue(self, path, title=""):
         """Queue a video for transcription."""
+        # Derive the channel from the index DB so the transcribe worker can
+        # resolve the correct conjoined Transcript.txt path. The manual
+        # "Transcribe now" JS call passes only (path, title); with no channel,
+        # _resolve_transcript_paths falls back to folder_name="" and writes the
+        # transcript to the archive ROOT with an empty name — so manual
+        # transcribe reached the FTS index but produced NO on-disk
+        # Transcript.txt / .jsonl in the channel folder. Falls back to "" (the
+        # prior behavior) if the lookup misses, so there's no regression.
+        _channel = ""
         try:
-            ok = self._transcribe.enqueue(path, title)
+            from backend import index as _idx
+            _rconn = _idx._reader_open()
+            if _rconn is not None:
+                _cands = [str(path), os.path.normpath(str(path))]
+                with _idx._reader_lock:
+                    for _fp in _cands:
+                        _row = _rconn.execute(
+                            "SELECT channel FROM videos WHERE filepath = ? "
+                            "LIMIT 1", (_fp,)).fetchone()
+                        if _row and _row[0]:
+                            _channel = _row[0]
+                            break
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+        try:
+            ok = self._transcribe.enqueue(path, title, channel=_channel)
         except Exception as _e:
             # surface the error instead of the silent
             # {ok: False} that the old code returned. Caller can
@@ -66,18 +90,86 @@ class TranscribeMixin:
             folder = paths if isinstance(paths, str) else paths[0]
             queued = 0
             skipped = 0
+            # Channel + dedup support. The old walk enqueued with NO
+            # channel (transcripts landed at the archive ROOT with an
+            # empty name — the same bug transcribe_enqueue had before
+            # its v78.2 fix) and deduped only on the legacy per-video
+            # .jsonl sidecar, which never exists in the aggregated
+            # layout — so every already-transcribed video was re-run
+            # through Whisper AND appended as a duplicate entry.
+            from backend import index as _idx
+            _title_cache: dict[str, set] = {}
+            try:
+                from backend.transcribe.helpers import (
+                    _resolve_transcript_paths,
+                    _scan_existing_transcript_titles,
+                )
+                from backend.transcribe.transcribe_files import _norm_title
+                _have_agg = True
+            except Exception:
+                _have_agg = False
+
+            def _channel_for(video):
+                try:
+                    _rconn = _idx._reader_open()
+                    if _rconn is None:
+                        return ""
+                    for _fp in (str(video), os.path.normpath(str(video))):
+                        with _idx._reader_lock:
+                            _row = _rconn.execute(
+                                "SELECT channel FROM videos "
+                                "WHERE filepath = ? LIMIT 1",
+                                (_fp,)).fetchone()
+                        if _row and _row[0]:
+                            return _row[0]
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                return ""
+
+            def _already_done(video, title, channel):
+                # Legacy per-video sidecar (older builds).
+                if os.path.isfile(os.path.splitext(video)[0] + ".jsonl"):
+                    return True
+                if not _have_agg:
+                    return False
+                # Aggregated-transcript membership — same check
+                # load_pending uses (transcribe/core.py).
+                try:
+                    _p = _resolve_transcript_paths(video, title, channel)
+                    if _p is None:
+                        return False
+                    _txt = _p[0]
+                    _fdir = os.path.dirname(_txt)
+                    _fkey = (os.path.dirname(_fdir)
+                             if os.path.basename(_fdir).isdigit()
+                             else _fdir)
+                    _ck = f"{channel}::{_fkey}"
+                    _titles = _title_cache.get(_ck)
+                    if _titles is None:
+                        _titles = _scan_existing_transcript_titles(
+                            _fkey, channel)
+                        _title_cache[_ck] = _titles
+                    return _norm_title(title) in _titles
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
+                    return False
+
             for dp, _dns, fns in os.walk(folder):
                 for fn in fns:
                     if not fn.lower().endswith((".mp4", ".mkv", ".webm", ".m4a", ".mov")):
                         continue
                     video = os.path.join(dp, fn)
-                    base = os.path.splitext(video)[0]
-                    if os.path.isfile(base + ".jsonl"):
+                    title = os.path.splitext(fn)[0]
+                    _ch = _channel_for(video)
+                    if _already_done(video, title, _ch):
                         skipped += 1
                         continue
-                    title = os.path.splitext(fn)[0]
-                    self._transcribe.enqueue(video, title)
+                    self._transcribe.enqueue(video, title, channel=_ch)
                     queued += 1
+            try:
+                self._on_queue_changed()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
             self._log_stream.emit([
                 ["[GPU] ", "trans_bracket"],
                 [f"Transcribe folder \u2014 {os.path.basename(folder)}: ", "simpleline_blue"],

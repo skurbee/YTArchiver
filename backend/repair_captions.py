@@ -800,14 +800,20 @@ def repair_archive(*, output_dir: str, log_stream,
         success, msg, n_segs, n_words = _repair_one_video(
             yt_dlp, j, t, vid, tag, dry_run, log_stream, cancel_event,
             db_conn=db_conn)
-        # Record progress AFTER each outcome (success/skip/fail-non-429)
-        # so a restart picks up after the last completed video. We don't
-        # record "rate-limited (all retries exhausted)" failures — those
-        # were aborts from a sustained throttle, not the video's fault,
-        # and they should be retried on the next resume.
-        _persist_this = (scope_url and not dry_run
-                         and "rate-limited" not in (msg or "")
-                         and "cancelled" not in (msg or ""))
+        # Record progress only for a GENUINE success or a deliberate
+        # "skipped:" downgrade, so a restart resumes after the last truly-done
+        # video. Do NOT persist hard FAILs, the "DB skipped" partial (JSONL
+        # written but the DB UPDATE failed), rate-limited aborts, or cancels —
+        # those MUST be retried on the next resume rather than silently skipped
+        # forever (audit r2). (Permanent fails like "no captions" re-check each
+        # run, which also catches captions added to YT later.)
+        _persist_this = (
+            scope_url and not dry_run
+            and (
+                (success and "DB skipped" not in (msg or ""))
+                or (msg or "").startswith("skipped:")
+            )
+        )
         if _persist_this:
             _append_progress(scope_url, vid)
         short = (t[:60] + "…") if len(t) > 63 else t

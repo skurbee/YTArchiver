@@ -28,7 +28,18 @@
      window.askConfirm                — confirm dialogs from modals.js
      window.showContextMenu           — right-click menu from contextMenu.js
      window._showToast                — toasts.js
-     window.pywebview.api             — Python bridge
+     window.pywebview.api             — Python bridge (used directly on
+       purpose — see note below)
+
+   Bridge note: this module deliberately calls window.pywebview.api
+   directly rather than going through the YT.api proxy / bridgeCall. Its
+   remove/reorder handlers feature-detect specific backend methods
+   (e.g. `if (api.queues_sync_remove_at) … else if (api.queues_sync_remove)`,
+   `if (api.queues_*_reorder)`) and fall back to legacy URL/path-based APIs
+   on backends that don't expose the newer index-based ones. The YT.api
+   proxy resolves every property name to a function, so it can't express
+   "does this method actually exist?" — routing these calls through it
+   would silently disable the legacy fallbacks. Keep them on the raw bridge.
    ═══════════════════════════════════════════════════════════════════════ */
 
 (function () {
@@ -109,12 +120,21 @@
   function paintTaskList(body, list, emptyText, queueKind) {
     body.innerHTML = "";
     if (!list || list.length === 0) {
-      body.innerHTML = `<div class="queue-empty">${emptyText}</div>`;
+      // textContent, not innerHTML — defense-in-depth so emptyText can never
+      // be an injection sink if a caller ever passes derived text (audit r2).
+      const empty = document.createElement("div");
+      empty.className = "queue-empty";
+      empty.textContent = emptyText;
+      body.appendChild(empty);
       return;
     }
     list.forEach((t, i) => {
       const row = document.createElement("div");
-      const statusCls = t.status || "queued";
+      // Whitelist status → a fixed class; never interpolate a raw backend
+      // string into class/innerHTML below (defense-in-depth, audit r2).
+      const _rawStatus = t.status || "queued";
+      const statusCls = (_rawStatus === "running" || _rawStatus === "paused")
+        ? _rawStatus : "queued";
       row.className = `queue-task-row ${statusCls}`;
       row.draggable = true;
       row.dataset.idx = i;
@@ -311,7 +331,18 @@
         row.classList.add("drag-src");
         e.dataTransfer.effectAllowed = "move";
         e.dataTransfer.setData("text/plain",
-          JSON.stringify({ queueKind: queueKind, idx: i }));
+          JSON.stringify({
+            queueKind: queueKind,
+            idx: i,
+            // Identity fields: the drop handler re-resolves the live
+            // index from these. A backend push between dragstart and
+            // drop re-renders the list and renumbers everything — the
+            // captured idx alone then splices the WRONG entry (same
+            // class as context-menu fix H205).
+            url: t.url || "",
+            path: t.path || "",
+            name: t.name || t.title || "",
+          }));
       });
       row.addEventListener("dragend", () => {
         row.classList.remove("drag-src");
@@ -319,15 +350,10 @@
             .forEach(el => el.classList.remove("drag-target-above", "drag-target-below"));
       });
       row.addEventListener("dragover", (e) => {
-        // Refuse drop visualization for cross-queue drags so the user
-        // gets no false "you can drop here" feedback.
-        let srcKind = queueKind;
-        try {
-          const raw = e.dataTransfer.types.includes("text/plain")
-            ? null  // dragover doesn't expose the data — fall back to
-                    // assuming same-queue and validate at drop time
-            : null;
-        } catch {}
+        // Cross-queue drops can't be detected here (dragover doesn't expose the
+        // payload), so we show the drop indicator and reject the actual
+        // cross-queue drop at drop-time below. (Removed dead detection code
+        // that assigned `null` and did nothing — audit r2.)
         e.preventDefault();
         const rect = row.getBoundingClientRect();
         const halfway = rect.top + rect.height / 2;
@@ -349,9 +375,21 @@
         // Back-compat: legacy payload was a bare index string. If parse
         // fails, treat as same-queue drop (matches old behavior).
         const srcKind = (parsed && parsed.queueKind) || queueKind;
-        const srcIdx = parsed && Number.isFinite(parsed.idx)
+        let srcIdx = parsed && Number.isFinite(parsed.idx)
           ? parsed.idx
           : Number(e.dataTransfer.getData("text/plain"));
+        // Re-resolve the source index by IDENTITY — the numeric idx
+        // goes stale if a backend push re-rendered between dragstart
+        // and drop (mirrors the context menu's H205 fix).
+        if (parsed && (parsed.url || parsed.path || parsed.name)) {
+          const _arr = _queueState[srcKind] || [];
+          const _m = _arr.findIndex(x => x && (
+            (x.url && parsed.url && x.url === parsed.url)
+            || (x.path && parsed.path && x.path === parsed.path)
+            || ((x.name || x.title) && parsed.name
+                && (x.name || x.title) === parsed.name)));
+          if (_m >= 0) srcIdx = _m;
+        }
         if (srcKind !== queueKind) {
           // Cross-queue drop: no-op. Show a brief toast so the user
           // knows the drag was registered but rejected on purpose.

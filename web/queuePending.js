@@ -25,6 +25,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initQueuePendingButton(trackObserver) {
     const qpBtn = document.getElementById("btn-queue-pending");
     const qpCount = document.getElementById("queue-pending-count");
@@ -75,7 +85,8 @@
     if (!qpBtn) return;
 
     qpBtn.addEventListener("click", async () => {
-      const res = await window.pywebview?.api?.subs_queue_pending?.();
+      if (!nativeBridgeUp()) return;
+      const res = await bridgeCall("subs_queue_pending");
       if (res?.ok) {
         const parts = [];
         if (res.transcribe_queued) parts.push(`${res.transcribe_queued} for transcribe`);
@@ -99,7 +110,8 @@
         "Add ALL channels to the transcribe queue? This may take a long time for large libraries.",
         { confirm: "Queue all" });
       if (!ok) return;
-      const res = await window.pywebview?.api?.subs_queue_all?.();
+      if (!nativeBridgeUp()) return;
+      const res = await bridgeCall("subs_queue_all");
       if (res?.ok) {
         window._showToast?.(`Queued ${res.queued} channels.`, "ok");
       }

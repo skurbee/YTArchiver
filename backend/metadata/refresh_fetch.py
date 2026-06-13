@@ -15,7 +15,6 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
 from typing import Any
 
 from ..log import get_logger
@@ -25,22 +24,12 @@ from ..metadata_io import (
     _read_metadata_jsonl,
 )
 from ..sync import find_yt_dlp
-from ..text_utils import normalize_title as _canon_norm_title
-from ..utils import sqlite_like_escape as _like_esc
-from .fetcher import fetch_metadata_for_videos
-from .scan import _scan_channel_videos
 from ._refresh_proxies import (
-    _ID_RE,
-    _enter_pause_wait,
-    _exit_pause_wait,
-    _flat_playlist_bulk_stats,
-    _probe_durations_bulk,
-    _resolve_channel_id_url,
     _resolve_ids_by_title,
-    backfill_video_ids,
-    existing_info_ids,
 )
+from .fetcher import fetch_metadata_for_videos
 from .refresh_views import bulk_refresh_views_likes
+from .scan import _scan_channel_videos
 
 _log = get_logger(__name__)
 
@@ -151,6 +140,19 @@ def fetch_channel_metadata(channel: dict[str, Any],
                             "UPDATE videos SET metadata_fetch_failed_ts=NULL, "
                             "id_resolve_failed_ts=NULL WHERE channel=?",
                             (ch_name,))
+                        # Also zero the failure counter — clearing only
+                        # the ts left a stale count >= threshold that
+                        # re-stamped the permanent flag on the next
+                        # single transient failure. Separate statement:
+                        # the column is lazily ALTERed in fetcher.py
+                        # and may not exist yet.
+                        try:
+                            conn.execute(
+                                "UPDATE videos SET "
+                                "metadata_fetch_fail_count=0 "
+                                "WHERE channel=?", (ch_name,))
+                        except Exception:
+                            pass
                         conn.commit()
                     except Exception as _ue:
                         try: conn.rollback()

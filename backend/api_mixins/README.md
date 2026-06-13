@@ -33,6 +33,7 @@ Set by `main.py` `Api.__init__`. Every mixin can rely on these existing.
 | `self._log_stream`     | main        | most mixins                             | `LogStreamer` for tagged log emit |
 | `self._queues`         | main        | sync_mixin, queue_mixin, channel_mixin  | `QueueState` (in `backend/queues.py`) |
 | `self._transcribe`     | main        | transcribe_mixin, channel_mixin, sync_mixin | `TranscribeManager` (in `backend/transcribe/core.py`, re-exported via `backend.transcribe`) |
+| `self.services`        | main        | new code                                | `AppServices` container for explicit dependency access; prefer this for new service-boundary work |
 | `self._sync_thread`    | main        | sync_mixin, channel_mixin               | Currently-running sync worker thread or None |
 | `self._sync_cancel`    | main        | sync_mixin                              | `threading.Event` to cancel sync |
 | `self._sync_pause`     | main        | sync_mixin                              | `threading.Event` |
@@ -52,7 +53,8 @@ those imports.
 
 The star import is a code smell — explicit imports per mixin would be cleaner.
 That's a future refactor. For now, treat `_shared.py` as "the global namespace
-this package operates in" and add new aliases there if multiple mixins need them.
+this package operates in". Avoid adding new aliases there for one-off work;
+prefer explicit imports or `self.services.<dependency>` for new code.
 
 ## Adding a new method
 

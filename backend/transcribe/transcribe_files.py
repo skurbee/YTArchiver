@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading as _threading
 
 from ..log import get_logger
 from ..transcribe_paths import (
@@ -31,6 +32,24 @@ from ..transcribe_paths import (
 )
 from ..utils import unhide_file_win as _unhide_file_win
 
+# Per-path locks for the aggregated Transcript.txt writers. drift_scan's
+# reconstruction does a read→append→os.replace of the SAME files from a
+# different thread; without shared serialization, its snapshot-replace
+# silently erased any entry a transcribe worker appended in between.
+_TXT_LOCKS: dict[str, _threading.RLock] = {}
+_TXT_LOCKS_GUARD = _threading.Lock()
+
+
+def txt_lock_for(path: str) -> _threading.RLock:
+    """Process-wide lock for one aggregated .txt path (normcase'd)."""
+    key = os.path.normcase(os.path.normpath(os.path.abspath(path or "")))
+    with _TXT_LOCKS_GUARD:
+        lk = _TXT_LOCKS.get(key)
+        if lk is None:
+            lk = _threading.RLock()
+            _TXT_LOCKS[key] = lk
+        return lk
+
 _log = get_logger(__name__)
 
 
@@ -40,6 +59,45 @@ def _norm_title(s: str) -> str:
     """
     from ..text_utils import normalize_title
     return normalize_title(s)
+
+
+def _seg_to_jsonl_line(video_id: str, title: str, seg: dict) -> str:
+    """Serialize ONE transcript segment to a single canonical .jsonl line
+    (trailing newline included). Single source of truth for the on-disk
+    format so the append path (_write_jsonl_entry) and the rewrite path
+    (_replace_jsonl_entry) can't drift byte-for-byte (audit: transcribe_files
+    duplicated serializer). Accepts short-form (s/e/t/w) or long-form
+    (start/end/text/words) segment dicts.
+    """
+    s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
+    e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
+    t = seg.get("text") if "text" in seg else seg.get("t", "")
+    raw_words = seg.get("words") if "words" in seg else seg.get("w")
+    entry = {
+        "video_id": video_id or "",
+        "title": title,
+        "start": round(float(s or 0), 2),
+        "end": round(float(e or 0), 2),
+        "text": t or "",
+    }
+    # Distinguish None (key absent — generate words) from [] (key
+    # explicit-empty — respect Whisper Branch 3 intent)
+    # (audit: transcribe_files.py:67-89).
+    if raw_words is None:
+        entry["words"] = _generate_distributed_words(
+            entry["text"], entry["start"], entry["end"])
+    elif raw_words:
+        # word records stay short-form ("w"/"s"/"e"), same as on-disk.
+        entry["words"] = [
+            {"w": w.get("w") if isinstance(w, dict) else str(w),
+             "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
+             "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
+            for w in raw_words
+        ]
+    else:
+        entry["words"] = _generate_distributed_words(
+            entry["text"], entry["start"], entry["end"])
+    return json.dumps(entry, ensure_ascii=False) + "\n"
 
 
 def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
@@ -61,41 +119,8 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
 
         # Build lines in memory so a disk failure mid-write doesn't leave
         # half-a-line on disk.
-        new_lines = []
-        for seg in segments:
-            # Accept either short-form (s/e/t/w) or long-form (start/end/text/words)
-            s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
-            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
-            t = seg.get("text") if "text" in seg else seg.get("t", "")
-            raw_words = seg.get("words") if "words" in seg else seg.get("w")
-            entry = {
-                "video_id": video_id or "",
-                "title": title,
-                "start": round(float(s or 0), 2),
-                "end": round(float(e or 0), 2),
-                "text": t or "",
-            }
-            # Distinguish None (key absent — generate words) from []
-            # (key explicit-empty — respect Whisper Branch 3 intent)
-            # (audit: transcribe_files.py:67-89).
-            if raw_words is None:
-                entry["words"] = _generate_distributed_words(
-                    entry["text"], entry["start"], entry["end"])
-                new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-                continue
-            if raw_words:
-                # Normalize word records to long-form too (OLD uses "w"/"s"/"e" inside
-                # the words array, same as our short-form — already correct)
-                entry["words"] = [
-                    {"w": w.get("w") if isinstance(w, dict) else str(w),
-                     "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
-                     "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
-                    for w in raw_words
-                ]
-            else:
-                entry["words"] = _generate_distributed_words(
-                    entry["text"], entry["start"], entry["end"])
-            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+        new_lines = [_seg_to_jsonl_line(video_id, title, seg)
+                     for seg in segments]
 
         # atomic write via .tmp + os.replace. Previously
         # the function opened in append mode ("a") and ALSO ran a torn-
@@ -152,7 +177,15 @@ def _write_jsonl_entry(jsonl_path: str, video_id: str, title: str,
                   f"{os.path.basename(jsonl_path)}: {_jse}")
 
 
-def _write_transcript_entry(txt_path: str, title: str,
+def _write_transcript_entry(txt_path, *args, **kwargs):
+    """Lock-serialized facade over _write_transcript_entry_unlocked —
+    shares per-path locks with _replace_txt_entry and drift_scan's
+    reconstruction writer."""
+    with txt_lock_for(txt_path):
+        return _write_transcript_entry_unlocked(txt_path, *args, **kwargs)
+
+
+def _write_transcript_entry_unlocked(txt_path: str, title: str,
                             upload_date: str, duration_secs: float,
                             source_tag: str, text: str) -> bool:
     """Append one formatted block to the aggregated Transcript.txt.
@@ -280,11 +313,20 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
                 obj = json.loads(ls)
                 seg_title = (obj.get("title") or "").strip()
                 seg_vid = (obj.get("video_id") or "").strip()
-                # Match by normalized title (punctuation-insensitive) OR by
-                # video_id. Either signal means this segment belongs to the
-                # video being re-transcribed and should be swapped out.
-                if (seg_title and _norm_title(seg_title) == tit_key) or \
-                   (vid_norm and seg_vid == vid_norm):
+                # Match by video_id, or by normalized title ONLY when id
+                # disambiguation is impossible (the line carries no id,
+                # or we don't know our own). The old title-OR-id match
+                # purged segments of a DIFFERENT video that legitimately
+                # shared the title ('Q&A', 'LIVE', weekly shows) —
+                # silent transcript loss that drift_scan can't detect
+                # because both sidecars stayed mutually consistent.
+                # (The .txt side still purges by title alone — its
+                # headers carry no ids — but with the .jsonl preserved,
+                # a lost .txt block is recoverable via Drift Scan's
+                # rebuild instead of being gone forever.)
+                _title_hit = bool(seg_title) and _norm_title(seg_title) == tit_key
+                _id_hit = bool(vid_norm) and seg_vid == vid_norm
+                if _id_hit or (_title_hit and (not seg_vid or not vid_norm)):
                     if seg_title:
                         removed_titles.add(seg_title)
                     continue # drop this line
@@ -297,38 +339,8 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
         # this function wrote kept lines, then called _write_jsonl_entry which
         # re-read the file from disk and rewrote it — two reads + two writes
         # for an operation that only needs one of each.
-        new_lines: list[str] = []
-        for seg in new_segments:
-            s = seg.get("start") if "start" in seg else seg.get("s", 0.0)
-            e = seg.get("end") if "end" in seg else seg.get("e", 0.0)
-            t = seg.get("text") if "text" in seg else seg.get("t", "")
-            raw_words = seg.get("words") if "words" in seg else seg.get("w")
-            entry = {
-                "video_id": video_id or "",
-                "title": title,
-                "start": round(float(s or 0), 2),
-                "end": round(float(e or 0), 2),
-                "text": t or "",
-            }
-            # Distinguish None (key absent — generate words) from []
-            # (key explicit-empty — respect Whisper Branch 3 intent)
-            # (audit: transcribe_files.py:67-89).
-            if raw_words is None:
-                entry["words"] = _generate_distributed_words(
-                    entry["text"], entry["start"], entry["end"])
-                new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
-                continue
-            if raw_words:
-                entry["words"] = [
-                    {"w": w.get("w") if isinstance(w, dict) else str(w),
-                     "s": round(float((w.get("s") if isinstance(w, dict) else 0) or 0), 3),
-                     "e": round(float((w.get("e") if isinstance(w, dict) else 0) or 0), 3)}
-                    for w in raw_words
-                ]
-            else:
-                entry["words"] = _generate_distributed_words(
-                    entry["text"], entry["start"], entry["end"])
-            new_lines.append(json.dumps(entry, ensure_ascii=False) + "\n")
+        new_lines = [_seg_to_jsonl_line(video_id, title, seg)
+                     for seg in new_segments]
 
         # If kept's last entry is missing a trailing newline, fix before append.
         if kept and not kept[-1].endswith("\n"):
@@ -372,7 +384,14 @@ def _replace_jsonl_entry(jsonl_path: str, title: str, video_id: str,
     return removed_titles
 
 
-def _replace_txt_entry(txt_path: str, title: str, new_text: str,
+def _replace_txt_entry(txt_path, *args, **kwargs):
+    """Lock-serialized facade over _replace_txt_entry_unlocked — see
+    txt_lock_for."""
+    with txt_lock_for(txt_path):
+        return _replace_txt_entry_unlocked(txt_path, *args, **kwargs)
+
+
+def _replace_txt_entry_unlocked(txt_path: str, title: str, new_text: str,
                        source_tag: str,
                        extra_titles_to_remove=None) -> bool:
     """Surgically swap this video's `===(…)===\\n<body>\\n\\n\\n` block in
@@ -414,7 +433,6 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
     # entry so the new block inherits the provenance.
     matches = list(_HEADER_RE.finditer(content))
     new_content = content
-    found_old = False
     date_fmt = "(Unknown date)"
     dur_fmt = "(Unknown length)"
     captured = False
@@ -430,7 +448,6 @@ def _replace_txt_entry(txt_path: str, title: str, new_text: str,
             dur_fmt = m.group(3)
             captured = True
         new_content = new_content[:m.start()] + new_content[end:]
-        found_old = True
 
     src_fmt = source_tag if source_tag.startswith("(") else f"({source_tag})"
     new_entry = f"===({title}), {date_fmt}, {dur_fmt}, {src_fmt}===\n{new_text}\n\n\n"

@@ -117,11 +117,14 @@ def _fetch_captions_via_ytdlp(video_path: str, stream: LogStreamer,
     temp_base = base + ".__cap_probe"
     video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
+    # glob.escape: titles with [brackets] are normal on YouTube and
+    # square brackets are glob character classes — unescaped, the probe
+    # finds nothing and cleanup deletes nothing (orphan .vtt litter).
     def _glob_vtts() -> list[str]:
-        return glob.glob(temp_base + "*.vtt")
+        return glob.glob(glob.escape(temp_base) + "*.vtt")
 
     def _cleanup():
-        for _p in glob.glob(temp_base + "*"):
+        for _p in glob.glob(glob.escape(temp_base) + "*"):
             try: os.remove(_p)
             except OSError: pass
 
@@ -538,8 +541,7 @@ def _parse_vtt(path: str) -> list:
             current_text = []
             current_raw = []
             continue
-        if not line or line.startswith("WEBVTT") or line.startswith("NOTE") \
-                or line.startswith("Kind:") or line.startswith("Language:"):
+        if not line or line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:")):
             continue
         if _re.match(r'^\d+$', line):
             continue

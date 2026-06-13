@@ -231,7 +231,7 @@ class YtDlpRunner:
         # coincidence (list() returns []) but is type-confusing if a
         # future caller passes a non-callable (audit:
         # process_runner.py:208).
-        self._cookies = cookie_provider or (lambda: [])
+        self._cookies = cookie_provider or list
         self._registry = registry or PROCESS_REGISTRY
         self._binary_finder = binary_finder
         self._binary_cached: str | None = None

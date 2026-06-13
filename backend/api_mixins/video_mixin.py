@@ -28,19 +28,22 @@ class VideoMixin:
             return {"ok": False, "error": "Missing filepath"}
         if not os.path.isfile(fp):
             return {"ok": False, "error": f"File not found: {fp}"}
+        # Defense-in-depth: the JS bridge is the trust boundary, so refuse to
+        # os.remove a path resolving OUTSIDE the archive roots this app
+        # manages — a crafted/compromised filepath must not delete arbitrary
+        # files (audit: video_mixin containment).
+        from backend.services.file_ops import (
+            safe_remove_file,
+            safe_remove_sidecars,
+        )
+        removed = safe_remove_file(
+            fp, require_config_writable=True, reason="video_delete_file")
+        if not removed.get("ok"):
+            return removed
         # Refuse the destructive os.remove if config writes are blocked
         # — see recent_mixin H22 for the same precondition.
-        if not config_is_writable():
-            return {"ok": False,
-                    "error": "Config is currently read-only. "
-                             "Refusing to delete file when state can't be updated."}
-        try:
-            os.remove(fp)
-        except OSError as e:
-            return {"ok": False, "error": str(e)}
+        safe_remove_sidecars(fp)
         # Drop sidecars. audit F-24 list lives in utils.delete_video_sidecars.
-        from backend.utils import delete_video_sidecars
-        delete_video_sidecars(fp)
         # Drop the index DB row (and its FTS segments) so Browse / Search
         # stop returning the now-deleted video.
         try:
@@ -54,12 +57,14 @@ class VideoMixin:
                 # "C:\.jsonl-archive\foo.jsonl" and the DELETE missed.
                 # Compute the sidecar path in Python and parameterize it
                 # straight into the IN clause.
-                _stem, _ext = os.path.splitext(fp)
-                _sidecar = _stem + ".jsonl"
+                # FTS-safe, video_id-keyed segment removal — see
+                # index.delete_segments_for_video (the old per-video
+                # jsonl_path DELETE was a no-op in the aggregated
+                # layout and skipped the FTS5 'delete' sync on legacy
+                # rows). Runs BEFORE the videos row drop (the helper
+                # resolves video_id from it) and takes _db_lock itself.
+                _idx.delete_segments_for_video(fp)
                 with _idx._db_lock:
-                    _conn.execute(
-                        "DELETE FROM segments WHERE jsonl_path = ? COLLATE NOCASE",
-                        (_sidecar,))
                     _conn.execute(
                         "DELETE FROM videos WHERE filepath = ? COLLATE NOCASE",
                         (fp,))
@@ -140,24 +145,43 @@ class VideoMixin:
         if not ch_url:
             return {"ok": False, "error":
                     f"Channel '{channel_name}' has no URL"}
-        # Reuse the channel-wide redownload path with a single-video
-        # filter via the existing _backlog_redownload_channel pipeline.
-        # For simplicity here we queue a normal redownload of the
-        # channel scoped to this one video_id.
+        # redownload_channel scans + os.path.isdir() the folder, so it needs
+        # the FULL channel-root path (output_dir + folder), NOT a bare folder
+        # name. Passing the bare name made single-video redownload abort with
+        # "folder not found: <name>" even though the folder exists under
+        # output_dir. Build the full path the same way reorg/sync do.
+        import os as _os
+
+        from backend.sync import channel_folder_name as _cfn
+        _base = (cfg.get("output_dir") or "").strip()
+        try:
+            _ch_folder = (_os.path.join(_base, _cfn(ch)) if _base
+                          else (ch.get("folder") or channel_name))
+        except Exception:
+            _ch_folder = ch.get("folder") or channel_name
+        # Redownload JUST this one video: reuse the channel redownload
+        # pipeline (match → containment → replace) but pass only_video_id so it
+        # filters to this single file instead of re-downloading the WHOLE
+        # channel (audit r2: this per-video button was a whole-channel redownload).
         try:
             import threading as _th
 
             from backend import redownload as _rd
+            # Per-run event — the shared _sync_cancel stays set after
+            # any stopped sync, ghost-cancelling this single-video
+            # redownload instantly in that window.
+            _vid_cancel = _th.Event()
             def _run():
                 try:
                     _rd.redownload_channel(
                         channel_name, ch_url,
-                        ch.get("folder") or channel_name, res,
+                        _ch_folder, res,
                         stream=self._log_stream,
-                        cancel_ev=self._sync_cancel,
+                        cancel_ev=_vid_cancel,
                         pause_ev=self._sync_pause,
                         confirm_cb=None,
                         queues=self._queues,
+                        only_video_id=vid,
                     )
                 except Exception as e:
                     self._log_stream.emit_error(

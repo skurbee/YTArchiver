@@ -21,6 +21,15 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const PAGE = 60;
   let _sort = "recent";
   let _filter = "";      // title/channel substring filter (server-side)
@@ -61,8 +70,8 @@
     }
     const onClick = (vv) => {
       if (typeof window._openVideoInWatch === "function") window._openVideoInWatch(vv);
-      else if (vv.filepath && window.pywebview?.api?.browse_open_video)
-        window.pywebview.api.browse_open_video(vv.filepath);
+      else if (vv.filepath && nativeBridgeUp())
+        bridgeCall("browse_open_video", vv.filepath);
     };
     const card = build(v, onClick);
     if (card) card.dataset.tracked = "1";
@@ -70,8 +79,7 @@
   }
 
   async function loadPage(reset) {
-    const api = window.pywebview && window.pywebview.api;
-    if (!api || !api.list_all_videos) return;
+    if (!nativeBridgeUp()) return;
     if (_loading) return;
     _loading = true;
     const myId = ++_seq;
@@ -83,7 +91,7 @@
         + '<span class="grid-loading-label">Loading videos…</span></div>';
     } else if (moreEl) { moreEl.hidden = false; }
     try {
-      const res = await api.list_all_videos(_sort, PAGE, _offset, _filter);
+      const res = await bridgeCall("list_all_videos", _sort, PAGE, _offset, _filter);
       if (myId !== _seq) return;  // superseded by a newer sort/reset
       const rows = (res && res.rows) || [];
       if (reset) {
@@ -116,7 +124,15 @@
   }
   function onScroll() {
     if (!isActive() || !_hasMore || _loading) return;
+    // The Videos grid's scroll can live on EITHER the inner frame
+    // (#recent-grid-frame) or the outer .browse-view (#view-recent) — the
+    // latter is a block-level overflow-y:auto container, so the inner
+    // frame's flex:1 is inert and #view-recent is what actually scrolls.
+    // Check both (plus the document) so load-more fires regardless of which
+    // element owns the scroll. (Bug: only #recent-grid-frame + window were
+    // checked, so on the real archive the grid stopped at the first page.)
     if (_nearBottom($("recent-grid-frame"))
+        || _nearBottom($("view-recent"))
         || _nearBottom(document.scrollingElement || document.documentElement)) {
       loadPage(false);
     }
@@ -144,6 +160,7 @@
       }, 220);
     });
     $("recent-grid-frame")?.addEventListener("scroll", onScroll, { passive: true });
+    $("view-recent")?.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("scroll", onScroll, { passive: true });
   }
 
@@ -159,12 +176,11 @@
   // loadPage() always rebuilds it for whatever sort is active.
   window._refreshVideosViewIfActive = async function () {
     if (!isActive() || _loading) return;
-    const api = window.pywebview && window.pywebview.api;
-    if (!api || !api.list_all_videos) return;
+    if (!nativeBridgeUp()) return;
     const sortAtCall = _sort;
     const filterAtCall = _filter;
     try {
-      const res = await api.list_all_videos(sortAtCall, PAGE, 0, filterAtCall);
+      const res = await bridgeCall("list_all_videos", sortAtCall, PAGE, 0, filterAtCall);
       if (sortAtCall !== _sort || filterAtCall !== _filter || _loading) return;  // superseded meanwhile
       const rows = (res && res.rows) || [];
       const sig = rows.map(r => r.video_id || r.filepath || "").join("|");

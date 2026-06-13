@@ -32,13 +32,12 @@ from .ytarchiver_config import DISK_CACHE_FILE, load_config
 _log = get_logger(__name__)
 
 
-# Matches YTArchiver.py:134 _CHANNEL_VIDEO_EXTS. Kept in sync with
-# index_maintenance._VIDEO_EXTS so the per-channel disk count (here)
-# and the sweep-registration walk both classify the same files as
-# videos. Earlier divergence (.mov / .m4v missing from this list)
-# made the Subs table report fewer videos than the Browse grid showed.
-_CHANNEL_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
-                       ".wav", ".mp3", ".m4a", ".flac")
+# Single source of truth in backend.fs_search so the per-channel disk count
+# (here), the sweep-registration walk (index_maintenance), metadata.scan, and
+# reorg all classify the same files as media. Earlier each kept its own tuple
+# and drifted (.flv/.wmv in reorg but not here), so the Subs table reported
+# fewer videos than Browse showed (audit: VIDEO_EXTS divergence).
+from .fs_search import MEDIA_EXTS_TUPLE as _CHANNEL_VIDEO_EXTS
 
 # Partial file suffixes — never count these as real videos
 _PARTIAL_SUFFIXES = (".part", ".tmp", ".temp", ".download", ".ytdl")
@@ -144,7 +143,13 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
                 with _idx._reader_lock:
                     _row = _conn.execute(
                         "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) "
-                        "FROM videos WHERE channel=? COLLATE NOCASE",
+                        "FROM videos WHERE channel=? COLLATE NOCASE "
+                        # Exclude duplicate rows so this DB fast-path agrees
+                        # with the filesystem walk (which subtracts dups) AND
+                        # with Browse (which filters is_duplicate_of IS NULL).
+                        # Without this the Subs count flipped between runs
+                        # depending on which path ran (audit r2).
+                        "AND is_duplicate_of IS NULL",
                         (_nm,)).fetchone()
                 if _row and _row[0]:
                     n_vids, total_bytes = int(_row[0]), int(_row[1])
@@ -153,15 +158,23 @@ def update_disk_cache_for_channel(channel: dict[str, Any]) -> dict[str, Any]:
     if n_vids is None:
         from pathlib import Path as _P
         n_vids, total_bytes = scan_channel_folder(_P(base), channel)
-    cache = load_disk_cache()
     url = channel.get("url", "").strip()
     if url:
-        cache[url] = {
-            "num_vids": int(n_vids),
-            "size_bytes": int(total_bytes),
-            "last_updated": time.time(),
-        }
-        save_disk_cache(cache)
+        with _CACHE_LOCK:
+            cache = load_disk_cache()
+            _prev = cache.get(url)
+            _rec = {
+                "num_vids": int(n_vids),
+                "size_bytes": int(total_bytes),
+                "last_updated": time.time(),
+            }
+            # Preserve the sweep fingerprint across stat refreshes —
+            # replacing the whole record dropped it and forced a full
+            # fingerprint re-walk on the next sweep.
+            if isinstance(_prev, dict) and "sweep_fingerprint" in _prev:
+                _rec["sweep_fingerprint"] = _prev["sweep_fingerprint"]
+            cache[url] = _rec
+            save_disk_cache(cache)
     return {"n_vids": n_vids,
             "size_bytes": total_bytes,
             "size_gb": total_bytes / (1024 ** 3)}
@@ -218,10 +231,11 @@ def invalidate_channel(ch_url: str) -> bool:
     """
     if not ch_url:
         return False
-    cache = load_disk_cache()
-    if ch_url in cache:
-        del cache[ch_url]
-        save_disk_cache(cache)
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        if ch_url in cache:
+            del cache[ch_url]
+            save_disk_cache(cache)
 
     def _rescan():
         try:
@@ -241,6 +255,17 @@ def invalidate_channel(ch_url: str) -> bool:
     return True
 
 
+import threading as _threading
+
+# Serializes every load→mutate→save of the disk-cache JSON. Without it,
+# concurrent writers (per-channel update after each sync, invalidate's
+# background rescan, startup heal, the sweep's end-of-run save in
+# index_maintenance) did unsynchronized read-modify-write — the last
+# writer clobbered everyone else's updates with a minutes-stale
+# snapshot. atomic_write only prevents torn files, not lost updates.
+_CACHE_LOCK = _threading.Lock()
+
+
 def heal_malformed_cache_entries() -> int:
     """Drop cache entries that lack `num_vids`/`size_bytes` so the next
     Subs render triggers a proper rescan instead of showing `—`.
@@ -256,17 +281,18 @@ def heal_malformed_cache_entries() -> int:
 
     Returns the number of entries dropped.
     """
-    cache = load_disk_cache()
-    dropped = [
-        url for url, rec in list(cache.items())
-        if not isinstance(rec, dict)
-           or "num_vids" not in rec or "size_bytes" not in rec
-    ]
-    if not dropped:
-        return 0
-    for url in dropped:
-        del cache[url]
-    save_disk_cache(cache)
+    with _CACHE_LOCK:
+        cache = load_disk_cache()
+        dropped = [
+            url for url, rec in list(cache.items())
+            if not isinstance(rec, dict)
+               or "num_vids" not in rec or "size_bytes" not in rec
+        ]
+        if not dropped:
+            return 0
+        for url in dropped:
+            del cache[url]
+        save_disk_cache(cache)
     return len(dropped)
 
 
@@ -496,6 +522,8 @@ def index_db_stats() -> dict[str, Any]:
     segments_count = 0
     hours = 0.0
     index_db_bytes = 0
+    transcribed_videos = 0
+    total_videos = 0
     try:
         from . import index as _idx
         from .ytarchiver_config import TRANSCRIPTION_DB as _DB
@@ -546,6 +574,20 @@ def index_db_stats() -> dict[str, Any]:
                 ")").fetchone()
             if _row:
                 hours += float(_row[0] or 0) / 3600.0
+            # Archive-wide transcription COVERAGE: videos that have an actual
+            # transcript (tx_status='transcribed') over the total video count.
+            # 'no_speech' (Whisper ran, found nothing), 'no_captions', and
+            # 'pending' are NOT counted as transcribed — they have no
+            # transcript — so this reflects real coverage, not the
+            # auto-transcribe channel setting (the old transcribed_pct_channels).
+            _row = _own.execute("SELECT COUNT(*) FROM videos").fetchone()
+            if _row:
+                total_videos = int(_row[0] or 0)
+            _row = _own.execute(
+                "SELECT COUNT(*) FROM videos WHERE tx_status='transcribed'"
+            ).fetchone()
+            if _row:
+                transcribed_videos = int(_row[0] or 0)
         finally:
             if _own is not None:
                 try: _own.close()
@@ -563,4 +605,6 @@ def index_db_stats() -> dict[str, Any]:
         "hours": round(hours, 1) if hours > 0 else 0,
         "index_db_bytes": index_db_bytes,
         "index_db_size_label": _fmt_size(index_db_bytes),
+        "transcribed_videos": transcribed_videos,
+        "total_videos": total_videos,
     }

@@ -19,6 +19,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Queue popovers (Sync Tasks, GPU Tasks) ──────────────────────────
   //
   // Anchor to the icon button. Clicking the button toggles; clicking
@@ -83,14 +87,13 @@
       // Preload from settings so the dropdown reflects the real current model.
       (async () => {
         try {
-          const s = await window.pywebview?.api?.settings_load?.();
+          const s = nativeBridgeUp() ? await bridgeCall("settings_load") : undefined;
           if (s?.whisper_model) swap.value = s.whisper_model;
         } catch { /* ignore */ }
       })();
 
       swap.addEventListener("change", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.transcribe_swap_model) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Native mode required for model swap.", "warn");
           return;
         }
@@ -103,7 +106,7 @@
           swap.value = prev;
           return;
         }
-        const res = await api.transcribe_swap_model(swap.value);
+        const res = await bridgeCall("transcribe_swap_model", swap.value);
         if (res?.ok) {
           window._showToast?.(`Model swapped to ${swap.value}.`, "ok");
           swap.dataset.prev = swap.value;

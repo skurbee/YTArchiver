@@ -598,7 +598,7 @@ class MetadataMixin:
             js = (
                 "(async () => {"
                 f" const c = await window.askMetadataAlreadyDownloaded({_json.dumps(channel_name)}, {int(count)});"
-                f" window.pywebview.api._metadata_choice_resolve({_json.dumps(token)}, c);"
+                f" window.pywebview.api.metadata_choice_resolve({_json.dumps(token)}, c);"
                 "})()"
             )
             self._window.evaluate_js(js)
@@ -613,9 +613,12 @@ class MetadataMixin:
                 pass
 
 
-    def _metadata_choice_resolve(self, _token, val):
-        """Internal: JS calls this when the user picks a choice. Routes
-        by token so concurrent prompts each get their own response."""
+    def metadata_choice_resolve(self, _token, val):
+        """JS calls this when the user picks a choice. Routes by token
+        so concurrent prompts each get their own response. MUST be
+        public: pywebview never exposes underscore-prefixed methods on
+        the js_api bridge, so the old _-prefixed name was unreachable
+        and every prompt timed out to "skip" after 120s."""
         try:
             pending_map = getattr(self, "_pending_metadata_choices", None) or {}
             pending = pending_map.get(_token)

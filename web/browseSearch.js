@@ -19,7 +19,7 @@
  *   - window._browseState (app.js)
  *   - window._formatTs (util.js)
  *   - window.YT.util.escapeHtml (util.js, falls back to identity)
- *   - window.pywebview.api.* (native bridge)
+ *   - window.YT.bridge.bridgeCall / isUp (bridge.js)
  */
 (function () {
   "use strict";
@@ -27,6 +27,15 @@
   const _browseState = window._browseState || {};
   const _formatTs = (sec) => (window._formatTs ? window._formatTs(sec) : String(sec));
   const escapeHtml = window.YT?.util?.escapeHtml || ((s) => String(s ?? ""));
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Search viewer pane — shows context around a clicked hit ────────
   // Mirrors YTArchiver.py:29598 PanedWindow viewer. Loads N segments
@@ -39,6 +48,7 @@
     after: 30,
     query: "",
     title: "",
+    seq: 0,
   };
 
   async function _loadSearchViewer(resultRow, query) {
@@ -48,8 +58,7 @@
     const bEarly = document.getElementById("search-viewer-earlier");
     const bLater = document.getElementById("search-viewer-later");
     if (!body || !titleEl) return;
-    const api = window.pywebview?.api;
-    if (!api?.browse_search_context) {
+    if (!nativeBridgeUp()) {
       body.innerHTML = '<div class="browse-empty">Viewer pane requires native mode.</div>';
       return;
     }
@@ -64,20 +73,25 @@
 
     titleEl.textContent = resultRow.title || "(untitled)";
     metaEl.textContent = `${resultRow.channel || ""} \u00b7 ${_formatTs(resultRow.start_time)}`;
-    body.innerHTML = '<div class="browse-empty">Loading\u2026</div>';
+    const mySeq = ++_searchViewerState.seq;
+    if (bEarly) bEarly.hidden = true;
+    if (bLater) bLater.hidden = true;
+    body.innerHTML = '<div class="browse-empty search-loading">Loading context\u2026</div>';
 
     let ctx;
     try {
-      ctx = await api.browse_search_context({
+      ctx = await bridgeCall("browse_search_context", {
         segment_id: resultRow.segment_id,
         before: _searchViewerState.before,
         after: _searchViewerState.after,
         query: _searchViewerState.query,
       });
     } catch (e) {
+      if (mySeq !== _searchViewerState.seq) return;
       body.innerHTML = `<div class="browse-empty">Error: ${escapeHtml(String(e))}</div>`;
       return;
     }
+    if (mySeq !== _searchViewerState.seq) return;
     if (!ctx?.ok) {
       body.innerHTML = `<div class="browse-empty">${escapeHtml(ctx?.error || "No context available.")}</div>`;
       return;
@@ -175,9 +189,8 @@
   }
 
   function _openSearchResultInWatch(state, seg) {
-    const api = window.pywebview?.api;
-    if (!api?.browse_resolve_segment) return;
-    api.browse_resolve_segment(state._jsonlPath || "",
+    if (!nativeBridgeUp()) return;
+    bridgeCall("browse_resolve_segment", state._jsonlPath || "",
                                state._videoId || "",
                                state.title || "").then((res) => {
       if (!res?.ok || !res.filepath) {
@@ -216,12 +229,15 @@
     // duplicate segments.
     if (_initSearchViewerLoadMore._wired) return;
     _initSearchViewerLoadMore._wired = true;
-    const api = window.pywebview?.api;
+    // Resolve the bridge per-click via bridgeCall rather than capturing
+    // window.pywebview.api once here — at init (boot) the bridge often
+    // isn't injected yet, so a captured reference would be a stale
+    // undefined when the buttons are actually clicked later.
     document.getElementById("search-viewer-earlier")?.addEventListener("click", async () => {
       if (!_searchViewerState.segmentId) return;
       _searchViewerState.before += 30;
       try {
-        const ctx = await api.browse_search_context({
+        const ctx = await bridgeCall("browse_search_context", {
           segment_id: _searchViewerState.segmentId,
           before: _searchViewerState.before,
           after: _searchViewerState.after,
@@ -240,7 +256,7 @@
       if (!_searchViewerState.segmentId) return;
       _searchViewerState.after += 30;
       try {
-        const ctx = await api.browse_search_context({
+        const ctx = await bridgeCall("browse_search_context", {
           segment_id: _searchViewerState.segmentId,
           before: _searchViewerState.before,
           after: _searchViewerState.after,
@@ -262,10 +278,9 @@
   // index, shows/hides the amber banner accordingly. Mirrors
   // YTArchiver.py:24756 _update_index_warning.
   async function _refreshUnindexedWarning() {
-    const api = window.pywebview?.api;
-    if (!api?.index_unindexed_count) return;
+    if (!nativeBridgeUp()) return;
     let res;
-    try { res = await api.index_unindexed_count(); } catch { return; }
+    try { res = await bridgeCall("index_unindexed_count"); } catch { return; }
     if (!res?.ok) return;
     const n = Number(res.unindexed) || 0;
     const show = n > 0;
@@ -292,14 +307,13 @@
   function _initUnindexedRescanBtns() {
     const handler = async (e) => {
       e.preventDefault();
-      const api = window.pywebview?.api;
-      if (!api?.archive_rescan) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       window._showToast?.("Rescanning archive for new transcripts\u2026", "ok");
       try {
-        await api.archive_rescan();
+        await bridgeCall("archive_rescan");
         // Poll until the rescan clears the unindexed count or times out.
         let tries = 0;
         const tick = async () => {
@@ -350,8 +364,7 @@
       results.innerHTML = '<div class="search-progress-bar" id="search-progress-bar"></div>' +
                           '<div class="browse-empty">Searching\u2026</div>';
       counter.textContent = "\u2026";
-      const api = window.pywebview?.api;
-      if (!api?.browse_search) {
+      if (!nativeBridgeUp()) {
         results.innerHTML = '<div class="browse-empty">Search requires native mode.</div>';
         return;
       }
@@ -411,7 +424,7 @@
         // Transcripts leg — FTS5 against segments.
         if (wantTranscripts) {
           promises.push(
-            Promise.resolve(api.browse_search(q, selectedChannels, 200, sortKey, yearFrom, yearTo))
+            Promise.resolve(bridgeCall("browse_search", q, selectedChannels, 200, sortKey, yearFrom, yearTo))
               .then(rs => (rs || []).map(r => ({ ...r, _match_kind: "transcript" })))
               .catch(() => [])
           );
@@ -422,7 +435,7 @@
         // like a transcript hit so the renderer below stays unified.
         if (wantTitles) {
           promises.push(
-            Promise.resolve(api.browse_search_titles?.(q, selectedChannels, 200, sortKeyTitles, yearFrom, yearTo))
+            Promise.resolve(bridgeCall("browse_search_titles", q, selectedChannels, 200, sortKeyTitles, yearFrom, yearTo))
               .then(rs => (rs || []).map(r => ({
                 ...r,
                 text: r.title || "",
@@ -561,7 +574,7 @@
               start_at: Number(r.start_time) || 0,
             };
             try {
-              const res = await api.browse_resolve_segment?.(
+              const res = await bridgeCall("browse_resolve_segment",
                 r.jsonl_path || "", r.video_id || "", r.title || "");
               if (res?.ok && res.filepath) {
                 video.filepath = res.filepath;
@@ -576,13 +589,24 @@
             _browseState.currentVideo = video;
             showView("watch");
             try {
-              const res = await api.browse_get_transcript({
-                video_id: r.video_id, jsonl_path: r.jsonl_path, title: video.title || "",
+              // NOTE: pass video_id + title ONLY (no jsonl_path). Forwarding
+              // the search hit's jsonl_path made get_segments re-normpath a
+              // stored path that mixes slashes, so the literal jsonl_path=?
+              // match missed and Watch showed "No transcript available".
+              // Letting the backend resolve its own canonical jsonl_path
+              // (as the channel-grid/bookmark paths do) fixes it.
+              const res = await bridgeCall("browse_get_transcript", {
+                video_id: r.video_id, title: video.title || "",
               });
               const segs = Array.isArray(res)
                 ? res
                 : (res?.segments || []);
               const sourceInfo = (res && !Array.isArray(res)) ? (res.source || null) : null;
+              // Carry tx_status so the empty-transcript branch can show
+              // "No speech detected" for a genuinely-silent video.
+              if (res && !Array.isArray(res) && res.tx_status) {
+                video.tx_status = res.tx_status;
+              }
               const rendered = segs.map(seg => ({
                 ts: _formatTs(seg.s), text: seg.t, words: seg.w, s: seg.s, e: seg.e,
               }));
@@ -787,9 +811,10 @@
       let rows = window._subsAllRows || [];
       if (!rows.length) {
         try {
-          const api = window.pywebview?.api;
-          const res = await api?.browse_list_channels?.();
-          if (Array.isArray(res)) rows = res;
+          if (nativeBridgeUp()) {
+            const res = await bridgeCall("browse_list_channels");
+            if (Array.isArray(res)) rows = res;
+          }
         } catch { /* leave empty */ }
       }
       rows = rows

@@ -14,13 +14,12 @@ emission, no row-tracking. Just:
   - batch-file write/cleanup
 
 Higher-level orchestration (sync_channel, sync_all, the DLTRACK
-handler, etc.) stays in sync/legacy.py. legacy.py re-imports the
-names below so existing callers in `backend.sync.legacy` keep
-resolving them as module-local.
+handler, etc.) lives in sync/core.py, which re-imports the names
+below so existing callers keep resolving them as module-local.
 
 External callers that did `from backend.sync import find_yt_dlp`
-keep working because backend/sync/__init__.py re-exports from
-legacy.py and the package's __all__ surface is unchanged.
+keep working because backend/sync/__init__.py re-exports these
+and the package's __all__ surface is unchanged.
 """
 
 from __future__ import annotations

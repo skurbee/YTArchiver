@@ -16,9 +16,17 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const esc = (s) => (window.YT?.util?.escapeHtml
     ? window.YT.util.escapeHtml(s) : String(s == null ? "" : s));
-  const api = () => (window.pywebview && window.pywebview.api) || null;
   const $ = (id) => document.getElementById(id);
 
   let _step = 1;
@@ -129,14 +137,13 @@
   // dependencies step, so the faster-whisper row resolves to a real ✓/✗
   // on its own instead of sitting at a misleading ✗ until a manual Re-check.
   async function autoVerifyWhisper() {
-    const a = api();
-    if (!a || !a.onboarding_probe) return;
+    if (!nativeBridgeUp()) return;
     if (_whisperChecking) return;
     if (_deps && _deps.whisper && _deps.whisper.checked) return; // already verified
     _whisperChecking = true;
     renderWhisperRows(_deps);       // show the spinner immediately
     try {
-      const r = await a.onboarding_probe(true);
+      const r = await bridgeCall("onboarding_probe", true);
       if (r && r.ok && r.deps) _deps = Object.assign({}, _deps || {}, r.deps);
     } catch (e) {
       console.error("[onboarding] auto-verify whisper", e);
@@ -238,48 +245,44 @@
 
   // ── install actions ───────────────────────────────────────────────────
   async function installCore() {
-    const a = api();
-    if (!a || !a.onboarding_install_core || _coreBusy) return;
+    if (!nativeBridgeUp() || _coreBusy) return;
     _coreBusy = true;
     const btn = $("onb-install-core");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-core-progress"); if (wrap) wrap.hidden = false;
-    try { await a.onboarding_install_core(); }
+    try { await bridgeCall("onboarding_install_core"); }
     catch (e) { _onboardingProgress({ phase: "core", status: "error", msg: String(e) }); _coreBusy = false; }
   }
 
   async function installWhisper() {
-    const a = api();
-    if (!a || !a.onboarding_install_whisper || _whisperBusy) return;
+    if (!nativeBridgeUp() || _whisperBusy) return;
     _whisperBusy = true;
     const btn = $("onb-install-whisper");
     if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
     const wrap = $("onb-whisper-progress"); if (wrap) wrap.hidden = false;
-    try { await a.onboarding_install_whisper(); }
+    try { await bridgeCall("onboarding_install_whisper"); }
     catch (e) { _onboardingProgress({ phase: "whisper", status: "error", msg: String(e) }); _whisperBusy = false; }
   }
 
   async function recheck() {
-    const a = api();
-    if (!a || !a.onboarding_probe) return;
+    if (!nativeBridgeUp()) return;
     try {
-      const r = await a.onboarding_probe(true);
+      const r = await bridgeCall("onboarding_probe", true);
       if (r && r.ok && r.deps) renderDeps(r.deps);
     } catch (e) { console.error("[onboarding] recheck", e); }
   }
 
   async function pickFolder() {
-    const a = api();
-    if (!a || !a.pick_folder) return;
+    if (!nativeBridgeUp()) return;
     const browse = $("onb-folder-browse");
     if (browse) browse.disabled = true;
     const hint = $("onb-folder-hint");
     try {
-      const picked = await a.pick_folder("Choose archive root");
+      const picked = await bridgeCall("pick_folder", "Choose archive root");
       if (picked && picked.ok && picked.path) {
         // Save immediately so the rest of the app + a mid-wizard quit
         // still leaves a valid output_dir.
-        const saved = await a.set_parent_folder(picked.path);
+        const saved = await bridgeCall("set_parent_folder", picked.path);
         if (saved && saved.ok) {
           _folder = picked.path;
           const pe = $("onb-folder-path"); if (pe) pe.value = _folder;
@@ -301,8 +304,7 @@
   }
 
   async function finish() {
-    const a = api();
-    try { if (a && a.onboarding_finish) await a.onboarding_finish(); }
+    try { if (nativeBridgeUp()) await bridgeCall("onboarding_finish"); }
     catch (e) { console.error("[onboarding] finish", e); }
     const ov = $("onboarding-overlay");
     if (ov) ov.hidden = true;
@@ -362,9 +364,8 @@
     // Seed state from the backend (best-effort; the wizard still works if
     // this fails — the user can Browse + Re-check manually).
     try {
-      const a = api();
-      if (a && a.onboarding_state) {
-        const st = await a.onboarding_state();
+      if (nativeBridgeUp()) {
+        const st = await bridgeCall("onboarding_state");
         if (st) {
           _folder = (st.output_dir || "");
           const pe = $("onb-folder-path"); if (pe) pe.value = _folder;

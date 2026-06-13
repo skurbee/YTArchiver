@@ -19,6 +19,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   const askConfirm = window.askConfirm;
   const askDanger = window.askDanger;
 
@@ -41,8 +51,7 @@
 
       const _loadChannels = async () => {
         try {
-          const api = window.pywebview?.api;
-          const resp = await api?.get_subs_channels?.();
+          const resp = nativeBridgeUp() ? await bridgeCall("get_subs_channels") : undefined;
           // get_subs_channels returns a (rows, total_label) TUPLE — which
           // arrives in JS as [rowsArray, "label string"]. The old code
           // treated the whole tuple as the channel list and iterated
@@ -81,12 +90,37 @@
         }
       };
 
+      // drift_scan_channel / drift_apply_channel are token-poll
+      // endpoints: they return {ok:true, pending:true, token} at once
+      // and the REAL result must be fetched via the matching *_poll
+      // method. Without polling, the bare token dict rendered as a
+      // green "No drift found" with Fix permanently disabled — the
+      // entire feature was decorative.
+      const _pollUntilDone = async (res, pollFn, timeoutMs) => {
+        const t0 = Date.now();
+        while (res && res.pending && res.token) {
+          if (Date.now() - t0 > timeoutMs) {
+            return { ok: false, error: "Timed out waiting for the result." };
+          }
+          await new Promise((r) => setTimeout(r, 500));
+          res = await pollFn(res.token);
+        }
+        return res;
+      };
+
       const _renderScan = (data) => {
         _lastScan = data;
         fixBtn.disabled = true;
         if (!data?.ok) {
           body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
             + `${escapeHtml(data?.error || "Scan failed.")}</div>`;
+          if (summary) summary.textContent = "";
+          return;
+        }
+        if (data.pending) {
+          // Belt-and-braces: a pending token must NEVER render as a
+          // successful empty result.
+          body.innerHTML = `<div class="browse-empty" style="padding:16px;">Still scanning…</div>`;
           if (summary) summary.textContent = "";
           return;
         }
@@ -197,12 +231,16 @@
         if (scanBtn) scanBtn.disabled = true;
         _scanInFlight = true;
         try {
-          const api = window.pywebview?.api;
-          if (!api?.drift_scan_channel) {
+          if (!nativeBridgeUp()) {
             _renderScan({ ok: false, error: "Native mode required." });
             return;
           }
-          const res = await api.drift_scan_channel(identity);
+          let res = await bridgeCall("drift_scan_channel", identity);
+          if (res?.pending && res?.token) {
+            body.innerHTML = `<div class="browse-empty" style="padding:16px;">Scanning…</div>`;
+            res = await _pollUntilDone(
+              res, (t) => bridgeCall("drift_scan_channel_poll", t), 10 * 60 * 1000);
+          }
           // Stash the identity we just scanned with so _fix uses
           // the same one regardless of dropdown drift (audit H216).
           if (res && typeof res === "object") res._scan_identity = identity;
@@ -244,8 +282,16 @@
         fixBtn.disabled = true;
         body.innerHTML = `<div class="browse-empty" style="padding:16px;">Applying fixes…</div>`;
         try {
-          const api = window.pywebview?.api;
-          const res = await api.drift_apply_channel(identity);
+          if (!nativeBridgeUp()) {
+            body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
+              + `Native mode required.</div>`;
+            return;
+          }
+          let res = await bridgeCall("drift_apply_channel", identity);
+          if (res?.pending && res?.token) {
+            res = await _pollUntilDone(
+              res, (t) => bridgeCall("drift_apply_channel_poll", t), 10 * 60 * 1000);
+          }
           if (!res?.ok) {
             body.innerHTML = `<div class="browse-empty" style="padding:16px;color:#e78a8a;">`
               + `${escapeHtml(res?.error || "Fix failed.")}</div>`;

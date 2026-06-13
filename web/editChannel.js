@@ -20,10 +20,21 @@
  *   - window._removeChannelWithPrompt (app.js)
  *   - window.renderSubsTable, window._primeBrowse (app.js)
  *   - window._subsAllRows (app.js, optional)
- *   - window.pywebview.api.* (native bridge)
+ *   - window.YT.bridge.bridgeCall / isUp (bridge.js)
+ *   - window.pywebview.api.* (raw bridge — update handler dedup check only)
  */
 (function () {
   "use strict";
+
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   function flashError(msg) {
     console.warn("[subs]", msg);
@@ -120,21 +131,38 @@
       if (m) return decodeURIComponent(m[1]);
       return "";
     };
+    // Track whether the user has MANUALLY edited the Folder Name. The old
+    // guard ("stop once the folder field is non-empty") broke TYPED urls: the
+    // first keystroke '...@N' derived "N", then every later keystroke saw a
+    // non-empty folder and bailed, freezing the name at "N" (pasting worked
+    // because the whole handle arrived in one event). Instead we keep
+    // re-deriving on each URL keystroke until the user edits the folder
+    // themselves. _suppressFolderEditFlag keeps the auto-fill's own synthetic
+    // input event from falsely tripping the "user edited" flag.
+    let _folderUserEdited = false;
+    let _suppressFolderEditFlag = false;
     const _maybeAutoFillFolder = () => {
       if (_editingIdentity) return;          // editing an existing channel
       const folderEl = document.getElementById("edit-folder");
       const urlEl = document.getElementById("edit-url");
       if (!folderEl || !urlEl) return;
-      if ((folderEl.value || "").trim()) return;  // don't clobber user input
+      if (_folderUserEdited) return;         // don't clobber the user's own text
       const guess = _deriveFolderFromUrl((urlEl.value || "").trim());
       if (!guess) return;
       // Sanitize to a valid Windows folder name.
       const clean = guess.replace(/[\\/:*?"<>|]/g, "_")
                          .replace(/\s+/g, " ").trim();
       if (!clean) return;
+      if (folderEl.value === clean) return;  // nothing to change
+      _suppressFolderEditFlag = true;
       folderEl.value = clean;
       folderEl.dispatchEvent(new Event("input", { bubbles: true }));
+      _suppressFolderEditFlag = false;
     };
+    // A genuine user edit of the Folder Name stops auto-derive from then on.
+    document.getElementById("edit-folder")?.addEventListener("input", () => {
+      if (!_suppressFolderEditFlag) _folderUserEdited = true;
+    });
     _editUrlField?.addEventListener("input", _maybeAutoFillFolder);
     _editUrlField?.addEventListener("paste",
       () => setTimeout(_maybeAutoFillFolder, 15));
@@ -247,9 +275,8 @@
           if (txSep) txSep.hidden = true;
           if (txLbl) txLbl.hidden = true;
           if (txVal) txVal.hidden = true;
-          const api = window.pywebview?.api;
-          if (api?.channel_transcription_stats) {
-            api.channel_transcription_stats(channel.folder || channel.name || "")
+          if (nativeBridgeUp()) {
+            bridgeCall("channel_transcription_stats", channel.folder || channel.name || "")
               .then((res) => {
                 if (!res?.ok) return;
                 if (!res.total) return;
@@ -257,9 +284,19 @@
                 if (txLbl) txLbl.hidden = false;
                 if (txVal) {
                   txVal.hidden = false;
-                  const pct = res.total ? Math.round(100 * res.transcribed / res.total) : 0;
-                  txVal.textContent = `${res.transcribed} / ${res.total} (${pct}%)`;
-                  txVal.title = `Pending: ${res.pending}, Failed: ${res.failed}`;
+                  // Don't round UP: 469/471 = 99.6% must not display as
+                  // (100%) and imply "done". Use one decimal, and if that
+                  // would still round to 100.0 while under 100, show 2 dp.
+                  const rawPct = res.total ? (100 * res.transcribed / res.total) : 0;
+                  let pctStr = rawPct.toFixed(1);
+                  if (pctStr === "100.0" && rawPct < 100) pctStr = rawPct.toFixed(2);
+                  const nsp = res.no_speech || 0;
+                  // Show no-speech videos explicitly so "508 / 510" doesn't
+                  // read as "2 behind" — they're checked-and-silent (done).
+                  txVal.textContent = `${res.transcribed} / ${res.total} (${pctStr}%)`
+                    + (nsp > 0 ? ` · ${nsp} no speech` : "");
+                  txVal.title = `Pending: ${res.pending}, Failed: ${res.failed}`
+                    + (nsp > 0 ? `, No speech: ${nsp}` : "");
                 }
               })
               .catch(() => {});
@@ -290,6 +327,7 @@
       const ds = document.getElementById("edit-diskstats");
       if (ds) ds.hidden = true;
       _updateCollapsed();
+      _folderUserEdited = false;   // a fresh add should auto-derive again
       window._editOriginalSnapshot = null;
     };
 
@@ -367,10 +405,9 @@
       continueBtn.hidden = true;
       if (cancelBtn) cancelBtn.hidden = true;
       if (!name) return;
-      const api = window.pywebview?.api;
-      if (!api?.chan_redownload_progress_peek) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const p = await api.chan_redownload_progress_peek(name);
+        const p = await bridgeCall("chan_redownload_progress_peek", name);
         if (p?.ok && p.pending) {
           continueBtn.hidden = false;
           const res = p.resolution || "best";
@@ -406,12 +443,11 @@
       const name = _editFolderEl?.value.trim() || "";
       if (!name) return;
       const res = continueBtn.dataset.resolution || "best";
-      const api = window.pywebview?.api;
-      if (!api?.chan_redownload) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
-      const r = await api.chan_redownload(name, res);
+      const r = await bridgeCall("chan_redownload", name, res);
       if (r?.ok) {
         if (r.queued) {
           window._showToast?.(`Queued redownload of ${name}.`, "ok");
@@ -425,8 +461,7 @@
     cancelBtn?.addEventListener("click", async () => {
       const name = _editFolderEl?.value.trim() || "";
       if (!name) return;
-      const api = window.pywebview?.api;
-      if (!api?.chan_cancel_redownload) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -439,7 +474,7 @@
       });
       if (!ok) return;
       try {
-        const r = await api.chan_cancel_redownload(name);
+        const r = await bridgeCall("chan_cancel_redownload", name);
         if (!r?.ok) {
           window._showToast?.(r?.error || "Cancel failed.", "error");
           return;
@@ -484,8 +519,7 @@
     // offers to queue mismatches for redownload.
     const recheckBtn = document.getElementById("edit-res-recheck");
     recheckBtn?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.chan_scan_resolution_mismatch) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -501,7 +535,7 @@
         // poll every 500ms until the worker thread reports done. The
         // old synchronous call could freeze the UI for minutes on
         // large channels.
-        const startRes = await api.chan_scan_resolution_mismatch(name, target);
+        const startRes = await bridgeCall("chan_scan_resolution_mismatch", name, target);
         if (!startRes?.ok) {
           window._showToast?.(startRes?.error || "Scan failed.", "error");
           return;
@@ -511,7 +545,7 @@
           const deadline = Date.now() + 30 * 60 * 1000;
           while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 500));
-            const p = await api.chan_scan_resolution_mismatch_poll(startRes.token);
+            const p = await bridgeCall("chan_scan_resolution_mismatch_poll", startRes.token);
             if (!p?.pending) { res = p; break; }
           }
           if (!res || res.pending) {
@@ -538,7 +572,7 @@
           "you can cancel and resume later.",
           "Start redownload");
         if (!ok) return;
-        const r2 = await api.chan_redownload(name, target);
+        const r2 = await bridgeCall("chan_redownload", name, target);
         if (r2?.ok) window._showToast?.(`Redownload started (${lab}).`, "ok");
         else window._showToast?.(r2?.error || "Redownload failed.", "error");
       } catch (e) {
@@ -548,7 +582,7 @@
 
     // Restore defaults button — pulls from settings and applies.
     document.getElementById("btn-edit-restore")?.addEventListener("click", async () => {
-      const defs = await window.pywebview?.api?.subs_get_defaults?.();
+      const defs = nativeBridgeUp() ? await bridgeCall("subs_get_defaults") : null;
       if (!defs) return;
       document.getElementById("edit-resolution").value = defs.resolution || "720";
       document.getElementById("edit-min-dur").value = defs.min_duration ?? 3;
@@ -632,8 +666,8 @@
       // edit panel surfaces the missing URL so the user pastes a
       // legitimate one before saving.
       const chan = { folder, url: urlGuess || "" };
-      if (window.pywebview?.api?.subs_get_channel) {
-        window.pywebview.api.subs_get_channel({ name: folder }).then(res => {
+      if (nativeBridgeUp()) {
+        bridgeCall("subs_get_channel", { name: folder }).then(res => {
           const channel = (res && res.ok && res.channel) ? {
             ...res.channel,
             folder: res.channel.name || res.channel.folder,
@@ -678,6 +712,10 @@
         return;
       }
       if (!payload.url) { flashError("Channel URL is required."); return; }
+      // Keeps direct `api`: the dedup step below is gated on an
+      // optional-method existence check (`if (api.subs_check_duplicate)`)
+      // that the YT.api proxy can't express (it resolves every name to a
+      // function), so route this handler through the raw bridge.
       const api = window.pywebview?.api;
       if (!api) { flashError("Not running in native mode — writes disabled."); return; }
 
@@ -741,10 +779,9 @@
     });
 
     async function refreshSubsTable() {
-      const api = window.pywebview?.api;
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       try {
-        const data = await api.get_subs_channels();
+        const data = await bridgeCall("get_subs_channels");
         if (Array.isArray(data) && data.length === 2) {
           window.renderSubsTable(data[0], data[1]);
           window._primeBrowse(data[0]);

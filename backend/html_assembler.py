@@ -24,7 +24,6 @@ import os
 import re
 from pathlib import Path
 
-
 _INCLUDE_RE = re.compile(
     r"^(\s*)<!--\s*@include\s+(?P<path>[A-Za-z0-9_./-]+)\s*-->\s*$",
     re.MULTILINE,

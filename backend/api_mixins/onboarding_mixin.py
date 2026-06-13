@@ -12,9 +12,9 @@ the wizard can re-render final state.
 """
 from __future__ import annotations
 
-from ._shared import *  # noqa: F401,F403
-
 from backend import deps_installer as _deps
+
+from ._shared import *  # noqa: F401,F403
 
 
 class OnboardingMixin:
@@ -49,9 +49,7 @@ class OnboardingMixin:
         try:
             if self._window is None:
                 return
-            self._window.evaluate_js(
-                "window._onboardingProgress && "
-                f"window._onboardingProgress({json.dumps(payload)});")
+            self.services.event_bus.onboarding_progress(payload)
         except Exception as e:
             _log.debug("onboarding push failed: %s", e)
 

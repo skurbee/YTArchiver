@@ -756,13 +756,29 @@ class MediaOpsMixin:
                                      f"for it to finish before reorganizing."}
             except Exception as e:
                 _log.debug("swallowed: %s", e)
+        # "Re-apply organization" (Subs > Reorg folder) passes
+        # split_years=split_months=None as a sentinel meaning "use THIS
+        # channel's configured folder org" rather than a specific layout.
+        # Previously bool(None) silently collapsed to False, so Re-apply
+        # FLATTENED the channel instead of re-splitting it. Resolve None
+        # from the channel's split_years/split_months flags. The explicit
+        # Flat (False,False) / Split-by-year (True,...) menu items still
+        # pass real booleans and are honored as-is.
+        _sy = bool(ch.get("split_years")) if split_years is None else bool(split_years)
+        _sm = bool(ch.get("split_months")) if split_months is None else bool(split_months)
+        # Reorg gets its OWN cancel event — it used to share
+        # self._sync_cancel, which every sync-stop path SETS and only a
+        # new sync start CLEARS. Run a reorg after stopping a sync and
+        # it aborted at video #1 ("Reorg cancelled") or stopped partway
+        # through recheck_dates, leaving the folder half-done.
+        _reorg_cancel = threading.Event()
         def _run():
             try:
                 reorg_backend.reorg_channel(folder,
-                                            split_years=bool(split_years),
-                                            split_months=bool(split_months),
+                                            split_years=_sy,
+                                            split_months=_sm,
                                             stream=self._log_stream,
-                                            cancel_event=self._sync_cancel,
+                                            cancel_event=_reorg_cancel,
                                             recheck_dates=bool(recheck_dates))
             finally:
                 self._log_stream.flush()

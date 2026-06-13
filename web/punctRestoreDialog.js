@@ -13,6 +13,16 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initPunctRestoreDialog() {
       const btn = document.getElementById("btn-punct-restore");
       const bd = document.getElementById("punct-restore-backdrop");
@@ -24,9 +34,16 @@
 
       const _loadChannels = async () => {
         try {
-          const api = window.pywebview?.api;
-          const list = await api?.get_subs_channels?.();
-          const channels = Array.isArray(list) ? list : (list?.channels || []);
+          const list = nativeBridgeUp()
+            ? await bridgeCall("get_subs_channels")
+            : undefined;
+          // get_subs_channels returns a [rows, totalLabel] tuple —
+          // unwrap rows like driftScanDialog does, or the dropdown
+          // fills with two garbage entries.
+          let channels = [];
+          if (Array.isArray(list) && Array.isArray(list[0])) channels = list[0];
+          else if (Array.isArray(list)) channels = list;
+          else channels = list?.channels || [];
           chanSel.innerHTML = "";
           const allOpt = document.createElement("option");
           allOpt.value = "";
@@ -63,8 +80,7 @@
       });
 
       runBtn.addEventListener("click", async () => {
-        const api = window.pywebview?.api;
-        if (!api?.punct_restore_segments) {
+        if (!nativeBridgeUp()) {
           window._showToast?.("Punctuation restore API not available.", "warn");
           return;
         }
@@ -87,7 +103,7 @@
           if (!_ok) return;
         }
         try {
-          const res = await api.punct_restore_segments(payload);
+          const res = await bridgeCall("punct_restore_segments", payload);
           if (res?.ok && res.queued) {
             const msg = res.started
               ? "Punctuation restore queued — running now. Watch the main log."

@@ -16,12 +16,21 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   function initRefreshSizesClick() {
     const totalEl = document.getElementById("subs-total-size");
     if (!totalEl) return;
     totalEl.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.archive_rescan) return;
+      if (!nativeBridgeUp()) return;
       const ok = await (window.askConfirm
         ? window.askConfirm("Refresh sizes",
             "Rescan all channel folder sizes?\n\nThis walks every channel folder on disk " +
@@ -31,13 +40,11 @@
       if (!ok) return;
       window._showToast?.("Rescanning archive folder sizes…", "ok");
       try {
-        await api.archive_rescan();
+        await bridgeCall("archive_rescan");
         // After rescan completes, refresh the Subs table so totals update.
-        if (api.get_subs_channels) {
-          const subsData = await api.get_subs_channels();
-          if (Array.isArray(subsData) && subsData.length === 2) {
-            window.renderSubsTable(subsData[0], subsData[1]);
-          }
+        const subsData = await bridgeCall("get_subs_channels");
+        if (Array.isArray(subsData) && subsData.length === 2) {
+          window.renderSubsTable(subsData[0], subsData[1]);
         }
       } catch (e) { window._showToast?.("Rescan failed.", "error"); }
     });

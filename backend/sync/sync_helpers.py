@@ -23,7 +23,6 @@ from pathlib import Path
 
 from .. import utils as _utils
 
-
 # yt-dlp's per-track format-suffix intermediates: `video.f135.mp4`,
 # `video.f140-16.m4a`, `video.f140-drc.m4a`. Used by `_scan_recent_video`
 # to skip these when picking the most-recent merged output.
@@ -51,7 +50,7 @@ def _hide_sidecar_win(video_path: str) -> None:
         sibs = []
     for sc in sibs:
         low = sc.lower()
-        if low.endswith(_utils._VISIBLE_MEDIA_EXTS) or low.endswith("transcript.txt"):
+        if low.endswith(_utils._VISIBLE_MEDIA_EXTS + ("transcript.txt",)):
             continue
         try:
             if os.path.isfile(sc):
@@ -103,7 +102,7 @@ def _scan_recent_video(channel_dir) -> str | None:
         channel_dir = str(channel_dir)
         if not channel_dir or not os.path.isdir(channel_dir):
             return None
-        exts = (".mp4", ".mkv", ".webm")
+        exts = _RESOLVE_MEDIA_EXTS
         now = time.time()
         tkey = os.path.getctime if os.name == "nt" else os.path.getmtime
         best_path = None
@@ -151,6 +150,7 @@ def _resolve_final_mp4(dest_path: str) -> str | None:
                    ".wav", ".opus", ".ogg"):
         return None
     stem = p.stem
+    _had_fmt_suffix = False
     if "." in stem:
         parts = stem.split(".")
         last = parts[-1]
@@ -164,6 +164,7 @@ def _resolve_final_mp4(dest_path: str) -> str | None:
         # audio (observed on bodycam / multi-language content).
         if (len(last) >= 2 and last[0] == "f" and last[1].isdigit()):
             stem = ".".join(parts[:-1])
+            _had_fmt_suffix = True
         # Strip language codes left from `--write-subs` (e.g. `.en`, `.en-orig`,
         # `.en-us`). These don't appear on merged video outputs but defensive
         # handling prevents future caption-related regressions.
@@ -177,14 +178,29 @@ def _resolve_final_mp4(dest_path: str) -> str | None:
     # grid would then point at a non-existent .mp4 and fall back to
     # scan-recent which may pick up the wrong file.
     _video_container_exts = (".mp4", ".mkv", ".webm")
-    _target_ext = ext if ext in _video_container_exts else ".mp4"
+    _audio_container_exts = (".m4a", ".mp3", ".flac", ".wav", ".opus", ".ogg")
+    if ext in _video_container_exts:
+        _target_ext = ext
+    elif ext in _audio_container_exts and not _had_fmt_suffix:
+        # Final audio output (audio-mode channels): keep the real
+        # container. Coercing 'Title.m4a' to 'Title.mp4' pointed every
+        # audio download at a nonexistent file — worst-case info.json
+        # walk of the whole channel per download.
+        _target_ext = ext
+    else:
+        # f-suffixed audio destinations (Title.f140.m4a) are the audio
+        # TRACK of a video merge — the merged output will be .mp4.
+        _target_ext = ".mp4"
     final = p.parent / f"{stem}{_target_ext}"
     # Return regardless of existence — file may still be writing when we enqueue
     return str(final)
 
 
-# Media containers a merged yt-dlp download can land in.
-_RESOLVE_MEDIA_EXTS = (".mp4", ".mkv", ".webm")
+# Media containers a merged yt-dlp download can land in. Audio
+# containers included so the fallback resolvers can find audio-mode
+# downloads instead of always falling through to the info.json walk.
+_RESOLVE_MEDIA_EXTS = (".mp4", ".mkv", ".webm",
+                       ".m4a", ".mp3", ".flac", ".wav", ".opus", ".ogg")
 
 
 def _resolve_path_for_vid(channel_dir, vid: str) -> str | None:

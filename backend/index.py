@@ -15,6 +15,7 @@ Operations:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
@@ -39,7 +40,7 @@ _db_lock = threading.RLock()
 # of spawning a daemon thread per ingest.
 _tx_retry_set: set = set()
 _tx_retry_lock = threading.Lock()
-_tx_retry_thread: "threading.Thread | None" = None
+_tx_retry_thread: threading.Thread | None = None
 def _enqueue_tx_retry(fp: str) -> None:
     global _tx_retry_thread
     with _tx_retry_lock:
@@ -142,6 +143,7 @@ def _reader_open() -> sqlite3.Connection | None:
                 check_same_thread=False, timeout=30.0)
             _reader_conn.execute("PRAGMA journal_mode=WAL")
             _reader_conn.execute("PRAGMA synchronous=NORMAL")
+            _reader_conn.execute("PRAGMA busy_timeout=30000")
             _reader_conn.execute("PRAGMA query_only=ON")
             return _reader_conn
         except Exception:
@@ -174,9 +176,47 @@ def _open_independent() -> sqlite3.Connection | None:
                             check_same_thread=False, timeout=30.0)
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=30000")
         return c
     except Exception:
         return None
+
+
+def _shutdown_index() -> None:
+    """atexit hook: checkpoint + close the long-lived connections on a clean
+    exit so the -wal file is truncated (it can otherwise grow unbounded on Z:
+    between SQLite's opportunistic auto-checkpoints) and the query planner's
+    stats are refreshed. Best-effort; never raises (audit: index.py shutdown
+    checkpoint). NOTE: the window 'nuclear' TerminateProcess quit path bypasses
+    atexit, so this covers clean exits only."""
+    global _conn, _reader_conn
+    with _db_lock:
+        if _conn is not None:
+            try:
+                _conn.execute("PRAGMA optimize")
+                # PASSIVE (not TRUNCATE): non-blocking. TRUNCATE waits for all
+                # other readers/writers and could busy-stall up to busy_timeout
+                # (30s) at shutdown if an independent-connection writer is still
+                # active (audit r2). PASSIVE merges what it can without stalling;
+                # normal-operation auto-checkpoint bounds -wal growth.
+                _conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            try:
+                _conn.close()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            _conn = None
+    with _reader_lock:
+        if _reader_conn is not None:
+            try:
+                _reader_conn.close()
+            except Exception as e:
+                _log.debug("swallowed: %s", e)
+            _reader_conn = None
+
+
+atexit.register(_shutdown_index)
 
 
 # ── DB open / schema ────────────────────────────────────────────────────
@@ -189,7 +229,7 @@ def _open() -> sqlite3.Connection | None:
             return _conn
         try:
             TRANSCRIPTION_DB.parent.mkdir(parents=True, exist_ok=True)
-            _conn = sqlite3.connect(str(TRANSCRIPTION_DB), check_same_thread=False, timeout=10.0)
+            _conn = sqlite3.connect(str(TRANSCRIPTION_DB), check_same_thread=False, timeout=30.0)
             # Check the PRAGMA result — on some filesystems (network
             # shares without shared-memory support, certain DrivePool
             # configs) WAL silently falls back to "delete" mode, and
@@ -206,6 +246,11 @@ def _open() -> sqlite3.Connection | None:
                     "behind sync writers — file an issue with this msg.",
                     TRANSCRIPTION_DB, _wal_mode)
             _conn.execute("PRAGMA synchronous=NORMAL")
+            # Wait up to 30s for a competing writer's lock instead of failing
+            # fast at the old 10s connect timeout — consistent with the reader/
+            # independent connections and punct_restore/repair_captions on the
+            # same DB (audit: index.py busy_timeout).
+            _conn.execute("PRAGMA busy_timeout=30000")
             # Schema matches YTArchiver.py:23448 verbatim
             _conn.execute("""CREATE TABLE IF NOT EXISTS segments (
                 id INTEGER PRIMARY KEY,
@@ -377,6 +422,12 @@ def _open() -> sqlite3.Connection | None:
                 # ORDER BY ... LIMIT/OFFSET pagination off a full table scan.
                 "CREATE INDEX IF NOT EXISTS idx_vid_added_ts ON videos(added_ts)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_upload_ts ON videos(upload_ts)",
+                # Covering index for the search year-filter's (channel, title)
+                # upload-date fallback: segments with an empty video_id resolve
+                # their year via MIN(upload_ts) grouped by (channel, title).
+                # The 3-col covering index lets that run index-only.
+                "CREATE INDEX IF NOT EXISTS idx_vid_chan_title "
+                "ON videos(channel, title, upload_ts)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_view_count ON videos(view_count)",
                 "CREATE INDEX IF NOT EXISTS idx_vid_like_count ON videos(like_count)",
             ):
@@ -434,7 +485,12 @@ def _parse_year_month_from_path(filepath: str) -> tuple[int | None, int | None]:
     # most <channel>/<year>/<month>/file.mp4 (depth 3) or
     # <channel>/<year>/file.mp4 (depth 2).
     MAX_YEAR_DEPTH = 3
-    for depth, p in enumerate(reversed(parts), start=0):
+    # parts[:-1]: NEVER consider the file's basename — titles starting
+    # with a month word ('May Day Parade …') matched the month check
+    # at depth 0 and blocked the real month FOLDER from ever being
+    # read, mis-bucketing the video in Browse/Graph/search filters.
+    # start=1 keeps the dir-depth numbering identical to before.
+    for depth, p in enumerate(reversed(parts[:-1]), start=1):
         low = p.lower().strip()
         # Month hit — either "january" style OR "01 January" style.
         if month is None:
@@ -760,7 +816,7 @@ def register_video(filepath: str, channel: str, title: str | None = None,
 
 
 def mark_video_transcribed(filepath: str,
-                            _conn_override: "sqlite3.Connection | None" = None) -> bool:
+                            _conn_override: sqlite3.Connection | None = None) -> bool:
     """Flip the tx_status flag for `filepath` to 'transcribed'.
 
     `_conn_override` lets the caller pass an independent connection
@@ -798,6 +854,216 @@ def mark_video_transcribed(filepath: str,
             try: invalidate_channel_videos(row[0])
             except Exception as e: _log.debug("swallowed: %s", e)
         return True
+    except sqlite3.Error:
+        return False
+
+
+def mark_video_no_speech(filepath: str,
+                          _conn_override: sqlite3.Connection | None = None) -> bool:
+    """Flip the tx_status flag for `filepath` to 'no_speech'.
+
+    Used when Whisper ran successfully but produced an EMPTY transcript
+    (silent / music-only video). 'no_speech' is a TERMINAL state, distinct
+    from 'transcribed' (has a transcript) and 'pending' (still needs an
+    attempt): the video has been checked, there is nothing to transcribe,
+    and it must NOT be auto-re-queued. Same connection-override pattern as
+    mark_video_transcribed.
+    """
+    fp = os.path.normpath(filepath)
+    use_override = _conn_override is not None
+    try:
+        if use_override:
+            conn = _conn_override
+            conn.execute("UPDATE videos SET tx_status='no_speech' "
+                          "WHERE filepath=? COLLATE NOCASE", (fp,))
+            row = conn.execute(
+                "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
+                (fp,)).fetchone()
+            conn.commit()
+        else:
+            with _db_lock:
+                conn = _open()
+                if conn is None:
+                    return False
+                conn.execute("UPDATE videos SET tx_status='no_speech' "
+                              "WHERE filepath=? COLLATE NOCASE", (fp,))
+                row = conn.execute(
+                    "SELECT channel FROM videos WHERE filepath=? COLLATE NOCASE",
+                    (fp,)).fetchone()
+                conn.commit()
+        if row and row[0]:
+            try: invalidate_channel_videos(row[0])
+            except Exception as e: _log.debug("swallowed: %s", e)
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def delete_segments_for_video(filepath: str) -> int:
+    """FTS-safe removal of every transcript segment tied to a video FILE.
+
+    Used by the Recent/Browse delete-file endpoints. Two things the old
+    inline cleanups got wrong: (1) they deleted by the per-video
+    "<stem>.jsonl" path, which matches ZERO rows in the aggregated
+    layout (segments.jsonl_path holds the per-folder aggregated file),
+    so deleted videos stayed searchable; (2) they skipped the
+    external-content FTS5 'delete' insert, leaving stale rowids in the
+    FTS shadow that map old text onto recycled rows later. This helper
+    deletes by video_id (idx_seg_video_id) with the proper FTS sync,
+    plus a legacy per-video-path cleanup for pre-aggregation rows.
+    Acquires _db_lock itself — call OUTSIDE any existing _db_lock block.
+    Returns the number of segment rows removed."""
+    _fp = os.path.normpath(filepath or "")
+    if not _fp:
+        return 0
+    _legacy_jsonl = os.path.splitext(_fp)[0] + ".jsonl"
+    removed = 0
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT video_id FROM videos WHERE filepath=? COLLATE NOCASE",
+                (_fp,)).fetchone()
+            vid = (row[0] or "") if row else ""
+            if vid:
+                conn.execute(
+                    "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                    "SELECT 'delete', id, text FROM segments "
+                    "WHERE video_id=?", (vid,))
+                cur = conn.execute(
+                    "DELETE FROM segments WHERE video_id=?", (vid,))
+                removed += cur.rowcount
+            conn.execute(
+                "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                "SELECT 'delete', id, text FROM segments "
+                "WHERE jsonl_path=? COLLATE NOCASE", (_legacy_jsonl,))
+            cur = conn.execute(
+                "DELETE FROM segments WHERE jsonl_path=? COLLATE NOCASE",
+                (_legacy_jsonl,))
+            removed += cur.rowcount
+            conn.commit()
+    except sqlite3.Error as e:
+        _log.debug("swallowed: %s", e)
+    return removed
+
+
+def delete_channel_from_index(channel: str) -> dict[str, int]:
+    """Remove an ENTIRE channel from the index: every `videos` row plus all
+    of its transcript segments (FTS-safe).
+
+    Called when a channel is removed via the UI WITH delete_files=True. The
+    Browse / Search / Videos views read the index DB, not the disk — so
+    without this the deleted channel's cards keep showing and 404 ("File not
+    found — index entry may be stale") when clicked. Mirrors
+    delete_segments_for_video's FTS sync, scoped to the channel: push a
+    'delete' into segments_fts for every row before dropping it so the FTS
+    shadow doesn't strand stale text on recycled rowids. Order matters —
+    segments are deleted BEFORE the videos rows the subquery depends on.
+    Acquires _db_lock — call OUTSIDE any existing _db_lock block.
+    Returns {videos, segments} removed counts."""
+    out = {"videos": 0, "segments": 0}
+    if not channel:
+        return out
+    _sub = ("video_id IN (SELECT video_id FROM videos "
+            "WHERE channel=? COLLATE NOCASE AND video_id IS NOT NULL)")
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return out
+            # FTS-safe removal of this channel's segments first.
+            conn.execute(
+                "INSERT INTO segments_fts(segments_fts, rowid, text) "
+                "SELECT 'delete', id, text FROM segments WHERE " + _sub,
+                (channel,))
+            cur = conn.execute(
+                "DELETE FROM segments WHERE " + _sub, (channel,))
+            out["segments"] = cur.rowcount or 0
+            # Then the video rows for the channel.
+            cur = conn.execute(
+                "DELETE FROM videos WHERE channel=? COLLATE NOCASE",
+                (channel,))
+            out["videos"] = cur.rowcount or 0
+            conn.commit()
+        try:
+            invalidate_channel_videos(channel)
+        except Exception as e:
+            _log.debug("swallowed: %s", e)
+    except sqlite3.Error as e:
+        _log.debug("delete_channel_from_index(%s) failed: %s", channel, e)
+    return out
+
+
+def update_video_path(old_path: str, new_path: str) -> bool:
+    """Re-point a video's row at its new on-disk location after a move.
+
+    reorg physically moves the .mp4 into a different year/month folder but
+    the catalog's `videos.filepath` would otherwise still point at the OLD
+    location, so Watch playback + the Browse grid show "File not found" for
+    relocated videos (the transcript still loads — segments are keyed by
+    video_id, not path). This rewrites JUST the filepath old→new; video_id /
+    transcript / segments are untouched. Returns True if a row was updated.
+    """
+    _old = os.path.normpath(old_path)
+    _new = os.path.normpath(new_path)
+    if _old == _new:
+        return False
+    try:
+        with _db_lock:
+            conn = _open()
+            if conn is None:
+                return False
+            cur = conn.execute(
+                "UPDATE videos SET filepath=? WHERE filepath=? COLLATE NOCASE",
+                (_new, _old))
+            row = conn.execute(
+                "SELECT channel, video_id FROM videos "
+                "WHERE filepath=? COLLATE NOCASE",
+                (_new,)).fetchone()
+            # Re-point transcript sidecar references in the SAME
+            # transaction. reorg moves the per-video .jsonl alongside
+            # the .mp4; leaving segments.jsonl_path / indexed_files.path
+            # at the OLD location made the next boot sweep treat the
+            # moved .jsonl as un-indexed and re-ingest it — duplicating
+            # every segment (and FTS hit) for the video. Both sidecar
+            # name shapes are covered (legacy "stem.jsonl" and hidden
+            # ".stem.jsonl"); aggregated channel/year jsonls never equal
+            # these exact paths, so they are untouched.
+            _vid = (row[1] or "") if (row and len(row) > 1) else ""
+            _od, _ob = os.path.split(os.path.splitext(_old)[0])
+            _nd, _nb = os.path.split(os.path.splitext(_new)[0])
+            for _oj, _nj in (
+                    (os.path.join(_od, _ob + ".jsonl"),
+                     os.path.join(_nd, _nb + ".jsonl")),
+                    (os.path.join(_od, "." + _ob + ".jsonl"),
+                     os.path.join(_nd, "." + _nb + ".jsonl"))):
+                if _vid:
+                    # video_id scope lets the planner use
+                    # idx_seg_video_id while keeping the path compare
+                    # NOCASE-robust.
+                    conn.execute(
+                        "UPDATE segments SET jsonl_path=? "
+                        "WHERE video_id=? AND jsonl_path=? COLLATE NOCASE",
+                        (_nj, _vid, _oj))
+                else:
+                    # No video_id: exact match keeps idx_seg_jsonl
+                    # usable (NOCASE here would force a full-table
+                    # scan per moved file).
+                    conn.execute(
+                        "UPDATE segments SET jsonl_path=? "
+                        "WHERE jsonl_path=?",
+                        (_nj, _oj))
+                conn.execute(
+                    "UPDATE indexed_files SET path=? "
+                    "WHERE path=? COLLATE NOCASE",
+                    (_nj, _oj))
+            conn.commit()
+        if row and row[0]:
+            try: invalidate_channel_videos(row[0])
+            except Exception as e: _log.debug("swallowed: %s", e)
+        return cur.rowcount > 0
     except sqlite3.Error:
         return False
 
@@ -924,7 +1190,7 @@ def ingest_jsonl(video_filepath: str, jsonl_path: str,
                     jp,
                     json.dumps(w_val, ensure_ascii=False),
                 ))
-            cur = conn.executemany(
+            conn.executemany(
                 """INSERT INTO segments
                    (video_id, title, channel, year, month, start_time, end_time,
                     text, jsonl_path, words)
@@ -1057,6 +1323,15 @@ def invalidate_channel_videos(channel: str | None = None) -> None:
         # change can shift it — always clear it wholesale (it's tiny: a
         # few pages of the default sort).
         _all_videos_cache.clear()
+    # Also drop the channel-wide thumbnail index. Its freshness stamp is
+    # the channel ROOT's mtime, but NTFS only bumps the IMMEDIATE parent
+    # dir — new thumbs land in <root>/<year>/.Thumbnails/, so the stamp
+    # never changes and the cache stayed permanently stale (gradient
+    # placeholders for every new video until restart). We only have the
+    # channel NAME here (the cache is keyed by folder path), so clear
+    # wholesale — it rebuilds lazily per channel on next access.
+    with _thumb_index_cache_lock:
+        _thumb_index_cache.clear()
 
 
 def preload_channel_videos(channel: str,
@@ -1175,6 +1450,14 @@ def list_videos_for_channel(channel: str, sort: str = "newest",
         "oldest": "COALESCE(year, 99999) ASC, COALESCE(month, 99) ASC, COALESCE(added_ts, 0) ASC",
         "largest": "COALESCE(size_bytes, 0) DESC",
         "title": "title COLLATE NOCASE ASC",
+        # most_viewed MUST order in SQL: without this key the query ran
+        # the default newest-first order, LIMIT truncated to the newest
+        # N, and the Python view-count re-sort below only reshuffled
+        # those — genuinely top-viewed older videos were absent
+        # entirely on channels larger than the limit. The Python
+        # re-sort stays as a tie-refiner from JSONL data.
+        "most_viewed": "(view_count IS NULL) ASC, view_count DESC, "
+                       "COALESCE(added_ts, 0) DESC",
     }.get(sort, "COALESCE(year, 0) DESC, COALESCE(month, 0) DESC, COALESCE(added_ts, 0) DESC")
     with _reader_lock:
         # Select removed_from_yt_ts last so older DBs (where the column
@@ -1559,12 +1842,15 @@ def new_videos_in_last_n_days(days: int = 7) -> dict[str, Any]:
 
 
 def channel_transcription_stats(channel: str) -> dict[str, int]:
-    """Return {total, transcribed, pending, failed} video counts for a channel.
+    """Return {total, transcribed, pending, failed, no_speech} video counts.
 
     Matches on channel name via the videos table (NOCASE). Empty channel ->
-    zeros. Safe to call with an uninitialized DB (returns zeros).
+    zeros. Safe to call with an uninitialized DB (returns zeros). `no_speech`
+    is a terminal "checked, genuinely silent" state — counted separately from
+    `transcribed` (it has no transcript) and excluded from `pending`.
     """
-    out = {"total": 0, "transcribed": 0, "pending": 0, "failed": 0}
+    out = {"total": 0, "transcribed": 0, "pending": 0, "failed": 0,
+           "no_speech": 0}
     if not channel:
         return out
     try:
@@ -1590,7 +1876,9 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
                               THEN 1 ELSE 0 END) AS done,
                      SUM(CASE WHEN tx_status='pending' OR tx_status IS NULL
                               THEN 1 ELSE 0 END) AS pending,
-                     SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed
+                     SUM(CASE WHEN tx_status='failed' THEN 1 ELSE 0 END) AS failed,
+                     SUM(CASE WHEN tx_status='no_speech'
+                              THEN 1 ELSE 0 END) AS no_speech
                    FROM videos
                    WHERE channel = ? COLLATE NOCASE
                      AND is_duplicate_of IS NULL""",
@@ -1601,6 +1889,7 @@ def channel_transcription_stats(channel: str) -> dict[str, int]:
             out["transcribed"] = int(row[1] or 0)
             out["pending"] = int(row[2] or 0)
             out["failed"] = int(row[3] or 0)
+            out["no_speech"] = int(row[4] or 0)
     except Exception as e:
         _log.debug("swallowed: %s", e)
     return out
@@ -1846,8 +2135,8 @@ def backfill_video_stats(progress=None) -> dict:
     archive by views/likes off an indexed column. Idempotent; safe to re-run.
     """
     try:
-        from .ytarchiver_config import load_config
         from .metadata_io import _folder_for_channel, _read_metadata_jsonl
+        from .ytarchiver_config import load_config
     except Exception as e:
         return {"ok": False, "error": f"import: {e}", "updated": 0}
     channels = (load_config().get("channels") or [])
@@ -2108,6 +2397,39 @@ def find_archived_by_video_id(video_id: str) -> dict | None:
             "filepath": row[2] or ""}
 
 
+def video_tx_status(video_id: str | None = None,
+                    title: str | None = None) -> str:
+    """Return the tx_status for a single video, or "" if unknown.
+
+    Values: 'transcribed' | 'pending' | 'no_speech' | 'no_captions' |
+    'failed' | 'done'. Lock-free reader path (same rationale as
+    get_segments). Used by browse_get_transcript so the Watch view can tell
+    a genuinely-silent video ('no_speech') apart from one that simply hasn't
+    been transcribed yet (both have zero segments)."""
+    if not video_id and not title:
+        return ""
+    conn = _reader_open() or _open()
+    if conn is None:
+        return ""
+    try:
+        with _reader_lock:
+            if video_id:
+                row = conn.execute(
+                    "SELECT tx_status FROM videos WHERE video_id=? LIMIT 1",
+                    (video_id,)).fetchone()
+                if row:
+                    return row[0] or ""
+            if title:
+                row = conn.execute(
+                    "SELECT tx_status FROM videos WHERE title=? LIMIT 1",
+                    (title,)).fetchone()
+                if row:
+                    return row[0] or ""
+    except sqlite3.Error as e:
+        _log.debug("video_tx_status failed: %s", e)
+    return ""
+
+
 def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                  title: str | None = None) -> list[dict[str, Any]]:
     """Return ordered segments for a video.
@@ -2152,6 +2474,15 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
     # or return wrong segment results.
     with _reader_lock:
         _jp_from_canon = False
+        # When the video_id resolves to no segments, fall back to matching
+        # by title (the way get_segment_context / video_tx_status already do).
+        # Legacy rows store video_id="" when the filename had no 11-char YT id
+        # AND the JSONL carried none, so those transcripts are searchable (and
+        # the search viewer reaches them by segment_id) but a video_id lookup
+        # returns nothing — leaving the Watch pane blank. Matching by title
+        # (scoped to a canonical jsonl_path to avoid doubling a combined +
+        # year-split ingest) makes them viewable in Watch too.
+        _match_by_title = False
         if video_id and not jsonl_path:
             try:
                 canon = conn.execute(
@@ -2162,12 +2493,28 @@ def get_segments(video_id: str | None = None, jsonl_path: str | None = None,
                 if canon and canon[0]:
                     jsonl_path = canon[0]
                     _jp_from_canon = True
+                elif title:
+                    # No segments carry this video_id -> match by title.
+                    _match_by_title = True
+                    try:
+                        tcanon = conn.execute(
+                            "SELECT jsonl_path FROM segments WHERE title=? "
+                            "GROUP BY jsonl_path ORDER BY MAX(id) DESC LIMIT 1",
+                            (title,)
+                        ).fetchone()
+                        if tcanon and tcanon[0]:
+                            jsonl_path = tcanon[0]
+                            _jp_from_canon = True
+                    except Exception as e:
+                        _log.debug("swallowed: %s", e)
             except Exception as e:
                 _log.debug("swallowed: %s", e)
         where = []
         args: list[Any] = []
-        if video_id:
+        if video_id and not _match_by_title:
             where.append("video_id=?"); args.append(video_id)
+        if _match_by_title and title:
+            where.append("title=?"); args.append(title)
         if jsonl_path:
             where.append("jsonl_path=?")
             args.append(jsonl_path if _jp_from_canon
@@ -2224,17 +2571,31 @@ def get_segment_context(segment_id: int, before: int = 30,
             if not hit:
                 return {"ok": False, "error": "Segment not found"}
             hit_id, vid_id, title, channel, jsonl_path, hit_start = hit
-            # Pull the window around the hit within the same jsonl file
+            # Pull the window around the hit within the same video.
+            # A combined-transcript .jsonl holds MANY videos under ONE
+            # jsonl_path, so path-only context leaks other videos' lines.
+            # Prefer video_id-only scope when present. On combined-transcript
+            # files, a jsonl_path predicate can make SQLite choose the broad
+            # path index and scan huge files before applying video_id. The
+            # video_id index narrows to one video first and still prevents
+            # cross-video context bleed. Fall back to path+title+channel for
+            # legacy rows that lack video_id.
+            if vid_id:
+                scope_sql = "video_id=?"
+                scope_args = (vid_id,)
+            else:
+                scope_sql = "jsonl_path=? AND title=? AND channel=?"
+                scope_args = (jsonl_path, title, channel)
             rows_before = conn.execute(
                 "SELECT id, start_time, end_time, text FROM segments "
-                "WHERE jsonl_path=? AND start_time < ? "
+                f"WHERE {scope_sql} AND start_time < ? "
                 "ORDER BY start_time DESC LIMIT ?",
-                (jsonl_path, hit_start, before)).fetchall()
+                (*scope_args, hit_start, before)).fetchall()
             rows_after = conn.execute(
                 "SELECT id, start_time, end_time, text FROM segments "
-                "WHERE jsonl_path=? AND start_time > ? "
+                f"WHERE {scope_sql} AND start_time > ? "
                 "ORDER BY start_time ASC LIMIT ?",
-                (jsonl_path, hit_start, after)).fetchall()
+                (*scope_args, hit_start, after)).fetchall()
             hit_row = conn.execute(
                 "SELECT id, start_time, end_time, text FROM segments "
                 "WHERE id=?", (segment_id,)).fetchone()
@@ -2245,14 +2606,14 @@ def get_segment_context(segment_id: int, before: int = 30,
                 before_edge = rows_before[-1][1] # earliest start_time in window
                 more_before = conn.execute(
                     "SELECT COUNT(*) FROM segments "
-                    "WHERE jsonl_path=? AND start_time < ?",
-                    (jsonl_path, before_edge)).fetchone()[0] > 0
+                    f"WHERE {scope_sql} AND start_time < ?",
+                    (*scope_args, before_edge)).fetchone()[0] > 0
             if rows_after:
                 after_edge = rows_after[-1][1]
                 more_after = conn.execute(
                     "SELECT COUNT(*) FROM segments "
-                    "WHERE jsonl_path=? AND start_time > ?",
-                    (jsonl_path, after_edge)).fetchone()[0] > 0
+                    f"WHERE {scope_sql} AND start_time > ?",
+                    (*scope_args, after_edge)).fetchone()[0] > 0
             # All other segments matching the query in this same video —
             # mark them so the viewer can highlight every hit, not just the
             # one the user clicked.
@@ -2262,8 +2623,9 @@ def get_segment_context(segment_id: int, before: int = 30,
                     cur2 = conn.execute(
                         "SELECT s.id FROM segments_fts "
                         "JOIN segments s ON s.id = segments_fts.rowid "
-                        "WHERE s.jsonl_path=? AND segments_fts MATCH ?",
-                        (jsonl_path, query))
+                        f"WHERE {('s.video_id=?' if vid_id else 's.jsonl_path=? AND s.title=? AND s.channel=?')} "
+                        "AND segments_fts MATCH ?",
+                        (*scope_args, query))
                     other_hits = {r[0] for r in cur2.fetchall()}
                 except sqlite3.Error:
                     other_hits = set()
@@ -2295,12 +2657,6 @@ def get_segment_context(segment_id: int, before: int = 30,
 # Patch 17 (v71.9): search functions extracted to index_search.py.
 # Re-imported here so existing callers (api_mixins.browse_mixin, etc.)
 # continue to resolve the names against the index module's namespace.
-from .index_search import (  # noqa: F401
-    _sanitize_fts_query,
-    search_fts,
-    search_video_titles,
-)
-
 # Patch 17 (v71.9): graph functions extracted to index_graph.py.
 from .index_graph import (  # noqa: F401
     backfill_upload_ts,
@@ -2312,7 +2668,11 @@ from .index_graph import (  # noqa: F401
     list_all_channels_in_db,
     top_words,
 )
-
+from .index_search import (  # noqa: F401
+    _sanitize_fts_query,
+    search_fts,
+    search_video_titles,
+)
 
 # ── Stats ───────────────────────────────────────────────────────────────
 

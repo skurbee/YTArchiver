@@ -91,14 +91,8 @@ class DiagnosticsMixin:
                             msg = (f"Missing: {names}. "
                                    "Install + add to PATH for downloads "
                                    "to work.")
-                            # Use json.dumps so the JS-side string
-                            # literal stays valid for quotes / non-
-                            # ASCII (audit: diagnostics_mixin.py:96-97).
-                            import json as _json
-                            self._window.evaluate_js(
-                                "window._showToast && "
-                                f"window._showToast({{msg: {_json.dumps(msg)}, "
-                                "kind: 'error', ttlMs: 12000}});")
+                            self.services.event_bus.show_toast(
+                                msg, "error", ttl_ms=12000)
                         except Exception:
                             pass
                     _th.Timer(3.0, _delayed_toast).start()

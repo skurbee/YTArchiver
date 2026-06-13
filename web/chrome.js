@@ -23,6 +23,15 @@
 (function () {
   "use strict";
 
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ── Header version label ─────────────────────────────────────────
   // Bounded retry + once-only guard so a stuck pywebview bind doesn't
   // spin setTimeout forever, and so the double-event wiring (both
@@ -34,13 +43,12 @@
     if (_hdrVerDone) return;
     const el = document.getElementById("header-version");
     if (!el) return;
-    const api = window.pywebview?.api;
-    if (!api || !api.get_header_version) {
+    if (!nativeBridgeUp()) {
       if (_hdrVerTries++ > 40) return;  // ~8s of retries, then give up
       setTimeout(_updateHeaderVersion, 200);
       return;
     }
-    api.get_header_version().then((r) => {
+    bridgeCall("get_header_version").then((r) => {
       if (!r) return;
       _hdrVerDone = true;
       const v = r.version || "";
@@ -75,6 +83,12 @@
         document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
         const panel = document.getElementById("panel-" + target);
         if (panel) panel.classList.add("active");
+        // Re-entering Subs: clear any lingering filter text so the box starts
+        // fresh (parity with Browse's clear-on-view-enter; previously the Subs
+        // filter persisted across tab switches, so re-typing doubled it).
+        if (target === "subs" && typeof window._clearSubsFilter === "function") {
+          window._clearSubsFilter();
+        }
         // Returning to Browse: the Videos sub-grid is a one-time render that
         // doesn't re-query on its own, so a download that landed while the
         // user was on another tab wouldn't appear until they changed the sort.

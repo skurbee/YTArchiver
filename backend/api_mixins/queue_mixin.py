@@ -250,9 +250,12 @@ class QueueMixin:
         if which in ("sync", "both"):
             self._sync_pause.set()
             self._queues.set_sync_paused(True)
-            self._transcribe.pause() # covers mixed queues via TranscribeManager
         if which in ("gpu", "both"):
             self._queues.set_gpu_paused(True)
+            # The TranscribeManager worker (transcribe + compress jobs) is the
+            # GPU lane — only pause it for gpu/both, NOT for a sync-only pause,
+            # so the two popover Pause buttons are independent (audit r2: a
+            # sync resume was secretly un-pausing a deliberately-paused GPU).
             self._transcribe.pause()
         self._on_queue_changed()
         return {"ok": True, "paused": which}
@@ -263,7 +266,6 @@ class QueueMixin:
         if which in ("sync", "both"):
             self._sync_pause.clear()
             self._queues.set_sync_paused(False)
-            self._transcribe.resume()
         if which in ("gpu", "both"):
             self._queues.set_gpu_paused(False)
             self._transcribe.resume()

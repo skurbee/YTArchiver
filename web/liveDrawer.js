@@ -17,26 +17,28 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Deferred livestreams drawer ─────────────────────────────────────
   async function refreshDeferredLivestreams() {
-    const api = window.pywebview?.api;
     const wrap = document.getElementById("deferred-livestreams");
     const list = document.getElementById("deferred-list");
     const count = document.getElementById("deferred-count");
     if (!wrap || !list) return;
-    if (!api?.livestreams_list) { wrap.hidden = true; return; }
+    if (!nativeBridgeUp()) { wrap.hidden = true; return; }
     try {
       // Check snooze state first — if active, keep the drawer hidden
       // regardless of how many deferred items exist. Timer in
       // initDeferredLivestreams re-checks every 30s so the drawer
       // reappears automatically after snooze expires.
-      const state = await api.livestreams_drawer_state?.();
+      const state = await bridgeCall("livestreams_drawer_state");
       if (state?.ok && state.visible === false) {
         wrap.hidden = true;
         return;
       }
-      const res = await api.livestreams_list();
+      const res = await bridgeCall("livestreams_list");
       const items = res?.items || [];
       if (!items.length) { wrap.hidden = true; return; }
       wrap.hidden = false;
@@ -57,7 +59,7 @@
           ? ` \u2014 ${it.title.slice(0, 60)}` : "";
         row.querySelector("[data-drop]").addEventListener("click", async () => {
           try {
-            await api.livestreams_drop(it.video_id);
+            await bridgeCall("livestreams_drop", it.video_id);
             refreshDeferredLivestreams();
           } catch (e) {
             window._showToast?.("Couldn't drop deferred entry: " + e, "error");
@@ -78,7 +80,7 @@
           });
           if (!ok) return;
           try {
-            await api.livestreams_ignore?.(it.video_id);
+            await bridgeCall("livestreams_ignore", it.video_id);
             window._showToast?.("Ignored. Won't appear again.", "ok");
             refreshDeferredLivestreams();
           } catch (e) {
@@ -108,17 +110,16 @@
     retryMenu?.querySelectorAll("button[data-retry]").forEach((b) => {
       b.addEventListener("click", async () => {
         const mode = b.dataset.retry;
-        const api = window.pywebview?.api;
         closeMenu();
         if (mode === "now") {
-          api?.sync_start_all?.();
+          if (nativeBridgeUp()) bridgeCall("sync_start_all");
           window._showToast?.("Retrying deferred livestreams via Sync Subbed.", "ok");
         } else if (mode === "24h") {
-          await api?.livestreams_snooze?.(24 * 60 * 60);
+          if (nativeBridgeUp()) await bridgeCall("livestreams_snooze", 24 * 60 * 60);
           window._showToast?.("Deferred livestreams snoozed for 24 hours.", "ok");
           refreshDeferredLivestreams();
         } else if (mode === "1w") {
-          await api?.livestreams_snooze?.(7 * 24 * 60 * 60);
+          if (nativeBridgeUp()) await bridgeCall("livestreams_snooze", 7 * 24 * 60 * 60);
           window._showToast?.("Deferred livestreams snoozed for 1 week.", "ok");
           refreshDeferredLivestreams();
         }
@@ -129,10 +130,10 @@
         "Clear deferred livestreams",
         "Forget every deferred livestream in the journal?\n\nThis doesn't delete any files.", "Clear");
       if (!ok) return;
-      const api = window.pywebview?.api;
-      const r = await api?.livestreams_list?.();
+      if (!nativeBridgeUp()) return;
+      const r = await bridgeCall("livestreams_list");
       for (const it of (r?.items || [])) {
-        await api?.livestreams_drop?.(it.video_id);
+        await bridgeCall("livestreams_drop", it.video_id);
       }
       refreshDeferredLivestreams();
     });

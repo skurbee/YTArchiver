@@ -18,7 +18,6 @@
  *   - window._editChannelFromContext (editChannel.js)
  *   - window._removeChannelWithPrompt (app.js)
  *   - window.YT.bridge.bridgeCall (bridge.js)
- *   - window.pywebview.api.* (native bridge)
  */
 (function () {
   "use strict";
@@ -34,6 +33,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Browse tab context menus ────────────────────────────────────────
   function initBrowseContextMenus() {
     // Channel grid cards
@@ -44,7 +47,7 @@
         if (!card) return;
         e.preventDefault();
         const name = card.querySelector(".channel-card-name")?.textContent || "";
-        const api = window.pywebview?.api;
+        const api = window.YT?.api;
         // Live-count labels: pull pending counters stashed on the card by
         // renderChannelGrid. folder-level
         // "Transcribe untranscribed (N pending)" live count.
@@ -158,7 +161,7 @@
                     || _browseState.currentChannel?.name
                     || "";
           if (!year || year === "?" || !chan) return;
-          const api = window.pywebview?.api;
+          const api = window.YT?.api;
           const _scope = { year: parseInt(year, 10) };
           const _yearInt = parseInt(year, 10);
           showContextMenu(e.clientX, e.clientY, [
@@ -209,7 +212,7 @@
         const title = card.dataset.title || "";
         const channel = card.dataset.channel || "";
         const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
-        const api = window.pywebview?.api;
+        const api = window.YT?.api;
         showContextMenu(e.clientX, e.clientY, [
           { label: "Play video", action: () => {
             // The label promises the in-app Watch view (embedded HTML5
@@ -220,10 +223,10 @@
               window._openVideoInWatch({
                 title, channel, filepath, video_id: videoId,
               });
-            } else if (filepath && api?.browse_open_video) {
+            } else if (filepath && nativeBridgeUp()) {
               // Defensive fallback: if the Watch helper got removed,
               // open externally so the user still gets video playback.
-              api.browse_open_video(filepath);
+              api?.browse_open_video?.(filepath);
             }
           }},
           { label: "Open on YouTube", action: () => {
@@ -236,8 +239,16 @@
             }
           }},
           { label: "Show in Explorer", action: () => {
-            if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
+            if (filepath) api?.browse_show_in_explorer?.(filepath);
           }},
+          { label: "Bookmark video", action: () => _bookmarkVideo({
+            videoId, title,
+            // The video-grid card's dataset.channel is often empty (older
+            // renders don't set v.channel), so fall back to the channel
+            // we drilled into — same fallback the Refresh metadata item
+            // above uses.
+            channel: channel || (window._browseState?.currentChannel?.folder || ""),
+          }) },
           { sep: true },
           { label: "Refresh metadata", action: async () => {
             // Re-fetches views/likes/description/comments for this single
@@ -245,7 +256,7 @@
             // Metadata.jsonl. Also covers the missing-metadata case —
             // fetch_single_video_metadata writes a fresh entry when one
             // doesn't exist. Same backend as Watch view's refresh button.
-            if (!api?.browse_refresh_video_metadata) {
+            if (!nativeBridgeUp()) {
               window._showToast?.("Refresh unavailable.", "warn");
               return;
             }
@@ -261,7 +272,7 @@
             console.log("[refresh-meta] sending", payload);
             window._showToast?.({ msg: "Refreshing metadata…", ttlMs: 15000 });
             try {
-              const res = await api.browse_refresh_video_metadata(payload);
+              const res = await api?.browse_refresh_video_metadata?.(payload);
               console.log("[refresh-meta] result", res);
               if (res?.ok) {
                 window._showToast?.("Metadata refreshed.", "ok");
@@ -276,11 +287,11 @@
             }
           }},
           { label: "Transcribe now", action: async () => {
-            if (filepath && api?.transcribe_enqueue) {
+            if (filepath && nativeBridgeUp()) {
               // Manual → Whisper model picker (60s countdown auto-picks default).
               const model = await (window._askWhisperModel?.(`"${title}"`));
               if (model === null) return;
-              api.transcribe_enqueue(filepath, title);
+              api?.transcribe_enqueue?.(filepath, title);
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
@@ -288,10 +299,10 @@
             // `_on_retranscribe` — ask for
             // a Whisper model, then queue a GPU task. No extra "are you
             // sure" confirm (the model picker Cancel handles that).
-            if (!filepath || !api?.transcribe_retranscribe) return;
+            if (!filepath || !nativeBridgeUp()) return;
             const model = await (window._askWhisperModel?.(`"${title}"`));
             if (!model) return;
-            const res = await api.transcribe_retranscribe(filepath, title, videoId || "");
+            const res = await api?.transcribe_retranscribe?.(filepath, title, videoId || "");
             if (res?.ok) window._showToast?.(
               `Queued ${model} re-transcription.`, "ok");
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
@@ -328,7 +339,7 @@
         const title = card.dataset.title || "";
         const channel = card.dataset.channel || "";
         const ytUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : "";
-        const api = window.pywebview?.api;
+        const api = window.YT?.api;
         // Loose manual single-video downloads aren't part of a tracked
         // subscription. Refresh metadata + Redownload both require a
         // subscription channel and hard-fail ("Channel not in
@@ -346,10 +357,10 @@
               window._openVideoInWatch({
                 title, channel, filepath, video_id: videoId,
               });
-            } else if (filepath && api?.browse_open_video) {
+            } else if (filepath && nativeBridgeUp()) {
               // Defensive fallback: if the Watch helper got removed,
               // open externally so the user still gets video playback.
-              api.browse_open_video(filepath);
+              api?.browse_open_video?.(filepath);
             }
           }},
           { label: "Open on YouTube", action: () => {
@@ -362,11 +373,12 @@
             }
           }},
           { label: "Show in Explorer", action: () => {
-            if (filepath && api?.browse_show_in_explorer) api.browse_show_in_explorer(filepath);
+            if (filepath) api?.browse_show_in_explorer?.(filepath);
           }},
+          { label: "Bookmark video", action: () => _bookmarkVideo({ videoId, title, channel }) },
           { sep: true },
           ...(tracked ? [{ label: "Refresh metadata", action: async () => {
-            if (!api?.browse_refresh_video_metadata) {
+            if (!nativeBridgeUp()) {
               window._showToast?.("Refresh unavailable.", "warn");
               return;
             }
@@ -376,7 +388,7 @@
             console.log("[refresh-meta] sending", payload);
             window._showToast?.({ msg: "Refreshing metadata…", ttlMs: 15000 });
             try {
-              const res = await api.browse_refresh_video_metadata(payload);
+              const res = await api?.browse_refresh_video_metadata?.(payload);
               console.log("[refresh-meta] result", res);
               if (res?.ok) {
                 window._showToast?.("Metadata refreshed.", "ok");
@@ -391,18 +403,18 @@
             }
           }}] : []),
           { label: "Transcribe now", action: async () => {
-            if (filepath && api?.transcribe_enqueue) {
+            if (filepath && nativeBridgeUp()) {
               const model = await (window._askWhisperModel?.(`"${title}"`));
               if (model === null) return;
-              api.transcribe_enqueue(filepath, title);
+              api?.transcribe_enqueue?.(filepath, title);
               window._showToast?.("Queued for whisper.", "ok");
             }
           }},
           { label: "Re-transcribe…", action: async () => {
-            if (!filepath || !api?.transcribe_retranscribe) return;
+            if (!filepath || !nativeBridgeUp()) return;
             const model = await (window._askWhisperModel?.(`"${title}"`));
             if (!model) return;
-            const res = await api.transcribe_retranscribe(filepath, title, videoId || "");
+            const res = await api?.transcribe_retranscribe?.(filepath, title, videoId || "");
             if (res?.ok) window._showToast?.(
               `Queued ${model} re-transcription.`, "ok");
             else window._showToast?.(res?.error || "Re-transcribe failed.", "error");
@@ -442,17 +454,20 @@
         const start = parseFloat((wordEl && wordEl.dataset.s) || seg.dataset.s) || 0;
         const ts = _fmtTs(start);
         const text = seg.textContent.trim();
-        const api = window.pywebview?.api;
+        const api = window.YT?.api;
         const v = _browseState.currentVideo || {};
         showContextMenu(e.clientX, e.clientY, [
           { label: `Copy segment`, action: () => navigator.clipboard?.writeText(text) },
           { label: `Copy timestamp + text`, action: () => navigator.clipboard?.writeText(`${ts} ${text}`) },
           { sep: true },
           { label: "Bookmark this moment\u2026", action: async () => {
-            if (!api?.bookmark_add) return;
+            if (!nativeBridgeUp()) {
+              window._showToast?.("Native mode required.", "warn");
+              return;
+            }
             // right-click on a transcript segment always
             // creates a timestamped bookmark with no note prompt.
-            const res = await api.bookmark_add({
+            const res = await api?.bookmark_add?.({
               video_id: v.video_id || "",
               title: v.title || "",
               channel: v.channel || "",
@@ -489,6 +504,35 @@
     const s = sec % 60;
     const mm = h ? String(m).padStart(2, "0") : String(m);
     return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
+  }
+
+  // Whole-video bookmark from a grid card's right-click menu. Mirrors the
+  // Watch view's "Whole video" path (watchActions.js btn-bookmark-now):
+  // start_time = -1 is the sentinel the Bookmarks sub-mode reads to render
+  // a favorites-style row (title + channel, no timestamp/transcript). Grid
+  // cards have no playhead, so there's no "moment vs. whole video" prompt —
+  // it's always the whole video. Shared by the #video-grid and #recent-grid
+  // menus so both stay in lockstep.
+  async function _bookmarkVideo({ videoId, title, channel }) {
+    const api = window.YT?.api;
+    if (!nativeBridgeUp()) {
+      window._showToast?.("Native mode required.", "warn");
+      return;
+    }
+    const res = await api?.bookmark_add?.({
+      video_id: videoId || "",
+      title: title || "",
+      channel: channel || "",
+      start_time: -1,
+      text: "",
+      note: "",
+    });
+    if (res?.ok) {
+      window._showToast?.("Video bookmarked.", "ok");
+      try { window.refreshBookmarks?.(); } catch {}
+    } else {
+      window._showToast?.(res?.error || "Bookmark failed.", "error");
+    }
   }
 
   window.initBrowseContextMenus = initBrowseContextMenus;

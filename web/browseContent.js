@@ -18,6 +18,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // ─── Manual-queue Whisper model picker ───────────────────────
   // Mirrors YTArchiver.py:22030 `_ask_whisper_model_dialog`. Shows a 4-option
   // modal (tiny/small/medium/large-v3) with a 60-second countdown that
@@ -27,10 +31,9 @@
   // null on cancel. Swaps the running whisper model via the backend so the
   // next job uses it.
   async function _askWhisperModel(contextLabel = "") {
-    const api = window.pywebview?.api;
     let currentDefault = "small";
     try {
-      const s = await api?.settings_load?.();
+      const s = nativeBridgeUp() ? await bridgeCall("settings_load") : null;
       if (s?.whisper_model) currentDefault = String(s.whisper_model);
     } catch (_e) {}
     // Issue #150 \u2014 just the model names, no verbose blurbs.
@@ -64,7 +67,7 @@
     // so the caller (retranscribe button) aborts instead of queuing
     // against the wrong model.
     try {
-      const _swap = await api?.transcribe_swap_model?.(pick, false);
+      const _swap = nativeBridgeUp() ? await bridgeCall("transcribe_swap_model", pick, false) : null;
       if (_swap && _swap.ok === false) {
         window._showToast?.(
           `Couldn't switch to ${pick}: ${_swap.error || "unknown error"}.`,
@@ -82,8 +85,7 @@
   window._askWhisperModel = _askWhisperModel;
 
   async function _askTranscribeChannel(channelName, combined) {
-    const api = window.pywebview?.api;
-    if (!api?.chan_transcribe_all) {
+    if (!nativeBridgeUp()) {
       window._showToast?.("Native mode required.", "warn");
       return;
     }
@@ -94,7 +96,7 @@
       const model = await _askWhisperModel(`"${channelName}"`);
       if (model === null) return; // user cancelled
     }
-    const res = await api.chan_transcribe_all(channelName, combined);
+    const res = await bridgeCall("chan_transcribe_all", channelName, combined);
     if (res?.ok === false) {
       window._showToast?.(res.error || "Transcribe failed to start.", "error");
       return;
@@ -168,12 +170,11 @@
     // Forward gesture, this helper) gets identical treatment without
     // each handler having to remember to call it.
 
-    const api = window.pywebview?.api;
     let transcript = null;
     let sourceInfo = null;
-    if (api?.browse_get_transcript) {
+    if (nativeBridgeUp()) {
       try {
-        const res = await api.browse_get_transcript({
+        const res = await bridgeCall("browse_get_transcript", {
           video_id: video.video_id || undefined,
           title: video.title || "",
         });
@@ -186,6 +187,12 @@
         } else if (res && res.segments) {
           transcript = res.segments;
           sourceInfo = res.source || null;
+        }
+        // Carry tx_status (backend sets it when there are no segments) so the
+        // empty-transcript branch can show "No speech detected" for a
+        // genuinely-silent video instead of the generic message.
+        if (res && !Array.isArray(res) && res.tx_status) {
+          video.tx_status = res.tx_status;
         }
       } catch (e) {
         // Surface bridge errors so the user knows the transcript
@@ -270,9 +277,8 @@
   };
   window._reloadChannelsGrid = () => {
     // Re-fetch the channel list (Subs table + per-channel counts).
-    const api = window.pywebview?.api;
-    if (!api?.get_index_summary) return;
-    api.get_index_summary().then((idx) => {
+    if (!nativeBridgeUp()) return;
+    bridgeCall("get_index_summary").then((idx) => {
       if (typeof window._applyIndexSummary === "function") {
         window._applyIndexSummary(idx);
       }
@@ -280,7 +286,6 @@
   };
 
   async function loadVideosFor(channel) {
-    const api = window.pywebview?.api;
     const name = channel.folder || channel.name || "";
     const sort = document.getElementById("browse-sort")?.value || "newest";
 
@@ -314,9 +319,9 @@
     const myLoadSeq = (loadVideosFor._seq = (loadVideosFor._seq || 0) + 1);
 
     // Native mode → real DB
-    if (api && api.browse_list_videos) {
+    if (nativeBridgeUp()) {
       try {
-        const rows = await api.browse_list_videos(name, sort, 50000);
+        const rows = await bridgeCall("browse_list_videos", name, sort, 50000);
         if (myLoadSeq !== loadVideosFor._seq) return; // stale, user clicked another channel
         if (Array.isArray(rows) && rows.length > 0) {
           _browseState.videos = rows.map(r => {
@@ -443,13 +448,12 @@
     banner.querySelector("b").textContent = ch.folder || ch.name || "this channel";
     banner.querySelector("button").addEventListener("click", async (e) => {
       e.stopPropagation();
-      const api = window.pywebview?.api;
-      if (!api?.metadata_recheck_channel) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       const name = ch.folder || ch.name || "";
-      const res = await api.metadata_recheck_channel({ name });
+      const res = await bridgeCall("metadata_recheck_channel", { name });
       if (res?.ok) {
         window._showToast?.(`Metadata fetch started for ${name}.`, "ok");
         banner.remove();
@@ -492,37 +496,6 @@
     // The browseSearch handler is the authoritative one because it
     // also short-circuits the e.repeat autorepeat stream (audit:
     // browseContent.js:472).
-  }
-
-  function synthSearchResults(q, regex) {
-    const channels = _browseState.channels || [];
-    const rx = (() => {
-      try { return new RegExp(regex ? q : escapeForRegex(q), "gi"); }
-      catch { return new RegExp(escapeForRegex(q), "gi"); }
-    })();
-    const sample = [
-      "and so that brings us to the really interesting part of this discussion",
-      "which is honestly something i didn't expect when we started",
-      "but it actually makes a lot of sense once you think about it",
-      "the first time this came up on the show we had no idea how it would play out",
-      "so here's the thing though you have to understand the context of the era",
-      "the entire budget was basically spent on one very specific thing",
-      "and that turned out to be a huge deal for the company long term",
-    ];
-    const results = [];
-    for (let i = 0; i < 25; i++) {
-      const chan = channels[i % Math.max(1, channels.length)]?.folder || "Channel";
-      const text = sample[i % sample.length] + " " + q + " " + sample[(i + 2) % sample.length];
-      const minute = i * 7 % 60;
-      const secs = (i * 13) % 60;
-      results.push({
-        channel: chan,
-        title: `Episode ${i + 1}`,
-        timestamp: `${minute}:${String(secs).padStart(2, "0")}`,
-        snippet: text,
-      });
-    }
-    return results;
   }
 
   function renderSearchResults(container, hits, q) {
@@ -586,13 +559,12 @@
   }
 
   async function _openSearchHitInWatch(hit) {
-    const api = window.pywebview?.api;
-    if (!api?.browse_resolve_segment) {
+    if (!nativeBridgeUp()) {
       window._showToast?.("Native mode required for playback.", "warn");
       return;
     }
     try {
-      const res = await api.browse_resolve_segment(
+      const res = await bridgeCall("browse_resolve_segment",
         hit.jsonl_path || "", hit.video_id || "", hit.title || "");
       if (!res?.ok) {
         window._showToast?.(res?.error || "Video file not found.", "error");
@@ -610,22 +582,26 @@
       // Load real transcript, fall back to synthesized
       let transcript = null;
       let sourceInfo = null;
-      if (api.browse_get_transcript) {
-        try {
-          const res = await api.browse_get_transcript({
-            video_id: video.video_id || undefined,
-            jsonl_path: hit.jsonl_path,
-            title: video.title,
-          });
-          if (Array.isArray(res)) transcript = res;
-          else if (res && res.segments) {
-            transcript = res.segments;
-            sourceInfo = res.source || null;
-          }
-        } catch { /* ignore */ }
-      }
+      try {
+        // Pass video_id + title ONLY (no jsonl_path) — see browseSearch.js:
+        // forwarding the hit's jsonl_path made the backend re-normpath a
+        // slash-mixed stored path and the jsonl_path=? match missed, blanking
+        // the Watch transcript. Let the backend resolve its canonical path.
+        const res = await bridgeCall("browse_get_transcript", {
+          video_id: video.video_id || undefined,
+          title: video.title,
+        });
+        if (Array.isArray(res)) transcript = res;
+        else if (res && res.segments) {
+          transcript = res.segments;
+          sourceInfo = res.source || null;
+        }
+        if (res && !Array.isArray(res) && res.tx_status) {
+          video.tx_status = res.tx_status;
+        }
+      } catch { /* ignore */ }
       if (!transcript || transcript.length === 0) {
-        // empty array → renderer shows "No transcript available."
+        // empty array → renderer shows the no-speech / no-transcript message
         transcript = [];
       } else {
         transcript = transcript.map(seg => ({
@@ -651,70 +627,6 @@
 
   function escapeForRegex(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  function drawWordFrequencyGraph(word) {
-    // Coerce to string at entry — caller may pass numbers or other
-    // primitives in the synthesized-data debug path (audit:
-    // browseContent.js:670). `${word}` interpolation later is then
-    // safe; Math.sin() on a non-string was a non-issue only because
-    // we don't actually do that, but keeping types stable here
-    // prevents future regressions.
-    word = String(word ?? "");
-    const canvas = document.getElementById("graph-canvas");
-    const empty = document.getElementById("graph-empty");
-    if (!canvas) return;
-    empty.style.display = "none";
-
-    const ctx = canvas.getContext("2d");
-    const w = canvas.width, h = canvas.height;
-    ctx.clearRect(0, 0, w, h);
-
-    // Background
-    ctx.fillStyle = "#0a0b0d";
-    ctx.fillRect(0, 0, w, h);
-
-    // Axis
-    ctx.strokeStyle = "#2a2c30";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(40, h - 30);
-    ctx.lineTo(w - 10, h - 30);
-    ctx.moveTo(40, 10);
-    ctx.lineTo(40, h - 30);
-    ctx.stroke();
-
-    // Synthesized data: 24 months
-    const points = [];
-    for (let i = 0; i < 24; i++) {
-      const val = Math.sin((i + word.length) * 0.35) * 40 + 60 + Math.random() * 20;
-      points.push(val);
-    }
-    const maxVal = Math.max(...points);
-    const xStep = (w - 60) / (points.length - 1);
-    // Line
-    ctx.strokeStyle = "#6cb4ee";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    points.forEach((v, i) => {
-      const x = 40 + i * xStep;
-      const y = (h - 30) - (v / maxVal) * (h - 50);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    // Points
-    ctx.fillStyle = "#6cb4ee";
-    points.forEach((v, i) => {
-      const x = 40 + i * xStep;
-      const y = (h - 30) - (v / maxVal) * (h - 50);
-      ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    // Title
-    ctx.fillStyle = "#dde1e8";
-    ctx.font = "12px Segoe UI, sans-serif";
-    ctx.fillText(`Frequency of "${word}" \u2014 last 24 months (synthesized)`, 50, 20);
   }
 
   function populateIndexTable(channels) {
@@ -760,9 +672,8 @@
     // overwrites window._applyIndexSummary.)
     if (!window.__segStatFetched) {
       window.__segStatFetched = true;
-      const _api = window.pywebview?.api;
-      if (_api?.get_index_db_stats) {
-        _api.get_index_db_stats().then((db) => {
+      if (nativeBridgeUp()) {
+        bridgeCall("get_index_db_stats").then((db) => {
           if (db && db.segments != null) {
             setText("stat-segments", Number(db.segments).toLocaleString());
           } else {
@@ -824,9 +735,8 @@
     let _restored = false;
     const restore = () => {
       if (_restored) return true;
-      const api = window.pywebview?.api;
-      if (!api?.queue_auto_get) return false;
-      api.queue_auto_get().then((st) => {
+      if (!nativeBridgeUp()) return false;
+      bridgeCall("queue_auto_get").then((st) => {
         if (_restored) return;            // late response — user already saw a result
         if (!st) return;
         _restored = true;
@@ -851,14 +761,14 @@
       setTimeout(poll, 150);
     }
 
-    // Change handler: re-resolve api each call (same api-timing gotcha).
+    // Change handler: bridgeCall re-resolves the api each call (handles
+    // the same api-timing gotcha noted above). Gated on nativeBridgeUp so
+    // a toggle in browser-preview mode stays a silent no-op.
     syncCB?.addEventListener("change", () => {
-      const api = window.pywebview?.api;
-      api?.queue_auto_set?.("sync", syncCB.checked);
+      if (nativeBridgeUp()) bridgeCall("queue_auto_set", "sync", syncCB.checked);
     });
     gpuCB?.addEventListener("change", () => {
-      const api = window.pywebview?.api;
-      api?.queue_auto_set?.("gpu", gpuCB.checked);
+      if (nativeBridgeUp()) bridgeCall("queue_auto_set", "gpu", gpuCB.checked);
     });
   }
 
@@ -870,6 +780,5 @@
   window.sortCurrentVideos = sortCurrentVideos;
   window._formatTs = _formatTs;
   window.renderSearchResults = renderSearchResults;
-  window.drawWordFrequencyGraph = drawWordFrequencyGraph;
   window.populateIndexTable = populateIndexTable;
 })();

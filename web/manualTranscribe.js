@@ -18,6 +18,9 @@
     if (fn) return fn(method, ...args);
     return undefined;
   }
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
 
   // ─── Manual Transcribe dialog ────────────────────────────────────────
   function initManualTranscribe() {
@@ -44,15 +47,14 @@
     // "Transcribe folder..." — recursively queue every untranscribed video
     // under a picked folder. Native folder picker handles the prompt.
     document.getElementById("btn-transcribe-folder")?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.transcribe_folder) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.("this folder"));
       if (model === null) return;
-      const res = await api.transcribe_folder();
+      const res = await bridgeCall("transcribe_folder");
       if (res?.ok) {
         window._showToast?.("Walking folder \u2014 watch the log for queue counts.", "ok");
       } else if (!res?.cancelled) {
@@ -61,12 +63,11 @@
     });
 
     browseBtn?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api?.pick_file) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
-      const res = await api.pick_file("Pick a video to transcribe", null,
+      const res = await bridgeCall("pick_file", "Pick a video to transcribe", null,
                                        [("Video files (*.mp4;*.mkv;*.webm;*.mov)")]);
       if (res?.ok && res.path) {
         pathEl.value = res.path;
@@ -74,10 +75,9 @@
     });
 
     confirmBtn?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
       const path = pathEl?.value || "";
       if (!path) { window._showToast?.("Pick a video file first.", "warn"); return; }
-      if (!api?.transcribe_enqueue) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Native mode required.", "warn");
         return;
       }
@@ -93,7 +93,7 @@
       // Manual → ask Whisper model (60s countdown auto-picks Settings default).
       const model = await (window._askWhisperModel?.(`"${title}"`));
       if (model === null) return;
-      const res = await api.transcribe_enqueue(path, title);
+      const res = await bridgeCall("transcribe_enqueue", path, title);
       if (res?.ok) {
         window._showToast?.("Queued for transcription.", "ok");
         hide();

@@ -33,11 +33,10 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
 
 from .log import get_logger
 from .ytarchiver_config import APP_DATA_DIR

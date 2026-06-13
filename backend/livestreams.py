@@ -59,7 +59,7 @@ def _load_ignore() -> set:
         with _IGNORE_JOURNAL.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return set(x for x in data if isinstance(x, str))
+            return {x for x in data if isinstance(x, str)}
     except (OSError, json.JSONDecodeError):
         pass
     return set()

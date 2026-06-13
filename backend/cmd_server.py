@@ -189,10 +189,10 @@ class _CmdHandler(_http_server.BaseHTTPRequestHandler):
             return ""
         if origin in ("null",):
             return origin
-        if origin.startswith("http://127.0.0.1") or \
-                origin.startswith("http://localhost") or \
-                origin.startswith("https://127.0.0.1") or \
-                origin.startswith("https://localhost"):
+        if origin.startswith(("http://127.0.0.1",
+                              "http://localhost",
+                              "https://127.0.0.1",
+                              "https://localhost")):
             return origin
         # Unknown origin — don't advertise CORS. Browser will block.
         return ""

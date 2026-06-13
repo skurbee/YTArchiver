@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from ._shared import *  # noqa: F401,F403
 
-
 # Module-level init lock — the bridge attribute (_archive_single_lock)
 # is created lazily on first call, and without an outer lock two near-
 # simultaneous first-time calls from JS could both pass the `hasattr`
@@ -101,6 +100,19 @@ class ArchiveMixin:
             except Exception:
                 return u
         url = _canonicalize_yt_url(url)
+        # Security: require an http(s) scheme before the URL reaches yt-dlp as
+        # a positional arg. A pasted value beginning with '-' (e.g.
+        # "--exec=calc.exe") has no scheme and would otherwise be parsed by
+        # yt-dlp as an OPTION rather than a URL — an argument-injection /
+        # command-execution vector (audit r2). Scheme-only (not host) so
+        # non-YouTube yt-dlp-supported sites still work.
+        try:
+            from urllib.parse import urlparse as _up2
+            if _up2(url).scheme not in ("http", "https"):
+                return {"ok": False,
+                        "error": "Only http(s) URLs can be downloaded."}
+        except Exception:
+            return {"ok": False, "error": "Invalid URL."}
         # Concurrency guard — track in-flight URLs so a rapid
         # double-click doesn't launch two yt-dlp processes fighting
         # over the same filename. Lazy init wrapped in a module-level
@@ -387,7 +399,7 @@ class ArchiveMixin:
                     except Exception:
                         pass
                     self._log_stream.emit_error(
-                        f"[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
+                        "[Dwnld] Watchdog: yt-dlp hung; killed after 15 min.")
                 # audit DT-1: only write to URL history now that the
                 # download actually ran. Previously written on submit,
                 # which polluted history with any URL the user
@@ -596,11 +608,9 @@ class ArchiveMixin:
                     ])
                     try:
                         if self._window is not None:
-                            import json as _json
-                            self._window.evaluate_js(
-                                "window._showToast && window._showToast("
-                                f"{_json.dumps('Downloaded but not indexed — run Rescan')},"
-                                " 'warn');")
+                            self.services.event_bus.show_toast(
+                                "Downloaded but not indexed — run Rescan",
+                                "warn")
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 else:
@@ -622,11 +632,8 @@ class ArchiveMixin:
                     ])
                     try:
                         if self._window is not None:
-                            import json as _json
-                            self._window.evaluate_js(
-                                "window._showToast && window._showToast("
-                                f"{_json.dumps(f'Download failed: {_reason}')},"
-                                " 'error');")
+                            self.services.event_bus.show_toast(
+                                f"Download failed: {_reason}", "error")
                     except Exception as e:
                         _log.debug("swallowed: %s", e)
                 self._log_stream.flush()

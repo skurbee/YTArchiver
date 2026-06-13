@@ -30,7 +30,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..log import get_logger
@@ -47,7 +47,6 @@ from ..sync import _find_cookie_source, _startupinfo, find_yt_dlp
 from ..thumbnails import _download_thumbnail, _ensure_thumbnails_dir
 from ..utils import utf8_subprocess_env as _utf8_env
 from .scan import _group_by_metadata_path, _scan_channel_videos
-
 
 # Module-scoped tracking for in-flight metadata-fetch subprocesses.
 # Used so a cancel during a bulk pre-fetch can forcibly kill the
@@ -240,7 +239,15 @@ def _fetch_video_metadata(yt: str, video_id: str,
         "duration": data.get("duration", 0),
         "thumbnail_url": data.get("thumbnail", ""),
         "comments": comments,
-        "fetched_at": datetime.now().isoformat(),
+        # UTC, offset-aware: refresh_comments' resume-skip parses this
+        # as UTC (H75). The old naive LOCAL string parsed 5-6h in the
+        # past for Central Time, so 'already done this pass' never
+        # matched and every resumed comment refresh restarted from
+        # video 1. (metadata_io's duplicate resolution compares these
+        # lexicographically — for UTC-negative timezones the UTC
+        # string sorts >= the old naive-local string for the same
+        # instant, so mixed old/new entries still resolve correctly.)
+        "fetched_at": datetime.now(UTC).isoformat(),
     }
 
 
@@ -555,14 +562,14 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
             except OSError:
                 pass
 
-        def _has_thumbnail_for(vid: str) -> bool:
+        def _has_thumbnail_for(vid: str, _brackets=_thumb_brackets) -> bool:
             """Check if any thumbnail file in this group's .Thumbnails
             folder matches `[vid]`. a case: 2 videos had metadata
             but no thumbnail — the old skip-if-in-existing check treated
             those as "complete" and never re-downloaded the thumbnail."""
             if not vid:
                 return False
-            return f"[{vid}]" in _thumb_brackets
+            return f"[{vid}]" in _brackets
 
         # Patch F (followup): parallel pre-fetch metadata for this
         # group. Previously the inner loop called _fetch_video_metadata
@@ -830,6 +837,28 @@ def fetch_metadata_for_videos(channel: dict[str, Any],
                 fetched += 1
                 changed = True
                 _changed_ids.add(vid_id)
+            # Successful fetch (refresh or fresh) — reset the failure
+            # counter so the 3-strike threshold means CONSECUTIVE
+            # failures. Without this it was lifetime-cumulative: any 3
+            # transient blips spread over months permanently stamped
+            # metadata_fetch_failed_ts, and after a recheck cleared the
+            # ts, the stale counter re-stamped it on the very next
+            # single blip (one-strike-permanent).
+            if not needs_thumb_only:
+                try:
+                    from .. import index as _idx_rs
+                    _c_rs = _idx_rs._open()
+                    if _c_rs is not None:
+                        with _idx_rs._db_lock:
+                            _c_rs.execute(
+                                "UPDATE videos SET "
+                                "metadata_fetch_fail_count=0 "
+                                "WHERE video_id=? AND "
+                                "COALESCE(metadata_fetch_fail_count,0) != 0",
+                                (vid_id,))
+                            _c_rs.commit()
+                except Exception as e:
+                    _log.debug("swallowed: %s", e)
             if entry.get("thumbnail_url"):
                 _download_thumbnail(entry["thumbnail_url"], thumb_dir,
                                     title or entry.get("title", ""), vid_id,

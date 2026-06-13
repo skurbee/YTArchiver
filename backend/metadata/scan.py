@@ -37,9 +37,7 @@ _log = get_logger(__name__)
 # of these as the final output depending on the channel's resolution
 # pref (e.g. "audio" mode lands a .m4a, "best" can land a .webm if no
 # H.264 source exists).
-_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v",
-               ".wav", ".mp3", ".m4a", ".flac")
-
+from ..fs_search import MEDIA_EXTS_TUPLE as _VIDEO_EXTS  # unified media set
 
 # Per-folder fingerprint cache. Adding a new download bumps the folder
 # mtime, so the fingerprint changes naturally and the cache invalidates.

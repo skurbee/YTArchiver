@@ -213,12 +213,21 @@
         ? _browseState.videos
         : _browseState.videos.filter(v => (v.title || "").toLowerCase().includes(q));
       const groupByYear = !!document.getElementById("browse-group-year")?.checked;
+      const groupByMonth = !!document.getElementById("browse-group-month")?.checked;
       window.renderVideoGrid(filtered, (v) => {
-        _browseState.currentVideo = v;
-        showView("watch");
-        // pass [] for "No transcript available." message
-        window.renderWatchView(v, []);
-      }, { groupByYear });
+        // Route through the canonical opener (transcript fetch + _watchOpenToken
+        // race guard), same as the unfiltered grid. The old inline path passed
+        // [] so a video opened from a FILTERED grid always showed "No transcript
+        // available." and skipped the race guard (audit r2). Also forward
+        // groupByMonth (was dropped → month sections collapsed on each keystroke).
+        if (typeof window._openVideoInWatch === "function") {
+          window._openVideoInWatch(v);
+        } else {
+          _browseState.currentVideo = v;
+          showView("watch");
+          window.renderWatchView(v, []);
+        }
+      }, { groupByYear, groupByMonth });
     }
   }
 

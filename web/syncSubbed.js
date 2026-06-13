@@ -18,6 +18,10 @@
     return undefined;
   }
 
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   // Wraps an async click handler so a second click that lands before
   // the first finishes is dropped. Stops "user clicked Sync 3 times,
   // 3 sync_start_all requests in flight" races.
@@ -46,13 +50,12 @@
     // while Auto is off.
     btn.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      const api = window.pywebview?.api;
-      if (!api?.sync_enqueue_all_channels) return;
+      if (!nativeBridgeUp()) return;
       showContextMenu(e.clientX, e.clientY, [
         { label: "Add all subbed channels to end of queue",
           action: async () => {
             try {
-              const r = await api.sync_enqueue_all_channels();
+              const r = await bridgeCall("sync_enqueue_all_channels");
               if (!r?.ok) {
                 window._showToast?.(r?.error || "Enqueue failed.", "error");
                 return;
@@ -74,13 +77,12 @@
     });
 
     btn.addEventListener("click", _inFlight(async () => {
-      const api = window.pywebview?.api;
-      if (!api) {
+      if (!nativeBridgeUp()) {
         window._showToast?.("Sync requires native mode (launch main.py).", "warn");
         return;
       }
       try {
-        const res = await api.sync_start_all();
+        const res = await bridgeCall("sync_start_all");
         if (!res.ok) {
           window._showToast?.(res.error || "Sync failed to start", "error");
           return;
@@ -125,6 +127,9 @@
       // gets processed. Click-triggered only; never automatic —
       // matches Project rule: "launching with items in queue
       // must never auto-start" (main.py:168).
+      // Keeps direct `api`: the branches below gate each call on a
+      // `typeof api.X === "function"` availability check that the YT.api
+      // proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api) return;
       const s = _blinkState.sync;
@@ -177,6 +182,10 @@
     // stays frozen. Matches the global Pause button's behavior.
     const pauseSyncBtn = document.getElementById("btn-pause-sync-queue");
     pauseSyncBtn?.addEventListener("click", async () => {
+      // Keeps direct `api`: this handler feature-detects newer methods
+      // (queue_is_paused, sync_start_all, resume_pending_redownloads) and
+      // falls back to legacy behavior when absent — semantics the YT.api
+      // proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api?.queue_is_paused) { api?.sync_cancel?.(); return; }
       const s = _blinkState.sync;
@@ -228,8 +237,7 @@
       }
     });
     document.getElementById("btn-cancel-sync-queue")?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       // If the sync queue is already paused, "Pause" and "Stop now"
       // are useless options (nothing's actively running to kill or
       // pause). Show only Clear + Never mind. The opposite case
@@ -269,20 +277,20 @@
           })
         : Promise.resolve(confirm("Clear the sync queue?") ? "clear" : null));
       if (choice === "clear") {
-        const res = await api.sync_clear_queue?.();
+        const res = await bridgeCall("sync_clear_queue");
         const n = res?.removed || 0;
         window._showToast?.(
           n > 0 ? `Sync queue cleared (${n} pending).`
                 : "Sync cancel requested.", "warn");
       } else if (choice === "stop") {
-        const res = await api.sync_force_stop?.();
+        const res = await bridgeCall("sync_force_stop");
         const n = res?.removed || 0;
         const k = res?.killed || 0;
         window._showToast?.(
           `Stopped — cleared ${n} queued, killed ${k} subprocess(es).`,
           "warn");
       } else if (choice === "pause") {
-        await api.queue_pause?.("sync");
+        await bridgeCall("queue_pause", "sync");
         window._showToast?.("Sync paused \u2014 finishing current channel.", "warn");
       }
       // null → Cancel → no-op (dialog closed)
@@ -290,6 +298,9 @@
 
     // GPU Tasks queue popover — mirror the Sync handlers.
     document.getElementById("btn-pause-gpu-queue")?.addEventListener("click", async () => {
+      // Keeps direct `api`: falls back to legacy transcribe_cancel_all
+      // when queue_is_paused is absent — a method-existence fallback the
+      // YT.api proxy can't express (it resolves every name to a function).
       const api = window.pywebview?.api;
       if (!api?.queue_is_paused) { api?.transcribe_cancel_all?.(); return; }
       const st = await api.queue_is_paused();
@@ -302,8 +313,7 @@
       }
     });
     document.getElementById("btn-cancel-gpu-queue")?.addEventListener("click", async () => {
-      const api = window.pywebview?.api;
-      if (!api) return;
+      if (!nativeBridgeUp()) return;
       const choice = await (window.askChoice
         ? askChoice({
             title: "Stop the processing queue?",
@@ -318,13 +328,13 @@
           })
         : Promise.resolve(confirm("Clear the processing queue?") ? "clear" : null));
       if (choice === "clear") {
-        const res = await api.gpu_clear_queue?.();
+        const res = await bridgeCall("gpu_clear_queue");
         const n = res?.removed || 0;
         window._showToast?.(
           n > 0 ? `Processing queue cleared (${n} pending).`
                 : "Processing queue cleared.", "warn");
       } else if (choice === "pause") {
-        await api.queue_pause?.("gpu");
+        await bridgeCall("queue_pause", "gpu");
         window._showToast?.("Processing queue paused \u2014 current job will finish.", "warn");
       }
     });

@@ -678,6 +678,13 @@
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
+/* Let the longer "Views refreshed" / "Comments refreshed" headers wrap to two
+   lines in the narrow 82px column; data cells ("29d ago") stay single-line
+   via the rule above (this th-only override has higher specificity). */
+.metadata-table th.md-col-ts {
+  white-space: normal;
+  line-height: 1.15;
+}
 /* Video IDs column — small status icon + optional count. Green
    when every on-disk file has a resolvable id in the DB; yellow
    when some are missing (backfill recommended); red when none

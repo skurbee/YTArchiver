@@ -27,8 +27,8 @@ from .log_stream import LogStreamer
 
 _log = get_logger(__name__)
 
-_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v",
-               ".wav", ".mp3", ".m4a", ".flac")
+from .fs_search import MEDIA_EXTS_TUPLE as _VIDEO_EXTS  # unified media set
+
 _SIDECAR_EXTS = (".txt", ".jsonl", ".info.json", ".jpg", ".jpeg", ".png", ".webp",
                  ".vtt", ".srt", ".description")
 
@@ -38,12 +38,7 @@ _SIDECAR_EXTS = (".txt", ".jsonl", ".info.json", ".jpg", ".jpeg", ".png", ".webp
 # so the two apps never create sibling folders for the same month.
 # Shared with metadata.py + transcribe.py — see backend.utils.MONTH_FOLDERS.
 from .utils import MONTH_FOLDERS as _MONTH_FOLDERS
-
-# Legacy name kept for any callers that imported it; points to the plain
-# month name (not used for new writes any more).
-_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
-                "July", "August", "September", "October", "November", "December"]
-
+from .utils import sampled_files_equal
 
 _REORG_SKIP_DIRS = ("_TEMP_COMPRESS", "_BACKLOG_TEMP", "_REDOWNLOAD_TEMP")
 
@@ -187,26 +182,12 @@ def _move_video(video: Path, target_dir: Path, stream: LogStreamer,
             _same_meta = False
         _same = False
         if _same_meta:
-            # Confirm with a content-sample compare so two genuinely
-            # different videos that happen to have the same size +
-            # near-identical mtime (rare but possible \u2014 re-encodes
-            # produced at the same instant, or restored-from-backup
-            # files) aren't deduped as identical. Mirrors the
-            # redownload.py head/tail sample-compare pattern.
-            _SAMPLE = 1024 * 1024  # 1 MB
-            _same = True
-            try:
-                with open(video, "rb") as _sf, open(dst, "rb") as _df:
-                    if _sf.read(_SAMPLE) != _df.read(_SAMPLE):
-                        _same = False
-                    if _same and _s_stat.st_size > _SAMPLE * 2:
-                        _tail_off = _s_stat.st_size - _SAMPLE
-                        _sf.seek(_tail_off)
-                        _df.seek(_tail_off)
-                        if _sf.read(_SAMPLE) != _df.read(_SAMPLE):
-                            _same = False
-            except OSError:
-                _same = False
+            # Content-sample compare (size + head/mid/tail 1MB windows) before
+            # treating dst as a duplicate and moving/removing the source.
+            # Shared helper so this delete path uses the SAME 3-window check as
+            # redownload's replace path \u2014 reorg previously had only head+tail
+            # (audit: sampled_files_equal).
+            _same = sampled_files_equal(str(video), str(dst))
         if _same:
             # Handle sidecars FIRST (move or remove). The source video
             # is deleted LAST so that any sidecar failure mid-loop
@@ -344,7 +325,13 @@ def _cleanup_empty_dirs(root: Path):
 def _date_from_info_json(video: Path) -> datetime | None:
     """Read `.info.json` sidecar and pull the YouTube upload_date field."""
     candidates = [
-        video.with_suffix("").with_suffix(".info.json"),
+        # Single, exact form. The old first candidate
+        # video.with_suffix("").with_suffix(".info.json") mangled
+        # dotted titles ('Vol. 2' → 'Vol.info.json') and — checked
+        # FIRST — could silently read a DIFFERENT video's upload date
+        # when the mangled name collided with a shorter-titled
+        # sibling. For dot-free stems it was byte-identical to this
+        # one anyway.
         video.parent / (video.stem + ".info.json"),
     ]
     for p in candidates:
@@ -606,6 +593,17 @@ def reorg_channel(channel_folder: str, split_years: bool, split_months: bool,
                             pass
                 except (OSError, ValueError):
                     pass
+                # Re-point the index at the moved file so Watch playback +
+                # the Browse grid keep finding it. Without this, reorg
+                # physically moves the .mp4 but videos.filepath still points
+                # at the OLD folder -> relocated videos showed "File not
+                # found" (the transcript still loaded, since segments are
+                # keyed by video_id, not path).
+                try:
+                    from . import index as _idx
+                    _idx.update_video_path(str(video), str(target / video.name))
+                except Exception as _ie:
+                    _log.debug("swallowed: %s", _ie)
             # Every 10 instead of 25 — on a ≤24-video reorg the old
             # threshold never fired, making the pass look stalled.
             if moved % 10 == 0:

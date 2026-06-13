@@ -19,9 +19,25 @@
  */
 (function () {
   "use strict";
+  function bridgeCall(method, ...args) {
+    const fn = window.YT?.bridge?.bridgeCall;
+    if (fn) return fn(method, ...args);
+    return undefined;
+  }
+
+  function nativeBridgeUp() {
+    return !!window.YT?.bridge?.isUp?.();
+  }
+
   window.YT = window.YT || {};
   const YT = window.YT;
-  const escapeHtml = (YT.util && YT.util.escapeHtml) || (s => String(s ?? ""));
+  // Hard fallback that ACTUALLY escapes. This IIFE loads before app.js and
+  // captures escapeHtml at module-eval time; if YT.util weren't populated yet
+  // the old `|| (s => String(s))` fallback was a no-op, leaving channel names
+  // (YT-derived) flowing raw into <option> innerHTML. The fallback now escapes.
+  const escapeHtml = (YT.util && YT.util.escapeHtml) || window._escapeHtml
+    || (s => String(s ?? "").replace(/[&<>"']/g,
+        c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])));
 
   // ─── Browse > Graph sub-mode (word frequency + word cloud) ───────────
   // Mirrors YTArchiver.py Graph/Frequency sub-mode: 3 chart types (Line,
@@ -57,13 +73,18 @@
           } else {
             drawGraph();
           }
+        } else if ((document.getElementById("graph-word")?.value || "").trim()) {
+          // Line/Bar with a word present: re-query so the switch reflects the
+          // CURRENT word/channel form state, not the last-plotted snapshot.
+          // (Redrawing the cached series here is what made edits to Word or
+          // Channel look ignored when you only toggled the chart type.)
+          drawGraph();
         } else if (_graphLastData && !_graphLastData.cloud) {
+          // No word typed but a cached series exists — redraw it so the
+          // Line<->Bar toggle still works without forcing a re-type.
           drawGraphFromData(_graphLastData);
         } else {
-          // Leaving word cloud (or a cold start) with no cached series:
-          // re-query so Line/Bar actually renders instead of leaving the
-          // stale word cloud sitting on the canvas. drawGraph() toasts
-          // "Enter a word to plot." if the Word box is empty.
+          // Cold start / empty box: drawGraph() toasts "Enter a word to plot."
           drawGraph();
         }
         _syncGraphWordField();
@@ -74,6 +95,22 @@
     document.getElementById("graph-normalize")?.addEventListener("change", () => {
       if ((document.getElementById("graph-word")?.value || "").trim()) {
         drawGraph();
+      }
+    });
+    // Channel scope change auto-replots (parity with the Plot button) so the
+    // chart reflects the selected channel without a manual Plot click.
+    document.getElementById("graph-channel")?.addEventListener("change", () => {
+      if (_graphType === "wordcloud"
+          || (document.getElementById("graph-word")?.value || "").trim()) {
+        drawGraph();
+      }
+    });
+    // Enter in the Word field plots — fire the Plot button itself so Enter and
+    // Plot can never drift apart.
+    document.getElementById("graph-word")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        document.getElementById("btn-graph-run")?.click();
       }
     });
     // CSV export
@@ -93,8 +130,16 @@
   function _syncGraphWordField() {
     const wordEl = document.getElementById("graph-word");
     if (!wordEl) return;
+    if (wordEl.dataset.defaultPlaceholder === undefined) {
+      wordEl.dataset.defaultPlaceholder = wordEl.placeholder || "";
+    }
     const cloud = _graphType === "wordcloud";
     wordEl.disabled = cloud;
+    // Swap the placeholder too (not just disabled + hover tooltip) so the
+    // "ignored here" state is visible at a glance, not only on hover.
+    wordEl.placeholder = cloud
+      ? "(ignored in word-cloud mode)"
+      : wordEl.dataset.defaultPlaceholder;
     wordEl.title = cloud
       ? "Word cloud shows the most-spoken words across the whole scope — the Word field is ignored here."
       : "";
@@ -120,8 +165,7 @@
       return;
     }
 
-    const api = window.pywebview?.api;
-    if (!api) {
+    if (!nativeBridgeUp()) {
       if (emptyEl) emptyEl.textContent = "Graph requires native mode.";
       return;
     }
@@ -130,12 +174,16 @@
 
     // Word Cloud path
     if (_graphType === "wordcloud") {
-      if (!api.browse_word_cloud) {
+      // Method-existence check — kept on direct api because the YT.api
+      // proxy resolves every name to a function and so can't express
+      // "is this endpoint actually wired on the backend?". Preserves the
+      // distinct "not wired yet" message instead of a generic toast.
+      if (!window.pywebview?.api?.browse_word_cloud) {
         if (emptyEl) emptyEl.textContent = "Word cloud backend not wired yet.";
         return;
       }
       let cloud;
-      try { cloud = await api.browse_word_cloud(channel, 120); }
+      try { cloud = await bridgeCall("browse_word_cloud", channel, 120); }
       catch (e) { if (emptyEl) emptyEl.textContent = "Error: " + e; return; }
       if (!cloud?.ok || !Array.isArray(cloud.words) || !cloud.words.length) {
         if (emptyEl) emptyEl.textContent = cloud?.error || "No words found.";
@@ -148,12 +196,13 @@
     }
 
     // Line / Bar path
-    if (!api.browse_graph) {
+    // Method-existence check kept on direct api (see word-cloud note above).
+    if (!window.pywebview?.api?.browse_graph) {
       if (emptyEl) emptyEl.textContent = "Graph requires native mode.";
       return;
     }
     let data;
-    try { data = await api.browse_graph(word, channel, bucket, normalize); }
+    try { data = await bridgeCall("browse_graph", word, channel, bucket, normalize); }
     catch (e) { if (emptyEl) emptyEl.textContent = "Error: " + e; return; }
     if (data?.error) { if (emptyEl) emptyEl.textContent = data.error; return; }
     // backend reports `backfill_pending` when week-bucket
@@ -302,9 +351,12 @@
   // YTArchiver.py:30507 _on_graph_click.
   function _drillIntoSearch(word, bucketLabel, bucket, channel) {
     if (!word) return;
-    // Activate the Search sub-view within Browse
+    // Activate the Search sub-view within Browse. NOTE: the sub-view switcher
+    // is a .submode-btn[data-submode="..."]; there is no [data-view] element,
+    // so the old selector silently no-op'd and the drill ran the search into a
+    // still-hidden Search view (looked like "clicking a point does nothing").
     document.querySelector('.tab[data-tab="browse"]')?.click();
-    document.querySelector('[data-view="search"]')?.click();
+    document.querySelector('.submode-btn[data-submode="search"]')?.click();
     const q = document.getElementById("search-query");
     const yf = document.getElementById("search-year-from");
     const yt = document.getElementById("search-year-to");
@@ -444,11 +496,10 @@
         ? `"${s.replace(/"/g, '""')}"` : s;
     }).join(",")).join("\n");
 
-    const api = window.pywebview?.api;
     const fname = _graphLastData.cloud ? "wordcloud.csv" :
       `graph_${(_graphLastData.word || "data").replace(/[^\w-]+/g, "_")}.csv`;
-    if (api?.save_text_to_file) {
-      const res = await api.save_text_to_file(fname, csv);
+    if (nativeBridgeUp()) {
+      const res = await bridgeCall("save_text_to_file", fname, csv);
       if (res?.ok) window._showToast?.("CSV saved.", "ok");
       else window._showToast?.(res?.error || "Save failed.", "error");
     } else {
@@ -465,10 +516,9 @@
   async function populateGraphChannels() {
     const sel = document.getElementById("graph-channel");
     if (!sel) return;
-    const api = window.pywebview?.api;
-    if (!api?.browse_list_channels) return;
+    if (!nativeBridgeUp()) return;
     try {
-      const chans = await api.browse_list_channels();
+      const chans = await bridgeCall("browse_list_channels");
       if (!chans) return;
       sel.innerHTML = '<option value="All">All</option>' +
         chans.map(c => `<option value="${escapeHtml(c.name || c.folder)}">${escapeHtml(c.name || c.folder)}</option>`).join("");
